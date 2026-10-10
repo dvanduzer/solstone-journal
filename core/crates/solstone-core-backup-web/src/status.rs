@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use std::path::Path;
 
 use solstone_core_backup::load_hosted_binding;
-use solstone_core_offload::build_offload_status;
+use solstone_core_offload::status::build_checked_offload_status;
 
 use crate::{
     config,
@@ -68,7 +68,7 @@ pub fn offload(
     let operation = crate::operation::observed_current(operations)?;
     #[cfg(not(windows))]
     let operation = crate::operation::current(operations);
-    let mut value = build_offload_status(root).map_err(|_| ())?.value;
+    let mut value = build_checked_offload_status(root).map_err(|_| ())?.value;
     let measured = measurement::snapshot(cache);
     let device = Map::from_iter([
         ("free_bytes".to_owned(), measured["free_bytes"].clone()),
@@ -109,6 +109,72 @@ mod tests {
     use super::hosted_view;
     use crate::{operation::Operation, test_support::hosted_binding};
     use solstone_core_backup::save_hosted_binding;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn offload_keeps_actual_media_and_cached_geometry_when_catalog_is_uncertain() {
+        use serde_json::json;
+        use solstone_core_offload::{OffloadFile, append_offload_event};
+        use std::fs;
+
+        let root = crate::test_support::root("healthy");
+        let segment = root.path().join("chronicle/20260101/010000_001");
+        fs::create_dir_all(&segment).unwrap();
+        for (name, bytes) in [
+            ("ordinary.webm", 11),
+            ("pending.flac", 7),
+            ("kept.flac", 5),
+            ("metadata.txt", 100),
+        ] {
+            fs::write(segment.join(name), vec![0; bytes]).unwrap();
+        }
+        append_offload_event(
+            root.path(),
+            "20260101",
+            "_default",
+            "010000_001",
+            "snapshot",
+            &[OffloadFile {
+                name: "pending.flac".into(),
+                bytes: 7,
+                sha256: "a".repeat(64),
+            }],
+            1,
+        )
+        .unwrap();
+        let cache = crate::measurement::with_geometry(crate::measurement::DeviceGeometry {
+            free_bytes: Some(31),
+            total_bytes: Some(100),
+        });
+        let slot = crate::operation::new_slot();
+        let before = super::offload(root.path(), &cache, &slot).unwrap();
+        assert_eq!(before["raw_media"]["total_bytes"], 23);
+        assert_eq!(before["raw_media"]["total_files"], 3);
+        assert_eq!(before["raw_media"]["complete"], true);
+        assert_eq!(before["backup_only"]["unbound_files"], 1);
+        assert_eq!(before["backup_only"]["complete"], false);
+        assert!(before["backup_only"]["total_bytes"].is_null());
+        assert!(before["pending_release"]["total_bytes"].is_null());
+        assert_eq!(before["proposed_release"]["available"], false);
+        for key in [
+            "structural_bytes",
+            "eligible_bytes",
+            "projected_local_bytes",
+        ] {
+            assert!(before["proposed_release"][key].is_null());
+        }
+        assert_eq!(before["device"], json!({"free_bytes":31,"total_bytes":100}));
+        let ledger = solstone_core_offload::ledger_path_for_day(root.path(), "20260101").unwrap();
+        fs::write(&ledger, b"{broken}\n").unwrap();
+        let after = super::offload(root.path(), &cache, &slot).unwrap();
+        assert_eq!(after["raw_media"]["total_bytes"], 23);
+        assert_eq!(after["raw_media"]["complete"], true);
+        assert_eq!(after["backup_only"]["degraded"], true);
+        assert!(after["backup_only"]["total_bytes"].is_null());
+        assert_eq!(after["device"], before["device"]);
+        assert_eq!(after["suggested_defaults"], before["suggested_defaults"]);
+        assert_eq!(fs::read(ledger).unwrap(), b"{broken}\n");
+    }
 
     #[cfg(not(windows))]
     #[cfg(all(test, feature = "full-tests"))]
