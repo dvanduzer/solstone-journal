@@ -1094,7 +1094,7 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
-    fn scheduled_briefing_publishes_its_open_loops() {
+    fn scheduled_briefing_keeps_model_attention_and_ignores_retired_packet_rows() {
         let root = tempfile::tempdir().unwrap();
         let (context, identity, request) = fixture(root.path(), false);
         let mut record = load_daily_unit_record(&context.journal, &identity)
@@ -1108,10 +1108,11 @@ mod tests {
         record.packet_digest = Some(crate::daily_prepare::packet_digest(&packet));
         record.frozen_packet = Some(packet);
         save_daily_unit_record(&context.journal, &record).unwrap();
-        let stub = crate::test_support::one_shot_stub(
-            root.path(),
-            &json!({"needs_attention":[],"your_day":[]}).to_string(),
-        );
+        let model_output = json!({"needs_attention":[
+            {"text":"Prepare for today's meeting","source_id":"sol://calendar/meeting"},
+            {"text":"Yesterday's audio is still processing","source_id":"sol://chronicle/20251231/audio"}
+        ],"your_day":[]});
+        let stub = crate::test_support::one_shot_stub(root.path(), &model_output.to_string());
         let outcome = execute(
             request,
             &context,
@@ -1135,12 +1136,16 @@ mod tests {
             .iter()
             .map(|row| row["source_id"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(sources, ["sol://owed/1", "sol://waiting/1"]);
+        assert_eq!(
+            sources,
+            ["sol://calendar/meeting", "sol://chronicle/20251231/audio"]
+        );
+        assert_eq!(saved, model_output);
     }
 
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
-    fn scheduled_briefing_caps_attention_before_schema_retry() {
+    fn scheduled_briefing_rejects_attention_overflow_after_normal_schema_retry() {
         let root = tempfile::tempdir().unwrap();
         let (context, identity, request) = fixture(root.path(), false);
         let mut record = load_daily_unit_record(&context.journal, &identity)
@@ -1152,14 +1157,10 @@ mod tests {
                 "required":["text","source_id"],"properties":{"text":{"type":"string"},"source_id":{"type":"string"}}}}
         }});
         packet["prepared"]["config"]["json_schema"] = schema.clone();
-        packet["state"]["MorningBriefing"]["values"] = json!({"briefing_open_loop_rows":[
-            {"owed":true,"voice":false,"row":{"text":"still open for 90 days","source_id":"sol://owed/1"}},
-            {"owed":false,"voice":false,"row":{"text":"still open for 40 days","source_id":"sol://waiting/1"}}
-        ]});
         record.packet_digest = Some(crate::daily_prepare::packet_digest(&packet));
         record.frozen_packet = Some(packet);
         save_daily_unit_record(&context.journal, &record).unwrap();
-        let raw = json!({"needs_attention":vec![json!({"text":"older task","source_id":"sol://owed/1"});13]}).to_string();
+        let raw = json!({"needs_attention":vec![json!({"text":"Prepare for today's meeting","source_id":"sol://calendar/meeting"});13]}).to_string();
         let validation =
             solstone_core_generate_wire::validate_schema_with_annotations(&raw, &schema);
         assert_eq!(validation.validation["valid"], false);
@@ -1175,34 +1176,31 @@ mod tests {
             &OneShotClient::at_path(stub),
             &mut events,
         );
-        let RuntimeOutcome::Finished { output, .. } = outcome else {
-            panic!("expected bounded publication without retry: {outcome:?}")
-        };
+        assert!(
+            matches!(outcome, RuntimeOutcome::SchemaValidationFailed { .. }),
+            "{outcome:?}"
+        );
         let attempts = std::str::from_utf8(&events)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .filter(|event| event["event"] == "generate_attempt")
             .collect::<Vec<_>>();
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0]["status"], "success");
-        assert_eq!(attempts[0]["retry"], false);
-        let accepted = load_daily_unit_record(&context.journal, &identity)
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["status"], "retry_eligible");
+        assert_eq!(attempts[0]["retry"], true);
+        assert_eq!(attempts[1]["status"], "exhausted");
+        assert_eq!(attempts[1]["retry"], false);
+        let rejected = load_daily_unit_record(&context.journal, &identity)
             .unwrap()
             .unwrap();
-        assert_eq!(accepted.generated_result.unwrap()["response"], output);
-        assert_eq!(
-            fs::read_to_string(
-                context
-                    .journal
-                    .join("chronicle/20260101/talents/morning_briefing.md")
-            )
-            .unwrap(),
-            output
+        assert!(rejected.accepted.is_none());
+        assert!(
+            !context
+                .journal
+                .join("chronicle/20260101/talents/morning_briefing.md")
+                .exists()
         );
-        let saved: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(saved["needs_attention"].as_array().unwrap().len(), 2);
-        assert_eq!(saved["needs_attention"][1]["source_id"], "sol://waiting/1");
     }
 
     #[cfg(all(test, feature = "full-tests"))]
