@@ -10,6 +10,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+solstone-core-segment.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 solstone-core-journal-config.workspace = true

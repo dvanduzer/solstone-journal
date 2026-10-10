@@ -27,6 +27,7 @@ mod error;
 mod identity;
 mod manifest;
 mod projection;
+pub mod output_attempt;
 mod relocate;
 mod segment_dir;
 mod source_mutation;
