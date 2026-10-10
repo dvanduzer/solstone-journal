@@ -289,6 +289,7 @@ pub enum RawRelease {
 }
 
 /// One content file as the caller found it on disk.
+#[derive(Clone, Debug)]
 pub struct FoundContent {
     pub name: ContentName,
     pub size: u64,

@@ -31,7 +31,7 @@
 //! evidence, never manufacture it.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
 
 use serde_json::Value;
@@ -91,7 +91,10 @@ fn first_two_rows(path: &Path) -> Vec<String> {
 /// `marker_key` is the row key that proves this modality's analysis rows exist;
 /// `None` means no handler claims the content, so no row can prove anything.
 pub fn read_sidecar(path: &Path, marker_key: Option<&str>) -> SidecarFacts {
-    let rows = first_two_rows(path);
+    sidecar_facts(&first_two_rows(path), marker_key)
+}
+
+fn sidecar_facts(rows: &[String], marker_key: Option<&str>) -> SidecarFacts {
     let header = rows
         .first()
         .and_then(|line| serde_json::from_str::<Value>(line).ok());
@@ -163,4 +166,90 @@ pub fn scan_segment(
         });
     }
     found
+}
+
+/// A complete read observation, without release or archive authority.
+/// Callers needing a stable decision must also hold writer and segment exclusion.
+pub struct CheckedSegment {
+    pub(crate) found: Vec<FoundContent>,
+}
+
+impl CheckedSegment {
+    pub fn files(&self) -> &[FoundContent] {
+        &self.found
+    }
+}
+
+fn invalid_observation() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "segment observation is incomplete",
+    )
+}
+
+fn checked_sidecar(path: &Path, marker: Option<&str>) -> io::Result<SidecarFacts> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SidecarFacts::default());
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Err(invalid_observation());
+    }
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid_observation());
+    }
+    let mut buffer = Vec::new();
+    file.by_ref().take(READ_BOUND).read_to_end(&mut buffer)?;
+    let text = std::str::from_utf8(&buffer).map_err(|_| invalid_observation())?;
+    let rows = text
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .take(2)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    Ok(sidecar_facts(&rows, marker))
+}
+
+/// Read all owner-media siblings, refusing missing directories and read errors.
+/// Unlike the soft scanner, an unreadable sibling cannot disappear from a group.
+pub fn scan_segment_checked(
+    segment: &Path,
+    registry: &dyn HandlerRegistry,
+    classifier: &dyn MediaClassifier,
+) -> io::Result<CheckedSegment> {
+    if !std::fs::symlink_metadata(segment)?.is_dir() {
+        return Err(invalid_observation());
+    }
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(segment)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let name = filename.to_str().ok_or_else(invalid_observation)?;
+        let Some(name) = ContentName::new(name) else {
+            return Err(invalid_observation());
+        };
+        if !classifier.is_owner_media(&name) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() {
+            return Err(invalid_observation());
+        }
+        let marker = registry.expected_handler(&name).and_then(analysis_row_key);
+        let sidecar = match sidecar_name(&name) {
+            Some(sidecar) => checked_sidecar(&segment.join(sidecar), marker)?,
+            None => SidecarFacts::default(),
+        };
+        found.push(FoundContent {
+            name,
+            size: metadata.len(),
+            sidecar,
+        });
+    }
+    found.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    Ok(CheckedSegment { found })
 }
