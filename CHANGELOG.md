@@ -22,6 +22,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - the health page now shows which source on a device had uploads turned away, even when another source is still adding material. after a successful check, if device status can't be checked again, it keeps that last result and shows when it was checked.
+- backup commands now report when media offload couldn't finish, even if some files were marked for removal first. the backup page shows the latest offload and verification results separately from the last completed run.
+
 - moving a segment now stops if another operation is changing either its current directory or the directory it would move to. try the move again once that operation finishes.
 
 - a week your journal makes after you've deleted every segment of a conversation now leaves that conversation's words out of "said by you". before, they could still appear there.

@@ -109,6 +109,8 @@ class Element {
   set id(value) { this.setAttribute('id', value); }
   get href() { return this.getAttribute('href') || ''; }
   set href(value) { if (value) this.setAttribute('href', value); else this.removeAttribute('href'); }
+  get title() { return this.getAttribute('title') || ''; }
+  set title(value) { this.setAttribute('title', value); }
   get hidden() { return this.hasAttribute('hidden'); }
   set hidden(value) { if (value) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }
   get textContent() { return this._textContent; }
@@ -276,6 +278,16 @@ function fixture(document) {
   rotateKey.disabled = true;
   const retention = add(management, 'form', { 'data-retention-form': '' });
   const saveRetention = add(retention, 'button', { type: 'submit' });
+  const offload = add(management, 'section', { 'data-offload-section': '' });
+  const offloadProof = add(offload, 'div', { 'data-offload-proof': '', hidden: '' });
+  const lastOffload = add(offloadProof, 'p', { 'data-offload-last-run': '' });
+  const lastVerify = add(offloadProof, 'p', { 'data-offload-last-verify': '' });
+  const runHistory = add(offloadProof, 'p', { 'data-offload-run-history': '', hidden: '' });
+  const runSuccessTime = add(runHistory, 'span', { 'data-offload-success-time': '' });
+  const verifyHistory = add(offloadProof, 'p', { 'data-offload-verify-history': '', hidden: '' });
+  const verifySuccessTime = add(verifyHistory, 'span', { 'data-offload-success-time': '' });
+  const stallReason = add(offload, 'p', { 'data-offload-stall-reason': '', hidden: '' });
+  const saveOffload = add(offload, 'button', { 'data-action': 'offload-save' });
   const destination = add(panels, 'article', { 'data-backup-panel': 'destination', hidden: '' });
   const destinationByo = add(destination, 'button', { class: 'backup-mode is-selected', 'data-mode': 'byo', role: 'radio', 'aria-checked': 'true' });
   destinationByo.textContent = 'your own';
@@ -309,7 +321,7 @@ function fixture(document) {
   add(byo, 'form', { 'data-restore-form': '' });
   const panelCancel = add(restore, 'button', { 'data-action': 'cancel-restore' });
   panelCancel.textContent = 'cancel';
-  return { root, showRestore, generateKey, backupNow, viewKey, rotateKey, retention, saveRetention, restore, destinationByo, destinationHosted, byoLane, operatedLane, operated, byo, heading, keyControl, key, keyReassurance, outcome, primary, attemptCancel, reopen, panelCancel, banner, cleanupBanner, cleanup, management, managementGrid, lastBackup };
+  return { root, showRestore, generateKey, backupNow, viewKey, rotateKey, retention, saveRetention, offloadProof, lastOffload, lastVerify, runHistory, runSuccessTime, verifyHistory, verifySuccessTime, stallReason, saveOffload, restore, destinationByo, destinationHosted, byoLane, operatedLane, operated, byo, heading, keyControl, key, keyReassurance, outcome, primary, attemptCancel, reopen, panelCancel, banner, cleanupBanner, cleanup, management, managementGrid, lastBackup };
 }
 
 function createHarness(options = {}) {
@@ -516,6 +528,98 @@ testCase('offload byte units are binary, matching settings’ unit family (g3-10
   assert.ok(source.includes('"under_1mb": "under 1 MiB"'), 'the under-threshold copy must match the MiB suffix');
   assert.ok(!source.includes('"gb_suffix": "GB"'), 'no leftover decimal GB suffix');
   assert.ok(!source.includes('"mb_suffix": "MB"'), 'no leftover decimal MB suffix');
+});
+
+asyncCase('offload current results stay distinct from historical success through refresh', async () => {
+  const earlier = 1760000000;
+  const current = 1770000000;
+  let payload = {
+    success: true, offload: { enabled: true }, days: [],
+    last_offload: { status: 'stalled', time: current, reason: 'confirm_failed', last_ok_time: earlier },
+    last_verification: { status: 'error', time: current, reason: 'timeout', last_ok_time: earlier },
+  };
+  const harness = createHarness({ respond(call) {
+    if (call.url === '/app/backup/status') return response({ ...status(), enabled: true, recovery_key_confirmed: true });
+    if (['/app/backup/offload/status', '/app/backup/offload/config'].includes(call.url)) return response(payload);
+  } });
+  await ready(harness);
+  const title = (time) => new Date(time * 1000).toLocaleString();
+  assert.ok(!harness.offloadProof.hidden);
+  assert.strictEqual(harness.lastOffload.getAttribute('data-result-status'), 'stalled');
+  assert.strictEqual(harness.lastVerify.getAttribute('data-result-status'), 'error');
+  assert.strictEqual(harness.lastOffload.getAttribute('title'), title(current));
+  assert.strictEqual(harness.lastVerify.getAttribute('title'), title(current));
+  assert.strictEqual(harness.runSuccessTime.getAttribute('title'), title(earlier));
+  assert.strictEqual(harness.verifySuccessTime.getAttribute('title'), title(earlier));
+  assert.ok(!harness.runHistory.hidden && !harness.verifyHistory.hidden);
+  assert.ok(!harness.stallReason.hidden && harness.stallReason.textContent);
+  const failedOffload = harness.lastOffload.textContent;
+  const failedVerify = harness.lastVerify.textContent;
+
+  payload = { ...payload,
+    last_offload: { ...payload.last_offload, reason: 'locked' },
+    last_verification: { ...payload.last_verification, reason: 'locked' },
+  };
+  click(harness.saveOffload);
+  await settle();
+  assert.notStrictEqual(harness.lastOffload.textContent, failedOffload);
+  assert.notStrictEqual(harness.lastVerify.textContent, failedVerify);
+
+  const lockedOffload = harness.lastOffload.textContent;
+  const lockedVerify = harness.lastVerify.textContent;
+  payload = { ...payload,
+    last_offload: { ...payload.last_offload, reason: 'unfamiliar_reason' },
+    last_verification: { ...payload.last_verification, reason: 'integrity_failed' },
+  };
+  click(harness.saveOffload);
+  await settle();
+  assert.notStrictEqual(harness.lastOffload.textContent, lockedOffload);
+  assert.notStrictEqual(harness.lastVerify.textContent, lockedVerify);
+  const unknownReason = harness.lastOffload.textContent;
+  payload = { ...payload, last_offload: { ...payload.last_offload, reason: null } };
+  click(harness.saveOffload);
+  await settle();
+  assert.notStrictEqual(harness.lastOffload.textContent, unknownReason);
+
+  payload = { ...payload,
+    last_offload: { status: 'ok', time: current + 10, last_ok_time: current + 10 },
+    last_verification: { status: 'ok', time: current + 10, last_ok_time: current + 10 },
+  };
+  click(harness.saveOffload);
+  await settle();
+  assert.strictEqual(harness.lastOffload.getAttribute('data-result-status'), 'ok');
+  assert.strictEqual(harness.lastVerify.getAttribute('data-result-status'), 'ok');
+  assert.strictEqual(harness.lastOffload.getAttribute('title'), title(current + 10));
+  assert.notStrictEqual(harness.lastOffload.textContent, failedOffload);
+  assert.notStrictEqual(harness.lastVerify.textContent, failedVerify);
+  assert.strictEqual(harness.runSuccessTime.getAttribute('title'), title(current + 10));
+  assert.ok(harness.stallReason.hidden);
+  assert.strictEqual(harness.stallReason.textContent, '');
+
+  payload = { ...payload, last_offload: null, last_verification: null };
+  click(harness.saveOffload);
+  await settle();
+  for (const element of [harness.lastOffload, harness.lastVerify]) {
+    assert.strictEqual(element.getAttribute('data-result-status'), 'missing');
+    assert.ok(!element.hasAttribute('title'));
+  }
+  for (const element of [harness.runHistory, harness.verifyHistory]) assert.ok(element.hidden);
+  for (const element of [harness.runSuccessTime, harness.verifySuccessTime]) {
+    assert.strictEqual(element.textContent, '');
+    assert.ok(!element.hasAttribute('title'));
+  }
+
+  payload = { ...payload,
+    last_offload: { status: 'unfamiliar', time: current, last_ok_time: earlier },
+    last_verification: { last_ok_time: earlier },
+  };
+  click(harness.saveOffload);
+  await settle();
+  assert.strictEqual(harness.lastOffload.getAttribute('data-result-status'), 'unknown');
+  assert.strictEqual(harness.lastVerify.getAttribute('data-result-status'), 'missing');
+  assert.strictEqual(harness.lastOffload.getAttribute('title'), title(current));
+  assert.strictEqual(harness.runSuccessTime.getAttribute('title'), title(earlier));
+  assert.strictEqual(harness.verifySuccessTime.getAttribute('title'), title(earlier));
 });
 
 asyncCase('initial settings stay hidden until status is known', async () => {
