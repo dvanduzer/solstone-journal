@@ -4964,6 +4964,7 @@ dependencies = [
  "solstone-core-backup",
  "solstone-core-backup-runtime",
  "solstone-core-distribution",
+ "solstone-core-format",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-retention",
