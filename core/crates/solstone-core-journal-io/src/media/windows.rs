@@ -4,80 +4,465 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
+use std::mem::{offset_of, size_of};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::{JournalRoot, MediaIdentity, unsupported};
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
+    FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation, FileFsFullSizeInformation,
+    FileRenameInformation, NtQueryVolumeInformationFile, NtSetInformationFile,
+};
+use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_SUCCESS};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_BASIC_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE,
+    FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandleEx,
+    SYNCHRONIZE,
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+use super::{JournalRoot, MediaIdentity, changed, invalid};
+use crate::windows_identity::{WindowsFileIdentity, file_identity};
+use crate::windows_ntcreate::{
+    nt_create_relative, nt_create_relative_deny_delete_sharing, nt_create_relative_share_read,
+};
+use crate::windows_publication_path::{
+    AncestorAdmission, WindowsPublicationPath, admit_publication_path,
+};
+
+const OPTIONS: u32 =
+    FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT;
+const DIRECTORY_ACCESS: u32 =
+    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+
+struct Node {
+    name: OsString,
+    file: File,
+    // None retains the actual created handle if the initial identity query fails.
+    identity: Option<MediaIdentity>,
+}
 
 pub(super) struct Directory {
-    identity: MediaIdentity,
+    root: Arc<JournalRoot>,
+    anchor: Arc<WindowsPublicationPath>,
+    nodes: Vec<Arc<Node>>,
     path: PathBuf,
 }
+
 impl Directory {
-    pub(super) fn open(_root: Arc<JournalRoot>, _names: &[OsString]) -> io::Result<Self> {
-        Err(unsupported())
+    pub(super) fn open(root: Arc<JournalRoot>, names: &[OsString]) -> io::Result<Self> {
+        root.revalidate_canonical_binding()
+            .map_err(io::Error::other)?;
+        let mut path = root.canonical_path().to_path_buf();
+        path.extend(names);
+        // The dummy leaf is never opened. ExistingOnly retains every directory
+        // from the volume root through the requested terminal directory.
+        let locator = path.join("media-admission");
+        let anchor = admit_publication_path(
+            locator
+                .to_str()
+                .ok_or_else(|| invalid("invalid Windows media path"))?,
+            &[],
+        )
+        .and_then(|admitted| admitted.retain_ancestors(AncestorAdmission::ExistingOnly))
+        .map_err(io::Error::other)?;
+        let directory = Self {
+            root,
+            anchor: Arc::new(anchor),
+            nodes: Vec::new(),
+            path,
+        };
+        directory.revalidate()?;
+        Ok(directory)
     }
-    pub(super) fn open_child(&self, _name: &OsStr) -> io::Result<Self> {
-        Err(unsupported())
+
+    fn handle(&self) -> RawHandle {
+        self.nodes.last().map_or_else(
+            || self.anchor.terminal_parent().as_raw_handle(),
+            |node| node.file.as_raw_handle(),
+        )
     }
+
+    /// Only owned stage directories have a node with DELETE access.
+    pub(super) fn file(&self) -> &File {
+        &self.nodes.last().expect("owned stage directory").file
+    }
+
     pub(super) fn identity(&self) -> MediaIdentity {
-        self.identity
+        self.nodes.last().map_or_else(
+            || witness(self.anchor.terminal_parent_identity()),
+            |node| node.identity.expect("admitted directory identity"),
+        )
     }
+
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
+
     pub(super) fn revalidate(&self) -> io::Result<()> {
-        Err(unsupported())
+        self.root
+            .revalidate_canonical_binding()
+            .map_err(io::Error::other)?;
+        self.anchor.revalidate().map_err(io::Error::other)?;
+        let mut parent = self.anchor.terminal_parent().as_raw_handle();
+        for node in &self.nodes {
+            let expected = node.identity.ok_or_else(changed)?;
+            require_kind(node.file.as_raw_handle(), true)?;
+            if identity(&node.file)? != expected {
+                return Err(changed());
+            }
+            let current = nt_create_relative(
+                parent,
+                &node.name,
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_OPEN,
+                OPTIONS | FILE_DIRECTORY_FILE,
+            )?;
+            require_kind(current.as_raw_handle(), true)?;
+            if witness(file_identity(current.as_raw_handle())?) != expected {
+                return Err(changed());
+            }
+            parent = node.file.as_raw_handle();
+        }
+        Ok(())
     }
+
     pub(super) fn available_bytes(&self) -> io::Result<u64> {
-        Err(unsupported())
+        let mut info = FullSizeInformation::default();
+        let mut status = IO_STATUS_BLOCK::default();
+        // SAFETY: the retained synchronous directory handle and aligned fixed
+        // buffer remain live through this call. No asynchronous completion is accepted.
+        #[allow(unsafe_code)]
+        let result = unsafe {
+            NtQueryVolumeInformationFile(
+                self.handle(),
+                &mut status,
+                (&mut info as *mut FullSizeInformation).cast(),
+                size_of::<FullSizeInformation>() as u32,
+                FileFsFullSizeInformation,
+            )
+        };
+        native_status(result)?;
+        if status.Information < size_of::<FullSizeInformation>() {
+            return Err(invalid("incomplete retained volume capacity"));
+        }
+        info.available_bytes()
     }
+
     pub(super) fn sync(&self) -> io::Result<()> {
-        Err(unsupported())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows directory durability is unproven",
+        ))
     }
 }
+
+#[repr(C, align(8))]
+#[derive(Default)]
+struct FullSizeInformation {
+    total: i64,
+    caller_available: i64,
+    actual_available: i64,
+    sectors_per_unit: u32,
+    bytes_per_sector: u32,
+}
+
+impl FullSizeInformation {
+    fn available_bytes(&self) -> io::Result<u64> {
+        if self.sectors_per_unit == 0 || self.bytes_per_sector == 0 {
+            return Err(invalid("invalid retained volume geometry"));
+        }
+        u64::try_from(self.caller_available)
+            .ok()
+            .and_then(|units| units.checked_mul(u64::from(self.sectors_per_unit)))
+            .and_then(|sectors| sectors.checked_mul(u64::from(self.bytes_per_sector)))
+            .ok_or_else(|| invalid("retained volume capacity overflow"))
+    }
+}
+
 pub(super) fn supported_mutation() -> io::Result<()> {
-    Err(unsupported())
+    Ok(())
 }
-pub(super) fn identity(_file: &File) -> io::Result<MediaIdentity> {
-    Err(unsupported())
+
+fn witness(identity: WindowsFileIdentity) -> MediaIdentity {
+    MediaIdentity::Windows {
+        volume: identity.volume_serial(),
+        file_id: identity.file_id(),
+    }
 }
-pub(super) type Stamp = (u64, i64, i64, i64, i64);
-pub(super) fn stamp(_file: &File) -> io::Result<Stamp> {
-    Err(unsupported())
+
+pub(super) fn identity(file: &File) -> io::Result<MediaIdentity> {
+    file_identity(file.as_raw_handle()).map(witness)
 }
+
+pub(super) type Stamp = (u64, i64, i64);
+pub(super) fn stamp(file: &File) -> io::Result<Stamp> {
+    let mut info = FILE_BASIC_INFO::default();
+    // SAFETY: exact initialized output buffer and retained handle for synchronous query.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut info as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((file.metadata()?.len(), info.LastWriteTime, info.ChangeTime))
+}
+
+fn require_kind(handle: RawHandle, directory: bool) -> io::Result<()> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: exact initialized output buffer and retained handle for synchronous query.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
+    {
+        return Err(invalid("media entry is not the admitted plain kind"));
+    }
+    Ok(())
+}
+
 pub(super) fn check_leaf(
-    _directory: &Directory,
-    _name: &OsStr,
-    _identity: MediaIdentity,
+    directory: &Directory,
+    name: &OsStr,
+    expected: MediaIdentity,
 ) -> io::Result<()> {
-    Err(unsupported())
+    let file = nt_create_relative(
+        directory.handle(),
+        name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+        OPTIONS,
+    )?;
+    require_kind(file.as_raw_handle(), false)?;
+    if witness(file_identity(file.as_raw_handle())?) != expected {
+        return Err(changed());
+    }
+    Ok(())
 }
-pub(super) fn open_plain(_directory: &Directory, _name: &OsStr) -> io::Result<Option<File>> {
-    Err(unsupported())
+
+fn open_file(
+    directory: &Directory,
+    name: &OsStr,
+    exclude_writes: bool,
+) -> io::Result<Option<File>> {
+    // Classify before opening for media reads, and refuse all reparse/non-files.
+    let admission = match nt_create_relative(
+        directory.handle(),
+        name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+        OPTIONS,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    require_kind(admission.as_raw_handle(), false)?;
+    let expected = witness(file_identity(admission.as_raw_handle())?);
+    let open = if exclude_writes {
+        nt_create_relative_share_read
+    } else {
+        nt_create_relative
+    };
+    let file = File::from(open(
+        directory.handle(),
+        name,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+        OPTIONS | FILE_NON_DIRECTORY_FILE,
+    )?);
+    require_kind(file.as_raw_handle(), false)?;
+    if identity(&file)? != expected {
+        return Err(changed());
+    }
+    Ok(Some(file))
 }
-pub(super) fn create_directory(_parent: &Directory, _name: &OsStr) -> io::Result<()> {
-    Err(unsupported())
+
+pub(super) fn open_plain(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
+    open_file(directory, name, false)
 }
-pub(super) fn create_file(_parent: &Directory, _name: &OsStr) -> io::Result<File> {
-    Err(unsupported())
+pub(super) fn open_source(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
+    open_file(directory, name, true)
 }
+
+pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
+    let file = File::from(nt_create_relative_deny_delete_sharing(
+        parent.handle(),
+        name,
+        DIRECTORY_ACCESS | DELETE,
+        FILE_CREATE,
+        OPTIONS | FILE_DIRECTORY_FILE,
+    )?);
+    // Retain the same create handle even on initial identity-query refusal.
+    let id = identity(&file).ok();
+    let mut nodes = parent.nodes.clone();
+    nodes.push(Arc::new(Node {
+        name: name.to_os_string(),
+        file,
+        identity: id,
+    }));
+    Ok(Directory {
+        root: parent.root.clone(),
+        anchor: parent.anchor.clone(),
+        nodes,
+        path: parent.path.join(name),
+    })
+}
+
+pub(super) fn create_file(parent: &Directory, name: &OsStr) -> io::Result<File> {
+    Ok(File::from(nt_create_relative_share_read(
+        parent.handle(),
+        name,
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        FILE_CREATE,
+        OPTIONS | FILE_NON_DIRECTORY_FILE,
+    )?))
+}
+
 pub(super) fn publish(
     _source: &Directory,
     _source_name: &OsStr,
-    _file: &File,
-    _destination: &Directory,
-    _name: &OsStr,
+    file: &File,
+    destination: &Directory,
+    name: &OsStr,
 ) -> io::Result<()> {
-    Err(unsupported())
+    let wide: Vec<u16> = name.encode_wide().collect();
+    let bytes = wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| invalid("media rename name overflow"))?;
+    let length = offset_of!(FILE_RENAME_INFORMATION, FileName)
+        .checked_add(bytes)
+        .ok_or_else(|| invalid("media rename buffer overflow"))?;
+    let native_length =
+        u32::try_from(length).map_err(|_| invalid("media rename buffer overflow"))?;
+    let name_length = u32::try_from(bytes).map_err(|_| invalid("media rename name overflow"))?;
+    // u64 storage provides header alignment on supported Windows architectures;
+    // zero padding includes ReplaceIfExists=false and no flags.
+    let mut buffer = vec![
+        0u64;
+        length
+            .max(size_of::<FILE_RENAME_INFORMATION>())
+            .div_ceil(size_of::<u64>())
+    ];
+    let header = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: buffer has header alignment and enough bytes for the variable UTF-16
+    // name; name and both handles remain live through the synchronous native call.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*header).RootDirectory = destination.handle();
+        (*header).FileNameLength = name_length;
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            std::ptr::addr_of_mut!((*header).FileName).cast::<u16>(),
+            wide.len(),
+        );
+    }
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: aligned initialized buffer with checked native length; synchronous retained handle.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status,
+            header.cast(),
+            native_length,
+            FileRenameInformation,
+        )
+    };
+    native_status(result)
 }
-pub(super) fn remove_leaf(_parent: &Directory, _name: &OsStr, _file: &File) -> io::Result<()> {
-    Err(unsupported())
+
+pub(super) fn mark_delete(file: &File) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: retained owned DELETE handle and initialized fixed-size input;
+    // caller closes its handles then independently confirms name absence.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status,
+            (&info as *const FILE_DISPOSITION_INFORMATION).cast(),
+            size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+            FileDispositionInformation,
+        )
+    };
+    native_status(result)
 }
-pub(super) fn remove_directory(
-    _parent: &Directory,
-    _name: &OsStr,
-    _directory: &Directory,
-) -> io::Result<()> {
-    Err(unsupported())
+
+pub(super) fn ensure_absent(parent: &Directory, name: &OsStr) -> io::Result<()> {
+    parent.revalidate()?;
+    match nt_create_relative(
+        parent.handle(),
+        name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+        OPTIONS,
+    ) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error), // Delete-pending/sharing/query failure stays pending.
+        Ok(_) => Err(changed()),  // Never delete a replacement from saved evidence.
+    }
+}
+
+fn native_status(status: i32) -> io::Result<()> {
+    if status == STATUS_SUCCESS {
+        return Ok(());
+    }
+    // SAFETY: pure conversion of the returned native status.
+    #[allow(unsafe_code)]
+    let error = unsafe { RtlNtStatusToDosError(status) };
+    Err(io::Error::from_raw_os_error(error as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_uses_caller_quota_with_checked_geometry() {
+        let mut info = FullSizeInformation {
+            total: 1000,
+            actual_available: 500,
+            caller_available: 3,
+            sectors_per_unit: 8,
+            bytes_per_sector: 512,
+        };
+        assert_eq!(info.available_bytes().unwrap(), 12288);
+        info.caller_available = 1;
+        assert_eq!(info.available_bytes().unwrap(), 4096);
+        info.caller_available = 0;
+        assert_eq!(info.available_bytes().unwrap(), 0);
+        info.caller_available = -1;
+        assert!(info.available_bytes().is_err());
+        info.caller_available = i64::MAX;
+        assert!(info.available_bytes().is_err());
+        info.caller_available = 1;
+        info.sectors_per_unit = 0;
+        assert!(info.available_bytes().is_err());
+        info.sectors_per_unit = 1;
+        info.bytes_per_sector = 0;
+        assert!(info.available_bytes().is_err());
+    }
 }
