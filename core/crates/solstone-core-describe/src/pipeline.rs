@@ -153,7 +153,7 @@ pub fn run_with_factory(
 /// Keeping this seam private lets pipeline tests use small, valid synthetic frame
 /// data while the CLI integration suite continues to prove the native decode,
 /// child-session, detector, and command-line boundaries.
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 fn run_decoded(
     options: DescribeOptions<'_>,
     factory: &dyn DescribeSessionFactory,

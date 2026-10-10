@@ -854,81 +854,6 @@ fn remove_failed_audio_segment(
     fs::remove_dir_all(segment)
 }
 
-#[cfg(test)]
-mod publication_tests {
-    use super::*;
-
-    #[cfg(feature = "full-tests")]
-    #[test]
-    fn raw_remux_publication_keeps_attempt_outside_segment_and_refuses_stale_or_deleted_parent() {
-        for mutation in ["unchanged", "deleted", "replaced"] {
-            let root = tempfile::tempdir().unwrap();
-            let segment = root.path().join("segment");
-            fs::create_dir(&segment).unwrap();
-            let output = segment.join("imported_audio.flac");
-            let result =
-                publish_audio_slice(Path::new("unused"), &output, 0.0, 1.0, |_, staged, _, _| {
-                    let options = solstone_core_journal_io::LockOptions {
-                        timeout: Duration::ZERO,
-                        ..Default::default()
-                    };
-                    assert!(
-                        solstone_core_journal_io::hold_lock(
-                            output.with_extension("jsonl"),
-                            options
-                        )
-                        .is_err()
-                    );
-                    assert!(solstone_core_journal_io::hold_lock(&segment, options).is_ok());
-                    fs::write(staged, b"synthetic remux").unwrap();
-                    match mutation {
-                        "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
-                        "replaced" => {
-                            fs::rename(&segment, root.path().join("previous")).unwrap();
-                            fs::create_dir(&segment).unwrap();
-                        }
-                        _ => (),
-                    }
-                    Ok(())
-                });
-            if mutation == "unchanged" {
-                result.unwrap();
-                assert_eq!(fs::read(output).unwrap(), b"synthetic remux");
-            } else {
-                assert!(result.is_err(), "{mutation}");
-                assert!(!output.exists(), "{mutation}");
-            }
-        }
-    }
-
-    #[test]
-    fn failed_slice_cleanup_preserves_owner_deletion_and_reused_directories() {
-        for mutation in ["unchanged", "deleted", "replaced"] {
-            let root = tempfile::tempdir().unwrap();
-            let segment = root.path().join("segment");
-            fs::create_dir(&segment).unwrap();
-            let admitted = solstone_core_journal_io::JournalRoot::open(&segment).unwrap();
-            match mutation {
-                "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
-                "replaced" => {
-                    fs::rename(&segment, root.path().join("previous")).unwrap();
-                    fs::create_dir(&segment).unwrap();
-                    fs::write(segment.join("owner.txt"), b"keep").unwrap();
-                }
-                _ => (),
-            }
-            let result = remove_failed_audio_segment(&segment, &admitted);
-            if mutation == "unchanged" {
-                result.unwrap();
-                assert!(!segment.exists());
-            } else {
-                assert!(result.is_err());
-                assert!(segment.exists());
-            }
-        }
-    }
-}
-
 fn remux_slice_to_stage(
     source: &Path,
     output: &Path,
@@ -1405,6 +1330,81 @@ pub mod native_long_audio_remux_corpus {
                     "remux duration {output_duration} differs from expected {expected_duration} for {}",
                     output.display()
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn raw_remux_publication_keeps_attempt_outside_segment_and_refuses_stale_or_deleted_parent() {
+        for mutation in ["unchanged", "deleted", "replaced"] {
+            let root = tempfile::tempdir().unwrap();
+            let segment = root.path().join("segment");
+            fs::create_dir(&segment).unwrap();
+            let output = segment.join("imported_audio.flac");
+            let result =
+                publish_audio_slice(Path::new("unused"), &output, 0.0, 1.0, |_, staged, _, _| {
+                    let options = solstone_core_journal_io::LockOptions {
+                        timeout: Duration::ZERO,
+                        ..Default::default()
+                    };
+                    assert!(
+                        solstone_core_journal_io::hold_lock(
+                            output.with_extension("jsonl"),
+                            options
+                        )
+                        .is_err()
+                    );
+                    assert!(solstone_core_journal_io::hold_lock(&segment, options).is_ok());
+                    fs::write(staged, b"synthetic remux").unwrap();
+                    match mutation {
+                        "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
+                        "replaced" => {
+                            fs::rename(&segment, root.path().join("previous")).unwrap();
+                            fs::create_dir(&segment).unwrap();
+                        }
+                        _ => (),
+                    }
+                    Ok(())
+                });
+            if mutation == "unchanged" {
+                result.unwrap();
+                assert_eq!(fs::read(output).unwrap(), b"synthetic remux");
+            } else {
+                assert!(result.is_err(), "{mutation}");
+                assert!(!output.exists(), "{mutation}");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_slice_cleanup_preserves_owner_deletion_and_reused_directories() {
+        for mutation in ["unchanged", "deleted", "replaced"] {
+            let root = tempfile::tempdir().unwrap();
+            let segment = root.path().join("segment");
+            fs::create_dir(&segment).unwrap();
+            let admitted = solstone_core_journal_io::JournalRoot::open(&segment).unwrap();
+            match mutation {
+                "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
+                "replaced" => {
+                    fs::rename(&segment, root.path().join("previous")).unwrap();
+                    fs::create_dir(&segment).unwrap();
+                    fs::write(segment.join("owner.txt"), b"keep").unwrap();
+                }
+                _ => (),
+            }
+            let result = remove_failed_audio_segment(&segment, &admitted);
+            if mutation == "unchanged" {
+                result.unwrap();
+                assert!(!segment.exists());
+            } else {
+                assert!(result.is_err());
+                assert!(segment.exists());
             }
         }
     }

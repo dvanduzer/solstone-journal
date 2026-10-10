@@ -658,6 +658,25 @@ pub fn catalog_journal(journal: &Path) -> JournalCatalog {
     result.days.sort_by(|a, b| a.day.cmp(&b.day));
     result
 }
+
+/// Fresh catalog coverage for an operation retaining its own admitted root.
+///
+/// This pathname-based observation is not an immutable snapshot or backup-safety
+/// capability. Callers retain their policy/admission and read again at each boundary.
+/// Local byte identity and unresolved restore obligations are not checked here.
+pub fn read_complete_catalog(
+    root: &solstone_core_journal_io::journal_root::JournalRoot,
+) -> Result<JournalCatalog, String> {
+    root.revalidate_canonical_binding()
+        .map_err(|error| error.to_string())?;
+    let catalog = catalog_journal(root.canonical_path());
+    root.revalidate_canonical_binding()
+        .map_err(|error| error.to_string())?;
+    if catalog.degraded() {
+        return Err("offload catalog coverage is incomplete".into());
+    }
+    Ok(catalog)
+}
 fn summary(catalog: SegmentCatalog) -> SegmentOffloadSummary {
     let manifests = catalog
         .active
@@ -765,7 +784,7 @@ mod catalog_tests {
     }
     fn archive_v2(id: &str, name: &str) -> Value {
         json!({"event_kind":"offload_archive_v2", "schema_version":2, "time":2, "day":"20260101", "stream":"_default", "segment":"010000_001",
-            "segment_dir":"010000_001_full", "layout":"direct", "journal_id":"journal", "repository_id":"c".repeat(64),
+            "segment_dir":"010000_001_full", "layout":"direct", "journal_id":"native-root-v1:unix:0000000000000001:0000000000000002", "repository_id":"c".repeat(64),
             "snapshot_id":"b".repeat(64), "manifest_id":id,
             "files":[{"witness_id":format!("w-{id}"), "name":name, "bytes":7, "sha256":"a".repeat(64), "archive_path":format!("/stage/{name}"),
                 "processing":{"record":null,"has_analysis_row":true}}]})
@@ -1025,6 +1044,60 @@ mod catalog_tests {
 #[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use super::*;
+    #[test]
+    fn complete_catalog_is_fresh_and_refuses_later_damage() {
+        let journal = tempfile::tempdir().unwrap();
+        let root =
+            solstone_core_journal_io::journal_root::JournalRoot::open(journal.path()).unwrap();
+        assert_eq!(
+            read_complete_catalog(&root).unwrap(),
+            JournalCatalog::default()
+        );
+        append_offload_event(
+            journal.path(),
+            "20260101",
+            "_default",
+            "010000_001",
+            "snapshot",
+            &[OffloadFile {
+                name: "audio.flac".into(),
+                bytes: 7,
+                sha256: "a".repeat(64),
+            }],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            read_complete_catalog(&root).unwrap().days[0].segments[0]
+                .active
+                .len(),
+            1
+        );
+        let ledger = path(journal.path(), "20260101");
+        for bytes in [b"{broken}\n".as_slice(), b"{torn".as_slice()] {
+            fs::write(&ledger, bytes).unwrap();
+            assert!(read_complete_catalog(&root).is_err());
+            assert_eq!(fs::read(&ledger).unwrap(), bytes);
+        }
+        fs::remove_file(&ledger).unwrap();
+        fs::create_dir(&ledger).unwrap();
+        assert!(read_complete_catalog(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_catalog_refuses_replaced_canonical_root_despite_retained_identity() {
+        let parent = tempfile::tempdir().unwrap();
+        let journal = parent.path().join("journal");
+        fs::create_dir(&journal).unwrap();
+        let root = solstone_core_journal_io::journal_root::JournalRoot::open(&journal).unwrap();
+        fs::rename(&journal, parent.path().join("original")).unwrap();
+        fs::create_dir(&journal).unwrap();
+        root.revalidate().unwrap();
+        assert!(root.revalidate_canonical_binding().is_err());
+        assert!(read_complete_catalog(&root).is_err());
+    }
+
     #[test]
     fn damaged_ledger_bytes_are_preserved_and_directory_failures_are_unknown() {
         let journal = tempfile::tempdir().unwrap();
