@@ -13,6 +13,7 @@ publish = false
 full-tests = []
 
 [dependencies]
+solstone-core-segment.workspace = true
 base64 = "0.22.1"
 chrono.workspace = true
 env_logger.workspace = true

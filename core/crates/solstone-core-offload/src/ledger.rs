@@ -72,7 +72,8 @@ impl JournalOffloadSummary {
 }
 
 /// A single archived generation. Historical records leave unstored bindings unknown.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveWitness {
     pub manifest_id: String,
     pub witness_id: String,
@@ -153,7 +154,8 @@ pub struct RestoreFileV2 {
     pub name: String,
     pub disposition: RestoreDisposition,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreOperation {
     pub operation_id: String,
     pub files: Vec<RestoreFileV2>,
@@ -765,6 +767,38 @@ mod catalog_tests {
     fn folded(records: &[Value]) -> DayCatalog {
         let lines = records.iter().map(|r| format!("{r}\n")).collect::<String>();
         fold_lines("20260101", lines.as_bytes())
+    }
+    #[test]
+    fn recovery_witness_values_roundtrip_losslessly_and_refuse_unknown_fields() {
+        for record in [
+            archive("a", &["raw.flac"]),
+            archive_v2("manifest", "raw.flac"),
+        ] {
+            let day = folded(&[record]);
+            let witness = &day.segments[0].active[0];
+            let mut value = serde_json::to_value(witness).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ArchiveWitness>(value.clone()).unwrap(),
+                *witness
+            );
+            value["unknown_binding"] = json!(true);
+            assert!(serde_json::from_value::<ArchiveWitness>(value).is_err());
+        }
+        let operation = RestoreOperation {
+            operation_id: "operation".into(),
+            files: vec![RestoreFileV2 {
+                witness_id: "w-manifest".into(),
+                name: "raw.flac".into(),
+                disposition: RestoreDisposition::Published,
+            }],
+        };
+        let mut value = serde_json::to_value(&operation).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RestoreOperation>(value.clone()).unwrap(),
+            operation
+        );
+        value["files"][0]["unknown_effect"] = json!(true);
+        assert!(serde_json::from_value::<RestoreOperation>(value).is_err());
     }
     #[test]
     fn disjoint_generations_survive_legacy_restore_of_last_manifest() {

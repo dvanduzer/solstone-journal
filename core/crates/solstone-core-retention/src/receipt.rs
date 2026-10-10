@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// row where the caller supplied two, and an owner's receipt would disagree with
 /// their request. `Vec` cannot do that.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Target {
     pub day: String,
     pub stream: String,

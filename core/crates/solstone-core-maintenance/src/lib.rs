@@ -213,7 +213,7 @@ fn format_backup_resolution_error(args: &[String], error: &ClosedToolError) -> C
     CliRun {
         stdout: format!("{line}\n"),
         stderr: String::new(),
-        exit_code: i32::from(id.as_deref() != Some("backup:offload")),
+        exit_code: 1,
     }
 }
 
@@ -373,6 +373,33 @@ mod composed_tests {
         BackupServices, Clock, HttpRequest, HttpResponse, HttpTransport, JournalMaintenance,
         JournalMaintenanceError, ToolOutput, ToolRequest, ToolRunner,
     };
+
+    #[test]
+    fn offload_tool_resolution_failures_report_failure() {
+        use solstone_core_backup_runtime::ClosedToolError;
+        for error in [
+            ClosedToolError::ResticUnavailable {
+                detail: "restic member missing".into(),
+                guidance: "repair installed tools".into(),
+            },
+            ClosedToolError::RcloneUnavailable {
+                detail: "rclone member missing".into(),
+                guidance: "repair installed tools".into(),
+            },
+        ] {
+            for dry_run in [false, true] {
+                let mut args = vec!["run".into(), "backup:offload".into()];
+                if dry_run {
+                    args.push("--dry-run".into());
+                }
+                let result = super::format_backup_resolution_error(&args, &error);
+                assert_eq!(result.exit_code, 1);
+                assert!(result.stdout.starts_with("backup offload: stalled"));
+                assert!(result.stdout.contains(error.detail()));
+                assert!(result.stderr.is_empty());
+            }
+        }
+    }
 
     struct Runner(RefCell<VecDeque<ToolOutput>>);
 

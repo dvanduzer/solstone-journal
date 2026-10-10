@@ -10,11 +10,112 @@ use serde_json::{Value, json};
 use solstone_core_backup::get_backup_config;
 use solstone_core_journal_io::paths::{PathOrDay, iter_segments, segment_path};
 
-use crate::ledger::summarize_journal;
+use crate::ledger::{ArchiveWitness, JournalCatalog, summarize_journal};
 use crate::measurement::{
-    RawMediaUsage, SuggestedOffloadDefaults, device_free_bytes, device_total_bytes,
-    measure_raw_media_usage, suggest_offload_defaults,
+    RawMediaPopulation, RawMediaUsage, SuggestedOffloadDefaults, device_free_bytes,
+    device_total_bytes, measure_raw_media_usage, suggest_offload_defaults,
 };
+
+/// Advisory metadata presence, never hash equality or restore/release authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogLocalPresence {
+    Present { local_bytes: u64 },
+    Absent,
+    Unknown { known_local_bytes: Option<u64> },
+    Unbound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogMediaObservation {
+    pub day: String,
+    pub stream: String,
+    pub segment: String,
+    pub witness: ArchiveWitness,
+    pub presence: CatalogLocalPresence,
+}
+
+/// Coverage is retained even when no active witness could be decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogMediaStatus {
+    pub files: Vec<CatalogMediaObservation>,
+    pub local_complete: bool,
+    pub catalog_degraded: bool,
+}
+
+/// Join active catalog witnesses to checked local metadata by exact locator/name.
+///
+/// Historical unstored locators remain unbound. An absent observation requires complete
+/// coverage; none of these observations certify backup safety or proposed pending relief.
+pub fn observe_catalog_media(
+    catalog: &JournalCatalog,
+    local: &RawMediaPopulation,
+) -> CatalogMediaStatus {
+    let files = local
+        .files
+        .iter()
+        .map(|file| {
+            (
+                (
+                    file.key.day.as_str(),
+                    file.key.stream.as_str(),
+                    file.key.segment_dir.as_str(),
+                    file.key.layout,
+                    file.key.name.as_str(),
+                ),
+                file.bytes,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut observations = Vec::new();
+    for day in &catalog.days {
+        for segment in &day.segments {
+            for witness in &segment.active {
+                let presence = match (witness.layout, witness.segment_dir.as_ref()) {
+                    (Some(layout), Some(segment_dir)) => {
+                        let key = (
+                            segment.day.as_str(),
+                            segment.stream.as_str(),
+                            segment_dir.as_str(),
+                            layout,
+                            witness.file.name.as_str(),
+                        );
+                        let known = files.get(&key).copied();
+                        if catalog.degraded()
+                            || day.degraded()
+                            || segment.degraded()
+                            || !local.complete()
+                        {
+                            CatalogLocalPresence::Unknown {
+                                known_local_bytes: known,
+                            }
+                        } else if let Some(local_bytes) = known {
+                            CatalogLocalPresence::Present { local_bytes }
+                        } else {
+                            CatalogLocalPresence::Absent
+                        }
+                    }
+                    _ => CatalogLocalPresence::Unbound,
+                };
+                observations.push(CatalogMediaObservation {
+                    day: segment.day.clone(),
+                    stream: segment.stream.clone(),
+                    segment: segment.segment.clone(),
+                    witness: witness.clone(),
+                    presence,
+                });
+            }
+        }
+    }
+    CatalogMediaStatus {
+        files: observations,
+        local_complete: local.complete(),
+        catalog_degraded: catalog.degraded()
+            || catalog
+                .days
+                .iter()
+                .any(|day| day.degraded() || day.segments.iter().any(|segment| segment.degraded())),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OffloadStatusMeasurement {
@@ -150,6 +251,155 @@ fn build_offload_status_with(
 }
 
 #[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::ledger::{DayCatalog, OffloadFile, SegmentCatalog};
+    use crate::measurement::{LocalMediaFile, LocalMediaKey};
+    use solstone_core_journal_io::paths::SegmentLayout;
+
+    fn fixture() -> (JournalCatalog, RawMediaPopulation) {
+        let witness = ArchiveWitness {
+            manifest_id: "manifest".into(),
+            witness_id: "witness".into(),
+            snapshot_id: "a".repeat(64),
+            repository_id: Some("repository".into()),
+            archive_path: Some("/exact/archive/raw.flac".into()),
+            journal_id: Some("journal".into()),
+            layout: Some(SegmentLayout::Direct),
+            segment_dir: Some("010000_001_full".into()),
+            file: OffloadFile {
+                name: "raw.flac".into(),
+                bytes: 17,
+                sha256: "b".repeat(64),
+            },
+        };
+        let catalog = JournalCatalog {
+            days: vec![DayCatalog {
+                day: "20260101".into(),
+                segments: vec![SegmentCatalog {
+                    day: "20260101".into(),
+                    stream: "_default".into(),
+                    segment: "010000_001".into(),
+                    active: vec![witness],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let local = RawMediaPopulation {
+            files: vec![LocalMediaFile {
+                key: LocalMediaKey {
+                    day: "20260101".into(),
+                    stream: "_default".into(),
+                    segment: "010000_001".into(),
+                    segment_dir: "010000_001_full".into(),
+                    layout: SegmentLayout::Direct,
+                    name: "raw.flac".into(),
+                },
+                bytes: 7,
+            }],
+            unknown_paths: Vec::new(),
+        };
+        (catalog, local)
+    }
+
+    #[test]
+    fn exact_presence_is_metadata_only_and_distinguishes_layout_and_full_basename() {
+        let (mut catalog, local) = fixture();
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Present { local_bytes: 7 }
+        );
+        // Archived size differs: local presence grants no content identity or AlreadyPresent authority.
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0]
+                .witness
+                .file
+                .bytes,
+            17
+        );
+        catalog.days[0].segments[0].segment = "grouping-only".into();
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Present { local_bytes: 7 }
+        );
+        catalog.days[0].segments[0].active[0].layout = Some(SegmentLayout::Named);
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Absent
+        );
+        catalog.days[0].segments[0].active[0].layout = Some(SegmentLayout::Direct);
+        catalog.days[0].segments[0].active[0].segment_dir = Some("010000_001_other".into());
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Absent
+        );
+    }
+
+    #[test]
+    fn incomplete_and_degraded_coverage_stays_unknown_with_known_bytes_advisory() {
+        let (mut catalog, mut local) = fixture();
+        local.unknown_paths.push("unreadable".into());
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Unknown {
+                known_local_bytes: Some(7)
+            }
+        );
+        local.files.clear();
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Unknown {
+                known_local_bytes: None
+            }
+        );
+        local.unknown_paths.clear();
+        catalog.days[0].skipped_records = 1;
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Unknown {
+                known_local_bytes: None
+            }
+        );
+        catalog.days[0].skipped_records = 0;
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Absent
+        );
+    }
+
+    #[test]
+    fn legacy_locator_is_unbound_and_inactive_history_is_not_observed() {
+        let (mut catalog, local) = fixture();
+        catalog.days[0].segments[0].active[0].layout = None;
+        catalog.days[0].segments[0].active[0].segment_dir = None;
+        assert_eq!(
+            observe_catalog_media(&catalog, &local).files[0].presence,
+            CatalogLocalPresence::Unbound
+        );
+        catalog.days[0].segments[0].active.clear();
+        assert!(observe_catalog_media(&catalog, &local).files.is_empty());
+    }
+
+    #[test]
+    fn empty_observations_preserve_unknown_coverage() {
+        let catalog = JournalCatalog {
+            unreadable_ledgers: vec!["unreadable-ledger".into()],
+            ..Default::default()
+        };
+        let local = RawMediaPopulation {
+            files: Vec::new(),
+            unknown_paths: vec!["unreadable-media".into()],
+        };
+        let status = observe_catalog_media(&catalog, &local);
+        assert!(status.files.is_empty());
+        assert!(!status.local_complete);
+        assert!(status.catalog_degraded);
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use super::*;
     use crate::ledger::{OffloadFile, append_offload_event};

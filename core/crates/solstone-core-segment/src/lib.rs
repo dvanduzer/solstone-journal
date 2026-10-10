@@ -26,6 +26,7 @@ mod document_migration;
 mod error;
 mod identity;
 mod manifest;
+pub mod output_attempt;
 mod projection;
 mod relocate;
 mod segment_dir;
