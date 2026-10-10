@@ -143,7 +143,12 @@ impl Directory {
 
     pub(super) fn available_bytes(&self) -> io::Result<u64> {
         let stat = fstatvfs(self)?;
-        stat.blocks_available()
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "fsblkcnt_t is 32-bit on macOS and 64-bit on Linux"
+        )]
+        let blocks = stat.blocks_available() as u64;
+        blocks
             .checked_mul(stat.fragment_size())
             .ok_or_else(|| invalid("media capacity overflow"))
     }

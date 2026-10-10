@@ -31,10 +31,8 @@ use solstone_core_generate::{
 use solstone_core_journal::{
     detect_checkout_root, discover_home, read_config_journal, resolve_journal_path,
 };
-use solstone_core_journal_io::{
-    AtomicWriteOptions, DEFAULT_LOCK_POLL_INTERVAL, DEFAULT_LOCK_TIMEOUT, ExistingParentLock,
-    acquire_existing_parent_lock, write_jsonl,
-};
+use solstone_core_journal_io::LockOptions;
+use solstone_core_journal_io::{AtomicWriteOptions, write_jsonl};
 use solstone_core_local::install::rfdetr_install::ENGINE_PROVENANCE_REF;
 #[cfg(any(not(windows), test))]
 use solstone_core_local::install::rfdetr_install::{
@@ -45,6 +43,7 @@ use solstone_core_processing_record::{
     TerminalProofOutcome, evaluate_terminal_proof, read_processing_record_header, record_attempts,
     should_reenter_analysis_output, vocab,
 };
+use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
 
 pub const ERROR_SCHEMA: &str = "solstone-depict-error-v1";
 pub const DESCRIPTION_PROMPT: &str = "Describe this image in detail. Include any visible text, people, objects, setting, and notable context. Return a concise natural-language description.";
@@ -487,23 +486,31 @@ fn run_depict(
 ) -> Result<RunOutcome, DepictError> {
     validate_image_path(image_path)?;
     let output_path = image_path.with_extension("jsonl");
+    let claims = OutputClaims::acquire([output_path.clone()], LockOptions::default())
+        .map_err(|error| DepictError::Output(error.to_string()))?;
+    let input = InputObservation::capture(&claims, image_path)
+        .map_err(|error| DepictError::Output(error.to_string()))?;
     if !redo && output_path.exists() {
         let record = read_processing_record_header(&output_path);
         if !should_reenter_analysis_output(record.as_ref(), &output_path, vocab::HANDLER_DEPICT) {
             return Ok(RunOutcome::Skipped);
         }
     }
+    let publication = FailurePublication {
+        output_path: &output_path,
+        image_path,
+        claims: &claims,
+        input: &input,
+    };
     // A missing read has no bytes to size a processing record against.
     let source = fs::read(image_path).map_err(|error| DepictError::Image(error.to_string()))?;
     let image = match image::load_from_memory(&source) {
         Ok(image) => image,
         Err(error) => {
             return publish_failed_analysis(
-                &output_path,
-                image_path,
+                &publication,
                 DepictError::Image(error.to_string()),
                 vocab::REASON_CORRUPT_INPUT,
-                source.len() as u64,
                 redo,
                 hooks,
             );
@@ -513,11 +520,9 @@ fn run_depict(
         Ok(png) => png,
         Err(error) => {
             return publish_failed_analysis(
-                &output_path,
-                image_path,
+                &publication,
                 error,
                 vocab::REASON_CORRUPT_INPUT,
-                source.len() as u64,
                 redo,
                 hooks,
             );
@@ -528,11 +533,9 @@ fn run_depict(
         Ok(png) => png,
         Err(error) => {
             return publish_failed_analysis(
-                &output_path,
-                image_path,
+                &publication,
                 error,
                 vocab::REASON_CORRUPT_INPUT,
-                source.len() as u64,
                 redo,
                 hooks,
             );
@@ -544,11 +547,9 @@ fn run_depict(
         Ok(Description::NoEngine) => return Ok(RunOutcome::NoEngine),
         Err(error) => {
             return publish_failed_analysis(
-                &output_path,
-                image_path,
+                &publication,
                 error,
                 vocab::REASON_ANALYSIS_FAILED,
-                source.len() as u64,
                 redo,
                 hooks,
             );
@@ -579,7 +580,9 @@ fn run_depict(
         Ok(None) => {}
         Err(_) => insert_detection_error(&mut entry),
     }
-    let _publication_lock = hold_depict_publication(&output_path)?;
+    let _commit = input
+        .commit(&claims)
+        .map_err(|error| DepictError::Output(error.to_string()))?;
     write_jsonl(
         &output_path,
         [Value::Object(header), Value::Object(entry)],
@@ -594,21 +597,33 @@ fn run_depict(
 /// The publication lock covers the fresh read and replacement; successful
 /// writers use the same lock. A held depict proof keeps those bytes and the
 /// original error is returned either way.
+struct FailurePublication<'a> {
+    output_path: &'a Path,
+    image_path: &'a Path,
+    claims: &'a OutputClaims,
+    input: &'a InputObservation,
+}
+
 fn publish_failed_analysis(
-    output_path: &Path,
-    image_path: &Path,
+    publication: &FailurePublication<'_>,
     error: DepictError,
     reason_code: &str,
-    input_size: u64,
     redo: bool,
     hooks: &FailurePublicationHooks<'_>,
 ) -> Result<RunOutcome, DepictError> {
+    let FailurePublication {
+        output_path,
+        image_path,
+        claims,
+        input,
+    } = publication;
+    let input_size = input.input_size();
     if let Some(before_lock) = hooks.before_lock {
         before_lock();
     }
-    let _publication_lock = match hold_depict_publication(output_path) {
+    let _commit = match input.commit(claims) {
         Ok(lock) => lock,
-        Err(persist) => return Err(join_persistence(error, persist.detail())),
+        Err(persist) => return Err(join_persistence(error, &persist.to_string())),
     };
     let existing = read_processing_record_header(output_path);
     if let Some(record) = existing.as_ref() {
@@ -649,22 +664,6 @@ fn publish_failed_analysis(
         return Err(join_persistence(error, &persist.to_string()));
     }
     Err(error)
-}
-
-fn hold_depict_publication(output_path: &Path) -> Result<ExistingParentLock, DepictError> {
-    let parent = output_path.parent().expect("validated image parent");
-    let mut name = output_path
-        .file_name()
-        .expect("validated image name")
-        .to_os_string();
-    name.push(".depict.lock");
-    acquire_existing_parent_lock(
-        parent,
-        &name,
-        DEFAULT_LOCK_TIMEOUT,
-        DEFAULT_LOCK_POLL_INTERVAL,
-    )
-    .map_err(|error| DepictError::Output(error.to_string()))
 }
 
 fn failure_document(
@@ -1348,6 +1347,90 @@ mod tests {
         assert!(!output.exists());
     }
 
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn writer_commit_admits_success_and_failure_but_refuses_changed_or_deleted_input() {
+        struct MutatingWire<'a> {
+            image: &'a Path,
+            mutation: &'a str,
+            fail: bool,
+        }
+        impl WireClient for MutatingWire<'_> {
+            fn execute(&self, request: &GenerateRequest) -> Result<GenerateResponse, ClientError> {
+                let options = solstone_core_journal_io::LockOptions {
+                    timeout: std::time::Duration::ZERO,
+                    ..Default::default()
+                };
+                assert!(
+                    solstone_core_journal_io::hold_lock(
+                        self.image.with_extension("jsonl"),
+                        options
+                    )
+                    .is_err()
+                );
+                assert!(
+                    solstone_core_journal_io::hold_lock(self.image.parent().unwrap(), options)
+                        .is_ok()
+                );
+                match self.mutation {
+                    "bytes" => {
+                        let mut bytes = fs::read(self.image).unwrap();
+                        bytes[0] ^= 1;
+                        fs::write(self.image, bytes).unwrap();
+                    }
+                    "deleted" => {
+                        fs::write(self.image.parent().unwrap().join("tombstone.json"), b"{}")
+                            .unwrap()
+                    }
+                    "missing" => fs::remove_file(self.image).unwrap(),
+                    "replaced" => {
+                        let bytes = fs::read(self.image).unwrap();
+                        fs::remove_file(self.image).unwrap();
+                        fs::write(self.image, bytes).unwrap();
+                    }
+                    _ => (),
+                }
+                if self.fail {
+                    FailingWire.execute(request)
+                } else {
+                    SuccessWire.execute(request)
+                }
+            }
+        }
+        let _env = lock_depict_env();
+        for fail in [false, true] {
+            for mutation in ["unchanged", "bytes", "deleted", "missing", "replaced"] {
+                let (_root, image) = fixture_image();
+                let result = run_with_clients(
+                    &image,
+                    false,
+                    &MutatingWire {
+                        image: &image,
+                        mutation,
+                        fail,
+                    },
+                    &NoDetector,
+                );
+                let output = image.with_extension("jsonl");
+                if mutation == "unchanged" {
+                    assert_eq!(result.is_ok(), !fail);
+                    assert_eq!(
+                        solstone_core_processing_record::read_processing_record_header(&output)
+                            .unwrap()["state"],
+                        if fail {
+                            vocab::STATE_FAILED
+                        } else {
+                            vocab::STATE_ANALYZED
+                        }
+                    );
+                } else {
+                    assert!(result.is_err(), "{mutation}");
+                    assert!(!output.exists(), "{mutation}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn successful_write_stamps_analyzed_depict_record() {
         let _env = lock_depict_env();
@@ -1612,13 +1695,14 @@ mod tests {
         let _env = lock_depict_env();
         let (_root, image) = fixture_image();
         let output = image.with_extension("jsonl");
-        let published = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            run_with_clients(&image, false, &SuccessWire, &NoDetector).unwrap(),
+            RunOutcome::Written
+        );
+        let published = fs::read(&output).unwrap();
+        fs::remove_file(&output).unwrap();
         let publish_success = || {
-            assert_eq!(
-                run_with_clients(&image, false, &SuccessWire, &NoDetector).unwrap(),
-                RunOutcome::Written
-            );
-            *published.borrow_mut() = fs::read(&output).unwrap();
+            fs::write(&output, &published).unwrap();
         };
         let error = run_depict(
             &image,
@@ -1632,7 +1716,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, DepictError::Wire { .. }));
-        assert_eq!(fs::read(&output).unwrap(), published.into_inner());
+        assert_eq!(fs::read(&output).unwrap(), published);
         let header: Value = serde_json::from_str(
             std::str::from_utf8(&fs::read(&output).unwrap())
                 .unwrap()
@@ -1676,14 +1760,6 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        struct ReadyDetector(mpsc::Sender<()>);
-        impl Detector for ReadyDetector {
-            fn detect(&self, _: &[u8]) -> Result<Option<Value>, String> {
-                self.0.send(()).unwrap();
-                Ok(None)
-            }
-        }
-
         let _env = lock_depict_env();
         let (_root, image) = fixture_image();
         let output = image.with_extension("jsonl");
@@ -1711,7 +1787,8 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
         let success = std::thread::spawn(move || {
-            let result = run_with_clients(&image, false, &SuccessWire, &ReadyDetector(ready_tx));
+            ready_tx.send(()).unwrap();
+            let result = run_with_clients(&image, false, &SuccessWire, &NoDetector);
             finished_tx.send(()).unwrap();
             result
         });

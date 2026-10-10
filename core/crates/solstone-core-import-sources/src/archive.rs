@@ -1101,6 +1101,7 @@ enum UndoKind {
 struct UndoRecord {
     kind: UndoKind,
     relative: String,
+    segment_binding: Option<solstone_core_journal_io::JournalRoot>,
 }
 
 struct MergeState {
@@ -2465,7 +2466,7 @@ fn stage_bytes(state: &MergeState, relative: &str, bytes: &[u8]) -> Result<(), I
 }
 
 /// Stage and publish what the archive brings. Segments and raw imports are
-/// new directories: they are staged and published first, unlocked, and one
+/// new directories: they are staged and published first with live-name exclusion, and one
 /// whose destination appeared in between stops the import. Entities and
 /// facets are then staged and published under one hold of the facet trust
 /// lock, which takes the entity lock first, so nothing changes what staging
@@ -2486,10 +2487,10 @@ fn stage_and_publish(
     if let Err(error) = publish_units(target, state, &chronicle_units)
         .and_then(|()| publish_units(target, state, &import_units))
     {
-        return Err(abort_publish(target, state, error));
+        return Err(abort_publish(target, state, error, || {}));
     }
     {
-        let _facet_lock = match hold_facet_trust_lock(target) {
+        let facet_lock = match hold_facet_trust_lock(target) {
             Ok(lock) => lock,
             Err(error) => {
                 let error = ImportSourcesError::FacetMerge {
@@ -2502,12 +2503,13 @@ fn stage_and_publish(
         if let Err(error) =
             stage_entities(source, target, state).and_then(|()| stage_facets(source, target, state))
         {
+            drop(facet_lock);
             return Err(abandon(target, state, error));
         }
         #[cfg(test)]
         run_while_locked();
         if let Err(error) = publish_owned_files(target, state) {
-            return Err(abort_publish(target, state, error));
+            return Err(abort_publish(target, state, error, || drop(facet_lock)));
         }
     }
     touch_stream_markers(target, state)
@@ -2571,7 +2573,7 @@ fn abandon(target: &Path, state: &mut MergeState, error: ImportSourcesError) -> 
     if state.published.is_empty() {
         return error;
     }
-    let undo_failures = undo_publish(target, state);
+    let undo_failures = undo_publish(target, state, || {});
     if undo_failures.is_empty() {
         // Nothing is left to restore, so nothing is left for an operator.
         let _ = fs::remove_dir_all(&state.publish_undo);
@@ -2594,13 +2596,14 @@ fn abort_publish(
     target: &Path,
     state: &mut MergeState,
     error: ImportSourcesError,
+    release_owned: impl FnOnce(),
 ) -> ImportSourcesError {
     let mutation = if state.published.is_empty() {
         MergeMutationState::NotMutated
     } else {
         MergeMutationState::MayHaveMutated
     };
-    let undo_failures = undo_publish(target, state);
+    let undo_failures = undo_publish(target, state, release_owned);
     let detail = if undo_failures.is_empty() {
         error.to_string()
     } else {
@@ -2658,8 +2661,34 @@ fn publish_one(
                     mutation,
                 });
             }
+            // Chronicle units are always whole new segments (stage_segments).
+            // Acquire attempts on the exact staged lock inodes that the pivot
+            // publishes, then exclude the live name through that pivot.
+            let is_segment = state.chronicle_units.contains_key(&relative);
+            let mut staged_claims = None;
+            let mut live_name = None;
             publish_staged_dir(&destination, StagedDirOptions::default(), |staging| {
-                copy_tree(&staged, staging)
+                copy_tree(&staged, staging)?;
+                if is_segment {
+                    staged_claims = Some(
+                        solstone_core_segment::output_attempt::OutputClaims::discover(
+                            staging,
+                            LockOptions::default(),
+                        )?,
+                    );
+                    live_name = Some(
+                        solstone_core_segment::output_attempt::SegmentMutation::acquire(
+                            &destination,
+                            LockOptions::default(),
+                        )?,
+                    );
+                    if fs::symlink_metadata(&destination).is_ok() {
+                        return Err(io::Error::other(
+                            "segment appeared before archive publication",
+                        ));
+                    }
+                }
+                Ok(())
             })
             .map_err(|error| ImportSourcesError::MergePublishFailed {
                 detail: error.to_string(),
@@ -2668,6 +2697,18 @@ fn publish_one(
             state.published.push(UndoRecord {
                 kind: UndoKind::UnlinkNew,
                 relative,
+                segment_binding: if is_segment {
+                    Some(
+                        solstone_core_journal_io::JournalRoot::open(&destination).map_err(
+                            |error| ImportSourcesError::MergePublishFailed {
+                                detail: error.to_string(),
+                                mutation: MergeMutationState::MayHaveMutated,
+                            },
+                        )?,
+                    )
+                } else {
+                    None
+                },
             });
         }
         PublishUnit::File => {
@@ -2705,6 +2746,7 @@ fn publish_file(
             state.published.push(UndoRecord {
                 kind: UndoKind::UnlinkNew,
                 relative,
+                segment_binding: None,
             });
         }
         Ok(metadata) if metadata.is_file() => {
@@ -2745,6 +2787,7 @@ fn publish_file(
             state.published.push(UndoRecord {
                 kind: UndoKind::Restore,
                 relative,
+                segment_binding: None,
             });
         }
         Ok(_) => {
@@ -2801,12 +2844,14 @@ fn publish_pending_ambiguities(
             state.published.push(UndoRecord {
                 kind: UndoKind::Restore,
                 relative: relative.to_owned(),
+                segment_binding: None,
             });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             state.published.push(UndoRecord {
                 kind: UndoKind::UnlinkNew,
                 relative: relative.to_owned(),
+                segment_binding: None,
             });
         }
         Ok(_) => {
@@ -2833,41 +2878,102 @@ fn publish_pending_ambiguities(
     Ok(())
 }
 
-fn undo_publish(target: &Path, state: &mut MergeState) -> Vec<String> {
+fn undo_publish(
+    target: &Path,
+    state: &mut MergeState,
+    release_owned: impl FnOnce(),
+) -> Vec<String> {
     #[cfg(test)]
     maybe_drop_undo_preimages(state);
     let mut failures = Vec::new();
     let mut undone = 0_usize;
-    for record in state.published.iter().rev() {
-        let destination = target.join(&record.relative);
-        match record.kind {
-            UndoKind::UnlinkNew => {
-                let result = if destination.is_dir() {
-                    fs::remove_dir_all(&destination)
-                } else {
-                    fs::remove_file(&destination)
-                };
-                if let Err(error) = result {
-                    failures.push(format!("unlink {}: {error}", record.relative));
-                }
-                remove_empty_parents(target, &record.relative);
+    let mut release_owned = Some(release_owned);
+    // Undo entity/facet files and their cache under their original trust
+    // lock, then release it before waiting for any segment output attempt.
+    for owned_phase in [true, false] {
+        if !owned_phase {
+            if state.published_entity_json
+                && let Err(error) = rewrite_identity_map_cache(target)
+            {
+                failures.push(format!("rewrite identity map: {error}"));
             }
-            UndoKind::Restore => {
-                let undo = state.publish_undo.join(&record.relative);
-                if let Err(error) = fs::rename(&undo, &destination) {
-                    failures.push(format!("restore {}: {error}", record.relative));
+            release_owned.take().unwrap()();
+            #[cfg(all(test, feature = "full-tests"))]
+            BEFORE_RAW_UNDO.with(|cell| {
+                if let Some(action) = cell.borrow_mut().take() {
+                    action();
                 }
-            }
+            });
         }
-        undone += 1;
-        maybe_crash_undo(undone);
-    }
-    if state.published_entity_json
-        && let Err(error) = rewrite_identity_map_cache(target)
-    {
-        failures.push(format!("rewrite identity map: {error}"));
+        for record in state.published.iter().rev().filter(|record| {
+            let owned = !state.chronicle_units.contains_key(&record.relative)
+                && !state.import_units.contains_key(&record.relative);
+            owned == owned_phase
+        }) {
+            let destination = target.join(&record.relative);
+            // Only chronicle trees are segment publications; entity/facet/import
+            // files never enter the processing output-attempt namespace.
+            let claims =
+                if state.chronicle_units.contains_key(&record.relative) && destination.exists() {
+                    match solstone_core_segment::output_attempt::OutputClaims::discover(
+                        &destination,
+                        LockOptions::default(),
+                    ) {
+                        Ok(claims) => Some(claims),
+                        Err(error) => {
+                            failures.push(format!("coordinate {}: {error}", record.relative));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+            let _commit = match claims
+                .as_ref()
+                .map(|claims| claims.commit(&destination))
+                .transpose()
+            {
+                Ok(commit) => commit,
+                Err(error) => {
+                    failures.push(format!("coordinate {}: {error}", record.relative));
+                    continue;
+                }
+            };
+            if let Some(binding) = &record.segment_binding
+                && let Err(error) = binding.revalidate_canonical_binding()
+            {
+                failures.push(format!("coordinate {}: {error}", record.relative));
+                continue;
+            }
+            match record.kind {
+                UndoKind::UnlinkNew => {
+                    let result = if destination.is_dir() {
+                        fs::remove_dir_all(&destination)
+                    } else {
+                        fs::remove_file(&destination)
+                    };
+                    if let Err(error) = result {
+                        failures.push(format!("unlink {}: {error}", record.relative));
+                    }
+                    remove_empty_parents(target, &record.relative);
+                }
+                UndoKind::Restore => {
+                    let undo = state.publish_undo.join(&record.relative);
+                    if let Err(error) = fs::rename(&undo, &destination) {
+                        failures.push(format!("restore {}: {error}", record.relative));
+                    }
+                }
+            }
+            undone += 1;
+            maybe_crash_undo(undone);
+        }
     }
     failures
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+thread_local! {
+    static BEFORE_RAW_UNDO: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn extra_files(path: &Path) -> Vec<PathBuf> {
@@ -4009,6 +4115,114 @@ mod tests {
             b"mine"
         );
         assert!(!target.join("chronicle/20260311/120000_60").exists());
+    }
+
+    #[test]
+    fn raw_archive_pivot_publishes_claim_inodes_and_refuses_owner_deleted_names() {
+        for deleted in [false, true] {
+            let _reset = FaultReset;
+            let tree = PlanTree::new();
+            let target = tree.path.join("target");
+            fs::create_dir(&target).unwrap();
+            let archive = write_zip(
+                &tree.path,
+                &[(
+                    "chronicle/20260311/120000_60/audio.flac",
+                    b"synthetic audio",
+                )],
+            );
+            if deleted {
+                let retired = target.join("chronicle/20260311/.removing_120000_60");
+                inject_before_publish(Some(Box::new(move || {
+                    fs::create_dir_all(&retired).unwrap();
+                    fs::write(retired.join("tombstone.json"), b"{}").unwrap();
+                })));
+            }
+            let result = merge_journal_archive(&archive, &target, &merge_options(&tree), None);
+            let segment = target.join("chronicle/20260311/120000_60");
+            if deleted {
+                assert!(result.is_err());
+                assert!(!segment.exists());
+                assert!(
+                    target
+                        .join("chronicle/20260311/.removing_120000_60/tombstone.json")
+                        .exists()
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    fs::read(segment.join("audio.flac")).unwrap(),
+                    b"synthetic audio"
+                );
+                assert!(segment.join("audio.jsonl.lock").is_file());
+                let claims = solstone_core_segment::output_attempt::OutputClaims::discover(
+                    &segment,
+                    LockOptions::default(),
+                )
+                .unwrap();
+                assert!(claims.commit(&segment).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "full-tests")]
+    fn raw_archive_undo_releases_trust_locks_after_owned_files_are_restored() {
+        for replaced in [false, true] {
+            let _reset = FaultReset;
+            let tree = PlanTree::new();
+            let target = tree.path.join("target");
+            fs::create_dir(&target).unwrap();
+            let archive = write_zip(
+                &tree.path,
+                &[
+                    (
+                        "chronicle/20260311/120000_60/audio.flac",
+                        b"synthetic audio",
+                    ),
+                    (
+                        "entities/new-person/entity.json",
+                        br#"{"id":"new-person","name":"Qxjvplmzt","type":"Person"}"#,
+                    ),
+                ],
+            );
+            let root = target.clone();
+            let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = reached.clone();
+            BEFORE_RAW_UNDO.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move || {
+                    assert!(!root.join("entities/new-person/entity.json").exists());
+                    for lock in ["health/locks/entity-trust", "health/locks/facet-trust"] {
+                        let _guard = hold_lock(
+                            root.join(lock),
+                            LockOptions {
+                                timeout: Duration::ZERO,
+                                ..LockOptions::default()
+                            },
+                        )
+                        .expect("trust lock must be released before raw attempt acquisition");
+                    }
+                    if replaced {
+                        let segment = root.join("chronicle/20260311/120000_60");
+                        fs::rename(&segment, root.join("previous")).unwrap();
+                        fs::create_dir(&segment).unwrap();
+                        fs::write(segment.join("owner.txt"), b"keep").unwrap();
+                    }
+                    seen.set(true);
+                }));
+            });
+            inject_publish_fail_after(Some(2));
+            let error =
+                merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap_err();
+            assert!(reached.get());
+            let segment = target.join("chronicle/20260311/120000_60");
+            if replaced {
+                assert_eq!(fs::read(segment.join("owner.txt")).unwrap(), b"keep");
+                assert!(error.to_string().contains("undo incomplete"));
+            } else {
+                assert!(!segment.exists());
+            }
+        }
     }
 
     #[test]

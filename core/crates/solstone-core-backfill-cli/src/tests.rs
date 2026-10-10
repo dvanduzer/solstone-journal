@@ -972,3 +972,60 @@ fn marker_failure_is_terminal_after_retaining_the_rewritten_sidecar() {
     let header: Value = serde_json::from_str(&first_row).expect("header json");
     assert!(header.get("_solstone_processing").is_some());
 }
+
+#[test]
+fn commit_reclassifies_raw_choice_size_markers_stream_and_owner_deletion() {
+    for mutation in [
+        "unchanged",
+        "size",
+        "choice",
+        "marker",
+        "import",
+        "deleted",
+        "parent",
+    ] {
+        let fixture = setup_fixture();
+        let mut sink = Cursor::new(Vec::new());
+        let report = plan(fixture.journal(), Some(&fixture.day), instant(), &mut sink).unwrap();
+        let item = report
+            .eligible
+            .iter()
+            .find(|item| item.path == fixture.screen)
+            .unwrap();
+        let before = fs::read(&item.path).unwrap();
+        let segment = item.path.parent().unwrap();
+        let moved = segment.with_file_name("moved-before-backfill");
+        match mutation {
+            "size" => fs::write(&item.raw_path, b"different size").unwrap(),
+            "choice" => {
+                let alternate = item.raw_path.with_extension("mov");
+                fs::write(alternate, b"second raw").unwrap();
+            }
+            "marker" => fs::write(segment.join(".analyzing_screen"), b"").unwrap(),
+            "import" => fs::write(
+                segment.join("stream.json"),
+                json!({"stream":"import.test"}).to_string(),
+            )
+            .unwrap(),
+            "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
+            "parent" => {
+                fs::rename(segment, &moved).unwrap();
+                fs::create_dir(segment).unwrap();
+                fs::write(&item.path, &before).unwrap();
+                fs::write(&item.raw_path, vec![0; item.input_size as usize]).unwrap();
+            }
+            _ => (),
+        }
+        let result = crate::commit::commit(fixture.journal(), item, &AtomicWriter);
+        if mutation == "unchanged" {
+            result.unwrap();
+            let header =
+                solstone_core_processing_record::read_processing_record_header(&item.path).unwrap();
+            assert_eq!(header["source"], "backfill");
+            assert_eq!(header["input_size"], item.input_size);
+        } else {
+            assert!(result.is_err(), "{mutation}");
+            assert_eq!(fs::read(&item.path).unwrap(), before, "{mutation}");
+        }
+    }
+}

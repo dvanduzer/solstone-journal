@@ -2782,7 +2782,7 @@ fn run_speaker_transcript_write() -> ExitCode {
         );
         return ExitCode::from(EXIT_USAGE);
     }
-    match solstone_core_speaker_id::writer::write_request(&input) {
+    match solstone_core_transcribe::publish_transcript_request(&input) {
         Ok(response) => {
             let output = json!({
                 "schema": solstone_core_speaker_id::writer::RESPONSE_SCHEMA,

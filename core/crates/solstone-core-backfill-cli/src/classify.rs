@@ -132,12 +132,26 @@ const AUDIO: Modality = Modality {
     reason: REASON_NO_DECODABLE_AUDIO,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Eligible {
     pub(crate) day: String,
     pub(crate) path: PathBuf,
     pub(crate) original: Vec<u8>,
     pub(crate) replacement: Vec<u8>,
+    pub(crate) segment_stream: String,
+    pub(crate) raw_path: PathBuf,
+    pub(crate) input_size: u64,
+    pub(crate) instant: DateTime<Utc>,
+    pub(crate) parent_binding: std::sync::Arc<solstone_core_journal_io::JournalRoot>,
+}
+
+impl std::fmt::Debug for Eligible {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Eligible")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -257,10 +271,9 @@ fn report_non_directory_day_entries(day_path: &Path, stderr: &mut dyn Write) {
     let Ok(entries) = list_dir_entries(day_path) else {
         return;
     };
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.kind == DirEntryKind::File)
-    {
+    for entry in entries.iter().filter(|entry| {
+        entry.kind == DirEntryKind::File && !entry.name.to_string_lossy().ends_with(".lock")
+    }) {
         let _ = writeln!(
             stderr,
             "Could not list stream directory {}: not a directory",
@@ -347,6 +360,14 @@ pub(crate) fn classify(
         path: candidate.path.clone(),
         original,
         replacement,
+        segment_stream: segment_stream.to_owned(),
+        raw_path: sibling.path.clone(),
+        input_size,
+        instant,
+        parent_binding: std::sync::Arc::new(
+            solstone_core_journal_io::JournalRoot::open(segment_path)
+                .map_err(|_| Outcome::SkipUnreadable)?,
+        ),
     })
 }
 

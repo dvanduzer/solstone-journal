@@ -1144,3 +1144,56 @@ fn synthetic_decode_double_schema_failure_latches_first_error_and_suppresses_sec
         "error must suppress second category's error details: {error}"
     );
 }
+
+#[test]
+fn writer_commit_admits_unchanged_success_and_empty_but_refuses_stale_or_deleted_input() {
+    use solstone_core_journal_io::{LockOptions, hold_lock};
+    for frames in [vec![], vec![1]] {
+        for mutation in ["unchanged", "bytes", "deleted", "missing", "replaced"] {
+            let run = TestRun::new("writer-commit");
+            let factory = ScriptedFactory::new(default_response);
+            let result = super::run_with_decoder(run.options(false, Vec::new()), &factory, || {
+                let options = LockOptions {
+                    timeout: Duration::ZERO,
+                    ..LockOptions::default()
+                };
+                // The whole attempt excludes another writer; inference/decode
+                // does not retain the short segment mutation lock.
+                assert!(hold_lock(run.artifact(), options).is_err());
+                assert!(hold_lock(&run.root, options).is_ok());
+                match mutation {
+                    "bytes" => {
+                        let mut bytes = fs::read(&run.video).unwrap();
+                        bytes[0] ^= 1;
+                        fs::write(&run.video, bytes).unwrap();
+                    }
+                    "deleted" => fs::write(run.root.join("tombstone.json"), b"{}").unwrap(),
+                    "missing" => fs::remove_file(&run.video).unwrap(),
+                    "replaced" => {
+                        let bytes = fs::read(&run.video).unwrap();
+                        fs::remove_file(&run.video).unwrap();
+                        fs::write(&run.video, bytes).unwrap();
+                    }
+                    _ => (),
+                }
+                decoded(&frames)
+            });
+            if mutation == "unchanged" {
+                result.unwrap();
+                let rows = run.rows();
+                assert_eq!(rows[0]["_solstone_processing"]["handler"], "describe");
+                assert_eq!(
+                    rows[0]["_solstone_processing"]["state"],
+                    if frames.is_empty() {
+                        "empty"
+                    } else {
+                        "analyzed"
+                    }
+                );
+            } else {
+                assert!(result.is_err(), "{mutation}");
+                assert!(!run.artifact().exists(), "{mutation}");
+            }
+        }
+    }
+}

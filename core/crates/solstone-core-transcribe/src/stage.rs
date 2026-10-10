@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use solstone_core_journal_config::JournalConfigRead;
-use solstone_core_journal_io::{LockOptions, hold_lock};
+use solstone_core_journal_io::LockOptions;
 use solstone_core_observe_audio::{AudioError, SAMPLE_RATE, audio_to_wav_bytes, decode_f32_mono};
 use solstone_core_processing_record::{read_processing_record_header, record_attempts};
+use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
 use solstone_core_speaker_id::writer::WriteResponse;
 use solstone_core_spp_ratls::AttestationStateStore;
 
@@ -84,6 +85,30 @@ pub(crate) enum ProcessOutcome {
     Failed,
 }
 
+fn commit_input<'a>(
+    input: &InputObservation,
+    claims: &'a OutputClaims,
+    raw: &Path,
+) -> Result<solstone_core_segment::output_attempt::SegmentCommit<'a>, TranscribeError> {
+    #[cfg(all(test, feature = "full-tests"))]
+    BEFORE_PROCESSING_COMMIT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    input
+        .commit(claims)
+        .map_err(|error| TranscribeError::ProcessingClaim {
+            path: raw.to_path_buf(),
+            detail: error.to_string(),
+        })
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+thread_local! {
+    static BEFORE_PROCESSING_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Run the currently implemented native transcription path for one segment audio file.
 pub(crate) fn process_one(
     audio_path: &Path,
@@ -103,8 +128,8 @@ pub(crate) fn process_one(
     // This kernel lock is released on process death; the sidecar is never removed.
     // Allow an ordinary Sense transcription's 45-minute execution budget to finish.
     let output = audio_path.with_extension("jsonl");
-    let _claim = hold_lock(
-        &output,
+    let claim = OutputClaims::acquire(
+        [output],
         LockOptions {
             timeout: Duration::from_secs(45 * 60),
             ..LockOptions::default()
@@ -118,7 +143,16 @@ pub(crate) fn process_one(
         return Ok(ProcessOutcome::Skipped);
     }
     let started = Instant::now();
-    let facts = capture_input_facts(audio_path)?;
+    let observation = InputObservation::capture(&claim, audio_path).map_err(|error| {
+        TranscribeError::ProcessingClaim {
+            path: audio_path.to_path_buf(),
+            detail: error.to_string(),
+        }
+    })?;
+    let facts = InputFacts {
+        path: audio_path.to_path_buf(),
+        input_size: observation.input_size(),
+    };
     let mut timings = Timings::default();
     if let Some(queue_wait_ms) = queue_wait_ms() {
         timings.add_ms("queue_wait", queue_wait_ms);
@@ -132,7 +166,9 @@ pub(crate) fn process_one(
                 detail: error.to_string(),
             };
             let write_at = Instant::now();
+            let commit = commit_input(&observation, &claim, audio_path)?;
             let terminal = decode_failure(&facts, redo, &error)?;
+            drop(commit);
             timings.add_ms("write", elapsed_ms(write_at));
             emit_event(
                 audio_path,
@@ -170,7 +206,9 @@ pub(crate) fn process_one(
 
     if !vad.has_speech {
         let write_at = Instant::now();
+        let commit = commit_input(&observation, &claim, audio_path)?;
         let terminal = vad_no_speech(&facts, redo, sound_tags.as_ref(), sound_tag_status.as_ref())?;
+        drop(commit);
         timings.add_ms("write", elapsed_ms(write_at));
         let outcome = match terminal {
             TerminalOutcome::Preserved => {
@@ -321,8 +359,10 @@ pub(crate) fn process_one(
 
     if transcription.words.is_empty() {
         let write_at = Instant::now();
+        let commit = commit_input(&observation, &claim, audio_path)?;
         let terminal =
             stt_zero_statements(&facts, redo, sound_tags.as_ref(), sound_tag_status.as_ref())?;
+        drop(commit);
         timings.add_ms("write", elapsed_ms(write_at));
         let outcome = match terminal {
             TerminalOutcome::Preserved => {
@@ -394,6 +434,7 @@ pub(crate) fn process_one(
     let (jsonl_path, npz_path) = transcript_paths(audio_path);
     let processing = analyzed_record(facts.input_size);
     let write_at = Instant::now();
+    let commit = commit_input(&observation, &claim, audio_path)?;
     write_full_transcript(FullTranscriptWrite {
         raw_path: audio_path,
         jsonl_path: &jsonl_path,
@@ -417,6 +458,7 @@ pub(crate) fn process_one(
         speaker_analysis_producer: Some(SPEAKER_ANALYSIS_PRODUCER),
         redo,
     })?;
+    drop(commit);
     timings.add_ms("write", elapsed_ms(write_at));
     emit_event(
         audio_path,
@@ -900,6 +942,7 @@ mod tests {
     use crate::event::Timings;
     use crate::terminal::TerminalWriteFailure;
 
+    #[cfg(feature = "full-tests")]
     #[test]
     fn overlapping_transcription_waits_then_rechecks_the_published_result() {
         use solstone_core_journal_io::{LockOptions, hold_lock};
@@ -957,6 +1000,138 @@ mod tests {
         );
         worker.join().unwrap();
         assert_eq!(fs::read(output).unwrap(), published);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn writer_commit_guards_success_empty_and_failure_publications() {
+        use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
+        for state in ["analyzed", "empty", "failed"] {
+            for mutation in ["unchanged", "bytes", "deleted", "missing", "replaced"] {
+                let dir = tempfile::tempdir().unwrap();
+                let facts = input(dir.path());
+                let (jsonl, npz) = transcript_paths(&facts.path);
+                let claims = OutputClaims::acquire([jsonl.clone()], Default::default()).unwrap();
+                let observed = InputObservation::capture(&claims, &facts.path).unwrap();
+                match mutation {
+                    "bytes" => fs::write(&facts.path, b"OWNER-MEDIA").unwrap(),
+                    "deleted" => fs::write(dir.path().join("tombstone.json"), b"{}").unwrap(),
+                    "missing" => fs::remove_file(&facts.path).unwrap(),
+                    "replaced" => {
+                        fs::remove_file(&facts.path).unwrap();
+                        fs::write(&facts.path, b"owner-media").unwrap();
+                    }
+                    _ => (),
+                }
+                let commit = super::commit_input(&observed, &claims, &facts.path);
+                if mutation != "unchanged" {
+                    assert!(commit.is_err(), "{state}/{mutation}");
+                    assert!(!jsonl.exists());
+                    continue;
+                }
+                let _commit = commit.unwrap();
+                match state {
+                    "empty" => {
+                        vad_no_speech(&facts, false, None, None).unwrap();
+                    }
+                    "failed" => {
+                        decode_failure(
+                            &facts,
+                            false,
+                            &AudioError::CorruptInput {
+                                path: facts.path.clone(),
+                                detail: "synthetic corrupt input".into(),
+                                errno: None,
+                            },
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        let result = crate::speakers::SpeakerAnalyzeResult {
+                            statements: vec![
+                                json!({"id": 1, "start": 0.0, "end": 1.0, "text": "synthetic words"})
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                            ],
+                            embedding_payload: None,
+                            speaker_evidence: "none".into(),
+                            speaker_evidence_multi_fraction: 0.0,
+                            overlap_fraction: 0.0,
+                            statement_labels: None,
+                        };
+                        let processing = crate::processing::analyzed_record(facts.input_size);
+                        super::write_full_transcript(super::FullTranscriptWrite {
+                            raw_path: &facts.path,
+                            jsonl_path: &jsonl,
+                            npz_path: &npz,
+                            base_time_us_of_day: 0,
+                            source: None,
+                            speaker_result: &result,
+                            backend: Some("parakeet-cpp"),
+                            model: Some("parakeet"),
+                            device: Some("cpu"),
+                            compute_type: None,
+                            observer: None,
+                            vad_result: None,
+                            segment_meta: None,
+                            overlap_detector: None,
+                            speaker_evidence_version: "windowed-slots-v1",
+                            processing: &processing,
+                            sound_tags: None,
+                            sound_tag_status: None,
+                            speaker_analysis_producer: None,
+                            redo: false,
+                        })
+                        .unwrap();
+                    }
+                }
+                let header =
+                    solstone_core_processing_record::read_processing_record_header(&jsonl).unwrap();
+                assert_eq!(header["handler"], "transcribe");
+                assert_eq!(header["state"], state);
+                assert_eq!(header["input_size"], facts.input_size);
+            }
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn actual_decode_failure_refuses_input_changed_after_admission() {
+        for mutation in ["unchanged", "bytes", "deleted"] {
+            let dir = tempfile::tempdir().unwrap();
+            let raw = dir.path().join("audio.wav");
+            fs::write(&raw, b"corrupt audio").unwrap();
+            let hook_path = raw.clone();
+            super::BEFORE_PROCESSING_COMMIT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || match mutation {
+                    "bytes" => fs::write(&hook_path, b"changed audio").unwrap(),
+                    "deleted" => {
+                        fs::write(hook_path.parent().unwrap().join("tombstone.json"), b"{}")
+                            .unwrap()
+                    }
+                    _ => (),
+                }))
+            });
+            let config = solstone_core_journal_config::read_journal_config(dir.path()).unwrap();
+            let result = super::process_one(
+                &raw,
+                dir.path(),
+                false,
+                None,
+                &config,
+                &solstone_core_spp_ratls::AttestationStateStore::new(),
+                #[cfg(windows)]
+                &solstone_core_system::process::ChildLaunchContext::default(),
+            );
+            if mutation == "unchanged" {
+                assert_eq!(result.unwrap(), super::ProcessOutcome::Failed);
+                assert!(raw.with_extension("jsonl").exists());
+            } else {
+                assert!(result.is_err());
+                assert!(!raw.with_extension("jsonl").exists());
+            }
+        }
     }
 
     fn input(directory: &Path) -> InputFacts {

@@ -36,6 +36,17 @@ pub fn write_content(
 ) -> Result<ContentWriteOutcome, SegmentError> {
     let path = segment.path.join(name.as_str());
     let incoming = descriptor(name.clone(), bytes);
+    let coordination = |source| SegmentError::Io {
+        path: path.clone(),
+        source,
+    };
+    crate::output_attempt::prepare_segment(segment.path()).map_err(coordination)?;
+    let claims = crate::output_attempt::OutputClaims::acquire(
+        [path.with_extension("jsonl")],
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(coordination)?;
+    let _commit = claims.commit(segment.path()).map_err(coordination)?;
     match write_bytes_exclusive(&path, bytes, AtomicWriteOptions::default()) {
         Ok(()) => Ok(ContentWriteOutcome::Written(incoming)),
         Err(AtomicWriteError::Io { source, .. })
@@ -105,6 +116,66 @@ mod tests {
         let outcome = write_content(&segment, name.clone(), b"same").unwrap();
         assert!(matches!(outcome, ContentWriteOutcome::AlreadyHeld(_)));
         assert_eq!(fs::read(segment.path.join(name.as_str())).unwrap(), b"same");
+    }
+
+    #[test]
+    fn owner_deleted_content_is_not_recreated() {
+        let temporary = TempDir::new();
+        let segment = segment(temporary.path());
+        crate::output_attempt::prepare_segment(segment.path()).unwrap();
+        fs::write(segment.path().join("tombstone.json"), b"{}").unwrap();
+        assert!(write_content(&segment, ContentName::new("audio.flac").unwrap(), b"raw").is_err());
+        assert!(!segment.path().join("audio.flac").exists());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn raw_content_waits_for_the_same_stem_attempt_without_retaining_segment_exclusion() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let temporary = TempDir::new();
+        let segment = segment(temporary.path());
+        crate::output_attempt::prepare_segment(segment.path()).unwrap();
+        let claim = crate::output_attempt::OutputClaims::acquire(
+            [segment.path().join("audio.jsonl")],
+            Default::default(),
+        )
+        .unwrap();
+        let directory = segment.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(write_content(
+                    &segment,
+                    ContentName::new("audio.flac").unwrap(),
+                    b"raw",
+                ))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(
+            solstone_core_journal_io::hold_lock(
+                &directory,
+                solstone_core_journal_io::LockOptions {
+                    timeout: Duration::ZERO,
+                    ..Default::default()
+                }
+            )
+            .is_ok()
+        );
+        drop(claim);
+        assert!(matches!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            ContentWriteOutcome::Written(_)
+        ));
+        worker.join().unwrap();
+        assert_eq!(fs::read(directory.join("audio.flac")).unwrap(), b"raw");
     }
 
     #[cfg(unix)]

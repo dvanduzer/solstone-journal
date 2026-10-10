@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use solstone_core_journal_io::{append_jsonl, paths::SegmentLayout};
+use solstone_core_retention::archive_proof::{
+    AcceptedProcessingObservation, ArchiveFileProof, OffloadProof,
+};
+use solstone_core_retention::receipt::Target;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +87,8 @@ pub struct ArchiveWitness {
     pub journal_id: Option<String>,
     pub layout: Option<SegmentLayout>,
     pub segment_dir: Option<String>,
+    /// Accepted historical observation, never current release authority.
+    pub processing: Option<AcceptedProcessingObservation>,
     pub file: OffloadFile,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,15 +144,6 @@ pub enum RestoreDisposition {
     Unverified,
     Unattempted,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArchiveFileV2 {
-    pub witness_id: String,
-    pub name: String,
-    pub bytes: u64,
-    pub sha256: String,
-    pub archive_path: String,
-}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreFileV2 {
@@ -192,7 +189,7 @@ enum Event {
         manifest_id: String,
         repository_id: String,
         snapshot_id: String,
-        files: Vec<ArchiveFileV2>,
+        files: Vec<ArchiveFileProof>,
     },
     #[serde(rename = "offload_restore_v2")]
     RestoreV2 {
@@ -382,6 +379,7 @@ fn fold_lines(day: &str, bytes: &[u8]) -> DayCatalog {
                         journal_id: None,
                         layout: None,
                         segment_dir: None,
+                        processing: None,
                         file,
                     })
                     .collect();
@@ -400,37 +398,43 @@ fn fold_lines(day: &str, bytes: &[u8]) -> DayCatalog {
                 ..
             } => {
                 let _ = time;
+                let proof = OffloadProof {
+                    journal_id,
+                    manifest_id,
+                    target: Target {
+                        day: day.into(),
+                        stream: fold.catalog.stream.clone(),
+                        dir: segment_dir,
+                    },
+                    layout,
+                    repository_id,
+                    snapshot_id,
+                    files,
+                };
                 if schema_version != 2
-                    || manifest_id.is_empty()
-                    || manifest_id.starts_with("v1:")
-                    || manifests.contains(&manifest_id)
-                    || repository_id.is_empty()
-                    || journal_id.is_empty()
-                    || !digest(&snapshot_id)
-                    || !component(&segment_dir)
-                    || files.is_empty()
-                    || (layout == SegmentLayout::Direct && fold.catalog.stream != "_default")
-                    || files.iter().any(|f| {
-                        f.witness_id.is_empty()
-                            || f.witness_id.starts_with("v1:")
+                    || proof.manifest_id.starts_with("v1:")
+                    || manifests.contains(&proof.manifest_id)
+                    || !component(&proof.target.dir)
+                    // Keep names representable by the catalog's restore decoder.
+                    || proof.files.iter().any(|f| {
+                        f.witness_id.starts_with("v1:")
                             || witnesses.contains(&f.witness_id)
                             || !component(&f.name)
-                            || !digest(&f.sha256)
-                            || !f.archive_path.starts_with('/')
-                            || f.archive_path.contains(['\\', '\0'])
-                            || f.archive_path.split('/').any(|p| matches!(p, "." | ".."))
                     })
-                    || files.iter().map(|f| &f.name).collect::<BTreeSet<_>>().len() != files.len()
-                    || files
-                        .iter()
-                        .map(|f| &f.witness_id)
-                        .collect::<BTreeSet<_>>()
-                        .len()
-                        != files.len()
+                    || proof.validate().is_err()
                 {
                     skipped += 1;
                     continue;
                 }
+                let OffloadProof {
+                    journal_id,
+                    manifest_id,
+                    target,
+                    layout,
+                    repository_id,
+                    snapshot_id,
+                    files,
+                } = proof;
                 let files = files
                     .into_iter()
                     .map(|f| ArchiveWitness {
@@ -440,8 +444,9 @@ fn fold_lines(day: &str, bytes: &[u8]) -> DayCatalog {
                         repository_id: Some(repository_id.clone()),
                         journal_id: Some(journal_id.clone()),
                         layout: Some(layout),
-                        segment_dir: Some(segment_dir.clone()),
+                        segment_dir: Some(target.dir.clone()),
                         archive_path: Some(f.archive_path),
+                        processing: Some(f.processing),
                         file: OffloadFile {
                             name: f.name,
                             bytes: f.bytes,
@@ -760,9 +765,10 @@ mod catalog_tests {
     }
     fn archive_v2(id: &str, name: &str) -> Value {
         json!({"event_kind":"offload_archive_v2", "schema_version":2, "time":2, "day":"20260101", "stream":"_default", "segment":"010000_001",
-            "segment_dir":"010000_001_full", "layout":"direct", "journal_id":"journal", "repository_id":"repo",
+            "segment_dir":"010000_001_full", "layout":"direct", "journal_id":"journal", "repository_id":"c".repeat(64),
             "snapshot_id":"b".repeat(64), "manifest_id":id,
-            "files":[{"witness_id":format!("w-{id}"), "name":name, "bytes":7, "sha256":"a".repeat(64), "archive_path":format!("/stage/{name}")}]})
+            "files":[{"witness_id":format!("w-{id}"), "name":name, "bytes":7, "sha256":"a".repeat(64), "archive_path":format!("/stage/{name}"),
+                "processing":{"record":null,"has_analysis_row":true}}]})
     }
     fn folded(records: &[Value]) -> DayCatalog {
         let lines = records.iter().map(|r| format!("{r}\n")).collect::<String>();
@@ -799,6 +805,106 @@ mod catalog_tests {
         );
         value["files"][0]["unknown_effect"] = json!(true);
         assert!(serde_json::from_value::<RestoreOperation>(value).is_err());
+    }
+    fn processing_record(state: &str, bytes: u64) -> Value {
+        json!({"schema":"solstone.processing.v1", "handler":"transcribe", "state":state,
+            "input_size":bytes, "reason_code":if state == "analyzed" { "ok" } else { "no_decodable_audio" },
+            "attempted_at":"2026-01-01T00:00:00Z", "source":"backfill",
+            "extra":{"preserved":[null,true,"detail"]}})
+    }
+    #[test]
+    fn accepted_processing_observations_remain_lossless_historical_evidence() {
+        for (record, has_analysis_row) in [
+            (Value::Null, true),
+            (processing_record("empty", 7), false),
+            (processing_record("analyzed", 7), true),
+        ] {
+            let mut event = archive_v2("accepted", "audio.flac");
+            let processing = json!({"record":record,"has_analysis_row":has_analysis_row});
+            event["files"][0]["processing"] = processing.clone();
+            let day = folded(&[event]);
+            assert!(!day.degraded());
+            let segment = &day.segments[0];
+            let witness = &segment.active[0];
+            assert_eq!(segment.history[0].files[0], *witness);
+            assert_eq!(
+                serde_json::to_value(&witness.processing).unwrap(),
+                processing
+            );
+            assert_eq!(
+                serde_json::from_value::<ArchiveWitness>(serde_json::to_value(witness).unwrap())
+                    .unwrap(),
+                *witness
+            );
+        }
+        let legacy = folded(&[archive("legacy", &["audio.flac"])]);
+        assert!(legacy.segments[0].active[0].processing.is_none());
+    }
+    #[test]
+    fn invalid_processing_or_binding_retains_preceding_generation() {
+        let preceding = archive_v2("previous", "audio.flac");
+        let valid = archive_v2("later", "audio.flac");
+        let mut cases = Vec::new();
+        let mut missing = valid.clone();
+        missing["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("processing");
+        cases.push(missing);
+        for observation in [
+            json!({"record":null,"has_analysis_row":true,"unknown":true}),
+            json!({"record":null,"has_analysis_row":"true"}),
+            json!({"record":null,"has_analysis_row":false}),
+            json!({"record":processing_record("analyzed",7),"has_analysis_row":false}),
+            json!({"record":processing_record("empty",8),"has_analysis_row":true}),
+        ] {
+            let mut event = valid.clone();
+            event["files"][0]["processing"] = observation;
+            cases.push(event);
+        }
+        for repository in ["repo", "A".repeat(64).as_str()] {
+            let mut event = valid.clone();
+            event["repository_id"] = json!(repository);
+            cases.push(event);
+        }
+        for path in [
+            "/stage/other.flac",
+            "/stage//audio.flac",
+            "/stage/../audio.flac",
+        ] {
+            let mut event = valid.clone();
+            event["files"][0]["archive_path"] = json!(path);
+            cases.push(event);
+        }
+        let mut overflow = valid.clone();
+        overflow["files"][0]["bytes"] = json!(u64::MAX);
+        let mut second = overflow["files"][0].clone();
+        second["name"] = json!("z.flac");
+        second["witness_id"] = json!("second");
+        second["archive_path"] = json!("/stage/z.flac");
+        overflow["files"].as_array_mut().unwrap().push(second);
+        cases.push(overflow);
+        for invalid in cases {
+            let day = folded(&[preceding.clone(), invalid]);
+            assert_eq!(day.skipped_records, 1);
+            assert!(day.degraded());
+            assert_eq!(day.segments[0].history.len(), 1);
+            assert_eq!(day.segments[0].active[0].witness_id, "w-previous");
+        }
+    }
+    #[test]
+    fn archive_names_remain_representable_by_exact_restore_events() {
+        assert!(folded(&[archive_v2("colon", "audio:part.flac")]).degraded());
+        for disposition in ["published", "already_present"] {
+            let restore = json!({"event_kind":"offload_restore_v2", "schema_version":2,
+                "time":3, "day":"20260101", "stream":"_default", "segment":"010000_001",
+                "operation_id":"restore", "files":[{"witness_id":"w-valid",
+                    "name":"audio.flac", "disposition":disposition}]});
+            let day = folded(&[archive_v2("valid", "audio.flac"), restore]);
+            assert!(!day.degraded());
+            assert!(day.segments[0].active.is_empty());
+            assert_eq!(day.segments[0].history.len(), 1);
+        }
     }
     #[test]
     fn disjoint_generations_survive_legacy_restore_of_last_manifest() {
