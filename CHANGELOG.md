@@ -21,7 +21,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- the backup page now counts all original media on this device, including files proposed for removal. when a media total can't be checked completely, it shows the amount counted so far separately.
+- the backup page and the backup offload status command now count all original media on this device, including files proposed for removal. when a media total can't be checked completely, they show the amount counted so far separately.
 - when a backup action fails, the backup page now shows any guidance the tool gave on what to do next.
 - your journal no longer saves a transcript or description after the media has changed or its segment has been deleted.
 - the health page now shows which source on a device had uploads turned away, even when another source is still adding material. after a successful check, if device status can't be checked again, it keeps that last result and shows when it was checked.
