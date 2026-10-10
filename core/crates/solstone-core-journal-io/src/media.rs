@@ -253,6 +253,12 @@ pub struct MediaStage {
     directory: Option<Arc<MediaDirectory>>,
     leaf: Option<Leaf>,
     removed: bool,
+    #[cfg(windows)]
+    published: bool,
+    #[cfg(windows)]
+    payload_delete_pending: bool,
+    #[cfg(windows)]
+    directory_delete_pending: bool,
 }
 
 impl MediaStage {
@@ -270,20 +276,34 @@ impl MediaStage {
             });
         }
         let name = OsString::from(format!(".tmp-offload-{:032x}", u128::from_le_bytes(random)));
-        if let Err(error) = platform::create_directory(&parent.inner, &name) {
-            return Err(OwnedMediaFailure { error, owned: None });
-        }
         let mut stage = Self {
             parent,
             name,
             directory: None,
             leaf: None,
             removed: false,
+            #[cfg(windows)]
+            published: false,
+            #[cfg(windows)]
+            payload_delete_pending: false,
+            #[cfg(windows)]
+            directory_delete_pending: false,
         };
-        match stage.parent.inner.open_child(&stage.name) {
+        match platform::create_directory(&stage.parent.inner, &stage.name) {
             Ok(inner) => {
                 stage.directory = Some(Arc::new(MediaDirectory { inner }));
-                Ok(stage)
+                match stage
+                    .directory
+                    .as_ref()
+                    .expect("retained stage")
+                    .revalidate()
+                {
+                    Ok(()) => Ok(stage),
+                    Err(error) => Err(OwnedMediaFailure {
+                        error,
+                        owned: Some(stage),
+                    }),
+                }
             }
             Err(error) => Err(OwnedMediaFailure {
                 error,
@@ -346,6 +366,7 @@ impl MediaStage {
         }
     }
 
+    #[cfg(unix)]
     fn cleanup_exact(&mut self) -> io::Result<()> {
         if self.removed {
             return Ok(());
@@ -364,6 +385,46 @@ impl MediaStage {
         step(MediaPrimitive::StageRemove)?;
         directory.revalidate()?;
         platform::remove_directory(&self.parent.inner, &self.name, &directory.inner)?;
+        self.removed = true;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn cleanup_exact(&mut self) -> io::Result<()> {
+        if self.removed {
+            return Ok(());
+        }
+        self.parent.revalidate()?;
+        if self.directory_delete_pending {
+            platform::ensure_absent(&self.parent.inner, &self.name)?;
+            self.removed = true;
+            return Ok(());
+        }
+        let directory = self.directory.as_ref().ok_or_else(changed)?;
+        directory.revalidate()?;
+        // A successful rename made this handle live destination content. Keep
+        // it retained; cleanup must never set its delete disposition.
+        if !self.published {
+            if let Some(leaf) = &self.leaf {
+                let identity = leaf.identity.ok_or_else(changed)?;
+                platform::check_leaf(&directory.inner, OsStr::new("payload"), identity)?;
+                step(MediaPrimitive::StageUnlink)?;
+                platform::check_leaf(&directory.inner, OsStr::new("payload"), identity)?;
+                platform::mark_delete(&leaf.file)?;
+                self.payload_delete_pending = true;
+                self.leaf = None; // Close our owned handle before confirming absence.
+            }
+            if self.payload_delete_pending {
+                platform::ensure_absent(&directory.inner, OsStr::new("payload"))?;
+                self.payload_delete_pending = false;
+            }
+        }
+        step(MediaPrimitive::StageRemove)?;
+        directory.revalidate()?;
+        platform::mark_delete(directory.inner.file())?;
+        self.directory_delete_pending = true;
+        self.directory = None; // Delete-pending acceptance alone is not completion.
+        platform::ensure_absent(&self.parent.inner, &self.name)?;
         self.removed = true;
         Ok(())
     }
@@ -454,7 +515,7 @@ impl OwnedMediaTarget {
             plain_name(name)?;
             self.revalidate()?;
             source.revalidate()?;
-            let mut input = platform::open_plain(&source.inner, name)?
+            let mut input = platform::open_source(&source.inner, name)?
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             let identity = platform::identity(&input)?;
             let before = platform::stamp(&input)?;
@@ -632,6 +693,10 @@ impl PreparedMedia {
                 name,
             ) {
                 Ok(()) => {
+                    #[cfg(windows)]
+                    {
+                        self.target.stage.published = true;
+                    }
                     receipt.effect = PublicationEffect::Published;
                     receipt.identity = Some(self.identity());
                 }

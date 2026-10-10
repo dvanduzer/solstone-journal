@@ -35,6 +35,7 @@ const DOOR: &str = "door";
 
 const SOURCES: &[(&str, &str)] = &[
     ("age", include_str!("../src/age.rs")),
+    ("archive_proof", include_str!("../src/archive_proof.rs")),
     ("class", include_str!("../src/class.rs")),
     ("content", include_str!("../src/content.rs")),
     ("door", include_str!("../src/door.rs")),
@@ -42,6 +43,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("layout", include_str!("../src/layout.rs")),
     ("logs", include_str!("../src/logs.rs")),
     ("marks", include_str!("../src/marks.rs")),
+    ("mark_mutation", include_str!("../src/mark_mutation.rs")),
     ("notify", include_str!("../src/notify.rs")),
     ("oplog_retention", include_str!("../src/oplog_retention.rs")),
     (
@@ -51,6 +53,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("policy", include_str!("../src/policy.rs")),
     ("receipt", include_str!("../src/receipt.rs")),
     ("remove_marked", include_str!("../src/remove_marked.rs")),
+    ("review_context", include_str!("../src/review_context.rs")),
     ("scan", include_str!("../src/scan.rs")),
     ("staging", include_str!("../src/staging.rs")),
     ("summary", include_str!("../src/summary.rs")),
