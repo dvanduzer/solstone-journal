@@ -39,6 +39,7 @@ pub mod lease;
 pub mod legacy_log_alias;
 #[cfg(any(unix, windows))]
 pub mod locking;
+pub mod media;
 pub mod name_admission;
 pub mod observation;
 #[cfg(any(unix, windows))]
