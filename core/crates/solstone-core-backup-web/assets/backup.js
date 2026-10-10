@@ -166,7 +166,7 @@
     "offload": {
       "title": "media offload",
       "stakes": "after this, your backup holds the only copy of your older days. if you lose your recovery key, no one can recover them. not even sol pbc.",
-      "stalled_lead": "offload is paused: your backup isn't working. nothing has been deleted.",
+      "stalled_lead": "offload couldn't finish.",
       "backup_only_label": "kept only in backup",
       "restore_expectation": "restoring {size} from your backup. a large restore can take a while.",
       "disable_note": "this stops. days already in your backup stay there, protected and restorable.",
@@ -187,11 +187,22 @@
         "last_offload": "last offload",
         "last_verify": "last verification",
         "last_restore": "last restore",
+        "last_completed": "last completed",
         "days": "offloaded days",
         "mb_suffix": "MiB",
         "under_1mb": "under 1 MiB",
         "gb_suffix": "GiB"
       },
+      "result_labels": {
+        "ok": "completed",
+        "skipped": "didn't run",
+        "stalled": "couldn't finish",
+        "partial": "partly completed",
+        "error": "failed",
+        "unknown": "result unavailable"
+      },
+      "reason_unavailable": "the reason isn't available here.",
+      "verification_integrity_failed": "the backup copy failed its integrity check and may be damaged.",
       "actions": {
         "enable": "turn on media offload",
         "save": "save limits",
@@ -1218,16 +1229,46 @@
   }
 
   function offloadStallReasonLabel(reason) {
-    return reasonFromOffloadMap(offloadStallLabels, 'offload.stall_reason_labels', reason);
+    if (!reason) return '';
+    return Object.prototype.hasOwnProperty.call(offloadStallLabels, reason)
+      ? offloadStallLabels[reason] : offloadCopy.reason_unavailable || '';
   }
 
   function offloadRestoreReasonLabel(reason) {
     return reasonFromOffloadMap(offloadRestoreLabels, 'offload.restore_reason_labels', reason);
   }
 
-  function formatWorkingProofDisplay(result) {
-    if (!result || !result.last_ok_time) return { text: statusLabels.not_yet || '', title: '' };
-    return timestampDisplay(result.last_ok_time);
+  function workingVerificationReasonLabel(reason) {
+    if (reason === 'integrity_failed' || reason === 'read_data_mismatch') {
+      return offloadCopy.verification_integrity_failed || '';
+    }
+    const labels = (copy.status && copy.status.error_reasons) || {};
+    return Object.prototype.hasOwnProperty.call(labels, reason)
+      ? labels[reason] : offloadCopy.reason_unavailable || '';
+  }
+
+  function renderWorkingProof(selector, historySelector, result, reasonLabel) {
+    const element = root.querySelector(selector);
+    if (!element) return;
+    const labels = offloadCopy.result_labels || {};
+    const hasResult = Boolean(result && typeof result.status === 'string' && result.status);
+    const knownStatus = hasResult && Object.prototype.hasOwnProperty.call(labels, result.status)
+      && result.status !== 'unknown';
+    const status = hasResult ? (knownStatus ? result.status : 'unknown') : 'missing';
+    element.setAttribute('data-result-status', status);
+    const display = hasResult ? timestampDisplay(result.time) : { text: statusLabels.not_yet || '', title: '' };
+    const reason = hasResult && result.status !== 'ok' && result.reason ? reasonLabel(result.reason) : '';
+    setTextWithTitle(selector, {
+      text: hasResult ? [labels[status] || labels.unknown || '', display.text, reason].filter(Boolean).join(' · ') : display.text,
+      title: display.title,
+    });
+    const history = root.querySelector(historySelector);
+    if (history) {
+      const available = Boolean(result && validTimestamp(result.last_ok_time));
+      history.hidden = !available;
+      setTextWithTitle(`${historySelector} [data-offload-success-time]`, available
+        ? timestampDisplay(result.last_ok_time) : { text: '', title: '' });
+    }
   }
 
   function formatRestoreResultDisplay(result) {
@@ -1549,11 +1590,11 @@
     setElementHidden('[data-offload-floor-row]', !floorValid);
     setText('[data-offload-budget]', budgetValid ? formatBytes(budget) : '');
     setText('[data-offload-floor]', floorValid ? formatBytes(floor) : '');
-    setTextWithTitle(
+    renderWorkingProof(
       '[data-offload-last-run]',
-      formatWorkingProofDisplay(payload.last_offload),
+      '[data-offload-run-history]', payload.last_offload, offloadStallReasonLabel,
     );
-    setTextWithTitle('[data-offload-last-verify]', formatWorkingProofDisplay(payload.last_verification));
+    renderWorkingProof('[data-offload-last-verify]', '[data-offload-verify-history]', payload.last_verification, workingVerificationReasonLabel);
     setTextWithTitle('[data-offload-last-restore]', formatRestoreResultDisplay(payload.last_restore));
 
     const stalled = payload.last_offload && payload.last_offload.status === 'stalled';
@@ -1565,7 +1606,7 @@
           offloadCopy.stalled_lead || '',
           offloadStallReasonLabel(payload.last_offload.reason),
         ].filter(Boolean).join(' ');
-      }
+      } else stallElement.textContent = '';
     }
 
     renderOffloadDays(showProof ? payload.days : []);
