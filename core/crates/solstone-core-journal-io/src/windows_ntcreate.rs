@@ -107,6 +107,26 @@ pub(crate) fn nt_create_relative_share_read_delete(
     )
 }
 
+/// Open or create an owned media leaf sharing READ only. The retained handle
+/// excludes competing writers and deletion through preparation/publication.
+pub(crate) fn nt_create_relative_share_read(
+    parent: RawHandle,
+    name: &OsStr,
+    desired_access: u32,
+    disposition: u32,
+    options: u32,
+) -> io::Result<OwnedHandle> {
+    nt_create_relative_raw(
+        parent,
+        name,
+        desired_access,
+        disposition,
+        options,
+        OBJ_CASE_INSENSITIVE,
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+    )
+}
+
 fn nt_create_relative_raw(
     parent: RawHandle,
     name: &OsStr,

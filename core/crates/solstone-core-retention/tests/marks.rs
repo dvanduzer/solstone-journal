@@ -123,10 +123,10 @@ fn unknown_version_is_rejected() {
     let bed = Bed::new();
     let register = bed.path().join("health").join("retention-marks.json");
     fs::create_dir_all(register.parent().unwrap()).unwrap();
-    fs::write(register, b"{\"version\":2,\"marks\":{}}\n").unwrap();
+    fs::write(register, b"{\"version\":3,\"marks\":{}}\n").unwrap();
     assert!(matches!(
         load(bed.path()),
-        Err(StoreError::UnsupportedVersion { found: 2 })
+        Err(StoreError::UnsupportedVersion { found: 3 })
     ));
 }
 

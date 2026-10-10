@@ -17,6 +17,9 @@ use solstone_core_processing_record::{
 use crate::WinnowConfig;
 use crate::categories::OutputKind;
 use crate::decode::{QualifiedFrame, process_video, resize_for_vlm_png};
+use solstone_core_journal_io::LockOptions;
+use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
+
 use crate::detect;
 use crate::extraction;
 use crate::merge;
@@ -56,6 +59,8 @@ struct CategorizedRow {
 }
 
 struct Promotion<'a> {
+    claims: &'a OutputClaims,
+    input: &'a InputObservation,
     output: &'a Path,
     rows: &'a Path,
     video: &'a Path,
@@ -138,8 +143,9 @@ pub fn run_with_factory(
     if options.jobs == 0 {
         return Err(RunError::Internal("--jobs must be positive".to_owned()));
     }
-    let decoded = process_video(options.video, options.config);
-    run_decoded(options, factory, decoded)
+    let video = options.video;
+    let config = options.config;
+    run_with_decoder(options, factory, || process_video(video, config))
 }
 
 /// Run the describe pipeline after media decoding has completed.
@@ -147,12 +153,25 @@ pub fn run_with_factory(
 /// Keeping this seam private lets pipeline tests use small, valid synthetic frame
 /// data while the CLI integration suite continues to prove the native decode,
 /// child-session, detector, and command-line boundaries.
+#[cfg(all(test, feature = "full-tests"))]
 fn run_decoded(
     options: DescribeOptions<'_>,
     factory: &dyn DescribeSessionFactory,
     decoded: crate::DescribeResult,
 ) -> Result<(), RunError> {
+    run_with_decoder(options, factory, || decoded)
+}
+
+fn run_with_decoder(
+    options: DescribeOptions<'_>,
+    factory: &dyn DescribeSessionFactory,
+    decode: impl FnOnce() -> crate::DescribeResult,
+) -> Result<(), RunError> {
     let output = options.video.with_extension("jsonl");
+    let claims = OutputClaims::acquire([output.clone()], LockOptions::default())
+        .map_err(|error| RunError::Internal(error.to_string()))?;
+    let input = InputObservation::capture(&claims, options.video)
+        .map_err(|error| RunError::Internal(error.to_string()))?;
     let mut previous_attempts = 0;
     let mut incremental_source = None;
     if !options.redo && output.exists() {
@@ -163,13 +182,12 @@ fn run_decoded(
         previous_attempts = record.as_ref().map(record_attempts).unwrap_or(0);
         incremental_source = Some(output.clone());
     }
+    let decoded = decode();
     let start = Instant::now();
     let parent = output
         .parent()
         .ok_or_else(|| RunError::Internal("video has no parent".to_owned()))?;
-    let input_size = fs::metadata(options.video)
-        .map_err(|error| RunError::Internal(error.to_string()))?
-        .len();
+    let input_size = input.input_size();
     let mut rows = RowTemp::new(parent)?;
     let existing_artifact = incremental_source
         .as_deref()
@@ -205,6 +223,8 @@ fn run_decoded(
             (vocab::STATE_EMPTY, vocab::REASON_NO_DECODABLE_FRAMES)
         };
         promote(Promotion {
+            claims: &claims,
+            input: &input,
             output: &output,
             rows: &rows.path,
             video: options.video,
@@ -367,6 +387,8 @@ fn run_decoded(
     if total_frames > 0 && failed_frames == total_frames && plan.is_none() {
         let _ = session.close();
         promote(Promotion {
+            claims: &claims,
+            input: &input,
             output: &output,
             rows: &rows.path,
             video: options.video,
@@ -590,6 +612,8 @@ fn run_decoded(
     let _ = session.close();
     let (state, reason) = verdict(decoded.decode_failed, failures);
     promote(Promotion {
+        claims: &claims,
+        input: &input,
         output: &output,
         rows: &rows.path,
         video: options.video,
@@ -944,6 +968,10 @@ fn promote(promotion: Promotion<'_>) -> Result<(), RunError> {
         std::io::copy(&mut row_file, &mut final_file)
             .map_err(|error| RunError::Internal(error.to_string()))?;
         drop(final_file);
+        let _commit = promotion
+            .input
+            .commit(promotion.claims)
+            .map_err(|error| RunError::Internal(error.to_string()))?;
         install_file(&final_path, promotion.output, AtomicWriteOptions::default())
             .map_err(|error| RunError::Internal(error.to_string()))
     })();

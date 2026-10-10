@@ -162,7 +162,7 @@ pub fn write_rendered(
         }
 
         let path = segment_dir.join(file.name);
-        if let Err(error) = write_private(&path, file.contents.as_bytes()) {
+        if let Err(error) = write_segment_private(&path, file.contents.as_bytes()) {
             return WriteOutcome {
                 created,
                 error: Some(error),
@@ -271,6 +271,22 @@ pub fn write_rendered(
     }
 }
 
+fn write_segment_private(path: &Path, contents: &[u8]) -> Result<(), SaveError> {
+    let directory = path.parent().expect("rendered segment output has a parent");
+    let map_error = |error: std::io::Error| SaveError {
+        path: path.to_path_buf(),
+        detail: error.to_string(),
+    };
+    solstone_core_segment::output_attempt::prepare_segment(directory).map_err(map_error)?;
+    let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+        [path.with_extension("jsonl")],
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(map_error)?;
+    let _commit = claims.commit(directory).map_err(map_error)?;
+    write_private(path, contents)
+}
+
 fn write_private(path: &Path, contents: &[u8]) -> Result<(), SaveError> {
     atomic_replace(
         path,
@@ -306,6 +322,17 @@ fn hints(source: RegistrySource) -> StreamHints {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_rendered_file_publication_preserves_owner_deleted_segments() {
+        let root = tempfile::tempdir().unwrap();
+        let segment = root.path().join("chronicle/20260101/import.ics/120000_0");
+        let output = segment.join("calendar.md");
+        super::write_segment_private(&output, b"first").unwrap();
+        super::write_segment_private(&output, b"second").unwrap();
+        std::fs::write(segment.join("tombstone.json"), b"{}").unwrap();
+        assert!(super::write_segment_private(&output, b"refused").is_err());
+        assert_eq!(std::fs::read(output).unwrap(), b"second");
+    }
     use super::*;
     use serde_json::json;
     use std::fs;

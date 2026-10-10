@@ -63,12 +63,48 @@ pub(crate) fn commit(
     item: &Eligible,
     writer: &dyn Writer,
 ) -> Result<(), CommitError> {
+    let segment = item.path.parent().ok_or(CommitError::Changed)?;
+    let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+        [item.path.clone()],
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(|error| CommitError::Read(error.to_string()))?;
+    let _commit = claims
+        .commit(segment)
+        .map_err(|error| CommitError::Read(error.to_string()))?;
+    item.parent_binding
+        .revalidate_canonical_binding()
+        .map_err(|_| CommitError::Changed)?;
+    let instant = chrono::Utc::now();
+    let current_day = instant
+        .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+        .format("%Y%m%d")
+        .to_string();
+    let entries = solstone_core_journal_io::list_dir_entries(segment)
+        .map_err(|error| CommitError::Read(error.to_string()))?;
+    let candidate = entries
+        .iter()
+        .find(|entry| entry.path == item.path)
+        .ok_or(CommitError::Changed)?;
+    let fresh = crate::classify::classify(
+        &item.day,
+        &current_day,
+        segment,
+        &item.segment_stream,
+        candidate,
+        &entries,
+        item.instant,
+    )
+    .map_err(|_| CommitError::Changed)?;
+    if fresh.raw_path != item.raw_path || fresh.input_size != item.input_size {
+        return Err(CommitError::Changed);
+    }
     let current = fs::read(&item.path).map_err(|error| CommitError::Read(error.to_string()))?;
     if current != item.original {
         return Err(CommitError::Changed);
     }
     writer
-        .replace(&item.path, &item.replacement)
+        .replace(&item.path, &fresh.replacement)
         .map_err(CommitError::Write)?;
     bump_stream_marker(journal, &item.day)
         .map(|_| ())

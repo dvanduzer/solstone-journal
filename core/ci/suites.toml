@@ -816,8 +816,9 @@ areas = ["import"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
+features = ["full-tests"]
 
 [[package_suites]]
 id = "package::solstone-core-import-sources"
@@ -4009,6 +4010,19 @@ id = "solstone-core-retention::release_oracle"
 package = "solstone-core-retention"
 target = "release_oracle"
 set = "package"
+areas = ["retention"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-retention::review_context"
+package = "solstone-core-retention"
+target = "review_context"
+set = "component"
 areas = ["retention"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]

@@ -143,7 +143,12 @@ impl Directory {
 
     pub(super) fn available_bytes(&self) -> io::Result<u64> {
         let stat = fstatvfs(self)?;
-        stat.blocks_available()
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "fsblkcnt_t is 32-bit on macOS and 64-bit on Linux"
+        )]
+        let blocks = stat.blocks_available() as u64;
+        blocks
             .checked_mul(stat.fragment_size())
             .ok_or_else(|| invalid("media capacity overflow"))
     }
@@ -220,8 +225,13 @@ pub(super) fn open_plain(directory: &Directory, name: &OsStr) -> io::Result<Opti
     Ok(Some(file))
 }
 
-pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<()> {
-    mkdirat(parent, name, Mode::S_IRWXU).map_err(Into::into)
+pub(super) fn open_source(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
+    open_plain(directory, name)
+}
+
+pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
+    mkdirat(parent, name, Mode::S_IRWXU)?;
+    parent.open_child(name)
 }
 
 pub(super) fn create_file(parent: &Directory, name: &OsStr) -> io::Result<File> {
