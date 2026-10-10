@@ -277,6 +277,60 @@ fn a_v1_transcript_places_every_turn_from_the_file_with_no_model_at_all() {
     }
 }
 
+#[cfg(feature = "full-tests")]
+#[test]
+fn text_publication_keeps_inference_outside_segment_and_refuses_deleted_or_replaced_parent() {
+    struct ChangingWire {
+        segment: PathBuf,
+        mutation: &'static str,
+    }
+    impl WireClient for ChangingWire {
+        fn execute(&self, _: &GenerateRequest) -> Result<GenerateResponse, ClientError> {
+            let options = solstone_core_journal_io::LockOptions {
+                timeout: std::time::Duration::ZERO,
+                ..Default::default()
+            };
+            assert!(
+                solstone_core_journal_io::hold_lock(
+                    self.segment.join("conversation_transcript.jsonl"),
+                    options
+                )
+                .is_err()
+            );
+            assert!(solstone_core_journal_io::hold_lock(&self.segment, options).is_ok());
+            match self.mutation {
+                "deleted" => fs::write(self.segment.join("tombstone.json"), b"{}").unwrap(),
+                "replaced" => {
+                    fs::rename(&self.segment, self.segment.with_file_name("previous")).unwrap();
+                    fs::create_dir(&self.segment).unwrap();
+                }
+                _ => (),
+            }
+            no_engine()
+        }
+    }
+    for mutation in ["unchanged", "deleted", "replaced"] {
+        let (_temporary, source, day) = setup("notes.txt", "synthetic transcript");
+        let segment = day.join("import.text/120000_300");
+        let outcome = run(
+            &source,
+            &day,
+            "12:00:00",
+            &ChangingWire {
+                segment: segment.clone(),
+                mutation,
+            },
+        );
+        if mutation == "unchanged" {
+            assert!(matches!(outcome, TextImportOutcome::Success(_)));
+            assert!(segment.join("conversation_transcript.jsonl").exists());
+        } else {
+            assert!(matches!(outcome, TextImportOutcome::Failed { .. }));
+            assert!(!segment.join("conversation_transcript.jsonl").exists());
+        }
+    }
+}
+
 #[test]
 fn a_model_adds_topics_and_setting_and_nothing_else() {
     let (_temporary, source, day) = setup("meeting.md", MEETING);

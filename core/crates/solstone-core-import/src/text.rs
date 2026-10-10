@@ -362,6 +362,31 @@ fn import(
                 Err(error) => return Err((created, TextImportError::SegmentDeconflict(error))),
             };
 
+        let directory = parent.join(&segment_key);
+        if let Err(source) = solstone_core_segment::output_attempt::prepare_segment(&directory) {
+            return Err((
+                created,
+                TextImportError::SourceRead {
+                    path: directory,
+                    source,
+                },
+            ));
+        }
+        let claims = match solstone_core_segment::output_attempt::OutputClaims::acquire(
+            [directory.join("conversation_transcript.jsonl")],
+            solstone_core_journal_io::LockOptions::default(),
+        ) {
+            Ok(claims) => claims,
+            Err(source) => {
+                return Err((
+                    created,
+                    TextImportError::SourceRead {
+                        path: directory,
+                        source,
+                    },
+                ));
+            }
+        };
         let context = if model_available {
             tile_context(wire, &turns, &mut model_available)
         } else {
@@ -380,6 +405,18 @@ fn import(
             context.as_ref(),
             untimed,
         );
+        let commit = match claims.commit(&directory) {
+            Ok(commit) => commit,
+            Err(source) => {
+                return Err((
+                    created,
+                    TextImportError::SourceRead {
+                        path: directory,
+                        source,
+                    },
+                ));
+            }
+        };
         if let Err(source) = write_jsonl(
             &output,
             rows,
@@ -396,6 +433,7 @@ fn import(
             ));
         }
 
+        drop(commit);
         created.push(TextCreated {
             day: tile_day.clone(),
             segment: segment_key.clone(),

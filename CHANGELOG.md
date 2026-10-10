@@ -21,6 +21,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- your journal no longer saves a transcript or description after the media has changed or its segment has been deleted.
 - moving a segment now stops if another operation is changing either its current directory or the directory it would move to. try the move again once that operation finishes.
 
 - a week your journal makes after you've deleted every segment of a conversation now leaves that conversation's words out of "said by you". before, they could still appear there.

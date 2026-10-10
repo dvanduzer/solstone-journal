@@ -1148,6 +1148,7 @@ pub fn install_and_publish_document(
             &item.source,
             &item.segment_dir,
             &item.prepared,
+            item.claim.binding.as_deref(),
             request.journal_root,
             &item.claim.day,
             publication,
@@ -1383,6 +1384,7 @@ pub struct SegmentClaim {
     segment: String,
     timestamp: SystemTime,
     already_imported: bool,
+    binding: Option<std::sync::Arc<solstone_core_journal_io::JournalRoot>>,
 }
 
 /// A chronicle segment could not be claimed. Day overflow and the 60-candidate
@@ -1468,6 +1470,7 @@ fn claim_segment(
                     segment,
                     timestamp: SystemTime::from(candidate_local.with_timezone(&Utc)),
                     already_imported: true,
+                    binding: None,
                 });
             }
             continue;
@@ -1484,6 +1487,22 @@ fn claim_segment(
             }
         }
         let candidate_path = parent.join(&segment);
+        if solstone_core_segment::owner_deleted(&candidate_path).map_err(|error| {
+            DocumentSegmentError::Io {
+                path: candidate_path.clone(),
+                detail: error.to_string(),
+            }
+        })? {
+            continue;
+        }
+        let _allocation = solstone_core_segment::output_attempt::SegmentMutation::acquire(
+            &candidate_path,
+            solstone_core_journal_io::LockOptions::default(),
+        )
+        .map_err(|error| DocumentSegmentError::Io {
+            path: candidate_path.clone(),
+            detail: error.to_string(),
+        })?;
         let fresh = match fs::create_dir(&candidate_path) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
@@ -1515,6 +1534,7 @@ fn claim_segment(
                     segment,
                     timestamp: SystemTime::from(candidate_local.with_timezone(&Utc)),
                     already_imported: true,
+                    binding: None,
                 });
             }
             occupied.insert(key, sha256.to_owned());
@@ -1536,6 +1556,14 @@ fn claim_segment(
                 segment,
                 timestamp: SystemTime::from(candidate_local.with_timezone(&Utc)),
                 already_imported: false,
+                binding: Some(std::sync::Arc::new(
+                    solstone_core_journal_io::JournalRoot::open(resolved.path()).map_err(
+                        |error| DocumentSegmentError::Io {
+                            path: resolved.path().to_path_buf(),
+                            detail: error.to_string(),
+                        },
+                    )?,
+                )),
             });
         }
     }
@@ -1604,7 +1632,7 @@ fn reusable_original(candidate: &Path, sha256: &str) -> Result<bool, DocumentSeg
         })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("original.") || name == ORIGINAL {
+        if name.starts_with("original.") && !name.ends_with(".lock") {
             originals.push(entry.path());
         }
     }
@@ -2018,14 +2046,33 @@ fn install_artifacts(
     source: &Path,
     segment_dir: &Path,
     prepared: &PreparedDocument,
+    binding: Option<&solstone_core_journal_io::JournalRoot>,
     journal_root: &Path,
     day: &str,
     publication: &dyn PublicationOperations,
 ) -> Result<String, ArtifactInstallError> {
+    let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+        [
+            segment_dir.join(ORIGINAL).with_extension("jsonl"),
+            segment_dir.join(TRANSCRIPT).with_extension("jsonl"),
+        ],
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(|error| ArtifactInstallError::Write(error.to_string()))?;
     let pages_dir = segment_dir.join("pages");
+    let commit = claims
+        .commit(segment_dir)
+        .map_err(|error| ArtifactInstallError::Write(error.to_string()))?;
+    binding
+        .ok_or_else(|| ArtifactInstallError::Write("document segment was not admitted".into()))?
+        .revalidate_canonical_binding()
+        .map_err(|error| ArtifactInstallError::Write(error.to_string()))?;
     create_document_artifact_directories(segment_dir, &pages_dir)
         .map_err(ArtifactInstallError::Write)?;
+    drop(commit);
     install_original_pdf(
+        &claims,
+        segment_dir,
         source,
         &segment_dir.join(ORIGINAL),
         journal_root,
@@ -2033,10 +2080,18 @@ fn install_artifacts(
         publication,
     )?;
     for (index, raster) in &prepared.rasters {
-        install_page_raster(raster, &pages_dir.join(page_name(*index)))
-            .map_err(ArtifactInstallError::Write)?;
+        install_page_raster(
+            &claims,
+            segment_dir,
+            raster,
+            &pages_dir.join(page_name(*index)),
+        )
+        .map_err(ArtifactInstallError::Write)?;
     }
     let transcript = segment_dir.join(TRANSCRIPT);
+    let _commit = claims
+        .commit(segment_dir)
+        .map_err(|error| ArtifactInstallError::Write(error.to_string()))?;
     write_document_transcript(&transcript, &prepared.transcript)
         .map_err(ArtifactInstallError::Write)?;
     Ok(transcript.display().to_string())
@@ -2051,6 +2106,8 @@ fn create_document_artifact_directories(
 }
 
 fn install_original_pdf(
+    claims: &solstone_core_segment::output_attempt::OutputClaims,
+    segment: &Path,
     source: &Path,
     destination: &Path,
     journal_root: &Path,
@@ -2060,7 +2117,7 @@ fn install_original_pdf(
     let modified = fs::metadata(source)
         .and_then(|metadata| metadata.modified())
         .map_err(|error| ArtifactInstallError::Write(error.to_string()))?;
-    install_source_file_before_metadata(source, destination)
+    install_source_file_before_metadata(claims, segment, source, destination)
         .map_err(ArtifactInstallError::Write)?;
     publication
         .touch_stream_health_marker(journal_root, day)
@@ -2071,21 +2128,36 @@ fn install_original_pdf(
     set_installed_modified_time(destination, modified).map_err(ArtifactInstallError::Write)
 }
 
-fn install_page_raster(source: &Path, destination: &Path) -> Result<(), String> {
+fn install_page_raster(
+    claims: &solstone_core_segment::output_attempt::OutputClaims,
+    segment: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
     let modified = fs::metadata(source)
         .and_then(|metadata| metadata.modified())
         .map_err(|error| error.to_string())?;
-    install_source_file_before_metadata(source, destination)?;
+    install_source_file_before_metadata(claims, segment, source, destination)?;
     set_installed_modified_time(destination, modified)
 }
 
-fn install_source_file_before_metadata(source: &Path, destination: &Path) -> Result<(), String> {
+fn install_source_file_before_metadata(
+    claims: &solstone_core_segment::output_attempt::OutputClaims,
+    segment: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
     let parent = destination
         .parent()
         .ok_or_else(|| "destination has no parent".to_owned())?;
-    create_directory_with_mode(parent, DIRECTORY_MODE).map_err(|error| error.to_string())?;
+    let admitted_parent =
+        solstone_core_journal_io::JournalRoot::open(parent).map_err(|error| error.to_string())?;
     let temporary = create_temporary_file(parent, destination.file_name().unwrap_or_default());
     fs::copy(source, &temporary).map_err(|error| error.to_string())?;
+    let _commit = claims.commit(segment).map_err(|error| error.to_string())?;
+    admitted_parent
+        .revalidate_canonical_binding()
+        .map_err(|error| error.to_string())?;
     install_file(
         &temporary,
         destination,
@@ -2297,6 +2369,44 @@ mod claim_tests {
         assert_eq!(claim.segment, "120000_0");
         assert!(!claim.already_imported);
         assert!(parent(journal.path()).join(&claim.segment).is_dir());
+    }
+
+    #[test]
+    fn raw_document_install_revalidates_deletion_and_the_claimed_parent() {
+        for mutation in ["unchanged", "deleted", "replaced"] {
+            let journal = tempfile::tempdir().unwrap();
+            let directory = parent(journal.path()).join("120000_0");
+            solstone_core_segment::output_attempt::prepare_segment(&directory).unwrap();
+            let source = journal.path().join("source.pdf");
+            fs::write(&source, b"synthetic PDF bytes").unwrap();
+            let destination = directory.join(ORIGINAL);
+            let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+                [destination.with_extension("jsonl")],
+                Default::default(),
+            )
+            .unwrap();
+            match mutation {
+                "deleted" => fs::write(directory.join("tombstone.json"), b"{}").unwrap(),
+                "replaced" => {
+                    fs::rename(&directory, journal.path().join("previous")).unwrap();
+                    fs::create_dir(&directory).unwrap();
+                }
+                _ => (),
+            }
+            let result = super::install_source_file_before_metadata(
+                &claims,
+                &directory,
+                &source,
+                &destination,
+            );
+            if mutation == "unchanged" {
+                result.unwrap();
+                assert_eq!(fs::read(destination).unwrap(), b"synthetic PDF bytes");
+            } else {
+                assert!(result.is_err(), "{mutation}");
+                assert!(!destination.exists(), "{mutation}");
+            }
+        }
     }
 
     #[test]
