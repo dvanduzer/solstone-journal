@@ -17,6 +17,7 @@ publish = false
 workspace = true
 
 [dependencies]
+getrandom.workspace = true
 chrono = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true }
