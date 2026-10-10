@@ -1749,6 +1749,66 @@ fn connection_no_tokenizable_query_probes_coverage_and_degraded_state() {
 }
 
 #[test]
+fn a_day_bounded_connection_listing_needs_no_words_and_keeps_its_scope() {
+    const A: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    const B: &str = "b1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let (root, connection) = seeded_root("connection-day-listing");
+    for (content, path, day, facet) in [
+        ("in scope that day", "20260107/default/090000_300/talents/a.md", "20260107", A),
+        ("out of scope that day", "20260107/default/100000_300/talents/b.md", "20260107", B),
+        ("in scope another day", "20260106/default/090000_300/talents/a.md", "20260106", A),
+    ] {
+        insert(&connection, content, path, day, "", "fixture", "default", 0);
+        seed_classification(&connection, path, "transcripts", "segment_assigned", &[facet]);
+    }
+    finish_classification(&connection);
+    drop(connection);
+    let chosen = connection_boundary(
+        &["Transcripts"],
+        ConnectionScope::ChosenFacets {
+            ids: [A.to_string()].into_iter().collect(),
+        },
+    );
+    let whole = connection_boundary(&["Transcripts"], ConnectionScope::WholeJournal);
+    let listing = |boundary: &ConnectionBoundary, query: &str, day: Option<&str>| {
+        crate::search_connection(
+            &root,
+            boundary,
+            &ConnectionSearchRequest {
+                query: query.to_string(),
+                limit: 50,
+                day: day.map(str::to_string),
+                ..ConnectionSearchRequest::default()
+            },
+            reference_date(),
+        )
+        .expect("connection listing")
+        .results
+        .into_iter()
+        .map(|hit| hit.text)
+        .collect::<Vec<_>>()
+    };
+    // No words and no searchable term both list the bounded day, inside the scope.
+    for query in ["", "📅"] {
+        assert_eq!(
+            listing(&chosen, query, Some("20260107")),
+            vec!["in scope that day".to_string()],
+            "{query:?}"
+        );
+        let mut whole_day = listing(&whole, query, Some("20260107"));
+        whole_day.sort();
+        assert_eq!(
+            whole_day,
+            vec!["in scope that day".to_string(), "out of scope that day".to_string()],
+            "{query:?}"
+        );
+    }
+    // Without a day bound, a query with no searchable term still finds nothing.
+    assert!(listing(&whole, "📅", None).is_empty());
+    fs::remove_dir_all(root).expect("cleanup connection day listing");
+}
+
+#[test]
 fn connection_coverage_fails_closed_for_every_incomplete_state() {
     let boundary = connection_boundary(&["Facets"], ConnectionScope::WholeJournal);
 

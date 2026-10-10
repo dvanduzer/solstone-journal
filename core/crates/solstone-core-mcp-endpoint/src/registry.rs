@@ -267,15 +267,14 @@ fn list_facets_input_schema(_context: &SchemaContext<'_>) -> Value {
     })
 }
 
-const SEARCH_QUERY_DESCRIPTION: &str = "a few plain keywords such as names or topics. when no entry matches every word, results match some of them and `relaxed` is true.";
+const SEARCH_QUERY_DESCRIPTION: &str = "a few plain keywords such as names or topics. when no entry matches every word, results match some of them and `relaxed` is true. leave it out to list what a day or range of days holds.";
 
 fn search_input_schema(context: &SchemaContext<'_>) -> Value {
     let mut schema = json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["query"],
         "properties": {
-            "query": { "type": "string", "minLength": 1, "maxLength": MAX_QUERY_BYTES, "description": SEARCH_QUERY_DESCRIPTION },
+            "query": { "type": "string", "maxLength": MAX_QUERY_BYTES, "description": SEARCH_QUERY_DESCRIPTION },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
             "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
             "day": { "type": "string", "minLength": 1, "maxLength": MAX_DAY_BYTES, "pattern": DAY_PATTERN, "description": DAY_DESCRIPTION },
