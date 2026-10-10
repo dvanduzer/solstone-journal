@@ -891,6 +891,46 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     }
 }
 
+#[cfg(test)]
+fn seed_indexed_note(journal: &std::path::Path) {
+    use std::fs;
+
+    use rusqlite::params;
+
+    let path = "20260831/default/123456_1/talents/brief.md";
+    let source = journal.join("chronicle/20260831/default/123456_1");
+    fs::create_dir_all(source.join("talents")).expect("fixture segment directory");
+    fs::write(source.join("talents/brief.md"), "disk fixture source")
+        .expect("fixture source content");
+    fs::write(source.join("talents/facets.json"), "[]").expect("fixture assignments");
+    let connection =
+        solstone_core_indexer_store::db::open_index(journal).expect("fixture index opens");
+    connection
+        .execute(
+            "INSERT INTO chunks(content, path, day, facet, agent, stream, idx, time_bucket) VALUES (?1, ?2, '20260831', '', 'fixture', 'default', 0, '')",
+            params!["MCP fixture search needle", path],
+        )
+        .expect("fixture chunk inserts");
+    connection
+        .execute(
+            "REPLACE INTO index_build_state(id, schema_version, state, files_count, chunks_count) VALUES (1, 1, 'complete', 1, 1)",
+            [],
+        )
+        .expect("fixture index completes");
+    connection
+        .execute(
+            "INSERT INTO chunk_classification(path, category, basis, eligible, unclassified) VALUES (?1, 'transcripts', 'segment_assigned', 1, 0)",
+            params![path],
+        )
+        .expect("fixture classification inserts");
+    connection
+        .execute(
+            "REPLACE INTO chunk_classification_backfill(id, cursor, completed, stalled, stalled_path, resume_count) VALUES (1, '', 1, 0, NULL, 0)",
+            [],
+        )
+        .expect("fixture classification completes");
+}
+
 #[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use std::fs;
@@ -903,7 +943,6 @@ mod tests {
     use std::task::{Context, Poll};
 
     use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-    use rusqlite::params;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
     use serde_json::{Value, json};
@@ -1391,41 +1430,6 @@ mod tests {
         (status, body, head)
     }
 
-    fn seed_indexed_note(journal: &Path) {
-        let path = "20260831/default/123456_1/talents/brief.md";
-        let source = journal.join("chronicle/20260831/default/123456_1");
-        fs::create_dir_all(source.join("talents")).expect("fixture segment directory");
-        fs::write(source.join("talents/brief.md"), "disk fixture source")
-            .expect("fixture source content");
-        fs::write(source.join("talents/facets.json"), "[]").expect("fixture assignments");
-        let connection =
-            solstone_core_indexer_store::db::open_index(journal).expect("fixture index opens");
-        connection
-            .execute(
-                "INSERT INTO chunks(content, path, day, facet, agent, stream, idx, time_bucket) VALUES (?1, ?2, '20260831', '', 'fixture', 'default', 0, '')",
-                params!["MCP fixture search needle", path],
-            )
-            .expect("fixture chunk inserts");
-        connection
-            .execute(
-                "REPLACE INTO index_build_state(id, schema_version, state, files_count, chunks_count) VALUES (1, 1, 'complete', 1, 1)",
-                [],
-            )
-            .expect("fixture index completes");
-        connection
-            .execute(
-                "INSERT INTO chunk_classification(path, category, basis, eligible, unclassified) VALUES (?1, 'transcripts', 'segment_assigned', 1, 0)",
-                params![path],
-            )
-            .expect("fixture classification inserts");
-        connection
-            .execute(
-                "REPLACE INTO chunk_classification_backfill(id, cursor, completed, stalled, stalled_path, resume_count) VALUES (1, '', 1, 0, NULL, 0)",
-                [],
-            )
-            .expect("fixture classification completes");
-    }
-
     fn session_id(headers: &str) -> String {
         headers
             .lines()
@@ -1653,7 +1657,7 @@ mod tests {
     async fn admitted_search_and_fetch_calls_each_publish_an_admission_and_an_outcome() {
         let (server_config, client_config) = tls_configs();
         let server = ServerHarness::start(server_config).await;
-        seed_indexed_note(server.journal.path());
+        super::seed_indexed_note(server.journal.path());
         let listener = solstone_core_callosum::test_fixture::OneShotListener::bind(
             server.journal.path().join("health/callosum.sock"),
         );
@@ -1923,7 +1927,7 @@ mod tests {
     async fn narrowing_a_grant_mid_session_tells_the_client_its_tool_list_changed() {
         let (server_config, client_config) = tls_configs();
         let server = ServerHarness::start(server_config).await;
-        seed_indexed_note(server.journal.path());
+        super::seed_indexed_note(server.journal.path());
         let (alpha, _) = seed_two_facets(server.journal.path());
         let token = server.create_token("stale-schema-agent");
         let verified = TokenStore::open(server.journal.path())
@@ -2094,7 +2098,7 @@ mod tests {
     async fn fragmented_and_coalesced_tls_client_hellos_support_the_read_only_mcp_flow() {
         let (server_config, client_config) = tls_configs();
         let server = ServerHarness::start(server_config).await;
-        seed_indexed_note(server.journal.path());
+        super::seed_indexed_note(server.journal.path());
         let token = server.create_token("full-flow-agent");
 
         let (mut client, fragmented_writes) =
@@ -2192,10 +2196,10 @@ mod tests {
     async fn tool_calls_are_contained_to_the_server_journal_root() {
         let (server_config, client_config) = tls_configs();
         let server = ServerHarness::start(server_config).await;
-        seed_indexed_note(server.journal.path());
+        super::seed_indexed_note(server.journal.path());
 
         let journal_b = tempfile::tempdir().expect("second fixture journal");
-        seed_indexed_note(journal_b.path());
+        super::seed_indexed_note(journal_b.path());
         let before_b = snapshot_tree(journal_b.path());
 
         let token = server.create_token("containment-agent");
@@ -3161,7 +3165,7 @@ mod tests {
             .prefix("solstone-mcp-server-")
             .tempdir_in(crate::test_scratch())
             .expect("fixture journal directory");
-        seed_indexed_note(journal.path());
+        super::seed_indexed_note(journal.path());
         let server = ServerHarness::start_with_journal_override(
             server_config,
             journal,
@@ -3542,7 +3546,7 @@ mod tests {
     async fn oauth_bulkhead_saturation_does_not_block_other_traffic() {
         let (server_config, client_config) = tls_configs();
         let server = ServerHarness::start(server_config).await;
-        seed_indexed_note(server.journal.path());
+        super::seed_indexed_note(server.journal.path());
         let mut held = Vec::new();
         for octet in 1..=16 {
             held.push(
@@ -3874,6 +3878,163 @@ mod unit_tests {
             journal.path(),
         );
         assert_eq!(fresh_list.status, 200);
+    }
+
+    #[tokio::test]
+    async fn same_bearer_initialization_reclaims_session_slots_and_serves_tools() {
+        let journal = tempfile::Builder::new()
+            .prefix("solstone-mcp-server-")
+            .tempdir_in(crate::test_scratch())
+            .expect("fixture journal directory");
+        super::seed_indexed_note(journal.path());
+        let sessions = SessionTable::new();
+        let verified = crate::tokens::VerifiedToken {
+            id: "session-reclaim-token".to_owned(),
+            agent_identity: "session-reclaim-agent".to_owned(),
+        };
+        crate::permissions::PermissionStore::open(journal.path())
+            .set_permission(
+                &verified.id,
+                crate::permissions::ReadPermission::default_whole_journal(),
+            )
+            .expect("fixture grants read permission");
+
+        let request = |method: &str, session: Option<&str>, params: Option<serde_json::Value>| {
+            let mut headers = vec![("content-type".to_owned(), "application/json".to_owned())];
+            if let Some(session) = session {
+                headers.push(("mcp-session-id".to_owned(), session.to_owned()));
+            }
+            let mut body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+            });
+            if let Some(params) = params {
+                body["params"] = params;
+            }
+            HttpRequest::from_test_parts(
+                HttpMethod::Post,
+                headers,
+                serde_json::to_vec(&body).unwrap(),
+            )
+        };
+
+        let mut session_ids = Vec::new();
+        for _ in 0..17 {
+            let response = super::post_json_rpc(
+                &request("initialize", None, None),
+                &sessions,
+                &verified,
+                journal.path(),
+            );
+            assert_eq!(response.status, 200);
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&response.body).expect("initialize body parses");
+            assert_eq!(parsed["result"], crate::jsonrpc::initialize_result());
+            let session_id = response.session_id.expect("session_id is present");
+            session_ids.push(session_id);
+        }
+        let unique = session_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert_eq!(unique, 17);
+
+        let evicted = super::post_json_rpc(
+            &request("initialize", Some(&session_ids[0]), None),
+            &sessions,
+            &verified,
+            journal.path(),
+        );
+        assert_eq!(evicted.status, 404);
+        assert!(evicted.session_id.is_none());
+        assert!(sessions.validate(&session_ids[16], &verified.id).is_ok());
+
+        let newest_id = &session_ids[16];
+        let list_response = super::post_json_rpc(
+            &request("tools/list", Some(newest_id), None),
+            &sessions,
+            &verified,
+            journal.path(),
+        );
+        assert_eq!(list_response.status, 200);
+        let list_body: serde_json::Value =
+            serde_json::from_slice(&list_response.body).expect("tools/list parses");
+        let tools = list_body["result"]["tools"]
+            .as_array()
+            .expect("tools array");
+        assert!(tools.iter().any(|tool| tool["name"] == "search"));
+
+        let search_response = super::post_json_rpc(
+            &request(
+                "tools/call",
+                Some(newest_id),
+                Some(json!({"name": "search", "arguments": {"query": "needle", "limit": 10}})),
+            ),
+            &sessions,
+            &verified,
+            journal.path(),
+        );
+        assert_eq!(search_response.status, 200);
+        let search_body: serde_json::Value =
+            serde_json::from_slice(&search_response.body).expect("search call parses");
+        assert!(search_body.get("error").is_none());
+        let reference = search_body["result"]["structuredContent"]["results"][0]["reference"]
+            .as_str()
+            .expect("search returns reference");
+
+        let fetch_response = super::post_json_rpc(
+            &request(
+                "tools/call",
+                Some(newest_id),
+                Some(json!({"name": "fetch", "arguments": {"reference": reference}})),
+            ),
+            &sessions,
+            &verified,
+            journal.path(),
+        );
+        assert_eq!(fetch_response.status, 200);
+        let fetch_body: serde_json::Value =
+            serde_json::from_slice(&fetch_response.body).expect("fetch call parses");
+        assert!(fetch_body.get("error").is_none());
+        assert_eq!(
+            fetch_body["result"]["structuredContent"],
+            json!({
+                "title": "Indexed journal entry — 20260831",
+                "date": "20260831",
+                "text": "MCP fixture search needle"
+            })
+        );
+
+        let unpermissioned = crate::tokens::VerifiedToken {
+            id: "unpermissioned-reclaim-token".to_owned(),
+            agent_identity: "unpermissioned-reclaim-agent".to_owned(),
+        };
+        let unperm_init = super::post_json_rpc(
+            &request("initialize", None, None),
+            &sessions,
+            &unpermissioned,
+            journal.path(),
+        );
+        assert_eq!(unperm_init.status, 200);
+        let unperm_session = unperm_init
+            .session_id
+            .expect("unpermissioned session ID is present");
+        let unperm_list = super::post_json_rpc(
+            &request("tools/list", Some(&unperm_session), None),
+            &sessions,
+            &unpermissioned,
+            journal.path(),
+        );
+        assert_eq!(unperm_list.status, 200);
+        let unperm_body: serde_json::Value =
+            serde_json::from_slice(&unperm_list.body).expect("unpermissioned tools list parses");
+        let unperm_tools = unperm_body["result"]["tools"]
+            .as_array()
+            .expect("tools array");
+        assert!(!unperm_tools.iter().any(|tool| tool["name"] == "search"));
+
+        assert!(sessions.validate(newest_id, &verified.id).is_ok());
     }
 
     #[tokio::test]
