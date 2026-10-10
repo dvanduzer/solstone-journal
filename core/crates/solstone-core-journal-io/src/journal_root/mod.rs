@@ -167,6 +167,27 @@ enum Repr {
 }
 
 impl ObjectIdentity {
+    /// Canonical lossless physical-source observation. This is provenance, not
+    /// a logical journal ID, destination constraint, or reconstructible handle.
+    pub fn observation_id(&self) -> String {
+        match self.0 {
+            #[cfg(unix)]
+            Repr::Unix { dev, ino } => format!("native-root-v1:unix:{dev:016x}:{ino:016x}"),
+            #[cfg(windows)]
+            Repr::Windows {
+                volume_serial,
+                file_id,
+            } => {
+                use std::fmt::Write;
+                let mut encoded = format!("native-root-v1:windows:{volume_serial:016x}:");
+                for byte in file_id {
+                    write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+                }
+                encoded
+            }
+        }
+    }
+
     /// Construct an identity from a no-follow Unix stat result.
     #[cfg(unix)]
     pub(crate) const fn from_device_inode(dev: u64, ino: u64) -> Self {
@@ -189,6 +210,80 @@ impl ObjectIdentity {
             Repr::Windows {
                 file_id: observed, ..
             } => observed == file_id,
+        }
+    }
+}
+
+/// Validate either platform's observation syntax on every OS. Parsing this
+/// string never reconstructs an ObjectIdentity or grants mutation authority.
+pub fn is_canonical_identity_observation(value: &str) -> bool {
+    fn hex(value: &str, width: usize) -> bool {
+        value.len() == width
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+    let mut parts = value.split(':');
+    if parts.next() != Some("native-root-v1") {
+        return false;
+    }
+    let width = match parts.next() {
+        Some("unix") => 16,
+        Some("windows") => 32,
+        _ => return false,
+    };
+    let Some(volume) = parts.next() else {
+        return false;
+    };
+    let Some(object) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none() && hex(volume, 16) && hex(object, width)
+}
+
+#[cfg(test)]
+mod identity_observation_tests {
+    use super::*;
+
+    #[test]
+    fn both_platforms_parse_canonically_without_authority() {
+        let unix = "native-root-v1:unix:0000000000000000:ffffffffffffffff";
+        let windows = "native-root-v1:windows:ffffffffffffffff:01000000000000000100000000000000";
+        for value in [
+            unix,
+            windows,
+            "native-root-v1:unix:0000000000000000:0000000000000000",
+            "native-root-v1:windows:0000000000000000:00000000000000000000000000000000",
+        ] {
+            assert!(is_canonical_identity_observation(value));
+        }
+        for value in [
+            "native-root-v2:unix:0000000000000000:ffffffffffffffff",
+            "native-root-v1:unix:0:ffffffffffffffff",
+            "native-root-v1:unix:0000000000000000:FFFFFFFFFFFFFFFF",
+            "native-root-v1:unix:0000000000000000:ffffffffffffffff:extra",
+            "native-root-v1:windows:0000000000000000:0000000000000000",
+            "native-root-v1:other:0000000000000000:0000000000000000",
+            "native-root-v1:unix:0000000000000000:",
+        ] {
+            assert!(!is_canonical_identity_observation(value), "{value}");
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            ObjectIdentity::from_device_inode(0, u64::MAX).observation_id(),
+            unix
+        );
+        #[cfg(windows)]
+        {
+            let mut bytes = [0; 16];
+            bytes[0] = 1;
+            bytes[8] = 1;
+            let observed = ObjectIdentity::from_volume_and_file_id(u64::MAX, bytes);
+            assert_eq!(observed.observation_id(), windows);
+            assert_ne!(
+                observed.observation_id(),
+                ObjectIdentity::from_volume_and_file_id(u64::MAX, [0; 16]).observation_id()
+            );
         }
     }
 }

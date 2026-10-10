@@ -286,6 +286,7 @@ struct ClaimedImageSegment {
     day: String,
     segment: String,
     directory: PathBuf,
+    binding: solstone_core_journal_io::JournalRoot,
 }
 
 fn claim_image_segment(
@@ -348,6 +349,22 @@ fn claim_image_segment(
         }
 
         let candidate_path = parent.join(&segment);
+        if solstone_core_segment::owner_deleted(&candidate_path).map_err(|error| {
+            ImageImportError::JournalIo {
+                path: candidate_path.clone(),
+                detail: error.to_string(),
+            }
+        })? {
+            continue;
+        }
+        let _allocation = solstone_core_segment::output_attempt::SegmentMutation::acquire(
+            &candidate_path,
+            solstone_core_journal_io::LockOptions::default(),
+        )
+        .map_err(|error| ImageImportError::JournalIo {
+            path: candidate_path.clone(),
+            detail: error.to_string(),
+        })?;
         match fs::create_dir(&candidate_path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -391,7 +408,7 @@ fn claim_image_segment(
                     })?;
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    if name_str.starts_with("original.") {
+                    if name_str.starts_with("original.") && !name_str.ends_with(".lock") {
                         original_entries.push(entry);
                     }
                 }
@@ -457,6 +474,12 @@ fn claim_image_segment(
             day,
             segment,
             directory: resolved.path().to_path_buf(),
+            binding: solstone_core_journal_io::JournalRoot::open(resolved.path()).map_err(
+                |error| ImageImportError::JournalIo {
+                    path: resolved.path().to_path_buf(),
+                    detail: error.to_string(),
+                },
+            )?,
         });
     }
 
@@ -490,6 +513,7 @@ pub fn install_and_publish_image(
         &prepared.path,
         &original_path,
         prepared.modified,
+        &claimed.binding,
         journal_root,
         &claimed.day,
         publication,
@@ -510,6 +534,28 @@ pub fn install_and_publish_image(
         &transcript_date,
         &prepared.description,
     );
+    let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+        [transcript_path.with_extension("jsonl")],
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(|error| ImageImportError::JournalIo {
+        path: transcript_path.clone(),
+        detail: error.to_string(),
+    })?;
+    let commit =
+        claims
+            .commit(&claimed.directory)
+            .map_err(|error| ImageImportError::JournalIo {
+                path: transcript_path.clone(),
+                detail: error.to_string(),
+            })?;
+    claimed
+        .binding
+        .revalidate_canonical_binding()
+        .map_err(|error| ImageImportError::JournalIo {
+            path: transcript_path.clone(),
+            detail: error.to_string(),
+        })?;
     write_text(
         &transcript_path,
         &transcript,
@@ -522,6 +568,7 @@ pub fn install_and_publish_image(
         detail: error.to_string(),
     })?;
 
+    drop(commit);
     let days_affected = vec![claimed.day.clone()];
     let files_created = vec![transcript_path.clone()];
     write_import_manifest(
@@ -751,6 +798,7 @@ fn install_source(
     source: &Path,
     destination: &Path,
     modified: SystemTime,
+    binding: &solstone_core_journal_io::JournalRoot,
     journal_root: &Path,
     day: &str,
     publication: &dyn PublicationOperations,
@@ -758,6 +806,14 @@ fn install_source(
     let parent = destination
         .parent()
         .expect("image destination has a parent");
+    let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+        [destination.with_extension("jsonl")],
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(|error| ImageImportError::Install {
+        path: destination.to_path_buf(),
+        detail: error.to_string(),
+    })?;
     let mut source_file = File::open(source).map_err(|error| ImageImportError::Install {
         path: destination.to_path_buf(),
         detail: error.to_string(),
@@ -788,6 +844,18 @@ fn install_source(
                 path: destination.to_path_buf(),
                 detail: error.error.to_string(),
             })?;
+    let _commit = claims
+        .commit(parent)
+        .map_err(|error| ImageImportError::Install {
+            path: destination.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    binding
+        .revalidate_canonical_binding()
+        .map_err(|error| ImageImportError::Install {
+            path: destination.to_path_buf(),
+            detail: error.to_string(),
+        })?;
     install_file(
         &temporary_path,
         destination,
@@ -1238,6 +1306,50 @@ mod tests {
         fn new() -> Self {
             Self {
                 touched_days: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    #[test]
+    fn raw_install_admits_the_claimed_directory_and_refuses_deletion_or_path_reuse() {
+        for mutation in ["unchanged", "deleted", "replaced"] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source.png");
+            fs::write(&source, b"synthetic image bytes").unwrap();
+            let claimed = claim_image_segment(
+                root.path(),
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 2)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap(),
+                &source,
+                ".png",
+            )
+            .unwrap();
+            match mutation {
+                "deleted" => fs::write(claimed.directory.join("tombstone.json"), b"{}").unwrap(),
+                "replaced" => {
+                    fs::rename(&claimed.directory, root.path().join("previous")).unwrap();
+                    fs::create_dir(&claimed.directory).unwrap();
+                }
+                _ => (),
+            }
+            let destination = claimed.directory.join("original.png");
+            let result = install_source(
+                &source,
+                &destination,
+                SystemTime::now(),
+                &claimed.binding,
+                root.path(),
+                &claimed.day,
+                &TestPublication::new(),
+            );
+            if mutation == "unchanged" {
+                result.unwrap();
+                assert_eq!(fs::read(destination).unwrap(), b"synthetic image bytes");
+            } else {
+                assert!(result.is_err(), "{mutation}");
+                assert!(!destination.exists(), "{mutation}");
             }
         }
     }

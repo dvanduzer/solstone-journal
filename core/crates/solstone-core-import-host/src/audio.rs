@@ -346,7 +346,7 @@ where
         let true_start = request.base_timestamp
             + chrono::Duration::seconds((index * CHUNK_SECONDS as u64) as i64);
         let key_duration = chunk_duration_seconds.ceil().max(1.0) as u64;
-        let (segment, segment_dir) =
+        let (segment, segment_dir, admitted) =
             match allocate_segment_directory(&request, &segment_parent, true_start, key_duration) {
                 Ok(allocation) => allocation,
                 Err(error) => {
@@ -414,7 +414,7 @@ where
                 });
             }
             Err(error) if error.is_tolerated() => {
-                if let Err(remove_error) = fs::remove_dir_all(&segment_dir) {
+                if let Err(remove_error) = remove_failed_audio_segment(&segment_dir, &admitted) {
                     let error = ImportError::AudioSegmentDirectory {
                         path: segment_dir,
                         message: remove_error.to_string(),
@@ -440,9 +440,11 @@ where
                 });
             }
             Err(error) => {
-                let cleanup_note = fs::remove_dir_all(&segment_dir).err().map(|cleanup_error| {
-                    format!("; cleanup left {}: {cleanup_error}", segment_dir.display())
-                });
+                let cleanup_note = remove_failed_audio_segment(&segment_dir, &admitted)
+                    .err()
+                    .map(|cleanup_error| {
+                        format!("; cleanup left {}: {cleanup_error}", segment_dir.display())
+                    });
                 let error = ImportError::AudioSliceRejected {
                     path: request.source_media.clone(),
                     chunk_index: index,
@@ -679,7 +681,7 @@ fn allocate_segment_directory(
     parent: &Path,
     true_start: NaiveDateTime,
     key_duration: u64,
-) -> Result<(String, PathBuf), ImportError> {
+) -> Result<(String, PathBuf, solstone_core_journal_io::JournalRoot), ImportError> {
     for attempt in 0..COLLISION_FORWARD_PROBE_LIMIT {
         let candidate = true_start + chrono::Duration::seconds(i64::from(attempt));
         if candidate.format("%Y%m%d").to_string() != request.day {
@@ -709,8 +711,25 @@ fn allocate_segment_directory(
                 });
             }
         }
+        let _allocation = solstone_core_segment::output_attempt::SegmentMutation::acquire(
+            &path,
+            solstone_core_journal_io::LockOptions::default(),
+        )
+        .map_err(|error| ImportError::AudioSegmentDirectory {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
         match fs::create_dir(&path) {
-            Ok(()) => return Ok((segment, path)),
+            Ok(()) => {
+                let admitted =
+                    solstone_core_journal_io::JournalRoot::open(&path).map_err(|error| {
+                        ImportError::AudioSegmentDirectory {
+                            path: path.clone(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                return Ok((segment, path, admitted));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(ImportError::AudioSegmentDirectory {
@@ -768,6 +787,149 @@ fn native_duration_probe(path: &Path) -> Result<f64, AudioProbeError> {
 }
 
 fn native_remux_slice(
+    source: &Path,
+    output: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+) -> Result<(), AudioSliceError> {
+    publish_audio_slice(
+        source,
+        output,
+        start_seconds,
+        duration_seconds,
+        remux_slice_to_stage,
+    )
+}
+
+fn publish_audio_slice(
+    source: &Path,
+    output: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+    remux: impl FnOnce(&Path, &Path, f64, f64) -> Result<(), AudioSliceError>,
+) -> Result<(), AudioSliceError> {
+    let failure = |error: std::io::Error| AudioSliceError::InputUnreadable {
+        detail: error.to_string(),
+    };
+    let parent = output
+        .parent()
+        .ok_or_else(|| failure(std::io::Error::other("audio output has no parent")))?;
+    let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+        [output.with_extension("jsonl")],
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(failure)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".remux-stage-")
+        .tempdir_in(parent)
+        .map_err(failure)?;
+    let staged_output = staging.path().join(output.file_name().unwrap_or_default());
+    remux(source, &staged_output, start_seconds, duration_seconds)?;
+    let _commit = claims.commit(parent).map_err(failure)?;
+    if fs::symlink_metadata(output).is_ok() {
+        return Err(failure(std::io::Error::other(
+            "audio output appeared before publication",
+        )));
+    }
+    solstone_core_journal_io::install_file(
+        &staged_output,
+        output,
+        solstone_core_journal_io::AtomicWriteOptions::default(),
+    )
+    .map_err(|error| AudioSliceError::InputUnreadable {
+        detail: error.to_string(),
+    })
+}
+
+fn remove_failed_audio_segment(
+    segment: &Path,
+    admitted: &solstone_core_journal_io::JournalRoot,
+) -> Result<(), std::io::Error> {
+    let claims =
+        solstone_core_segment::output_attempt::OutputClaims::discover(segment, Default::default())?;
+    let _commit = claims.commit(segment)?;
+    admitted
+        .revalidate_canonical_binding()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    fs::remove_dir_all(segment)
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn raw_remux_publication_keeps_attempt_outside_segment_and_refuses_stale_or_deleted_parent() {
+        for mutation in ["unchanged", "deleted", "replaced"] {
+            let root = tempfile::tempdir().unwrap();
+            let segment = root.path().join("segment");
+            fs::create_dir(&segment).unwrap();
+            let output = segment.join("imported_audio.flac");
+            let result =
+                publish_audio_slice(Path::new("unused"), &output, 0.0, 1.0, |_, staged, _, _| {
+                    let options = solstone_core_journal_io::LockOptions {
+                        timeout: Duration::ZERO,
+                        ..Default::default()
+                    };
+                    assert!(
+                        solstone_core_journal_io::hold_lock(
+                            output.with_extension("jsonl"),
+                            options
+                        )
+                        .is_err()
+                    );
+                    assert!(solstone_core_journal_io::hold_lock(&segment, options).is_ok());
+                    fs::write(staged, b"synthetic remux").unwrap();
+                    match mutation {
+                        "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
+                        "replaced" => {
+                            fs::rename(&segment, root.path().join("previous")).unwrap();
+                            fs::create_dir(&segment).unwrap();
+                        }
+                        _ => (),
+                    }
+                    Ok(())
+                });
+            if mutation == "unchanged" {
+                result.unwrap();
+                assert_eq!(fs::read(output).unwrap(), b"synthetic remux");
+            } else {
+                assert!(result.is_err(), "{mutation}");
+                assert!(!output.exists(), "{mutation}");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_slice_cleanup_preserves_owner_deletion_and_reused_directories() {
+        for mutation in ["unchanged", "deleted", "replaced"] {
+            let root = tempfile::tempdir().unwrap();
+            let segment = root.path().join("segment");
+            fs::create_dir(&segment).unwrap();
+            let admitted = solstone_core_journal_io::JournalRoot::open(&segment).unwrap();
+            match mutation {
+                "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
+                "replaced" => {
+                    fs::rename(&segment, root.path().join("previous")).unwrap();
+                    fs::create_dir(&segment).unwrap();
+                    fs::write(segment.join("owner.txt"), b"keep").unwrap();
+                }
+                _ => (),
+            }
+            let result = remove_failed_audio_segment(&segment, &admitted);
+            if mutation == "unchanged" {
+                result.unwrap();
+                assert!(!segment.exists());
+            } else {
+                assert!(result.is_err());
+                assert!(segment.exists());
+            }
+        }
+    }
+}
+
+fn remux_slice_to_stage(
     source: &Path,
     output: &Path,
     start_seconds: f64,

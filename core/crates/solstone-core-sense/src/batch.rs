@@ -403,6 +403,13 @@ pub fn delete_outputs(
         if segment_filter.is_some_and(|value| value != segment.key()) {
             continue;
         }
+        let admitted =
+            solstone_core_journal_io::JournalRoot::open(segment.path()).map_err(|error| {
+                BatchError::Scan {
+                    path: segment.path().to_path_buf(),
+                    source: std::io::Error::other(error.to_string()),
+                }
+            })?;
         for entry in fs::read_dir(segment.path()).map_err(|source| BatchError::Scan {
             path: segment.path().to_path_buf(),
             source,
@@ -437,6 +444,30 @@ pub fn delete_outputs(
             }
             deleted.push(path.clone());
             if !dry_run {
+                let failure = |source| BatchError::Delete {
+                    path: path.clone(),
+                    source,
+                };
+                let claims = solstone_core_segment::output_attempt::OutputClaims::acquire(
+                    [path.clone()],
+                    solstone_core_journal_io::LockOptions::default(),
+                )
+                .map_err(failure)?;
+                let _commit = claims.commit(segment.path()).map_err(failure)?;
+                admitted
+                    .revalidate_canonical_binding()
+                    .map_err(|error| failure(std::io::Error::other(error.to_string())))?;
+                if !fs::symlink_metadata(&path)
+                    .map_err(failure)?
+                    .file_type()
+                    .is_file()
+                    || (matches!(reprocess, ReprocessKind::All)
+                        && !has_exact_media_source(segment.path(), &path))
+                {
+                    return Err(failure(std::io::Error::other(
+                        "reprocess selection changed before deletion",
+                    )));
+                }
                 // A journal rel is `/`-separated on every platform; the native
                 // spelling carries backslashes on Windows, which `sync_dir` refuses.
                 let parent = path
@@ -934,6 +965,65 @@ mod tests {
                 .expect("screen scan"),
             vec![output]
         );
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn reprocess_waits_for_output_attempt_and_preserves_late_owner_deletion() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for deleted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let directory = segment(temp.path());
+            let output = directory.join("audio.jsonl");
+            fs::write(&output, b"proof").unwrap();
+            let claim = solstone_core_segment::output_attempt::OutputClaims::acquire(
+                [output.clone()],
+                Default::default(),
+            )
+            .unwrap();
+            let journal = temp.path().to_path_buf();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx
+                    .send(delete_outputs(
+                        &journal,
+                        &journal.join("chronicle/20260812"),
+                        ReprocessKind::Audio,
+                        None,
+                        None,
+                        false,
+                    ))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            assert!(
+                solstone_core_journal_io::hold_lock(
+                    &directory,
+                    solstone_core_journal_io::LockOptions {
+                        timeout: Duration::ZERO,
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+            );
+            if deleted {
+                fs::write(directory.join("tombstone.json"), b"{}").unwrap();
+            }
+            drop(claim);
+            let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            if deleted {
+                assert!(result.is_err());
+                assert_eq!(fs::read(&output).unwrap(), b"proof");
+            } else {
+                assert_eq!(result.unwrap(), vec![output.clone()]);
+                assert!(!output.exists());
+            }
+        }
     }
 
     #[test]
