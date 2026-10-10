@@ -307,7 +307,8 @@ UV_OPTIONAL_GOALS := \
 	check-rust-unit check-rust-doc check-rust-test check-rust-race \
 	check-rust-journal-mcp-endpoint \
 	check-rust-android check-rust-android-prepared \
-	\
+	build-mobile-android build-mobile-ios \
+	check-mobile-native-android check-mobile-native-ios check-mobile-native-driver \
 	check-rust-ios check-rust-macos check-rust-windows check-rust-deny check-rust-describe-cli-stubs \
 	require-win-remote-host sync-win-host win-host-ci \
 	check-rust-vad-analyze-test build-sandbox-processing check-rust-sandbox-processing-build check-rust-onnx-stage check-rust-onnx-ready check-rust-onnx-test \
