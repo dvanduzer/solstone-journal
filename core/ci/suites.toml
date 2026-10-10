@@ -1125,7 +1125,8 @@ areas = ["backup"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
+features = ["full-tests"]
 runtime = "none"
 
 [[package_suites]]
