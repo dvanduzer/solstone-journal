@@ -8,7 +8,7 @@
 //! Lock entries are persistent; removing one would split its lock namespace.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use solstone_core_journal_io::{
     BoundParentLock, JournalRoot, LockOptions, acquire_existing_parent_lock_bound,
+    open_existing_parent_lock_bound,
 };
 use solstone_core_processing_record::media::is_media_extension;
 
@@ -84,6 +85,24 @@ impl DirectoryBinding {
     }
 }
 
+// Existing hold_lock entries may have the caller's ordinary file mode. Open
+// the existing inode without changing permissions; only new entries need the
+// bound creation primitive's private mode. Both paths refuse namespace swaps.
+fn acquire_bound(
+    root: &JournalRoot,
+    name: &OsStr,
+    options: LockOptions,
+) -> Result<BoundParentLock> {
+    if let Some(lock) =
+        open_existing_parent_lock_bound(root, name, options.timeout, options.poll_interval)
+            .map_err(|error| refusal(error.to_string()))?
+    {
+        return Ok(lock);
+    }
+    acquire_existing_parent_lock_bound(root, name, options.timeout, options.poll_interval)
+        .map_err(|error| refusal(error.to_string()))
+}
+
 /// Names observed before acquiring a segment-wide collection of attempts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputDiscovery {
@@ -147,15 +166,7 @@ impl OutputClaims {
             }
             let root = &parents[path];
             root.revalidate()?;
-            locks.push(
-                acquire_existing_parent_lock_bound(
-                    &root.root,
-                    &lock_name(output)?,
-                    options.timeout,
-                    options.poll_interval,
-                )
-                .map_err(|error| refusal(error.to_string()))?,
-            );
+            locks.push(acquire_bound(&root.root, &lock_name(output)?, options)?);
             root.revalidate()?;
         }
         Ok(Self {
@@ -197,13 +208,7 @@ impl OutputClaims {
     pub fn commit(&self, segment: &Path) -> Result<SegmentCommit<'_>> {
         self.validate_parent(segment)?;
         let segment_parent = admit(parent(segment)?)?;
-        let lock = acquire_existing_parent_lock_bound(
-            &segment_parent,
-            &lock_name(segment)?,
-            self.options.timeout,
-            self.options.poll_interval,
-        )
-        .map_err(|error| refusal(error.to_string()))?;
+        let lock = acquire_bound(&segment_parent, &lock_name(segment)?, self.options)?;
         revalidate(&segment_parent)?;
         for binding in self.parents.values() {
             binding.revalidate()?;
@@ -242,13 +247,7 @@ impl SegmentMutation {
     /// Acquire after output attempts, when any exist. Does not create ancestors.
     pub fn acquire(segment: &Path, options: LockOptions) -> Result<Self> {
         let root = admit(parent(segment)?)?;
-        let lock = acquire_existing_parent_lock_bound(
-            &root,
-            &lock_name(segment)?,
-            options.timeout,
-            options.poll_interval,
-        )
-        .map_err(|error| refusal(error.to_string()))?;
+        let lock = acquire_bound(&root, &lock_name(segment)?, options)?;
         revalidate(&root)?;
         live(segment)?;
         Ok(Self {
@@ -268,7 +267,7 @@ struct RawFacts {
     identity: solstone_core_journal_io::WindowsFileIdentity,
 }
 
-fn raw_facts(path: &Path) -> Result<RawFacts> {
+fn raw_facts(path: &Path) -> Result<(RawFacts, File)> {
     let named = fs::symlink_metadata(path)?;
     if !named.file_type().is_file() {
         return Err(refusal("processing input is not a plain file"));
@@ -299,17 +298,23 @@ fn raw_facts(path: &Path) -> Result<RawFacts> {
     if size != metadata.len() || file.metadata()?.len() != size {
         return Err(refusal("processing input changed while reading"));
     }
-    Ok(RawFacts {
-        size,
-        digest: digest.finalize().into(),
-        identity,
-    })
+    Ok((
+        RawFacts {
+            size,
+            digest: digest.finalize().into(),
+            identity,
+        },
+        file,
+    ))
 }
 
 /// Exact raw input admitted under its output attempt before decoding/inference.
 pub struct InputObservation {
     path: PathBuf,
     facts: RawFacts,
+    // Keep the admitted inode alive through the attempt. Otherwise unlink and
+    // recreate can reuse an inode number and make equal bytes look unchanged.
+    _input: File,
 }
 
 impl InputObservation {
@@ -320,11 +325,12 @@ impl InputObservation {
         }
         claims.validate_parent(parent(path)?)?;
         live(parent(path)?)?;
-        let facts = raw_facts(path)?;
+        let (facts, input) = raw_facts(path)?;
         claims.validate_parent(parent(path)?)?;
         Ok(Self {
             path: path.to_path_buf(),
             facts,
+            _input: input,
         })
     }
 
@@ -339,7 +345,7 @@ impl InputObservation {
             return Err(refusal("input has no output attempt"));
         }
         let commit = claims.commit(parent(&self.path)?)?;
-        if raw_facts(&self.path)? != self.facts {
+        if raw_facts(&self.path)?.0 != self.facts {
             return Err(refusal("processing input changed before publication"));
         }
         Ok(commit)
@@ -353,13 +359,7 @@ pub fn prepare_segment(segment: &Path) -> Result<()> {
         .map_err(|error| refusal(error.to_string()))?;
     let root = admit(directory)?;
     let options = LockOptions::default();
-    let _lock = acquire_existing_parent_lock_bound(
-        &root,
-        &lock_name(segment)?,
-        options.timeout,
-        options.poll_interval,
-    )
-    .map_err(|error| refusal(error.to_string()))?;
+    let _lock = acquire_bound(&root, &lock_name(segment)?, options)?;
     revalidate(&root)?;
     live(segment)?;
     solstone_core_journal_io::ensure_directory(segment)
@@ -390,6 +390,48 @@ mod tests {
     }
 
     #[test]
+    fn existing_writer_sidecars_keep_their_inode_and_mode() {
+        let (_root, segment, raw) = fixture();
+        let output = raw.with_extension("jsonl");
+        // hold_lock is the preexisting writer/retention namespace.
+        drop(
+            solstone_core_journal_io::hold_lock(
+                &output,
+                LockOptions {
+                    mode: Some(0o644),
+                    ..no_wait()
+                },
+            )
+            .unwrap(),
+        );
+        drop(
+            solstone_core_journal_io::hold_lock(
+                &segment,
+                LockOptions {
+                    mode: Some(0o644),
+                    ..no_wait()
+                },
+            )
+            .unwrap(),
+        );
+        #[cfg(unix)]
+        let before = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(output.with_extension("jsonl.lock")).unwrap();
+            (metadata.ino(), metadata.mode())
+        };
+        let claims = OutputClaims::acquire([output.clone()], no_wait()).unwrap();
+        let input = InputObservation::capture(&claims, &raw).unwrap();
+        let _commit = input.commit(&claims).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(output.with_extension("jsonl.lock")).unwrap();
+            assert_eq!((metadata.ino(), metadata.mode()), before);
+        }
+    }
+
+    #[test]
     fn unchanged_input_publishes_and_same_size_rewrite_refuses() {
         let (_root, segment, raw) = fixture();
         let claims = OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).unwrap();
@@ -401,6 +443,16 @@ mod tests {
         fs::write(&raw, b"after!").unwrap();
         assert!(input.commit(&claims).is_err());
         assert_eq!(fs::read(segment.join("audio.jsonl")).unwrap(), b"proof");
+    }
+
+    #[test]
+    fn identical_bytes_at_a_recreated_raw_name_are_a_different_input() {
+        let (_root, _segment, raw) = fixture();
+        let claims = OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).unwrap();
+        let input = InputObservation::capture(&claims, &raw).unwrap();
+        fs::remove_file(&raw).unwrap();
+        fs::write(&raw, b"before").unwrap();
+        assert!(input.commit(&claims).is_err());
     }
 
     #[test]
