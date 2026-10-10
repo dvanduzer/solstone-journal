@@ -21,6 +21,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- moving a segment now stops if another operation is changing either its current directory or the directory it would move to. try the move again once that operation finishes.
+
 - a week your journal makes after you've deleted every segment of a conversation now leaves that conversation's words out of "said by you". before, they could still appear there.
 - `solstone call health pipeline --day DAY` now says when it couldn't read a day's processing record, as `scan_failed` with a reason. before, on a day with a very large record, it said the day's recordings hadn't been processed.
 - on the entities page, when your journal refuses something you asked for, such as a merge or a restore, it now says why, for example that one side of a merge is blocked. before, it often said only "Entity request refused".

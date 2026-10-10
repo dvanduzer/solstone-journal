@@ -126,6 +126,27 @@ pub fn available_segment_key(
 pub fn relocate_segment(
     relocation: &Relocation<'_>,
 ) -> Result<RelocationOutcome, RelocationRefusal> {
+    ensure_directory(&relocation.journal.join(&relocation.destination.parent_rel))
+        .map_err(|error| RelocationRefusal::Failed(RelocationError(error.to_string())))?;
+    let _live_locks = claim_pivots([
+        relocation.source.path.clone(),
+        relocation.destination.path.clone(),
+    ])
+    .map_err(RelocationRefusal::Failed)?;
+    let admitted = solstone_core_journal_io::JournalRoot::open(&relocation.source.path)
+        .map_err(|error| RelocationRefusal::Failed(RelocationError(error.to_string())))?;
+    admitted
+        .revalidate_canonical_binding()
+        .map_err(|error| RelocationRefusal::Failed(RelocationError(error.to_string())))?;
+    for path in [&relocation.source.path, &relocation.destination.path] {
+        if crate::owner_deleted(path)
+            .map_err(|error| RelocationRefusal::Failed(RelocationError(error.to_string())))?
+        {
+            return Err(RelocationRefusal::Failed(RelocationError::new(
+                "segment was deleted by its owner",
+            )));
+        }
+    }
     move_directory(relocation)?;
     let destination = relocation.destination;
     let mut mutated_days = BTreeSet::from([relocation.source.day.clone(), destination.day.clone()]);
@@ -154,6 +175,35 @@ pub fn relocate_segment(
         tail,
         mutated_days,
     })
+}
+
+// Existing agent-memory advancement holds current then predecessor. Pivots
+// must not wait with one live name held: nonblocking acquisition prevents a
+// cycle with that holder regardless of chronological/path ordering.
+fn claim_pivots(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<Vec<solstone_core_journal_io::ExistingParentLock>, RelocationError> {
+    let mut locks = Vec::new();
+    for path in paths.into_iter().collect::<BTreeSet<_>>() {
+        let parent = path
+            .parent()
+            .ok_or_else(|| RelocationError::new("segment has no parent"))?;
+        let mut name = path
+            .file_name()
+            .ok_or_else(|| RelocationError::new("segment has no name"))?
+            .to_os_string();
+        name.push(".lock");
+        locks.push(
+            solstone_core_journal_io::acquire_existing_parent_lock(
+                parent,
+                &name,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            )
+            .map_err(|error| RelocationError(error.to_string()))?,
+        );
+    }
+    Ok(locks)
 }
 
 fn move_directory(relocation: &Relocation<'_>) -> Result<(), RelocationRefusal> {
@@ -347,6 +397,10 @@ pub fn restructure_segments_by_stream(
     for (segment, stream) in plan {
         let Some(stream) = stream else {
             if !dry_run {
+                let _live_locks = claim_pivots([segment.clone()])?;
+                if !is_empty_segment(&segment)? {
+                    return Err(RelocationError::new("segment changed during restructure"));
+                }
                 remove_dir_all(journal, &relative(journal, &segment)?)
                     .map_err(|error| RelocationError(error.to_string()))?;
             }
@@ -364,6 +418,14 @@ pub fn restructure_segments_by_stream(
         if !dry_run {
             ensure_directory(&parent.join(&stream))
                 .map_err(|error| RelocationError(error.to_string()))?;
+            let destination = parent.join(&stream).join(name);
+            let _live_locks = claim_pivots([segment.clone(), destination.clone()])?;
+            if crate::owner_deleted(&segment).map_err(|error| RelocationError(error.to_string()))?
+                || crate::owner_deleted(&destination)
+                    .map_err(|error| RelocationError(error.to_string()))?
+            {
+                return Err(RelocationError::new("segment was deleted by its owner"));
+            }
             // Python's `shutil.move` performs no destination pre-check here;
             // the restructure runs against a flat layout it has just proven
             // has no stream directory of this name holding this key.

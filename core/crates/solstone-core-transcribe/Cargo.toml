@@ -20,6 +20,7 @@ path = "tests/transcription_transports.rs"
 required-features = ["test-hooks"]
 
 [dependencies]
+solstone-core-segment.workspace = true
 log.workspace = true
 thiserror.workspace = true
 chrono = { workspace = true }
