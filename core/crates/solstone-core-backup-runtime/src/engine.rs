@@ -1630,17 +1630,31 @@ struct ArchiveConfiguration {
     binding: Option<HostedBinding>,
 }
 
+const MAX_ARCHIVE_CONFIGURATION_BYTES: usize = 1024 * 1024;
+
 impl ArchiveConfiguration {
     fn read(root: &JournalRoot) -> Result<Self, ArchiveError> {
         root.revalidate_canonical_binding()
             .map_err(|_| ArchiveError::JournalIdentityChanged)?;
-        let config = get_backup_config(root.canonical_path())
-            .map_err(|_| ArchiveError::ConfigurationUnavailable)?;
+        let raw = Self::read_object(root, Path::new("config/journal.json"))?;
+        let config = solstone_core_backup::merge_backup_config(&raw);
         let binding = if config.get("mode") == Some(&Value::String("operated".into())) {
-            Some(
-                solstone_core_backup::load_hosted_binding(root.canonical_path())
-                    .ok_or(ArchiveError::ConfigurationUnavailable)?,
-            )
+            let raw = Self::read_object(root, Path::new("backup/hosted/binding.json"))?;
+            let nonblank = |key| {
+                raw.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or(ArchiveError::ConfigurationUnavailable)
+            };
+            Some(HostedBinding {
+                broker_endpoint: nonblank("broker_endpoint")?,
+                account_id: nonblank("account_id")?,
+                instance_id: nonblank("instance_id")?,
+                bucket: nonblank("bucket")?,
+                prefix: nonblank("prefix")?,
+                broker_token: nonblank("broker_token")?,
+            })
         } else {
             None
         };
@@ -1663,6 +1677,20 @@ impl ArchiveConfiguration {
         })
         .collect();
         Ok(Self { settings, binding })
+    }
+
+    fn read_object(
+        root: &JournalRoot,
+        relative: &Path,
+    ) -> Result<Map<String, Value>, ArchiveError> {
+        let observed = solstone_core_journal_io::read_relative_file_bounded(
+            root,
+            relative,
+            MAX_ARCHIVE_CONFIGURATION_BYTES,
+        )
+        .map_err(|_| ArchiveError::ConfigurationUnavailable)?
+        .ok_or(ArchiveError::ConfigurationUnavailable)?;
+        serde_json::from_slice(&observed.bytes).map_err(|_| ArchiveError::ConfigurationUnavailable)
     }
 }
 
@@ -2824,6 +2852,158 @@ mod tests {
             );
             assert_eq!(runner.requests.borrow().len(), 2);
             assert!(runner.outputs.borrow().is_empty());
+        }
+
+        #[test]
+        fn missing_configuration_or_binding_refuses_before_remote_work() {
+            for relative in ["config/journal.json", "backup/hosted/binding.json"] {
+                let (journal, root) = fixture();
+                let _http = hosted(journal.path(), "1970-01-01T02:00:00Z");
+                fs::remove_file(journal.path().join(relative)).unwrap();
+                let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+                assert_eq!(
+                    refusal(admit_archive(root, &services)),
+                    ArchiveError::ConfigurationUnavailable
+                );
+            }
+        }
+
+        #[test]
+        fn configuration_and_binding_require_bounded_json_objects() {
+            for relative in ["config/journal.json", "backup/hosted/binding.json"] {
+                for contents in ["", "{", "[]", "null", "42"] {
+                    let (journal, root) = fixture();
+                    let _http = hosted(journal.path(), "1970-01-01T02:00:00Z");
+                    fs::write(journal.path().join(relative), contents).unwrap();
+                    let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+                    assert_eq!(
+                        refusal(admit_archive(root, &services)),
+                        ArchiveError::ConfigurationUnavailable
+                    );
+                }
+                let (journal, root) = fixture();
+                let _http = hosted(journal.path(), "1970-01-01T02:00:00Z");
+                let path = journal.path().join(relative);
+                let mut oversized: Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                oversized["padding"] = json!("x".repeat(MAX_ARCHIVE_CONFIGURATION_BYTES));
+                fs::write(path, serde_json::to_vec(&oversized).unwrap()).unwrap();
+                let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+                assert_eq!(
+                    refusal(admit_archive(root, &services)),
+                    ArchiveError::ConfigurationUnavailable
+                );
+            }
+        }
+
+        #[test]
+        fn retained_binding_preserves_nonblank_field_requirements() {
+            for key in [
+                "broker_endpoint",
+                "account_id",
+                "instance_id",
+                "bucket",
+                "prefix",
+                "broker_token",
+            ] {
+                for value in [Value::Null, json!(" \t"), json!(1)] {
+                    let (journal, root) = fixture();
+                    let _http = hosted(journal.path(), "1970-01-01T02:00:00Z");
+                    let path = journal.path().join("backup/hosted/binding.json");
+                    let mut binding: Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    binding[key] = value;
+                    fs::write(&path, serde_json::to_vec(&binding).unwrap()).unwrap();
+                    let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+                    assert_eq!(
+                        refusal(admit_archive(root, &services)),
+                        ArchiveError::ConfigurationUnavailable
+                    );
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn symlinked_configuration_and_binding_descendants_refuse() {
+            for relative in [
+                "config",
+                "config/journal.json",
+                "backup/hosted",
+                "backup/hosted/binding.json",
+            ] {
+                let (journal, root) = fixture();
+                let _http = hosted(journal.path(), "1970-01-01T02:00:00Z");
+                let path = journal.path().join(relative);
+                let retained = path.with_extension("retained");
+                fs::rename(&path, &retained).unwrap();
+                std::os::unix::fs::symlink(&retained, &path).unwrap();
+                let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+                assert_eq!(
+                    refusal(admit_archive(root, &services)),
+                    ArchiveError::ConfigurationUnavailable
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn nonplain_configuration_and_binding_files_refuse_without_blocking() {
+            for relative in ["config/journal.json", "backup/hosted/binding.json"] {
+                for fifo in [false, true] {
+                    let (journal, root) = fixture();
+                    let _http = hosted(journal.path(), "1970-01-01T02:00:00Z");
+                    let path = journal.path().join(relative);
+                    fs::remove_file(&path).unwrap();
+                    if fifo {
+                        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).unwrap();
+                    } else {
+                        fs::create_dir(&path).unwrap();
+                    }
+                    let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+                    assert_eq!(
+                        refusal(admit_archive(root, &services)),
+                        ArchiveError::ConfigurationUnavailable
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn replacement_configuration_or_binding_refuses_during_admission() {
+            for replace_binding in [false, true] {
+                let (journal, root) = fixture();
+                let http = hosted(journal.path(), "1970-01-01T02:00:00Z");
+                let mut runner = script(vec![repo(REPOSITORY_ID)]);
+                let journal_path = journal.path().to_path_buf();
+                runner.hook = Some(Box::new(move |_| {
+                    let relative = if replace_binding {
+                        "backup/hosted/binding.json"
+                    } else {
+                        "config/journal.json"
+                    };
+                    let path = journal_path.join(relative);
+                    fs::rename(&path, path.with_extension("retained")).unwrap();
+                    if replace_binding {
+                        let mut binding = hosted_binding("https://broker");
+                        binding.prefix = "replacement".into();
+                        solstone_core_backup::save_hosted_binding(&journal_path, &binding).unwrap();
+                    } else {
+                        let mut config = valid_backup_section(valid_destination());
+                        config["mode"] = json!("operated");
+                        config["enabled"] = json!(false);
+                        write_backup_section(&journal_path, config);
+                    }
+                }));
+                let mut services = services(&runner, &http, &FixedClock, &Maintenance);
+                services.rclone_path = Some(Path::new("/fixture/bin/rclone"));
+                assert_eq!(
+                    refusal(admit_archive(root, &services)),
+                    ArchiveError::ConfigurationChanged
+                );
+                assert_eq!(runner.requests.borrow().len(), 1);
+                assert_eq!(http.requests.borrow().len(), 1);
+            }
         }
 
         #[test]
