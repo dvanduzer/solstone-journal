@@ -79,7 +79,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::Search,
         wire_name: "search",
-        description: "Search what this connection may see of the owner's journal: summaries of days and conversations, activities, and notes about people and projects. Use a few keywords such as names or topics, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. Raw transcripts are not searched; use list_transcripts and get_transcript for what was said. Read source context to answer questions about promises or decisions; a summary alone does not establish whether something happened. When nothing matches, say so rather than guessing.",
+        description: "Search what this connection may see of the owner's journal: short summaries of conversations and work sessions, activities and their stories, imported documents and calendar events, and notes about people and projects. Use a few keywords such as names or topics, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. Search does not read conversations word for word. When a result lists transcript segments, read them with get_transcript before saying who said, promised or decided something. When a result shows more_segments, fetch it for more. When nothing matches, say so rather than guessing.",
         input_schema: search_input_schema,
         requires: TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::Search,
@@ -87,7 +87,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::Fetch,
         wire_name: "fetch",
-        description: "Read the full text of an entry returned by search. Pass its reference unchanged.",
+        description: "Read the full text of an entry returned by search. Pass its reference unchanged. When the entry lists transcript segments, read them with get_transcript. If it still shows more_segments, call list_transcripts for that day and the entry's time.",
         input_schema: fetch_input_schema,
         requires: TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::Fetch,
@@ -95,7 +95,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::ListTranscripts,
         wire_name: "list_transcripts",
-        description: "List transcript segments this connection may read, optionally for one day (YYYYMMDD or YYYY-MM-DD). Read one with get_transcript.",
+        description: "List transcript segments this connection may read, each with its time. Give one day (YYYYMMDD or YYYY-MM-DD), and a time range within it when you know one; without a day, the newest days come first. When more remain, pass next_cursor as cursor to continue. Read one with get_transcript.",
         input_schema: list_transcripts_input_schema,
         requires: TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::ListTranscripts,
@@ -103,7 +103,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::GetTranscript,
         wire_name: "get_transcript",
-        description: "Read what was said in one transcript segment returned by list_transcripts.",
+        description: "Read what was said in one transcript segment, from a search result or from list_transcripts. When it returns next_cursor, pass it as cursor to read the rest. When it says untimed, the times are not real. If a segment can't be read, search again or list that day.",
         input_schema: transcript_input_schema,
         requires: TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::GetTranscript,
@@ -308,7 +308,10 @@ fn list_transcripts_input_schema(context: &SchemaContext<'_>) -> Value {
         "additionalProperties": false,
         "properties": {
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
             "day": { "type": "string", "minLength": 1, "maxLength": MAX_DAY_BYTES, "pattern": DAY_PATTERN, "description": DAY_DESCRIPTION },
+            "time_from": { "type": "string", "description": "Start of a time range within day, as HH:MM." },
+            "time_to": { "type": "string", "description": "End of a time range within day, as HH:MM." },
         }
     });
     with_scoped_facet(schema, context)
@@ -556,22 +559,18 @@ mod tests {
         let context = context(&categories, &facet_ids);
         for schema in [
             list_facets_input_schema(&context),
-            list_transcripts_input_schema(&context),
             list_entities_input_schema(&context),
         ] {
             assert_eq!(schema["additionalProperties"], false);
             assert!(schema["properties"].get("cursor").is_none());
         }
-        assert!(
-            list_transcripts_input_schema(&context)["properties"]
-                .get("day")
-                .is_some()
-        );
-        assert!(
-            list_transcripts_input_schema(&context)["properties"]
-                .get("facet")
-                .is_some()
-        );
+        let transcript_schema = list_transcripts_input_schema(&context);
+        assert_eq!(transcript_schema["additionalProperties"], false);
+        assert!(transcript_schema["properties"].get("cursor").is_some());
+        assert!(transcript_schema["properties"].get("day").is_some());
+        assert!(transcript_schema["properties"].get("time_from").is_some());
+        assert!(transcript_schema["properties"].get("time_to").is_some());
+        assert!(transcript_schema["properties"].get("facet").is_some());
         assert!(
             list_entities_input_schema(&context)["properties"]
                 .get("facet")
@@ -582,9 +581,8 @@ mod tests {
             MAX_QUERY_BYTES
         );
         assert!(crate::tools::facets::validate(Some(&json!({"cursor": "nope"}))).is_err());
-        assert!(
-            crate::tools::transcripts::validate_list(Some(&json!({"cursor": "nope"}))).is_err()
-        );
+        assert!(crate::tools::transcripts::validate_list(Some(&json!({"cursor": "nope"}))).is_ok());
+        assert!(crate::tools::transcripts::validate_list(Some(&json!({"cursor": ""}))).is_err());
         assert!(crate::tools::entities::validate_list(Some(&json!({"cursor": "nope"}))).is_err());
     }
 
@@ -596,6 +594,10 @@ mod tests {
         let opaque = "x".repeat(MAX_OPAQUE_REFERENCE_BYTES);
         assert_eq!(
             search_input_schema(&context)["properties"]["cursor"]["maxLength"],
+            MAX_OPAQUE_REFERENCE_BYTES
+        );
+        assert_eq!(
+            list_transcripts_input_schema(&context)["properties"]["cursor"]["maxLength"],
             MAX_OPAQUE_REFERENCE_BYTES
         );
         assert_eq!(

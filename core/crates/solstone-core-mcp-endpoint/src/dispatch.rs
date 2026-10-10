@@ -4,7 +4,6 @@
 //! Shared, transport-independent execution of authenticated MCP tool calls.
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -21,8 +20,11 @@ use solstone_core_indexer_query::{
     search_connection,
 };
 use solstone_core_indexer_store::classification::{FacetDeclarationSet, classify_source};
-use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
+use solstone_core_journal_io::paths::{
+    PathOrDay, day_dirs, iter_segments, iter_segments_skipping_unreadable_streams,
+};
 use solstone_core_memory_original::{OriginalRead, read_original};
+use solstone_core_transcripts::segment_clock;
 
 use solstone_core_mcp_audit::{Admission, AuditCoordinates, Outcome, result_shape};
 
@@ -30,9 +32,10 @@ use crate::audit;
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision, evaluate_connection_read};
 use crate::references::{
     CursorReference, EntityReference, EntryReference, ReferenceCodec, ReferenceKind,
-    ReferenceTarget, SegmentReference,
+    ReferenceTarget, SegmentReference, TranscriptListCursor,
 };
 use crate::registry::{ToolEntry, category_token, find_tool, snapshot_allows};
+use crate::segment_links::{LinkSubject, LiveTranscriptPages, issue_segment_links};
 use crate::tools::{
     ToolError, ValidatedFetch, ValidatedGetEntity, ValidatedGetTranscript, ValidatedListEntities,
     ValidatedListFacets, ValidatedListTranscripts, ValidatedSearch, ValidatedTool,
@@ -53,11 +56,12 @@ static REFERENCES: OnceLock<ReferenceCodec> = OnceLock::new();
 // The plain-words reading of each empty result. ⚠ Search does not cover raw
 // transcripts (`coverage.transcript_index`), so an empty search must never be
 // worded as "the journal has nothing".
-const SEARCH_EMPTY: &str = "No results. Nothing this connection can see in the journal's \
-index matches this search. This is a complete answer, not an error. The index does not include \
-raw transcripts: if the owner named a day, call list_transcripts for that day, then \
-get_transcript to read what was said. Otherwise tell the owner a search of the journal found \
-nothing on this, rather than reading transcripts or entities one by one.";
+const SEARCH_EMPTY: &str = "No results. Nothing this connection can search in the journal \
+matches this. This is a complete answer, not an error, but it does not show that something \
+never happened: search does not read conversations word for word. If the owner named a day, \
+call list_transcripts for that day, narrowed to any time they mention, then get_transcript. \
+Otherwise tell the owner a search of the journal found nothing on this, rather than reading \
+transcripts one by one.";
 const SEARCH_EMPTY_INCOMPLETE: &str = "No results, but this search did not check the whole \
 index, so it does not show the journal has nothing on this. Tell the owner the search came back \
 empty and may be incomplete.";
@@ -420,6 +424,11 @@ fn recorded_arguments(validated: &ValidatedTool) -> Map<String, Value> {
             arguments.insert("limit".to_owned(), request.limit.into());
             insert_present(&mut arguments, "day", request.day.as_deref());
             insert_present(&mut arguments, "facet", request.facet_id.as_deref());
+            insert_present(&mut arguments, "time_from", request.time_from.as_deref());
+            insert_present(&mut arguments, "time_to", request.time_to.as_deref());
+            if let Some(cursor) = request.cursor.as_deref() {
+                arguments.insert("cursor".to_owned(), reference_fingerprint(cursor).into());
+            }
         }
         ValidatedTool::GetTranscript(request) => {
             arguments.insert(
@@ -598,7 +607,7 @@ fn arguments_within_scope(snapshot: &ConnectionReadSnapshot, request: &Validated
     facet_ok && category_ok
 }
 
-fn boundary(
+pub(crate) fn boundary(
     snapshot: &ConnectionReadSnapshot,
     category: Option<AdmittedCategory>,
     facet: Option<&str>,
@@ -627,7 +636,7 @@ fn live_allows(
         .is_ok_and(|classification| boundary.allows_classification(&classification))
 }
 
-fn codec() -> &'static ReferenceCodec {
+pub(crate) fn codec() -> &'static ReferenceCodec {
     REFERENCES.get_or_init(|| {
         ReferenceCodec::new().expect("system randomness initializes MCP reference codec")
     })
@@ -663,6 +672,7 @@ fn search(
         })
         .transpose()?;
     let mut results = Vec::new();
+    let mut subjects_data = Vec::new();
     // The owner's coordinates for each hit released. ⚠ These never enter
     // `results`: the wire response carries no path or chunk index.
     let mut targets = Vec::new();
@@ -750,7 +760,7 @@ fn search(
                     ReferenceTarget::Entry(EntryReference {
                         day: hit.metadata.day.clone(),
                         stream: hit.metadata.stream.clone(),
-                        path: hit.metadata.path,
+                        path: hit.metadata.path.clone(),
                         idx: hit.metadata.idx,
                         row_id: hit.row_id,
                     }),
@@ -766,6 +776,7 @@ fn search(
                 value["origin"] = public_memory_origin(&origin);
             }
             results.push(value);
+            subjects_data.push((hit.metadata.path, hit.metadata.idx, hit.text));
             if results.len() == request.limit {
                 break;
             }
@@ -806,6 +817,35 @@ fn search(
         examined < MAX_SEARCH_EXAMINED_ROWS && !(live_dropped && results.len() < request.limit);
     let count = results.len();
     let complete = index_coverage_complete && live_examination_complete && !degraded;
+    let mut subjects: Vec<LinkSubject<'_>> = subjects_data
+        .iter()
+        .map(|(path, idx, text)| LinkSubject {
+            path,
+            idx: *idx,
+            text,
+            segments: Vec::new(),
+            more_segments: false,
+        })
+        .collect();
+    let mut checker = LiveTranscriptPages;
+    issue_segment_links(
+        journal_root,
+        principal,
+        snapshot,
+        &mut subjects,
+        3,
+        30,
+        &mut checker,
+    );
+    for (i, result) in results.iter_mut().enumerate() {
+        let subject = &subjects[i];
+        if !subject.segments.is_empty() {
+            result["segments"] = Value::Array(subject.segments.clone());
+        }
+        if subject.more_segments {
+            result["more_segments"] = Value::Bool(true);
+        }
+    }
     Ok(Prepared::new(
         json!({
             "results": results,
@@ -813,7 +853,7 @@ fn search(
             "coverage": {
                 "index_classification_complete": index_coverage_complete,
                 "live_examination_complete": live_examination_complete,
-                "transcript_index": "Raw transcript JSONL is not covered by index search.",
+                "transcript_index": "Search does not read conversations word for word. Read the segments a result lists with get_transcript.",
             },
             "degraded": degraded,
             "relaxed": relaxed,
@@ -921,6 +961,29 @@ fn fetch(
         let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
             .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
         value["origin"] = public_memory_origin(&origin);
+    }
+    let mut subjects = [LinkSubject {
+        path: &entry.path,
+        idx: entry.idx,
+        text: &text,
+        segments: Vec::new(),
+        more_segments: false,
+    }];
+    let mut checker = LiveTranscriptPages;
+    issue_segment_links(
+        journal_root,
+        principal,
+        snapshot,
+        &mut subjects,
+        48,
+        48,
+        &mut checker,
+    );
+    if !subjects[0].segments.is_empty() {
+        value["segments"] = Value::Array(subjects[0].segments.clone());
+    }
+    if subjects[0].more_segments {
+        value["more_segments"] = Value::Bool(true);
     }
     let target = format!("{}#{}", entry.path, entry.idx);
     Ok(Prepared::new(value, 1, vec![target]))
@@ -1161,72 +1224,243 @@ fn get_entity(
     Ok(Prepared::new(value, 1, targets))
 }
 
+fn is_after_cursor(
+    day: &str,
+    start_seconds: u32,
+    stream: &str,
+    name: &str,
+    cursor: Option<&TranscriptListCursor>,
+) -> bool {
+    let Some(cursor) = cursor else {
+        return true;
+    };
+    let cursor_start = segment_clock(&cursor.last_name)
+        .map(|c| c.start_seconds)
+        .unwrap_or(0);
+    match day.cmp(&cursor.last_day) {
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => {
+            (start_seconds, stream, name)
+                > (
+                    cursor_start,
+                    cursor.last_stream.as_str(),
+                    cursor.last_name.as_str(),
+                )
+        }
+    }
+}
+
 fn list_transcripts(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
     snapshot: &ConnectionReadSnapshot,
     request: ValidatedListTranscripts,
 ) -> Result<Prepared, DispatchError> {
+    let cursor = request
+        .cursor
+        .as_deref()
+        .map(|token| {
+            let ReferenceTarget::TranscriptList(cursor) = codec()
+                .resolve(
+                    token,
+                    ReferenceKind::TranscriptList,
+                    principal.connection,
+                    snapshot.generation,
+                )
+                .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?
+            else {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            };
+            if cursor.day != request.day
+                || cursor.time_from != request.time_from
+                || cursor.time_to != request.time_to
+                || cursor.facet != request.facet_id
+            {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+            Ok(cursor)
+        })
+        .transpose()?;
+
     let boundary = boundary(
         snapshot,
         Some(AdmittedCategory::Transcripts),
         request.facet_id.as_deref(),
     );
-    let chronicle = journal_root.join("chronicle");
+
+    let day_map =
+        day_dirs(journal_root).map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
+    let days: Vec<String> = if let Some(ref day) = request.day {
+        if day_map.contains_key(day) {
+            vec![day.clone()]
+        } else {
+            Vec::new()
+        }
+    } else {
+        let mut keys: Vec<String> = day_map.into_keys().collect();
+        keys.sort_unstable_by(|a, b| b.cmp(a));
+        keys
+    };
+
+    let parse_time_to_seconds = |t: &str| -> Option<u32> {
+        let (h, m) = t.split_once(':')?;
+        let h: u32 = h.parse().ok()?;
+        let m: u32 = m.parse().ok()?;
+        Some(h * 3600 + m * 60)
+    };
+
+    let time_filter =
+        if request.day.is_some() && (request.time_from.is_some() || request.time_to.is_some()) {
+            let from_sec = request
+                .time_from
+                .as_deref()
+                .and_then(parse_time_to_seconds)
+                .unwrap_or(0);
+            let to_sec = request
+                .time_to
+                .as_deref()
+                .and_then(parse_time_to_seconds)
+                .unwrap_or(86400);
+            Some((from_sec, to_sec))
+        } else {
+            None
+        };
+
     let mut segments = Vec::new();
     let mut targets = Vec::new();
-    // A journal that has recorded nothing yet has no `chronicle/`. That is an
-    // honest zero, not an unreadable file.
-    let days = match fs::read_dir(&chronicle) {
-        Ok(days) => days.filter_map(Result::ok).collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(_) => return Err(DispatchError::Tool(ToolError::FileUnreadable)),
-    };
-    for day in days {
-        let Some(day) = day.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if request.day.as_deref().is_some_and(|wanted| wanted != day) {
-            continue;
-        }
-        for segment in iter_segments(journal_root, PathOrDay::Day(&day))
-            .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?
-        {
-            if segments.len() == request.limit {
-                break;
-            }
+    let mut unreadable = 0;
+    let mut last_examined: Option<(String, String, String)> = None;
+    let mut has_more = false;
+
+    'outer: for day in &days {
+        let day_segments =
+            iter_segments_skipping_unreadable_streams(journal_root, PathOrDay::Day(day))
+                .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
+
+        let mut matching_segments = Vec::new();
+        for segment in day_segments {
             let Ok(identity) = segment.record_identity() else {
                 continue;
             };
-            let probe_path = segment_assignment_probe_path(&day, identity.stream, identity.name);
-            if !live_allows(journal_root, &boundary, &probe_path, Some(identity.stream)) {
+            let stream = identity.stream.to_string();
+            let name = identity.name.to_string();
+            let clock = segment_clock(&name);
+            if let Some((from_sec, to_sec)) = time_filter {
+                let Some(ref clock) = clock else {
+                    continue;
+                };
+                let start = clock.start_seconds;
+                let end = clock.exclusive_end_seconds;
+                if std::cmp::max(start, from_sec) >= std::cmp::min(end, to_sec) {
+                    continue;
+                }
+            }
+            matching_segments.push((segment, stream, name, clock));
+        }
+
+        matching_segments.sort_by(
+            |(_, stream_a, name_a, clock_a), (_, stream_b, name_b, clock_b)| {
+                let start_a = clock_a.as_ref().map(|c| c.start_seconds).unwrap_or(0);
+                let start_b = clock_b.as_ref().map(|c| c.start_seconds).unwrap_or(0);
+                start_a
+                    .cmp(&start_b)
+                    .then_with(|| stream_a.cmp(stream_b))
+                    .then_with(|| name_a.cmp(name_b))
+            },
+        );
+
+        for (segment, stream, name, clock) in matching_segments {
+            let start_seconds = clock.as_ref().map(|c| c.start_seconds).unwrap_or(0);
+            if !is_after_cursor(day, start_seconds, &stream, &name, cursor.as_ref()) {
                 continue;
             }
-            let page = solstone_core_transcripts::read_segment_transcript_page(&segment, None)
-                .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
+
+            if segments.len() == request.limit {
+                has_more = true;
+                break 'outer;
+            }
+
+            last_examined = Some((day.clone(), stream.clone(), name.clone()));
+
+            let probe_path = segment_assignment_probe_path(day, &stream, &name);
+            if !live_allows(journal_root, &boundary, &probe_path, Some(&stream)) {
+                continue;
+            }
+
+            let page = match solstone_core_transcripts::read_segment_transcript_page(&segment, None)
+            {
+                Ok(page) => page,
+                Err(_) => {
+                    unreadable += 1;
+                    continue;
+                }
+            };
+
             let reference = codec()
                 .mint(
                     principal.connection,
                     snapshot.generation,
                     ReferenceTarget::Segment(SegmentReference {
                         day: day.clone(),
-                        stream: identity.stream.to_owned(),
-                        segment: identity.name.to_owned(),
+                        stream: stream.clone(),
+                        segment: name.clone(),
                         version: page.version.fingerprint(),
                         source_index: None,
                         byte_offset: None,
                     }),
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
-            targets.push(format!("{day}/{}/{}", identity.stream, identity.name));
-            segments.push(json!({"title": format!("Transcript segment — {}", day), "date": day, "reference": reference}));
+
+            targets.push(format!("{day}/{stream}/{name}"));
+            let time_str = clock.as_ref().map(|c| c.label.as_str()).unwrap_or("");
+            segments.push(json!({
+                "title": format!("Transcript segment — {}", day),
+                "date": day,
+                "time": time_str,
+                "reference": reference,
+            }));
         }
     }
+
+    let next_cursor = if has_more {
+        if let Some((last_day, last_stream, last_name)) = last_examined {
+            Some(
+                codec()
+                    .mint(
+                        principal.connection,
+                        snapshot.generation,
+                        ReferenceTarget::TranscriptList(TranscriptListCursor {
+                            day: request.day.clone(),
+                            time_from: request.time_from.clone(),
+                            time_to: request.time_to.clone(),
+                            facet: request.facet_id.clone(),
+                            last_day,
+                            last_stream,
+                            last_name,
+                        }),
+                    )
+                    .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let count = segments.len();
-    Ok(
-        Prepared::new(json!({"transcripts": segments}), count, targets)
-            .when_empty(LIST_TRANSCRIPTS_EMPTY),
-    )
+    let mut response_val = json!({
+        "transcripts": segments,
+    });
+    if let Some(cursor) = next_cursor {
+        response_val["next_cursor"] = json!(cursor);
+    }
+    if unreadable > 0 {
+        response_val["unreadable"] = json!(unreadable);
+    }
+
+    Ok(Prepared::new(response_val, count, targets).when_empty(LIST_TRANSCRIPTS_EMPTY))
 }
 
 fn get_transcript(
@@ -1335,17 +1569,16 @@ fn get_transcript(
         .map(|item| item.text)
         .collect::<Vec<_>>();
     let count = entries.len();
-    Ok(Prepared::new(
-        json!({"entries": entries, "next_cursor": next_cursor }),
-        count,
-        vec![target],
-    )
-    .when_empty(GET_TRANSCRIPT_EMPTY))
+    let mut response_val = json!({"entries": entries, "next_cursor": next_cursor });
+    if page.untimed {
+        response_val["untimed"] = Value::Bool(true);
+    }
+    Ok(Prepared::new(response_val, count, vec![target]).when_empty(GET_TRANSCRIPT_EMPTY))
 }
 
 /// An admitted segment-derived path used only to classify the segment's live
 /// assignment. The path need not exist: `classify_source` reads `facets.json`.
-fn segment_assignment_probe_path(day: &str, stream: &str, segment: &str) -> String {
+pub(crate) fn segment_assignment_probe_path(day: &str, stream: &str, segment: &str) -> String {
     format!("{day}/{stream}/{segment}/talents/transcript.md")
 }
 

@@ -24,6 +24,7 @@ pub(crate) enum ReferenceKind {
     Entity,
     Cursor,
     MemoryRecall,
+    TranscriptList,
 }
 
 impl ReferenceKind {
@@ -34,6 +35,7 @@ impl ReferenceKind {
             Self::Entity => 3,
             Self::Cursor => 4,
             Self::MemoryRecall => 5,
+            Self::TranscriptList => 6,
         }
     }
 
@@ -44,6 +46,7 @@ impl ReferenceKind {
             3 => Some(Self::Entity),
             4 => Some(Self::Cursor),
             5 => Some(Self::MemoryRecall),
+            6 => Some(Self::TranscriptList),
             _ => None,
         }
     }
@@ -104,6 +107,21 @@ pub(crate) struct MemoryRecallCursor {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TranscriptListCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facet: Option<String>,
+    pub last_day: String,
+    pub last_stream: String,
+    pub last_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub(crate) enum ReferenceTarget {
     Entry(EntryReference),
@@ -111,6 +129,7 @@ pub(crate) enum ReferenceTarget {
     Entity(EntityReference),
     Cursor(CursorReference),
     MemoryRecall(MemoryRecallCursor),
+    TranscriptList(TranscriptListCursor),
 }
 
 impl ReferenceTarget {
@@ -121,6 +140,7 @@ impl ReferenceTarget {
             Self::Entity(_) => ReferenceKind::Entity,
             Self::Cursor(_) => ReferenceKind::Cursor,
             Self::MemoryRecall(_) => ReferenceKind::MemoryRecall,
+            Self::TranscriptList(_) => ReferenceKind::TranscriptList,
         }
     }
 }
