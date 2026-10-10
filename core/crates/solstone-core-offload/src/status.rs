@@ -262,11 +262,17 @@ mod catalog_tests {
             manifest_id: "manifest".into(),
             witness_id: "witness".into(),
             snapshot_id: "a".repeat(64),
-            repository_id: Some("repository".into()),
+            repository_id: Some("c".repeat(64)),
             archive_path: Some("/exact/archive/raw.flac".into()),
             journal_id: Some("journal".into()),
             layout: Some(SegmentLayout::Direct),
             segment_dir: Some("010000_001_full".into()),
+            processing: Some(
+                solstone_core_retention::archive_proof::AcceptedProcessingObservation {
+                    record: None,
+                    has_analysis_row: true,
+                },
+            ),
             file: OffloadFile {
                 name: "raw.flac".into(),
                 bytes: 17,
