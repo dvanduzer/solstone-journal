@@ -225,8 +225,13 @@ pub(super) fn open_plain(directory: &Directory, name: &OsStr) -> io::Result<Opti
     Ok(Some(file))
 }
 
-pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<()> {
-    mkdirat(parent, name, Mode::S_IRWXU).map_err(Into::into)
+pub(super) fn open_source(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
+    open_plain(directory, name)
+}
+
+pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
+    mkdirat(parent, name, Mode::S_IRWXU)?;
+    parent.open_child(name)
 }
 
 pub(super) fn create_file(parent: &Directory, name: &OsStr) -> io::Result<File> {

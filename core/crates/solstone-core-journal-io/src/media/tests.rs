@@ -379,3 +379,315 @@ mod native {
         assert_eq!(failure.cleanup_after_helper_quiescence(), Cleanup::Complete);
     }
 }
+
+#[cfg(all(windows, feature = "full-tests"))]
+mod windows_native {
+    use super::*;
+    use std::fs::{self, OpenOptions};
+    use std::os::windows::fs::{OpenOptionsExt, symlink_file};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    struct Fixture {
+        parent: Arc<MediaDirectory>,
+        destination: Arc<MediaDirectory>,
+        digest: MediaDigest,
+        temp: tempfile::TempDir,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let temp = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+                Some(path) => tempfile::tempdir_in(path).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            fs::create_dir_all(temp.path().join("day/segment")).unwrap();
+            fs::write(temp.path().join("day/input"), b"source media").unwrap();
+            let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let parent = MediaDirectory::open(root.clone(), Path::new("day")).unwrap();
+            let destination = MediaDirectory::open(root, Path::new("day/segment")).unwrap();
+            let digest = digest_reader(&mut &b"source media"[..]).unwrap();
+            Self {
+                parent,
+                destination,
+                digest,
+                temp,
+            }
+        }
+        fn target(&self) -> OwnedMediaTarget {
+            MediaStage::create(self.parent.clone())
+                .unwrap()
+                .create_target()
+                .unwrap()
+        }
+        fn prepared(&self) -> PreparedMedia {
+            self.target()
+                .copy_from(&self.parent, OsStr::new("input"), &self.digest)
+                .unwrap()
+        }
+        fn live(&self, name: &str) -> PathBuf {
+            self.temp.path().join("day/segment").join(name)
+        }
+    }
+    fn assert_shared(error: io::Error) {
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
+    }
+
+    #[test]
+    fn local_publication_confirms_full_identity_and_distinct_already_present() {
+        let f = Fixture::new();
+        let target = f.target();
+        assert!(target.available_bytes().unwrap() > 0);
+        let (capacity, fired) = run_with_media_hook(
+            MediaPrimitive::CapacityQuery,
+            || Err(io::Error::other("query failed")),
+            || target.available_bytes(),
+        );
+        assert!(fired && capacity.is_err());
+        let mut prepared = target
+            .copy_from(&f.parent, OsStr::new("input"), &f.digest)
+            .unwrap();
+        let id = prepared.identity();
+        let stage = prepared.target.stage.diagnostic_path();
+        let r = prepared.publish(&f.destination, OsStr::new("audio.flac"));
+        assert_eq!(r.effect, PublicationEffect::Published);
+        assert_eq!(r.confirmation, Confirmation::Confirmed);
+        assert_eq!(r.file_durability, Durability::Synced);
+        assert_eq!(r.parent_durability, Durability::Unproven);
+        assert_eq!(r.cleanup, Cleanup::Complete);
+        assert_eq!(r.identity, Some(id));
+        assert!(!stage.exists());
+        assert_eq!(
+            f.destination
+                .observe_file(OsStr::new("audio.flac"))
+                .unwrap()
+                .unwrap()
+                .identity,
+            id
+        );
+        eprintln!("WINDOWS_MEDIA_ID source={id:?} final={:?}", r.identity);
+        assert_shared(fs::write(f.live("audio.flac"), b"competitor").unwrap_err());
+        assert_shared(fs::remove_file(f.live("audio.flac")).unwrap_err());
+        let mut identical = f.prepared();
+        assert_ne!(identical.identity(), id);
+        let r = identical.publish(&f.destination, OsStr::new("audio.flac"));
+        assert_eq!(r.effect, PublicationEffect::AlreadyPresent);
+        assert_eq!(r.confirmation, Confirmation::Confirmed);
+        assert_eq!(r.identity, Some(id));
+        assert_eq!(r.cleanup, Cleanup::Complete);
+        drop(identical);
+        drop(prepared);
+        fs::write(f.live("audio.flac"), b"competitor").unwrap(); // inverse write
+        fs::remove_file(f.live("audio.flac")).unwrap(); // inverse delete
+    }
+
+    #[test]
+    fn occupied_plain_directory_and_reparse_preserve_competitors() {
+        let f = Fixture::new();
+        fs::write(f.live("different"), b"competitor").unwrap();
+        fs::create_dir(f.live("directory")).unwrap();
+        symlink_file(f.temp.path().join("day/input"), f.live("symlink")).unwrap();
+        for name in ["different", "directory", "symlink"] {
+            let mut prepared = f.prepared();
+            let r = prepared.publish(&f.destination, OsStr::new(name));
+            assert_eq!(r.effect, PublicationEffect::Conflict, "{name}: {r:?}");
+            assert_eq!(prepared.cleanup(), Cleanup::Complete);
+        }
+        assert_eq!(fs::read(f.live("different")).unwrap(), b"competitor");
+        assert!(
+            fs::symlink_metadata(f.live("symlink"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(f.live("directory").is_dir());
+    }
+
+    #[test]
+    fn retained_source_and_ancestors_exclude_mutation_with_inverse_controls() {
+        let f = Fixture::new();
+        let input = f.temp.path().join("day/input");
+        let input_check = input.clone();
+        let (result, fired) = run_with_media_hook(
+            MediaPrimitive::PreparationWrite,
+            move || {
+                assert_shared(fs::write(&input_check, b"competitor").unwrap_err());
+                assert_shared(fs::remove_file(&input_check).unwrap_err());
+                assert_shared(
+                    fs::rename(&input_check, input_check.with_extension("moved")).unwrap_err(),
+                );
+                Ok(())
+            },
+            || {
+                f.target()
+                    .copy_from(&f.parent, OsStr::new("input"), &f.digest)
+            },
+        );
+        assert!(fired);
+        let prepared = result.unwrap();
+        fs::write(&input, b"competitor").unwrap();
+        fs::rename(&input, input.with_extension("moved")).unwrap();
+        fs::remove_file(input.with_extension("moved")).unwrap();
+        let stage = prepared.target.stage.diagnostic_path();
+        let payload = stage.join("payload");
+        assert_shared(fs::write(&payload, b"competitor").unwrap_err());
+        assert_shared(fs::rename(&payload, payload.with_extension("moved")).unwrap_err());
+        for path in [
+            f.temp.path().to_path_buf(),
+            f.temp.path().join("day"),
+            f.live(""),
+            stage.clone(),
+        ] {
+            assert_shared(fs::rename(&path, path.with_extension("moved")).unwrap_err());
+        }
+        // Drop closes ownership without unlinking. The exact previously refused
+        // payload write/rename/delete and stage rename now succeed.
+        drop(prepared);
+        fs::write(&payload, b"competitor").unwrap();
+        fs::rename(&payload, payload.with_extension("moved")).unwrap();
+        fs::remove_file(payload.with_extension("moved")).unwrap();
+        fs::rename(&stage, stage.with_extension("moved")).unwrap();
+        fs::remove_dir(stage.with_extension("moved")).unwrap();
+        let stage = MediaStage::create(f.parent.clone()).unwrap();
+        let stage_path = stage.diagnostic_path();
+        drop(stage);
+        fs::rename(&stage_path, stage_path.with_extension("moved")).unwrap();
+        fs::remove_dir(stage_path.with_extension("moved")).unwrap();
+        let root_path = f.temp.path().to_path_buf();
+        drop(f.destination);
+        drop(f.parent);
+        fs::rename(root_path.join("day/segment"), root_path.join("day/moved")).unwrap();
+        fs::rename(root_path.join("day"), root_path.join("moved")).unwrap();
+        let renamed = root_path.with_extension("moved");
+        fs::rename(&root_path, &renamed).unwrap();
+        fs::rename(renamed, root_path).unwrap();
+    }
+
+    #[test]
+    fn missing_destination_and_wrong_digest_never_publish_or_enable_helper() {
+        let f = Fixture::new();
+        let root = Arc::new(JournalRoot::open(f.temp.path()).unwrap());
+        assert!(MediaDirectory::open(root, Path::new("day/missing")).is_err());
+        assert!(!f.temp.path().join("day/missing").exists());
+        for digest in [
+            MediaDigest {
+                size: 1,
+                ..f.digest.clone()
+            },
+            MediaDigest {
+                sha256: "0".repeat(64),
+                ..f.digest.clone()
+            },
+        ] {
+            let mut failure = f
+                .target()
+                .copy_from(&f.parent, OsStr::new("input"), &digest)
+                .unwrap_err()
+                .owned;
+            assert_eq!(failure.cleanup_after_helper_quiescence(), Cleanup::Complete);
+        }
+        let mut target = f.target();
+        assert_eq!(
+            target.helper_transport().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(!target.helper_taken);
+        let leaf = target.stage.leaf.as_mut().unwrap();
+        assert_eq!(leaf.file.metadata().unwrap().len(), 0);
+        assert_eq!(leaf.file.stream_position().unwrap(), 0);
+        assert_eq!(target.cleanup_after_helper_quiescence(), Cleanup::Complete);
+    }
+
+    #[test]
+    fn native_faults_preserve_effect_and_never_dispose_live_renamed_handle() {
+        let f = Fixture::new();
+        for primitive in [
+            MediaPrimitive::PreparationRead,
+            MediaPrimitive::PreparationWrite,
+            MediaPrimitive::FileSync,
+        ] {
+            let (result, fired) = run_with_media_hook(
+                primitive,
+                || Err(io::Error::other("fault")),
+                || {
+                    f.target()
+                        .copy_from(&f.parent, OsStr::new("input"), &f.digest)
+                },
+            );
+            assert!(fired);
+            let mut failure = result.unwrap_err().owned;
+            assert_eq!(failure.cleanup_after_helper_quiescence(), Cleanup::Complete);
+            assert!(!f.live("new").exists());
+        }
+        for primitive in [
+            MediaPrimitive::BeforePublish,
+            MediaPrimitive::AfterPublish,
+            MediaPrimitive::ParentSync,
+            MediaPrimitive::StageRemove,
+            MediaPrimitive::Completion,
+        ] {
+            let mut prepared = f.prepared();
+            let name = format!("{primitive:?}");
+            let (r, fired) = run_with_media_hook(
+                primitive,
+                || Err(io::Error::other("fault")),
+                || prepared.publish(&f.destination, OsStr::new(&name)),
+            );
+            assert!(fired);
+            if primitive == MediaPrimitive::BeforePublish {
+                assert_eq!(r.effect, PublicationEffect::NotPublished);
+                assert!(!f.live(&name).exists());
+            } else {
+                assert_eq!(r.effect, PublicationEffect::Published);
+                assert_eq!(fs::read(f.live(&name)).unwrap(), b"source media");
+                assert_shared(fs::remove_file(f.live(&name)).unwrap_err());
+            }
+            assert_eq!(prepared.cleanup(), Cleanup::Complete);
+            if primitive != MediaPrimitive::BeforePublish {
+                assert_eq!(fs::read(f.live(&name)).unwrap(), b"source media");
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_waits_for_physical_absence_and_preserves_nonempty_stage() {
+        let f = Fixture::new();
+        let mut target = f.target();
+        let stage = target.stage.diagnostic_path();
+        let foreign = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(stage.join("payload"))
+            .unwrap();
+        assert_eq!(target.cleanup_after_helper_quiescence(), Cleanup::Pending);
+        assert!(!target.stage.removed);
+        drop(foreign);
+        assert_eq!(target.cleanup_after_helper_quiescence(), Cleanup::Complete);
+        assert!(!stage.exists());
+        let mut target = f.target();
+        let stage = target.stage.diagnostic_path();
+        fs::write(stage.join("foreign"), b"preserve").unwrap();
+        assert_eq!(target.cleanup_after_helper_quiescence(), Cleanup::Pending);
+        assert_eq!(fs::read(stage.join("foreign")).unwrap(), b"preserve");
+        fs::remove_file(stage.join("foreign")).unwrap();
+        assert_eq!(target.cleanup_after_helper_quiescence(), Cleanup::Complete);
+    }
+
+    #[test]
+    #[ignore = "requires SOLSTONE_MEDIA_OTHER_ROOT on a separate Windows volume"]
+    fn cross_volume_has_no_copy_fallback() {
+        let f = Fixture::new();
+        let other =
+            tempfile::tempdir_in(std::env::var_os("SOLSTONE_MEDIA_OTHER_ROOT").unwrap()).unwrap();
+        let root = Arc::new(JournalRoot::open(other.path()).unwrap());
+        let destination = MediaDirectory::open(root, Path::new("")).unwrap();
+        assert!(!destination.identity().same_volume(f.parent.identity()));
+        let mut prepared = f.prepared();
+        let r = prepared.publish(&destination, OsStr::new("new"));
+        assert_eq!(r.effect, PublicationEffect::NotPublished);
+        assert!(!other.path().join("new").exists());
+        assert_eq!(prepared.cleanup(), Cleanup::Complete);
+        drop(prepared);
+        drop(destination);
+    }
+}
