@@ -3996,6 +3996,19 @@ required_features = []
 runtime = "none"
 
 [[suites]]
+id = "solstone-core-retention::review_context"
+package = "solstone-core-retention"
+target = "review_context"
+set = "component"
+areas = ["retention"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
 id = "solstone-core-retention::scan_segment"
 package = "solstone-core-retention"
 target = "scan_segment"

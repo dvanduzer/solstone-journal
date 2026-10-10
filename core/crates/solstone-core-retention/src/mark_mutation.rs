@@ -281,7 +281,7 @@ mod tests {
             .collect();
         mark.offload = Some(
             OffloadOffer::new(crate::archive_proof::OffloadProof {
-                journal_id: "source".into(),
+                journal_id: "native-root-v1:unix:0000000000000001:0000000000000002".into(),
                 manifest_id: "manifest".into(),
                 target: mark.target.clone(),
                 layout: solstone_core_journal_io::paths::SegmentLayout::Named,

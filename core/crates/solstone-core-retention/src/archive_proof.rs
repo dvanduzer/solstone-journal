@@ -126,9 +126,9 @@ fn exact_archive_path(value: &str) -> bool {
 
 impl OffloadProof {
     pub fn validate(&self) -> Result<(), ProofError> {
-        if self.journal_id.is_empty()
-            || self.journal_id.chars().any(char::is_control)
-            || !plain_component(&self.manifest_id)
+        if !solstone_core_journal_io::journal_root::is_canonical_identity_observation(
+            &self.journal_id,
+        ) || !plain_component(&self.manifest_id)
             || self.target.day.len() != 8
             || !self.target.day.bytes().all(|byte| byte.is_ascii_digit())
             || chrono::NaiveDate::parse_from_str(&self.target.day, "%Y%m%d").is_err()
@@ -282,7 +282,7 @@ mod tests {
 
     fn proof() -> OffloadProof {
         OffloadProof {
-            journal_id: "source-binding".into(),
+            journal_id: "native-root-v1:unix:0000000000000001:0000000000000002".into(),
             manifest_id: "manifest".into(),
             target: Target {
                 day: "20261009".into(),
@@ -345,6 +345,12 @@ mod tests {
 
     #[test]
     fn invalid_paths_identity_order_and_processing_refuse() {
+        let mut windows_source = proof();
+        windows_source.journal_id =
+            "native-root-v1:windows:0000000000000001:01000000000000000100000000000000".into();
+        assert!(windows_source.validate().is_ok());
+        windows_source.journal_id = "native-root-v1:unix:1:2".into();
+        assert!(windows_source.validate().is_err());
         for path in [
             "relative/audio.flac",
             "/x/../audio.flac",
