@@ -3209,7 +3209,7 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
-    fn briefing_saves_the_same_source_backed_rows_it_returns() {
+    fn briefing_saves_model_attention_without_reading_historical_tracking_lists() {
         let (root, paths, context) = fixture(
             "morning_briefing",
             r#"{
@@ -3232,8 +3232,14 @@ mod tests {
             json!({"title":"Work"}).to_string(),
         )
         .unwrap();
-        fs::write(facet.join("activities/20251201.jsonl"), json!({"id":"old","created_at":1764547200000_i64,"commitments":[{"owner":"you","owner_entity_id":"owner","action":"send report"},{"owner":"Pat","owner_entity_id":"pat","counterparty_entity_id":"owner","action":"send estimate"}]}).to_string()).unwrap();
-        let model_output = json!({"metadata":{},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[],"reading":[]}).to_string();
+        let historical_path = facet.join("activities/20251201.jsonl");
+        let historical = json!({"id":"old","created_at":1764547200000_i64,"commitments":[{"owner":"you","owner_entity_id":"owner","action":"send report"},{"owner":"Pat","owner_entity_id":"pat","counterparty_entity_id":"owner","action":"send estimate"}]}).to_string();
+        fs::write(&historical_path, &historical).unwrap();
+        let attention = json!([
+            {"text":"Prepare for today's meeting","source_id":"sol://calendar/meeting"},
+            {"text":"Yesterday's audio is still processing","source_id":"sol://chronicle/20251231/audio"}
+        ]);
+        let model_output = json!({"metadata":{},"your_day":[],"yesterday":[],"needs_attention":attention,"forward_look":[],"reading":[]}).to_string();
         let client =
             OneShotClient::at_path(test_support::one_shot_stub(root.path(), &model_output));
         let output_path = context.journal.join("briefing.json");
@@ -3248,14 +3254,13 @@ mod tests {
             panic!("briefing did not finish")
         };
         let result: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(result["needs_attention"].as_array().unwrap().len(), 2);
-        assert!(
-            result["needs_attention"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("open for 32 days")
+        assert_eq!(result["needs_attention"], attention);
+        assert_eq!(
+            result,
+            serde_json::from_str::<Value>(&model_output).unwrap()
         );
         assert_eq!(fs::read_to_string(output_path).unwrap(), output);
+        assert_eq!(fs::read(&historical_path).unwrap(), historical.as_bytes());
     }
 
     #[test]

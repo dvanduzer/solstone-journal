@@ -182,28 +182,22 @@ pub fn relocate_segment(
 // cycle with that holder regardless of chronological/path ordering.
 fn claim_pivots(
     paths: impl IntoIterator<Item = PathBuf>,
-) -> Result<Vec<solstone_core_journal_io::ExistingParentLock>, RelocationError> {
-    let mut locks = Vec::new();
-    for path in paths.into_iter().collect::<BTreeSet<_>>() {
-        let parent = path
-            .parent()
-            .ok_or_else(|| RelocationError::new("segment has no parent"))?;
-        let mut name = path
-            .file_name()
-            .ok_or_else(|| RelocationError::new("segment has no name"))?
-            .to_os_string();
-        name.push(".lock");
-        locks.push(
-            solstone_core_journal_io::acquire_existing_parent_lock(
-                parent,
-                &name,
-                std::time::Duration::ZERO,
-                std::time::Duration::ZERO,
+) -> Result<Vec<crate::output_attempt::SegmentMutation>, RelocationError> {
+    paths
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|path| {
+            crate::output_attempt::SegmentMutation::acquire(
+                &path,
+                LockOptions {
+                    timeout: std::time::Duration::ZERO,
+                    ..LockOptions::default()
+                },
             )
-            .map_err(|error| RelocationError(error.to_string()))?,
-        );
-    }
-    Ok(locks)
+            .map_err(|error| RelocationError(error.to_string()))
+        })
+        .collect()
 }
 
 fn move_directory(relocation: &Relocation<'_>) -> Result<(), RelocationRefusal> {
