@@ -20,6 +20,7 @@ use solstone_core_journal_io::{
     AtomicWriteError, JsonWriteOptions, LockError, LockOptions, hold_lock, write_json,
 };
 
+use crate::archive_proof::OffloadOffer;
 use crate::receipt::Target;
 
 const REGISTER_VERSION: u32 = 1;
@@ -170,6 +171,8 @@ pub struct Mark {
     pub marked_at: String,
     pub proposal: Proposal,
     pub state: MarkState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offload: Option<OffloadOffer>,
 }
 
 /// Human-readable proposed removal scope.
@@ -293,6 +296,7 @@ pub enum StoreError {
     Read(io::Error),
     Malformed(serde_json::Error),
     UnsupportedVersion { found: u32 },
+    WriterHeld,
     Integrity { reason: &'static str },
     DuplicateProposal { id: MarkId },
     Write(AtomicWriteError),
@@ -306,6 +310,7 @@ pub enum PreflightRefusal {
     Missing { id: MarkId },
     NotRequired { id: MarkId },
     Failed { id: MarkId },
+    ArchiveBound { id: MarkId },
     Register(StoreError),
 }
 
@@ -328,6 +333,13 @@ impl fmt::Display for PreflightRefusal {
             }
             Self::Failed { id } => {
                 write!(formatter, "mark `{}` has a recorded failure", id.as_str())
+            }
+            Self::ArchiveBound { id } => {
+                write!(
+                    formatter,
+                    "mark `{}`: this mark needs its backup verified before it can be approved",
+                    id.as_str()
+                )
             }
             Self::Register(error) => error.fmt(formatter),
         }
@@ -359,6 +371,10 @@ impl fmt::Display for StoreError {
                 formatter,
                 "the removal register uses an unsupported version; no marks were changed"
             ),
+            Self::WriterHeld => write!(
+                formatter,
+                "this removal list needs a newer version of solstone; no marks were changed"
+            ),
             Self::Integrity { .. } => write!(
                 formatter,
                 "the removal register has inconsistent entries; no marks were changed"
@@ -383,6 +399,7 @@ impl Error for StoreError {
             Self::Malformed(error) => Some(error),
             Self::Write(error) => Some(error),
             Self::UnsupportedVersion { .. }
+            | Self::WriterHeld
             | Self::Integrity { .. }
             | Self::DuplicateProposal { .. } => None,
         }
@@ -462,6 +479,7 @@ pub fn reconcile(
                             marked_at: format_marked_at(at),
                             proposal,
                             state: MarkState::Marked,
+                            offload: None,
                         },
                     );
                     changed = true;
@@ -506,6 +524,7 @@ pub fn upsert(
                         marked_at: format_marked_at(at),
                         proposal,
                         state: MarkState::Marked,
+                        offload: None,
                     },
                 );
                 true
@@ -549,6 +568,7 @@ pub fn record_failure(
                             names: names.to_vec(),
                         },
                         state: MarkState::Failed(failure),
+                        offload: None,
                     },
                 );
             }
@@ -628,7 +648,13 @@ fn preflight_register(
         if matches!(mark.state, MarkState::Failed(_)) {
             return Err(PreflightRefusal::Failed { id: id.clone() });
         }
+        if mark.offload.is_some() {
+            return Err(PreflightRefusal::ArchiveBound { id: id.clone() });
+        }
         marks.push((id.clone(), mark.clone()));
+    }
+    if register.version != REGISTER_VERSION {
+        return Err(PreflightRefusal::Register(StoreError::WriterHeld));
     }
     Ok(PreflightMarks(marks))
 }
@@ -655,6 +681,9 @@ where
         .map_err(StoreError::Lock)
         .map_err(E::from)?;
     let mut register = load_path(&path).map_err(E::from)?;
+    if register.version != REGISTER_VERSION {
+        return Err(E::from(StoreError::WriterHeld));
+    }
     if mutation(&mut register)? {
         validate(&register).map_err(E::from)?;
         write_json(
@@ -671,18 +700,18 @@ where
     Ok(register)
 }
 
-fn register_path(journal: &Path) -> PathBuf {
+pub(crate) fn register_path(journal: &Path) -> PathBuf {
     journal.join("health").join(REGISTER_FILE)
 }
 
-fn register_lock_options() -> LockOptions {
+pub(crate) fn register_lock_options() -> LockOptions {
     LockOptions {
         mode: Some(0o600),
         ..LockOptions::default()
     }
 }
 
-fn load_path(path: &Path) -> Result<Register, StoreError> {
+pub(crate) fn load_path(path: &Path) -> Result<Register, StoreError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Register::empty()),
@@ -693,8 +722,8 @@ fn load_path(path: &Path) -> Result<Register, StoreError> {
     Ok(register)
 }
 
-fn validate(register: &Register) -> Result<(), StoreError> {
-    if register.version != REGISTER_VERSION {
+pub(crate) fn validate(register: &Register) -> Result<(), StoreError> {
+    if !matches!(register.version, 1 | 2) {
         return Err(StoreError::UnsupportedVersion {
             found: register.version,
         });
@@ -706,6 +735,7 @@ fn validate(register: &Register) -> Result<(), StoreError> {
             });
         }
         validate_proposal(&mark.proposal)?;
+        validate_mark_binding(mark, register.version)?;
         if *id != MarkId::derive(mark.class, &mark.target, &mark.proposal.names) {
             return Err(StoreError::Integrity {
                 reason: "a stored mark does not match its class and target",
@@ -713,6 +743,41 @@ fn validate(register: &Register) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+fn validate_mark_binding(mark: &Mark, version: u32) -> Result<(), StoreError> {
+    match (&mark.offload, version, mark.class) {
+        (None, 1, _)
+        | (
+            None,
+            2,
+            RemovalClass::OwnerSegmentRemoval
+            | RemovalClass::OwnerRawRelease
+            | RemovalClass::PolicyRawRelease,
+        ) => Ok(()),
+        (Some(offer), 2, RemovalClass::OffloadRawRelease) => {
+            offer.validate().map_err(|_| StoreError::Integrity {
+                reason: "invalid archive evidence or consent",
+            })?;
+            if offer.proof.target != mark.target
+                || offer.proof.bytes().ok() != Some(mark.proposal.bytes)
+                || offer
+                    .proof
+                    .files
+                    .iter()
+                    .map(|file| &file.name)
+                    .ne(mark.proposal.names.iter())
+            {
+                return Err(StoreError::Integrity {
+                    reason: "archive evidence does not match its proposal",
+                });
+            }
+            Ok(())
+        }
+        _ => Err(StoreError::Integrity {
+            reason: "archive binding is absent or incompatible with the register",
+        }),
+    }
 }
 
 fn validate_proposal(proposal: &Proposal) -> Result<(), StoreError> {
@@ -779,6 +844,7 @@ mod tests {
             marked_at: "first".to_owned(),
             proposal,
             state,
+            offload: None,
         }
     }
 
@@ -954,6 +1020,7 @@ mod tests {
             marked_at: "2026-08-06T12:00:00Z".to_owned(),
             proposal: proposal("owner requested it"),
             state: MarkState::Marked,
+            offload: None,
         };
         let encoded = serde_json::to_vec(&item).unwrap();
         let decoded: Mark = serde_json::from_slice(&encoded).unwrap();

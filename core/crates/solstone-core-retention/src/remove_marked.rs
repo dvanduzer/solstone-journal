@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use solstone_core_journal_io::{LockOptions, hold_lock};
 
 use crate::age::segment_age;
@@ -14,9 +14,9 @@ use crate::class::{classify, partition_empty_audio};
 use crate::content::{ClosedHandlerSet, JournalMedia};
 use crate::door::release_raw;
 use crate::eligibility::{Blocker, FoundContent, ProvenRaw, RawRelease, resolve};
+use crate::mark_mutation::{PlannedMarkMutation, conditional_mutate};
 use crate::marks::{
-    Failure, Mark, MarkId, PreflightMarks, RemovalClass, load as load_marks, record_failure,
-    resolve as resolve_mark,
+    Failure, Mark, MarkId, PreflightMarks, PreflightRefusal, RemovalClass, load as load_marks,
 };
 use crate::original_deletion::RawReleaseClass;
 use crate::receipt::{NotRemoved, Outcome, RunHalt, TargetOutcome};
@@ -88,14 +88,25 @@ fn remove_one(
     context: &mut RemovalContext<'_>,
 ) -> Result<TargetOutcome, ()> {
     let target = &mark.target;
+    if mark.offload.is_some() {
+        return Ok(refused(
+            mark,
+            &PreflightRefusal::ArchiveBound { id: id.clone() }.to_string(),
+        ));
+    }
     let live = crate::layout::segment_rel(&target.day, &target.stream, &target.dir);
+    let _segment_lock = hold_lock(journal.join(&live), LockOptions::default()).map_err(|_| ())?;
     let (row, complete, staged) = {
-        let _segment_lock =
-            hold_lock(journal.join(&live), LockOptions::default()).map_err(|_| ())?;
         let register = match load_marks(journal) {
             Ok(register) => register,
             Err(error) => return Ok(refused(mark, &error.to_string())),
         };
+        if register.version != 1 {
+            return Ok(refused(
+                mark,
+                &crate::marks::StoreError::WriterHeld.to_string(),
+            ));
+        }
         if register.marks.get(id) != Some(mark) {
             return Ok(refused(mark, NO_LONGER_ON_REMOVAL_LIST));
         }
@@ -227,23 +238,22 @@ fn remove_one(
         (row, complete, staged)
     };
     // Segment lock, then register lock, always: marks owns the second lock internally.
-    if complete {
-        if let Err(error) = resolve_mark(journal, id) {
-            context.register_errors.push(error.to_string());
-        }
-    } else if let Some((staged, reason)) = staged
-        && let Err(error) = record_failure(
-            journal,
-            mark.class,
-            target,
-            &mark.proposal.names,
-            Failure {
-                at: String::new(),
-                reason,
-                staged: Some(staged),
-            },
-            context.now,
-        )
+    let plan = if complete {
+        Some(PlannedMarkMutation::resolve(mark))
+    } else {
+        staged.map(|(staged, reason)| {
+            PlannedMarkMutation::failure(
+                mark,
+                Failure {
+                    at: context.now.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    reason,
+                    staged: Some(staged),
+                },
+            )
+        })
+    };
+    if let Some(plan) = plan
+        && let Err(error) = plan.and_then(|plan| conditional_mutate(journal, &plan))
     {
         context.register_errors.push(error.to_string());
     }
@@ -699,6 +709,7 @@ mod tests {
             marked_at: "2026-08-06T00:00:00Z".to_owned(),
             proposal: proposal.clone(),
             state: crate::marks::MarkState::Marked,
+            offload: None,
         };
         let mut reg = crate::marks::Register::empty();
         reg.marks.insert(id.clone(), mark.clone());

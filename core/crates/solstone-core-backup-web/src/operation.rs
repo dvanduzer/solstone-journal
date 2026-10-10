@@ -318,6 +318,20 @@ pub fn finish(
     reason_code: Option<String>,
     recording_failure: Option<String>,
 ) {
+    finish_terminal(
+        slot,
+        generation,
+        Terminal {
+            phase: phase.into(),
+            reason_code,
+            detail: None,
+            guidance: None,
+            recording_failure,
+        },
+    );
+}
+
+fn finish_terminal(slot: &SharedOperationSlot, generation: u64, terminal: Terminal) {
     let mut guard = slot.lock().expect("operation slot lock");
     let Some(current) = guard.as_mut() else {
         return;
@@ -329,16 +343,7 @@ pub fn finish(
     if current.worker_active || current.cleanup.is_some() {
         return;
     }
-    apply_terminal(
-        current,
-        Terminal {
-            phase: phase.into(),
-            reason_code,
-            detail: None,
-            guidance: None,
-            recording_failure,
-        },
-    );
+    apply_terminal(current, terminal);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -401,7 +406,11 @@ impl Terminal {
 }
 
 #[cfg(not(windows))]
-pub fn spawn_worker<F>(slot: SharedOperationSlot, generation: u64, work: F)
+pub fn spawn_worker<F>(
+    slot: SharedOperationSlot,
+    generation: u64,
+    work: F,
+) -> thread::JoinHandle<()>
 where
     F: FnOnce() -> Terminal + Send + 'static,
 {
@@ -412,14 +421,8 @@ where
     thread::spawn(move || {
         let terminal = panic::catch_unwind(AssertUnwindSafe(work))
             .unwrap_or_else(|_| Terminal::error("failed"));
-        finish(
-            &slot,
-            generation,
-            terminal.phase,
-            terminal.reason_code,
-            terminal.recording_failure,
-        );
-    });
+        finish_terminal(&slot, generation, terminal);
+    })
 }
 
 #[allow(dead_code)]
@@ -648,6 +651,141 @@ mod tests {
         let result = match_handoff(&slot, "nonce-1");
 
         assert!(matches!(result, Err(HandoffError::Expired)));
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    fn running_slot() -> SharedOperationSlot {
+        Arc::new(Mutex::new(Some(Slot {
+            view: Operation {
+                kind: "restore_hosted".into(),
+                phase: "restoring".into(),
+                reason_code: None,
+                detail: None,
+                guidance: None,
+                recording_failure: None,
+                portal_url: Some("https://example.test/restore".into()),
+            },
+            nonce: Some("test-nonce".into()),
+            restore_key: Some("test-key".into()),
+            started: Instant::now(),
+            generation: 2,
+            #[cfg(windows)]
+            worker_active: false,
+            #[cfg(windows)]
+            cleanup: None,
+        })))
+    }
+
+    fn failure() -> Terminal {
+        Terminal {
+            phase: "degraded".into(),
+            reason_code: Some("tool_failed".into()),
+            detail: Some("tool detail".into()),
+            guidance: Some("next step".into()),
+            recording_failure: Some("recording failed".into()),
+        }
+    }
+
+    fn assert_failure(slot: &SharedOperationSlot) {
+        let guard = slot.lock().unwrap();
+        let current = guard.as_ref().unwrap();
+        assert_eq!(current.view.phase, "degraded");
+        assert_eq!(current.view.reason_code.as_deref(), Some("tool_failed"));
+        assert_eq!(current.view.detail.as_deref(), Some("tool detail"));
+        assert_eq!(current.view.guidance.as_deref(), Some("next step"));
+        assert_eq!(
+            current.view.recording_failure.as_deref(),
+            Some("recording failed")
+        );
+        assert!(current.view.portal_url.is_none());
+        assert!(current.nonce.is_none());
+        assert!(current.restore_key.is_none());
+    }
+
+    #[test]
+    fn complete_terminal_preserves_payload_and_clears_secrets() {
+        let slot = running_slot();
+        finish_terminal(&slot, 2, failure());
+        assert_failure(&slot);
+    }
+
+    #[test]
+    fn complete_terminal_ignores_absent_stale_and_terminal_slots() {
+        let absent = new_slot();
+        finish_terminal(&absent, 2, failure());
+        assert!(absent.lock().unwrap().is_none());
+
+        let slot = running_slot();
+        let original = slot.lock().unwrap().as_ref().unwrap().view.clone();
+        finish_terminal(&slot, 1, failure());
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().view, original);
+        assert!(slot.lock().unwrap().as_ref().unwrap().restore_key.is_some());
+        finish_terminal(&slot, 2, failure());
+        finish_terminal(&slot, 2, Terminal::done());
+        assert_failure(&slot);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn complete_terminal_respects_worker_and_cleanup_ownership() {
+        let slot = running_slot();
+        let original = slot.lock().unwrap().as_ref().unwrap().view.clone();
+        slot.lock().unwrap().as_mut().unwrap().worker_active = true;
+        finish_terminal(&slot, 2, failure());
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().view, original);
+        {
+            let mut guard = slot.lock().unwrap();
+            let current = guard.as_mut().unwrap();
+            current.worker_active = false;
+            current.cleanup = Some(PendingCleanup {
+                owners: Vec::new(),
+                terminal: failure(),
+            });
+        }
+        finish_terminal(&slot, 2, Terminal::done());
+        let guard = slot.lock().unwrap();
+        let current = guard.as_ref().unwrap();
+        assert_eq!(current.view, original);
+        assert!(current.cleanup.is_some());
+        assert!(current.nonce.is_some() && current.restore_key.is_some());
+    }
+
+    #[cfg(all(not(windows), feature = "full-tests"))]
+    fn wait_for_worker(handle: thread::JoinHandle<()>) {
+        let (completed, observed) = std::sync::mpsc::channel();
+        thread::spawn(move || completed.send(handle.join()).unwrap());
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker finished")
+            .expect("worker did not panic");
+    }
+
+    #[cfg(all(not(windows), feature = "full-tests"))]
+    #[test]
+    fn ordinary_worker_preserves_complete_terminal() {
+        let slot = running_slot();
+        wait_for_worker(spawn_worker(slot.clone(), 2, failure));
+        assert_failure(&slot);
+    }
+
+    #[cfg(all(not(windows), feature = "full-tests"))]
+    #[test]
+    fn ordinary_worker_preserves_panic_failure() {
+        let slot = running_slot();
+        wait_for_worker(spawn_worker(slot.clone(), 2, || {
+            panic!("test worker panic")
+        }));
+        let guard = slot.lock().unwrap();
+        let current = guard.as_ref().unwrap();
+        assert_eq!(current.view.phase, "error");
+        assert_eq!(current.view.reason_code.as_deref(), Some("failed"));
+        assert!(current.view.detail.is_none() && current.view.guidance.is_none());
+        assert!(current.view.portal_url.is_none());
+        assert!(current.nonce.is_none() && current.restore_key.is_none());
     }
 }
 
