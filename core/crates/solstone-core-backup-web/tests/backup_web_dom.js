@@ -111,6 +111,8 @@ class Element {
   set href(value) { if (value) this.setAttribute('href', value); else this.removeAttribute('href'); }
   get title() { return this.getAttribute('title') || ''; }
   set title(value) { this.setAttribute('title', value); }
+  get className() { return this.getAttribute('class') || ''; }
+  set className(value) { this.setAttribute('class', value); }
   get hidden() { return this.hasAttribute('hidden'); }
   set hidden(value) { if (value) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }
   get textContent() { return this._textContent; }
@@ -158,6 +160,14 @@ class Element {
     this.children.forEach((child) => { child.parentElement = null; });
     this.children = [];
     this.append(...children);
+  }
+
+  cloneNode(deep = false) {
+    const clone = new Element(this.tagName, this.ownerDocument);
+    for (const [name, value] of Object.entries(this.attributes)) clone.setAttribute(name, value);
+    clone.textContent = this.textContent;
+    if (deep) for (const child of this.children) clone.appendChild(child.cloneNode(true));
+    return clone;
   }
 
   querySelector(selector) { return queryAll(this, selector)[0] || null; }
@@ -279,6 +289,28 @@ function fixture(document) {
   const retention = add(management, 'form', { 'data-retention-form': '' });
   const saveRetention = add(retention, 'button', { type: 'submit' });
   const offload = add(management, 'section', { 'data-offload-section': '' });
+  const summary = add(offload, 'div', { 'data-offload-summary': '' });
+  for (const name of ['raw', 'backup-only', 'proposed', 'eligible', 'projected']) {
+    add(summary, 'p', { ['data-offload-' + name + '-bytes']: '' });
+  }
+  for (const name of ['raw', 'backup-only']) {
+    const known = add(summary, 'p', { ['data-offload-' + name + '-known-row']: '', hidden: '' });
+    add(known, 'span', { ['data-offload-' + name + '-known-bytes']: '' });
+  }
+  add(summary, 'p', { 'data-offload-device-free': '' });
+  add(summary, 'p', { 'data-offload-device-total': '' });
+  add(offload, 'p', { 'data-offload-coverage-note': '', hidden: '' });
+  const tiering = add(offload, 'section', { class: 'backup-offload-tiering' });
+  add(tiering, 'div', { 'data-offload-days': '' });
+  const dayTemplate = add(tiering, 'template', { 'data-offload-day-template': '' });
+  dayTemplate.content = new Element('#fragment', document);
+  const day = add(dayTemplate.content, 'article', { class: 'backup-offload-day' });
+  const detail = add(day, 'div', { 'data-offload-day-detail': '' });
+  add(detail, 'strong', { 'data-offload-day-value': '' });
+  add(detail, 'span', { 'data-offload-day-backup-only-bytes': '' });
+  const rawRow = add(detail, 'span', { 'data-offload-day-raw-row': '' });
+  add(rawRow, 'span', { 'data-offload-day-raw-bytes': '' });
+  add(day, 'button', { 'data-action': 'offload-restore-day', 'data-offload-day-restore': '' });
   const offloadProof = add(offload, 'div', { 'data-offload-proof': '', hidden: '' });
   const lastOffload = add(offloadProof, 'p', { 'data-offload-last-run': '' });
   const lastVerify = add(offloadProof, 'p', { 'data-offload-last-verify': '' });
@@ -288,6 +320,7 @@ function fixture(document) {
   const verifySuccessTime = add(verifyHistory, 'span', { 'data-offload-success-time': '' });
   const stallReason = add(offload, 'p', { 'data-offload-stall-reason': '', hidden: '' });
   const saveOffload = add(offload, 'button', { 'data-action': 'offload-save' });
+  add(offload, 'button', { 'data-action': 'offload-enable' });
   const destination = add(panels, 'article', { 'data-backup-panel': 'destination', hidden: '' });
   const destinationByo = add(destination, 'button', { class: 'backup-mode is-selected', 'data-mode': 'byo', role: 'radio', 'aria-checked': 'true' });
   destinationByo.textContent = 'your own';
@@ -620,6 +653,91 @@ asyncCase('offload current results stay distinct from historical success through
   assert.strictEqual(harness.lastOffload.getAttribute('title'), title(current));
   assert.strictEqual(harness.runSuccessTime.getAttribute('title'), title(earlier));
   assert.strictEqual(harness.verifySuccessTime.getAttribute('title'), title(earlier));
+});
+
+asyncCase('checked accounting forwards distinct totals and clears incomplete observations', async () => {
+  const MiB = 1048576;
+  let payload = {
+    success: true, offload: { enabled: true },
+    days: [{ day: '20260101', raw_media_bytes: 23 * MiB, raw_media_complete: true, backup_only_bytes: 3 * MiB, backup_only_segments: 1, backup_only_complete: true }],
+    raw_media: { total_bytes: 23 * MiB, known_bytes: 23 * MiB, complete: true },
+    backup_only: { total_bytes: 3 * MiB, complete: true, degraded: false },
+    proposed_release: { structural_bytes: 11 * MiB, eligible_bytes: 7 * MiB, projected_local_bytes: 16 * MiB, available: true },
+    device: { free_bytes: 31 * MiB, total_bytes: 100 * MiB },
+  };
+  const harness = createHarness({ respond(call) {
+    if (call.url === '/app/backup/status') return response({ ...status(), enabled: true, recovery_key_confirmed: true });
+    if (['/app/backup/offload/status', '/app/backup/offload/config', '/app/backup/offload/enable'].includes(call.url)) return response(payload);
+  } });
+  await ready(harness);
+  const get = (name) => harness.root.querySelector('[data-offload-' + name + ']');
+  const refresh = async () => {
+    click(harness.saveOffload.disabled ? harness.root.querySelector('[data-action="offload-enable"]') : harness.saveOffload);
+    await settle();
+  };
+  for (const [name, amount] of [['raw-bytes', 23], ['backup-only-bytes', 3], ['proposed-bytes', 11], ['eligible-bytes', 7], ['projected-bytes', 16], ['device-free', 31], ['device-total', 100]]) {
+    assert.strictEqual(get(name).textContent, amount + ' MiB');
+  }
+  const boundDay = get('days').querySelector('.backup-offload-day');
+  assert.strictEqual(boundDay.querySelector('[data-offload-day-backup-only-bytes]').textContent, '3 MiB');
+  assert.strictEqual(boundDay.querySelector('[data-offload-day-raw-bytes]').textContent, '23 MiB');
+  assert.ok(!boundDay.querySelector('[data-offload-day-restore]').disabled);
+  assert.ok(!boundDay.querySelector('.backup-warning'));
+  assert.ok(get('coverage-note').hidden && get('raw-known-row').hidden);
+  payload.proposed_release.available = false;
+  payload.days = [];
+  click(harness.saveOffload); await settle();
+  const completeEmpty = get('days').children[0].textContent;
+  const unavailable = get('eligible-bytes').textContent;
+  assert.ok(unavailable && unavailable !== '7 MiB');
+  assert.strictEqual(get('projected-bytes').textContent, unavailable);
+  assert.strictEqual(get('proposed-bytes').textContent, '11 MiB');
+
+  payload.backup_only = { total_bytes: null, known_bytes: 2 * MiB, complete: false, degraded: true };
+  click(harness.saveOffload); await settle();
+  assert.strictEqual(get('raw-bytes').textContent, '23 MiB');
+  assert.strictEqual(get('backup-only-bytes').textContent, unavailable);
+  assert.ok(!get('coverage-note').hidden);
+
+  payload.raw_media = { total_bytes: null, known_bytes: 5 * MiB, complete: false };
+  payload.backup_only = { total_bytes: null, known_bytes: 2 * MiB, complete: false, unbound_files: 1, degraded: false };
+  payload.proposed_release.available = true;
+  payload.offload.enabled = false;
+  payload.days = [{ day: '20260101', raw_media_bytes: null, raw_media_complete: false, backup_only_bytes: null, backup_only_segments: null, backup_only_complete: false, unbound_files: 1 }];
+  click(harness.saveOffload); await settle();
+  assert.strictEqual(get('raw-bytes').textContent, unavailable);
+  assert.strictEqual(get('backup-only-bytes').textContent, unavailable);
+  assert.strictEqual(get('projected-bytes').textContent, unavailable);
+  assert.ok(!get('raw-known-row').hidden && !get('backup-only-known-row').hidden);
+  assert.strictEqual(get('raw-known-bytes').textContent, '5 MiB');
+  assert.strictEqual(get('backup-only-known-bytes').textContent, '2 MiB');
+  assert.ok(!harness.root.querySelector('.backup-offload-tiering').hidden);
+  const day = get('days').querySelector('.backup-offload-day');
+  assert.ok(day && day.querySelector('.backup-warning'));
+  assert.strictEqual(day.querySelector('[data-offload-day-raw-bytes]').textContent, unavailable);
+  assert.ok(!day.querySelector('[data-offload-day-raw-row]').hidden);
+  assert.strictEqual(day.querySelector('[data-offload-day-backup-only-bytes]').textContent, unavailable);
+  assert.ok(day.querySelector('[data-offload-day-restore]').disabled);
+
+  payload.days = [];
+  await refresh();
+  assert.ok(!get('coverage-note').hidden);
+  assert.ok(get('days').querySelector('.backup-warning'));
+  assert.notStrictEqual(get('days').children[0].textContent, completeEmpty);
+
+  payload.raw_media = { total_bytes: 0, complete: true };
+  payload.backup_only = { total_bytes: 0, complete: true, degraded: false };
+  payload.proposed_release = { structural_bytes: 0, eligible_bytes: 0, projected_local_bytes: 0, available: true };
+  payload.offload.enabled = true;
+  await refresh();
+  for (const name of ['raw-bytes', 'backup-only-bytes', 'proposed-bytes', 'eligible-bytes', 'projected-bytes']) assert.strictEqual(get(name).textContent, '0 GiB');
+  for (const name of ['raw', 'backup-only']) {
+    assert.ok(get(name + '-known-row').hidden);
+    assert.strictEqual(get(name + '-known-bytes').textContent, '');
+  }
+  assert.ok(get('coverage-note').hidden);
+  assert.strictEqual(get('coverage-note').textContent, '');
+  assert.strictEqual(get('days').children[0].textContent, completeEmpty);
 });
 
 asyncCase('initial settings stay hidden until status is known', async () => {

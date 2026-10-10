@@ -234,6 +234,10 @@
           <section>
             <h3 data-copy="offload.labels.raw_media"></h3>
             <p data-offload-raw-bytes data-copy="management.status_labels.not_available"></p>
+            <p class="backup-note" data-offload-raw-known-row hidden>
+              <span data-copy="offload.labels.known"></span>:
+              <span data-offload-raw-known-bytes></span>
+            </p>
             <p class="backup-offload-subline" data-offload-budget-row hidden>
               <span data-copy="offload.labels.budget_short"></span>
               <span data-offload-budget></span>
@@ -242,7 +246,23 @@
           <section>
             <h3 data-copy="offload.backup_only_label"></h3>
             <p data-offload-backup-only-bytes data-copy="management.status_labels.not_available"></p>
+            <p class="backup-note" data-offload-backup-only-known-row hidden>
+              <span data-copy="offload.labels.known"></span>:
+              <span data-offload-backup-only-known-bytes></span>
+            </p>
             <p class="muted">older files moved off this device. your full backup also includes files still here.</p>
+          </section>
+          <section>
+            <h3 data-copy="offload.labels.proposed"></h3>
+            <p data-offload-proposed-bytes data-copy="management.status_labels.not_available"></p>
+          </section>
+          <section>
+            <h3 data-copy="offload.labels.eligible"></h3>
+            <p data-offload-eligible-bytes data-copy="management.status_labels.not_available"></p>
+          </section>
+          <section>
+            <h3 data-copy="offload.labels.projected"></h3>
+            <p data-offload-projected-bytes data-copy="management.status_labels.not_available"></p>
           </section>
           <section>
             <h3 data-copy="offload.labels.device_free"></h3>
@@ -257,6 +277,8 @@
             <p data-offload-device-total data-copy="management.status_labels.not_available"></p>
           </section>
         </div>
+
+        <p class="backup-warning" data-offload-coverage-note hidden></p>
 
         <div class="backup-offload-summary" data-offload-proof hidden>
           <section>

@@ -2005,7 +2005,7 @@ async fn status_reports_hosted_binding_without_token() {
 }
 
 #[tokio::test]
-async fn offload_status_matches_builder_across_distinct_ledgers() {
+async fn offload_status_preserves_checked_coverage_across_distinct_ledgers() {
     let first = crate::test_support::offload_inventory_root();
     let second = crate::test_support::root("healthy");
     let first_seg = second.path().join("chronicle/20260303/030000_001");
@@ -2026,12 +2026,11 @@ async fn offload_status_matches_builder_across_distinct_ledgers() {
     .unwrap();
     let degraded = crate::test_support::degraded_offload_root();
     let unreadable = crate::test_support::unreadable_offload_root();
-    let mut totals = vec![];
-    for journal in [
-        first.path(),
-        second.path(),
-        degraded.path(),
-        unreadable.path(),
+    for (journal, local_bytes, unbound_files, is_degraded) in [
+        (first.path(), 33, 2, false),
+        (second.path(), 0, 1, false),
+        (degraded.path(), 33, 2, true),
+        (unreadable.path(), 33, 2, true),
     ] {
         let (deps, _restic) = prepared(
             journal.to_path_buf(),
@@ -2049,43 +2048,25 @@ async fn offload_status_matches_builder_across_distinct_ledgers() {
             body["device"],
             json!({"free_bytes":crate::test_support::DEVICE_FREE_BYTES,"total_bytes":crate::test_support::DEVICE_TOTAL_BYTES})
         );
-        let built = solstone_core_offload::build_offload_status(journal)
-            .unwrap()
-            .value;
-        totals.push((
-            body["backup_only"]["total_days"].as_u64().unwrap(),
-            body["backup_only"]["total_bytes"].as_u64().unwrap(),
-            body["backup_only"]["degraded"].as_bool().unwrap(),
-        ));
-        assert_eq!(
-            body["backup_only"]["total_bytes"],
-            built["backup_only"]["total_bytes"]
-        );
-        assert_eq!(
-            body["backup_only"]["total_days"],
-            built["backup_only"]["total_days"]
-        );
-        if journal != degraded.path() {
-            assert_eq!(
-                body["backup_only"]["degraded"],
-                built["backup_only"]["degraded"]
+        assert_eq!(body["raw_media"]["total_bytes"], local_bytes);
+        assert_eq!(body["raw_media"]["complete"], true);
+        assert_eq!(body["backup_only"]["unbound_files"], unbound_files);
+        assert_eq!(body["backup_only"]["complete"], false);
+        assert_eq!(body["backup_only"]["degraded"], is_degraded);
+        for key in ["total_bytes", "total_files", "total_segments", "total_days"] {
+            assert!(body["backup_only"][key].is_null());
+        }
+        assert_eq!(body["proposed_release"]["available"], false);
+        assert!(body["proposed_release"]["eligible_bytes"].is_null());
+        if journal == unreadable.path() {
+            assert!(
+                !body["backup_only"]["unreadable_ledgers"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
             );
         }
     }
-    assert_ne!(totals[0].1, 0);
-    assert_ne!(totals[1].1, 0);
-    assert_ne!(totals[0], totals[1]);
-    assert!(totals[2].2);
-    let unreadable_status = solstone_core_offload::build_offload_status(unreadable.path())
-        .unwrap()
-        .value;
-    assert_eq!(unreadable_status["backup_only"]["degraded"], true);
-    assert!(
-        !unreadable_status["backup_only"]["unreadable_ledgers"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[tokio::test]

@@ -182,6 +182,10 @@
         "floor_short": "floor",
         "suggested": "suggested: {value}",
         "raw_media": "on this device",
+        "proposed": "proposed to leave this device",
+        "eligible": "ready to leave this device",
+        "projected": "on this device after removal",
+        "known": "counted so far",
         "device_free": "device free",
         "device_total": "device total",
         "last_offload": "last offload",
@@ -213,6 +217,7 @@
         "saved": "saved",
         "empty_days": "no offloaded media yet.",
         "show_all_days": "show all {count} days",
+        "incomplete": "some media totals aren't available.",
         "degraded": "some of the record of what's in your backup couldn't be read. these days may hold more than shown."
       },
       "stall_reason_labels": {
@@ -1306,12 +1311,17 @@
     if (button) setButtonDisabled(button, !teardownConfirmSatisfied());
   }
 
+  function offloadDayUncertain(day) {
+    return Boolean(day && (day.backup_only_complete === false || day.raw_media_complete === false ||
+      day.unbound_files > 0 || day.unknown_files > 0 || day.degraded === true));
+  }
+
   function offloadDayHasBackupOnly(day) {
     return Boolean(
       day &&
         (day.backup_only_bytes > 0 ||
           day.backup_only_segments > 0 ||
-          day.degraded === true),
+          offloadDayUncertain(day)),
     );
   }
 
@@ -1322,7 +1332,10 @@
         backupOnly.total_bytes > 0 ||
         backupOnly.total_segments > 0 ||
         backupOnly.total_days > 0 ||
-        backupOnly.degraded === true
+        backupOnly.degraded === true ||
+        backupOnly.complete === false ||
+        backupOnly.unbound_files > 0 ||
+        backupOnly.unknown_files > 0
       ) {
         return true;
       }
@@ -1424,10 +1437,13 @@
     };
   }
 
-  function offloadDaysDegraded(days, payload) {
+  function offloadCoverageUncertain(days, payload) {
     return Boolean(
-      (payload && payload.backup_only && payload.backup_only.degraded === true) ||
-        (Array.isArray(days) && days.some((day) => day && day.degraded === true)),
+      (payload && payload.raw_media && payload.raw_media.complete === false) ||
+      (payload && payload.backup_only && (payload.backup_only.degraded === true ||
+        payload.backup_only.complete === false || payload.backup_only.unbound_files > 0 ||
+        payload.backup_only.unknown_files > 0)) ||
+        (Array.isArray(days) && days.some(offloadDayUncertain)),
     );
   }
 
@@ -1444,10 +1460,10 @@
           .sort((left, right) => String(right.day || '').localeCompare(String(left.day || '')))
       : [];
     if (filtered.length === 0) {
-      if (offloadDaysDegraded(days, payload)) {
+      if (offloadCoverageUncertain(days, payload)) {
         const degraded = document.createElement('p');
         degraded.className = 'backup-warning';
-        degraded.textContent = offloadMessages.degraded || '';
+        degraded.textContent = offloadMessages.incomplete || '';
         target.append(degraded);
         return;
       }
@@ -1467,16 +1483,16 @@
       const displayDay = formatDisplayDay(day.day);
       if (heading) heading.textContent = displayDay;
       const raw = clone.querySelector('[data-offload-day-raw-bytes]');
-      if (raw) raw.textContent = formatBytes(day.raw_media_bytes || 0);
+      if (raw) raw.textContent = formatBytes(day.raw_media_bytes);
       const rawRow = clone.querySelector('[data-offload-day-raw-row]');
-      if (rawRow) rawRow.hidden = !(day.raw_media_bytes > 0);
+      if (rawRow) rawRow.hidden = day.raw_media_bytes === 0;
       const backupOnly = clone.querySelector('[data-offload-day-backup-only-bytes]');
-      if (backupOnly) backupOnly.textContent = formatBytes(day.backup_only_bytes || 0);
+      if (backupOnly) backupOnly.textContent = formatBytes(day.backup_only_bytes);
 
-      if (day.degraded) {
+      if (offloadDayUncertain(day)) {
         const degraded = document.createElement('p');
         degraded.className = 'backup-warning';
-        degraded.textContent = offloadMessages.degraded || '';
+        degraded.textContent = offloadMessages.incomplete || '';
         if (details) details.append(degraded);
       }
 
@@ -1580,8 +1596,22 @@
     }
     setElementHidden('[data-offload-disable-note]', !enabled);
 
-    setText('[data-offload-raw-bytes]', formatBytes(payload.raw_media && payload.raw_media.total_bytes));
-    setText('[data-offload-backup-only-bytes]', formatBytes(payload.backup_only && payload.backup_only.total_bytes));
+    const rawMedia = payload.raw_media || {};
+    const backupOnly = payload.backup_only || {};
+    const proposed = payload.proposed_release || {};
+    setText('[data-offload-raw-bytes]', formatBytes(rawMedia.complete === true ? rawMedia.total_bytes : null));
+    setText('[data-offload-backup-only-bytes]', formatBytes(backupOnly.complete === true ? backupOnly.total_bytes : null));
+    setText('[data-offload-proposed-bytes]', formatBytes(proposed.structural_bytes));
+    setText('[data-offload-eligible-bytes]', formatBytes(proposed.available === true ? proposed.eligible_bytes : null));
+    setText('[data-offload-projected-bytes]', formatBytes(proposed.available === true && rawMedia.complete === true ? proposed.projected_local_bytes : null));
+    for (const [name, population] of [['raw', rawMedia], ['backup-only', backupOnly]]) {
+      const showKnown = population.complete === false && Number.isFinite(population.known_bytes);
+      setElementHidden('[data-offload-' + name + '-known-row]', !showKnown);
+      setText('[data-offload-' + name + '-known-bytes]', showKnown ? formatBytes(population.known_bytes) : '');
+    }
+    const uncertain = offloadCoverageUncertain(payload.days, payload);
+    setElementHidden('[data-offload-coverage-note]', !uncertain);
+    setText('[data-offload-coverage-note]', uncertain ? offloadMessages.incomplete : '');
     setText('[data-offload-device-free]', formatBytes(payload.device && payload.device.free_bytes));
     setText('[data-offload-device-total]', formatBytes(payload.device && payload.device.total_bytes));
     const budgetValid = typeof budget === 'number' && Number.isFinite(budget) && budget > 0;
