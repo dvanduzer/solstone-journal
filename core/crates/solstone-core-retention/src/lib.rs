@@ -57,6 +57,7 @@ pub mod door;
 pub mod eligibility;
 pub mod layout;
 pub mod logs;
+pub mod mark_mutation;
 pub mod marks;
 pub mod notify;
 pub mod oplog_retention;
