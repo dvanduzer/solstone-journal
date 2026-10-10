@@ -9,7 +9,7 @@ use solstone_core_backup_runtime::{
     BackupResult, BackupServices, PruneResult, VerificationResult, prepare, run_prune,
     run_verification,
 };
-use solstone_core_offload::{format_offload_result, run_offload};
+use solstone_core_offload::{OffloadResult, format_offload_result, run_offload};
 
 use crate::CliRun;
 
@@ -99,9 +99,14 @@ fn backup_offload(args: &[String], journal: &Path, services: &BackupServices<'_>
         return usage_error("backup:offload", args);
     }
     let dry_run = args.iter().any(|argument| argument == "--dry-run");
-    success(format_offload_result(&run_offload(
-        journal, services, dry_run,
-    )))
+    backup_offload_result(run_offload(journal, services, dry_run))
+}
+
+fn backup_offload_result(result: OffloadResult) -> CliRun {
+    CliRun {
+        exit_code: i32::from(!matches!(result.status.as_str(), "ok" | "skipped")),
+        ..success(format_offload_result(&result))
+    }
 }
 
 fn routine_result(line: String, status: &str) -> CliRun {
@@ -152,7 +157,9 @@ mod tests {
         JournalMaintenance, JournalMaintenanceError, ToolOutput, ToolRequest, ToolRunner,
     };
 
-    use super::{backup_run_result, run};
+    use super::{
+        OffloadResult, backup_offload_result, backup_run_result, format_offload_result, run,
+    };
 
     struct FixtureRunner(RefCell<VecDeque<ToolOutput>>);
 
@@ -397,6 +404,61 @@ mod tests {
     }
 
     #[test]
+    fn offload_result_preserves_effects_and_recording_diagnostics() {
+        for (status, expected_exit) in [
+            ("ok", 0),
+            ("skipped", 0),
+            ("stalled", 1),
+            ("partial", 1),
+            ("error", 1),
+            ("unfamiliar", 1),
+        ] {
+            for dry_run in [false, true] {
+                for (state_failure, audit_failure) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let result = OffloadResult {
+                        status: status.into(),
+                        reason: Some("confirm_failed".into()),
+                        files_marked: 3,
+                        bytes_marked: 42,
+                        files_already_marked: 2,
+                        bytes_already_marked: 12,
+                        ran_out_of_markable_media: false,
+                        dry_run,
+                        reason_detail: Some("earlier effects retained".into()),
+                        details: Vec::new(),
+                        recording_failure: state_failure.then(|| "state unavailable".into()),
+                        audit_recording_failure: audit_failure.then(|| "audit unavailable".into()),
+                    };
+                    let expected = format!("{}\n", format_offload_result(&result));
+                    let mapped = backup_offload_result(result);
+                    assert_eq!(
+                        mapped.exit_code, expected_exit,
+                        "{status}, dry_run={dry_run}"
+                    );
+                    assert_eq!(mapped.stdout, expected);
+                    assert!(mapped.stderr.is_empty());
+                    assert_eq!(
+                        mapped.stdout.contains("recording_failed=state unavailable"),
+                        state_failure
+                    );
+                    assert_eq!(
+                        mapped
+                            .stdout
+                            .contains("audit_recording_failed=audit unavailable"),
+                        audit_failure
+                    );
+                    if status == "stalled" && !dry_run {
+                        assert!(mapped.stdout.contains("files_marked=3 bytes_marked=42"));
+                        assert!(mapped.stdout.contains("detail=earlier effects retained"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn backup_offload_allows_only_dry_run_and_uses_injected_services() {
         let journal = configured_journal();
         set_offload(
@@ -419,7 +481,7 @@ mod tests {
             journal.path(),
             &service,
         );
-        assert_eq!(dry.exit_code, 0);
+        assert_eq!(dry.exit_code, 1);
         assert_eq!(
             dry.stdout,
             "backup offload: stalled reason=your last backup didn't complete successfully dry_run=true\n"

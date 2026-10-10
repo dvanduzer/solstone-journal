@@ -990,8 +990,10 @@ fn offload_run(args: &[String], journal: &Path, services: &BackupServices<'_>) -
 }
 
 fn offload_run_result(result: OffloadResult) -> CliRun {
-    // A stalled offload is an operational result, not a CLI failure.
-    success(format!("{}\n", format_offload_result(&result)))
+    CliRun {
+        exit_code: i32::from(!matches!(result.status.as_str(), "ok" | "skipped")),
+        ..success(format!("{}\n", format_offload_result(&result)))
+    }
 }
 
 fn offload_restore(args: &[String], journal: &Path, services: &BackupServices<'_>) -> CliRun {
@@ -2210,7 +2212,62 @@ mod tests {
     }
 
     #[test]
-    fn offload_run_stalled_is_success_and_forwards_dry_run() {
+    fn offload_result_preserves_effects_and_recording_diagnostics() {
+        for (status, expected_exit) in [
+            ("ok", 0),
+            ("skipped", 0),
+            ("stalled", 1),
+            ("partial", 1),
+            ("error", 1),
+            ("unfamiliar", 1),
+        ] {
+            for dry_run in [false, true] {
+                for (state_failure, audit_failure) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let result = OffloadResult {
+                        status: status.into(),
+                        reason: Some("confirm_failed".into()),
+                        files_marked: 3,
+                        bytes_marked: 42,
+                        files_already_marked: 2,
+                        bytes_already_marked: 12,
+                        ran_out_of_markable_media: false,
+                        dry_run,
+                        reason_detail: Some("earlier effects retained".into()),
+                        details: Vec::new(),
+                        recording_failure: state_failure.then(|| "state unavailable".into()),
+                        audit_recording_failure: audit_failure.then(|| "audit unavailable".into()),
+                    };
+                    let expected = format!("{}\n", format_offload_result(&result));
+                    let mapped = offload_run_result(result);
+                    assert_eq!(
+                        mapped.exit_code, expected_exit,
+                        "{status}, dry_run={dry_run}"
+                    );
+                    assert_eq!(mapped.stdout, expected);
+                    assert!(mapped.stderr.is_empty());
+                    assert_eq!(
+                        mapped.stdout.contains("recording_failed=state unavailable"),
+                        state_failure
+                    );
+                    assert_eq!(
+                        mapped
+                            .stdout
+                            .contains("audit_recording_failed=audit unavailable"),
+                        audit_failure
+                    );
+                    if status == "stalled" && !dry_run {
+                        assert!(mapped.stdout.contains("files_marked=3 bytes_marked=42"));
+                        assert!(mapped.stdout.contains("detail=earlier effects retained"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offload_run_stalled_reports_failure_and_forwards_dry_run() {
         let journal = tempfile::tempdir().unwrap();
         set_offload(
             journal.path(),
@@ -2228,7 +2285,7 @@ mod tests {
         let services = unconfigured_services(&runner, &http, &clock, &maintenance);
 
         let normal = run_cli_with(&["offload".into(), "run".into()], journal.path(), &services);
-        assert_eq!(normal.exit_code, 0);
+        assert_eq!(normal.exit_code, 1);
         assert_eq!(
             normal.stdout,
             "backup offload: stalled reason=your backup isn't set up or hasn't completed a successful run yet files_marked=0 bytes_marked=0 bytes_released=0 ran_out_of_markable_media=false\n"
@@ -2238,7 +2295,7 @@ mod tests {
             journal.path(),
             &services,
         );
-        assert_eq!(dry_run.exit_code, 0);
+        assert_eq!(dry_run.exit_code, 1);
         assert_eq!(
             dry_run.stdout,
             "backup offload: stalled reason=your backup isn't set up or hasn't completed a successful run yet dry_run=true\n"

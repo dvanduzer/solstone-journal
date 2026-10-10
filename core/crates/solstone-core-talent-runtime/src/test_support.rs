@@ -120,7 +120,10 @@ fn one_shot_stub_with(
     });
     install_stub(
         &path,
-        &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n", response),
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n",
+            response.to_string().replace('\'', "'\\''")
+        ),
     );
     path
 }
