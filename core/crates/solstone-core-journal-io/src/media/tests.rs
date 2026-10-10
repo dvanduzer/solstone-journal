@@ -214,6 +214,11 @@ mod native {
                 transport.descriptor.as_raw_fd()
             ))
         );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            transport.target,
+            PathBuf::from(format!("/dev/fd/{}", transport.descriptor.as_raw_fd()))
+        );
         let owned = transport.descriptor.try_clone_to_owned().unwrap();
         drop(transport);
         assert!(target.helper_transport().is_err());
