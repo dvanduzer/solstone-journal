@@ -224,6 +224,39 @@ impl ActivityLease {
     pub fn revalidate(&self) -> Result<(), ActivityAdmissionError> {
         self.inner.revalidate()
     }
+
+    /// Share the held lock with a joined child; this does not grant settlement.
+    /// Retain this lease until the child stops: its drop explicitly unlocks the shared lock.
+    #[cfg(target_os = "linux")]
+    pub fn duplicate_descriptor_for_child(
+        &self,
+    ) -> Result<std::os::fd::OwnedFd, ActivityAdmissionError> {
+        let root_error =
+            |error| ActivityAdmissionError::Unavailable(ActivityUnavailable::Root(error));
+        self.inner
+            .root
+            .revalidate_canonical_binding()
+            .map_err(root_error)?;
+        let guard = self
+            .inner
+            .guard
+            .lock()
+            .map_err(|_| ActivityAdmissionError::Unavailable(ActivityUnavailable::Poisoned))?;
+        guard
+            .revalidate_bound(self.inner.root.as_ref(), OsStr::new(ENTRY))
+            .map_err(entry_error)?;
+        let descriptor = guard
+            .duplicate_descriptor(OsStr::new(ENTRY))
+            .map_err(entry_error)?;
+        guard
+            .revalidate_bound(self.inner.root.as_ref(), OsStr::new(ENTRY))
+            .map_err(entry_error)?;
+        self.inner
+            .root
+            .revalidate_canonical_binding()
+            .map_err(root_error)?;
+        Ok(descriptor)
+    }
 }
 
 /// Exclusive admission for fresh checks and cooperating destructive boundaries.

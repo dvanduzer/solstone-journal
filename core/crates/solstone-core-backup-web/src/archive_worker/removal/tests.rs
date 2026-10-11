@@ -176,7 +176,36 @@ fn approval_pending_inputs_preserve_original_budget_custody_and_exact_response()
                     10_000 + 6 * 60 * 60 + 1,
                     std::sync::atomic::Ordering::SeqCst,
                 ),
-                "cancel" => cancel(&deps.operations),
+                "cancel" => {
+                    assert!(
+                        !status(&deps.operations, started.generation())
+                            .unwrap()
+                            .cancellation_requested
+                    );
+                    assert!(
+                        cancel_response(&deps.operations, started.generation())
+                            .unwrap()
+                            .status()
+                            .is_success()
+                    );
+                    assert!(
+                        status(&deps.operations, started.generation())
+                            .unwrap()
+                            .cancellation_requested
+                    );
+                    assert!(
+                        cancel_response(&deps.operations, started.generation())
+                            .unwrap()
+                            .status()
+                            .is_success()
+                    );
+                    assert!(
+                        status(&deps.operations, started.generation())
+                            .unwrap()
+                            .cancellation_requested
+                    );
+                    assert!(operation::is_busy(&deps.operations));
+                }
                 "start" => {
                     deps.operations
                         .lock()
@@ -275,6 +304,77 @@ fn approval_pending_inputs_preserve_original_budget_custody_and_exact_response()
             assert!(operation::begin(&deps.operations, "archive", None, None, None).is_ok());
             assert!(status(&deps.operations, started.generation()).is_err());
         }
+    }
+}
+
+#[test]
+fn approval_cancellation_refuses_other_generations_kinds_tickets_and_poison() {
+    for cut in ["ordinary", "ticket", "poison"] {
+        let (_journal, deps, _clock, context, _mark) = pending_fixture();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        DISPATCH.with(|control| {
+            control.borrow_mut().pause = Some((entered_tx, resume_rx));
+        });
+        let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
+        let started = start(&deps, context, now.date_naive(), now).unwrap();
+        entered_rx.recv().unwrap();
+        let flag = deps
+            .operations
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .archive_cancellation
+            .as_ref()
+            .unwrap()
+            .clone();
+        for id in ["", "01", "+1", "1.0", "18446744073709551616", "2"] {
+            assert_eq!(
+                cancel_response(&deps.operations, id).unwrap_err(),
+                ApprovalStatusRefusal::Stale
+            );
+            assert!(!flag.is_cancelled());
+        }
+        match cut {
+            "ordinary" => {
+                deps.operations
+                    .lock()
+                    .unwrap()
+                    .current
+                    .as_mut()
+                    .unwrap()
+                    .view
+                    .kind = "backup".into()
+            }
+            "ticket" => deps.operations.lock().unwrap().archive.approval.ticket = None,
+            "poison" => {
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| {
+                        let _guard = deps.operations.lock().unwrap();
+                        panic!("poison original cancellation mutex");
+                    }))
+                    .is_err()
+                );
+            }
+            _ => unreachable!(),
+        }
+        let expected = if cut == "poison" {
+            ApprovalStatusRefusal::Unavailable
+        } else {
+            ApprovalStatusRefusal::Stale
+        };
+        assert_eq!(
+            cancel_response(&deps.operations, started.generation()).unwrap_err(),
+            expected
+        );
+        assert!(!flag.is_cancelled());
+        assert!(operation::is_busy(&deps.operations));
+        resume_tx.send(()).unwrap();
+        join_pending(&deps.operations);
+        assert!(!flag.is_cancelled());
+        assert!(operation::is_busy(&deps.operations));
     }
 }
 
@@ -638,6 +738,18 @@ fn approval_unknown_snapshot_keeps_actual_preparation_custody() {
     let observed = status(&deps.operations, &generation.to_string()).unwrap();
     assert_eq!(observed.state, ApprovalState::Unknown);
     assert!(observed.worker_settled);
+    assert!(!observed.cancellation_requested);
+    assert!(
+        cancel_response(&deps.operations, &generation.to_string())
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert!(
+        status(&deps.operations, &generation.to_string())
+            .unwrap()
+            .cancellation_requested
+    );
     assert!(operation::is_busy(&deps.operations));
     assert!(
         response(&deps.operations, &generation.to_string())

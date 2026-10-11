@@ -688,6 +688,17 @@ fn post_json_rpc(
             _ => json_rpc_response(session_error_response(json_request.id.as_ref(), error)),
         };
     }
+    // A notification (no id) expects no reply, and ping is answered empty, as
+    // Streamable HTTP requires; neither touches the journal.
+    if json_request.id.is_none() {
+        return HttpResponse::empty(202, "Accepted");
+    }
+    if json_request.method == "ping" {
+        return json_rpc_response(JsonRpcResponse::success(
+            json_request.id.as_ref(),
+            serde_json::json!({}),
+        ));
+    }
     match classify_method(&json_request) {
         Ok(McpMethod::Initialize) => match sessions.create(&verified.id) {
             Ok(session_id) => json_rpc_response(JsonRpcResponse::success(
@@ -773,16 +784,25 @@ fn execute_tool_call(
             request.id.as_ref(),
             tool_result(output.value, output.empty_note.as_deref()),
         ),
-        Err(DispatchError::InvalidInput) => JsonRpcResponse::invalid_params(request.id.as_ref()),
+        Err(DispatchError::InvalidInput) => JsonRpcResponse::invalid_arguments(
+            request.id.as_ref(),
+            crate::registry::invalid_arguments_message(
+                journal_root,
+                &permissions::evaluate_connection_read(journal_root, &verified.id),
+                tool_name,
+                tool_arguments(request),
+            ),
+        ),
         Err(DispatchError::PermissionDenied(reason)) => {
             JsonRpcResponse::permission_denied(request.id.as_ref(), reason)
         }
         Err(DispatchError::Tool(crate::tools::ToolError::AuditUnavailable)) => {
-            JsonRpcResponse::internal_error(request.id.as_ref(), "MCP audit publication failed")
+            JsonRpcResponse::internal_error(
+                request.id.as_ref(),
+                crate::tools::ToolError::AuditUnavailable.agent_message(),
+            )
         }
-        Err(DispatchError::Tool(error)) => {
-            JsonRpcResponse::tool_error(request.id.as_ref(), error.reason())
-        }
+        Err(DispatchError::Tool(error)) => JsonRpcResponse::tool_failed(request.id.as_ref(), error),
     };
     json_rpc_response(if tools_list_changed {
         response.with_tools_list_changed()
@@ -2162,7 +2182,7 @@ mod tests {
         .0;
         assert_eq!(
             fetch["result"]["structuredContent"],
-            json!({"title": "Indexed journal entry — 20260831", "date": "20260831", "text": "MCP fixture search needle"})
+            json!({"title": "journal entry from 20260831", "date": "20260831", "text": "MCP fixture search needle"})
         );
         client.shutdown().await.expect("client closes TLS");
         drop(client);
@@ -2231,7 +2251,7 @@ mod tests {
         .await;
         assert_eq!(
             fetch["result"]["structuredContent"],
-            json!({"title": "Indexed journal entry — 20260831", "date": "20260831", "text": "MCP fixture search needle"})
+            json!({"title": "journal entry from 20260831", "date": "20260831", "text": "MCP fixture search needle"})
         );
         client.shutdown().await.expect("client closes TLS");
         drop(client);
@@ -3349,7 +3369,7 @@ mod tests {
         .0;
         assert_eq!(
             fetch["result"]["structuredContent"],
-            json!({"title": "Indexed journal entry — 20260831", "date": "20260831", "text": "MCP fixture search needle"})
+            json!({"title": "journal entry from 20260831", "date": "20260831", "text": "MCP fixture search needle"})
         );
         assert_eq!(audit_record_count(server.journal.path()), 2);
         exercise_memory_postures(&server, &mut client, &access, &verified_oauth.id).await;
@@ -3805,6 +3825,35 @@ mod unit_tests {
     use crate::session::SessionTable;
     use crate::tokens::TokenStore;
 
+    #[test]
+    fn ping_is_answered_and_notifications_get_no_reply() {
+        let journal = tempfile::tempdir().unwrap();
+        let sessions = SessionTable::new();
+        let verified = crate::tokens::VerifiedToken {
+            id: "ping-token".to_owned(),
+            agent_identity: "ping-agent".to_owned(),
+        };
+        let post = |body: serde_json::Value| {
+            super::post_json_rpc(
+                &crate::http1::HttpRequest::from_test_parts(
+                    crate::http1::HttpMethod::Post,
+                    vec![("content-type".to_owned(), "application/json".to_owned())],
+                    serde_json::to_vec(&body).unwrap(),
+                ),
+                &sessions,
+                &verified,
+                journal.path(),
+            )
+        };
+        let ping = post(json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}));
+        assert_eq!(ping.status, 200);
+        let reply: serde_json::Value = serde_json::from_slice(&ping.body).unwrap();
+        assert_eq!(reply["result"], json!({}));
+        let note = post(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        assert_eq!(note.status, 202);
+        assert!(note.body.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn expired_post_sessions_return_404_and_can_initialize_again() {
         let journal = tempfile::tempdir().unwrap();
@@ -3999,7 +4048,7 @@ mod unit_tests {
         assert!(fetch_body.get("error").is_none());
         assert_ne!(fetch_body["result"]["isError"], true);
         let fetched = &fetch_body["result"]["structuredContent"];
-        assert_eq!(fetched["title"], "Indexed journal entry — 20260831");
+        assert_eq!(fetched["title"], "journal entry from 20260831");
         assert_eq!(fetched["date"], "20260831");
         assert_eq!(fetched["text"], "MCP fixture search needle");
 

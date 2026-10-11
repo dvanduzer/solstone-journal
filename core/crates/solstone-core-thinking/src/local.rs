@@ -43,7 +43,7 @@ pub fn invalid_model(model: &str) -> Value {
 }
 
 pub fn models() -> Value {
-    json!([{"name":DEFAULT_MODEL,"label":"qwen 3.5 4B VLM — 8 GB","min_ram_gb":8,"size_bytes":2_740_937_888_u64}])
+    json!([{"name":DEFAULT_MODEL,"label":"qwen 3.5 4B VLM","min_ram_gb":8,"size_bytes":2_740_937_888_u64}])
 }
 
 pub fn availability(journal: &Path, model: &str) -> Value {

@@ -2951,21 +2951,30 @@ mod tests {
         assert_eq!(rendered["status"], "ok");
         assert_eq!(rendered["reason_code"], Value::Null);
         assert_eq!(rendered["recording_failure"], Value::Null);
-        assert_eq!(rendered["files_expected"], 4);
+        assert_eq!(
+            rendered["files_expected"],
+            if cfg!(target_os = "linux") {
+                Value::Null
+            } else {
+                json!(4)
+            }
+        );
         assert_eq!(rendered["bytes_restored"], 12);
         assert_eq!(recorder.calls().len(), 1);
+        let mut restore_argv = vec![
+            "restore".into(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:/journal".into(),
+            "--target".into(),
+            journal.path().display().to_string(),
+        ];
+        #[cfg(target_os = "linux")]
+        restore_argv.extend(["--exclude".into(), "backup-activity.lock".into()]);
+        restore_argv.push("--json".into());
         assert_eq!(
             runner.calls(),
             vec![
                 vec!["snapshots".into(), "--json".into()],
-                vec![
-                    "restore".into(),
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:/journal"
-                        .into(),
-                    "--target".into(),
-                    journal.path().display().to_string(),
-                    "--json".into(),
-                ],
+                restore_argv,
                 vec!["check".into()],
             ]
         );

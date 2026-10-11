@@ -12,6 +12,7 @@ use solstone_core_journal_io::media::{Durability, MediaRead};
 use solstone_core_retention::restore_intent::{RepairHold, RestoreIntent};
 
 mod adoption;
+pub(crate) mod recovered;
 pub(crate) mod transaction;
 
 #[derive(Debug, PartialEq, Eq)]

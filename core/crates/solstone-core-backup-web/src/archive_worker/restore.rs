@@ -3,12 +3,12 @@
 
 //! Run an already admitted restore and retain its whole owning return.
 
-#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use crate::operation;
 #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
 use solstone_core_backup_runtime::DirectReadFinishState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -22,6 +22,354 @@ use solstone_core_offload::restore::owned::{
 use super::{ArchivePayload, PreparedArchiveWorker, entry, return_owned, runtime_facts};
 use crate::operation::{SharedOperationSlot, Terminal};
 use crate::restore_report;
+
+#[cfg(target_os = "linux")]
+use {
+    super::{ArchiveTicket, OwnedArchiveBegin, begin_owned_locked, prepare_read},
+    crate::{BackupWebDeps, operation::OperationState},
+    solstone_core_backup::archive_admission::AdmissionError,
+    solstone_core_backup_runtime::ClosedToolError,
+    solstone_core_backup_runtime::resolve::resolve_restic_member,
+    solstone_core_journal_io::JournalRoot,
+    solstone_core_retention::archive_catalog::read_complete_catalog,
+    std::{path::PathBuf, thread::JoinHandle},
+};
+
+#[cfg(target_os = "linux")]
+struct Input {
+    begin: OwnedArchiveBegin,
+    repository: String,
+    day: Option<String>,
+    time: u64,
+    executable: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+struct Unused {
+    input: Input,
+    refusal: UnusedRefusal,
+}
+
+#[cfg(target_os = "linux")]
+enum UnusedRefusal {
+    Start,
+    Budget(AdmissionError),
+    Tools(ClosedToolError),
+    ResolverUnknown,
+}
+
+#[cfg(target_os = "linux")]
+impl UnusedRefusal {
+    fn reason(&self) -> String {
+        match self {
+            Self::Start => "worker_start_failed".into(),
+            Self::ResolverUnknown => "resolver_unknown".into(),
+            Self::Tools(error) => error.to_string(),
+            Self::Budget(error) => match error {
+                AdmissionError::ConfigurationUnavailable => "configuration_unavailable",
+                AdmissionError::ConfigurationChanged => "configuration_changed",
+                AdmissionError::JournalIdentityChanged => "journal_identity_changed",
+                AdmissionError::DeadlineExceeded => "deadline_exceeded",
+                AdmissionError::ClockChanged => "clock_changed",
+                AdmissionError::CredentialsExpired => "credentials_expired",
+                AdmissionError::Cancelled => "cancelled",
+            }
+            .into(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Custody {
+    #[cfg(target_os = "linux")]
+    ticket: Option<ArchiveTicket>,
+    #[cfg(target_os = "linux")]
+    input: Option<Input>,
+    #[cfg(target_os = "linux")]
+    unused: Vec<Unused>,
+    #[cfg(target_os = "linux")]
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Custody {
+    pub(super) fn is_busy(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.input.is_some()
+                || !self.unused.is_empty()
+                || self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn refuse(reason: &str) -> axum::response::Response {
+    crate::response::error(
+        axum::http::StatusCode::BAD_REQUEST,
+        "that action isn't available in the current state.",
+        reason,
+        "",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn repository(root: &Arc<JournalRoot>, day: Option<&str>) -> Result<String, &'static str> {
+    let catalog = read_complete_catalog(root).map_err(|_| "ledger_degraded")?;
+    let mut selected = None;
+    for witness in catalog
+        .days
+        .iter()
+        .filter(|entry| day.is_none_or(|day| entry.day == day))
+        .flat_map(|entry| &entry.segments)
+        .flat_map(|segment| &segment.active)
+    {
+        let candidate = witness
+            .repository_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or("archive_unbound")?;
+        if selected.is_some_and(|id| id != candidate) {
+            return Err("repository_mismatch");
+        }
+        selected = Some(candidate);
+    }
+    selected.map(str::to_owned).ok_or("nothing_to_restore")
+}
+
+/// Reserve the original input before an installed restore worker can start.
+#[cfg(target_os = "linux")]
+pub(crate) fn start(
+    deps: &BackupWebDeps,
+    day: Option<String>,
+) -> Result<u64, axum::response::Response> {
+    let root = Arc::new(JournalRoot::open(&deps.journal_root).map_err(|_| refuse("restore_held"))?);
+    let repository = repository(&root, day.as_deref()).map_err(refuse)?;
+    let time = u64::try_from(deps.clock.now_unix()).map_err(|_| refuse("failed"))?;
+    let mut state =
+        operation::lock_for_begin(&deps.operations).map_err(|()| operation::busy_response())?;
+    root.revalidate_canonical_binding()
+        .map_err(|_| refuse("restore_held"))?;
+    let begin = begin_owned_locked(&mut state, "offload_restore", root, Arc::clone(&deps.clock))
+        .map_err(|_| refuse("restore_held"))?;
+    let generation = begin.generation();
+    let ticket = ArchiveTicket(Arc::clone(&begin.ticket.0));
+    state.archive.restore = Custody {
+        ticket: Some(ArchiveTicket(Arc::clone(&ticket.0))),
+        input: Some(Input {
+            begin,
+            repository,
+            day,
+            time,
+            executable: deps.executable.clone(),
+        }),
+        ..Default::default()
+    };
+    let slot = Arc::clone(&deps.operations);
+    #[cfg(all(test, feature = "full-tests"))]
+    let control = tests::take_dispatch();
+    match operation::spawn_thread(move || {
+        #[cfg(all(test, feature = "full-tests"))]
+        tests::install_dispatch(control);
+        run_pending(&slot, &ticket);
+    }) {
+        Ok(worker) => state.archive.restore.worker = Some(worker),
+        Err(_) => {
+            let input = state
+                .archive
+                .restore
+                .input
+                .take()
+                .expect("original restore input");
+            state.archive.restore.unused.push(Unused {
+                input,
+                refusal: UnusedRefusal::Start,
+            });
+        }
+    }
+    Ok(generation)
+}
+
+#[cfg(target_os = "linux")]
+fn current_matches(state: &OperationState, ticket: &ArchiveTicket) -> bool {
+    state.archive.matches(ticket)
+        && state
+            .archive
+            .restore
+            .ticket
+            .as_ref()
+            .is_some_and(|original| Arc::ptr_eq(&original.0, &ticket.0))
+        && state.current.as_ref().is_some_and(|current| {
+            current.generation == ticket.generation()
+                && current.view.kind == "offload_restore"
+                && current.handoff_poll.is_none()
+                && current.pending_handoff_terminal.is_none()
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn retain_unused(slot: &SharedOperationSlot, input: Input, refusal: UnusedRefusal) {
+    slot.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .archive
+        .restore
+        .unused
+        .push(Unused { input, refusal });
+}
+
+#[cfg(target_os = "linux")]
+fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
+    #[cfg(all(test, feature = "full-tests"))]
+    tests::before_pending();
+    let input = {
+        let (mut state, poisoned) = match slot.lock() {
+            Ok(state) => (state, false),
+            Err(error) => (error.into_inner(), true),
+        };
+        let ready = !poisoned
+            && current_matches(&state, ticket)
+            && state.current.as_ref().is_some_and(|current| {
+                !current.worker_active && !operation::is_terminal(&current.view.phase)
+            });
+        let Some(input) = state
+            .archive
+            .restore
+            .input
+            .take_if(|input| Arc::ptr_eq(&input.begin.ticket.0, &ticket.0))
+        else {
+            return;
+        };
+        if !ready {
+            state.archive.restore.unused.push(Unused {
+                input,
+                refusal: UnusedRefusal::Start,
+            });
+            return;
+        }
+        input
+    };
+    // Original input remains outside the borrowed resolver unwind boundary.
+    let resolution = catch_unwind(AssertUnwindSafe(|| {
+        input
+            .begin
+            .budget
+            .remaining(input.begin.ticket.0.clock.as_ref())
+            .map_err(UnusedRefusal::Budget)?;
+        #[cfg(all(test, feature = "full-tests"))]
+        tests::before_resolver();
+        resolve_restic_member(&input.executable).map_err(UnusedRefusal::Tools)
+    }));
+    let restic = match resolution {
+        Ok(Ok(restic)) => restic,
+        Ok(Err(refusal)) => return retain_unused(slot, input, refusal),
+        Err(_) => return retain_unused(slot, input, UnusedRefusal::ResolverUnknown),
+    };
+    let Input {
+        begin,
+        repository,
+        day: selection,
+        time,
+        ..
+    } = input;
+    if let Some(worker) = prepare_read(slot, begin, repository, &restic) {
+        match selection {
+            Some(selection) => day(slot, worker, &selection, time),
+            None => all(slot, worker, time),
+        }
+    }
+}
+
+/// Serialize a matching unused input before releasing it under admission lock.
+pub(crate) fn response(
+    deps: &crate::BackupWebDeps,
+    expected: Option<u64>,
+) -> Option<axum::response::Response> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (deps, expected);
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut state = match deps.operations.lock() {
+            Ok(state) => state,
+            Err(_) => return Some(crate::internal_error()),
+        };
+        let pending = &state.archive.restore;
+        if expected.is_none() && pending.unused.is_empty() {
+            return None;
+        }
+        let ticket = match &pending.ticket {
+            Some(ticket) => ticket,
+            None => return Some(crate::internal_error()),
+        };
+        let Some(current) = state.current.as_ref().filter(|current| {
+            current.generation == ticket.generation()
+                && expected.is_none_or(|id| id == current.generation)
+                && current.view.kind == "offload_restore"
+        }) else {
+            return Some(crate::internal_error());
+        };
+        if !Arc::ptr_eq(&ticket.0.clock, &deps.clock)
+            || ticket.0.root.revalidate_canonical_binding().is_err()
+        {
+            return Some(crate::internal_error());
+        }
+        let mut view = current.view.clone();
+        let discharge = !pending.unused.is_empty()
+            && pending
+                .worker
+                .as_ref()
+                .is_none_or(|worker| worker.is_finished());
+        if discharge {
+            if pending.unused.len() != 1
+                || !current_matches(&state, ticket)
+                || current.worker_active
+                || operation::is_terminal(&current.view.phase)
+                || pending
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+                || !state.archive.retained.is_empty()
+                || !Arc::ptr_eq(&pending.unused[0].input.begin.ticket.0, &ticket.0)
+            {
+                return Some(crate::internal_error());
+            }
+            let unused = &pending.unused[0];
+            view.phase = "refused".into();
+            let reason = unused.refusal.reason();
+            if let UnusedRefusal::Tools(error) = &unused.refusal {
+                view.detail = Some(error.detail().into());
+                view.guidance = Some(error.guidance().into());
+            }
+            view.reason_code = Some(reason.clone());
+            view.report = Some(json!({"status":"refused", "reason":reason,
+                "scope":if unused.input.day.is_some() {"day"} else {"all"},
+                "day":unused.input.day,"files_restored":0,"bytes_restored":0}));
+        }
+        let response = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(all(test, feature = "full-tests"))]
+            tests::before_response();
+            crate::status::status_with_operation(&deps.journal_root, Some(&view))
+                .map(crate::response::success)
+        }));
+        match response {
+            Ok(Ok(response)) if response.status().is_success() => {
+                if discharge {
+                    state.current.as_mut().expect("matching restore").view = view;
+                    drop(state.archive.restore.unused.pop());
+                    state.archive.reservation = None;
+                }
+                Some(response)
+            }
+            _ => Some(crate::internal_error()),
+        }
+    }
+}
 
 /// Called synchronously inside the worker holding the original admission.
 pub fn day(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: &str, now: u64) {

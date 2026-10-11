@@ -57,8 +57,7 @@ pub struct UnitCoverage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earlier_version: Option<AcceptedReuse>,
     /// Why an owed unit is owed: `never_made`, `evidence_changed`,
-    /// `contract_changed`, `output_missing`, `retry`, `unconfirmed_write` or
-    /// `conflict`.  Lets a release state what it would
+    /// `contract_changed`, `retry`, `unconfirmed_write` or `conflict`.  Lets a release state what it would
     /// regenerate before it is installed (`journal reprocess --owed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owed_by: Option<String>,
@@ -169,8 +168,8 @@ pub enum AcceptedReuse {
 /// time.  `None` means it is owed.
 ///
 /// `Some(None)` is an exact match on evidence and contract; `Some(Some(_))` is
-/// an accepted result kept on purpose.  The caller still checks the accepted
-/// artifacts exist.  ⛔ Every reader that decides reuse goes through this --
+/// an accepted result kept on purpose.  Either stands whatever became of its
+/// files: a deleted or edited output is the owner's.  ⛔ Every reader that decides reuse goes through this --
 /// the coverage reader and the run's own skip must never disagree, or a day
 /// reads current while its run regenerates it.
 pub fn accepted_reuse(
@@ -416,13 +415,10 @@ fn read_unit_coverage_cached(
                     && record.has_uncommitted_started_receipt())
             {
                 CoverageState::Outstanding
-            } else if let Some(reuse) = accepted_reuse(record, &evidence, now)
-                // A kept result stands whatever became of its files: a deleted
-                // or edited past output is the owner's, not work to redo.
-                && (reuse.is_some()
-                    || solstone_core_journal_io::accepted_daily_artifacts_valid(journal, record)
-                        .map_err(|e| e.to_string())?)
-            {
+            } else if let Some(reuse) = accepted_reuse(record, &evidence, now) {
+                // An accepted result stands whatever became of its files: a
+                // deleted or edited output is the owner's, not work to redo.
+                // The run's own skip reads the same, so the two never disagree.
                 earlier_version = reuse;
                 if record
                     .accepted
@@ -457,7 +453,7 @@ fn read_unit_coverage_cached(
         reason_code: reason,
         earlier_version,
         owed_by: if state.is_owed() {
-            Some(owed_cause(journal, record.as_ref(), &evidence).to_owned())
+            Some(owed_cause(record.as_ref(), &evidence).to_owned())
         } else {
             None
         },
@@ -466,7 +462,6 @@ fn read_unit_coverage_cached(
 
 /// Why an owed unit is owed, for `journal reprocess --owed`.
 fn owed_cause(
-    journal: &Path,
     record: Option<&solstone_core_journal_io::DailyUnitRecord>,
     evidence: &DailyEvidence,
 ) -> &'static str {
@@ -482,26 +477,13 @@ fn owed_cause(
     let Some(accepted) = record.accepted.as_ref() else {
         return "never_made";
     };
-    // A diagnostic: it must never turn a readable day unreadable, so a result
-    // whose proof or artifacts cannot be checked reads as not valid.
-    let artifacts_valid = accepted.has_valid_proof()
-        && solstone_core_journal_io::accepted_daily_artifacts_valid(journal, record)
-            .unwrap_or(false);
     if accepted.evidence_revision == evidence.revision
         && accepted.contract_digest == evidence.contract
     {
-        return if artifacts_valid {
-            "retry"
-        } else {
-            "output_missing"
-        };
+        return "retry";
     }
     if evidence.revision_under(&accepted.contract_digest) == accepted.evidence_revision {
-        return if artifacts_valid {
-            "contract_changed"
-        } else {
-            "output_missing"
-        };
+        return "contract_changed";
     }
     "evidence_changed"
 }
@@ -1026,6 +1008,29 @@ mod tests {
                 .state,
             CoverageState::Outstanding
         );
+    }
+    /// A made output the owner deleted or edited is theirs.  The unit stays
+    /// current, so catch-up neither remakes it nor resubmits its day forever.
+    #[test]
+    fn a_deleted_or_edited_output_is_the_owners_and_is_not_owed() {
+        let (dir, talent, apps) = fixture();
+        let root = dir.path();
+        let day = "20260910";
+        source(root, day, "# Flow\nMeeting at ten.");
+        let mut record = accept(root, day, &talent, &apps);
+        let accepted = record.accepted.as_mut().unwrap();
+        accepted.status = DailyUnitStatus::Committed;
+        accepted.receipts = vec![
+            serde_json::json!({"kind":"owner_action","state":"committed","action_id":"a","token":"t"}),
+            // Its file is gone, or no longer the bytes that were made.
+            serde_json::json!({"kind":"required_artifact","path":"out/made.md","sha256":"0".repeat(64)}),
+        ];
+        record.status = DailyUnitStatus::Committed;
+        save_daily_unit_record(root, &record).unwrap();
+        assert!(!solstone_core_journal_io::accepted_daily_artifacts_valid(root, &record).unwrap());
+        let coverage = read_daily_coverage_with_roots(root, day, &talent, &apps).unwrap();
+        assert_eq!(coverage.state, CoverageState::Current);
+        assert_eq!(coverage.units[0].owed_by, None);
     }
     #[test]
     fn matching_accepted_proof_cannot_hide_a_conflicting_or_pending_replacement() {

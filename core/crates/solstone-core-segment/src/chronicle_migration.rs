@@ -98,6 +98,11 @@ pub fn migrate_root_days_to_chronicle(
     if days.is_empty() {
         return Ok(report);
     }
+    if !dry_run {
+        return Err(ChronicleMigrationError::new(
+            "root-level day folders cannot be moved while their journal operations cannot be checked; the folders were left in place",
+        ));
+    }
 
     let chronicle = journal.join("chronicle");
     if !dry_run {
@@ -218,76 +223,24 @@ mod tests {
     }
 
     #[test]
-    fn root_day_directories_move_under_chronicle() {
-        let temp = TempDir::new();
-        let root = temp.path();
-        write(root.join("20260304/090000_60/audio.jsonl"), "one");
-        write(root.join("20260305/100000_60/audio.jsonl"), "two");
-        // Neither of these is a day directory.
-        write(root.join("notes/readme.md"), "keep");
-        fs::create_dir_all(root.join("2026030")).expect("short name");
-
-        let report = migrate_root_days_to_chronicle(root, false).expect("migration runs");
-
-        assert_eq!(report.moved, 2);
-        assert_eq!(report.merged, 0);
-        assert_eq!(
-            fs::read_to_string(root.join("chronicle/20260304/090000_60/audio.jsonl"))
-                .expect("moved content"),
-            "one"
-        );
-        assert!(
-            root.join("chronicle/20260305/100000_60/audio.jsonl")
-                .is_file()
-        );
-        assert!(!root.join("20260304").exists());
-        assert!(!root.join("20260305").exists());
-        assert!(root.join("notes/readme.md").is_file());
-        assert!(root.join("2026030").is_dir());
-    }
-
-    #[test]
-    fn an_existing_chronicle_day_is_merged_and_the_root_copy_is_removed() {
+    fn non_dry_root_days_hold_without_changing_either_tree() {
         let temp = TempDir::new();
         let root = temp.path();
         write(root.join("20260304/090000_60/audio.jsonl"), "root");
-        write(root.join("20260304/090000_60/only-root.txt"), "root only");
-        write(root.join("20260304/110000_60/audio.jsonl"), "root segment");
         write(
             root.join("chronicle/20260304/090000_60/audio.jsonl"),
             "chronicle",
         );
-        write(
-            root.join("chronicle/20260304/100000_60/audio.jsonl"),
-            "chronicle only",
-        );
-
-        let report = migrate_root_days_to_chronicle(root, false).expect("migration runs");
-
-        assert_eq!(report.moved, 1);
-        assert_eq!(report.merged, 1);
-        assert!(!root.join("20260304").exists(), "the root copy is removed");
+        assert!(migrate_root_days_to_chronicle(root, false).is_err());
         assert_eq!(
-            fs::read_to_string(root.join("chronicle/20260304/090000_60/audio.jsonl"))
-                .expect("merged file"),
-            "root",
-            "the root copy wins a collision, as copytree overwrite did"
+            fs::read_to_string(root.join("20260304/090000_60/audio.jsonl")).unwrap(),
+            "root"
         );
         assert_eq!(
-            fs::read_to_string(root.join("chronicle/20260304/090000_60/only-root.txt"))
-                .expect("root-only file"),
-            "root only"
+            fs::read_to_string(root.join("chronicle/20260304/090000_60/audio.jsonl")).unwrap(),
+            "chronicle"
         );
-        assert_eq!(
-            fs::read_to_string(root.join("chronicle/20260304/100000_60/audio.jsonl"))
-                .expect("pre-existing file"),
-            "chronicle only",
-            "content only the destination had survives the merge"
-        );
-        assert!(
-            root.join("chronicle/20260304/110000_60/audio.jsonl")
-                .is_file()
-        );
+        assert!(!root.join("chronicle/.maint-merge-20260304").exists());
     }
 
     #[test]

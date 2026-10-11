@@ -1693,6 +1693,28 @@ default_full = false
 runtime = "none"
 
 [[package_suites]]
+id = "package::solstone-core-location"
+package = "solstone-core-location"
+set = "component"
+areas = ["observation"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = false
+runtime = "none"
+
+[[package_suites]]
+id = "package::solstone-core-map-web"
+package = "solstone-core-map-web"
+set = "component"
+areas = ["observation"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = false
+runtime = "none"
+
+[[package_suites]]
 id = "package::solstone-core-transcripts-web"
 package = "solstone-core-transcripts-web"
 set = "component"
@@ -4897,6 +4919,19 @@ set = "component"
 areas = ["audio"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache", "host-tools"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-map-web::map_workspace_dom"
+package = "solstone-core-map-web"
+target = "map_workspace_dom"
+set = "component"
+areas = ["observation"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = []

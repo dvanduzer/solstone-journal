@@ -52,7 +52,15 @@
   if(path.startsWith('entity_search:'))return '/app/entities/#'+encodeURIComponent(path.slice('entity_search:'.length));
   const segment=/^(?:chronicle\/)?(\d{8})\/(?:(?<stream>[^/]+)\/)?([^/]+)\/(?:audio|screen|[^/]+_(?:audio|screen))\.jsonl/.exec(path);
   if(segment)return '/app/transcripts/'+segment[1]+(segment.groups.stream?'?stream='+encodeURIComponent(segment.groups.stream):'')+'#'+encodeURIComponent(segment[3]);
+  const location=/^(?:chronicle\/)?(\d{8})\/location\.md$/.exec(path);
+  if(location)return '/app/map/'+location[1];
   return null;
+ }
+ function sourceLabel(hit){
+  const path=String(hit.path||'');
+  if(path.startsWith('entity_search:'))return 'open entity';
+  if(/(?:^|\/)location\.md$/.test(path))return 'open on the map';
+  return 'open transcript';
  }
  function excerpt(value){
   // The API returns escaped excerpts with strong tags. Keep only text and that emphasis.
@@ -77,7 +85,7 @@
   text.append(excerpt(hit.text));
   card.append(text);
   const actions=node('div','search-actions');const destination=sourceLink(hit);
-  if(destination){const a=node('a','search-link',String(hit.path).startsWith('entity_search:')?'open entity':'open transcript');a.href=destination;actions.append(a);}
+  if(destination){const a=node('a','search-link',sourceLabel(hit));a.href=destination;actions.append(a);}
   else if(hit.week_url){const a=node('a','search-link','open that week →');a.href=hit.week_url;actions.append(a);}
   // G2-B09: this link goes exactly where the day heading above it already
   // goes, so on a page of five results per day it was the same link a hundred

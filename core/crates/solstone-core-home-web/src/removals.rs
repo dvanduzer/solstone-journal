@@ -7,8 +7,8 @@ use std::sync::Arc;
 use axum::{
     Extension, Json,
     body::Bytes,
-    extract::State,
-    http::StatusCode,
+    extract::{Path as RoutePath, State, rejection::PathRejection},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::SecondsFormat;
@@ -106,15 +106,130 @@ fn rendered_review(journal_root: &Path) -> Result<(Vec<Value>, String), &'static
     Ok((removals, context))
 }
 
-pub async fn approve(body: Result<Bytes, axum::extract::rejection::BytesRejection>) -> Response {
-    match action_context(body) {
-        Ok(context) => write_response(context.marks().len(), refused_before_start()),
-        Err((status, state)) => request_response(status, state),
+pub async fn approve(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    Extension(clock): Extension<crate::Clock>,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let context = match action_context(body) {
+        Ok(context) => context,
+        Err((status, state)) => return uncached(request_response(status, state)),
+    };
+    let count = context.marks().len();
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (deps, clock);
+        uncached(write_response(count, refused_before_start()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(Extension(deps)) = deps else {
+            return uncached(write_response(count, refused_before_start()));
+        };
+        #[cfg(all(test, feature = "full-tests"))]
+        let after_start = approval_tests::take_public_start_hook();
+        let result = tokio::task::spawn_blocking(move || {
+            let now = clock.now();
+            let started = solstone_core_backup_web::archive_worker::removal::start(
+                &deps,
+                context,
+                now.date_naive(),
+                now,
+            );
+            #[cfg(all(test, feature = "full-tests"))]
+            if let (Ok(started), Some(after_start)) = (&started, after_start) {
+                after_start(started.generation());
+            }
+            started
+        })
+        .await;
+        match result {
+            Ok(Ok(started)) => uncached(
+                Json(json!({"state":"approve.started", "generation":started.generation()}))
+                    .into_response(),
+            ),
+            Ok(Err(_)) => uncached(write_response(count, refused_before_start())),
+            Err(_) => approval_unavailable(OUTCOME_UNKNOWN, StatusCode::SERVICE_UNAVAILABLE),
+        }
     }
 }
 
-// Classified consumer join only. Public dispatch remains held until the
-// browser/current-result and namespace cooperation boundaries are qualified.
+fn uncached(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn approval_unavailable(state: &'static str, status: StatusCode) -> Response {
+    uncached((status, Json(json!({"state": state}))).into_response())
+}
+
+async fn approval_receiving(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    id: Result<RoutePath<String>, PathRejection>,
+    cancel: bool,
+) -> Response {
+    let Ok(RoutePath(id)) = id else {
+        return approval_unavailable(REQUEST_INVALID, StatusCode::BAD_REQUEST);
+    };
+    let Some(Extension(deps)) = deps else {
+        return approval_unavailable("approve.unavailable", StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        use solstone_core_backup_web::archive_worker::removal;
+        if cancel {
+            removal::cancel_response(&deps.operations, &id)
+        } else {
+            removal::response(&deps.operations, &id)
+        }
+    })
+    .await;
+    use solstone_core_backup_web::archive_worker::removal::ApprovalStatusRefusal;
+    match result {
+        Ok(Ok(response)) => uncached(response),
+        Ok(Err(ApprovalStatusRefusal::Stale)) => {
+            approval_unavailable("approve.stale", StatusCode::CONFLICT)
+        }
+        Ok(Err(ApprovalStatusRefusal::Unavailable)) | Err(_) => {
+            approval_unavailable("approve.unavailable", StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
+pub async fn approval_status(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    id: Result<RoutePath<String>, PathRejection>,
+) -> Response {
+    approval_receiving(deps, id, false).await
+}
+
+pub async fn cancel_approval(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    id: Result<RoutePath<String>, PathRejection>,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(body) if body.len() <= 1024 => body,
+        Ok(_) => return approval_unavailable(REQUEST_TOO_LARGE, StatusCode::PAYLOAD_TOO_LARGE),
+        Err(error) => {
+            return if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                approval_unavailable(REQUEST_TOO_LARGE, StatusCode::PAYLOAD_TOO_LARGE)
+            } else {
+                approval_unavailable(REQUEST_INVALID, StatusCode::BAD_REQUEST)
+            };
+        }
+    };
+    if !serde_json::from_slice::<serde_json::Map<String, Value>>(&body)
+        .is_ok_and(|object| object.is_empty())
+    {
+        return approval_unavailable(REQUEST_INVALID, StatusCode::BAD_REQUEST);
+    }
+    approval_receiving(deps, id, true).await
+}
+
+// Direct fixture entry for the same retained worker used by the public handler.
 #[cfg(all(test, feature = "full-tests"))]
 #[cfg(target_os = "linux")]
 fn dispatch_approval(

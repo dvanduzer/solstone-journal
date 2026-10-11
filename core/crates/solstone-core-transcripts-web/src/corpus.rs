@@ -657,6 +657,7 @@ mod tests {
                         || path == Path::new("chronicle/20260731/health/stream.updated")
                         || path == Path::new("chronicle/20260731/health/stream.updated.lock")
                         || path == Path::new("indexer/journal.sqlite.lock")
+                        || path == Path::new("backup-activity.lock")
                         || path.starts_with("config/actions")
                         || path.starts_with(crate::pending::RECORD_DIR),
                     "unexpected journal mutation: {}",

@@ -489,6 +489,25 @@ fn bundled_identity(
                     }],
                 ))
             }
+            "area-tier" => {
+                // The bundled place names: GeoNames cities500 as downloaded
+                // 2026-10-11 and Natural Earth at commit ca96624; see
+                // core/models/assets/geo/README.md. Change both with the file.
+                let ver = "geonames-20261011-natural-earth-ca96624".to_string();
+                let src = "core/models/assets/geo/area-tier.bin".to_string();
+                let sha = read_digest_const(
+                    &checkout.join("core/crates/solstone-core-location/src/asset.rs"),
+                    "AREA_TIER_SHA256",
+                )?;
+                Ok((
+                    ver,
+                    src,
+                    vec![InputRef {
+                        name: "area-tier.bin".to_string(),
+                        sha256: sha,
+                    }],
+                ))
+            }
             "silero-vad-model" => {
                 let ver = "v6".to_string();
                 let src = "core/models/assets/silero_vad_v6.onnx".to_string();
@@ -597,6 +616,25 @@ fn bundled_identity(
                     src,
                     vec![InputRef {
                         name: "pyannote-segmentation-3.0.onnx".to_string(),
+                        sha256: sha,
+                    }],
+                ))
+            }
+            "area-tier" => {
+                // The bundled place names: GeoNames cities500 as downloaded
+                // 2026-10-11 and Natural Earth at commit ca96624; see
+                // core/models/assets/geo/README.md. Change both with the file.
+                let ver = "geonames-20261011-natural-earth-ca96624".to_string();
+                let src = "core/models/assets/geo/area-tier.bin".to_string();
+                let sha = read_digest_const(
+                    &checkout.join("core/crates/solstone-core-location/src/asset.rs"),
+                    "AREA_TIER_SHA256",
+                )?;
+                Ok((
+                    ver,
+                    src,
+                    vec![InputRef {
+                        name: "area-tier.bin".to_string(),
                         sha256: sha,
                     }],
                 ))

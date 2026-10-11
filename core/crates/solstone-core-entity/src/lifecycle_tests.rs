@@ -355,23 +355,23 @@ fn a_stray_principal_flag_does_not_block_a_person_from_becoming_principal() {
     write_identity_file(
         temporary.path(),
         "office",
-        json!({"id": "office", "name": "Jer", "type": "Project", "is_principal": true}),
+        json!({"id": "office", "name": "Robin", "type": "Project", "is_principal": true}),
     );
     assert!(!has_journal_principal(temporary.path()).unwrap());
     create_journal_entity(
         temporary.path(),
-        "jer",
-        "Jer",
+        "robin",
+        "Robin",
         "Person",
         None,
         None,
-        &["Jer".to_owned()],
+        &["Robin".to_owned()],
         false,
         None,
     )
     .unwrap();
     let principal = read_journal_principal(temporary.path()).unwrap().unwrap();
-    assert_eq!(principal["id"], "jer");
+    assert_eq!(principal["id"], "robin");
     assert_eq!(principal["type"], "Person");
 }
 

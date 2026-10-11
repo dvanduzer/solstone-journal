@@ -589,6 +589,13 @@ where
     let mut retry_request = None;
     let mut last_response = None;
     for ordinal in 0..=VALIDATION_RETRY_ATTEMPTS {
+        // Written before the model is asked, so a run that stops here reads as
+        // a call that never returned, not as work that never reached the model.
+        emit_attempt(json!({
+            "event": "generate_call",
+            "ordinal": ordinal,
+            "batch": batch,
+        }));
         let response = match execute(ordinal, retry_request.as_ref().unwrap_or(request)) {
             Ok(response) => response,
             Err(error) => {
@@ -1244,7 +1251,7 @@ fn emit_outcome(writer: &mut impl Write, outcome: RuntimeOutcome) {
         ),
         RuntimeOutcome::SchemaValidationFailed { talent, validation } => emit(
             writer,
-            json!({"event":"error", "terminal":true, "name":talent, "error":"talent output failed schema validation", "schema_validation":validation, "reason_code":"schema_validation_failed"}),
+            json!({"event":"error", "terminal":true, "name":talent, "error":"talent output failed schema validation", "schema_validation":validation, "reason_code":"schema_validation_failed", "retryable":false}),
         ),
         RuntimeOutcome::PrepareFailed(error) => emit(
             writer,
@@ -1640,15 +1647,16 @@ mod tests {
             Ok(&client),
         );
         let output_events = events(&output);
-        assert_eq!(output_events.len(), 4);
+        assert_eq!(output_events.len(), 5);
         assert_eq!(output_events[0]["event"], "start");
         assert_eq!(output_events[0]["name"], "plain");
         assert!(output_events[0].get("model").is_some());
         assert!(output_events[0].get("provider").is_some());
-        assert_eq!(output_events[1]["event"], "generate_attempt");
-        assert_eq!(output_events[1]["status"], "success");
-        assert_eq!(output_events[2]["event"], "index.attempt");
-        assert_eq!(output_events[3]["event"], "finish");
+        assert_eq!(output_events[1]["event"], "generate_call");
+        assert_eq!(output_events[2]["event"], "generate_attempt");
+        assert_eq!(output_events[2]["status"], "success");
+        assert_eq!(output_events[3]["event"], "index.attempt");
+        assert_eq!(output_events[4]["event"], "finish");
         assert_eq!(
             fs::read_to_string(context.journal.join("chronicle/20260101/talents/plain.md"))
                 .unwrap(),
@@ -1702,11 +1710,12 @@ mod tests {
             Ok(&client),
         );
         let enabled_events = events(&enabled_output);
-        assert_eq!(enabled_events.len(), 4);
+        assert_eq!(enabled_events.len(), 5);
         assert_eq!(enabled_events[0]["event"], "start");
-        assert_eq!(enabled_events[1]["event"], "generate_attempt");
-        assert_eq!(enabled_events[2]["event"], "index.attempt");
-        assert_eq!(enabled_events[3]["event"], "finish");
+        assert_eq!(enabled_events[1]["event"], "generate_call");
+        assert_eq!(enabled_events[2]["event"], "generate_attempt");
+        assert_eq!(enabled_events[3]["event"], "index.attempt");
+        assert_eq!(enabled_events[4]["event"], "finish");
         assert_eq!(fs::read_to_string(output_path).unwrap(), "generated");
     }
 
@@ -1755,15 +1764,18 @@ mod tests {
             Ok(&client),
         );
         let output_events = events(&output);
-        assert_eq!(output_events.len(), 4);
+        assert_eq!(output_events.len(), 6);
         assert_eq!(output_events[0]["event"], "start");
-        assert_eq!(output_events[1]["event"], "generate_attempt");
-        assert_eq!(output_events[1]["status"], "retry_eligible");
+        assert_eq!(output_events[1]["event"], "generate_call");
         assert_eq!(output_events[2]["event"], "generate_attempt");
-        assert_eq!(output_events[2]["status"], "exhausted");
-        assert_eq!(output_events[3]["event"], "error");
+        assert_eq!(output_events[2]["status"], "retry_eligible");
+        assert_eq!(output_events[3]["event"], "generate_call");
+        assert_eq!(output_events[3]["ordinal"], 1);
+        assert_eq!(output_events[4]["event"], "generate_attempt");
+        assert_eq!(output_events[4]["status"], "exhausted");
+        assert_eq!(output_events[5]["event"], "error");
         assert_eq!(
-            output_events[3]["error"],
+            output_events[5]["error"],
             "talent output failed schema validation"
         );
         assert_eq!(fs::read(&activity_path).unwrap(), before);
@@ -1905,11 +1917,12 @@ mod tests {
         assert!(matches!(source_outcome, RuntimeOutcome::Finished { .. }));
         emit_outcome(&mut source_output, source_outcome);
         let source_events = events(&source_output);
-        assert_eq!(source_events.len(), 3);
+        assert_eq!(source_events.len(), 4);
         assert_eq!(source_events[0]["event"], "start");
-        assert_eq!(source_events[1]["event"], "generate_attempt");
-        assert_eq!(source_events[2]["event"], "finish");
-        assert_eq!(source_events[2]["output"], "generated");
+        assert_eq!(source_events[1]["event"], "generate_call");
+        assert_eq!(source_events[2]["event"], "generate_attempt");
+        assert_eq!(source_events[3]["event"], "finish");
+        assert_eq!(source_events[3]["output"], "generated");
     }
 
     #[test]
@@ -3378,15 +3391,22 @@ mod tests {
                 |event| recorded.push(event),
             );
             assert_eq!(calls, fail_at + 1);
-            assert_eq!(recorded.len(), fail_at + 1);
-            for (ordinal, event) in recorded.iter().enumerate() {
-                assert_eq!(event["ordinal"], ordinal);
-                assert_eq!(event["batch"], json!(batch));
-                assert_eq!(event["terminal"], false);
-                assert_eq!(event["retry"], ordinal < fail_at);
+            // Each call is on record before the client is asked, then its attempt.
+            assert_eq!(recorded.len(), 2 * (fail_at + 1));
+            for (ordinal, pair) in recorded.chunks(2).enumerate() {
+                let (call, attempt) = (&pair[0], &pair[1]);
+                assert_eq!(call["event"], "generate_call");
+                assert_eq!(call["ordinal"], ordinal);
+                assert_eq!(call["batch"], json!(batch));
+                assert_eq!(attempt["event"], "generate_attempt");
+                assert_eq!(attempt["ordinal"], ordinal);
+                assert_eq!(attempt["batch"], json!(batch));
+                assert_eq!(attempt["terminal"], false);
+                assert_eq!(attempt["retry"], ordinal < fail_at);
             }
-            assert_eq!(recorded[fail_at]["status"], "error");
-            assert_eq!(recorded[fail_at]["cause"], "talent_stage_failed");
+            let failed = recorded.last().unwrap();
+            assert_eq!(failed["status"], "error");
+            assert_eq!(failed["cause"], "talent_stage_failed");
             let RuntimeOutcome::StageFailed(error) = outcome.unwrap_err() else {
                 panic!("client failure lost")
             };
@@ -3419,10 +3439,11 @@ mod tests {
         .unwrap();
         assert!(matches!(response, GenerateResponse::Refused(_)));
         assert_eq!(calls, 1);
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0]["status"], "exhausted");
-        assert!(recorded[0]["cause"].is_null());
-        assert_eq!(recorded[0]["retry"], false);
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0]["event"], "generate_call");
+        assert_eq!(recorded[1]["status"], "exhausted");
+        assert!(recorded[1]["cause"].is_null());
+        assert_eq!(recorded[1]["retry"], false);
     }
 
     #[cfg(all(test, feature = "full-tests"))]

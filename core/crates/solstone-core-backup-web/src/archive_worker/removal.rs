@@ -306,6 +306,7 @@ pub struct ApprovalStatus {
     pub generation: String,
     pub state: ApprovalState,
     pub worker_settled: bool,
+    pub cancellation_requested: bool,
     pub actor_phase: Option<String>,
     pub reason_code: Option<String>,
     pub report: Option<Value>,
@@ -370,6 +371,10 @@ fn snapshot(
         generation: generation.to_string(),
         state: ApprovalState::Running,
         worker_settled: approval.settled(),
+        cancellation_requested: current
+            .archive_cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.is_cancelled()),
         actor_phase: None,
         reason_code: None,
         report: None,
@@ -454,7 +459,44 @@ pub fn response(slot: &SharedOperationSlot, id: &str) -> Result<Response, Approv
     let mut state = slot
         .lock()
         .map_err(|_| ApprovalStatusRefusal::Unavailable)?;
-    let snapshot = snapshot(&state, generation)?;
+    locked_response(&mut state, generation)
+}
+
+/// Negatively signal only this still-reserved approval's original flag.
+/// Validation, signaling and response custody share the same admission mutex.
+pub fn cancel_response(
+    slot: &SharedOperationSlot,
+    id: &str,
+) -> Result<Response, ApprovalStatusRefusal> {
+    let generation = generation(id)?;
+    let mut state = slot
+        .lock()
+        .map_err(|_| ApprovalStatusRefusal::Unavailable)?;
+    let approval = &state.archive.approval;
+    let matches = approval.generation == Some(generation)
+        && !approval.accepted_completion
+        && approval.discharged_refusal.is_none()
+        && approval
+            .ticket
+            .as_ref()
+            .is_some_and(|ticket| current_matches(&state, ticket));
+    if !matches {
+        return Err(ApprovalStatusRefusal::Stale);
+    }
+    state
+        .current
+        .as_ref()
+        .and_then(|current| current.archive_cancellation.as_ref())
+        .ok_or(ApprovalStatusRefusal::Unavailable)?
+        .cancel();
+    locked_response(&mut state, generation)
+}
+
+fn locked_response(
+    state: &mut OperationState,
+    generation: u64,
+) -> Result<Response, ApprovalStatusRefusal> {
+    let snapshot = snapshot(state, generation)?;
     let serialized = catch_unwind(AssertUnwindSafe(|| {
         #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
         tests::before_response();
@@ -467,7 +509,7 @@ pub fn response(slot: &SharedOperationSlot, id: &str) -> Result<Response, Approv
     if snapshot.worker_settled && !state.archive.approval.unused.is_empty() {
         let unused = &state.archive.approval.unused;
         if unused.len() != 1
-            || !current_matches(&state, &unused[0].input.begin.ticket)
+            || !current_matches(state, &unused[0].input.begin.ticket)
             || state
                 .current
                 .as_ref()

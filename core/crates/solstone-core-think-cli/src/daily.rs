@@ -286,14 +286,7 @@ fn queue_daily(
                         .unwrap_or_else(chrono::Utc::now),
                 ),
             );
-            if let Some(kept) = reuse
-                && (kept.is_some()
-                    || solstone_core_journal_io::accepted_daily_artifacts_valid(
-                        &context.journal,
-                        record,
-                    )
-                    .map_err(|e| e.to_string())?)
-            {
+            if let Some(kept) = reuse {
                 result.terminal_units.insert(unit);
                 let reason = match kept {
                     None => "evidence_unchanged",
@@ -305,24 +298,6 @@ fn queue_daily(
                     }
                 };
                 log_skip(log, context, &config.key, reason, facet);
-                return Ok(());
-            }
-            if reuse.is_some() {
-                log_daily_failure(
-                    log,
-                    context,
-                    &config.key,
-                    facet,
-                    None,
-                    "required_artifact_missing",
-                    "required_artifact_missing",
-                );
-                if config.key != "daily_schedule" {
-                    result.failed += 1;
-                }
-                result
-                    .failed_names
-                    .push(label(&config.key, facet, "required_artifact_missing"));
                 return Ok(());
             }
             if !retry

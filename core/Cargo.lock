@@ -3969,6 +3969,7 @@ dependencies = [
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "solstone-core-local",
+ "solstone-core-map-web",
  "solstone-core-mcp-endpoint",
  "solstone-core-npy",
  "solstone-core-profile-web",
@@ -4845,6 +4846,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-location"
+version = "2.0.41"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solstone-core-callosum",
+ "solstone-core-indexer-store",
+ "solstone-core-journal-config",
+ "solstone-core-journal-io",
+ "solstone-core-sol-link",
+ "tempfile",
+]
+
+[[package]]
 name = "solstone-core-maintenance"
 version = "2.0.41"
 dependencies = [
@@ -4864,6 +4882,21 @@ dependencies = [
  "solstone-core-speaker-resolve",
  "solstone-core-system",
  "tempfile",
+]
+
+[[package]]
+name = "solstone-core-map-web"
+version = "2.0.41"
+dependencies = [
+ "axum",
+ "chrono",
+ "log",
+ "serde_json",
+ "solstone-core-convey-http",
+ "solstone-core-location",
+ "tempfile",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

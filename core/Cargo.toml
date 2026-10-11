@@ -102,6 +102,8 @@ members = [
     "crates/solstone-core-nvattest-authority",
     "crates/solstone-core-speakers-onnx",
     "crates/solstone-core-local",
+    "crates/solstone-core-location",
+    "crates/solstone-core-map-web",
     "crates/solstone-core-assets",
     "crates/solstone-core-origin",
     "crates/solstone-core-body-source",
@@ -272,6 +274,8 @@ solstone-core-generate = { path = "crates/solstone-core-generate" }
 solstone-core-generate-wire = { path = "crates/solstone-core-generate-wire" }
 solstone-core-speakers-onnx = { path = "crates/solstone-core-speakers-onnx" }
 solstone-core-local = { path = "crates/solstone-core-local" }
+solstone-core-location = { path = "crates/solstone-core-location" }
+solstone-core-map-web = { path = "crates/solstone-core-map-web" }
 solstone-core-assets = { path = "crates/solstone-core-assets" }
 solstone-core-origin = { path = "crates/solstone-core-origin" }
 solstone-core-spp-attest = { path = "crates/solstone-core-spp-attest" }

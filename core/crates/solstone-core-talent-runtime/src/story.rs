@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use serde_json::{Map, Value, json};
+use solstone_core_transcripts::VoiceNames;
 
 use crate::contract::{CommitPlan, ParsedOutput, PrePostState};
 use crate::{AGENT_ACTOR, NamedActor, PreparedTalent, StageError, UNKNOWN_ACTOR, stage_error};
@@ -142,7 +143,14 @@ pub fn apply_story(
     // In a spoken conversation, "you" rests on the owner's recognized voice.
     let heard = (talent == "conversation"
         && record.get("activity").and_then(Value::as_str) == Some("meeting"))
-    .then(|| owner_heard(root, day, &record))
+    .then(|| {
+        owner_heard(
+            root,
+            day,
+            &record,
+            crate::transcript::voice_names(root).as_ref(),
+        )
+    })
     .flatten();
     let said = heard.as_deref().map(normalize_words).unwrap_or_default();
     // The owner's own references always resolve to the owner; "your agent" and
@@ -255,12 +263,14 @@ pub fn apply_story(
 
 /// What the owner said in the activity's audio, by recognized voice: `None`
 /// when it has no audio transcript, empty when no line is the owner's.
+/// `voices` is the journal's `voice_names`, loaded once by the caller: it reads
+/// every entity, so a caller walking many records must not reload it per record.
 pub(crate) fn owner_heard(
     root: &std::path::Path,
     day: &str,
     record: &Map<String, Value>,
+    voices: Option<&VoiceNames>,
 ) -> Option<Vec<String>> {
-    let voices = crate::transcript::voice_names(root);
     let day_dir = root.join("chronicle").join(day);
     // A record that names its stream reads only that stream's audio: another
     // stream can hold a segment with the same key.
@@ -302,7 +312,7 @@ pub(crate) fn owner_heard(
             if !matches!(solstone_core_segment::owner_deleted(&dir), Ok(false)) {
                 continue;
             }
-            if let Some(voices) = voices.as_ref() {
+            if let Some(voices) = voices {
                 said.extend(solstone_core_transcripts::owner_voice_lines(&dir, voices));
             }
         }

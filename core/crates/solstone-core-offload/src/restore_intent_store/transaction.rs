@@ -278,14 +278,27 @@ fn current_mark<'a>(
     witness: &ArchiveWitness,
     register: &'a Register,
 ) -> Result<Option<&'a Mark>, Hold> {
+    related_mark(
+        &owner.destination.locator().target,
+        &witness.file.name,
+        register,
+    )
+    .map_err(Hold::Repair)
+}
+
+pub(super) fn related_mark<'a>(
+    target: &solstone_core_retention::Target,
+    name: &str,
+    register: &'a Register,
+) -> Result<Option<&'a Mark>, RepairHold> {
     let mut matches = register.marks.values().filter(|mark| {
         mark.class == RemovalClass::OffloadRawRelease
-            && mark.target == owner.destination.locator().target
-            && mark.proposal.names.contains(&witness.file.name)
+            && &mark.target == target
+            && mark.proposal.names.iter().any(|current| current == name)
     });
     let selected = matches.next();
     if matches.next().is_some() {
-        return Err(Hold::Repair(RepairHold::MarkChanged));
+        return Err(RepairHold::MarkChanged);
     }
     Ok(selected)
 }
@@ -1266,7 +1279,7 @@ fn replay_local<'operation, 'clock>(
 #[cfg(all(test, feature = "full-tests", unix))]
 mod tests;
 
-mod retirement;
+pub(super) mod retirement;
 
 mod owned;
 pub(crate) use owned::{DetachedTransaction, SettledTransaction, SettlementFailure};

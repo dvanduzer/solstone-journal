@@ -16,7 +16,7 @@ use solstone_core_journal_io::{
 use crate::SegmentError;
 
 const TOMBSTONE_NAME: &str = "tombstone.json";
-const STAGED_PREFIX: &str = ".removing_";
+pub(crate) const STAGED_PREFIX: &str = ".removing_";
 
 /// Non-mutating state of an owner-deleted segment path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -186,6 +186,7 @@ fn unrecorded_outcome(draft: RestoreDraft) -> RestoreOutcome {
 #[allow(clippy::too_many_arguments)] // Mirrors the shared restic invocation boundary.
 fn restic(
     services: &BackupServices<'_>,
+    admitted: &crate::destination_admission::AdmittedDestination,
     args: Vec<String>,
     destination: &Destination,
     key: &str,
@@ -194,6 +195,9 @@ fn restic(
     timeout: u64,
     runner_error_reason: &'static str,
 ) -> Result<ResticResult, &'static str> {
+    admitted
+        .revalidate_for_target()
+        .map_err(|_| RESTORE_REASON_DESTINATION_ADMISSION_FAILED)?;
     let restic_path = services
         .restic_path()
         .map_err(|_| RESTORE_REASON_RESTIC_UNAVAILABLE)?;
@@ -207,7 +211,16 @@ fn restic(
         json_output,
         None,
         Some(Duration::from_secs(timeout)),
-        &[],
+        &{
+            #[cfg(target_os = "linux")]
+            {
+                [admitted.child_lock()]
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                []
+            }
+        },
     )
     .map_err(|_| runner_error_reason)
 }
@@ -292,34 +305,62 @@ pub fn restore_journal(
         ..*services
     };
     let journal = match admitted.revalidate_for_target() {
-        Ok(path) => path,
+        Ok(_) => admitted.callback_target(),
         Err(_) => {
             return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
         }
     };
     let active_binding = load_hosted_binding(journal);
-    let finish =
-        |journal: &Path, clock: &dyn Clock, recorder: &dyn RestoreRecorder, draft: RestoreDraft| {
-            #[cfg(windows)]
-            if retaining_runner.cleanup_pending() {
-                return unrecorded_outcome(draft);
-            }
+    let finish = |journal: &Path,
+                  clock: &dyn Clock,
+                  recorder: &dyn RestoreRecorder,
+                  draft: RestoreDraft| {
+        #[cfg(windows)]
+        if retaining_runner.cleanup_pending() {
+            return unrecorded_outcome(draft);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut draft = draft;
             if admitted.revalidate_for_target().is_err() {
-                unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED))
-            } else {
-                if let Some(binding) = &active_binding
-                    && save_hosted_binding(journal, binding).is_err()
-                {
-                    return crate::restore::finish(
-                        journal,
-                        clock,
-                        recorder,
-                        error_draft(RESTORE_REASON_RESTORE_IO_FAILED),
-                    );
-                }
-                crate::restore::finish(journal, clock, recorder, draft)
+                draft.status = "error".to_owned();
+                draft.reason_code = Some(RESTORE_REASON_DESTINATION_ADMISSION_FAILED.to_owned());
+                draft.resumable = false;
+            } else if let Some(binding) = &active_binding
+                && save_hosted_binding(journal, binding).is_err()
+            {
+                draft.status = "error".to_owned();
+                draft.reason_code = Some(RESTORE_REASON_RESTORE_IO_FAILED.to_owned());
+                draft.resumable = false;
             }
-        };
+            let mut outcome = crate::restore::finish(journal, clock, recorder, draft);
+            if admitted.revalidate_for_target().is_err() {
+                outcome.status = "error".to_owned();
+                outcome.reason_code = Some(RESTORE_REASON_DESTINATION_ADMISSION_FAILED.to_owned());
+                outcome.resumable = false;
+            }
+            outcome
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if admitted.revalidate_for_target().is_err() {
+                return unrecorded_outcome(error_draft(
+                    RESTORE_REASON_DESTINATION_ADMISSION_FAILED,
+                ));
+            }
+            if let Some(binding) = &active_binding
+                && save_hosted_binding(journal, binding).is_err()
+            {
+                return crate::restore::finish(
+                    journal,
+                    clock,
+                    recorder,
+                    error_draft(RESTORE_REASON_RESTORE_IO_FAILED),
+                );
+            }
+            crate::restore::finish(journal, clock, recorder, draft)
+        }
+    };
     let canonical = match parse_recovery_key(entered_recovery_key) {
         Ok(key) => key,
         Err(_) => {
@@ -337,6 +378,7 @@ pub fn restore_journal(
     };
     let snapshots = match restic(
         services,
+        &admitted,
         vec!["snapshots".into()],
         &destination,
         &canonical,
@@ -389,16 +431,26 @@ pub fn restore_journal(
     };
     let restored = match restic(
         services,
-        vec![
-            "restore".into(),
-            format!(
-                "{}:{}",
-                snapshot.id,
-                crate::restic_tree_path(Path::new(&snapshot.path))
-            ),
-            "--target".into(),
-            target_path.display().to_string(),
-        ],
+        &admitted,
+        {
+            let args = vec![
+                "restore".into(),
+                format!(
+                    "{}:{}",
+                    snapshot.id,
+                    crate::restic_tree_path(Path::new(&snapshot.path))
+                ),
+                "--target".into(),
+                target_path.display().to_string(),
+            ];
+            #[cfg(target_os = "linux")]
+            let args = {
+                let mut args = args;
+                args.extend(["--exclude".to_owned(), "backup-activity.lock".to_owned()]);
+                args
+            };
+            args
+        },
         &destination,
         &canonical,
         &env,
@@ -415,13 +467,19 @@ pub fn restore_journal(
             .unwrap_or(RESTORE_REASON_RESTORE_FAILED);
         return finish(journal, services.clock, recorder, error_draft(reason));
     }
+    let selected_regular_files = if cfg!(target_os = "linux") {
+        None
+    } else {
+        snapshot.regular_files
+    };
     let (counters, summary_missing) =
-        match restore_counters(restored.json.as_ref(), snapshot.regular_files) {
+        match restore_counters(restored.json.as_ref(), selected_regular_files) {
             Some(counters) => (counters, false),
             None => (RestoreCounters::default(), true),
         };
     let check = match restic(
         services,
+        &admitted,
         vec!["check".into()],
         &destination,
         &canonical,
@@ -464,8 +522,28 @@ pub fn restore_journal(
             false,
         )
     };
+    let admission_failed = || {
+        #[cfg(target_os = "linux")]
+        {
+            finish(
+                journal,
+                services.clock,
+                recorder,
+                counters.into_draft(
+                    "error",
+                    Some(RESTORE_REASON_DESTINATION_ADMISSION_FAILED.to_owned()),
+                    integrity_ok,
+                    false,
+                ),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED))
+        }
+    };
     if admitted.revalidate_for_target().is_err() {
-        return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
+        return admission_failed();
     }
     if services
         .journal_maintenance
@@ -485,7 +563,7 @@ pub fn restore_journal(
         );
     }
     if admitted.revalidate_for_target().is_err() {
-        return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
+        return admission_failed();
     }
     if set_destination(journal, &destination).is_err() {
         return finish(
@@ -501,7 +579,7 @@ pub fn restore_journal(
         );
     }
     if admitted.revalidate_for_target().is_err() {
-        return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
+        return admission_failed();
     }
     if set_recovery_key(journal, &canonical).is_err() {
         return finish(
@@ -517,7 +595,7 @@ pub fn restore_journal(
         );
     }
     if admitted.revalidate_for_target().is_err() {
-        return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
+        return admission_failed();
     }
     if set_recovery_key_confirmed(journal, true).is_err() {
         return finish(
@@ -542,7 +620,7 @@ pub fn restore_journal(
         })
         .is_some_and(|key| !key.is_empty());
     if admitted.revalidate_for_target().is_err() {
-        return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
+        return admission_failed();
     }
     if services.journal_maintenance.full_scan(journal).is_err() {
         return finish(
@@ -567,6 +645,9 @@ pub fn restore_journal(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod cooperation;
+
     use super::*;
     use crate::engine::{JournalMaintenance, JournalMaintenanceError, NativeRestoreRecorder};
     use crate::hosted_runtime::{HttpError, HttpRequest, HttpResponse, HttpTransport};
@@ -797,6 +878,14 @@ mod tests {
         assert_eq!(record.bytes_restored, bytes_restored);
     }
 
+    fn selected_file_count(files: u64) -> Option<u64> {
+        if cfg!(target_os = "linux") {
+            None
+        } else {
+            Some(files)
+        }
+    }
+
     #[test]
     fn absent_restic_path_returns_existing_unavailable_reason_and_records_once() {
         let journal = tempfile::tempdir().expect("journal");
@@ -870,8 +959,8 @@ mod tests {
         );
 
         assert_eq!(outcome.status, "ok");
-        assert_eq!(outcome.files_expected, Some(2));
-        assert_eq!(outcome.files_restored, Some(2));
+        assert_eq!(outcome.files_expected, selected_file_count(2));
+        assert_eq!(outcome.files_restored, selected_file_count(2));
         assert_eq!(outcome.bytes_expected, Some(11));
         assert_eq!(outcome.bytes_restored, Some(11));
         assert_eq!(
@@ -885,7 +974,14 @@ mod tests {
                 format!("{CAPTURED_SNAPSHOT_ID}:/tmp/journal")
             ]
         );
-        assert_recorded_counters(&recorder, "ok", json!(2), json!(2), json!(11), json!(11));
+        assert_recorded_counters(
+            &recorder,
+            "ok",
+            json!(selected_file_count(2)),
+            json!(selected_file_count(2)),
+            json!(11),
+            json!(11),
+        );
         assert!(runner.refusals().is_empty());
     }
 
@@ -951,11 +1047,18 @@ mod tests {
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.reason_code, None);
-        assert_eq!(outcome.files_expected, Some(0));
-        assert_eq!(outcome.files_restored, Some(0));
+        assert_eq!(outcome.files_expected, selected_file_count(0));
+        assert_eq!(outcome.files_restored, selected_file_count(0));
         assert_eq!(outcome.bytes_expected, Some(0));
         assert_eq!(outcome.bytes_restored, Some(0));
-        assert_recorded_counters(&recorder, "ok", json!(0), json!(0), json!(0), json!(0));
+        assert_recorded_counters(
+            &recorder,
+            "ok",
+            json!(selected_file_count(0)),
+            json!(selected_file_count(0)),
+            json!(0),
+            json!(0),
+        );
     }
 
     #[test]
@@ -1006,11 +1109,18 @@ mod tests {
 
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.reason_code, None);
-        assert_eq!(outcome.files_expected, Some(0));
-        assert_eq!(outcome.files_restored, Some(0));
+        assert_eq!(outcome.files_expected, selected_file_count(0));
+        assert_eq!(outcome.files_restored, selected_file_count(0));
         assert_eq!(outcome.bytes_expected, Some(0));
         assert_eq!(outcome.bytes_restored, Some(0));
-        assert_recorded_counters(&recorder, "ok", json!(0), json!(0), json!(0), json!(0));
+        assert_recorded_counters(
+            &recorder,
+            "ok",
+            json!(selected_file_count(0)),
+            json!(selected_file_count(0)),
+            json!(0),
+            json!(0),
+        );
     }
 
     #[test]

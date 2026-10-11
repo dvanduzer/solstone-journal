@@ -6,8 +6,16 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use solstone_core_journal_io::JournalRoot;
+#[cfg(target_os = "linux")]
+use {
+    solstone_core_journal_io::{
+        activity::ActivityLease, activity_obligations::observe_obligations,
+    },
+    std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    std::sync::Arc,
+};
 
 #[derive(Debug)]
 pub enum DestinationAdmissionError {
@@ -45,7 +53,15 @@ pub fn with_forced_admission_failure<T>(f: impl FnOnce() -> T) -> T {
 pub struct AdmittedDestination {
     #[cfg(windows)]
     root: JournalRoot,
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    root: Arc<JournalRoot>,
+    #[cfg(target_os = "linux")]
+    activity: Arc<ActivityLease>,
+    #[cfg(target_os = "linux")]
+    child_lock: OwnedFd,
+    #[cfg(target_os = "linux")]
+    callback_path: PathBuf,
+    #[cfg(all(unix, not(target_os = "linux")))]
     path: PathBuf,
 }
 
@@ -64,7 +80,35 @@ impl AdmittedDestination {
                 .map_err(|_| DestinationAdmissionError::Failed)?;
             Ok(Self { root })
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            let absolute =
+                std::path::absolute(path).map_err(|_| DestinationAdmissionError::Failed)?;
+            let root = Arc::new(
+                JournalRoot::open(&absolute).map_err(|_| DestinationAdmissionError::Failed)?,
+            );
+            root.canonical_path()
+                .to_str()
+                .ok_or(DestinationAdmissionError::Failed)?;
+            let activity = ActivityLease::try_acquire(Arc::clone(&root))
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            let child_lock = activity
+                .duplicate_descriptor_for_child()
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            let callback_path = PathBuf::from(format!(
+                "/proc/self/fd/{}/.",
+                root.as_ref().as_fd().as_raw_fd()
+            ));
+            let admitted = Self {
+                root,
+                activity,
+                child_lock,
+                callback_path,
+            };
+            admitted.revalidate_for_target()?;
+            Ok(admitted)
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             Ok(Self {
                 path: path.to_path_buf(),
@@ -91,7 +135,22 @@ impl AdmittedDestination {
                 .map_err(|_| DestinationAdmissionError::Failed)?;
             Ok(self.root.canonical_path())
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            self.activity
+                .revalidate()
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            let observations =
+                observe_obligations(&self.root).map_err(|_| DestinationAdmissionError::Failed)?;
+            if !observations.entries().is_empty() {
+                return Err(DestinationAdmissionError::Failed);
+            }
+            self.activity
+                .revalidate()
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            Ok(self.root.canonical_path())
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
         {
             Ok(&self.path)
         }
@@ -100,11 +159,72 @@ impl AdmittedDestination {
             Err(DestinationAdmissionError::Failed)
         }
     }
+
+    pub(crate) fn callback_target(&self) -> &Path {
+        #[cfg(target_os = "linux")]
+        {
+            &self.callback_path
+        }
+        #[cfg(windows)]
+        {
+            self.root.canonical_path()
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            &self.path
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Path::new("")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn child_lock(&self) -> BorrowedFd<'_> {
+        self.child_lock.as_fd()
+    }
 }
 
 pub fn admit_restore_destination(
     path: &Path,
 ) -> Result<AdmittedDestination, DestinationAdmissionError> {
+    #[cfg(target_os = "linux")]
+    {
+        let absolute = std::path::absolute(path).map_err(|_| DestinationAdmissionError::Failed)?;
+        let mut existing = absolute.as_path();
+        let mut missing = Vec::new();
+        loop {
+            match std::fs::symlink_metadata(existing) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(
+                        existing
+                            .file_name()
+                            .ok_or(DestinationAdmissionError::Failed)?
+                            .to_owned(),
+                    );
+                    existing = existing.parent().ok_or(DestinationAdmissionError::Failed)?;
+                }
+                Err(_) => return Err(DestinationAdmissionError::Failed),
+            }
+        }
+        let mut parent =
+            JournalRoot::open(existing).map_err(|_| DestinationAdmissionError::Failed)?;
+        for name in missing.into_iter().rev() {
+            parent
+                .revalidate_canonical_binding()
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            let retained = PathBuf::from(format!("/proc/self/fd/{}/.", parent.as_fd().as_raw_fd()))
+                .join(&name);
+            std::fs::create_dir(&retained).map_err(|_| DestinationAdmissionError::Failed)?;
+            parent
+                .revalidate_canonical_binding()
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            parent = JournalRoot::open(&parent.canonical_path().join(name))
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+        }
+        AdmittedDestination::admit(parent.canonical_path())
+    }
     #[cfg(windows)]
     {
         use solstone_core_journal_io::name_admission::check_portable_component;
@@ -145,6 +265,6 @@ pub fn admit_restore_destination(
         }
         Ok(admitted)
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     AdmittedDestination::admit(path)
 }

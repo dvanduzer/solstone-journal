@@ -92,6 +92,26 @@ impl ToolError {
             Self::ReferenceNotFound => "not_found",
         }
     }
+
+    /// What an agent is told, so it can retry, change the call or tell the
+    /// owner. ⛔ Never names the journal's derived index "the journal index".
+    pub(crate) fn agent_message(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "the arguments were not valid for this tool",
+            Self::IndexAbsent => "the search index has not been built yet, so nothing can be found",
+            Self::IndexUnreadable => "the search index could not be read; try again later",
+            Self::IndexLocked => "the search index is being updated; try again in a moment",
+            Self::EmptyIndex => "the search index is empty, so nothing can match yet",
+            Self::NotIndexed => "the requested material is not in the search index yet",
+            Self::FileUnreadable => "a journal file could not be read; try again later",
+            Self::AuditUnavailable => {
+                "the call could not be recorded in the owner's activity log, so nothing was returned; try again"
+            }
+            Self::ReferenceNotFound => {
+                "the reference or cursor did not resolve to anything this connection may read; pass one unchanged from a fresh result"
+            }
+        }
+    }
 }
 
 /// Keep audit publication as a mandatory predecessor of native tool execution.

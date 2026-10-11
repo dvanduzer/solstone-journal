@@ -519,6 +519,13 @@ mod tests {
         let journal_wide = classify_source(&root, "20260107/talents/day.md", None, &declarations);
         assert_eq!(journal_wide.basis, Some("journal_wide"));
 
+        // A day's location words reach a whole-journal agent holding the
+        // transcripts category, and never a connection scoped to facets.
+        let location = classify_source(&root, "20260107/location.md", None, &declarations);
+        assert!(location.eligible);
+        assert_eq!(location.category, Some("transcripts"));
+        assert_eq!(location.basis, Some("journal_wide"));
+
         let mcp = classify_source(
             &root,
             "20260107/mcp.agent/123456_300/talents/brief.md",

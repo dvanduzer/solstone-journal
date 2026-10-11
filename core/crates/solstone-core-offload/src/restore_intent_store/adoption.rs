@@ -126,12 +126,12 @@ fn named_obligation(selected: &NativeObligation, read: &ObservedIntent) -> Nativ
 }
 
 /// Loading a complete catalog is distinct from enforcing uniqueness across days.
-fn selected_catalog<'a>(
+pub(super) fn selected_catalog<'a>(
     catalog: &'a JournalCatalog,
     intent: &RestoreIntent,
-) -> Result<&'a SegmentCatalog, ReviewProblem> {
+) -> Result<&'a SegmentCatalog, RepairHold> {
     if catalog.degraded() {
-        return Err(ReviewProblem::Repair(RepairHold::DegradedCatalog));
+        return Err(RepairHold::DegradedCatalog);
     }
     let all = || catalog.days.iter().flat_map(|day| &day.segments);
     let mut selected = all().filter(|segment| {
@@ -139,30 +139,26 @@ fn selected_catalog<'a>(
             && segment.stream == intent.locator.target.stream
             && segment.segment == intent.locator.segment
     });
-    let segment = selected
-        .next()
-        .ok_or(ReviewProblem::Repair(RepairHold::CatalogChanged))?;
+    let segment = selected.next().ok_or(RepairHold::CatalogChanged)?;
     if selected.next().is_some() {
-        return Err(ReviewProblem::Repair(RepairHold::CatalogChanged));
+        return Err(RepairHold::CatalogChanged);
     }
     let mut manifests = all()
         .flat_map(|segment| &segment.history)
         .filter(|manifest| manifest.manifest_id == intent.witness.manifest_id);
-    let manifest = manifests
-        .next()
-        .ok_or(ReviewProblem::Repair(RepairHold::CatalogChanged))?;
+    let manifest = manifests.next().ok_or(RepairHold::CatalogChanged)?;
     if manifests.next().is_some()
         || !segment.history.contains(manifest)
         || !manifest.files.contains(&intent.witness)
     {
-        return Err(ReviewProblem::Repair(RepairHold::CatalogChanged));
+        return Err(RepairHold::CatalogChanged);
     }
     let mut witnesses = all()
         .flat_map(|segment| &segment.history)
         .flat_map(|manifest| &manifest.files)
         .filter(|witness| witness.witness_id == intent.witness.witness_id);
     if witnesses.next() != Some(&intent.witness) || witnesses.next().is_some() {
-        return Err(ReviewProblem::Repair(RepairHold::CatalogChanged));
+        return Err(RepairHold::CatalogChanged);
     }
     let mut operations = all().flat_map(|segment| {
         segment
@@ -176,13 +172,13 @@ fn selected_catalog<'a>(
         .is_some_and(|(location, event)| location != segment || event != &intent.event)
         || operations.next().is_some()
     {
-        return Err(ReviewProblem::Repair(RepairHold::OperationCollision));
+        return Err(RepairHold::OperationCollision);
     }
     if let Some(binding) = &intent.legacy_binding {
         if catalog.restore_binding(&binding.adoption_id) != Some(binding)
             || manifest != &binding.legacy_manifest
         {
-            return Err(ReviewProblem::Repair(RepairHold::CatalogChanged));
+            return Err(RepairHold::CatalogChanged);
         }
         for expected in &binding.legacy_manifest.files {
             let mut matches = all()
@@ -190,7 +186,7 @@ fn selected_catalog<'a>(
                 .flat_map(|manifest| &manifest.files)
                 .filter(|witness| witness.witness_id == expected.witness_id);
             if matches.next() != Some(expected) || matches.next().is_some() {
-                return Err(ReviewProblem::Repair(RepairHold::CatalogChanged));
+                return Err(RepairHold::CatalogChanged);
             }
         }
     }
@@ -259,7 +255,7 @@ impl ReviewOwner {
                 read_complete_catalog(self.activity.journal_root()).map_err(ReviewProblem::Io)?,
             );
             let catalog = evidence.catalog.as_ref().ok_or(ReviewProblem::Changed)?;
-            let segment = selected_catalog(catalog, intent)?;
+            let segment = selected_catalog(catalog, intent).map_err(ReviewProblem::Repair)?;
             evidence.register = Some(
                 review_context::load_at_root(self.activity.journal_root())
                     .map_err(|error| ReviewProblem::Io(format!("{error:?}")))?,

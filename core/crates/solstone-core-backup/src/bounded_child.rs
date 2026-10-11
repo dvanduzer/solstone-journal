@@ -541,7 +541,10 @@ fn execute_request(
             prepare_dns_child(&mut command);
             inherit_in_child(&mut command, &allowed)?;
         }
-        ChildSetup::Ordinary => inherit_in_child(&mut command, &request.pass_fds)?,
+        ChildSetup::Ordinary => {
+            prepare_dns_child(&mut command);
+            inherit_in_child(&mut command, &request.pass_fds)?;
+        }
     }
     #[cfg(not(target_os = "linux"))]
     inherit_in_child(&mut command, &request.pass_fds)?;
@@ -617,6 +620,9 @@ fn execute_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", feature = "full-tests"))]
+    mod cooperation;
 
     #[test]
     fn completion_reaps_before_collecting_and_preserves_cleanup_error() {

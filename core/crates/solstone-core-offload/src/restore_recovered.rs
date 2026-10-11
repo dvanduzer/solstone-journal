@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Immutable-record register recovery. This phase never retires intent or media.
+//! Immutable-record register recovery and consuming confirmed metadata retirement.
+
+pub mod retirement;
 
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -120,7 +122,9 @@ pub fn recover_restored_register(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn register_confirmed(result: &Result<BoundMutationOutcome, RecoveredRestoredMarkRefusal>) -> bool {
+pub(crate) fn register_confirmed(
+    result: &Result<BoundMutationOutcome, RecoveredRestoredMarkRefusal>,
+) -> bool {
     matches!(result,
         Ok(BoundMutationOutcome::Published(value) | BoundMutationOutcome::Unchanged(value))
             if matches!(value.status, MutationStatus::Applied | MutationStatus::AlreadyApplied))
