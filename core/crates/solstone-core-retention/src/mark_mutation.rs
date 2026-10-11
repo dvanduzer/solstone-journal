@@ -4,15 +4,33 @@
 //! Exact-observation updates for removal proposals and durable recovery plans.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use solstone_core_journal_io::{JsonWriteOptions, hold_lock, write_json};
+use solstone_core_journal_io::{
+    BoundParentLock, ExistingParentLockError, JournalRoot, JsonWriteOptions,
+    acquire_existing_parent_lock_bound, hold_lock, write_json,
+};
+#[cfg(unix)]
+use solstone_core_journal_io::{
+    FlatDirectory as HealthDirectory, open_flat_directory_bound as open_health,
+};
+#[cfg(windows)]
+use solstone_core_journal_io::{
+    WindowsFlatDirectory as HealthDirectory, open_windows_flat_directory_bound as open_health,
+};
 
 use crate::archive_proof::OffloadOffer;
 use crate::marks::{
     Failure, Mark, MarkState, Register, StoreError, load_path, register_lock_options,
     register_path, validate,
+};
+#[cfg(unix)]
+use crate::review_context::MAX_REGISTER_BYTES;
+use crate::review_context::{
+    CheckedReviewContext, ReviewRefusal, check_marks, read_at_health, revalidate_health,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -29,6 +47,50 @@ pub enum MutationStatus {
 pub struct ConditionalResult {
     pub status: MutationStatus,
     pub register: Register,
+}
+
+#[derive(Debug)]
+pub enum BoundMutationRefusal {
+    Unsupported,
+    Review(ReviewRefusal),
+    Lock(ExistingParentLockError),
+    Serialize(serde_json::Error),
+    #[cfg(unix)]
+    Write(solstone_core_journal_io::atomic::DetailedAtomicError),
+    #[cfg(windows)]
+    Write(solstone_core_journal_io::atomic::BoundAtomicPublishError),
+}
+
+impl From<ReviewRefusal> for BoundMutationRefusal {
+    fn from(value: ReviewRefusal) -> Self {
+        Self::Review(value)
+    }
+}
+
+/// Failures after publication; the candidate may no longer be the named register.
+#[derive(Debug, Default)]
+pub struct RegisterUncertainty {
+    pub durability: Option<io::Error>,
+    pub observation: Option<io::Error>,
+    pub bindings: Vec<ReviewRefusal>,
+}
+
+impl RegisterUncertainty {
+    #[cfg(unix)]
+    fn confirmed(&self) -> bool {
+        self.durability.is_none() && self.observation.is_none() && self.bindings.is_empty()
+    }
+}
+
+#[must_use]
+#[derive(Debug)]
+pub enum BoundMutationOutcome {
+    Unchanged(ConditionalResult),
+    Published(ConditionalResult),
+    PublishedUncertain {
+        candidate: ConditionalResult,
+        uncertainty: RegisterUncertainty,
+    },
 }
 
 /// A deterministic update that can be recorded before publishing restored media.
@@ -227,6 +289,167 @@ pub fn conditional_mutate(
         .map_err(StoreError::Write)?;
     }
     Ok(ConditionalResult { status, register })
+}
+
+fn begin_bound(
+    root: &JournalRoot,
+    health: &HealthDirectory,
+) -> Result<(BoundParentLock, Register), BoundMutationRefusal> {
+    // Windows publication remains held pending the owning adapter's qualification.
+    if cfg!(windows) {
+        return Err(BoundMutationRefusal::Unsupported);
+    }
+    revalidate_health(root, health)?;
+    let options = register_lock_options();
+    let lock = acquire_existing_parent_lock_bound(
+        health,
+        OsStr::new("retention-marks.json.lock"),
+        options.timeout,
+        options.poll_interval,
+    )
+    .map_err(BoundMutationRefusal::Lock)?;
+    revalidate_health(root, health)?;
+    let register = read_at_health(health)?.ok_or_else(|| {
+        BoundMutationRefusal::Review(ReviewRefusal::Register(invalid(
+            "the retained removal register disappeared",
+        )))
+    })?;
+    if register.version != 1 {
+        return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+            StoreError::WriterHeld,
+        )));
+    }
+    Ok((lock, register))
+}
+
+#[cfg(unix)]
+fn publish_bound(
+    root: &JournalRoot,
+    health: &HealthDirectory,
+    lock: &BoundParentLock,
+    result: ConditionalResult,
+) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
+    validate(&result.register)
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+    let bytes =
+        serde_json::to_vec_pretty(&result.register).map_err(BoundMutationRefusal::Serialize)?;
+    if bytes.len() > MAX_REGISTER_BYTES {
+        return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+            invalid("the replacement removal register exceeds the read bound"),
+        )));
+    }
+    revalidate_health(root, health)?;
+    #[cfg(unix)]
+    let mut uncertainty = {
+        use solstone_core_journal_io::BoundAtomicOutcome;
+        let _lock = lock;
+        match solstone_core_journal_io::atomic_replace_bound(
+            health,
+            OsStr::new("retention-marks.json"),
+            &bytes,
+            0o600,
+        )
+        .map_err(BoundMutationRefusal::Write)?
+        {
+            BoundAtomicOutcome::Published { .. } => RegisterUncertainty::default(),
+            BoundAtomicOutcome::PublishedDurabilityUncertain { source, .. } => {
+                RegisterUncertainty {
+                    durability: Some(source),
+                    ..RegisterUncertainty::default()
+                }
+            }
+            BoundAtomicOutcome::PublishedObservationUncertain {
+                source,
+                durability_source,
+                ..
+            } => RegisterUncertainty {
+                durability: durability_source,
+                observation: Some(source),
+                ..RegisterUncertainty::default()
+            },
+        }
+    };
+    if let Err(error) = revalidate_health(root, health) {
+        uncertainty.bindings.push(error);
+    }
+    Ok(if uncertainty.confirmed() {
+        BoundMutationOutcome::Published(result)
+    } else {
+        BoundMutationOutcome::PublishedUncertain {
+            candidate: result,
+            uncertainty,
+        }
+    })
+}
+
+#[cfg(windows)]
+fn publish_bound(
+    _root: &JournalRoot,
+    _health: &HealthDirectory,
+    _lock: &BoundParentLock,
+    _result: ConditionalResult,
+) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
+    Err(BoundMutationRefusal::Unsupported)
+}
+
+/// Compare the complete expected row and publish beneath this retained journal.
+/// Typed writers remain held; uncertainty after publication retains the candidate.
+pub fn conditional_mutate_at_root(
+    root: &JournalRoot,
+    plan: &PlannedMarkMutation,
+) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
+    plan.validate()
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+    root.revalidate_canonical_binding()
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Root(error)))?;
+    let health = open_health(root, OsStr::new("health"), root.canonical_path())
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Read(error)))?
+        .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
+    let (lock, mut register) = begin_bound(root, &health)?;
+    if plan.expected.offload.is_some() {
+        return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+            StoreError::WriterHeld,
+        )));
+    }
+    let status = apply(&mut register, plan)
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+    let result = ConditionalResult { status, register };
+    if status == MutationStatus::Applied {
+        publish_bound(root, &health, &lock, result)
+    } else {
+        revalidate_health(root, &health)?;
+        Ok(BoundMutationOutcome::Unchanged(result))
+    }
+}
+
+/// Decline the entire checked selection in one retained-root transaction.
+pub fn decline_reviewed(
+    checked: CheckedReviewContext,
+) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
+    let root = checked.root();
+    let health = checked.health();
+    let (lock, mut register) = begin_bound(root, health)?;
+    check_marks(
+        &register,
+        checked.marks(),
+        &root.identity().observation_id(),
+    )?;
+    for mark in checked.marks() {
+        if register.marks.remove(&mark.id).is_none() {
+            return Err(BoundMutationRefusal::Review(ReviewRefusal::Missing {
+                id: mark.id.clone(),
+            }));
+        }
+    }
+    publish_bound(
+        root,
+        health,
+        &lock,
+        ConditionalResult {
+            status: MutationStatus::Applied,
+            register,
+        },
+    )
 }
 
 #[cfg(test)]
