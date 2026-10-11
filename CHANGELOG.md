@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `solstone link serve` now warns at startup that it is for development on trusted systems, because local callers can use the paired owner's full journal API authority.
 - `solstone journal reprocess FIRST --through LAST --owed --json` reports, for each day in the range, whether the day is marked finished, the state of its daily results, how many there are, and how many are owed and why.
 
 ### Changed
