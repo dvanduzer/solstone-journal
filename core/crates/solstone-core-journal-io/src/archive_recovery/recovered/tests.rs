@@ -126,6 +126,7 @@ fn assert_removed_facts(result: &RecoveredArchiveRetirement) {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_actual_removal_keeps_original_lease_across_thread_until_drop() {
     fn closed<T: Send + 'static>() {}
     closed::<RecoveredArchiveRetirement>();
@@ -155,6 +156,7 @@ fn retirement_actual_removal_keeps_original_lease_across_thread_until_drop() {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_occupied_original_and_same_byte_replacement_keep_observed_reads() {
     for replace in [false, true] {
         let f = Fixture::new();
@@ -183,6 +185,7 @@ fn retirement_occupied_original_and_same_byte_replacement_keep_observed_reads() 
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_unknown_stage_or_intent_refuses_with_complete_population() {
     for stage in [false, true] {
         let f = Fixture::new();
@@ -210,6 +213,7 @@ fn retirement_unknown_stage_or_intent_refuses_with_complete_population() {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_failed_first_walk_retains_prior_record_and_encountered_errno() {
     let f = Fixture::new();
     let owner = retirement_ready(&f);
@@ -243,6 +247,7 @@ fn retirement_failed_first_walk_retains_prior_record_and_encountered_errno() {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_replaced_or_nonempty_reservation_and_native_error_keep_owner() {
     for replace in [false, true] {
         let f = Fixture::new();
@@ -285,6 +290,7 @@ fn retirement_replaced_or_nonempty_reservation_and_native_error_keep_owner() {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_sync_fault_preserves_removed_and_independent_confirmation() {
     let f = Fixture::new();
     let owner = retirement_ready(&f);
@@ -310,6 +316,7 @@ fn retirement_sync_fault_preserves_removed_and_independent_confirmation() {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_late_obligation_keeps_earlier_removed_synced_confirmed_facts() {
     let f = Fixture::new();
     let owner = retirement_ready(&f);
@@ -329,6 +336,7 @@ fn retirement_late_obligation_keeps_earlier_removed_synced_confirmed_facts() {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_guard_change_after_final_walk_keeps_empty_census_and_effects() {
     for lock in [false, true] {
         let f = Fixture::new();
@@ -358,6 +366,7 @@ fn retirement_guard_change_after_final_walk_keeps_empty_census_and_effects() {
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_failed_final_walk_retains_incomplete_evidence_after_actual_removal() {
     let f = Fixture::new();
     let owner = retirement_ready(&f);
@@ -397,6 +406,7 @@ fn retirement_failed_final_walk_retains_incomplete_evidence_after_actual_removal
 }
 
 #[test]
+#[ignore = "requires an actual ext4/direct PCIe NVMe origin; structural retirement only, no reboot credit"]
 fn retirement_selected_name_appearing_after_zero_walk_is_retained_refusal() {
     let f = Fixture::new();
     let owner = retirement_ready(&f);

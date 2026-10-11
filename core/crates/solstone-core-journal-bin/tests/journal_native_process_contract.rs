@@ -1405,12 +1405,12 @@ fn native_backup_grammar_never_reaches_a_poisoned_interpreter() {
         (["run"].as_slice(), 0),
         (["prune"].as_slice(), 0),
         (["offload", "status"].as_slice(), 0),
-        (["offload", "run"].as_slice(), 0),
+        (["offload", "run"].as_slice(), 1),
         (["offload", "restore"].as_slice(), 1),
         (["recovery-key", "show"].as_slice(), 1),
         (["recovery-key", "rotate"].as_slice(), 0),
         (["restore"].as_slice(), 1),
-        (["off", "--yes"].as_slice(), 0),
+        (["off", "--yes"].as_slice(), 1),
     ] {
         let output = run_dispatcher_with_bounded_output(&context, "backup", argv, PROBE_TIMEOUT)
             .expect("run native backup grammar through dispatcher")
@@ -1421,6 +1421,23 @@ fn native_backup_grammar_never_reaches_a_poisoned_interpreter() {
             "backup {argv:?} stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if argv == ["offload", "run"] {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("offload did not finish."),
+                "empty configuration must retain the actual offload refusal"
+            );
+        }
+        if argv == ["off", "--yes"] {
+            let reason = if cfg!(target_os = "linux") {
+                "namespace_cooperation_held"
+            } else {
+                "platform_unavailable"
+            };
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(reason),
+                "teardown must refuse before effects on an unqualified namespace"
+            );
+        }
         assert!(
             !context.poison_marker.exists(),
             "backup {argv:?} reached a poisoned interpreter"
@@ -1497,8 +1514,8 @@ fn native_maintenance_bodies_reach_real_native_owners_without_python() {
         (["run", "backup:verify"].as_slice(), 0, "backup verify:"),
         (
             ["run", "backup:offload", "--dry-run"].as_slice(),
-            0,
-            "backup offload:",
+            1,
+            "a read-only offload preview is unavailable. no offload work was started.",
         ),
         (["run", "health:mark-raw"].as_slice(), 0, "new items: 0"),
         (
@@ -1521,10 +1538,15 @@ fn native_maintenance_bodies_reach_real_native_owners_without_python() {
             "maintenance {argv:?} stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let observed = if argv == ["run", "backup:offload", "--dry-run"] {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains(witness),
-            "maintenance {argv:?} stdout: {}",
-            String::from_utf8_lossy(&output.stdout)
+            String::from_utf8_lossy(observed).contains(witness),
+            "maintenance {argv:?} response: {}",
+            String::from_utf8_lossy(observed)
         );
         assert!(
             !context.poison_marker.exists(),

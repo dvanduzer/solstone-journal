@@ -273,7 +273,7 @@ impl OwnedArchiveCreatorAdmission {
             Ok(())
         })();
         #[cfg(not(unix))]
-        let paired = Err(ReadbackError::Unsupported);
+        let paired: Result<(), ReadbackError> = Err(ReadbackError::Unsupported);
         if let Err(reason) = paired {
             if let Some(custody) = read.read.execution.borrow_mut().predecessor.as_mut() {
                 custody.refuse(reason);
