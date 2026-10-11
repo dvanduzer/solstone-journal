@@ -229,13 +229,20 @@ pub fn write_full_labels(
     write_labels(&path, Value::Object(result))
 }
 
-/// Write a skipped-labels payload, replacing any existing label contents.
+/// Write a skipped-labels payload, replacing every label the speaker step wrote.
+/// Labels the owner set by hand stay.
 pub fn write_stub_labels(segment_dir: &Path, reason: &str) -> Result<(), LabelsError> {
     let path = labels_path(segment_dir);
     let _lock = hold_lock(&path, LockOptions::default()).map_err(LabelsError::Lock)?;
 
+    let user_labels = read_current_labels(&path)
+        .and_then(|current| current.get("labels").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|label| label.as_object().is_some_and(is_user_label))
+        .collect::<Vec<_>>();
     let mut result = Map::new();
-    result.insert("labels".to_owned(), Value::Array(Vec::new()));
+    result.insert("labels".to_owned(), Value::Array(user_labels));
     result.insert("skipped".to_owned(), Value::Bool(true));
     result.insert("reason".to_owned(), Value::String(reason.to_owned()));
     write_labels(&path, Value::Object(result))
@@ -697,6 +704,35 @@ fn write_labels(path: &Path, value: Value) -> Result<(), LabelsError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stub_labels_keep_the_labels_the_owner_set_by_hand() {
+        let segment = std::env::temp_dir().join(format!(
+            "solstone-stub-keeps-user-labels-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&segment);
+        fs::create_dir_all(segment.join("talents")).unwrap();
+        fs::write(
+            labels_path(&segment),
+            serde_json::json!({"labels":[
+                {"sentence_id":1,"speaker":"owner","confidence":"high","method":"owner_centroid"},
+                {"sentence_id":2,"speaker":"ada","confidence":"high","method":"user_corrected"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        write_stub_labels(&segment, "no_owner_centroid").unwrap();
+
+        let written: Value =
+            serde_json::from_slice(&fs::read(labels_path(&segment)).unwrap()).unwrap();
+        assert_eq!(written["skipped"], true);
+        assert_eq!(
+            written["labels"],
+            serde_json::json!([{"sentence_id":2,"speaker":"ada","confidence":"high","method":"user_corrected"}])
+        );
+        fs::remove_dir_all(segment).unwrap();
+    }
     #[test]
     fn test_strict_writer_happy_path() {
         let temp = tempfile::tempdir().unwrap();

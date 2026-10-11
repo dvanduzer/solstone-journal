@@ -270,6 +270,8 @@
     const cards = [renderVitalsHtml(data)];
     if (data.home_state === 'welcome') {
       cards.push(renderWelcomeHtml());
+      const needs = welcomeNeedsYouHtml(data);
+      if (needs) cards.push(needs);
       setSurfaceHtml(cards.join(''));
       return;
     }
@@ -709,8 +711,21 @@
       + '</div></div></div>';
   }
 
+  // The welcome window has no needs card of its own, but something that is
+  // owed from the first day, like setting up your voice, still shows there.
+  function welcomeNeedsYouHtml(pulse) {
+    const items = Array.isArray(pulse.needs_you_items) ? pulse.needs_you_items : [];
+    return items.length ? renderNeedsYouHtml(pulse) : '';
+  }
+
   function renderNeedsYou(pulse) {
-    replaceHomeSurface('needs', renderNeedsYouHtml(pulse), predecessors('needs'));
+    const html = lastPulse && lastPulse.home_state === 'welcome'
+      ? welcomeNeedsYouHtml(pulse)
+      : renderNeedsYouHtml(pulse);
+    const anchors = lastPulse && lastPulse.home_state === 'welcome'
+      ? ['vitals', 'welcome']
+      : predecessors('needs');
+    replaceHomeSurface('needs', html, anchors);
   }
 
   // Every date on this dashboard is one shape, and the shape is the shared

@@ -1034,6 +1034,10 @@ fn router_with_hosted_parent(
             post(speakers_owner_write::set_aside),
         )
         .route(
+            "/app/speakers/api/owner/undo",
+            post(speakers_owner_write::undo),
+        )
+        .route(
             "/app/speakers/api/owner/classify",
             post(speakers_owner_write::classify),
         )

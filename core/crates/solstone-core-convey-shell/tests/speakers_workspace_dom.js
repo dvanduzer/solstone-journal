@@ -191,7 +191,55 @@ function findById(root, id) {
   return null;
 }
 
-function main() {
+// The source of one named function from the workspace, for exercising it alone.
+function functionSource(workspace, name) {
+  const match = new RegExp(`(?:async )?function ${name}\\(`).exec(workspace);
+  if (!match) throw new Error(`function ${name} not found`);
+  let depth = 0;
+  for (let index = workspace.indexOf('{', match.index); index < workspace.length; index += 1) {
+    if (workspace[index] === '{') depth += 1;
+    if (workspace[index] === '}') {
+      depth -= 1;
+      if (depth === 0) return workspace.slice(match.index, index + 1);
+    }
+  }
+  throw new Error(`function ${name} is not closed`);
+}
+
+// Teaching draws on recent days, so a quiet today still finds the owner's
+// statements from earlier in the week.
+async function teachingReachesPastDays(workspace) {
+  const context = {
+    day: '20261011',
+    OWNER_TEACH_RECENT_DAYS: 14,
+    OWNER_TEACH_TARGET_STATEMENTS: 40,
+    window: { logError() {} },
+    todayDayKey: () => '20261011',
+    asked: [],
+  };
+  context.ensureOwnerTeachSegments = async (dayKey) => {
+    context.asked.push(dayKey);
+    return dayKey === '20261008' ? [{ key: '090000_300', sources: ['audio'] }] : [];
+  };
+  context.loadOwnerTeachReviews = async (dayKey, segments) => segments.map(() => ({
+    items: Array.from({ length: 40 }, (_, id) => ({ day: dayKey, id })),
+    failed_count: 0,
+  }));
+  vm.createContext(context);
+  for (const name of ['recentDayKeys', 'ownerTeachPoolCounts', 'collectOwnerTeachReviews']) {
+    vm.runInContext(functionSource(workspace, name), context);
+  }
+  check(
+    JSON.stringify(vm.runInContext('recentDayKeys(3)', context)) === JSON.stringify(['20261011', '20261010', '20261009']),
+    'recent days count back from today'
+  );
+  const results = await vm.runInContext('collectOwnerTeachReviews(() => true)', context);
+  const items = results.flatMap((result) => result.items);
+  check(items.length === 40 && items.every((item) => item.day === '20261008'), 'statements from a past day are offered');
+  check(JSON.stringify(context.asked) === JSON.stringify(['20261011', '20261010', '20261009', '20261008']), 'teaching stops once it has enough');
+}
+
+async function main() {
   const manifestDir = process.argv[2];
   if (!manifestDir) throw new Error('manifest directory required');
   const workspacePath = path.join(manifestDir, 'assets/speakers/workspace.html');
@@ -214,8 +262,20 @@ function main() {
   check(workspace.includes('/app/speakers/api/owner/confirm'), 'workspace references confirm endpoint');
   check(workspace.includes('/app/speakers/api/owner/reject'), 'workspace references reject endpoint');
   check(workspace.includes('revokeObjectURL'), 'workspace handles audio error cleanup with revokeObjectURL');
+  check(workspace.includes('/app/speakers/api/owner/undo'), 'workspace references undo endpoint');
+  check(workspace.includes('/app/speakers/api/owner/rebuild'), 'workspace references rebuild endpoint for redo');
+
+  const dayScriptStart = workspace.lastIndexOf('<script>', workspace.indexOf('function checkOwnerStatus')) + '<script>'.length;
+  const dayScript = workspace.slice(dayScriptStart, workspace.indexOf('</script>', dayScriptStart));
+  check(dayScript.includes('function recentDayKeys'), 'the day script holds the owner-voice flow');
+  new vm.Script(dayScript, { filename: 'speakers-day.js' });
+  check(true, 'the Speakers day script parses without syntax error');
+  await teachingReachesPastDays(workspace);
 
   console.log(`DOM CASES: ${cases} passed`);
 }
 
-main();
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

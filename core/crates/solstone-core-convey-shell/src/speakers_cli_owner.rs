@@ -221,23 +221,22 @@ pub async fn confirm(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
     )
 }
 
+/// The CLI reject records the same rejection, cooldown and remembered voice
+/// as the browser's "no, try again".
 pub async fn reject(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
     let body = match body(request).await {
         Ok(val) => val,
         Err(resp) => return resp,
     };
-    if matches!(
-        solstone_core_speaker_resolve::owner_admission::admitted_owner_id(&root.0),
-        solstone_core_speaker_resolve::owner_admission::OwnerAdmission::Invalid
-    ) {
-        return err(
-            "speaker_owner_identity_invalid",
-            "that speaker command couldn't run because your configured owner identity needs attention.",
-            "configured owner identity is not admitted",
-            StatusCode::BAD_REQUEST,
-        );
-    }
-    let Some(req_version) = body.get("version").and_then(Value::as_str) else {
+    let Some(version) = body.get("version").and_then(Value::as_str) else {
+        if matches!(
+            solstone_core_speaker_resolve::owner_admission::admitted_owner_id(&root.0),
+            solstone_core_speaker_resolve::owner_admission::OwnerAdmission::Invalid
+        ) {
+            return crate::speakers_owner_write::owner_voice_error(
+                solstone_core_speaker_resolve::owner_voice::OwnerVoiceError::IdentityInvalid,
+            );
+        }
         return err(
             "missing_required_field",
             "a required field is missing.",
@@ -245,42 +244,9 @@ pub async fn reject(Extension(root): Extension<Arc<JournalRoot>>, request: Reque
             StatusCode::BAD_REQUEST,
         );
     };
-
-    let _lock =
-        match solstone_core_speaker_resolve::owner_candidate::hold_owner_candidate_lock(&root.0) {
-            Ok(guard) => guard,
-            Err(error) => return owner_error(error.to_string()),
-        };
-
-    let candidate =
-        match solstone_core_speaker_resolve::owner_candidate::load_owner_candidate(&root.0) {
-            Ok(Some(candidate)) => candidate,
-            Ok(None) => {
-                return err(
-                    "speaker_review_unavailable",
-                    "that speaker review couldn't be loaded.",
-                    "No candidate available",
-                    StatusCode::NOT_FOUND,
-                );
-            }
-            Err(error) => return owner_error(error.to_string()),
-        };
-
-    if req_version != candidate.version {
-        return err(
-            "speaker_candidate_stale_version",
-            "that speaker candidate is no longer current.",
-            "Candidate version mismatch or stale generation",
-            StatusCode::CONFLICT,
-        );
-    }
-
-    match solstone_core_speaker_resolve::owner_candidate::clear_owner_candidate_in_lock(&root.0) {
-        Ok(_) => Json(json!({
-            "status":"rejected", "partial_success":true,
-            "awareness_state":{"status":"skipped","reason_code":"speaker_awareness_state_not_native","detail":"The candidate was cleared, but the rejection/cooldown state was not recorded."}
-        })).into_response(),
-        Err(error) => owner_error(error.to_string()),
+    match solstone_core_speaker_resolve::owner_voice::reject_owner_candidate(&root.0, version) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => crate::speakers_owner_write::owner_voice_error(error),
     }
 }
 
@@ -323,23 +289,6 @@ fn required(field: &str) -> Response {
 }
 fn err(code: &str, message: &str, detail: &str, status: StatusCode) -> Response {
     error_envelope(code, message, detail, status).into_response()
-}
-fn owner_error(detail: String) -> Response {
-    if detail.contains("busy") || detail.contains("lock") {
-        err(
-            "speaker_voiceprint_busy",
-            "that voice couldn't be updated right now because it was busy. try again in a moment.",
-            &detail,
-            StatusCode::SERVICE_UNAVAILABLE,
-        )
-    } else {
-        err(
-            "speaker_command_failed",
-            "that speaker command didn't finish.",
-            &detail,
-            StatusCode::BAD_REQUEST,
-        )
-    }
 }
 fn speaker_write_error(detail: String, labels: bool) -> Response {
     let (code, message) = if labels {

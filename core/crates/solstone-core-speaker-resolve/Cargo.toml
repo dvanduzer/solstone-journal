@@ -42,6 +42,7 @@ solstone-core-system.workspace = true
 getrandom.workspace = true
 percent-encoding = "2.3.2"
 log.workspace = true
+ndarray = "=0.17.2"
 chrono.workspace = true
 chrono-tz.workspace = true
 rapidfuzz.workspace = true

@@ -176,7 +176,7 @@ pub fn build_person_admission_journal(mode: PersonAdmissionMode) -> PersonAdmiss
     );
     fs::write(
         segment.join("audio.jsonl"),
-        "{\"raw\":\"audio.flac\"}\n{\"id\":1,\"text\":\"test\"}\n",
+        "{\"raw\":\"audio.flac\"}\n{\"start\":\"00:00:01\",\"text\":\"test\",\"sentence_id\":1}\n",
     )
     .expect("transcript writes");
     write_embeddings_npz(&segment.join("audio.npz"), 1, false, 0);

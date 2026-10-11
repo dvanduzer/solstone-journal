@@ -3,7 +3,7 @@
 
 //! Native mutations for the owner-voice workflow.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,46 +13,36 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use chrono::{DateTime, Utc};
-use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
+use chrono::Utc;
+use serde_json::{Value, json};
 use solstone_core_convey_http::envelope::error_envelope;
-use solstone_core_journal_io::{
-    JsonWriteOptions, LockOptions, SegmentLayout, hold_lock, write_json,
-};
-use solstone_core_speaker_resolve::candidate_tracker::{
-    CandidateProfile, CandidateTracker, trim_solo_cluster_rows,
-};
 use solstone_core_speaker_resolve::owner_admission::{OwnerAdmission, admitted_owner_id};
 use solstone_core_speaker_resolve::owner_candidate::{
     clear_owner_candidate_in_lock, hold_owner_candidate_lock, hydrate_owner_candidate_samples,
-    load_owner_candidate, write_owner_candidate_in_lock,
+    load_owner_candidate,
 };
 use solstone_core_speaker_resolve::owner_centroid::{
     OwnerCentroidRebuildInput, OwnerCentroidRebuildOutcome, OwnerCentroidWriteInput,
     load_owner_centroid, rebuild_owner_centroid, write_owner_centroid,
 };
+use solstone_core_speaker_resolve::owner_detection::{
+    MIN_MEDIAN_DURATION, MIN_STATEMENTS, OWNER_IDENTITY_INVALID, Quality, detect_owner_candidate,
+    evidence_quality, mean, parse_time,
+};
 use solstone_core_speaker_resolve::owner_provisional::collect_manual_owner_embeddings;
+use solstone_core_speaker_resolve::owner_voice::{
+    OwnerVoiceError, cooldown_days_remaining, record_owner_voice_saved, reject_owner_candidate,
+    undo_owner_voice, update_voiceprint_state, voiceprint_state,
+};
 
 use crate::JournalRoot;
 use crate::speakers_attribution::action;
-use crate::speakers_known::intra_cosine_p25;
-use crate::speakers_quality::awareness_voiceprint;
 use crate::speakers_source::is_safe_source_component;
 use solstone_core_speaker_resolve::segment_catalog::{
     SegmentLookup, decode_stream_layout_value, lookup_segment,
 };
 
-const MIN_STATEMENTS: usize = 30;
-const STRONG_STATEMENTS: usize = 100;
-const MIN_MEDIAN_DURATION: f64 = 1.5;
-const STANDARD_P25: f64 = 0.30;
-const STRONG_P25: f64 = 0.15;
-const COOLDOWN_DAYS: i64 = 14;
-pub(crate) const CANDIDATE_EXPANSION_MAX_EMBEDDINGS: usize = 3000;
-const OWNER_THRESHOLD: f32 = 0.43;
 const EXISTING_CENTROID_GUIDANCE: &str = "Owner centroid already exists. Run solstone call speakers rebuild-owner to refresh it from current manual tags.";
-const OWNER_IDENTITY_INVALID: &str = "speaker_owner_identity_invalid";
 const OWNER_IDENTITY_INVALID_MESSAGE: &str =
     "that speaker command couldn't run because your configured owner identity needs attention.";
 const OWNER_IDENTITY_INVALID_DETAIL: &str = "configured owner identity is not admitted";
@@ -61,7 +51,14 @@ pub async fn detect(Extension(root): Extension<Arc<JournalRoot>>, request: Reque
     let body = optional_json(request).await;
     let force = body.get("force") == Some(&Value::Bool(true));
     match detect_owner_candidate(&root.0, force) {
-        Ok(value) => Json(value).into_response(),
+        Ok(mut value) => {
+            if matches!(value["status"].as_str(), Some("no_cluster" | "low_quality")) {
+                let count = manual_count(&root.0, admitted_principal_id(&root.0).as_deref());
+                value["manual_tags_count"] = json!(count);
+                value["can_build_from_tags"] = json!(count >= MIN_STATEMENTS);
+            }
+            Json(value).into_response()
+        }
         Err(error) => owner_error(error),
     }
 }
@@ -142,7 +139,7 @@ pub async fn confirm(Extension(root): Extension<Arc<JournalRoot>>, request: Requ
         }
         Err(error) => return owner_error(error.to_string()),
     };
-    let awareness = awareness_voiceprint(&root.0);
+    let awareness = voiceprint_state(&root.0);
     if awareness.get("status").and_then(Value::as_str) != Some("candidate") {
         return err(
             "speaker_review_unavailable",
@@ -266,12 +263,15 @@ pub async fn confirm(Extension(root): Extension<Arc<JournalRoot>>, request: Requ
     if let Err(error) = clear_owner_candidate_in_lock(&root.0) {
         return owner_error(error.to_string());
     }
-    if let Err(error) = update_voiceprint(
+    let relabel = match record_owner_voice_saved(
         &root.0,
-        json!({"status":"confirmed","cluster_size":candidate.cluster_size,"confirmed_at":Utc::now().to_rfc3339(),"evidence_tier":candidate.evidence_tier}),
+        "confirm",
+        candidate.cluster_size.max(0) as usize,
+        &candidate.evidence_tier,
     ) {
-        return owner_error(error);
-    }
+        Ok(relabel) => relabel,
+        Err(error) => return owner_error(error),
+    };
     if let Err(error) = action(
         &root.0,
         "owner_voiceprint_confirm",
@@ -279,7 +279,8 @@ pub async fn confirm(Extension(root): Extension<Arc<JournalRoot>>, request: Requ
     ) {
         return owner_error(error);
     }
-    Json(json!({"status":"confirmed","principal_id":principal_id})).into_response()
+    Json(json!({"status":"confirmed","principal_id":principal_id,"relabel":relabel}))
+        .into_response()
 }
 
 pub async fn reject(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
@@ -287,53 +288,53 @@ pub async fn reject(Extension(root): Extension<Arc<JournalRoot>>, request: Reque
         Ok(value) => value,
         Err(response) => return response,
     };
-    if admitted_principal_id(&root.0).is_none() {
-        return owner_identity_invalid();
-    }
-
     test_hooks::wait_if_hold_confirm_or_reject();
+    let version = body
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match reject_owner_candidate(&root.0, version) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => owner_voice_error(error),
+    }
+}
 
-    let _lock = match hold_owner_candidate_lock(&root.0) {
-        Ok(guard) => guard,
-        Err(error) => return owner_error(error.to_string()),
-    };
-
-    let candidate = match load_owner_candidate(&root.0) {
-        Ok(Some(candidate)) => candidate,
-        Ok(None) => {
-            return err(
-                "speaker_review_unavailable",
-                "that speaker review couldn't be loaded.",
-                "No candidate available",
-                StatusCode::NOT_FOUND,
-            );
+pub async fn undo(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
+    match undo_owner_voice(&root.0) {
+        Ok(value) => {
+            if let Err(error) = action(&root.0, "owner_voiceprint_undo", json!({})) {
+                return owner_error(error);
+            }
+            Json(value).into_response()
         }
-        Err(error) => return owner_error(error.to_string()),
-    };
-    let awareness = awareness_voiceprint(&root.0);
+        Err(error) => owner_voice_error(error),
+    }
+}
 
-    let req_version = body.get("version").and_then(Value::as_str);
-    if req_version != Some(&candidate.version)
-        || awareness.get("detected_at").and_then(Value::as_str) != Some(&candidate.version)
-    {
-        return err(
+/// Map a shared owner-voice failure onto the owner-write error envelope.
+pub(crate) fn owner_voice_error(error: OwnerVoiceError) -> Response {
+    match error {
+        OwnerVoiceError::IdentityInvalid => owner_identity_invalid(),
+        OwnerVoiceError::NoCandidate => err(
+            "speaker_review_unavailable",
+            "that speaker review couldn't be loaded.",
+            "No candidate available",
+            StatusCode::NOT_FOUND,
+        ),
+        OwnerVoiceError::StaleCandidate => err(
             "speaker_candidate_stale_version",
             "that speaker candidate is no longer current.",
             "Candidate version mismatch or stale generation",
             StatusCode::CONFLICT,
-        );
+        ),
+        OwnerVoiceError::NoSavedVoice => err(
+            "speaker_owner_voice_missing",
+            "there's no saved voice to undo.",
+            "No owner voice is saved",
+            StatusCode::NOT_FOUND,
+        ),
+        OwnerVoiceError::Failed(detail) => owner_error(detail),
     }
-
-    if let Err(error) = clear_owner_candidate_in_lock(&root.0) {
-        return owner_error(error.to_string());
-    }
-    if let Err(error) = update_voiceprint(
-        &root.0,
-        json!({"status":"rejected","rejected_at":Utc::now().to_rfc3339()}),
-    ) {
-        return owner_error(error);
-    }
-    Json(json!({"status":"needs_detection"})).into_response()
 }
 
 pub async fn set_aside(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
@@ -364,7 +365,7 @@ pub async fn set_aside(Extension(root): Extension<Arc<JournalRoot>>, request: Re
         }
         Err(error) => return owner_error(error.to_string()),
     };
-    let awareness = awareness_voiceprint(&root.0);
+    let awareness = voiceprint_state(&root.0);
 
     let req_version = body.get("version").and_then(Value::as_str);
     if req_version != Some(&candidate.version)
@@ -381,7 +382,7 @@ pub async fn set_aside(Extension(root): Extension<Arc<JournalRoot>>, request: Re
     if let Err(error) = clear_owner_candidate_in_lock(&root.0) {
         return owner_error(error.to_string());
     }
-    if let Err(error) = update_voiceprint(
+    if let Err(error) = update_voiceprint_state(
         &root.0,
         json!({"status":"no_cluster","detected_at":Value::Null,"samples":[]}),
     ) {
@@ -513,12 +514,9 @@ pub(crate) fn bootstrap_owner_from_manual_tags(root: &Path) -> Result<Value, Str
         },
     )
     .map_err(|error| error.to_string())?;
-    update_voiceprint(
-        root,
-        json!({"status":"confirmed","cluster_size":evidence.len(),"confirmed_at":Utc::now().to_rfc3339(),"evidence_tier":quality.tier} ),
-    )?;
+    let relabel = record_owner_voice_saved(root, "teach", evidence.len(), quality.tier)?;
     Ok(
-        json!({"status":"confirmed","principal_id":principal_id,"cluster_size":evidence.len(),"evidence_tier":quality.tier}),
+        json!({"status":"confirmed","principal_id":principal_id,"cluster_size":evidence.len(),"evidence_tier":quality.tier,"relabel":relabel}),
     )
 }
 
@@ -576,10 +574,8 @@ fn rebuild_owner(root: &Path, override_regression: bool) -> Result<Value, String
             object.insert("override_applied".to_owned(), json!(override_applied));
             object.insert("next_step".to_owned(), json!("none"));
             object.insert("guidance".to_owned(), json!(""));
-            update_voiceprint(
-                root,
-                json!({"status":"confirmed","cluster_size":evidence.len(),"evidence_tier":quality.tier}),
-            )?;
+            let relabel = record_owner_voice_saved(root, "redo", evidence.len(), quality.tier)?;
+            object.insert("relabel".to_owned(), relabel);
         }
         OwnerCentroidRebuildOutcome::Unchanged => {
             object.insert("status".to_owned(), json!("unchanged"));
@@ -597,530 +593,6 @@ fn rebuild_owner(root: &Path, override_regression: bool) -> Result<Value, String
     Ok(value)
 }
 
-fn detect_owner_candidate(root: &Path, force: bool) -> Result<Value, String> {
-    let principal = admitted_principal_id(root).ok_or_else(|| OWNER_IDENTITY_INVALID.to_owned())?;
-    let _lock = hold_owner_candidate_lock(root).map_err(|error| error.to_string())?;
-
-    if let Ok(Some(centroid)) = load_owner_centroid(root, &principal) {
-        // Confirmation saved how many streams the voice was heard in.
-        let streams_represented = awareness_voiceprint(root)
-            .get("streams_represented")
-            .cloned()
-            .unwrap_or_else(|| json!(0));
-        update_voiceprint(
-            root,
-            json!({"status":"confirmed","cluster_size":centroid.cluster_size,"confirmed_at":Utc::now().to_rfc3339(),"evidence_tier":centroid.evidence_tier.clone().unwrap_or_else(|| "standard".to_owned())}),
-        )?;
-        return Ok(
-            json!({"status":"confirmed","recommendation":"confirmed","cluster_size":centroid.cluster_size,"streams_represented":streams_represented,"samples":[],"evidence_tier":centroid.evidence_tier.unwrap_or_else(|| "standard".to_owned())}),
-        );
-    }
-    if force {
-        clear_owner_candidate_in_lock(root).map_err(|error| error.to_string())?;
-        update_voiceprint(root, json!({"rejected_at":Value::Null}))?;
-    }
-    let state = awareness_voiceprint(root);
-    if !force && cooldown(&state).is_some() {
-        return Ok(
-            json!({"status":"no_cluster","reason":"cooldown","segments_checked":0,"segments_available":0,"embeddings_available":0,"recommendation":"no_cluster","manual_tags_count":manual_count(root, Some(&principal)),"can_build_from_tags":manual_count(root, Some(&principal)) >= MIN_STATEMENTS,"days_remaining":cooldown(&state),"next_step":"wait_for_cooldown","guidance":"Wait for the owner voice rejection cooldown before running detection again, or run solstone call speakers detect --force to look now."}),
-        );
-    }
-    if let Ok(Some(candidate)) = load_owner_candidate(root)
-        && state.get("status").and_then(Value::as_str) == Some("candidate")
-    {
-        let raw_samples = state
-            .get("samples")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let samples = hydrate_owner_candidate_samples(root, &candidate, &raw_samples);
-        return Ok(
-            json!({"status":"candidate","cluster_size":candidate.cluster_size,"streams_represented":state.get("streams_represented").cloned().unwrap_or_else(|| json!(0)),"recommendation":state.get("recommendation").cloned().unwrap_or_else(|| json!("single_stream")),"samples":samples,"evidence_tier":candidate.evidence_tier}),
-        );
-    }
-    let pool_exists = root.join("awareness/speaker_candidates.json").exists();
-    let candidates = CandidateTracker::new(root).candidates();
-    let candidate = match select_candidate(pool_exists, candidates, Some(&principal)) {
-        Ok(candidate) => candidate,
-        Err(reason) => return no_cluster(root, Some(&principal), reason, 0, 0, 0),
-    };
-    if candidate.n_intervals < MIN_STATEMENTS {
-        return candidate_low_quality(
-            root,
-            Some(&principal),
-            CandidateLowQuality {
-                reason: "too_few_stmts",
-                observed: candidate.n_intervals as f64,
-                threshold: MIN_STATEMENTS as f64,
-                segments: candidate.n_segments,
-                embeddings: candidate.n_intervals,
-                tier: "standard",
-                bound: STANDARD_P25,
-            },
-        );
-    }
-    let expansion = expand_candidate(root, &candidate)?;
-    if expansion.rows.is_empty() {
-        return no_cluster(
-            root,
-            Some(&principal),
-            "candidate_no_usable_embeddings",
-            expansion.checked,
-            expansion.available,
-            0,
-        );
-    }
-    let quality = candidate_quality(&expansion.rows);
-    if let Some(reason) = quality.reason {
-        return candidate_low_quality(
-            root,
-            Some(&principal),
-            CandidateLowQuality {
-                reason,
-                observed: if reason == "median_duration_too_short" {
-                    quality.median
-                } else {
-                    quality.p25
-                },
-                threshold: if reason == "median_duration_too_short" {
-                    MIN_MEDIAN_DURATION
-                } else {
-                    quality.bound
-                },
-                segments: expansion.checked,
-                embeddings: expansion.rows.len(),
-                tier: quality.tier,
-                bound: quality.bound,
-            },
-        );
-    }
-    let Some(centroid) = mean(
-        &expansion
-            .rows
-            .iter()
-            .map(|row| row.embedding.clone())
-            .collect::<Vec<_>>(),
-    )
-    .and_then(|row| solstone_core_entity::normalize_embedding(&row)) else {
-        return no_cluster(
-            root,
-            Some(&principal),
-            "candidate_centroid_unusable",
-            expansion.checked,
-            expansion.available,
-            expansion.rows.len(),
-        );
-    };
-    let streams = expansion
-        .rows
-        .iter()
-        .map(|row| row.stream.clone())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let recommendation = if streams > 1 {
-        "ready"
-    } else {
-        "single_stream"
-    };
-    let version = Utc::now().to_rfc3339();
-    let samples = candidate_samples(root, &expansion.rows, &centroid, &version);
-    let snapshot = solstone_core_speaker_resolve::owner_candidate::OwnerCandidate {
-        centroid,
-        cluster_size: expansion.rows.len() as i32,
-        threshold: OWNER_THRESHOLD,
-        version: version.clone(),
-        evidence_tier: quality.tier.to_owned(),
-    };
-    write_owner_candidate_in_lock(root, &snapshot).map_err(|error| error.to_string())?;
-
-    test_hooks::wait_if_pause_after_snapshot();
-
-    update_voiceprint(
-        root,
-        json!({"status":"candidate","cluster_size":expansion.rows.len(),"streams_represented":streams,"recommendation":recommendation,"samples":samples,"detected_at":version,"evidence_tier":quality.tier}),
-    )?;
-    let hydrated_samples = hydrate_owner_candidate_samples(root, &snapshot, &samples);
-    Ok(
-        json!({"status":"candidate","cluster_size":expansion.rows.len(),"streams_represented":streams,"recommendation":recommendation,"samples":hydrated_samples,"evidence_tier":quality.tier}),
-    )
-}
-
-fn select_candidate(
-    pool_exists: bool,
-    candidates: Vec<CandidateProfile>,
-    principal: Option<&str>,
-) -> Result<CandidateProfile, &'static str> {
-    if !pool_exists {
-        return Err("pool_missing");
-    }
-    if candidates.is_empty() {
-        return Err("pool_empty");
-    }
-    candidates
-        .into_iter()
-        .filter(|candidate| {
-            candidate.status != "rejected"
-                && (candidate.confirmed_entity.is_none()
-                    || candidate.confirmed_entity.as_deref() == principal)
-        })
-        .max_by(|left, right| {
-            left.n_intervals
-                .cmp(&right.n_intervals)
-                .then_with(|| left.total_duration_s.total_cmp(&right.total_duration_s))
-                .then_with(|| right.cand_id.cmp(&left.cand_id))
-        })
-        .ok_or("no_eligible_candidate")
-}
-
-struct CandidateRow {
-    embedding: Vec<f32>,
-    day: String,
-    stream: String,
-    segment_key: String,
-    source: String,
-    sentence_id: i64,
-    jsonl_path: std::path::PathBuf,
-    layout: SegmentLayout,
-}
-struct CandidateExpansion {
-    rows: Vec<CandidateRow>,
-    checked: usize,
-    available: usize,
-}
-fn expand_candidate(
-    root: &Path,
-    candidate: &CandidateProfile,
-) -> Result<CandidateExpansion, String> {
-    let mut groups = BTreeMap::<(String, String), Vec<&Value>>::new();
-    for source in &candidate.source_segments {
-        groups
-            .entry((
-                source
-                    .get("stream_layout")
-                    .and_then(Value::as_str)
-                    .unwrap_or("named")
-                    .to_owned(),
-                source
-                    .get("stream")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            ))
-            .or_default()
-            .push(source);
-    }
-    let max = groups.values().map(Vec::len).max().unwrap_or(0);
-    let mut rows = Vec::new();
-    let mut checked = BTreeSet::new();
-    'rounds: for index in 0..max {
-        for group in groups.values() {
-            let Some(value) = group.get(index) else {
-                continue;
-            };
-            let (Some(day), Some(stream), Some(segment_key), Some(source), Some(label)) = (
-                value.get("day").and_then(Value::as_str),
-                value.get("stream").and_then(Value::as_str),
-                value.get("segment_key").and_then(Value::as_str),
-                value.get("source").and_then(Value::as_str),
-                value.get("cluster_label").and_then(Value::as_i64),
-            ) else {
-                return Err("invalid candidate source segment".to_owned());
-            };
-            let layout = decode_stream_layout_value(value.get("stream_layout"));
-            let layout = match layout {
-                Ok(layout) => layout,
-                Err(_) => {
-                    return Err("invalid stream_layout on candidate source segment".to_owned());
-                }
-            };
-            checked.insert((
-                day.to_owned(),
-                layout_flag(layout),
-                stream.to_owned(),
-                segment_key.to_owned(),
-            ));
-            let segment = match lookup_segment(root, day, stream, segment_key, Ok(layout)) {
-                SegmentLookup::Present(path) => path,
-                SegmentLookup::Absent => continue,
-                SegmentLookup::MalformedLayout => {
-                    return Err("invalid stream_layout on candidate source segment".to_owned());
-                }
-                SegmentLookup::Failed(error) => return Err(error.to_string()),
-            };
-            let jsonl = segment.join(format!("{source}.jsonl"));
-            if !segment.is_dir() || crate::speakers_quality::segment_overlap_fraction(&jsonl) > 0.10
-            {
-                continue;
-            }
-            let embeddings_path = segment.join(format!("{source}.npz"));
-            let file = match solstone_core_speaker_id::embeddings::load_embeddings_file(
-                &embeddings_path,
-            ) {
-                Ok(Some(file)) => file,
-                Ok(None) => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "failed to load {}: {error}",
-                        embeddings_path.display()
-                    ));
-                }
-            };
-            // A row written before membership was stored has no ids to expand;
-            // it is skipped. Ids that are present but unreadable are an error.
-            if value.get("sentence_ids").is_none() {
-                continue;
-            }
-            let ids = source_sentence_ids(value)
-                .ok_or_else(|| "invalid candidate sentence ids".to_owned())?;
-            let mut selected = ids
-                .into_iter()
-                .filter_map(|id| {
-                    file.statements
-                        .iter()
-                        .find(|(current, _)| *current == id)
-                        .and_then(|(_, embedding)| {
-                            solstone_core_entity::normalize_embedding(embedding).map(|embedding| {
-                                CandidateRow {
-                                    embedding,
-                                    day: day.to_owned(),
-                                    stream: stream.to_owned(),
-                                    segment_key: segment_key.to_owned(),
-                                    source: source.to_owned(),
-                                    sentence_id: id,
-                                    jsonl_path: jsonl.clone(),
-                                    layout,
-                                }
-                            })
-                        })
-                })
-                .collect::<Vec<_>>();
-            if label == -1 {
-                let before = selected
-                    .iter()
-                    .map(|row| row.embedding.clone())
-                    .collect::<Vec<_>>();
-                let (kept, _, _) = trim_solo_cluster_rows(&before);
-                selected.retain(|row| kept.contains(&row.embedding));
-            }
-            for row in selected {
-                if rows.len() >= CANDIDATE_EXPANSION_MAX_EMBEDDINGS {
-                    break 'rounds;
-                }
-                rows.push(row);
-            }
-        }
-    }
-    Ok(CandidateExpansion {
-        rows,
-        checked: checked.len(),
-        available: candidate.n_segments,
-    })
-}
-fn source_sentence_ids(value: &Value) -> Option<Vec<i64>> {
-    let mut ids = value
-        .get("sentence_ids")?
-        .as_array()?
-        .iter()
-        .map(|value| match value {
-            Value::Bool(_) => None,
-            Value::Number(value) => value
-                .as_i64()
-                .or_else(|| value.as_f64().map(|number| number as i64)),
-            Value::String(value) => value.parse().ok(),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    ids.sort_unstable();
-    ids.dedup();
-    Some(ids)
-}
-fn candidate_quality(rows: &[CandidateRow]) -> Quality {
-    let tier = if rows.len() >= STRONG_STATEMENTS {
-        "strong"
-    } else {
-        "standard"
-    };
-    let bound = if tier == "strong" {
-        STRONG_P25
-    } else {
-        STANDARD_P25
-    };
-    let mut durations = rows
-        .iter()
-        .filter_map(|row| fallback_duration(&row.jsonl_path, row.sentence_id))
-        .collect::<Vec<_>>();
-    durations.sort_by(f64::total_cmp);
-    let median = durations
-        .get((durations.len().saturating_sub(1)) / 2)
-        .copied()
-        .unwrap_or(0.0);
-    let p25 = intra_cosine_p25(
-        &rows
-            .iter()
-            .map(|row| row.embedding.clone())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(0.0);
-    let reason = if rows.len() < MIN_STATEMENTS {
-        Some("too_few_stmts")
-    } else if median < MIN_MEDIAN_DURATION {
-        Some("median_duration_too_short")
-    } else if p25 < bound {
-        Some("cluster_too_diffuse")
-    } else {
-        None
-    };
-    Quality {
-        reason,
-        median,
-        p25,
-        tier,
-        bound,
-    }
-}
-fn candidate_samples(
-    _root: &Path,
-    rows: &[CandidateRow],
-    centroid: &[f32],
-    version: &str,
-) -> Vec<Value> {
-    let mut ordered = rows.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| {
-        dot(&right.embedding, centroid).total_cmp(&dot(&left.embedding, centroid))
-    });
-    let mut seen = BTreeSet::new();
-    ordered
-        .into_iter()
-        .filter(|row| {
-            seen.insert((
-                row.day.as_str(),
-                layout_flag(row.layout),
-                row.stream.as_str(),
-                row.segment_key.as_str(),
-            ))
-        })
-        .take(3)
-        .map(|row| {
-            let segment = row
-                .jsonl_path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_path_buf();
-
-            let mut audio_sha256 = Value::Null;
-            let mut audio_url = None;
-
-            for (ext, _) in solstone_core_speaker_resolve::audio_sample::AUDIO_FORMATS {
-                let path = segment.join(format!("{}{}", row.source, ext));
-                if path.is_file() {
-                    if let Ok(bytes) = fs::read(&path)
-                        && !bytes.is_empty()
-                    {
-                        audio_sha256 = Value::String(format!("{:x}", Sha256::digest(&bytes)));
-                    }
-                    let (url, _) = solstone_core_speaker_resolve::audio_sample::audio_info(
-                        &segment,
-                        &row.day,
-                        &row.stream,
-                        &row.segment_key,
-                        &row.source,
-                        row.layout,
-                    );
-                    audio_url = url;
-                    break;
-                }
-            }
-
-            let mut emb_le = Vec::with_capacity(row.embedding.len() * 4);
-            for val in &row.embedding {
-                emb_le.extend_from_slice(&val.to_le_bytes());
-            }
-            let embedding_sha256 = format!("{:x}", Sha256::digest(&emb_le));
-
-            json!({
-                "day": row.day,
-                "stream_layout": layout_flag(row.layout),
-                "stream": row.stream,
-                "segment_key": row.segment_key,
-                "source": row.source,
-                "sentence_id": row.sentence_id,
-                "duration_s": fallback_duration(&row.jsonl_path, row.sentence_id),
-                "audio_url": audio_url,
-                "version": version,
-                "embedding_sha256": embedding_sha256,
-                "audio_sha256": audio_sha256,
-            })
-        })
-        .collect()
-}
-
-fn layout_flag(layout: SegmentLayout) -> &'static str {
-    match layout {
-        SegmentLayout::Direct => "direct",
-        SegmentLayout::Named => "named",
-    }
-}
-
-fn fallback_duration(path: &Path, sentence_id: i64) -> Option<f64> {
-    let starts = fs::read_to_string(path)
-        .ok()?
-        .lines()
-        .skip(1)
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|value| {
-            value
-                .get("start")
-                .and_then(Value::as_str)
-                .and_then(parse_time)
-        })
-        .collect::<Vec<_>>();
-    let index = usize::try_from(sentence_id.checked_sub(1)?).ok()?;
-    Some((starts.get(index + 1)? - starts.get(index)?) as f64)
-}
-fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| left * right)
-        .sum()
-}
-struct CandidateLowQuality<'a> {
-    reason: &'a str,
-    observed: f64,
-    threshold: f64,
-    segments: usize,
-    embeddings: usize,
-    tier: &'a str,
-    bound: f64,
-}
-fn candidate_low_quality(
-    root: &Path,
-    principal: Option<&str>,
-    value: CandidateLowQuality<'_>,
-) -> Result<Value, String> {
-    update_voiceprint(
-        root,
-        json!({"status":"low_quality","source":"candidate_pool","low_quality_reason":value.reason,"observed_value":value.observed,"threshold_value":value.threshold,"evidence_tier":value.tier,"intra_cosine_p25_bound":value.bound,"segments_checked":value.segments,"attempted_at":Utc::now().to_rfc3339()}),
-    )?;
-    let count = manual_count(root, principal);
-    Ok(
-        json!({"status":"low_quality","source":"candidate_pool","recommendation":"low_quality","segments_available":value.segments,"embeddings_available":value.embeddings,"low_quality_reason":value.reason,"observed_value":value.observed,"threshold_value":value.threshold,"evidence_tier":value.tier,"intra_cosine_p25_bound":value.bound,"manual_tags_count":count,"can_build_from_tags":count>=MIN_STATEMENTS,"next_step":"seed_manual_tags","guidance":"Use solstone call speakers tag-owner to add validated owner tags."}),
-    )
-}
-fn no_cluster(
-    root: &Path,
-    principal: Option<&str>,
-    reason: &str,
-    checked: usize,
-    segments: usize,
-    embeddings: usize,
-) -> Result<Value, String> {
-    update_voiceprint(root, json!({"status":"no_cluster","reason":reason}))?;
-    let count = manual_count(root, principal);
-    Ok(
-        json!({"status":"no_cluster","reason":reason,"segments_checked":checked,"segments_available":segments,"embeddings_available":embeddings,"recommendation":"no_cluster","manual_tags_count":count,"can_build_from_tags":count>=MIN_STATEMENTS,"next_step":"seed_manual_tags","guidance":"Use solstone call speakers tag-owner to add validated owner tags."}),
-    )
-}
-
 fn owner_detection_ready(root: &Path) -> Result<Value, ()> {
     let principal = admitted_principal_id(root).ok_or(())?;
     if load_owner_centroid(root, &principal)
@@ -1130,8 +602,8 @@ fn owner_detection_ready(root: &Path) -> Result<Value, ()> {
     {
         return Ok(json!({"ready":false,"reason":"centroid_exists"}));
     }
-    let state = awareness_voiceprint(root);
-    if let Some(days_remaining) = cooldown(&state) {
+    let state = voiceprint_state(root);
+    if let Some(days_remaining) = cooldown_days_remaining(&state) {
         return Ok(json!({"ready":false,"reason":"cooldown","days_remaining":days_remaining}));
     }
     if root.join("awareness/owner_candidate.npz").exists()
@@ -1148,54 +620,16 @@ fn owner_detection_ready(root: &Path) -> Result<Value, ()> {
     Ok(json!({"ready":false,"reason":"no_candidate"}))
 }
 
-struct Quality {
-    reason: Option<&'static str>,
-    median: f64,
-    p25: f64,
-    tier: &'static str,
-    bound: f64,
-}
 fn quality(
     evidence: &[solstone_core_speaker_resolve::owner_provisional::ManualOwnerEmbedding],
 ) -> Quality {
-    let tier = if evidence.len() >= STRONG_STATEMENTS {
-        "strong"
-    } else {
-        "standard"
-    };
-    let bound = if tier == "strong" {
-        STRONG_P25
-    } else {
-        STANDARD_P25
-    };
-    let mut durations = evidence.iter().filter_map(duration).collect::<Vec<_>>();
-    durations.sort_by(f64::total_cmp);
-    let median = if durations.is_empty() {
-        0.0
-    } else {
-        durations[(durations.len() - 1) / 2]
-    };
-    let rows = evidence
-        .iter()
-        .map(|item| item.embedding.clone())
-        .collect::<Vec<_>>();
-    let p25 = intra_cosine_p25(&rows).unwrap_or(0.0);
-    let reason = if evidence.len() < MIN_STATEMENTS {
-        Some("too_few_stmts")
-    } else if median < MIN_MEDIAN_DURATION {
-        Some("median_duration_too_short")
-    } else if p25 < bound {
-        Some("cluster_too_diffuse")
-    } else {
-        None
-    };
-    Quality {
-        reason,
-        median,
-        p25,
-        tier,
-        bound,
-    }
+    evidence_quality(
+        &evidence
+            .iter()
+            .map(|item| item.embedding.clone())
+            .collect::<Vec<_>>(),
+        evidence.iter().filter_map(duration).collect(),
+    )
 }
 fn low_quality(
     reason: &str,
@@ -1218,42 +652,26 @@ fn low_quality(
 fn rebuild_refusal(reason: &str) -> Value {
     json!({"status":"refused","reason":reason,"next_step":"build_from_tags","guidance":"Build or confirm an owner voice before running rebuild-owner."})
 }
-fn mean(rows: &[Vec<f32>]) -> Option<Vec<f32>> {
-    let first = rows.first()?;
-    let mut mean = vec![0.0; first.len()];
-    for row in rows {
-        for (out, value) in mean.iter_mut().zip(row) {
-            *out += *value;
-        }
-    }
-    for value in &mut mean {
-        *value /= rows.len() as f32;
-    }
-    Some(mean)
-}
 fn duration(
     item: &solstone_core_speaker_resolve::owner_provisional::ManualOwnerEmbedding,
 ) -> Option<f64> {
-    let rows = fs::read_to_string(&item.jsonl_path).ok()?;
-    let starts = rows
-        .lines()
-        .skip(1)
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    let read = solstone_core_speaker_id::transcript::read_transcript_rows(
+        &fs::read(&item.jsonl_path).ok()?,
+    )
+    .ok()?;
+    let starts = read
+        .rows
+        .iter()
         .filter_map(|row| {
-            row.get("start")
+            row.value
+                .get("start")
                 .and_then(Value::as_str)
-                .map(|start| (row.get("id").and_then(Value::as_i64), parse_time(start)))
+                .map(|start| (row.sentence_id, parse_time(start)))
         })
         .collect::<Vec<_>>();
-    let index = starts
-        .iter()
-        .position(|(id, _)| *id == Some(item.sentence_id))?;
+    let index = starts.iter().position(|(id, _)| *id == item.sentence_id)?;
     let start = starts[index].1?;
     starts.get(index + 1)?.1.map(|next| (next - start) as f64)
-}
-fn parse_time(value: &str) -> Option<i64> {
-    let mut parts = value.split(':').map(|part| part.parse::<i64>().ok());
-    Some(parts.next()?? * 3600 + parts.next()?? * 60 + parts.next()??)
 }
 fn evidence_hash(
     evidence: &[solstone_core_speaker_resolve::owner_provisional::ManualOwnerEmbedding],
@@ -1290,32 +708,6 @@ fn manual_count(root: &Path, principal: Option<&str>) -> usize {
     principal
         .map(|id| crate::speakers_quality::count_manual_owner_tags(root, id))
         .unwrap_or_default()
-}
-fn cooldown(state: &BTreeMap<String, Value>) -> Option<i64> {
-    let time = state.get("rejected_at")?.as_str()?;
-    let date = DateTime::parse_from_rfc3339(time).ok()?;
-    let elapsed = Utc::now()
-        .signed_duration_since(date.with_timezone(&Utc))
-        .num_days();
-    (elapsed < COOLDOWN_DAYS).then_some(COOLDOWN_DAYS - elapsed)
-}
-fn update_voiceprint(root: &Path, update: Value) -> Result<(), String> {
-    let path = root.join("awareness/current.json");
-    let _lock = hold_lock(&path, LockOptions::default()).map_err(|error| error.to_string())?;
-    let mut state = fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    let voiceprint = state
-        .entry("voiceprint".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let object = voiceprint
-        .as_object_mut()
-        .ok_or_else(|| "awareness voiceprint state is not an object".to_owned())?;
-    object.extend(update.as_object().cloned().unwrap_or_default());
-    write_json(path, &Value::Object(state), JsonWriteOptions::default())
-        .map_err(|error| error.to_string())
 }
 async fn optional_json(request: Request) -> Value {
     let bytes = to_bytes(request.into_body(), usize::MAX)
@@ -1501,349 +893,5 @@ pub mod test_hooks {
 #[cfg(not(feature = "test-hooks"))]
 pub mod test_hooks {
     #[inline(always)]
-    pub fn wait_if_pause_after_snapshot() {}
-    #[inline(always)]
     pub fn wait_if_hold_confirm_or_reject() {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    #[test]
-    fn detect_reports_the_confirmed_voice_streams_saved_at_confirmation() {
-        let root = PathBuf::from("/var/tmp").join(format!(
-            "solstone-convey-owner-confirmed-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("entities/owner")).unwrap();
-        fs::write(
-            root.join("entities/owner/entity.json"),
-            serde_json::json!({"id":"owner","name":"Owner","type":"Person","is_principal":true})
-                .to_string(),
-        )
-        .unwrap();
-        let mut centroid = vec![0.0_f32; 256];
-        centroid[0] = 1.0;
-        write_owner_centroid(
-            &root,
-            "owner",
-            &OwnerCentroidWriteInput {
-                centroid,
-                cluster_size: 40,
-                timestamp: Utc::now().to_rfc3339(),
-                evidence_tier: "standard".to_owned(),
-            },
-        )
-        .unwrap();
-        update_voiceprint(&root, serde_json::json!({"streams_represented": 3})).unwrap();
-
-        let detected = detect_owner_candidate(&root, false).unwrap();
-        assert_eq!(detected["status"], "confirmed");
-        assert_eq!(detected["streams_represented"], 3);
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// A journal with an owner and one transcribed source fed into the pool.
-    fn fed_owner_journal(name: &str) -> PathBuf {
-        let dir_path = PathBuf::from("/var/tmp").join(format!(
-            "solstone-convey-owner-{name}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir_path);
-        fs::create_dir_all(dir_path.join("entities/owner")).unwrap();
-        fs::write(
-            dir_path.join("entities/owner/entity.json"),
-            serde_json::json!({
-                "id": "owner",
-                "name": "Owner",
-                "type": "Person",
-                "is_principal": true
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let seg_dir = dir_path.join("chronicle/20260101/093000_300_summary");
-        fs::create_dir_all(&seg_dir).unwrap();
-        let jsonl_path = seg_dir.join("audio.jsonl");
-        let npz_path = seg_dir.join("audio.npz");
-
-        let mut unit_vec = vec![0.0_f32; 256];
-        unit_vec[0] = 1.0;
-        let mut raw_bytes = Vec::new();
-        for _ in 0..30 {
-            for col in &unit_vec {
-                raw_bytes.extend_from_slice(&col.to_le_bytes());
-            }
-        }
-        let payload_path = seg_dir.join("audio_payload.f32");
-        fs::write(&payload_path, &raw_bytes).unwrap();
-
-        let sids: Vec<i64> = (1..=30).collect();
-        let statements: Vec<serde_json::Value> = sids
-            .iter()
-            .enumerate()
-            .map(|(i, &sid)| {
-                serde_json::json!({
-                    "id": sid,
-                    "sentence_id": sid,
-                    "start_offset_us": (i as i64) * 1_000_000,
-                    "text": format!("statement {sid}"),
-                })
-            })
-            .collect();
-
-        let req = serde_json::json!({
-            "schema": "solstone-speaker-transcript-write-request-v1",
-            "output": {
-                "jsonl_path": jsonl_path.display().to_string(),
-                "npz_path": npz_path.display().to_string(),
-                "redo": true,
-            },
-            "base_time_us_of_day": 100_000_u64,
-            "source": "audio",
-            "statements": statements,
-            "header": {
-                "raw": "audio.wav",
-                "model": "model",
-                "device": "cpu",
-                "compute_type": "int8",
-                "speaker_evidence": "single",
-                "speaker_evidence_version": "windowed-slots-v1",
-                "speaker_evidence_multi_fraction": 0.0,
-            },
-            "embeddings": {
-                "payload_path": payload_path,
-                "payload_format": "raw-f32le-row-major-v1",
-                "dtype": "float32-le",
-                "shape": [30, 256],
-                "byte_count": 30 * 256 * 4,
-                "statement_ids": sids,
-                "durations_s": vec![1.5; 30],
-                "encoder": "test",
-            }
-        });
-        solstone_core_speaker_id::writer::write_request(
-            serde_json::to_vec(&req).unwrap().as_slice(),
-        )
-        .unwrap();
-
-        let inputs = match solstone_core_speaker_resolve::transcribed_clusters::load_transcribed_cluster_inputs(
-            &dir_path,
-            &jsonl_path,
-            &npz_path,
-        )
-        .unwrap() {
-            solstone_core_speaker_resolve::transcribed_clusters::TranscribedClusterLoad::Clusters(inputs) => inputs,
-            other => panic!("expected clusters, got {other:?}"),
-        };
-        assert!(!inputs.is_empty());
-
-        let mut tracker =
-            solstone_core_speaker_resolve::candidate_tracker::CandidateTracker::new(&dir_path);
-        tracker.add_transcribed_clusters(&inputs).unwrap();
-        dir_path
-    }
-
-    #[test]
-    fn detect_owner_candidate_accepts_transcribed_pool() {
-        let dir_path = fed_owner_journal("fed");
-        let res = detect_owner_candidate(&dir_path, true)
-            .expect("detection should succeed without error");
-        let reason = res.get("reason").and_then(Value::as_str);
-        assert_ne!(reason, Some("pool_missing"));
-        assert_ne!(reason, Some("pool_empty"));
-
-        let _ = fs::remove_dir_all(dir_path);
-    }
-
-    fn rewrite_pool_sentence_ids(root: &Path, value: Option<Value>) {
-        let path = root.join("awareness/speaker_candidates.json");
-        let mut pool: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        for candidate in pool["candidates"].as_array_mut().unwrap() {
-            for row in candidate["source_segments"].as_array_mut().unwrap() {
-                let row = row.as_object_mut().unwrap();
-                match &value {
-                    Some(value) => row.insert("sentence_ids".to_owned(), value.clone()),
-                    None => row.remove("sentence_ids"),
-                };
-            }
-        }
-        fs::write(&path, serde_json::to_vec(&pool).unwrap()).unwrap();
-    }
-
-    #[test]
-    fn detect_owner_candidate_skips_legacy_rows_without_sentence_ids() {
-        let dir_path = fed_owner_journal("legacy");
-        rewrite_pool_sentence_ids(&dir_path, None);
-        detect_owner_candidate(&dir_path, true)
-            .expect("a legacy row without sentence ids is skipped, not an error");
-        let _ = fs::remove_dir_all(dir_path);
-    }
-
-    #[test]
-    fn detect_owner_candidate_refuses_malformed_sentence_ids() {
-        let dir_path = fed_owner_journal("malformed");
-        rewrite_pool_sentence_ids(&dir_path, Some(serde_json::json!("not ids")));
-        assert_eq!(
-            detect_owner_candidate(&dir_path, true).unwrap_err(),
-            "invalid candidate sentence ids"
-        );
-        let _ = fs::remove_dir_all(dir_path);
-    }
-
-    #[test]
-    fn detect_owner_candidate_after_pool_backfill() {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir_path = PathBuf::from("/var/tmp").join(format!(
-            "solstone-convey-owner-backfill-test-{}-{seq}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir_path);
-        fs::create_dir_all(dir_path.join("entities/owner")).unwrap();
-        fs::write(
-            dir_path.join("entities/owner/entity.json"),
-            serde_json::json!({
-                "id": "owner",
-                "name": "Owner",
-                "type": "Person",
-                "is_principal": true
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        // 1. Before: detect_owner_candidate returns pool_missing
-        let res_before =
-            detect_owner_candidate(&dir_path, true).expect("detection before backfill");
-        assert_eq!(
-            res_before.get("reason").and_then(Value::as_str),
-            Some("pool_missing")
-        );
-
-        // Setup 3 days with 10 statement IDs each (30 total statements, 256-d unit vectors, 1.5s durations)
-        let days = ["20260101", "20260102", "20260103"];
-        let mut all_statement_ids = Vec::new();
-        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
-
-        for day in days {
-            let seg_dir = dir_path.join("chronicle").join(day).join("100000_300");
-            fs::create_dir_all(&seg_dir).unwrap();
-            let jsonl_path = seg_dir.join("audio.jsonl");
-            let npz_path = seg_dir.join("audio.npz");
-            let payload_path = seg_dir.join("payload.f32");
-
-            let sids: Vec<i32> = (1..=10).collect();
-            all_statement_ids.extend(sids.iter().copied());
-
-            let mut raw_bytes = Vec::new();
-            for _ in 0..10 {
-                let mut vec_unit = vec![0.0_f32; 256];
-                vec_unit[0] = 1.0;
-                for val in vec_unit {
-                    raw_bytes.extend_from_slice(&val.to_le_bytes());
-                }
-            }
-            fs::write(&payload_path, raw_bytes).unwrap();
-
-            let statements: Vec<Value> = (1..=11)
-                .map(|id| {
-                    json!({
-                        "id": id,
-                        "start_offset_us": (id as i64 - 1) * 2_000_000,
-                        "text": format!("statement {id}"),
-                    })
-                })
-                .collect();
-
-            let req = json!({
-                "schema": "solstone-speaker-transcript-write-request-v1",
-                "output": {
-                    "jsonl_path": jsonl_path.display().to_string(),
-                    "npz_path": npz_path.display().to_string(),
-                    "redo": true,
-                },
-                "base_time_us_of_day": 100_000_u64,
-                "source": "audio",
-                "statements": statements,
-                "header": {
-                    "raw": "audio.wav",
-                    "model": "model",
-                    "device": "cpu",
-                    "compute_type": "int8",
-                    "speaker_evidence": "single",
-                    "speaker_evidence_version": "windowed-slots-v1",
-                    "speaker_evidence_multi_fraction": 0.0,
-                },
-                "embeddings": {
-                    "payload_path": payload_path,
-                    "payload_format": "raw-f32le-row-major-v1",
-                    "dtype": "float32-le",
-                    "shape": [10, 256],
-                    "byte_count": 10 * 256 * 4,
-                    "statement_ids": sids,
-                    "durations_s": vec![1.5; 10],
-                    "encoder": "test",
-                }
-            });
-            solstone_core_speaker_id::writer::write_request(
-                serde_json::to_vec(&req).unwrap().as_slice(),
-            )
-            .unwrap();
-
-            // Set modified times older than 10 minutes settle window
-            let jsonl_file = fs::File::open(&jsonl_path).unwrap();
-            jsonl_file.set_modified(old_mtime).unwrap();
-            let npz_file = fs::File::open(&npz_path).unwrap();
-            npz_file.set_modified(old_mtime).unwrap();
-        }
-
-        // Run production backfill_speaker_pool
-        let catch_up =
-            solstone_core_speaker_resolve::candidate_tracker::backfill_speaker_pool(&dir_path);
-        let solstone_core_speaker_resolve::candidate_tracker::SpeakerPoolCatchUp::Done(report) =
-            catch_up
-        else {
-            panic!("backfill_speaker_pool refused: {catch_up:?}");
-        };
-        assert_eq!(report["complete"], true);
-
-        // Verify pool loaded strictly and carries all statements
-        let tracker =
-            solstone_core_speaker_resolve::candidate_tracker::CandidateTracker::new(&dir_path);
-        let candidates = tracker.candidates();
-        assert!(!candidates.is_empty());
-        let candidate = &candidates[0];
-        assert_eq!(candidate.n_intervals, 30);
-        assert!((candidate.total_duration_s - 45.0).abs() < 1e-3);
-
-        let mut gathered_sids: Vec<i64> = Vec::new();
-        for seg in &candidate.source_segments {
-            if let Some(arr) = seg.get("sentence_ids").and_then(Value::as_array) {
-                for v in arr {
-                    if let Some(sid) = v.as_i64() {
-                        gathered_sids.push(sid);
-                    }
-                }
-            }
-        }
-        gathered_sids.sort();
-        let mut expected_sids: Vec<i64> = all_statement_ids.into_iter().map(i64::from).collect();
-        expected_sids.sort();
-        assert_eq!(gathered_sids, expected_sids);
-
-        // 2. After: detect_owner_candidate status is candidate
-        let res_after = detect_owner_candidate(&dir_path, true).expect("detection after backfill");
-        assert_eq!(
-            res_after.get("status").and_then(Value::as_str),
-            Some("candidate")
-        );
-
-        let _ = fs::remove_dir_all(dir_path);
-    }
 }

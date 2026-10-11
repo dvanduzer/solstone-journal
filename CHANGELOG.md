@@ -17,6 +17,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- your journal now looks for your voice by itself each day. from your first day, your journal's home page says when it has found a voice that may be yours, or what it still needs. once you confirm it, your past conversations are updated in the background to show who said what, and the speakers page shows how far along that is. only the speaker names change: stories and weekly reflections already written stay as they were. on the speakers page you can also teach your voice from the last two weeks, teach it again later, or remove your saved voice. a voice you say isn't yours isn't offered again, and after a "no" your journal looks again in 14 days. transcripts now show your lines as "you".
 - on a mac or linux computer, a local thinking install now stops before downloading when that computer is known to be below the memory bar or has no usable GPU. when that memory cannot be read, the install still starts and the thinking page keeps a warning for that attempt.
 - each tool your journal offers a connected agent now has a short name. saving a note, the one tool that doesn't only read, now says it adds without changing anything already in your journal. when an agent's call has arguments your journal can't use, it's told what to fix.
 
