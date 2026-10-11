@@ -3638,6 +3638,7 @@ dependencies = [
  "solstone-core-backup-runtime",
  "solstone-core-installed-payload",
  "solstone-core-offload",
+ "solstone-core-retention",
  "solstone-core-system-health",
  "tempfile",
 ]
@@ -3690,6 +3691,7 @@ dependencies = [
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
  "solstone-core-offload",
+ "solstone-core-retention",
  "solstone-core-sol-link",
  "solstone-core-system",
  "tempfile",

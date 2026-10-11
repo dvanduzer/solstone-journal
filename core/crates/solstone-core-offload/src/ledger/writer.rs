@@ -8,7 +8,7 @@ use std::sync::Arc;
 use solstone_core_journal_io::{JournalRoot, paths::SegmentLayout};
 use solstone_core_retention::{archive_proof::OffloadProof, receipt::Target};
 
-use super::RestoreOperation;
+use solstone_core_retention::archive_catalog::RestoreOperation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LedgerWriteRefusal {
@@ -125,10 +125,12 @@ mod unix {
         locking::acquire_existing_parent_lock_bound,
     };
 
-    use super::super::{
-        Event, JournalCatalog, component, fold_lines, read_complete_catalog, valid_day,
-    };
     use super::*;
+    use solstone_core_retention::archive_catalog::{
+        JournalCatalog, SegmentCatalog,
+        codec::{Event, component, fold_lines, valid_day},
+        read_complete_catalog,
+    };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Point {
@@ -419,7 +421,7 @@ mod unix {
     ) -> Result<bool, LedgerWriteRefusal> {
         unique_ids(catalog)?;
         let segments = || catalog.days.iter().flat_map(|d| &d.segments);
-        let matching_segment = |s: &super::super::SegmentCatalog| {
+        let matching_segment = |s: &SegmentCatalog| {
             s.day == request.target.day
                 && s.stream == request.target.stream
                 && s.segment == request.segment

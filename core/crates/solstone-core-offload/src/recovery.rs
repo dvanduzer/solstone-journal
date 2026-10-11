@@ -526,9 +526,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use crate::ledger::RestoreDisposition;
     use crate::restore_intent::tests::fixture;
     use crate::restore_intent::{ConfirmedContent, Obligation};
+    use solstone_core_retention::archive_catalog::RestoreDisposition;
 
     struct Fixture {
         temp: tempfile::TempDir,

@@ -39,6 +39,7 @@ nix = { workspace = true, features = ["fs"] }
 solstone-core-system = { workspace = true, features = ["test-hooks"] }
 
 [dev-dependencies]
+solstone-core-retention.workspace = true
 sha2.workspace = true
 tempfile = "3.24.0"
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }

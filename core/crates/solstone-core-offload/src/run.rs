@@ -27,10 +27,11 @@ use solstone_core_retention::{
     upsert_offload,
 };
 
-use crate::ledger::{OffloadFile, append_offload_event};
+use crate::ledger::append_offload_event;
 use crate::marks::OffloadMarkIndex;
 use crate::measurement::measure_local_media;
 use crate::pruning_audit::{PruneAuditWriter, open_prune_audit, write_prune_audit};
+use solstone_core_retention::archive_catalog::OffloadFile;
 
 pub use current::{
     CurrentFileIdentity, CurrentOffloadAvailability, CurrentOffloadDecision, CurrentOffloadRefusal,
@@ -858,7 +859,9 @@ mod current {
     use solstone_core_retention::scan::{CheckedSegment, scan_segment_bound};
     use solstone_core_segment::output_attempt::OutputClaims;
 
-    use crate::ledger::{ArchiveWitness, JournalCatalog, read_complete_catalog};
+    use solstone_core_retention::archive_catalog::{
+        ArchiveWitness, JournalCatalog, read_complete_catalog,
+    };
 
     const MAX_CURRENT_ENTRIES: usize = 100_000;
     const MAX_CURRENT_CONFIG_BYTES: usize = 1024 * 1024;
