@@ -86,7 +86,7 @@ impl Directory {
         Ok(directory)
     }
 
-    pub(super) fn open_child(&self, name: &OsStr) -> io::Result<Self> {
+    pub(super) fn open_child(&self, name: &OsStr) -> io::Result<Option<Self>> {
         self.revalidate()?;
         let mut nodes = Vec::with_capacity(self.nodes.len() + 1);
         for node in &self.nodes {
@@ -96,9 +96,15 @@ impl Directory {
                 identity: node.identity,
             });
         }
-        let file = File::from(openat(self, name, DIRECTORY, Mode::empty())?);
+        let file = match openat(self, name, DIRECTORY, Mode::empty()) {
+            Ok(file) => File::from(file),
+            Err(nix::errno::Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        step(MediaPrimitive::AfterChildOpen)?;
         let id = identity(&file)?;
         check_leaf(self, name, id)?;
+        step(MediaPrimitive::AfterChildObservation)?;
         nodes.push(Node {
             name: name.to_os_string(),
             file,
@@ -112,7 +118,7 @@ impl Directory {
             path: self.path.join(name),
         };
         directory.revalidate()?;
-        Ok(directory)
+        Ok(Some(directory))
     }
 
     pub(super) fn identity(&self) -> MediaIdentity {
@@ -191,6 +197,7 @@ pub(super) fn entries(
             return Ok(None);
         }
         let name = OsString::from_vec(bytes.to_vec());
+        super::plain_name(&name)?;
         step(MediaPrimitive::BeforeEntryObservation)?;
         let observed = entry(directory, &name)?.ok_or_else(changed)?;
         let MediaIdentity::Unix { inode, device } = observed.identity else {
@@ -336,7 +343,7 @@ pub(super) fn open_source(directory: &Directory, name: &OsStr) -> io::Result<Opt
 
 pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
     mkdirat(parent, name, Mode::S_IRWXU)?;
-    parent.open_child(name)
+    parent.open_child(name)?.ok_or_else(changed)
 }
 
 pub(super) fn create_file(parent: &Directory, name: &OsStr) -> io::Result<File> {

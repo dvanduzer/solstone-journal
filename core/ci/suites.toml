@@ -285,6 +285,7 @@ areas = ["backup"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
+serial_group = "host-contention"
 default_full = true
 runtime = "none"
 features = ["full-tests"]
@@ -2203,6 +2204,20 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-backup::bounded_child_process"
+package = "solstone-core-backup"
+target = "bounded_child_process"
+set = "component"
+areas = ["backup"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+serial_group = "host-contention"
+default_full = true
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]

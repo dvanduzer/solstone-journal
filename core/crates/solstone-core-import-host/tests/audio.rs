@@ -575,10 +575,20 @@ async fn ac6_allocation_is_exclusive_bounded_and_cleans_failed_leaves() {
     let cleanup_parent = request(&cleanup_temp, "cleanup")
         .journal_root
         .join("chronicle/20260811/import.audio");
-    assert_eq!(
-        fs::read_dir(&cleanup_parent).unwrap().count(),
-        created(&failed).segments.len()
-    );
+    let mut remaining_segments = Vec::new();
+    for entry in fs::read_dir(&cleanup_parent).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        if ["120000_300.lock", "120500_300.lock", "121000_300.lock"].contains(&name.as_str()) {
+            assert!(entry.file_type().unwrap().is_file());
+        } else {
+            assert!(entry.file_type().unwrap().is_dir());
+            remaining_segments.push(name);
+        }
+    }
+    remaining_segments.sort();
+    assert_eq!(remaining_segments, ["120000_300", "121000_300"]);
+    assert_eq!(remaining_segments.len(), created(&failed).segments.len());
 
     let exhaustion = TempDir::new().unwrap();
     let exhaustion_request = request(&exhaustion, "exhaustion");

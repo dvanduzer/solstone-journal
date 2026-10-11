@@ -47,6 +47,8 @@ pub enum MediaPrimitive {
     StageRemove,
     Completion,
     ArchiveAccessGap,
+    AfterChildOpen,
+    AfterChildObservation,
     AfterFirstEnumeration,
     BeforeEntryObservation,
     BeforePrefixRead,

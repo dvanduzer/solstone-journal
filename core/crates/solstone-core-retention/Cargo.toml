@@ -17,6 +17,7 @@ publish = false
 workspace = true
 
 [dependencies]
+solstone-core-backup.workspace = true
 getrandom.workspace = true
 chrono = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

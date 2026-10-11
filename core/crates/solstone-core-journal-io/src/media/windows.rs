@@ -110,17 +110,23 @@ impl Directory {
         &self.path
     }
 
-    pub(super) fn open_child(&self, name: &OsStr) -> io::Result<Self> {
+    pub(super) fn open_child(&self, name: &OsStr) -> io::Result<Option<Self>> {
         self.revalidate()?;
-        let file = File::from(nt_create_relative_deny_delete_sharing(
+        let file = match nt_create_relative_deny_delete_sharing(
             self.handle(),
             name,
             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
             FILE_OPEN,
             OPTIONS | FILE_DIRECTORY_FILE,
-        )?);
+        ) {
+            Ok(file) => File::from(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        step(MediaPrimitive::AfterChildOpen)?;
         require_kind(file.as_raw_handle(), true)?;
         let identity = identity(&file)?;
+        step(MediaPrimitive::AfterChildObservation)?;
         let mut nodes = self.nodes.clone();
         nodes.push(Arc::new(Node {
             name: name.to_owned(),
@@ -134,7 +140,7 @@ impl Directory {
             path: self.path.join(name),
         };
         child.revalidate()?;
-        Ok(child)
+        Ok(Some(child))
     }
 
     pub(super) fn stamp(&self) -> io::Result<Stamp> {
