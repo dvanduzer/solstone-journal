@@ -16,6 +16,7 @@ mod restore_intent;
 mod restore_prepared;
 pub mod run;
 pub mod status;
+pub mod teardown;
 
 pub use ledger::{
     append_offload_event, append_restore_event, ledger_path_for_day, summarize_day,
