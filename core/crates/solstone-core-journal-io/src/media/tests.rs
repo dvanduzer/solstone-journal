@@ -380,7 +380,7 @@ mod native {
     }
 }
 
-#[cfg(feature = "full-tests")]
+#[cfg(all(test, feature = "full-tests"))]
 mod archive_input {
     use super::*;
     use std::fs;

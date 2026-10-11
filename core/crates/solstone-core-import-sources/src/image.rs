@@ -1931,7 +1931,9 @@ mod tests {
 
         let segments = fs::read_dir(&stream_dir)
             .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_dir())
+            .map(|entry| entry.file_name().into_string().unwrap())
             .filter(|name| !name.starts_with('.'))
             .count();
         assert_eq!(segments, 2);
