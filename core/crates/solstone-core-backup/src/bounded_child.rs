@@ -531,7 +531,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     fn live_test_session() -> SpawnedChild {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 60"]).process_group(0);
@@ -553,7 +553,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn reader_error_or_panic_stops_live_root_and_joins_open_sibling_in_either_order() {
         use std::sync::Barrier;
@@ -612,7 +612,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn drop_reaps_and_joins_when_only_first_reader_was_created() {
         let mut session = live_test_session();
@@ -634,7 +634,7 @@ mod tests {
         drop(held_writer);
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn collection_keeps_the_original_monotonic_timeout_after_root_exit() {
         let (reader, held_writer) = pipe_cloexec().unwrap();
