@@ -26,11 +26,10 @@ impl MediaDirectory {
     pub fn open_child(&self, name: &OsStr) -> io::Result<Option<Arc<Self>>> {
         plain_name(name)?;
         self.revalidate()?;
-        let child = match self.inner.open_child(name) {
-            Ok(inner) => Some(Arc::new(Self { inner })),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
+        let child = self
+            .inner
+            .open_child(name)?
+            .map(|inner| Arc::new(Self { inner }));
         self.revalidate()?;
         Ok(child)
     }

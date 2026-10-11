@@ -70,6 +70,17 @@ fn full_identity_is_lossless_and_strict() {
     assert_ne!(original, replaced);
 }
 
+#[cfg(unix)]
+#[test]
+fn portable_name_validation_refuses_non_utf8() {
+    use std::os::unix::ffi::OsStringExt;
+    let name = OsString::from_vec(vec![b'b', 0xff]);
+    assert_eq!(
+        plain_name(&name).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
 #[cfg(all(test, feature = "full-tests"))]
 mod observations {
     use super::*;
@@ -184,6 +195,60 @@ mod observations {
             );
             assert!(fired && result.is_err(), "{mutation}");
             assert_eq!(parent.identity(), identity);
+        }
+    }
+
+    #[test]
+    fn late_child_observation_errors_never_become_known_absence() {
+        for barrier in [
+            MediaPrimitive::AfterChildOpen,
+            MediaPrimitive::AfterChildObservation,
+        ] {
+            let (temp, parent) = fixture();
+            fs::create_dir(temp.path().join("parent/child")).unwrap();
+            let (result, fired) = run_with_media_hook(
+                barrier,
+                || Err(io::ErrorKind::NotFound.into()),
+                || parent.open_child(OsStr::new("child")),
+            );
+            assert!(fired);
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::NotFound);
+            parent.revalidate().unwrap();
+            assert!(parent.open_child(OsStr::new("child")).unwrap().is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_child_disappearance_is_uncertain_with_unchanged_parent() {
+        for barrier in [
+            MediaPrimitive::AfterChildOpen,
+            MediaPrimitive::AfterChildObservation,
+        ] {
+            let (temp, parent) = fixture();
+            let child = temp.path().join("parent/child");
+            fs::create_dir(&child).unwrap();
+            let identity = parent.identity();
+            let (result, fired) = run_with_media_hook(
+                barrier,
+                move || fs::remove_dir(child),
+                || parent.open_child(OsStr::new("child")),
+            );
+            assert!(fired && result.is_err(), "{barrier:?}");
+            parent.revalidate().unwrap();
+            assert_eq!(parent.identity(), identity);
+            assert!(parent.open_child(OsStr::new("child")).unwrap().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_enumerated_names_refuse_complete_coverage() {
+        for name in ["bad:name", "bad\\name"] {
+            let (temp, parent) = fixture();
+            fs::write(temp.path().join("parent").join(name), b"untouched").unwrap();
+            assert!(parent.entries(10).is_err());
+            parent.revalidate().unwrap();
         }
     }
 
