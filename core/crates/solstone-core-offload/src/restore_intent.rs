@@ -534,6 +534,56 @@ impl RestoreIntent {
         Ok(document.bytes)
     }
 
+    /// Pure evidence monotonicity. This grants no authority to complete an
+    /// obligation: the orchestrator still owes the actual owning receipt.
+    pub fn validate_successor(&self, next: &Self) -> Result<(), RepairHold> {
+        self.validate()?;
+        next.validate()?;
+        if self.version != next.version
+            || self.event.operation_id != next.event.operation_id
+            || self.locator != next.locator
+            || self.witness != next.witness
+            || self.destination != next.destination
+            || self.stage != next.stage
+            || self.retirement != next.retirement
+            || self.outcome.as_ref().is_some_and(|facts| next.outcome.as_ref() != Some(facts))
+            || self.confirmed.as_ref().is_some_and(|facts| next.confirmed.as_ref() != Some(facts))
+            || self.event_recorded == Obligation::Complete && self.event != next.event
+            || self.event_recorded == Obligation::Complete
+                && (self.outcome != next.outcome || self.confirmed != next.confirmed)
+            // Record only the exact prospective event already persisted.
+            || next.event_recorded == Obligation::Complete && self.event != next.event
+        {
+            return Err(RepairHold::ImmutableEvent);
+        }
+        let first_changed_day = self.outcome.is_none()
+            && next.outcome.as_ref().is_some_and(|facts| {
+                matches!(
+                    facts.effect,
+                    PublicationEffect::Published | PublicationEffect::AlreadyPresent
+                )
+            });
+        if first_changed_day && next.marker != Obligation::Pending {
+            return Err(RepairHold::ImmutableEvent);
+        }
+        for (before, after) in [
+            (self.event_recorded, next.event_recorded),
+            (self.register, next.register),
+            (self.cleanup, next.cleanup),
+        ] {
+            if before != Obligation::Pending && before != after {
+                return Err(RepairHold::ImmutableEvent);
+            }
+        }
+        if self.marker != Obligation::Pending
+            && self.marker != next.marker
+            && !(self.marker == Obligation::Complete && first_changed_day)
+        {
+            return Err(RepairHold::ImmutableEvent);
+        }
+        Ok(())
+    }
+
     /// The adapter supplies a capped, read-only read. Failed reads and torn data
     /// remain a hold; this function never rewrites or repairs their bytes.
     pub fn decode(bytes: io::Result<&[u8]>) -> Result<Self, RepairHold> {
@@ -1113,6 +1163,134 @@ pub(super) mod tests {
             error: (confirmation == Confirmation::Unverified)
                 .then(|| io::Error::other("cut after native effect")),
         }
+    }
+
+    #[test]
+    fn successor_freezes_independently_valid_bindings_and_whole_mark() {
+        let original = fixture(false);
+        let mut changed = Vec::new();
+        let mut next = original.clone();
+        next.locator.target.dir = "120000_60_other".into();
+        next.witness.segment_dir = Some(next.locator.target.dir.clone());
+        changed.push(next);
+        let mut next = original.clone();
+        next.witness.snapshot_id = "e".repeat(64);
+        changed.push(next);
+        let mut next = original.clone();
+        next.destination.root = "native-root-v1:unix:0000000000000001:0000000000000009".into();
+        changed.push(next);
+        let mut next = original.clone();
+        next.destination.parent = identity(20);
+        next.stage.parent = identity(20);
+        changed.push(next);
+        let mut next = original.clone();
+        next.stage.boot_id = Some("new-boot".into());
+        changed.push(next);
+        let mut next = original.clone();
+        next.event.operation_id = "0".repeat(32);
+        changed.push(next);
+        for next in changed {
+            next.validate().unwrap();
+            assert_eq!(
+                original.validate_successor(&next),
+                Err(RepairHold::ImmutableEvent)
+            );
+        }
+        let original = fixture(true);
+        let mut next = original.clone();
+        let mut mark = original.retirement.expected().unwrap().clone();
+        mark.marked_at = "2026-10-10T00:01:00Z".into();
+        next.retirement = MarkRetirement::plan(&next.locator, &next.witness, Some(&mark)).unwrap();
+        next.validate().unwrap();
+        assert_eq!(
+            original.validate_successor(&next),
+            Err(RepairHold::ImmutableEvent)
+        );
+    }
+
+    #[test]
+    fn successor_preserves_outcome_confirmation_and_recorded_event() {
+        let before = fixture(true);
+        let mut published = before.clone();
+        published
+            .record_outcome(&receipt(
+                &before,
+                PublicationEffect::Published,
+                Confirmation::Confirmed,
+            ))
+            .unwrap();
+        assert_eq!(before.validate_successor(&published), Ok(()));
+        let mut erased = before.clone();
+        erased.cleanup = published.cleanup;
+        assert!(published.validate_successor(&erased).is_err());
+        let mut rebound = published.clone();
+        rebound.outcome.as_mut().unwrap().error = None;
+        rebound.outcome.as_mut().unwrap().parent_durability = Durability::Synced;
+        rebound.validate().unwrap();
+        assert!(published.validate_successor(&rebound).is_err());
+        let mut rebound = published.clone();
+        rebound.event.files[0].disposition = RestoreDisposition::AlreadyPresent;
+        rebound.confirmed.as_mut().unwrap().identity = identity(99);
+        rebound.validate().unwrap();
+        assert!(published.validate_successor(&rebound).is_err());
+        let mut complete = published.clone();
+        complete.marker = Obligation::Complete;
+        complete.event_recorded = Obligation::Complete;
+        complete.register = Obligation::Complete;
+        complete.cleanup = Obligation::Complete;
+        assert_eq!(published.validate_successor(&complete), Ok(()));
+        for reset in 0..4 {
+            let mut next = complete.clone();
+            match reset {
+                0 => {
+                    next.marker = Obligation::Pending;
+                    next.register = Obligation::Pending;
+                }
+                1 => {
+                    next.event_recorded = Obligation::Pending;
+                    next.register = Obligation::Pending;
+                }
+                2 => next.register = Obligation::Pending,
+                _ => next.cleanup = Obligation::Pending,
+            }
+            next.validate().unwrap();
+            assert!(complete.validate_successor(&next).is_err());
+        }
+        let mut next = complete.clone();
+        next.event.files[0].disposition = RestoreDisposition::AlreadyPresent;
+        next.validate().unwrap();
+        assert!(complete.validate_successor(&next).is_err());
+    }
+
+    #[test]
+    fn event_revision_must_precede_recorded_completion_and_first_effect_reopens_marker() {
+        let before = fixture(false);
+        let mut next = before.clone();
+        next.event.files[0].disposition = RestoreDisposition::AlreadyPresent;
+        next.confirmed = Some(ConfirmedContent {
+            identity: identity(90),
+            digest: next.expected_digest(),
+        });
+        next.validate().unwrap();
+        assert_eq!(before.validate_successor(&next), Ok(()));
+        next.event_recorded = Obligation::Complete;
+        assert!(before.validate_successor(&next).is_err());
+        let mut observed = next.clone();
+        observed.event_recorded = Obligation::Pending;
+        observed.marker = Obligation::Complete;
+        let mut first = observed.clone();
+        first
+            .record_outcome(&receipt(
+                &observed,
+                PublicationEffect::AlreadyPresent,
+                Confirmation::Confirmed,
+            ))
+            .unwrap();
+        assert_eq!(observed.validate_successor(&first), Ok(()));
+        assert_eq!(first.marker, Obligation::Pending);
+        first.marker = Obligation::Complete;
+        first.validate().unwrap();
+        assert!(observed.validate_successor(&first).is_err());
     }
 
     #[test]
