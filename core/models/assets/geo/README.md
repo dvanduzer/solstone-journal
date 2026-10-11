@@ -11,24 +11,33 @@ and its SHA-256 is pinned as `AREA_TIER_SHA256` in
 
 ## inputs of the committed file
 
-| input | source | sha256 |
-|---|---|---|
-| `cities500.zip` | https://download.geonames.org/export/dump/ (2026-10-11) | `52cd097abe516fccc5749f4e88f558ac358e63f2bfa1700dd1b8059bc00d8e5a` |
-| `admin1CodesASCII.txt` | same | `1da92a6323a5fec3176f3f743bf4cf4040fd56a876da55e46fbca23c863aa60a` |
-| `countryInfo.txt` | same | `c5997ea659df5bcf42509eb937064d172b2a998bb873608603e8421d714a9974` |
-| `ne_10m_admin_0_countries.geojson` | https://github.com/nvkelso/natural-earth-vector, commit `ca96624a56bd078437bca8184e78163e5039ad19`, `geojson/` | `239eec57ac17f100a11e2536cffc56752c318b50ae765b0918ff7aab4ce8f255` |
-| `ne_10m_admin_1_states_provinces.geojson` | same | `22d0e3ad85eb3e27f17cabf8ba2d50e554fbc27a87796ff891d958185da62fb5` |
-
-Output: 225,397 towns, 3,777 first-level divisions, 4,596 state and province
-outlines, 258 country outlines; 7,776,080 bytes, SHA-256
-`a803dc5d4557b8b969c607834a3096d77803875e92c9acda7a5f9a1fd7c7aa21`.
+[`sources.json`](sources.json) records input SHA-256 hashes, output counts,
+the output digest and component version. GeoNames inputs come from
+https://download.geonames.org/export/dump/. Natural Earth inputs are pinned to
+commit `ca96624a56bd078437bca8184e78163e5039ad19` of
+https://github.com/nvkelso/natural-earth-vector, under `geojson/`.
 
 ## refreshing it
 
-Download the five inputs into one directory, then run
-`python3 scripts/build_location_area_tier.py <dir> core/models/assets/geo/area-tier.bin`.
-Update `AREA_TIER_SHA256`, the component version for `area-tier` in
-`core/crates/solstone-core-distribution/src/component_evidence.rs`, the digest
-in `THIRD_PARTY_NOTICES.md` and the table above in the same commit. A new file changes names only where the sources
-changed; every day's location document is rebuilt once, because its build
-record names the area tier it used.
+In an isolated preparation checkout, run:
+
+```sh
+python3 scripts/refresh_location_area_tier.py --cache /var/tmp/area-tier-inputs --receipt /var/tmp/area-tier-refresh.json --apply
+```
+
+The command downloads current GeoNames inputs and caches Natural Earth by its
+pinned digest. It rejects truncated, malformed or substantially shrunken data
+and retains the last good file, recording the reason in the receipt. Local pin
+drift returns nonzero. Without `--apply`, it checks for an
+update and writes only the cache and receipt.
+
+When output changes, it updates the file, `AREA_TIER_SHA256`, both `area-tier`
+component version declarations, the notices digest and `sources.json` together.
+Commit them together before the release cut. Identical output leaves them
+untouched, even if the ZIP metadata changed. A data-only update does not itself
+call for a release; each selected journal release carries the refreshed file.
+
+A new digest causes one pass over location days to re-read and re-render their
+surviving readings with current names. The small build record changes; the
+location document and its search index change only when the rendered words do.
+Days without location are skipped. Unchanged output causes no extra pass.
