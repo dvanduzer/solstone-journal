@@ -23,6 +23,10 @@ use solstone_core_retention::archive_proof::{
 };
 use solstone_core_retention::receipt::Target;
 
+// Additive recording leaves stay uncalled until orchestration is qualified.
+#[allow(dead_code)]
+pub(crate) mod writer;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadFile {
