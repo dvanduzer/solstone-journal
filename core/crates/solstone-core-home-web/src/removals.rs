@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::{
     Extension, Json,
@@ -14,8 +15,13 @@ use chrono::SecondsFormat;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solstone_core_journal_io::JournalRoot;
+use solstone_core_retention::mark_mutation::{
+    BoundMutationOutcome, BoundMutationRefusal, MutationStatus, decline_reviewed,
+};
 use solstone_core_retention::marks::{Approval, MarkId, MarkState};
-use solstone_core_retention::review_context::{ReviewContext, load_at_root, read_review_context};
+use solstone_core_retention::review_context::{
+    ReviewContext, ReviewRefusal, check_review_context, load_at_root, read_review_context,
+};
 use solstone_core_retention_client as retention;
 
 const LIST_EMPTY: &str = "list.empty";
@@ -34,12 +40,8 @@ const APPROVE_PARTIAL: &str = "approve.partial";
 const APPROVE_DELETED: &str = "approve.deleted";
 #[cfg(test)]
 const APPROVE_HALTED: &str = "approve.halted";
-#[cfg(test)]
 const DECLINED_DONE: &str = "declined.done";
-#[cfg(test)]
-const DECLINED_PARTIAL: &str = "declined.partial";
 const DECLINED_REFUSED: &str = "declined.refused";
-#[cfg(test)]
 const DECLINED_UNKNOWN: &str = "declined.unknown";
 const REFUSAL_ITEM_NAMED: &str = "refusal.item_named";
 const REFUSAL_ITEM_UNNAMED: &str = "refusal.item_unnamed";
@@ -111,19 +113,61 @@ pub async fn approve(body: Result<Bytes, axum::extract::rejection::BytesRejectio
     }
 }
 
-pub async fn decline(body: Result<Bytes, axum::extract::rejection::BytesRejection>) -> Response {
-    match action_context(body) {
-        Ok(context) => Json(json!({
-            "state": DECLINED_REFUSED,
-            "requested_count": context.marks().len(),
-            "declined_count": 0,
-            "refused_count": context.marks().len(),
-            "unavailable_count": 0,
-            "unknown_count": 0,
-        }))
-        .into_response(),
-        Err((status, state)) => request_response(status, state),
+pub async fn decline(
+    State(journal_root): State<PathBuf>,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let context = match action_context(body) {
+        Ok(context) => context,
+        Err((status, state)) => return request_response(status, state),
+    };
+    let count = context.marks().len();
+    match tokio::task::spawn_blocking(move || decline_current(&journal_root, &context)).await {
+        Ok(response) => response,
+        Err(_) => Json(decline_payload(count, None)).into_response(),
     }
+}
+
+fn decline_current(journal_root: &Path, context: &ReviewContext) -> Response {
+    let count = context.marks().len();
+    let root = match JournalRoot::open(journal_root) {
+        Ok(root) => Arc::new(root),
+        Err(error) => {
+            let result = Err(BoundMutationRefusal::Review(ReviewRefusal::Root(error)));
+            return Json(decline_payload(count, Some(&result))).into_response();
+        }
+    };
+    let result = check_review_context(Arc::clone(&root), context)
+        .map_err(BoundMutationRefusal::Review)
+        .and_then(decline_reviewed);
+    // Keep the original root and whole mutation result through serialization.
+    Json(decline_payload(count, Some(&result))).into_response()
+}
+
+fn decline_payload(
+    count: usize,
+    result: Option<&Result<BoundMutationOutcome, BoundMutationRefusal>>,
+) -> Value {
+    let (state, declined_count, refused_count, unknown_count) = match result {
+        Some(Ok(BoundMutationOutcome::Published(result)))
+            if result.status == MutationStatus::Applied =>
+        {
+            (DECLINED_DONE, count, 0, 0)
+        }
+        None | Some(Ok(BoundMutationOutcome::PublishedUncertain { .. })) => {
+            (DECLINED_UNKNOWN, 0, 0, count)
+        }
+        Some(_) => (DECLINED_REFUSED, 0, count, 0),
+    };
+    json!({
+        "state": state,
+        "requested_count": count,
+        "declined_count": declined_count,
+        "refused_count": refused_count,
+        "unavailable_count": 0,
+        "unknown_count": unknown_count,
+        "mutation": result.map(solstone_core_backup_web::removal_report::mutation_facts),
+    })
 }
 
 fn action_context(
@@ -175,8 +219,8 @@ fn decode_review_request(body: &[u8]) -> Result<ReviewContext, &'static str> {
     {
         return Err(REQUEST_INVALID);
     }
-    // This is rendered transport only. Execution stays refused until the
-    // consuming retained executor and shared worker are available.
+    // Rendered transport grants no authority; each consuming action must
+    // freshly validate the selected full rows against its retained root.
     Ok(selected)
 }
 
@@ -466,33 +510,6 @@ fn error_state(error: &retention::ClientError) -> &'static str {
 }
 
 #[cfg(test)]
-fn decline_success(receipt: &Value) -> bool {
-    receipt.get("ok") == Some(&Value::Bool(true))
-        && receipt.get("verb") == Some(&Value::String("decline".to_owned()))
-        && receipt.get("marks").and_then(Value::as_object).is_some()
-}
-
-#[cfg(test)]
-fn decline_state(
-    declined_count: usize,
-    refused_count: usize,
-    unavailable_count: usize,
-    unknown_count: usize,
-) -> &'static str {
-    if unknown_count > 0 {
-        DECLINED_UNKNOWN
-    } else if declined_count == 0 && unavailable_count > 0 && refused_count == 0 {
-        TOOL_UNAVAILABLE
-    } else if declined_count > 0 && (refused_count > 0 || unavailable_count > 0) {
-        DECLINED_PARTIAL
-    } else if declined_count > 0 {
-        DECLINED_DONE
-    } else {
-        DECLINED_REFUSED
-    }
-}
-
-#[cfg(test)]
 fn has_exact_keys<const N: usize>(value: &Value, expected: [&str; N]) -> bool {
     let Some(object) = value.as_object() else {
         return false;
@@ -549,13 +566,12 @@ mod tests {
 
     use super::{
         APPROVE_DELETED, APPROVE_HALTED, APPROVE_PARTIAL, APPROVE_REFUSED_AFTER_START,
-        APPROVE_REFUSED_BEFORE_START, ClientCall, DECLINED_DONE, DECLINED_PARTIAL,
-        DECLINED_REFUSED, DECLINED_UNKNOWN, LIST_REGISTER_UNAVAILABLE, OUTCOME_UNKNOWN,
-        RECOVER_DONE, RECOVER_FAILED, RECOVER_NONE, REFUSAL_ITEM_NAMED, REFUSAL_ITEM_UNNAMED,
-        REQUEST_INVALID, TOOL_UNAVAILABLE, decline_state, decline_success, error_state,
-        marks_store_refusal, project_mark, recover_empty, recover_from_call, recover_outcome,
-        recover_unavailable, recover_unknown, refusal_item, removal_outcome,
-        remove_preflight_refusal,
+        APPROVE_REFUSED_BEFORE_START, ClientCall, DECLINED_DONE, DECLINED_REFUSED,
+        DECLINED_UNKNOWN, LIST_REGISTER_UNAVAILABLE, OUTCOME_UNKNOWN, RECOVER_DONE, RECOVER_FAILED,
+        RECOVER_NONE, REFUSAL_ITEM_NAMED, REFUSAL_ITEM_UNNAMED, REQUEST_INVALID, TOOL_UNAVAILABLE,
+        decline_payload, error_state, marks_store_refusal, project_mark, recover_empty,
+        recover_from_call, recover_outcome, recover_unavailable, recover_unknown, refusal_item,
+        removal_outcome, remove_preflight_refusal,
     };
 
     fn receipt(removed: &[&str], entries: &[&str], halted: bool) -> Value {
@@ -625,9 +641,6 @@ mod tests {
         assert!(!remove_preflight_refusal(
             &json!({"ok": false, "verb": "remove-marked", "error": "e", "outcome": {}})
         ));
-        assert!(decline_success(
-            &json!({"ok": true, "verb": "decline", "marks": {}})
-        ));
     }
 
     #[test]
@@ -662,12 +675,94 @@ mod tests {
     }
 
     #[test]
-    fn sequential_decline_aggregation_keeps_unknown_dominant() {
-        assert_eq!(decline_state(2, 0, 0, 0), DECLINED_DONE);
-        assert_eq!(decline_state(1, 1, 0, 0), DECLINED_PARTIAL);
-        assert_eq!(decline_state(0, 2, 0, 0), DECLINED_REFUSED);
-        assert_eq!(decline_state(0, 0, 1, 0), TOOL_UNAVAILABLE);
-        assert_eq!(decline_state(1, 0, 0, 1), DECLINED_UNKNOWN);
+    fn retained_decline_projects_confirmed_uncertain_and_refused_mutations() {
+        use solstone_core_journal_io::ExistingParentLockError;
+        use solstone_core_retention::mark_mutation::{
+            BoundMutationOutcome, BoundMutationRefusal, ConditionalResult, MutationStatus,
+            RegisterUncertainty,
+        };
+        use solstone_core_retention::marks::Register;
+        use solstone_core_retention::review_context::ReviewRefusal;
+        use std::io;
+
+        let result = || ConditionalResult {
+            status: MutationStatus::Applied,
+            register: Register::empty(),
+        };
+        let confirmed = Ok(BoundMutationOutcome::Published(result()));
+        let payload = decline_payload(2, Some(&confirmed));
+        assert_eq!(payload["state"], DECLINED_DONE);
+        assert_eq!(payload["declined_count"], 2);
+        assert_eq!(payload["unknown_count"], 0);
+        assert_eq!(payload["mutation"]["publication"], "published");
+
+        let uncertain = Ok(BoundMutationOutcome::PublishedUncertain {
+            candidate: result(),
+            uncertainty: RegisterUncertainty {
+                durability: Some(io::Error::other("private durability path")),
+                observation: Some(io::Error::other("private observation path")),
+                bindings: vec![ReviewRefusal::RootChanged],
+                lock: Some(ExistingParentLockError::NamespaceChanged {
+                    path: PathBuf::from("private lock path"),
+                }),
+            },
+        });
+        let payload = decline_payload(2, Some(&uncertain));
+        assert_eq!(payload["state"], DECLINED_UNKNOWN);
+        assert_eq!(payload["declined_count"], 0);
+        assert_eq!(payload["refused_count"], 0);
+        assert_eq!(payload["unknown_count"], 2);
+        let mutation = &payload["mutation"];
+        assert_eq!(mutation["publication"], "published_uncertain");
+        assert_eq!(mutation["status"], "applied");
+        assert_eq!(mutation["durability_error"], "other error");
+        assert_eq!(mutation["observation_error"], "other error");
+        assert_eq!(mutation["binding_errors"], json!(["root_changed"]));
+        assert_eq!(mutation["lock_error"]["kind"], "namespace_changed");
+        assert!(!payload.to_string().contains("private"));
+
+        let unchanged = Ok(BoundMutationOutcome::Unchanged(ConditionalResult {
+            status: MutationStatus::AlreadyApplied,
+            register: Register::empty(),
+        }));
+        let payload = decline_payload(2, Some(&unchanged));
+        assert_eq!(payload["state"], DECLINED_REFUSED);
+        assert_eq!(payload["declined_count"], 0);
+        assert_eq!(payload["refused_count"], 2);
+        assert_eq!(payload["mutation"]["publication"], "unchanged");
+        assert_eq!(payload["mutation"]["status"], "already_applied");
+
+        let refused = Err(BoundMutationRefusal::Unsupported);
+        let payload = decline_payload(2, Some(&refused));
+        assert_eq!(payload["state"], DECLINED_REFUSED);
+        assert_eq!(payload["mutation"]["error"]["kind"], "unsupported");
+
+        #[cfg(unix)]
+        {
+            let refused = Err(BoundMutationRefusal::Write(
+                solstone_core_journal_io::atomic::DetailedAtomicError {
+                    path: PathBuf::from("private destination"),
+                    operation: "rename",
+                    source: io::Error::other("private error"),
+                    orphan_stage: Some("private stage".into()),
+                    cleanup_error: Some(io::Error::other("private cleanup")),
+                },
+            ));
+            let payload = decline_payload(2, Some(&refused));
+            assert_eq!(payload["state"], DECLINED_REFUSED);
+            assert_eq!(payload["mutation"]["error"]["kind"], "write");
+            assert_eq!(payload["mutation"]["error"]["detail"]["orphan_stage"], true);
+            assert_eq!(
+                payload["mutation"]["error"]["detail"]["cleanup_error"],
+                "other error"
+            );
+            assert!(!payload.to_string().contains("private"));
+        }
+        let payload = decline_payload(2, None);
+        assert_eq!(payload["state"], DECLINED_UNKNOWN);
+        assert_eq!(payload["unknown_count"], 2);
+        assert_eq!(payload["declined_count"], 0);
+        assert!(payload["mutation"].is_null());
     }
 
     #[test]

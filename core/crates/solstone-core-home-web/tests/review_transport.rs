@@ -220,16 +220,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actions_refuse_valid_context_and_legacy_ids_without_any_file_effects() {
+    async fn approval_stays_held_and_legacy_action_ids_refuse_without_file_effects() {
         let root = journal();
         let row = mark(root.path(), "a.flac", false);
         let before = save(root.path(), std::slice::from_ref(&row));
         let config = fs::read(root.path().join("config/journal.json")).unwrap();
         let context = list(root.path()).await["review_context"].clone();
-        for (endpoint, state) in [
-            ("/app/home/api/approve", "approve.refused_before_start"),
-            ("/app/home/api/decline", "declined.refused"),
-        ] {
+        for (endpoint, state) in [("/app/home/api/approve", "approve.refused_before_start")] {
             let (status, response) = call(
                 root.path(),
                 "POST",
@@ -256,6 +253,15 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(response["state"], "request.invalid");
         }
+        let (status, response) = call(
+            root.path(),
+            "POST",
+            "/app/home/api/decline",
+            json!({"mark_ids": [row.id]}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["state"], "request.invalid");
         assert_eq!(
             fs::read(root.path().join("health/retention-marks.json")).unwrap(),
             before
@@ -275,6 +281,180 @@ mod tests {
                 .exists()
         );
         assert!(!root.path().join("config/actions").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_decline_removes_mixed_selected_rows_and_keeps_failed_unselected_row() {
+        let root = journal();
+        let policy = mark(root.path(), "policy.flac", false);
+        let typed = mark(root.path(), "typed.flac", true);
+        let mut failed = mark(root.path(), "failed.flac", false);
+        failed.state = MarkState::Failed(Failure {
+            at: "now".into(),
+            reason: "unfinished".into(),
+            staged: None,
+        });
+        save(
+            root.path(),
+            &[policy.clone(), typed.clone(), failed.clone()],
+        );
+        let config = fs::read(root.path().join("config/journal.json")).unwrap();
+        let context = list(root.path()).await["review_context"].clone();
+        let body =
+            json!({"review_context": context, "mark_ids": [policy.id, typed.id]}).to_string();
+        let (status, response) =
+            call(root.path(), "POST", "/app/home/api/decline", body.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["state"], "declined.done");
+        assert_eq!(response["requested_count"], 2);
+        assert_eq!(response["declined_count"], 2);
+        assert_eq!(response["refused_count"], 0);
+        assert_eq!(response["unknown_count"], 0);
+        assert_eq!(response["mutation"]["publication"], "published");
+        assert_eq!(response["mutation"]["status"], "applied");
+        let after = fs::read(root.path().join("health/retention-marks.json")).unwrap();
+        let register: Register = serde_json::from_slice(&after).unwrap();
+        assert_eq!(register.version, 2);
+        assert_eq!(register.marks.len(), 1);
+        assert_eq!(register.marks.get(&failed.id), Some(&failed));
+        let (status, response) = call(root.path(), "POST", "/app/home/api/decline", body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["state"], "declined.refused");
+        assert_eq!(response["mutation"]["error"]["reason"], "missing");
+        assert_eq!(
+            fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+            after
+        );
+        assert_eq!(
+            fs::read(root.path().join("config/journal.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read(root.path().join("chronicle/raw.flac")).unwrap(),
+            b"original bytes"
+        );
+        assert!(!root.path().join("config/actions").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_decline_refuses_whole_drifted_batch_and_copied_root_contexts() {
+        for reoffer in [false, true] {
+            let root = journal();
+            let first = mark(root.path(), "first.flac", false);
+            let mut second = mark(root.path(), "second.flac", true);
+            save(root.path(), &[first.clone(), second.clone()]);
+            let context = list(root.path()).await["review_context"].clone();
+            if reoffer {
+                let previous = second.offload.as_ref().unwrap();
+                let replacement = OffloadOffer::new(previous.proof.clone()).unwrap();
+                assert_ne!(previous.nonce, replacement.nonce);
+                assert_ne!(previous.revision, replacement.revision);
+                second.offload = Some(replacement);
+            } else {
+                second.proposal.reason = "changed proposal".into();
+            }
+            let before = save(root.path(), &[first.clone(), second.clone()]);
+            let (_, response) = call(
+                root.path(),
+                "POST",
+                "/app/home/api/decline",
+                json!({"review_context": context, "mark_ids": [first.id, second.id]}).to_string(),
+            )
+            .await;
+            assert_eq!(response["state"], "declined.refused");
+            assert_eq!(response["declined_count"], 0);
+            assert_eq!(response["refused_count"], 2);
+            assert_eq!(response["mutation"]["error"]["reason"], "stale");
+            assert_eq!(
+                fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+                before
+            );
+            assert!(
+                !root
+                    .path()
+                    .join("health/retention-marks.json.lock")
+                    .exists()
+            );
+        }
+        for bound in [false, true] {
+            let original = journal();
+            let copied = journal();
+            let row = mark(original.path(), "copied.flac", bound);
+            let before = save(original.path(), std::slice::from_ref(&row));
+            save(copied.path(), std::slice::from_ref(&row));
+            let context = list(original.path()).await["review_context"].clone();
+            let (_, response) = call(
+                copied.path(),
+                "POST",
+                "/app/home/api/decline",
+                json!({"review_context": context, "mark_ids": [row.id]}).to_string(),
+            )
+            .await;
+            assert_eq!(response["state"], "declined.refused");
+            assert_eq!(response["declined_count"], 0);
+            assert_eq!(response["mutation"]["error"]["reason"], "root_changed");
+            assert_eq!(
+                fs::read(copied.path().join("health/retention-marks.json")).unwrap(),
+                before
+            );
+            assert!(
+                !copied
+                    .path()
+                    .join("health/retention-marks.json.lock")
+                    .exists()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_decline_preserves_outer_session_gate() {
+        for (config, expected_status) in [
+            (b"{}".as_slice(), StatusCode::FOUND),
+            (b"{".as_slice(), StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let root = journal();
+            let row = mark(root.path(), "gated.flac", false);
+            let before = save(root.path(), std::slice::from_ref(&row));
+            let context = list(root.path()).await["review_context"].clone();
+            fs::write(root.path().join("config/journal.json"), config).unwrap();
+            let response = solstone_core_convey_shell::router(root.path().to_path_buf())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/app/home/api/decline")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"review_context": context, "mark_ids": [row.id]}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            if expected_status == StatusCode::FOUND {
+                assert_eq!(response.headers().get("location").unwrap(), "/init");
+            }
+            assert_eq!(
+                fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+                before
+            );
+            assert_eq!(
+                fs::read(root.path().join("config/journal.json")).unwrap(),
+                config
+            );
+            assert_eq!(
+                fs::read(root.path().join("chronicle/raw.flac")).unwrap(),
+                b"original bytes"
+            );
+            assert!(
+                !root
+                    .path()
+                    .join("health/retention-marks.json.lock")
+                    .exists()
+            );
+        }
     }
 
     #[tokio::test]

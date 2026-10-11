@@ -494,7 +494,9 @@ fn publication_facts(publication: &solstone_core_journal_io::atomic::BoundAtomic
     json!({"effect":"published", "durability_error":durability, "observation_error":observation})
 }
 
-fn mutation_facts(result: &Result<BoundMutationOutcome, BoundMutationRefusal>) -> Value {
+/// Project actual register publication and independent uncertainty/refusal facts.
+/// The caller retains the whole result through response serialization.
+pub fn mutation_facts(result: &Result<BoundMutationOutcome, BoundMutationRefusal>) -> Value {
     match result {
         Err(error) => json!({"publication":"refused", "error":mutation_error(error)}),
         Ok(BoundMutationOutcome::Unchanged(result)) => {
