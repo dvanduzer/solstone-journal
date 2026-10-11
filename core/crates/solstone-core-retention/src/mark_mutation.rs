@@ -346,6 +346,66 @@ fn begin_bound_optional(
     Ok((lock, register))
 }
 
+/// Withdraw only the strict subsets minted by retained kept-empty inspection.
+#[cfg(unix)]
+pub(crate) fn reconcile_empty_observed(
+    observation: &crate::archive_offer::reconciliation::unix::ReconciliationObservation<'_, '_>,
+) -> Result<
+    (
+        BoundMutationOutcome,
+        Option<crate::archive_offer::OffloadOfferRefusal>,
+    ),
+    crate::archive_offer::reconciliation::unix::ReconciliationWriteRefusal,
+> {
+    use crate::archive_offer::reconciliation::unix::ReconciliationWriteRefusal;
+    let root = observation.journal_root();
+    observation
+        .revalidate()
+        .map_err(ReconciliationWriteRefusal::Observation)?;
+    let health = open_health(root, OsStr::new("health"), root.canonical_path())
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Read(error)))?
+        .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
+    let (lock, mut register) = begin_bound_read(root, &health)?;
+    observation
+        .revalidate()
+        .map_err(ReconciliationWriteRefusal::Observation)?;
+    for expected in observation.expected() {
+        if register.marks.get(&expected.id) != Some(expected) {
+            return Err(BoundMutationRefusal::Review(ReviewRefusal::Stale {
+                id: expected.id.clone(),
+            })
+            .into());
+        }
+    }
+    if observation.plans().is_empty() {
+        return Err(BoundMutationRefusal::Review(ReviewRefusal::Empty).into());
+    }
+    for plan in observation.plans() {
+        let status = apply(&mut register, plan)
+            .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+        if status != MutationStatus::Applied {
+            return Err(BoundMutationRefusal::Review(ReviewRefusal::Stale {
+                id: plan.expected().id.clone(),
+            })
+            .into());
+        }
+    }
+    observation
+        .revalidate()
+        .map_err(ReconciliationWriteRefusal::Observation)?;
+    let outcome = publish_bound(
+        root,
+        &health,
+        &lock,
+        ConditionalResult {
+            status: MutationStatus::Applied,
+            register,
+        },
+    )?;
+    let changed = observation.revalidate().err();
+    Ok((outcome, changed))
+}
+
 /// Private final publication phase after owning archive verification. No WAN
 /// or bookkeeping runs while this retained register exclusion is held.
 #[cfg(unix)]

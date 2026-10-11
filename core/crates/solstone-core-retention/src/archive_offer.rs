@@ -22,6 +22,12 @@ use crate::marks::Mark;
 use crate::marks::{MarkId, RemovalClass};
 use crate::receipt::Target;
 
+pub(crate) mod reconciliation;
+pub use reconciliation::{
+    OffloadReconciliation, OffloadReconciliationDisposition, OffloadReconciliationFailure,
+    OffloadReconciliationGroup, OffloadReconciliationStop, reconcile_offload_empty,
+};
+
 /// Requested coordinates only; the owning capture independently reads them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OffloadOfferSelection {
@@ -1080,14 +1086,14 @@ mod tests {
         }
     }
 
-    fn time() -> (NaiveDate, DateTime<Utc>) {
+    pub(super) fn time() -> (NaiveDate, DateTime<Utc>) {
         (
             NaiveDate::from_ymd_opt(2026, 10, 10).unwrap(),
             Utc.with_ymd_and_hms(2026, 10, 10, 0, 0, 0).unwrap(),
         )
     }
 
-    fn fixture() -> (tempfile::TempDir, Arc<JournalRoot>) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Arc<JournalRoot>) {
         let journal = tempfile::tempdir().unwrap();
         fs::create_dir(journal.path().join("config")).unwrap();
         fs::write(journal.path().join("config/journal.json"), b"{}").unwrap();
@@ -1095,7 +1101,7 @@ mod tests {
         (journal, root)
     }
 
-    fn operation(root: &Arc<JournalRoot>) -> PreparedArchiveOperation<'static> {
+    pub(super) fn operation(root: &Arc<JournalRoot>) -> PreparedArchiveOperation<'static> {
         PreparedArchiveOperation::prepare(
             Arc::clone(root),
             ArchiveBudget::new(&FixedClock).unwrap(),
@@ -1104,7 +1110,7 @@ mod tests {
         .unwrap()
     }
 
-    fn selection(layout: SegmentLayout, names: &[&str]) -> OffloadOfferSelection {
+    pub(super) fn selection(layout: SegmentLayout, names: &[&str]) -> OffloadOfferSelection {
         OffloadOfferSelection {
             target: Target {
                 day: "20261009".into(),
@@ -1119,7 +1125,12 @@ mod tests {
         }
     }
 
-    fn seed(root: &JournalRoot, selection: &OffloadOfferSelection, name: &str, state: &str) {
+    pub(super) fn seed(
+        root: &JournalRoot,
+        selection: &OffloadOfferSelection,
+        name: &str,
+        state: &str,
+    ) {
         let directory = root.canonical_path().join(selection_path(selection));
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(name), b"current").unwrap();
@@ -1140,7 +1151,7 @@ mod tests {
         .unwrap();
     }
 
-    fn capture(
+    pub(super) fn capture(
         operation: &PreparedArchiveOperation<'_>,
         selections: &[OffloadOfferSelection],
     ) -> Result<ObservedOffloadOffers, OffloadOfferRefusal> {
@@ -1148,7 +1159,7 @@ mod tests {
         capture_offload_offers(operation, selections, today, now)
     }
 
-    fn proof(observed: &ObservedOffloadOffers) -> OffloadProof {
+    pub(super) fn proof(observed: &ObservedOffloadOffers) -> OffloadProof {
         let group = &observed.groups()[0];
         OffloadProof {
             journal_id: observed.journal_root().identity().observation_id(),
@@ -1534,3 +1545,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "full-tests", unix))]
+#[path = "archive_offer/reconciliation_tests.rs"]
+mod reconciliation_tests;

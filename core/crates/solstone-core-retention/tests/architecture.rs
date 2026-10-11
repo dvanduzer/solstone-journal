@@ -70,6 +70,11 @@ const SOURCES: &[(&str, &str)] = &[
 
 const LIB: &str = include_str!("../src/lib.rs");
 
+const CHILD_SOURCES: &[(&str, &str)] = &[(
+    "archive_offer/reconciliation",
+    include_str!("../src/archive_offer/reconciliation.rs"),
+)];
+
 /// Primitives that remove or rename a directory entry.
 ///
 /// ⚠ Matched in **call-shaped** form, not as bare words. A bare `"rename"` also
@@ -156,7 +161,7 @@ fn the_scan_covers_every_declared_module() {
 
 #[test]
 fn no_module_names_a_removal_primitive() {
-    for (name, source) in SOURCES {
+    for (name, source) in SOURCES.iter().chain(CHILD_SOURCES) {
         if *name == DOOR {
             continue;
         }
@@ -217,7 +222,11 @@ fn target_remains_unkeyable() {
 
 #[test]
 fn no_module_silences_must_use() {
-    for (name, source) in SOURCES.iter().chain(std::iter::once(&("lib", LIB))) {
+    for (name, source) in SOURCES
+        .iter()
+        .chain(CHILD_SOURCES)
+        .chain(std::iter::once(&("lib", LIB)))
+    {
         for bypass in MUST_USE_BYPASSES {
             assert!(
                 !source.contains(bypass),
@@ -274,7 +283,11 @@ fn code_only(source: &str) -> String {
 #[test]
 fn no_module_builds_a_chronicle_path_by_hand() {
     let mut scanned = 0usize;
-    for (name, source) in SOURCES.iter().chain(std::iter::once(&("lib", LIB))) {
+    for (name, source) in SOURCES
+        .iter()
+        .chain(CHILD_SOURCES)
+        .chain(std::iter::once(&("lib", LIB)))
+    {
         if *name == LAYOUT {
             continue;
         }
@@ -293,7 +306,11 @@ fn no_module_builds_a_chronicle_path_by_hand() {
 #[test]
 fn no_module_reads_the_clock() {
     let mut scanned = 0usize;
-    for (name, source) in SOURCES.iter().chain(std::iter::once(&("lib", LIB))) {
+    for (name, source) in SOURCES
+        .iter()
+        .chain(CHILD_SOURCES)
+        .chain(std::iter::once(&("lib", LIB)))
+    {
         scanned = scanned.saturating_add(1);
         for read in CLOCK_READS {
             assert!(
