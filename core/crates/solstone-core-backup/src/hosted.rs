@@ -99,7 +99,7 @@ fn binding_lock_options() -> LockOptions {
 
 #[cfg(all(test, feature = "full-tests"))]
 thread_local! {
-    static BINDING_LOCK_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+    pub(crate) static BINDING_LOCK_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
 }
 
 fn non_blank(raw: &Map<String, Value>, key: &str) -> Option<String> {

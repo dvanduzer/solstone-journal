@@ -38,9 +38,24 @@ pub struct TeardownConfiguration {
     directory: Arc<solstone_core_journal_io::media::MediaDirectory>,
     #[cfg(unix)]
     binding_observation: Option<unix::BindingObservation>,
+    #[cfg(unix)]
+    expected_clear_sha256: Option<String>,
 }
 
+#[cfg(unix)]
+pub use unix::binding::{BindingFinalization, BindingFinalizationRefusal, BindingRemovalReceipt};
+
 impl TeardownConfiguration {
+    /// Retain both original-parent locks after this exact clear has been confirmed.
+    /// The returned value supplies local observations, not remote settlement authority.
+    #[cfg(unix)]
+    pub fn begin_binding_finalization(
+        &self,
+        publication: &BoundConfigPublication,
+    ) -> Result<BindingFinalization, BindingFinalizationRefusal> {
+        unix::binding::begin(self, publication)
+    }
+
     /// Capture existing state only; never creates parents or materializes defaults.
     pub fn capture(root: &Arc<JournalRoot>) -> Result<Self, TeardownConfigurationRefusal> {
         #[cfg(unix)]
@@ -136,6 +151,8 @@ mod unix {
     use super::*;
     use TeardownConfigurationRefusal as Refusal;
 
+    pub(super) mod binding;
+
     const MAX_BINDING_BYTES: usize = 1024 * 1024;
 
     pub(super) struct BindingObservation {
@@ -165,6 +182,7 @@ mod unix {
         let keys = crate::state::build_keys(backup.get("daily_key"), backup.get("recovery_key"))
             .map_err(|_| Refusal::KeysUnavailable)?;
         let destination = crate::state::destination_from_config(&backup);
+        let expected_clear_sha256 = expected_clear_fingerprint(&raw, &backup);
         let (binding, binding_observation) =
             if backup.get("mode").and_then(Value::as_str) == Some("operated") {
                 let parent = MediaDirectory::open(root.clone(), Path::new(""))
@@ -193,6 +211,7 @@ mod unix {
             root,
             directory,
             binding_observation,
+            expected_clear_sha256,
         };
         revalidate(&captured)?;
         Ok(captured)
@@ -204,6 +223,36 @@ mod unix {
             .map_err(|_| Refusal::BindingUnavailable)?
             .filter(|read| read.complete)
             .ok_or(Refusal::BindingUnavailable)
+    }
+
+    fn expected_clear_fingerprint(
+        raw: &Map<String, Value>,
+        backup: &Map<String, Value>,
+    ) -> Option<String> {
+        use std::io::Write;
+        struct Candidate(Vec<u8>);
+        impl Write for Candidate {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self
+                    .0
+                    .len()
+                    .checked_add(bytes.len())
+                    .is_none_or(|size| size > MAX_BOUND_CONFIG_BYTES)
+                {
+                    return Err(std::io::Error::other("clear candidate exceeds byte limit"));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let clear = crate::state::cleared_backup_configuration(raw, backup)?;
+        let mut candidate = Candidate(Vec::new());
+        serde_json::to_writer_pretty(&mut candidate, &clear).ok()?;
+        candidate.write_all(b"\n").ok()?;
+        Some(solstone_core_journal_config::fingerprint_journal_config_bytes(&candidate.0))
     }
 
     pub(super) fn revalidate(captured: &TeardownConfiguration) -> Result<(), Refusal> {
