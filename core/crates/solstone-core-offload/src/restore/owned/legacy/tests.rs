@@ -544,14 +544,13 @@ fn packaged_combined_restore_entry() {
             // Nothing is published and no provenance is recorded for a refused manifest.
             assert_eq!((bindings, recorded), (0, 0));
             assert_eq!(report.files_restored, 0);
-            let expected: &[&str] = if input.mode == "combined_tombstone" {
-                &["destination_admission_failed"]
+            let expected = if input.mode == "combined_tombstone" {
+                "destination_admission_failed"
             } else {
-                &["legacy_verification_failed", "legacy_read_failed"]
+                "legacy_verification_failed"
             };
             assert!(files.iter().all(|(_, disposition, reason)| {
-                *disposition == RestoreDisposition::Unattempted
-                    && reason.is_some_and(|reason| expected.contains(&reason))
+                *disposition == RestoreDisposition::Unattempted && *reason == Some(expected)
             }));
             assert_eq!(listing(&segment), before);
             // A refused manifest leaves no scratch copy and does not hold the read.
@@ -561,13 +560,31 @@ fn packaged_combined_restore_entry() {
                     .files()
                     .all(|file| !matches!(file.evidence, FileEvidence::LegacyReview(_)))
             );
-            let (settled, _) = outcome
-                .settle_direct()
-                .unwrap_or_else(|_| panic!("refused manifest held the restore"));
-            assert_eq!(
-                finish.finish_owned(settled).state(),
-                DirectReadFinishState::Completed
-            );
+            if input.mode == "combined_tombstone" {
+                // Nothing was read, so the read settles normally.
+                let (settled, _) = outcome
+                    .settle_direct()
+                    .unwrap_or_else(|_| panic!("refused manifest held the restore"));
+                assert_eq!(
+                    finish.finish_owned(settled).state(),
+                    DirectReadFinishState::Completed
+                );
+            } else {
+                // A completed read that didn't match never settles as success:
+                // with its probe removed and its child reaped, the read is
+                // released as refused and nothing of the operation remains.
+                let held = match outcome.settle_direct() {
+                    Ok(_) => panic!("a mismatched read settled as success"),
+                    Err(held) => held,
+                };
+                let (read, released) = held
+                    .release_refused()
+                    .unwrap_or_else(|_| panic!("refused manifest held the restore"));
+                assert_eq!(released.report().files_restored, 0);
+                let runtime = finish.finish_refused(read);
+                assert_ne!(runtime.state(), DirectReadFinishState::Completed);
+                assert!(runtime.released());
+            }
             assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
             assert_eq!(fs::read(&mark_path).unwrap(), original_mark);
         }
