@@ -102,12 +102,12 @@ mod native {
 
     use solstone_core_journal_io::{FlatDirectory, locking::acquire_existing_parent_lock_bound};
 
-    use super::super::super::{
-        Event, OffloadFile, RestoreDisposition, RestoreFileV2, append_offload_event,
-        read_complete_catalog,
-    };
     use super::super::unix::{self, Hooks, Point, SyncPoint};
     use super::*;
+    use crate::ledger::append_offload_event;
+    use solstone_core_retention::archive_catalog::{
+        OffloadFile, RestoreDisposition, RestoreFileV2, codec::Event, read_complete_catalog,
+    };
 
     fn archive_event(proof: &OffloadProof) -> Event {
         Event::ArchiveV2 {

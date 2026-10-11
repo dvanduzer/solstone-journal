@@ -20,7 +20,7 @@ use solstone_core_retention::archive_proof::{ArchiveFileProof, OffloadProof};
 use solstone_core_retention::mark_mutation::PlannedMarkMutation;
 use solstone_core_retention::{Mark, Register, RemovalClass, Target};
 
-use crate::ledger::{
+use solstone_core_retention::archive_catalog::{
     ArchiveWitness, RestoreDisposition, RestoreFileV2, RestoreOperation, SegmentCatalog,
 };
 
@@ -951,7 +951,7 @@ pub(crate) fn selected_name(intent: &RestoreIntent) -> &OsStr {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 pub(super) mod tests {
     use super::*;
-    use crate::ledger::{ArchiveManifest, OffloadFile};
+    use solstone_core_retention::archive_catalog::{ArchiveManifest, OffloadFile};
     use solstone_core_retention::archive_proof::{AcceptedProcessingObservation, OffloadOffer};
     use solstone_core_retention::{MarkId, MarkState, Proposal};
 

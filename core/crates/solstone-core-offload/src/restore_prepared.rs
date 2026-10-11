@@ -10,10 +10,9 @@ use std::sync::Arc;
 use solstone_core_journal_io::media::MediaDirectory;
 use solstone_core_journal_io::paths::Segment;
 use solstone_core_journal_io::{JournalRoot, LockOptions};
-use solstone_core_retention::marks;
+use solstone_core_retention::{archive_catalog::read_complete_catalog, marks};
 use solstone_core_segment::output_attempt::OutputClaims;
 
-use crate::ledger;
 use crate::restore_intent::{
     DestinationObservation, RecoveryDecision, RepairHold, RestoreIntent, RestoreLocator,
     content_observation, inspect_recovery, selected_name,
@@ -154,7 +153,7 @@ impl PreparedRestore {
         self.revalidate()?;
         // Consume the owning fresh complete catalog, including degradation that
         // would otherwise disappear when selection is absent.
-        let catalog = ledger::read_complete_catalog(&self.root)
+        let catalog = read_complete_catalog(&self.root)
             .map_err(|e| refused(RepairHold::DegradedCatalog, e))?;
         let selected = catalog
             .days
@@ -184,6 +183,7 @@ impl PreparedRestore {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::ledger;
     use crate::restore_intent::tests::{fixture, register};
     use crate::restore_intent::{AttemptEffects, PublicationDecision};
     use sha2::{Digest, Sha256};

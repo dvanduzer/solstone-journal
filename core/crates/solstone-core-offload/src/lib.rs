@@ -18,7 +18,7 @@ pub mod run;
 pub mod status;
 
 pub use ledger::{
-    OffloadFile, append_offload_event, append_restore_event, ledger_path_for_day, summarize_day,
+    append_offload_event, append_restore_event, ledger_path_for_day, summarize_day,
     summarize_journal, summarize_segment,
 };
 pub use marks::OffloadMarkIndex;

@@ -43,3 +43,6 @@ solstone-core-generate.workspace = true
 # rather than on a mock of both sides.
 serde_json = { workspace = true }
 tempfile = "3.24.0"
+
+[features]
+full-tests = []
