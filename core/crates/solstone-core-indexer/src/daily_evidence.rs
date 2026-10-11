@@ -31,6 +31,7 @@ const OUTPUTS: &[&str] = &[
     "_entities_entity_suggest",
     "_entities_entity_observer",
     "pulse",
+    "topics",
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1534,5 +1535,43 @@ mod tests {
         }
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn topics_md_in_talents_excluded_from_daily_evidence_projection_and_revision() {
+        let root = root("topics-md-excluded");
+        write(
+            &root,
+            "chronicle/20260910/mic/090000_60/talents/sense.md",
+            "# Sense\n\nOriginal sense narrative.",
+        );
+        let rev_before = revision(&root, "schedule", None);
+        let proj_before = capture_day_projection(&root, "20260910").expect("capture before");
+        assert!(
+            !proj_before.chunks.is_empty(),
+            "projection should include sense.md chunk"
+        );
+
+        write(
+            &root,
+            "chronicle/20260910/mic/090000_60/talents/topics.md",
+            "## Topics\n- testing\n\n## Quotes\n- none\n",
+        );
+        let rev_after = revision(&root, "schedule", None);
+        let proj_after = capture_day_projection(&root, "20260910").expect("capture after");
+
+        assert_eq!(rev_before, rev_after);
+        assert_eq!(proj_before.chunks, proj_after.chunks);
+        assert_eq!(proj_before.sources, proj_after.sources);
+
+        write(
+            &root,
+            "chronicle/20260910/mic/090000_60/talents/sense.md",
+            "# Sense\n\nUpdated sense narrative.",
+        );
+        let rev_changed = revision(&root, "schedule", None);
+        assert_ne!(rev_before, rev_changed);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

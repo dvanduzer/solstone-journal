@@ -396,13 +396,22 @@ impl<'a> ReadOperation<'a> {
                 pass_fds: vec![],
             },
             Some(MAX_QUERY_BYTES),
+            self.budget.cancellation(),
         )
-        .map_err(|_| ReadbackError::ToolFailed)?;
+        .map_err(|_| self.execution_error())?;
         self.revalidate_local()?;
         if !output.successful() {
             return Err(ReadbackError::ToolFailed);
         }
         Ok(output)
+    }
+
+    #[cfg(unix)]
+    fn execution_error(&self) -> ReadbackError {
+        match self.budget.remaining(self.clock) {
+            Err(error) => error.into(),
+            Ok(_) => ReadbackError::ToolFailed,
+        }
     }
 
     #[cfg(unix)]
@@ -500,8 +509,13 @@ impl<'a> ReadOperation<'a> {
                     pass_fds: vec![transport.descriptor],
                 };
                 writer = WriterState::Unknown;
-                let completed = bounded_child::run_owned(&request, Some(MAX_QUERY_BYTES))
-                    .map_err(|_| ReadbackError::ToolFailed)?;
+                let completed = bounded_child::run_owned(
+                    &request,
+                    Some(MAX_QUERY_BYTES),
+                    self.budget.cancellation(),
+                )
+                .map_err(|_| self.execution_error())?;
+                self.budget.remaining(self.clock)?;
                 if !completed.successful() {
                     return Err(ReadbackError::ToolFailed);
                 }

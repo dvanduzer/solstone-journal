@@ -269,7 +269,8 @@ fn classify_tool_resolution(args: &[String]) -> Option<bool> {
                         Some(true)
                     }
                 }
-                "restore" => Some(false),
+                // The owning interim restore path is read-only and launches no helper.
+                "restore" => None,
                 _ => None,
             }
         }
@@ -1300,16 +1301,18 @@ fn restore_failure_reason(reason: &str) -> String {
 /// Offload restore brings back raw media that was previously archived off
 /// this device — a different operation from [`restore_failure_reason`]'s
 /// whole-journal restore, with its own closed vocabulary
-/// (`solstone_core_offload::restore::OFFLOAD_RESTORE_REASONS`, 17 codes).
+/// (`solstone_core_offload::restore::OFFLOAD_RESTORE_REASONS`).
 /// Several codes share a name with `backup_failure_reason`'s or
 /// `restore_failure_reason`'s own arms (`locked`, `auth_failed`,
 /// `repo_missing`, `restic_unavailable`, `rclone_unavailable`, `timeout`,
 /// `failed`) because they trace back to the same restic return codes
 /// (`reason_for_returncode`) — routing through either of those maps blind
-/// would still miss the 10 codes unique to this operation, so this gets its
-/// own arm for every one of the 17.
+/// would still miss codes unique to this operation, so each has its own arm.
 fn offload_restore_failure_reason(reason: &str) -> String {
     match reason {
+        "archive_unbound" => {
+            "the backup record doesn't identify the archive needed to restore these files".into()
+        }
         "auth_failed" => "the destination rejected the credentials".into(),
         "backup_not_ready" => {
             "your backup isn't set up, so the offloaded files can't be fetched back".into()
@@ -1335,6 +1338,7 @@ fn offload_restore_failure_reason(reason: &str) -> String {
         "nothing_to_restore" => "there was nothing offloaded to restore".into(),
         "repo_missing" => "there's no backup at the destination yet".into(),
         "restic_unavailable" => "the restic backup program isn't available".into(),
+        "restore_held" => "restoring offloaded files is temporarily unavailable".into(),
         "rclone_unavailable" => "the rclone program isn't available".into(),
         "segment_identity" => "one of your journal's recordings couldn't be verified against \
              its own identity record"
@@ -1970,6 +1974,7 @@ mod tests {
     #[test]
     fn no_offload_restore_reason_code_reaches_the_owner_as_an_identifier() {
         const EVERY_REASON: &[&str] = &[
+            "archive_unbound",
             "auth_failed",
             "backup_not_ready",
             "destination_admission_failed",
@@ -1981,6 +1986,7 @@ mod tests {
             "nothing_to_restore",
             "repo_missing",
             "restic_unavailable",
+            "restore_held",
             "rclone_unavailable",
             "segment_identity",
             "segment_missing",
@@ -4673,23 +4679,55 @@ mod resolution_tests {
         assert_resolved_restic(&runner.programs.borrow(), &expected, &decoy);
     }
 
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
-    fn ac9_offload_restore_uses_pinned_restic() {
+    fn ac9_held_offload_restore_bypasses_tool_resolution_and_preserves_state() {
         let package_dir = tempfile::tempdir().unwrap();
-        let decoy_dir = tempfile::tempdir().unwrap();
-        let exe = build_fixture_tree(package_dir.path(), b"restic", b"rclone");
-        let expected = package_dir.path().join("lib/solstone-restic/restic");
-        let decoy = decoy_dir.path().join("restic");
-        fs::write(&decoy, b"decoy").unwrap();
+        let executable = package_dir.path().join("missing-package/bin/solstone-core");
         let journal = byo_journal();
         configure_offload(journal.path());
-        let restore = args(&["offload", "restore", "--all"]);
-        assert_eq!(classify_tool_resolution(&restore), Some(false));
+        solstone_core_offload::append_offload_event(
+            journal.path(),
+            "20260101",
+            "_default",
+            "010000_001",
+            "legacy-snapshot",
+            &[solstone_core_offload::OffloadFile {
+                name: "raw.webm".into(),
+                bytes: 3,
+                sha256: "a".repeat(64),
+            }],
+            1,
+        )
+        .unwrap();
+        let before = get_backup_config(journal.path()).unwrap();
+        let restore = args(&["offload", "restore", "--all", "--json"]);
+        assert_eq!(classify_tool_resolution(&restore), None);
+        assert_eq!(classify_tool_resolution(&args(&["prune"])), Some(false));
         let runner = RecordingRunner::new();
-        let tools = resolve_operational_tools(&runner, journal.path(), false, &exe)
-            .expect("offload restore resolves its pinned restic dependency");
-        assert_eq!(tools.restic_path, expected);
-        assert!(tools.rclone_path.is_none());
+        let output = run_cli_with_deps(
+            &restore,
+            journal.path(),
+            &runner,
+            &BrokerHttp::new(),
+            &executable,
+        );
+        let value: Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(output.exit_code, 1, "{output:?}");
+        assert_eq!(value["status"], "refused");
+        assert_eq!(value["reason"], "archive_unbound");
+        assert_eq!(value["bytes_restored"], 0);
+        assert!(runner.programs.borrow().is_empty());
+        assert_eq!(get_backup_config(journal.path()).unwrap(), before);
+        assert_eq!(
+            fs::read(
+                journal
+                    .path()
+                    .join("chronicle/20260101/010000_001/raw.webm")
+            )
+            .unwrap(),
+            b"one"
+        );
     }
 
     #[test]

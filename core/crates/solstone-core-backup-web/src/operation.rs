@@ -42,7 +42,6 @@ pub struct Slot {
     pub restore_key: Option<String>,
     pub started: Instant,
     pub generation: u64,
-    #[cfg(windows)]
     pub(crate) worker_active: bool,
     #[cfg(windows)]
     pub(crate) cleanup: Option<PendingCleanup>,
@@ -105,8 +104,11 @@ pub fn running_phase(kind: &str) -> &'static str {
 }
 
 fn hosted_wait_expired(slot: &Slot) -> bool {
+    if slot.worker_active {
+        return false;
+    }
     #[cfg(windows)]
-    if slot.worker_active || slot.cleanup.is_some() {
+    if slot.cleanup.is_some() {
         return false;
     }
     !is_terminal(&slot.view.phase)
@@ -177,7 +179,7 @@ pub(crate) fn observed_generation(
     Ok(observe(&mut guard).map(|current| current.view.clone()))
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub(crate) fn worker_or_cleanup_active(slot: &SharedOperationSlot, generation: u64) -> bool {
     let Ok(guard) = slot.try_lock() else {
         return true;
@@ -187,19 +189,22 @@ pub(crate) fn worker_or_cleanup_active(slot: &SharedOperationSlot, generation: u
     })
 }
 
-#[cfg(windows)]
 pub(crate) fn start_worker(slot: &SharedOperationSlot, generation: u64) -> bool {
+    #[cfg(windows)]
     let Ok(mut guard) = slot.try_lock() else {
         return false;
     };
+    #[cfg(not(windows))]
+    let mut guard = slot.lock().expect("operation slot lock");
     let Some(current) = guard.as_mut() else {
         return false;
     };
-    if current.generation != generation
-        || is_terminal(&current.view.phase)
-        || current.worker_active
-        || current.cleanup.is_some()
+    if current.generation != generation || is_terminal(&current.view.phase) || current.worker_active
     {
+        return false;
+    }
+    #[cfg(windows)]
+    if current.cleanup.is_some() {
         return false;
     }
     current.worker_active = true;
@@ -238,6 +243,19 @@ pub(crate) fn finish_worker(
     } else {
         apply_terminal(current, terminal);
     }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn finish_worker(slot: &SharedOperationSlot, generation: u64, terminal: Terminal) {
+    let mut guard = slot.lock().expect("operation slot lock");
+    let Some(current) = guard.as_mut() else {
+        return;
+    };
+    if current.generation != generation || !current.worker_active {
+        return;
+    }
+    current.worker_active = false;
+    apply_terminal(current, terminal);
 }
 
 #[cfg(any(not(windows), test))]
@@ -303,7 +321,6 @@ pub fn begin(
         restore_key,
         started: Instant::now(),
         generation,
-        #[cfg(windows)]
         worker_active: false,
         #[cfg(windows)]
         cleanup: None,
@@ -331,19 +348,23 @@ pub fn finish(
     );
 }
 
-fn finish_terminal(slot: &SharedOperationSlot, generation: u64, terminal: Terminal) {
+fn finish_terminal(slot: &SharedOperationSlot, generation: u64, terminal: Terminal) -> bool {
     let mut guard = slot.lock().expect("operation slot lock");
     let Some(current) = guard.as_mut() else {
-        return;
+        return false;
     };
     if current.generation != generation || is_terminal(&current.view.phase) {
-        return;
+        return false;
+    }
+    if current.worker_active {
+        return false;
     }
     #[cfg(windows)]
-    if current.worker_active || current.cleanup.is_some() {
-        return;
+    if current.cleanup.is_some() {
+        return false;
     }
     apply_terminal(current, terminal);
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,19 +431,46 @@ pub fn spawn_worker<F>(
     slot: SharedOperationSlot,
     generation: u64,
     work: F,
-) -> thread::JoinHandle<()>
+) -> Option<thread::JoinHandle<()>>
 where
     F: FnOnce() -> Terminal + Send + 'static,
 {
+    if !start_worker(&slot, generation) {
+        return None;
+    }
     // ToolRunner/HttpTransport are blocking std process/HTTP calls. axum already
     // owns the tokio runtime; a worker thread must not hold the slot lock across
     // restic/broker, and resolve_operational_tools runs here so POST returns before
     // restic install.
-    thread::spawn(move || {
+    let failed_spawn = slot.clone();
+    match spawn_thread(move || {
         let terminal = panic::catch_unwind(AssertUnwindSafe(work))
             .unwrap_or_else(|_| Terminal::error("failed"));
-        finish_terminal(&slot, generation, terminal);
-    })
+        finish_worker(&slot, generation, terminal);
+    }) {
+        Ok(handle) => Some(handle),
+        Err(_) => {
+            finish_worker(&failed_spawn, generation, Terminal::error("failed"));
+            None
+        }
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(not(windows))]
+thread_local! {
+    static FAIL_WORKER_START: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(not(windows))]
+fn spawn_thread(work: impl FnOnce() + Send + 'static) -> std::io::Result<thread::JoinHandle<()>> {
+    #[cfg(all(test, feature = "full-tests"))]
+    if FAIL_WORKER_START.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected backup worker creation failure",
+        ));
+    }
+    thread::Builder::new().spawn(work)
 }
 
 #[allow(dead_code)]
@@ -542,8 +590,8 @@ pub fn mark_prepare_lease_expired(slot: &SharedOperationSlot, generation: u64) {
     );
 }
 
-pub fn mark_cancelled(slot: &SharedOperationSlot, generation: u64) {
-    finish(slot, generation, "error", Some("cancelled".into()), None);
+pub fn mark_cancelled(slot: &SharedOperationSlot, generation: u64) -> bool {
+    finish_terminal(slot, generation, Terminal::error("cancelled"))
 }
 
 pub fn nonce_for_generation(slot: &SharedOperationSlot, generation: u64) -> Option<String> {
@@ -658,7 +706,7 @@ mod tests {
 mod terminal_tests {
     use super::*;
 
-    fn running_slot() -> SharedOperationSlot {
+    pub(super) fn running_slot() -> SharedOperationSlot {
         Arc::new(Mutex::new(Some(Slot {
             view: Operation {
                 kind: "restore_hosted".into(),
@@ -673,14 +721,13 @@ mod terminal_tests {
             restore_key: Some("test-key".into()),
             started: Instant::now(),
             generation: 2,
-            #[cfg(windows)]
             worker_active: false,
             #[cfg(windows)]
             cleanup: None,
         })))
     }
 
-    fn failure() -> Terminal {
+    pub(super) fn failure() -> Terminal {
         Terminal {
             phase: "degraded".into(),
             reason_code: Some("tool_failed".into()),
@@ -690,7 +737,7 @@ mod terminal_tests {
         }
     }
 
-    fn assert_failure(slot: &SharedOperationSlot) {
+    pub(super) fn assert_failure(slot: &SharedOperationSlot) {
         let guard = slot.lock().unwrap();
         let current = guard.as_ref().unwrap();
         assert_eq!(current.view.phase, "degraded");
@@ -754,7 +801,68 @@ mod terminal_tests {
         assert!(current.nonce.is_some() && current.restore_key.is_some());
     }
 
-    #[cfg(all(not(windows), feature = "full-tests"))]
+    #[test]
+    fn active_worker_refuses_other_terminal_transitions_until_actual_settlement() {
+        let slot = running_slot();
+        let original = slot.lock().unwrap().as_ref().unwrap().view.clone();
+        assert!(start_worker(&slot, 2));
+        assert!(!start_worker(&slot, 2));
+        assert!(!start_worker(&slot, 1));
+        slot.lock().unwrap().as_mut().unwrap().started =
+            Instant::now() - HANDOFF_TTL - Duration::from_secs(1);
+        assert!(!mark_cancelled(&slot, 2));
+        mark_expired(&slot, 2);
+        finish_terminal(&slot, 2, Terminal::done());
+        assert_eq!(current(&slot).unwrap(), original);
+        assert!(is_busy(&slot));
+        assert!(begin(&slot, "rotate", None, None, None).is_err());
+        settle(&slot, 1, Terminal::done());
+        assert!(slot.lock().unwrap().as_ref().unwrap().worker_active);
+        settle(&slot, 2, failure());
+        assert_failure(&slot);
+        assert!(!is_busy(&slot));
+
+        let next = begin(&slot, "restore", None, None, None)
+            .unwrap()
+            .generation;
+        assert!(start_worker(&slot, next));
+        let current_view = current(&slot).unwrap();
+        settle(&slot, 2, Terminal::error("stale"));
+        assert_eq!(current(&slot).unwrap(), current_view);
+        assert!(slot.lock().unwrap().as_ref().unwrap().worker_active);
+        settle(&slot, next, Terminal::done());
+    }
+
+    fn settle(slot: &SharedOperationSlot, generation: u64, terminal: Terminal) {
+        #[cfg(windows)]
+        finish_worker(slot, generation, terminal, Vec::new());
+        #[cfg(not(windows))]
+        finish_worker(slot, generation, terminal);
+    }
+
+    #[test]
+    fn cancellation_reports_only_an_applied_current_transition() {
+        let absent = new_slot();
+        assert!(!mark_cancelled(&absent, 2));
+        assert!(!start_worker(&absent, 2));
+        let slot = running_slot();
+        assert!(!mark_cancelled(&slot, 1));
+        assert!(mark_cancelled(&slot, 2));
+        assert!(!mark_cancelled(&slot, 2));
+        assert!(!start_worker(&slot, 2));
+        let guard = slot.lock().unwrap();
+        let current = guard.as_ref().unwrap();
+        assert_eq!(current.view.reason_code.as_deref(), Some("cancelled"));
+        assert!(current.nonce.is_none() && current.restore_key.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(not(windows))]
+mod worker_tests {
+    use super::terminal_tests::{assert_failure, failure, running_slot};
+    use super::*;
+
     fn wait_for_worker(handle: thread::JoinHandle<()>) {
         let (completed, observed) = std::sync::mpsc::channel();
         thread::spawn(move || completed.send(handle.join()).unwrap());
@@ -764,21 +872,32 @@ mod terminal_tests {
             .expect("worker did not panic");
     }
 
-    #[cfg(all(not(windows), feature = "full-tests"))]
+    fn assert_no_worker_starts(slot: SharedOperationSlot, generation: u64) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        assert!(
+            spawn_worker(slot, generation, move || {
+                entered.send(()).unwrap();
+                Terminal::done()
+            })
+            .is_none()
+        );
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
+    }
+
     #[test]
     fn ordinary_worker_preserves_complete_terminal() {
         let slot = running_slot();
-        wait_for_worker(spawn_worker(slot.clone(), 2, failure));
+        wait_for_worker(spawn_worker(slot.clone(), 2, failure).unwrap());
         assert_failure(&slot);
     }
 
-    #[cfg(all(not(windows), feature = "full-tests"))]
     #[test]
     fn ordinary_worker_preserves_panic_failure() {
         let slot = running_slot();
-        wait_for_worker(spawn_worker(slot.clone(), 2, || {
-            panic!("test worker panic")
-        }));
+        wait_for_worker(spawn_worker(slot.clone(), 2, || panic!("test worker panic")).unwrap());
         let guard = slot.lock().unwrap();
         let current = guard.as_ref().unwrap();
         assert_eq!(current.view.phase, "error");
@@ -786,6 +905,63 @@ mod terminal_tests {
         assert!(current.view.detail.is_none() && current.view.guidance.is_none());
         assert!(current.view.portal_url.is_none());
         assert!(current.nonce.is_none() && current.restore_key.is_none());
+    }
+
+    #[test]
+    fn ordinary_worker_holds_the_slot_until_its_closure_settles() {
+        let slot = running_slot();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let handle = spawn_worker(slot.clone(), 2, move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            failure()
+        })
+        .unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        slot.lock().unwrap().as_mut().unwrap().started =
+            Instant::now() - HANDOFF_TTL - Duration::from_secs(1);
+        assert!(!mark_cancelled(&slot, 2));
+        mark_expired(&slot, 2);
+        finish_terminal(&slot, 2, Terminal::done());
+        assert!(is_busy(&slot));
+        assert_eq!(current(&slot).unwrap().phase, "restoring");
+        assert!(begin(&slot, "teardown", None, None, None).is_err());
+        assert_no_worker_starts(slot.clone(), 2);
+        release.send(()).unwrap();
+        wait_for_worker(handle);
+        assert_failure(&slot);
+        assert!(!is_busy(&slot));
+    }
+
+    #[test]
+    fn refused_worker_admission_starts_no_closure() {
+        let absent = new_slot();
+        assert_no_worker_starts(absent, 2);
+        let slot = running_slot();
+        assert_no_worker_starts(slot.clone(), 1);
+        assert!(mark_cancelled(&slot, 2));
+        assert_no_worker_starts(slot.clone(), 2);
+        assert_eq!(
+            current(&slot).unwrap().reason_code.as_deref(),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn failed_thread_creation_settles_only_its_admitted_generation() {
+        let slot = running_slot();
+        FAIL_WORKER_START.with(|fail| fail.set(true));
+        assert_no_worker_starts(slot.clone(), 2);
+        let current = current(&slot).unwrap();
+        assert_eq!(current.phase, "error");
+        assert_eq!(current.reason_code.as_deref(), Some("failed"));
+        assert!(current.portal_url.is_none());
+        assert!(!slot.lock().unwrap().as_ref().unwrap().worker_active);
+        assert!(!is_busy(&slot));
+        let next = begin(&slot, "rotate", None, None, None).unwrap().generation;
+        wait_for_worker(spawn_worker(slot.clone(), next, Terminal::done).unwrap());
+        assert_eq!(super::current(&slot).unwrap().phase, "done");
     }
 }
 

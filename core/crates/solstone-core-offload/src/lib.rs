@@ -7,6 +7,7 @@ pub mod ledger;
 pub mod marks;
 pub mod measurement;
 pub mod pruning_audit;
+pub mod recovery;
 pub mod restore;
 // Private, uncalled coordination while durable intent publication is held.
 #[allow(dead_code)]

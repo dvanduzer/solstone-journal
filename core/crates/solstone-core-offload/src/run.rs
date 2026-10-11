@@ -924,6 +924,7 @@ mod current {
         Unproven { names: Vec<String> },
         Incomplete,
         AdmissionChanged,
+        ExecutionUnavailable,
         Prerequisite { reason: &'static str },
     }
 
@@ -1235,6 +1236,12 @@ mod current {
             eligible: Vec::new(),
             refusals: Vec::new(),
         };
+        // The exact writable archive-readback transport currently supports Unix only.
+        // Known prelaunch refusal cannot become actionable projected relief.
+        if !cfg!(unix) {
+            decision.unavailable(CurrentOffloadRefusalReason::ExecutionUnavailable);
+            return decision;
+        }
         let inspect = || -> Result<CurrentPolicyObservation, CurrentOffloadRefusalReason> {
             operation
                 .revalidate()
@@ -3004,9 +3011,12 @@ mod tests {
         assert!(!journal.path().join("health/retention-marks.json").exists());
     }
 
+    #[cfg(unix)]
     const CURRENT_NOW: i64 = 1_767_355_200;
+    #[cfg(unix)]
     const CURRENT_REPO: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    #[cfg(unix)]
     struct CurrentFixture {
         journal: tempfile::TempDir,
         root: std::sync::Arc<JournalRoot>,
@@ -3015,6 +3025,7 @@ mod tests {
         ledger: PathBuf,
     }
 
+    #[cfg(unix)]
     impl CurrentFixture {
         fn new(layout: solstone_core_journal_io::paths::SegmentLayout) -> Self {
             use solstone_core_retention::archive_proof::{
@@ -3302,26 +3313,19 @@ mod tests {
                     .fixed_offset(),
             )
         }
-    }
-
-    fn dedup_current_bytes(decision: &CurrentOffloadDecision) -> u64 {
-        let mut keys = std::collections::BTreeSet::new();
-        decision
-            .eligible()
-            .filter(|file| {
-                keys.insert((
-                    file.target().day.clone(),
-                    file.target().stream.clone(),
-                    file.target().dir.clone(),
-                    file.layout(),
-                    file.name().to_owned(),
-                ))
-            })
-            .map(|file| file.bytes())
-            .sum()
+        fn project(
+            &self,
+            decision: &CurrentOffloadDecision,
+        ) -> Result<Option<crate::measurement::ProposedRelief>, String> {
+            crate::measurement::project_current_offload(
+                &measure_local_media(self.journal.path()),
+                decision,
+            )
+        }
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_uses_actual_admission_and_hashes_overlaps_once_per_call() {
         use solstone_core_journal_io::paths::SegmentLayout;
         use std::rc::Rc;
@@ -3344,14 +3348,11 @@ mod tests {
             assert!(decision.refusals().is_empty());
             assert_eq!(hashes.borrow().len(), 2);
             assert_eq!(decision.eligible().count(), 3);
-            assert_eq!(dedup_current_bytes(&decision), 7);
-            assert_eq!(
-                measure_local_media(fixture.journal.path())
-                    .usage()
-                    .unwrap()
-                    .total_bytes,
-                23
-            );
+            let projected = fixture.project(&decision).unwrap().unwrap();
+            assert_eq!(projected.local.total_bytes, 23);
+            assert_eq!(projected.eligible_bytes, 7);
+            assert_eq!(projected.eligible_files, 2);
+            assert_eq!(projected.projected_local_bytes, 16);
             assert_eq!(
                 decision.root_observation(),
                 fixture.root.identity().observation_id()
@@ -3377,17 +3378,21 @@ mod tests {
                 },
                 || fixture.inspect(&fixture.marks),
             );
-            assert_eq!(dedup_current_bytes(&second), 7);
+            assert_eq!(fixture.project(&second).unwrap().unwrap().eligible_bytes, 7);
             assert_eq!(hashes.borrow().len(), 4);
         }
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_distinguishes_available_zero_from_unavailable() {
         let fixture = CurrentFixture::new(solstone_core_journal_io::paths::SegmentLayout::Direct);
         let zero = fixture.inspect(&[]);
         assert_eq!(zero.availability(), CurrentOffloadAvailability::Available);
         assert_eq!(zero.eligible().count(), 0);
+        let projected = fixture.project(&zero).unwrap().unwrap();
+        assert_eq!(projected.eligible_bytes, 0);
+        assert_eq!(projected.projected_local_bytes, 23);
         fixture.change_config(|config| config["retention"] = json!([]));
         let unavailable = fixture.inspect(&fixture.marks);
         assert_eq!(
@@ -3396,9 +3401,11 @@ mod tests {
         );
         assert_eq!(unavailable.eligible().count(), 0);
         assert!(!unavailable.refusals().is_empty());
+        assert_eq!(fixture.project(&unavailable).unwrap(), None);
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_changed_missing_failed_legacy_and_other_classes() {
         use solstone_core_retention::marks::{Failure, MarkId, MarkState, RemovalClass};
         for case in 0..5 {
@@ -3446,6 +3453,10 @@ mod tests {
                 "case {case}"
             );
             assert_eq!(decision.eligible().count(), 0, "case {case}");
+            let projected = fixture.project(&decision).unwrap().unwrap();
+            assert_eq!(projected.local.total_bytes, 23, "case {case}");
+            assert_eq!(projected.eligible_bytes, 0, "case {case}");
+            assert_eq!(projected.projected_local_bytes, 23, "case {case}");
             assert!(
                 decision
                     .refusals()
@@ -3457,8 +3468,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_wrong_bytes_processing_sibling_and_missing_witness() {
-        for case in 0..4 {
+        for case in 0..5 {
             let fixture =
                 CurrentFixture::new(solstone_core_journal_io::paths::SegmentLayout::Direct);
             match case {
@@ -3475,7 +3487,8 @@ mod tests {
                 2 => {
                     fs::write(fixture.segment.join("unselected.webm"), b"unproven sibling").unwrap()
                 }
-                _ => fs::write(&fixture.ledger, b"").unwrap(),
+                3 => fs::write(&fixture.ledger, b"").unwrap(),
+                _ => fs::remove_file(fixture.segment.join("first.webm")).unwrap(),
             }
             let decision = fixture.inspect(&fixture.marks[1..]);
             assert_eq!(
@@ -3484,10 +3497,20 @@ mod tests {
                 "case {case}"
             );
             assert_eq!(decision.eligible().count(), 0, "case {case}");
+            let projected = fixture.project(&decision).unwrap().unwrap();
+            assert_eq!(projected.eligible_bytes, 0, "case {case}");
+            assert_eq!(
+                projected.projected_local_bytes, projected.local.total_bytes,
+                "case {case}"
+            );
+            if case == 4 {
+                assert_eq!(projected.local.total_bytes, 20);
+            }
         }
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_kept_empty_independently_from_ordinary_siblings() {
         let mut fixture =
             CurrentFixture::new(solstone_core_journal_io::paths::SegmentLayout::Direct);
@@ -3508,7 +3531,10 @@ mod tests {
             decision.availability(),
             CurrentOffloadAvailability::Available
         );
-        assert_eq!(dedup_current_bytes(&decision), 7);
+        let projected = fixture.project(&decision).unwrap().unwrap();
+        assert_eq!(projected.local.total_bytes, 28);
+        assert_eq!(projected.eligible_bytes, 7);
+        assert_eq!(projected.projected_local_bytes, 21);
         assert!(
             decision
                 .refusals()
@@ -3517,14 +3543,19 @@ mod tests {
             CurrentOffloadRefusalReason::Kept {names} if names == &["empty.flac"]))
         );
         assert!(!decision.eligible().any(|file| file.name() == "empty.flac"));
+        let kept = fixture.inspect(&fixture.marks[2..]);
+        let projected = fixture.project(&kept).unwrap().unwrap();
+        assert_eq!(projected.eligible_bytes, 0);
+        assert_eq!(projected.projected_local_bytes, 28);
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_keeps_same_names_at_distinct_exact_locators() {
         use solstone_core_journal_io::paths::SegmentLayout;
         let mut fixture = CurrentFixture::new(SegmentLayout::Direct);
-        // Keep the two-file Direct offer; the Named one-file offer has a distinct Mark ID.
-        fixture.marks.truncate(1);
+        // Keep both overlapping Direct offers. The Named two-file offer has a
+        // distinct Mark ID while its first file differs only by exact layout.
         for (layout, dir, bytes, manifest) in [
             (
                 SegmentLayout::Named,
@@ -3548,7 +3579,15 @@ mod tests {
             let raw = segment.join("first.webm");
             fs::write(&raw, bytes).unwrap();
             write_eligible_sidecar(&raw);
-            fixture.add_offer(fixture.observe_offer(layout, dir, &["first.webm"], manifest));
+            let names = if layout == SegmentLayout::Named {
+                let raw = segment.join("named-only.webm");
+                fs::write(&raw, b"x").unwrap();
+                write_eligible_sidecar(&raw);
+                vec!["first.webm", "named-only.webm"]
+            } else {
+                vec!["first.webm"]
+            };
+            fixture.add_offer(fixture.observe_offer(layout, dir, &names, manifest));
         }
         let decision = fixture.inspect(&fixture.marks);
         assert_eq!(
@@ -3556,18 +3595,23 @@ mod tests {
             CurrentOffloadAvailability::Available
         );
         assert!(decision.refusals().is_empty(), "{:?}", decision.refusals());
-        assert_eq!(decision.eligible().count(), 4);
-        assert_eq!(dedup_current_bytes(&decision), 18);
+        assert_eq!(decision.eligible().count(), 6);
+        let projected = fixture.project(&decision).unwrap().unwrap();
+        assert_eq!(projected.local.total_bytes, 35);
+        assert_eq!(projected.eligible_bytes, 19);
+        assert_eq!(projected.eligible_files, 5);
+        assert_eq!(projected.projected_local_bytes, 16);
         assert_eq!(
             decision
                 .eligible()
                 .filter(|file| file.name() == "first.webm")
                 .count(),
-            3
+            4
         );
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_post_group_media_and_processing_drift_without_rehash() {
         use std::rc::Rc;
         for case in 0..4 {
@@ -3606,11 +3650,13 @@ mod tests {
                 "case {case}"
             );
             assert_eq!(decision.eligible().count(), 0, "case {case}");
+            assert_eq!(fixture.project(&decision).unwrap(), None);
             assert_eq!(*hashes.borrow(), 2, "case {case}");
         }
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_reoffered_nonce_and_retired_witness() {
         use std::io::Write;
         let fixture = CurrentFixture::new(solstone_core_journal_io::paths::SegmentLayout::Direct);
@@ -3656,6 +3702,10 @@ mod tests {
             CurrentOffloadAvailability::Available
         );
         assert_eq!(retired.eligible().count(), 0);
+        assert_eq!(
+            fixture.project(&retired).unwrap().unwrap().eligible_bytes,
+            0
+        );
         assert!(
             retired
                 .refusals()
@@ -3665,6 +3715,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_erases_prefix_credit_on_late_config_or_catalog_failure() {
         for case in 0..3 {
             let fixture =
@@ -3699,10 +3750,12 @@ mod tests {
                 "case {case}"
             );
             assert_eq!(decision.eligible().count(), 0);
+            assert_eq!(fixture.project(&decision).unwrap(), None);
         }
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_busy_group_does_not_block_unrelated_group() {
         use solstone_core_retention::marks::MarkId;
         use solstone_core_segment::output_attempt::OutputClaims;
@@ -3752,13 +3805,116 @@ mod tests {
             decision.availability(),
             CurrentOffloadAvailability::Available
         );
-        assert_eq!(dedup_current_bytes(&decision), 5);
+        let projected = fixture.project(&decision).unwrap().unwrap();
+        assert_eq!(projected.local.total_bytes, 28);
+        assert_eq!(projected.eligible_bytes, 5);
+        assert_eq!(projected.projected_local_bytes, 23);
         assert!(
             decision
                 .refusals()
                 .iter()
                 .any(|refusal| refusal.reason() == &CurrentOffloadRefusalReason::Busy)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn current_batch_projection_requires_complete_exact_local_intersection() {
+        use crate::measurement::project_current_offload;
+        use solstone_core_journal_io::paths::SegmentLayout;
+        for layout in [SegmentLayout::Direct, SegmentLayout::Named] {
+            let fixture = CurrentFixture::new(layout);
+            let decision = fixture.inspect(&fixture.marks);
+            let local = measure_local_media(fixture.journal.path());
+            for case in 0..6 {
+                let mut changed = local.clone();
+                let file = changed
+                    .files
+                    .iter_mut()
+                    .find(|file| file.key.name == "first.webm")
+                    .unwrap();
+                match case {
+                    0 => file.key.day = "20260102".into(),
+                    1 => file.key.stream = "other".into(),
+                    2 => file.key.segment_dir = "010000_001_other".into(),
+                    3 => {
+                        file.key.layout = match layout {
+                            SegmentLayout::Direct => SegmentLayout::Named,
+                            SegmentLayout::Named => SegmentLayout::Direct,
+                        }
+                    }
+                    4 => file.key.name = "renamed.webm".into(),
+                    _ => file.bytes += 1,
+                }
+                let projected = project_current_offload(&changed, &decision)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(projected.eligible_bytes, 4, "case {case}");
+                assert_eq!(projected.eligible_files, 1, "case {case}");
+                assert_eq!(
+                    projected.projected_local_bytes,
+                    projected.local.total_bytes - 4
+                );
+            }
+            let mut metadata = local.clone();
+            metadata
+                .files
+                .iter_mut()
+                .find(|file| file.key.name == "first.webm")
+                .unwrap()
+                .key
+                .segment = "grouping metadata only".into();
+            assert_eq!(
+                project_current_offload(&metadata, &decision)
+                    .unwrap()
+                    .unwrap()
+                    .eligible_bytes,
+                7
+            );
+            let mut duplicate = local.clone();
+            duplicate.files.push(duplicate.files[0].clone());
+            assert!(project_current_offload(&duplicate, &decision).is_err());
+            let mut incomplete = local.clone();
+            incomplete.unknown_paths.push(fixture.segment.clone());
+            assert!(project_current_offload(&incomplete, &decision).is_err());
+            let mut overflow = local;
+            overflow.files[0].bytes = u64::MAX;
+            assert!(project_current_offload(&overflow, &decision).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn current_batch_is_unavailable_without_writable_readback_transport() {
+        let journal = tempfile::tempdir().unwrap();
+        configure_offload(journal.path(), 100, Some(1));
+        let root = std::sync::Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let runner = Script {
+            outputs: RefCell::new(
+                (0..2)
+                    .map(|_| output(json!({"id":"a".repeat(64)}).to_string()))
+                    .collect(),
+            ),
+            calls: RefCell::new(vec![]),
+        };
+        let clock = TestClock { now: 100 };
+        let services = services(&runner, &Http, &clock, &Maintenance);
+        let mut operation = solstone_core_backup_runtime::admit_archive(root, &services).unwrap();
+        let decision = inspect_current_offload(
+            &mut operation,
+            &[],
+            DateTime::from_timestamp(100, 0).unwrap().fixed_offset(),
+        );
+        assert_eq!(
+            decision.availability(),
+            CurrentOffloadAvailability::Unavailable
+        );
+        assert_eq!(decision.eligible().count(), 0);
+        assert_eq!(
+            decision.refusals()[0].reason(),
+            &CurrentOffloadRefusalReason::ExecutionUnavailable
+        );
+        assert_eq!(runner.calls.borrow().len(), 2);
     }
 
     fn confirmation_failure(check: ToolOutput) -> OffloadResult {

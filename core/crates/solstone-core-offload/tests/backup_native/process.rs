@@ -250,13 +250,14 @@ pub(super) fn refused_selective_root(
         journal_maintenance: services.journal_maintenance,
     };
     let result = restore_all_offload(journal, &guarded);
-    assert_eq!(result.status, "error", "{result:?}");
+    assert_eq!(result.status, "refused", "{result:?}");
+    assert_eq!(result.reason.as_deref(), Some("archive_unbound"));
     assert_eq!(fs::read_dir(&outside).unwrap().count(), count);
     assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
     fs::remove_dir(segment).unwrap();
     fs::remove_file(outside.join("sentinel")).unwrap();
     fs::rename(outside, segment).unwrap();
-    println!("NATIVE_BACKUP_SELECTIVE_REPARSE_NO_WRITES_OK");
+    println!("NATIVE_BACKUP_SELECTIVE_REPARSE_RESTORE_HELD_OK");
 }
 
 fn identity() -> ProcessInstance {

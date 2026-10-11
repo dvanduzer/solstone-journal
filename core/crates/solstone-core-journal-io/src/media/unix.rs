@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use nix::sys::stat::{Mode, SFlag, fstatat, mkdirat};
 use nix::sys::statvfs::fstatvfs;
 use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 
+use super::removal::ClaimFailure;
 use super::{JournalRoot, MediaEntry, MediaIdentity, MediaPrimitive, changed, invalid, step};
 use crate::journal_root::JournalEntryKind;
 
@@ -339,6 +340,79 @@ pub(super) fn open_plain(directory: &Directory, name: &OsStr) -> io::Result<Opti
 
 pub(super) fn open_source(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
     open_plain(directory, name)
+}
+
+pub(super) fn open_removal(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
+    open_plain(directory, name)
+}
+
+pub(super) fn claim(
+    source: &Directory,
+    source_name: &OsStr,
+    _file: &File,
+    destination: &Directory,
+    name: &OsStr,
+) -> Result<(), ClaimFailure> {
+    let from = CString::new(source_name.as_bytes()).map_err(|_| invalid("invalid claim name"))?;
+    let to = CString::new(name.as_bytes()).map_err(|_| invalid("invalid claim name"))?;
+    step(MediaPrimitive::NativeClaimCut)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: both retained directory descriptors and NUL-terminated names
+        // remain live for the synchronous create-only rename. No fallback.
+        #[allow(unsafe_code)]
+        let result = unsafe {
+            #[cfg(target_os = "linux")]
+            {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    source.as_fd().as_raw_fd(),
+                    from.as_ptr(),
+                    destination.as_fd().as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                ) as i32
+            }
+            #[cfg(target_os = "macos")]
+            {
+                libc::renameatx_np(
+                    source.as_fd().as_raw_fd(),
+                    from.as_ptr(),
+                    destination.as_fd().as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            }
+        };
+        if result != 0 {
+            return Err(ClaimFailure::native(io::Error::last_os_error()));
+        }
+        step(MediaPrimitive::ClaimAppliedError)?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source, destination, from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native no-replace claim unavailable",
+        )
+        .into())
+    }
+}
+
+pub(super) fn delete_claim(directory: &Directory, name: &OsStr, file: &File) -> io::Result<()> {
+    remove_leaf(directory, name, file)?;
+    step(MediaPrimitive::DeleteAppliedError)
+}
+
+pub(super) fn ensure_absent(directory: &Directory, name: &OsStr) -> io::Result<()> {
+    if entry(directory, name)?.is_some() {
+        return Err(changed());
+    }
+    Ok(())
 }
 
 pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
