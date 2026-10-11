@@ -13,6 +13,10 @@ pub use creator::{
 mod historical;
 pub use historical::{HistoricalArchiveFile, HistoricalSnapshotFiles};
 
+/// Tag on the snapshots that hold offloaded media. Once the local copy is
+/// removed such a snapshot can be the only copy, so backup rotation keeps it.
+pub const OFFLOAD_ARCHIVE_TAG: &str = "spb-offload-archive";
+
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;

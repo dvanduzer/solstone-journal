@@ -336,7 +336,7 @@ impl OwnedArchiveCreator {
             "--force".into(),
             "--no-cache".into(),
             "--tag".into(),
-            "spb-offload-archive".into(),
+            super::OFFLOAD_ARCHIVE_TAG.into(),
             "--retry-lock".into(),
             "30m".into(),
         ];

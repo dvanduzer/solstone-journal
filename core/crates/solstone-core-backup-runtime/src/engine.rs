@@ -36,9 +36,9 @@ use solstone_core_backup::archive_admission::{AdmissionError, ArchiveBudget, Arc
 use solstone_core_backup::archive_readback::{
     ArchiveEndpointCapture, ArchivePredecessorCapture, ArchiveWriterObservation,
     ArchiveWriterSourceObservation, DirectArchiveEffects, DirectReadCompletion,
-    OwnedArchiveCreator, OwnedDirectReadHold, OwnedReadOperation, OwnedReadbackAdmissionError,
-    OwnedSettledDirectRead, ReadAdmission, ReadOperation, ReadbackAdmissionError, ReadbackError,
-    SettledDirectRead,
+    OFFLOAD_ARCHIVE_TAG, OwnedArchiveCreator, OwnedDirectReadHold, OwnedReadOperation,
+    OwnedReadbackAdmissionError, OwnedSettledDirectRead, ReadAdmission, ReadOperation,
+    ReadbackAdmissionError, ReadbackError, SettledDirectRead,
 };
 // Repository contention is coordinated by Restic, within each operation’s deadline.
 const REPOSITORY_RETRY_LOCK: &str = "30m";
@@ -1366,6 +1366,8 @@ pub fn run_prune(journal: &Path, services: &BackupServices<'_>) -> PruneResult {
             .to_string(),
         "--keep-tag".into(),
         ARCHIVE_TAG.into(),
+        "--keep-tag".into(),
+        OFFLOAD_ARCHIVE_TAG.into(),
         "--prune".into(),
     ];
     let result = match restic(
@@ -5931,6 +5933,33 @@ mod tests {
         assert_eq!(result.status, "error");
         assert_eq!(result.snapshot_id, None);
         assert_eq!(result.error_reason.as_deref(), Some("incomplete"));
+    }
+
+    #[test]
+    fn prune_keeps_every_snapshot_that_can_hold_the_only_copy_of_media() {
+        let journal = configured_journal();
+        let runner = ObservedScript {
+            outputs: RefCell::new(VecDeque::from([output(0, ""), output(0, "")])),
+            requests: RefCell::new(Vec::new()),
+            after_unlock: RefCell::new(None),
+        };
+        let services = services(&runner, &Http, &FixedClock, &Maintenance);
+        assert_eq!(run_prune(journal.path(), &services).status, "ok");
+        let requests = runner.requests.borrow();
+        let forget = requests
+            .iter()
+            .find(|request| request.argv.iter().any(|arg| arg == "forget"))
+            .expect("prune runs forget");
+        for tag in [ARCHIVE_TAG, OFFLOAD_ARCHIVE_TAG] {
+            assert!(
+                forget
+                    .argv
+                    .windows(2)
+                    .any(|pair| pair == ["--keep-tag", tag]),
+                "{tag} snapshots must survive rotation: {:?}",
+                forget.argv
+            );
+        }
     }
 
     #[test]
