@@ -842,15 +842,12 @@ mod current {
     use chrono::{DateTime, FixedOffset, Utc};
     use serde_json::{Map, Value};
     use solstone_core_backup_runtime::AdmittedArchive;
-    use solstone_core_format::segment::segment_key;
     use solstone_core_journal_io::journal_root::JournalRoot;
     use solstone_core_journal_io::locking::LockOptions;
     use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity, MediaObservation};
     use solstone_core_journal_io::paths::SegmentLayout;
     use solstone_core_retention::Target;
-    use solstone_core_retention::archive_proof::{
-        ApprovalRevision, ArchiveFileProof, OffloadProof,
-    };
+    use solstone_core_retention::archive_proof::{ApprovalRevision, ArchiveFileProof};
     use solstone_core_retention::content::{ClosedHandlerSet, ContentName, JournalMedia};
     use solstone_core_retention::grouped::{DecisionPurpose, GroupVerdict, inspect_grouped};
     use solstone_core_retention::marks::{Mark, MarkId, MarkState, RemovalClass};
@@ -859,9 +856,7 @@ mod current {
     use solstone_core_retention::scan::{CheckedSegment, scan_segment_bound};
     use solstone_core_segment::output_attempt::OutputClaims;
 
-    use solstone_core_retention::archive_catalog::{
-        ArchiveWitness, JournalCatalog, read_complete_catalog,
-    };
+    use solstone_core_retention::archive_catalog::read_complete_catalog;
 
     const MAX_CURRENT_ENTRIES: usize = 100_000;
     const MAX_CURRENT_CONFIG_BYTES: usize = 1024 * 1024;
@@ -1152,44 +1147,6 @@ mod current {
         }
     }
 
-    fn exact_witness(
-        witness: &ArchiveWitness,
-        proof: &OffloadProof,
-        file: &ArchiveFileProof,
-    ) -> bool {
-        witness.manifest_id == proof.manifest_id
-            && witness.witness_id == file.witness_id
-            && witness.snapshot_id == proof.snapshot_id
-            && witness.journal_id.as_deref() == Some(proof.journal_id.as_str())
-            && witness.layout == Some(proof.layout)
-            && witness.segment_dir.as_deref() == Some(proof.target.dir.as_str())
-            && witness.repository_id.as_deref() == Some(proof.repository_id.as_str())
-            && witness.archive_path.as_deref() == Some(file.archive_path.as_str())
-            && witness.file.name == file.name
-            && witness.file.bytes == file.bytes
-            && witness.file.sha256 == file.sha256
-            && witness.processing.as_ref() == Some(&file.processing)
-    }
-
-    fn current_witness(
-        catalog: &JournalCatalog,
-        proof: &OffloadProof,
-        file: &ArchiveFileProof,
-    ) -> bool {
-        let Some(key) = segment_key(&proof.target.dir) else {
-            return false;
-        };
-        let mut matches = catalog
-            .days
-            .iter()
-            .filter(|day| day.day == proof.target.day)
-            .flat_map(|day| &day.segments)
-            .filter(|segment| segment.stream == proof.target.stream && segment.segment == key)
-            .flat_map(|segment| &segment.active)
-            .filter(|witness| exact_witness(witness, proof, file));
-        matches.next().is_some() && matches.next().is_none()
-    }
-
     fn check_mark(
         root: &JournalRoot,
         repository: &str,
@@ -1346,7 +1303,7 @@ mod current {
                 return decision;
             };
             let proof = &offer.proof;
-            if !current_witness(&final_catalog, proof, file.file()) {
+            if final_catalog.active_witness(proof, file.file()).is_none() {
                 decision.refuse(Some(mark), CurrentOffloadRefusalReason::Unbound);
                 continue;
             }
@@ -1470,7 +1427,7 @@ mod current {
                 };
                 if current.bytes() != file.bytes
                     || current.processing() != &file.processing
-                    || !current_witness(&catalog, proof, file)
+                    || catalog.active_witness(proof, file).is_none()
                 {
                     decision.refuse(Some(mark), CurrentOffloadRefusalReason::Unbound);
                     continue;
@@ -1645,7 +1602,7 @@ mod current {
                 let Some(offer) = &file.mark.offload else {
                     return Err(CurrentOffloadRefusalReason::Incomplete);
                 };
-                if !current_witness(&catalog, &offer.proof, file.file()) {
+                if catalog.active_witness(&offer.proof, file.file()).is_none() {
                     decision.refuse(Some(&file.mark), CurrentOffloadRefusalReason::Unbound);
                     continue;
                 }

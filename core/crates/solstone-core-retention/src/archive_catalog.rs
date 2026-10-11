@@ -13,7 +13,7 @@ use solstone_core_journal_io::{
     JournalEntryKind, JournalRoot, media::MediaDirectory, paths::SegmentLayout,
 };
 
-use crate::archive_proof::AcceptedProcessingObservation;
+use crate::archive_proof::{AcceptedProcessingObservation, ArchiveFileProof, OffloadProof};
 use codec::{fold_lines, valid_day};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +81,39 @@ impl DayCatalog {
 impl JournalCatalog {
     pub fn degraded(&self) -> bool {
         self.skipped_records > 0 || !self.unreadable_ledgers.is_empty()
+    }
+
+    /// Finds one exact active historical witness. This data comparison does not
+    /// establish current input, consent, catalog coverage or release authority.
+    pub fn active_witness(
+        &self,
+        proof: &OffloadProof,
+        file: &ArchiveFileProof,
+    ) -> Option<&ArchiveWitness> {
+        let key = solstone_core_format::segment::segment_key(&proof.target.dir)?;
+        let mut matches = self
+            .days
+            .iter()
+            .filter(|day| day.day == proof.target.day)
+            .flat_map(|day| &day.segments)
+            .filter(|segment| segment.stream == proof.target.stream && segment.segment == key)
+            .flat_map(|segment| &segment.active)
+            .filter(|witness| {
+                witness.manifest_id == proof.manifest_id
+                    && witness.witness_id == file.witness_id
+                    && witness.snapshot_id == proof.snapshot_id
+                    && witness.journal_id.as_deref() == Some(proof.journal_id.as_str())
+                    && witness.layout == Some(proof.layout)
+                    && witness.segment_dir.as_deref() == Some(proof.target.dir.as_str())
+                    && witness.repository_id.as_deref() == Some(proof.repository_id.as_str())
+                    && witness.archive_path.as_deref() == Some(file.archive_path.as_str())
+                    && witness.file.name == file.name
+                    && witness.file.bytes == file.bytes
+                    && witness.file.sha256 == file.sha256
+                    && witness.processing.as_ref() == Some(&file.processing)
+            });
+        let witness = matches.next()?;
+        matches.next().is_none().then_some(witness)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
