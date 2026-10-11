@@ -160,6 +160,15 @@ impl ToolRunner for ArgvResticFixture {
                             && snapshot.contains(':')
                             && target == "--target"
                             && json == "--json"
+                ) || matches!(
+                    argv.as_slice(),
+                    [command, snapshot, target, _, exclude, name, json]
+                        if command == "restore"
+                            && snapshot.contains(':')
+                            && target == "--target"
+                            && exclude == "--exclude"
+                            && name == "backup-activity.lock"
+                            && json == "--json"
                 ) =>
             {
                 Ok(self.restore.clone())

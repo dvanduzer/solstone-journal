@@ -691,6 +691,21 @@ pub struct BoundParentLock {
 #[cfg(unix)]
 impl BoundParentLock {
     #[cfg(target_os = "linux")]
+    pub(crate) fn duplicate_descriptor(
+        &self,
+        name: &OsStr,
+    ) -> Result<std::os::fd::OwnedFd, ExistingParentLockError> {
+        self._guard
+            .try_clone()
+            .map(Into::into)
+            .map_err(|source| ExistingParentLockError::Io {
+                operation: "duplicate retained activity lock",
+                path: name.into(),
+                source,
+            })
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn recovery_observation(
         &self,
         parent: &impl AsFd,

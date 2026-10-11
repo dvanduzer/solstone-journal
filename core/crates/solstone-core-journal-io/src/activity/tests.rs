@@ -106,6 +106,38 @@ fn exclusive_roles_are_non_reentrant_and_entry_survives_release() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn child_descriptor_keeps_actual_lock_identity_and_refuses_changed_bindings() {
+    use std::os::unix::fs::MetadataExt;
+    for replace_root in [false, true] {
+        let f = Fixture::new();
+        let activity = ActivityLease::try_acquire(f.root.clone()).unwrap();
+        let descriptor = std::fs::File::from(activity.duplicate_descriptor_for_child().unwrap());
+        let named = fs::metadata(f.temp.path().join(ENTRY)).unwrap();
+        let retained = descriptor.metadata().unwrap();
+        assert_eq!((retained.dev(), retained.ino()), (named.dev(), named.ino()));
+        busy(ActivityLease::try_acquire(f.root.clone()));
+        if replace_root {
+            let moved = f.temp.path().with_extension("retained");
+            fs::rename(f.temp.path(), &moved).unwrap();
+            fs::create_dir(f.temp.path()).unwrap();
+            assert!(activity.duplicate_descriptor_for_child().is_err());
+            drop(descriptor);
+            drop(activity);
+            fs::remove_dir_all(moved).unwrap();
+        } else {
+            f.replace_entry();
+            assert!(activity.duplicate_descriptor_for_child().is_err());
+            let still_retained = descriptor.metadata().unwrap();
+            assert_eq!(
+                (still_retained.dev(), still_retained.ino()),
+                (named.dev(), named.ino())
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn existing_only_admission_retains_guard_after_final_validation_failure_and_never_creates() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
