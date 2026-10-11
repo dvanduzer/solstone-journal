@@ -262,6 +262,32 @@ pub struct SegmentCommit<'a> {
 }
 
 impl SegmentCommit<'_> {
+    /// Require output coverage from this exact commit's original claims.
+    /// This only checks existing coverage and never acquires another lock.
+    pub fn require_outputs(
+        &self,
+        claims: &OutputClaims,
+        segment: &Path,
+        outputs: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<()> {
+        if !std::ptr::eq(self.claims, claims) || self.segment != segment {
+            return Err(refusal("output coverage belongs to another segment commit"));
+        }
+        let mut any = false;
+        for output in outputs {
+            if output.parent() != Some(segment) || !claims.outputs.contains(&output) {
+                return Err(refusal(
+                    "requested output is not covered by this segment commit",
+                ));
+            }
+            any = true;
+        }
+        if !any {
+            return Err(refusal("requested output coverage is empty"));
+        }
+        self.revalidate()
+    }
+
     /// Recheck the same claims, ancestry and discovery while exclusion stays held.
     /// This does not acquire another lock or cover additional output names.
     pub fn revalidate(&self) -> Result<()> {
@@ -544,6 +570,63 @@ mod tests {
         let input = InputObservation::capture(&fixed, &raw).unwrap();
         fs::write(segment.join("screen.mp4"), b"unrelated").unwrap();
         assert!(input.commit(&fixed).is_ok());
+    }
+
+    #[test]
+    fn held_output_coverage_requires_original_claims_and_every_requested_output() {
+        let (_root, segment, raw) = fixture();
+        let audio = raw.with_extension("jsonl");
+        let screen = segment.join("screen.jsonl");
+        let claims = OutputClaims::acquire([audio.clone(), screen.clone()], no_wait()).unwrap();
+        let commit = claims.commit(&segment).unwrap();
+        assert!(
+            commit
+                .require_outputs(&claims, &segment, [audio.clone(), screen])
+                .is_ok()
+        );
+        assert!(
+            commit
+                .require_outputs(
+                    &claims,
+                    &segment,
+                    [audio.clone(), segment.join("unheld.jsonl")]
+                )
+                .is_err()
+        );
+        assert!(
+            commit
+                .require_outputs(&claims, &segment, [segment.join("nested/wrong.jsonl")])
+                .is_err()
+        );
+        assert!(commit.require_outputs(&claims, &segment, []).is_err());
+        let other = OutputClaims::acquire([segment.join("other.jsonl")], no_wait()).unwrap();
+        assert!(
+            commit
+                .require_outputs(&other, &segment, [audio.clone()])
+                .is_err()
+        );
+        assert!(commit.require_outputs(&claims, &segment, [audio]).is_ok());
+    }
+
+    #[test]
+    fn held_output_coverage_refuses_other_segment_and_late_tombstone() {
+        let (_root, segment, raw) = fixture();
+        let output = raw.with_extension("jsonl");
+        let claims = OutputClaims::acquire([output.clone()], no_wait()).unwrap();
+        let commit = claims.commit(&segment).unwrap();
+        assert!(
+            commit
+                .require_outputs(&claims, &segment, [output.clone()])
+                .is_ok()
+        );
+        assert!(
+            commit
+                .require_outputs(&claims, &segment.join("another"), [output.clone()])
+                .is_err()
+        );
+        fs::write(segment.join("tombstone.json"), b"{}").unwrap();
+        assert!(commit.require_outputs(&claims, &segment, [output]).is_err());
+        assert_eq!(fs::read(raw).unwrap(), b"before");
     }
 
     #[test]
