@@ -239,7 +239,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
             "/app/transcripts/api/serve_file/{day}/{*rel_path}",
             RouteClassification::Moved(OwnerReadRole::TranscriptsServeFile),
         ),
-        // Map (7 live GET paths in map-web lib.rs)
+        // Map (13 live GET paths in map-web lib.rs)
         (
             "/app/map/",
             RouteClassification::Moved(OwnerReadRole::MapRoot),
@@ -261,6 +261,21 @@ fn owner_read_role_classification_table_exhaustiveness() {
         (
             "/app/map/api/accuracy",
             RouteClassification::Moved(OwnerReadRole::MapAccuracy),
+        ),
+        ("/app/map/places", RouteClassification::NoQualifyingWork),
+        ("/app/map/place/{id}", RouteClassification::NoQualifyingWork),
+        ("/app/map/week/{day}", RouteClassification::NoQualifyingWork),
+        (
+            "/app/map/api/places",
+            RouteClassification::Moved(OwnerReadRole::MapPlaces),
+        ),
+        (
+            "/app/map/api/place/{id}",
+            RouteClassification::Moved(OwnerReadRole::MapPlace),
+        ),
+        (
+            "/app/map/api/week/{day}",
+            RouteClassification::Moved(OwnerReadRole::MapWeek),
         ),
         // Stats (8 live GET paths in stats-web lib.rs:24-43)
         ("/app/stats/", RouteClassification::NoQualifyingWork),
@@ -391,7 +406,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         ),
     ];
 
-    assert_eq!(table.len(), 82, "Must classify all 82 live GET routes");
+    assert_eq!(table.len(), 88, "Must classify all 88 live GET routes");
 
     let mut distinct_paths = BTreeSet::new();
     for (path, _) in table {
@@ -414,7 +429,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         moved_roles, all_roles,
         "Moved roles must equal OwnerReadRole::ALL exactly"
     );
-    assert_eq!(moved_roles.len(), 53);
+    assert_eq!(moved_roles.len(), 56);
 
     let ten_measured = [
         OwnerReadRole::SpeakersKnown,
@@ -457,8 +472,8 @@ fn owner_read_role_classification_table_exhaustiveness() {
         .collect();
     assert_eq!(
         no_qualifying.len(),
-        26,
-        "NoQualifyingWork must have exactly 26 routes"
+        29,
+        "NoQualifyingWork must have exactly 29 routes"
     );
 }
 

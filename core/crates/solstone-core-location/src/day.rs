@@ -25,6 +25,7 @@ use solstone_core_journal_io::{DEFAULT_STREAM, PathOrDay, Segment, StreamLocatio
 use crate::accuracy::{Packs, StopWords};
 use crate::area::{AreaName, AreaTier};
 use crate::record::{Platform, Precision, SegmentFile, Visit, parse_segment_file};
+use crate::stay::{Sample, find_stays};
 
 /// The file a phone writes into a segment.
 pub const LOCATION_FILE: &str = "location.jsonl";
@@ -98,6 +99,8 @@ pub struct Device {
     pub tier: Option<String>,
     pub readings: usize,
     pub visits: usize,
+    /// Stays worked out from this device's readings.
+    pub stays: usize,
     /// Pieces whose file the phone marked as interrupted.
     pub interrupted_segments: usize,
     pub unreadable_lines: u32,
@@ -164,6 +167,20 @@ pub enum Entry {
         point: Point,
         sources: Vec<SourceRef>,
     },
+    /// A stay the journal worked out from precise readings that stayed put.
+    /// The two times are its first and last reading.
+    Stay {
+        device: usize,
+        area: AreaName,
+        place: Option<StopWords>,
+        first: LocalTime,
+        last: LocalTime,
+        /// How many readings it rests on.
+        count: usize,
+        /// Its centre, with the margin that holds every supporting reading.
+        point: Point,
+        sources: Vec<SourceRef>,
+    },
     /// A file, or lines in it, that could not be read.
     Unreadable {
         device: usize,
@@ -177,7 +194,7 @@ pub enum Entry {
 impl Entry {
     fn sort_time(&self) -> Option<DateTime<Utc>> {
         match self {
-            Self::Readings { first, .. } => Some(first.utc),
+            Self::Readings { first, .. } | Self::Stay { first, .. } => Some(first.utc),
             Self::Visit {
                 arrival, departure, ..
             } => arrival.or(*departure).map(|time| time.utc),
@@ -189,6 +206,7 @@ impl Entry {
         match self {
             Self::Readings { sources, .. }
             | Self::Visit { sources, .. }
+            | Self::Stay { sources, .. }
             | Self::Unreadable { sources, .. } => sources,
         }
     }
@@ -420,6 +438,7 @@ fn assemble(
                     tier: None,
                     readings: 0,
                     visits: 0,
+                    stays: 0,
                     interrupted_segments: 0,
                     unreadable_lines: 0,
                     unrecognised_lines: 0,
@@ -519,8 +538,6 @@ fn assemble(
         kept.push(observation);
     }
 
-    let mut entries = Vec::new();
-    let mut run: Option<(Entry, String)> = None;
     for observation in &kept {
         let device = &mut devices[observation.device];
         device.readings += 1;
@@ -528,76 +545,9 @@ fn assemble(
             device.first = Some(observation.time);
         }
         device.last = Some(observation.time);
-        let mut area = tier.name_point(observation.point.latitude, observation.point.longitude);
-        area.within = packs.and_then(|packs| {
-            packs.within(
-                observation.point.latitude,
-                observation.point.longitude,
-                observation.point.accuracy_m,
-            )
-        });
-        let run_key = format!(
-            "{}|{}|{:?}",
-            observation.device,
-            observation.precision.as_str(),
-            area.label()
-        );
-        let extends = match &run {
-            Some((Entry::Readings { last, .. }, key)) => {
-                key == &run_key
-                    && (observation.time.utc - last.utc).num_seconds() <= RUN_BREAK_SECONDS
-            }
-            _ => false,
-        };
-        if extends {
-            if let Some((
-                Entry::Readings {
-                    last,
-                    points,
-                    sources,
-                    ..
-                },
-                _,
-            )) = &mut run
-            {
-                *last = observation.time;
-                points.push(observation.point);
-                add_line(
-                    sources,
-                    &located_segments,
-                    observation.source,
-                    observation.line,
-                );
-            }
-            continue;
-        }
-        if let Some((entry, _)) = run.take() {
-            entries.push(entry);
-        }
-        let mut sources = Vec::new();
-        add_line(
-            &mut sources,
-            &located_segments,
-            observation.source,
-            observation.line,
-        );
-        run = Some((
-            Entry::Readings {
-                device: observation.device,
-                area,
-                precision: observation.precision,
-                first: observation.time,
-                last: observation.time,
-                points: vec![observation.point],
-                sources,
-            },
-            run_key,
-        ));
-    }
-    if let Some((entry, _)) = run.take() {
-        entries.push(entry);
     }
 
+    let mut visit_entries: Vec<Entry> = Vec::new();
     // A visit the phone delivered again later (arrival first, then with a
     // departure) is one visit. Its position is the first delivery's: a repeat
     // is the same claim again, not more evidence, so nothing is averaged.
@@ -668,9 +618,181 @@ fn assemble(
             if let Entry::Visit { device, .. } = &entry {
                 devices[*device].visits += 1;
             }
-            entries.push(entry);
+            visit_entries.push(entry);
         }
     }
+
+    // Stays the journal works out: precise readings that stay put. A stay
+    // that overlaps a visit the phone reported is that visit, counted once.
+    let mut in_stay = vec![false; kept.len()];
+    let mut stay_entries: Vec<Entry> = Vec::new();
+    let device_count = devices.len();
+    for device_index in 0..device_count {
+        let indexes: Vec<usize> = (0..kept.len())
+            .filter(|&i| kept[i].device == device_index && kept[i].precision == Precision::Precise)
+            .collect();
+        let samples: Vec<Sample> = indexes
+            .iter()
+            .map(|&i| Sample {
+                seconds: kept[i].time.utc.timestamp(),
+                latitude: kept[i].point.latitude,
+                longitude: kept[i].point.longitude,
+                accuracy_m: kept[i].point.accuracy_m,
+            })
+            .collect();
+        for found in find_stays(&samples) {
+            let members: Vec<usize> = found.members.iter().map(|&m| indexes[m]).collect();
+            let first = kept[members[0]].time;
+            let last = kept[*members.last().unwrap_or(&members[0])].time;
+            // The same stop, reported: same device, overlapping times with at
+            // least one end known, and positions within both margins.
+            let overlaps_visit = visit_entries.iter().any(|visit| match visit {
+                Entry::Visit {
+                    device,
+                    arrival,
+                    departure,
+                    point,
+                    ..
+                } => {
+                    *device == device_index
+                        && (arrival.is_some() || departure.is_some())
+                        && arrival.is_none_or(|arrival| arrival.utc <= last.utc)
+                        && departure.is_none_or(|departure| departure.utc >= first.utc)
+                        && crate::pack::distance_m(
+                            point.latitude,
+                            point.longitude,
+                            found.latitude,
+                            found.longitude,
+                        ) <= point.accuracy_m.unwrap_or(0.0) + found.margin_m
+                }
+                _ => false,
+            });
+            if overlaps_visit {
+                continue;
+            }
+            let mut sources = Vec::new();
+            for &member in &members {
+                in_stay[member] = true;
+                add_line(
+                    &mut sources,
+                    &located_segments,
+                    kept[member].source,
+                    kept[member].line,
+                );
+            }
+            let mut area = tier.name_point(found.latitude, found.longitude);
+            let mut place = None;
+            if let Some((within, words)) = packs
+                .and_then(|packs| packs.stop(found.latitude, found.longitude, Some(found.margin_m)))
+            {
+                area.within = within;
+                place = Some(words).filter(|words| !words.is_empty());
+            }
+            stay_entries.push(Entry::Stay {
+                device: device_index,
+                area,
+                place,
+                first,
+                last,
+                count: members.len(),
+                point: Point {
+                    latitude: found.latitude,
+                    longitude: found.longitude,
+                    accuracy_m: Some(found.margin_m),
+                },
+                sources,
+            });
+        }
+    }
+
+    for entry in &stay_entries {
+        if let Entry::Stay { device, .. } = entry {
+            devices[*device].stays += 1;
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut run: Option<(Entry, String)> = None;
+    for (index, observation) in kept.iter().enumerate() {
+        if in_stay[index] {
+            // A reading inside a stay closes the run before it.
+            if let Some((entry, _)) = run.take() {
+                entries.push(entry);
+            }
+            continue;
+        }
+        let mut area = tier.name_point(observation.point.latitude, observation.point.longitude);
+        area.within = packs.and_then(|packs| {
+            packs.within(
+                observation.point.latitude,
+                observation.point.longitude,
+                observation.point.accuracy_m,
+            )
+        });
+        let run_key = format!(
+            "{}|{}|{:?}",
+            observation.device,
+            observation.precision.as_str(),
+            area.label()
+        );
+        let extends = match &run {
+            Some((Entry::Readings { last, .. }, key)) => {
+                key == &run_key
+                    && (observation.time.utc - last.utc).num_seconds() <= RUN_BREAK_SECONDS
+            }
+            _ => false,
+        };
+        if extends {
+            if let Some((
+                Entry::Readings {
+                    last,
+                    points,
+                    sources,
+                    ..
+                },
+                _,
+            )) = &mut run
+            {
+                *last = observation.time;
+                points.push(observation.point);
+                add_line(
+                    sources,
+                    &located_segments,
+                    observation.source,
+                    observation.line,
+                );
+            }
+            continue;
+        }
+        if let Some((entry, _)) = run.take() {
+            entries.push(entry);
+        }
+        let mut sources = Vec::new();
+        add_line(
+            &mut sources,
+            &located_segments,
+            observation.source,
+            observation.line,
+        );
+        run = Some((
+            Entry::Readings {
+                device: observation.device,
+                area,
+                precision: observation.precision,
+                first: observation.time,
+                last: observation.time,
+                points: vec![observation.point],
+                sources,
+            },
+            run_key,
+        ));
+    }
+    if let Some((entry, _)) = run.take() {
+        entries.push(entry);
+    }
+
+    entries.extend(visit_entries);
+    entries.extend(stay_entries);
     entries.extend(unreadable);
     entries.sort_by(|a, b| match (a.sort_time(), b.sort_time()) {
         (Some(left), Some(right)) => left.cmp(&right),
@@ -681,6 +803,7 @@ fn assemble(
     for entry in &mut entries {
         let (Entry::Readings { sources, .. }
         | Entry::Visit { sources, .. }
+        | Entry::Stay { sources, .. }
         | Entry::Unreadable { sources, .. }) = entry;
         for source in sources.iter_mut() {
             source.lines.sort_unstable();
@@ -999,6 +1122,145 @@ pub(crate) mod tests {
         fs::remove_file(segment.join(LOCATION_FILE)).unwrap();
         fs::write(segment.join("tombstone.json"), "{}").unwrap();
         assert!(day_of(root.path()).is_empty());
+    }
+
+    #[test]
+    fn precise_readings_that_stay_put_become_one_stay_and_a_visit_wins_its_overlap() {
+        let root = tempfile::tempdir().unwrap();
+        let header = iphone_header("full", "full");
+        let dwell: Vec<String> = (0..10)
+            .map(|minute| {
+                fix(
+                    &format!("2026-10-01T20:{minute:02}:10Z"),
+                    39.7527 + f64::from(minute % 3) * 0.00002,
+                    -105.0001,
+                    8.0,
+                )
+            })
+            .collect();
+        write(
+            root.path(),
+            "20261001",
+            "phone_mobile-segment",
+            "140000_300",
+            &format!("{header}\n{}\n", dwell.join("\n")),
+        );
+        let day = day_of(root.path());
+        let stays: Vec<&Entry> = day
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Stay { .. }))
+            .collect();
+        assert_eq!(stays.len(), 1);
+        let Entry::Stay {
+            count,
+            first,
+            last,
+            area,
+            ..
+        } = stays[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*count, 10);
+        assert_eq!(
+            (first.clock().as_str(), last.clock().as_str()),
+            ("14:00", "14:09")
+        );
+        assert_eq!(area.label().as_deref(), Some("near Denver, Colorado"));
+        assert!(
+            !day.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Readings { .. })),
+            "readings inside the stay are not listed again"
+        );
+        assert_eq!(day.devices[0].readings, 10, "every reading still counts");
+
+        // The same dwell with a visit the phone reported over it is that visit.
+        write(
+            root.path(),
+            "20261001",
+            "phone_mobile-segment",
+            "141000_300",
+            &format!(
+                "{header}\n{}\n",
+                r#"{"arrival":"2026-10-01T19:59:00Z","departure":"2026-10-01T20:30:00Z","h_acc":30,"lat":39.7527,"lon":-105.0001,"schema":"solstone.location.visit/1"}"#
+            ),
+        );
+        let day = day_of(root.path());
+        assert!(
+            !day.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Stay { .. }))
+        );
+        assert_eq!(day.visits(), 1);
+    }
+
+    #[test]
+    fn a_visit_with_no_known_end_or_somewhere_else_leaves_a_stay_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let header = iphone_header("full", "full");
+        let dwell: Vec<String> = (0..10)
+            .map(|minute| {
+                fix(
+                    &format!("2026-10-01T20:{minute:02}:10Z"),
+                    39.7527,
+                    -105.0001,
+                    8.0,
+                )
+            })
+            .collect();
+        write(
+            root.path(),
+            "20261001",
+            "phone_mobile-segment",
+            "140000_300",
+            &format!("{header}\n{}\n", dwell.join("\n")),
+        );
+        write(
+            root.path(),
+            "20261001",
+            "phone_mobile-segment",
+            "141000_300",
+            &format!(
+                "{header}\n{}\n{}\n",
+                r#"{"arrival":"0001-01-01T00:00:00Z","departure":null,"h_acc":30,"lat":39.7527,"lon":-105.0001,"schema":"solstone.location.visit/1"}"#,
+                r#"{"arrival":"2026-10-01T19:00:00Z","departure":null,"h_acc":30,"lat":39.7555,"lon":-105.2211,"schema":"solstone.location.visit/1"}"#
+            ),
+        );
+        let day = day_of(root.path());
+        assert_eq!(day.visits(), 2);
+        assert!(
+            day.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Stay { .. }))
+        );
+    }
+
+    #[test]
+    fn approximate_readings_never_become_a_stay() {
+        let root = tempfile::tempdir().unwrap();
+        let rows: Vec<String> = (0..20)
+            .map(|minute| {
+                format!(
+                    r#"{{"provider":"network","timestamp":{},"lat":39.7392,"lon":-104.9903,"accuracy":2000.0,"fixAge":0}}"#,
+                    1_759_320_300_000_i64 + minute * 60_000
+                )
+            })
+            .collect();
+        write(
+            root.path(),
+            "20261001",
+            "pixel_location",
+            "060500_300",
+            &rows.join("\n"),
+        );
+        let day = day_of(root.path());
+        assert!(
+            !day.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Stay { .. }))
+        );
     }
 
     #[test]

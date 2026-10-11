@@ -4,8 +4,114 @@
   max-width: 1200px;
 }
 
-.map-shell[data-map-empty] [data-date-nav] {
+.map-shell[data-map-empty] [data-date-nav],
+.map-shell[data-map-page] [data-date-nav],
+.map-shell[data-map-page] [data-date-nav-heading] {
   display: none;
+}
+
+.map-page-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: 0 0 var(--space-4);
+}
+
+.map-page-title {
+  margin: 0 0 var(--space-2);
+  font-family: var(--font-display);
+  font-weight: var(--weight-display);
+  color: var(--ink);
+}
+
+.map-week-day {
+  border-top: 1px solid var(--hairline);
+  padding: var(--space-3) 0;
+}
+
+.map-week-day:first-of-type {
+  border-top: 0;
+}
+
+.map-strip {
+  position: relative;
+  height: 14px;
+  margin: var(--space-2) 0;
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+
+.map-strip span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--orange);
+}
+
+.map-strip span[data-kind="stay"] {
+  background: transparent;
+  border: 2px solid var(--orange);
+}
+
+.map-week-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.map-week-items li {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr);
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+}
+
+.map-places {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.map-places li {
+  border-top: 1px solid var(--hairline);
+  padding: var(--space-3) 0;
+}
+
+.map-places li:first-child {
+  border-top: 0;
+}
+
+.map-edit {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 28rem;
+}
+
+.map-edit label {
+  display: grid;
+  gap: var(--space-1);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.map-edit input[type="text"],
+.map-edit select {
+  min-height: var(--touch-min);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+}
+
+.map-edit .map-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 400;
 }
 
 .map-title {
@@ -391,6 +497,27 @@
     return [within.neighbourhood, within.locality].filter(Boolean).join(", ");
   }
 
+  function pathView() {
+    const parts = String(window.location?.pathname || "").split("/");
+    if (parts[1] !== "app" || parts[2] !== "map") return {};
+    if (parts[3] === "places") return { page: "places" };
+    if (parts[3] === "place" && parts[4]) return { page: "place", id: decodeURIComponent(parts[4]) };
+    if (parts[3] === "week" && DAY_RE.test(parts[4] || "")) return { page: "week", day: parts[4] };
+    return {};
+  }
+
+  function shortDate(day) {
+    const date = dayDate(day);
+    return date ? `${MONTHS[date.getMonth()].slice(0, 3)} ${date.getDate()}` : "";
+  }
+
+  function placeLink(ref) {
+    if (!ref || !ref.id) return "";
+    const name = ref.owner_name ? `a place you named "${escapeHtml(ref.owner_name)}"` : "a place in your journal";
+    const hidden = ref.hidden ? " · hidden from the map" : "";
+    return `<p class="map-muted"><a class="map-link" href="/app/map/place/${encodeURIComponent(ref.id)}">${name}</a>${hidden}</p>`;
+  }
+
   function setGate(markup) {
     root.hidden = true;
     gate.hidden = false;
@@ -483,7 +610,10 @@
         ? "a segment your journal couldn't read"
         : `${plural(entry.lines, "line", "lines")} your journal couldn't read`;
     }
-    const place = entry.kind === "visit" ? entry.place : null;
+    if ((entry.kind === "visit" || entry.kind === "stay") && entry.place_ref?.owner_name) {
+      return `at ${entry.place_ref.owner_name}`;
+    }
+    const place = entry.kind === "visit" || entry.kind === "stay" ? entry.place : null;
     if (place?.at) return `at ${place.at.name}`;
     if (asArray(place?.near).length) return `near ${nearNames(place)}`;
     return entry.area?.label || "no named town nearby";
@@ -491,13 +621,15 @@
 
   // Under a visit named by the download: where it was, then what was near.
   function entryWhere(entry) {
-    const place = entry.kind === "visit" ? entry.place : null;
-    if (!place) return [];
+    const place = entry.kind === "visit" || entry.kind === "stay" ? entry.place : null;
+    const named = entry.place_ref?.owner_name;
+    if (!place) return named && entry.area?.label ? [entry.area.label] : [];
     const lines = [];
+    if (named && place.at) lines.push(`at ${place.at.name}`);
     if (place.at?.inside) lines.push(`in ${place.at.inside}`);
     if (entry.area?.label) lines.push(entry.area.label);
     const where = [lines.join(" · ")];
-    if (place.at && asArray(place.near).length) where.push(`near ${nearNames(place)}`);
+    if ((place.at || named) && asArray(place.near).length) where.push(`near ${nearNames(place)}`);
     return where.filter(Boolean);
   }
 
@@ -505,14 +637,25 @@
   // margin of error.
   function entryWhy(entry, data) {
     const reasons = [];
-    const place = entry.kind === "visit" ? entry.place : null;
+    const place = entry.kind === "visit" || entry.kind === "stay" ? entry.place : null;
     const margin = place?.margin_m;
+    if (entry.place_ref?.owner_name) {
+      reasons.push(`you named this place "${entry.place_ref.owner_name}".`);
+    }
+    if (entry.kind === "stay") {
+      reasons.push(`your journal worked this stay out from ${entry.count} precise readings that stayed within 100 m of the first of them for at least five minutes. its times are the first and last of them.`);
+    }
+    // A stay's margin is the journal's circle around its readings, not one
+    // the phone reported.
+    const placed = entry.kind === "stay"
+      ? `these readings, with their margins, all fall within ${margin} m of their centre`
+      : `your phone placed you within ${margin} m`;
     if (place?.at) {
-      reasons.push(`your phone placed you within ${margin} m, and all of that is inside ${place.at.name}.`);
+      reasons.push(`${placed}, and all of that is inside ${place.at.name}.`);
     }
     asArray(place?.near).forEach((near) => {
       const what = near.category ? ` (${near.category})` : "";
-      reasons.push(`${near.name}${what} is ${near.distance_m} m away; your phone placed you within ${margin} m.`);
+      reasons.push(`${near.name}${what} is ${near.distance_m} m away; ${placed}.`);
     });
     const within = withinName(entry.area?.within);
     if (within) {
@@ -520,7 +663,9 @@
         ? `that whole area is inside ${within}.`
         : entry.kind === "readings"
           ? `every reading here, with its margin of error, is inside ${within}.`
-          : `your phone's position, with its margin of error, is inside ${within}.`);
+          : entry.kind === "stay"
+            ? `these readings, with their margins, all fall inside ${within}.`
+            : `your phone's position, with its margin of error, is inside ${within}.`);
     } else if (entry.area?.town && entry.kind !== "unreadable") {
       reasons.push(`${entry.area.town} is the town that best stands for this area, ${entry.area.town_km} km away.`);
     }
@@ -540,6 +685,9 @@
     if (entry.kind === "visit") {
       return `${entry.arrival ? moment(entry.arrival, day) : "…"}–\u200b${entry.departure ? moment(entry.departure, day) : "…"}`;
     }
+    if (entry.kind === "stay") {
+      return `${moment(entry.first, day)}–\u200b${moment(entry.last, day)}`;
+    }
     return entry.at ? moment(entry.at, day) : "";
   }
 
@@ -551,6 +699,9 @@
       parts.push(plural(entry.count, "reading", "readings"));
       if (entry.precision === "approximate" || entry.precision === "reduced") parts.push("approximate");
       if (many) parts.push(`from ${device.phrase}`);
+    } else if (entry.kind === "stay") {
+      parts.push(`a stay your journal worked out from readings from ${device.phrase}`);
+      parts.push(plural(entry.count, "reading", "readings"));
     } else if (entry.kind === "visit") {
       parts.push(`a visit ${device.phrase} reported`);
       parts.push(entry.arrival ? `arrived ${moment(entry.arrival, data.day)}` : "arrival not known");
@@ -565,7 +716,10 @@
   function entryActions(entry, index) {
     const segments = asArray(entry.segments);
     const actions = [];
-    if (entry.kind !== "unreadable") {
+    const drawn = entry.kind === "readings"
+      ? asArray(entry.map_points ?? entry.points).length > 0
+      : entry.on_map !== false;
+    if (entry.kind !== "unreadable" && drawn) {
       actions.push(`<button type="button" data-map-show="${index}">show on the map</button>`);
     }
     if (segments.length === 1) {
@@ -585,7 +739,7 @@
     if (entry.kind === "readings") {
       return entry.precision === "precise" ? "map-row-mark-readings" : "map-row-mark-approximate";
     }
-    return `map-row-mark-${entry.kind}`;
+    return `map-row-mark-${entry.kind === "stay" ? "visit" : entry.kind}`;
   }
 
   function renderEntry(entry, index, data) {
@@ -597,7 +751,7 @@
     return `<li class="map-row" data-map-entry="${index}">
       <span class="map-row-time">${escapeHtml(entryTime(entry, data.day))}</span>
       <span class="map-row-mark ${markClass(entry)}" aria-hidden="true"></span>
-      <div><p class="map-row-title">${escapeHtml(entryTitle(entry))}</p>${where}
+      <div><p class="map-row-title">${escapeHtml(entryTitle(entry))}</p>${where}${placeLink(entry.place_ref)}
       <p class="map-muted">${escapeHtml(entryMeta(entry, data))}</p>${why}${entryActions(entry, index)}</div></li>`;
   }
 
@@ -712,7 +866,8 @@
         </section>`
       : "";
     const accuracy = accuracyCard(data.accuracy) || "<div data-accuracy-card hidden></div>";
-    reveal(`${devices.map((device) => renderDevice(device, data.day)).join("")}
+    reveal(`<nav class="map-page-nav" aria-label="more of your location"><a class="map-link" href="/app/map/week/${escapeHtml(data.day)}">this week</a><a class="map-link" href="/app/map/places">places</a></nav>
+      ${devices.map((device) => renderDevice(device, data.day)).join("")}
       <div class="map-columns">
         <section class="map-card" aria-label="the day, in order">
           <div class="map-list-head"><h2>the day, in order</h2>
@@ -728,6 +883,8 @@
         <p>without location accuracy, each reading is named after the town that best stands for its area, which isn't always the town you were in. that's why it says "near".</p>
         ${accuracyDrawn(data.accuracy)}
         <p>for readings, the times are the first and last reading in the row. they don't say how long you were anywhere.</p>
+        <p>a stay is worked out from precise readings, none more than five minutes apart, that stayed within 100 m of the first of them for at least five minutes. approximate readings never make a stay. its times are its first and last reading.</p>
+        <p>on the map, a run of precise readings shows as one dot at its middle reading, so a day doesn't read as a route. the list counts every reading.</p>
       </details></section>
       <section class="map-card"><h2>deleting any of this</h2>
         <p class="map-muted">every record above opens in transcripts, where you delete its segments the same way as any other. a deleted segment leaves this view and search.</p>
@@ -753,6 +910,13 @@
     return span;
   }
 
+  // A precise run can hold hundreds of readings that read like a route when
+  // all drawn, so the map draws the run as one dot at its middle reading.
+  // The list keeps every reading.
+  function thinned(points) {
+    return points.length ? [points[Math.floor(points.length / 2)]] : [];
+  }
+
   function drawMap(data) {
     const L = window.L;
     const element = document.getElementById("map-canvas");
@@ -774,8 +938,17 @@
     const layers = [];
     asArray(data.entries).forEach((entry, index) => {
       const group = L.featureGroup();
-      const points = entry.kind === "readings" ? asArray(entry.points) : entry.kind === "visit" ? [entry.point] : [];
-      const outline = entry.kind === "visit" ? asArray(entry.place?.at?.outline) : [];
+      // Nothing near a place the owner hid is drawn; the list still shows it.
+      const stop = entry.kind === "visit" || entry.kind === "stay";
+      if (stop && entry.on_map === false) {
+        layers[index] = null;
+        return;
+      }
+      const drawable = asArray(entry.map_points ?? entry.points);
+      const points = entry.kind === "readings"
+        ? (entry.precision === "precise" ? thinned(drawable) : drawable)
+        : stop ? [entry.point] : [];
+      const outline = stop ? asArray(entry.place?.at?.outline) : [];
       if (outline.length) {
         L.polygon(outline, { color: orange, weight: 1.5, dashArray: "3 3", fillColor: orange, fillOpacity: 0.06, interactive: false }).addTo(group);
       }
@@ -784,7 +957,7 @@
         if (Number.isFinite(accuracy) && accuracy > 25) {
           L.circle([lat, lon], { radius: accuracy, stroke: false, fillColor: orange, fillOpacity: accuracy > 500 ? 0.025 : 0.07, interactive: false }).addTo(group);
         }
-        const marker = entry.kind === "visit"
+        const marker = stop
           ? L.circleMarker([lat, lon], { radius: 8, color: orange, weight: 2.5, fill: false })
           : L.circleMarker([lat, lon], { radius: 3.5, color: orange, weight: 1, fillColor: orange, fillOpacity: entry.precision === "precise" ? 0.9 : 0.35 });
         marker.on("click", () => focusEntry(index, false));
@@ -829,7 +1002,148 @@
     }
   }
 
+  function pageShell(title, body) {
+    shell.setAttribute("data-map-page", "");
+    reveal(`<nav class="map-page-nav" aria-label="more of your location"><a class="map-link" href="/app/map/">the day</a><a class="map-link" href="/app/map/places">places</a></nav>
+      <h1 class="map-page-title">${escapeHtml(title)}</h1>${body}`);
+  }
+
+  function recorded(place) {
+    const span = place.first && place.last && place.first !== place.last
+      ? `, ${shortDate(place.first)} to ${shortDate(place.last)}`
+      : place.first ? `, ${shortDate(place.first)}` : "";
+    const lines = [`visits or stays here on ${plural(place.dates, "date", "dates")}${span}.`];
+    if (place.night_dates) {
+      lines.push(`on ${plural(place.night_dates, "night", "nights")}, a visit or stay here covers at least two hours between 22:00 and 06:00.`);
+    }
+    return lines;
+  }
+
+  function renderPlaces(data) {
+    const places = asArray(data.places);
+    const items = places.map((place) => `<li>
+        <p class="map-row-title"><a class="map-link" href="/app/map/place/${encodeURIComponent(place.id)}">${escapeHtml(place.label)}</a></p>
+        ${place.owner_name && place.area?.label ? `<p class="map-row-where">${escapeHtml(place.area.label)}</p>` : ""}
+        ${recorded(place).map((line) => `<p class="map-muted">${escapeHtml(line)}</p>`).join("")}
+        ${place.hidden ? '<p class="map-muted">hidden from the map</p>' : ""}</li>`).join("");
+    const body = places.length
+      ? `<section class="map-card"><ol class="map-places">${items}</ol></section>`
+      : `<section class="map-card"><p>no places yet.</p><p class="map-muted">a place is a spot your phone reported a visit at, or stayed at, on two different dates, close enough to be one spot. approximate location never makes a place.</p></section>`;
+    pageShell("places", `${body}
+      <section class="map-card"><details class="map-details"><summary>how places are worked out</summary>
+        <p>a place starts from visits or stays on two or more dates, all within 50 m of each other and more than 100 m from any other place. later ones within 50 m of it join it. a stay or visit with a margin of error over 50 m never makes or joins one.</p>
+        <p>you can name a place, call it home or work, or hide it from the map. hiding keeps everything within 50 m of it off the map; the day's list still shows it.</p>
+        <p>a place lasts as long as a segment it came from does. delete those segments in transcripts and the place, and its name, go too.</p>
+      </details></section>`);
+  }
+
+  function renderPlace(place) {
+    const stays = asArray(place.stays).slice().reverse();
+    const visits = stays.map((stay) => {
+      const clock = (value) => value || "…";
+      const how = stay.kind === "worked" ? "a stay your journal worked out" : "a visit your phone reported";
+      const date = dayDate(stay.day);
+      const label = date ? `${WEEKDAYS[date.getDay()].slice(0, 3)} ${shortDate(stay.day)}` : stay.day;
+      return `<li><span class="map-muted"><a class="map-link" href="/app/map/${escapeHtml(stay.day)}">${escapeHtml(label)}</a></span>
+        <span>${escapeHtml(`${clock(stay.start)}–${clock(stay.end)}`)} · ${escapeHtml(how)}</span></li>`;
+    }).join("");
+    const where = [place.owner_name ? place.area?.label : null, place.words?.at && place.owner_name ? `at ${place.words.at.name}` : null]
+      .filter(Boolean).map((line) => `<p class="map-row-where">${escapeHtml(line)}</p>`).join("");
+    const alias = place.alias || "";
+    pageShell(place.label, `${where}
+      <section class="map-card">${recorded(place).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}
+        ${place.hidden ? '<p class="map-muted">hidden from the map</p>' : ""}</section>
+      <section class="map-card" aria-label="edit this place"><h2>edit this place</h2>
+        <form class="map-edit" data-place-form>
+          <label>name<input type="text" name="name" maxlength="80" value="${escapeHtml(place.name || "")}" placeholder="${escapeHtml(place.label)}"></label>
+          <label>call it<select name="alias">
+            <option value=""${alias ? "" : " selected"}>nothing</option>
+            <option value="home"${alias === "home" ? " selected" : ""}>home</option>
+            <option value="work"${alias === "work" ? " selected" : ""}>work</option>
+          </select></label>
+          <p class="map-muted">what you call a place, a name or home or work, is used in search and by your journal's own thinking, and an agent that may see transcripts across your whole journal can read it.</p>
+          <label class="map-check"><input type="checkbox" name="hidden"${place.hidden ? " checked" : ""}> hide from the map</label>
+          <div class="map-accuracy-actions"><button type="submit">save</button><span class="map-muted" role="status" data-place-status></span></div>
+        </form></section>
+      <section class="map-card"><h2>visits and stays here</h2><ul class="map-week-items">${visits}</ul></section>
+      <section class="map-card"><p class="map-muted">to remove a visit or stay, open its day and delete its segments in transcripts. a place lasts as long as a segment it came from does.</p></section>`);
+    const form = root.querySelector("[data-place-form]");
+    form?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const status = root.querySelector("[data-place-status]");
+      const values = {
+        name: form.elements.name.value.trim() || null,
+        alias: form.elements.alias.value || null,
+        hidden: form.elements.hidden.checked,
+      };
+      try {
+        const next = await window.apiJson(`/app/map/api/place/${encodeURIComponent(place.id)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(values),
+        });
+        renderPlace(next);
+        const saved = root.querySelector("[data-place-status]");
+        if (saved) saved.textContent = "saved.";
+      } catch (err) {
+        if (window.logError) window.logError(err, { context: "map:place" });
+        if (status) status.textContent = "that change couldn't be saved.";
+      }
+    });
+  }
+
+  function renderWeek(data) {
+    const days = asArray(data.days);
+    const sections = days.map((day) => {
+      const items = asArray(day.items);
+      const blocks = items.map((item) => {
+        const start = item.kind === "stay" ? item.first : item.arrival;
+        const end = item.kind === "stay" ? item.last : item.departure;
+        const minute = (time, fallback) => {
+          if (!time) return fallback;
+          if (time.day < day.day) return 0;
+          if (time.day > day.day) return 1440;
+          const [h, m] = String(time.clock).split(":").map(Number);
+          return h * 60 + m;
+        };
+        const from = minute(start, 0);
+        const to = Math.max(minute(end, 1440), from + 1);
+        return `<span data-kind="${escapeHtml(item.kind)}" style="left:${(from / 14.4).toFixed(2)}%;width:${((to - from) / 14.4).toFixed(2)}%"></span>`;
+      }).join("");
+      const rows = items.map((item) => `<li><span class="map-muted">${escapeHtml(entryTime(item, day.day))}</span>
+        <span>${escapeHtml(entryTitle(item))}${item.place_ref?.id ? ` · <a class="map-link" href="/app/map/place/${encodeURIComponent(item.place_ref.id)}">place</a>` : ""}</span></li>`).join("");
+      const quiet = day.readings
+        ? `${plural(day.readings, "reading", "readings")}, no visits or stays`
+        : "no location kept";
+      return `<section class="map-week-day" aria-label="${escapeHtml(longDay(day.day))}">
+        <p class="map-row-title"><a class="map-link" href="/app/map/${escapeHtml(day.day)}">${escapeHtml(longDay(day.day))}</a></p>
+        ${items.length ? `<div class="map-strip" role="img" aria-label="visits and stays across the day">${blocks}</div><ul class="map-week-items">${rows}</ul>` : `<p class="map-muted">${escapeHtml(quiet)}</p>`}
+      </section>`;
+    }).join("");
+    pageShell(`the week of ${longDay(data.start)}`, `<nav class="map-page-nav" aria-label="other weeks">
+        <a class="map-link" href="/app/map/week/${escapeHtml(data.previous)}">the week before</a>
+        <a class="map-link" href="/app/map/week/${escapeHtml(data.next)}">the week after</a></nav>
+      <section class="map-card">${sections}</section>
+      <section class="map-card"><p class="map-muted">filled bars are visits your phone reported; outlined bars are stays your journal worked out. every reading is on each day's page.</p></section>`);
+  }
+
+  async function loadPage(view) {
+    setGate(window.SurfaceState.loading({ text: "loading…" }));
+    try {
+      if (view.page === "places") renderPlaces(await window.apiJson("/app/map/api/places"));
+      else if (view.page === "place") renderPlace(await window.apiJson(`/app/map/api/place/${encodeURIComponent(view.id)}`));
+      else renderWeek(await window.apiJson(`/app/map/api/week/${encodeURIComponent(view.day)}`));
+    } catch (err) {
+      showError(err, () => loadPage(view));
+    }
+  }
+
   async function start() {
+    const view = pathView();
+    if (view.page) {
+      await loadPage(view);
+      return;
+    }
     const { day } = window.solPathContext ? window.solPathContext() : {};
     if (DAY_RE.test(String(day || ""))) {
       await loadDay(day);
@@ -849,7 +1163,7 @@
     }
   }
 
-  window.__mapWorkspace = { start, renderDay, entryTitle, entryTime, entryMeta, entryWhere, entryWhy, accuracyCard, moment };
+  window.__mapWorkspace = { start, renderDay, renderWeek, renderPlaces, renderPlace, entryTitle, entryTime, entryMeta, entryWhere, entryWhy, accuracyCard, moment, thinned };
   start();
 })();
 </script>
