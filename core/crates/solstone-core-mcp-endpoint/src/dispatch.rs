@@ -367,6 +367,15 @@ fn owner_denial_reason(reason: &'static str) -> &'static str {
 /// admission and permission is decided above. They are kept exhaustive and
 /// worded accurately rather than left to imply a path that does not exist.
 ///
+/// The title an agent shows for an indexed entry: the day when there is one.
+fn entry_title(day: &str) -> String {
+    if day.is_empty() {
+        "journal entry".to_owned()
+    } else {
+        format!("journal entry from {day}")
+    }
+}
+
 /// ⛔ **Never name the journal's derived index as "the journal index".**
 /// Owner-facing copy reserves "the journal" for the owner's files. An owner
 /// reading *"the journal index is empty"* can read it as **their journal** being
@@ -1164,7 +1173,7 @@ fn search(
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
             let mut value = json!({
-                "title": format!("Indexed journal entry — {}", hit.metadata.day),
+                "title": entry_title(&hit.metadata.day),
                 "date": hit.metadata.day,
                 "snippet": snippet(&hit.text),
                 "reference": reference,
@@ -1373,7 +1382,7 @@ fn fetch(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
-    let mut value = json!({"title": format!("Indexed journal entry — {}", entry.day), "date": entry.day, "text": text});
+    let mut value = json!({"title": entry_title(&entry.day), "date": entry.day, "text": text});
     if entry.stream.starts_with("agent-memory-") {
         let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
             .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;

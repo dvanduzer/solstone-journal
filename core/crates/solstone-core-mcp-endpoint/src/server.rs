@@ -2182,7 +2182,7 @@ mod tests {
         .0;
         assert_eq!(
             fetch["result"]["structuredContent"],
-            json!({"title": "Indexed journal entry — 20260831", "date": "20260831", "text": "MCP fixture search needle"})
+            json!({"title": "journal entry from 20260831", "date": "20260831", "text": "MCP fixture search needle"})
         );
         client.shutdown().await.expect("client closes TLS");
         drop(client);
@@ -2251,7 +2251,7 @@ mod tests {
         .await;
         assert_eq!(
             fetch["result"]["structuredContent"],
-            json!({"title": "Indexed journal entry — 20260831", "date": "20260831", "text": "MCP fixture search needle"})
+            json!({"title": "journal entry from 20260831", "date": "20260831", "text": "MCP fixture search needle"})
         );
         client.shutdown().await.expect("client closes TLS");
         drop(client);
@@ -3369,7 +3369,7 @@ mod tests {
         .0;
         assert_eq!(
             fetch["result"]["structuredContent"],
-            json!({"title": "Indexed journal entry — 20260831", "date": "20260831", "text": "MCP fixture search needle"})
+            json!({"title": "journal entry from 20260831", "date": "20260831", "text": "MCP fixture search needle"})
         );
         assert_eq!(audit_record_count(server.journal.path()), 2);
         exercise_memory_postures(&server, &mut client, &access, &verified_oauth.id).await;
@@ -4048,7 +4048,7 @@ mod unit_tests {
         assert!(fetch_body.get("error").is_none());
         assert_ne!(fetch_body["result"]["isError"], true);
         let fetched = &fetch_body["result"]["structuredContent"];
-        assert_eq!(fetched["title"], "Indexed journal entry — 20260831");
+        assert_eq!(fetched["title"], "journal entry from 20260831");
         assert_eq!(fetched["date"], "20260831");
         assert_eq!(fetched["text"], "MCP fixture search needle");
 
