@@ -404,14 +404,7 @@ pub fn read_observed_root_file_bounded(
     })
 }
 
-pub(crate) fn read_observed_file_unchecked(
-    directory: &FlatDirectory,
-    name: &OsStr,
-) -> Result<Option<FileObservation>, FlatDirectoryError> {
-    read_observed_file_unchecked_bounded(directory, name, usize::MAX)
-}
-
-fn read_observed_file_unchecked_bounded(
+pub(crate) fn read_observed_file_unchecked_bounded(
     directory: &FlatDirectory,
     name: &OsStr,
     maximum: usize,

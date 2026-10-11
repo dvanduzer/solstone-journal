@@ -119,13 +119,13 @@ pub use atomic::{write_bytes_exclusive, write_reader_exclusive};
 #[cfg(any(unix, windows))]
 pub use atomic::{write_jsonl, write_text};
 pub use bounded_read::{JournalReadError, MAX_BYTES, resolve_read_path};
-#[cfg(unix)]
-pub use claim_remove::claim_and_remove_observed;
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use claim_remove::{
     ClaimRemovalPrimitive, run_with_claim_removal_barrier, run_with_claim_removal_fault,
     run_with_two_claim_removal_barriers,
 };
+#[cfg(unix)]
+pub use claim_remove::{claim_and_remove_observed, claim_and_remove_observed_bounded};
 pub use daily_unit::{
     AcceptedDailyResult, DAILY_UNIT_RECORD_VERSION, DailyUnitAuthority, DailyUnitError,
     DailyUnitIdentity, DailyUnitRecord, DailyUnitStatus, OWNER_REPROCESS_SENTINEL,

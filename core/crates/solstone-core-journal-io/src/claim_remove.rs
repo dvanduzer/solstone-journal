@@ -16,7 +16,7 @@ use crate::errors::{
     ClaimDurability, ClaimRemovalError, ClaimRemovalOutcome, ClaimUnchangedReason,
     FlatDirectoryError, IdentityChangeDisposition, NoReplacePrimitive,
 };
-use crate::flat_directory::{FlatDirectory, read_observed_file_unchecked, stat_entry};
+use crate::flat_directory::{FlatDirectory, read_observed_file_unchecked_bounded, stat_entry};
 use crate::name_admission::{ClaimName, check_portable_component};
 use crate::observation::{
     FileObservation, FlatDirectoryEntry, same_entry_metadata, same_observation,
@@ -226,6 +226,21 @@ pub fn claim_and_remove_observed(
     prior: &FileObservation,
     claim: &ClaimName,
 ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
+    claim_and_remove_observed_bounded(directory, original, prior, claim, usize::MAX)
+}
+
+/// Claim and remove an observed file while bounding every inspection read.
+///
+/// A size or inspection failure after the claim may leave the entry under
+/// `claim`; preserve that error and the owned directory rather than assuming
+/// no effect or unlinking an unverified entry.
+pub fn claim_and_remove_observed_bounded(
+    directory: &FlatDirectory,
+    original: &OsStr,
+    prior: &FileObservation,
+    claim: &ClaimName,
+    maximum: usize,
+) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
     validate_original_name(original)?;
     if original != prior.entry.name.as_os_str() {
         return Err(ClaimRemovalError::ObservationNameMismatch {
@@ -253,7 +268,7 @@ pub fn claim_and_remove_observed(
     if !same_entry_metadata(&original_stat, &prior.entry) {
         return Ok(unknown_location());
     }
-    match observation_state(directory, original, prior).map_err(preflight_error)? {
+    match observation_state(directory, original, prior, maximum).map_err(preflight_error)? {
         ObservationState::Matches => {}
         ObservationState::Absent | ObservationState::Different => return Ok(unknown_location()),
     }
@@ -289,7 +304,7 @@ pub fn claim_and_remove_observed(
             }
             RenameErrorClass::SourceAbsent => return Ok(unknown_location()),
             RenameErrorClass::Ambiguous => {
-                match reconcile_claim_rename(directory, original, prior, claim)? {
+                match reconcile_claim_rename(directory, original, prior, claim, maximum)? {
                     ClaimReconciliation::Succeeded => {}
                     ClaimReconciliation::Unchanged => {
                         return Ok(unchanged(
@@ -312,7 +327,8 @@ pub fn claim_and_remove_observed(
             },
         }
     })?;
-    let claimed = match read_observed_file_unchecked(directory, claim.as_os_str()) {
+    let claimed = match read_observed_file_unchecked_bounded(directory, claim.as_os_str(), maximum)
+    {
         Ok(Some(observation)) => ClaimedObject::Observed(observation),
         Ok(None) => return Ok(unknown_location()),
         Err(FlatDirectoryError::NotRegular { .. } | FlatDirectoryError::IdentityChanged { .. }) => {
@@ -338,7 +354,7 @@ pub fn claim_and_remove_observed(
     {
         return unlink_matching_claim(directory, claim);
     }
-    restore_changed_claim(directory, original, &claimed, claim)
+    restore_changed_claim(directory, original, &claimed, claim, maximum)
 }
 
 fn validate_original_name(original: &OsStr) -> Result<(), ClaimRemovalError> {
@@ -373,8 +389,9 @@ fn observation_state(
     directory: &FlatDirectory,
     name: &OsStr,
     expected: &FileObservation,
+    maximum: usize,
 ) -> Result<ObservationState, FlatDirectoryError> {
-    match read_observed_file_unchecked(directory, name) {
+    match read_observed_file_unchecked_bounded(directory, name, maximum) {
         Ok(Some(observed)) if same_observation(&observed, expected) => {
             Ok(ObservationState::Matches)
         }
@@ -391,9 +408,12 @@ fn claimed_object_state(
     directory: &FlatDirectory,
     name: &OsStr,
     expected: &ClaimedObject,
+    maximum: usize,
 ) -> Result<ObservationState, FlatDirectoryError> {
     match expected {
-        ClaimedObject::Observed(observation) => observation_state(directory, name, observation),
+        ClaimedObject::Observed(observation) => {
+            observation_state(directory, name, observation, maximum)
+        }
         ClaimedObject::StatOnly(expected) => match stat_entry(directory, name)? {
             Some(observed) if same_entry_metadata(&observed, expected) => {
                 Ok(ObservationState::Matches)
@@ -415,21 +435,24 @@ fn reconcile_claim_rename(
     original: &OsStr,
     prior: &FileObservation,
     claim: &ClaimName,
+    maximum: usize,
 ) -> Result<ClaimReconciliation, ClaimRemovalError> {
-    let original_state = observation_state(directory, original, prior).map_err(|source| {
-        ClaimRemovalError::Reconciliation {
-            original: original.to_os_string(),
-            claim: claim.clone(),
-            source,
-        }
-    })?;
-    let claim_state = observation_state(directory, claim.as_os_str(), prior).map_err(|source| {
-        ClaimRemovalError::Reconciliation {
-            original: original.to_os_string(),
-            claim: claim.clone(),
-            source,
-        }
-    })?;
+    let original_state =
+        observation_state(directory, original, prior, maximum).map_err(|source| {
+            ClaimRemovalError::Reconciliation {
+                original: original.to_os_string(),
+                claim: claim.clone(),
+                source,
+            }
+        })?;
+    let claim_state =
+        observation_state(directory, claim.as_os_str(), prior, maximum).map_err(|source| {
+            ClaimRemovalError::Reconciliation {
+                original: original.to_os_string(),
+                claim: claim.clone(),
+                source,
+            }
+        })?;
     match (original_state, claim_state) {
         (ObservationState::Matches, ObservationState::Matches) => {
             Err(ClaimRemovalError::ReconciliationInconclusive {
@@ -475,6 +498,7 @@ fn restore_changed_claim(
     original: &OsStr,
     claimed: &ClaimedObject,
     claim: &ClaimName,
+    maximum: usize,
 ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
     checkpoint(ClaimRemovalPrimitive::BeforeRestore).map_err(|source| {
         ClaimRemovalError::RestoreFailure {
@@ -502,7 +526,7 @@ fn restore_changed_claim(
                 source,
             }),
             RenameErrorClass::Ambiguous => {
-                reconcile_restore_rename(directory, original, claimed, claim)
+                reconcile_restore_rename(directory, original, claimed, claim, maximum)
             }
         },
     }
@@ -513,21 +537,21 @@ fn reconcile_restore_rename(
     original: &OsStr,
     claimed: &ClaimedObject,
     claim: &ClaimName,
+    maximum: usize,
 ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
-    let original_state = claimed_object_state(directory, original, claimed).map_err(|source| {
-        ClaimRemovalError::Reconciliation {
-            original: original.to_os_string(),
-            claim: claim.clone(),
-            source,
-        }
-    })?;
-    let claim_state =
-        claimed_object_state(directory, claim.as_os_str(), claimed).map_err(|source| {
+    let original_state =
+        claimed_object_state(directory, original, claimed, maximum).map_err(|source| {
             ClaimRemovalError::Reconciliation {
                 original: original.to_os_string(),
                 claim: claim.clone(),
                 source,
             }
+        })?;
+    let claim_state = claimed_object_state(directory, claim.as_os_str(), claimed, maximum)
+        .map_err(|source| ClaimRemovalError::Reconciliation {
+            original: original.to_os_string(),
+            claim: claim.clone(),
+            source,
         })?;
     match (original_state, claim_state) {
         (ObservationState::Matches, ObservationState::Matches) => {
@@ -795,6 +819,157 @@ mod tests {
         let directory = FlatDirectory::open(&root, Path::new("flat")).unwrap();
         let claim = ClaimName::parse("!solstone-claim-00000001-0000000000000001").unwrap();
         (temporary, root, directory, claim)
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    mod bounded {
+        use super::*;
+
+        #[test]
+        fn removes_exact_content_at_the_read_limit() {
+            let (temporary, _root, directory, claim) = setup();
+            let original = temporary.path().join("flat/entry");
+            fs::write(&original, b"observed").unwrap();
+            let prior = crate::flat_directory::read_observed_file(&directory, OsStr::new("entry"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                claim_and_remove_observed_bounded(
+                    &directory,
+                    OsStr::new("entry"),
+                    &prior,
+                    &claim,
+                    prior.bytes.len(),
+                )
+                .unwrap(),
+                ClaimRemovalOutcome::Removed,
+            );
+            assert!(!original.exists());
+            assert!(!temporary.path().join("flat").join(claim.as_str()).exists());
+        }
+
+        #[test]
+        fn oversized_preclaim_content_is_untouched() {
+            let (temporary, _root, directory, claim) = setup();
+            let original = temporary.path().join("flat/entry");
+            fs::write(&original, b"observed").unwrap();
+            let prior = crate::flat_directory::read_observed_file(&directory, OsStr::new("entry"))
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                claim_and_remove_observed_bounded(
+                    &directory,
+                    OsStr::new("entry"),
+                    &prior,
+                    &claim,
+                    prior.bytes.len() - 1,
+                ),
+                Err(ClaimRemovalError::Preflight {
+                    source: FlatDirectoryError::SizeLimitExceeded { .. },
+                }),
+            ));
+            assert_eq!(fs::read(original).unwrap(), prior.bytes);
+            assert!(!temporary.path().join("flat").join(claim.as_str()).exists());
+        }
+
+        #[test]
+        fn oversized_postclaim_replacement_is_retained_with_its_error() {
+            let (temporary, _root, directory, claim) = setup();
+            let original = temporary.path().join("flat/entry");
+            let claimed = temporary.path().join("flat").join(claim.as_str());
+            fs::write(&original, b"observed").unwrap();
+            let prior = crate::flat_directory::read_observed_file(&directory, OsStr::new("entry"))
+                .unwrap()
+                .unwrap();
+            let replacement = claimed.clone();
+            let (result, fired) = run_with_claim_removal_barrier(
+                ClaimRemovalPrimitive::BeforeInspection,
+                1,
+                move || fs::write(replacement, vec![b'x'; 513]).unwrap(),
+                || {
+                    claim_and_remove_observed_bounded(
+                        &directory,
+                        OsStr::new("entry"),
+                        &prior,
+                        &claim,
+                        512,
+                    )
+                },
+            );
+            assert!(fired);
+            assert!(matches!(
+                result,
+                Err(ClaimRemovalError::PostClaimInspection {
+                    claim: retained,
+                    source: FlatDirectoryError::SizeLimitExceeded {
+                        size: 513,
+                        limit: 512,
+                        ..
+                    },
+                }) if retained == claim,
+            ));
+            assert!(!original.exists());
+            assert_eq!(fs::read(claimed).unwrap(), vec![b'x'; 513]);
+        }
+
+        #[test]
+        fn restores_changed_content_and_preserves_removal_sync_uncertainty() {
+            let (temporary, _root, directory, claim) = setup();
+            let original = temporary.path().join("flat/entry");
+            fs::write(&original, b"observed").unwrap();
+            let prior = crate::flat_directory::read_observed_file(&directory, OsStr::new("entry"))
+                .unwrap()
+                .unwrap();
+            let replacement = original.clone();
+            let (changed, fired) = run_with_claim_removal_barrier(
+                ClaimRemovalPrimitive::BeforeClaim,
+                1,
+                move || fs::write(replacement, b"changed").unwrap(),
+                || {
+                    claim_and_remove_observed_bounded(
+                        &directory,
+                        OsStr::new("entry"),
+                        &prior,
+                        &claim,
+                        512,
+                    )
+                },
+            );
+            assert!(fired);
+            assert_eq!(
+                changed.unwrap(),
+                ClaimRemovalOutcome::IdentityChanged {
+                    disposition: IdentityChangeDisposition::Restored,
+                    durability: ClaimDurability::Synced,
+                },
+            );
+            assert_eq!(fs::read(&original).unwrap(), b"changed");
+            let current =
+                crate::flat_directory::read_observed_file(&directory, OsStr::new("entry"))
+                    .unwrap()
+                    .unwrap();
+            let (removed, fired) = run_with_claim_removal_fault(
+                ClaimRemovalPrimitive::DirectorySync,
+                1,
+                libc::EIO,
+                || {
+                    claim_and_remove_observed_bounded(
+                        &directory,
+                        OsStr::new("entry"),
+                        &current,
+                        &claim,
+                        512,
+                    )
+                },
+            );
+            assert!(fired);
+            assert_eq!(
+                removed.unwrap(),
+                ClaimRemovalOutcome::RemovedDurabilityUncertain
+            );
+            assert!(!original.exists());
+            assert!(!temporary.path().join("flat").join(claim.as_str()).exists());
+        }
     }
 
     #[test]
