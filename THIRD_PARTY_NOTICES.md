@@ -748,10 +748,13 @@ Source:
 
 | Bundled file | SHA-256 |
 |---|---|
-| `bin/msvcp140.dll`      | `0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9` |
-| `bin/vcruntime140.dll`  | `d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066` |
-| `bin/vcruntime140_1.dll`| `1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f` |
-| `bin/vcomp140.dll`      | `55aba23cdcd6484fbb06f4155b8ca75adfce7a881f10afd0c49457165e677164` |
+| `lib/solstone-native/msvcp140.dll` | `0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9` |
+| `lib/solstone-native/vcruntime140.dll` | `d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066` |
+| `lib/solstone-native/vcruntime140_1.dll` | `1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f` |
+| `lib/solstone-native/vcomp140.dll` | `55aba23cdcd6484fbb06f4155b8ca75adfce7a881f10afd0c49457165e677164` |
+| `lib/solstone-nvattest/msvcp140.dll` | `0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9` |
+| `lib/solstone-nvattest/vcruntime140.dll` | `d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066` |
+| `lib/solstone-nvattest/vcruntime140_1.dll` | `1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f` |
 
 License notice: sol pbc redistributes these components under the Distributable
 Code terms of the Microsoft Visual Studio 2022 license, published at
