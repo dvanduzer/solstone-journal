@@ -171,6 +171,14 @@ impl fmt::Debug for ArchiveOriginEvidence {
 }
 
 impl ArchiveOriginEvidence {
+    pub fn boot_id(&self) -> &str {
+        &self.0.boot_id
+    }
+
+    pub(crate) fn root_device(&self) -> u64 {
+        unix_observation(&self.0.root_identity).expect("validated origin identity")
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self, OriginEvidenceError> {
         if bytes.len() > MAX_EVIDENCE_BYTES {
             return Err(OriginEvidenceError::TooLarge);
@@ -180,6 +188,14 @@ impl ArchiveOriginEvidence {
         validate_evidence(&wire).map_err(|_| OriginEvidenceError::Invalid)?;
         Ok(Self(wire))
     }
+}
+
+pub(crate) fn deserialize_evidence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ArchiveOriginEvidence, D::Error> {
+    let wire = EvidenceWire::deserialize(deserializer)?;
+    validate_evidence(&wire).map_err(serde::de::Error::custom)?;
+    Ok(ArchiveOriginEvidence(wire))
 }
 
 fn lower_hex(bytes: &[u8]) -> bool {
@@ -334,6 +350,10 @@ impl OriginObservationFailure {
 }
 
 impl LocalArchiveOrigin {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
     pub fn evidence(&self) -> &ArchiveOriginEvidence {
         &self.evidence
     }
@@ -1246,6 +1266,60 @@ mod tests {
             root.identity().observation_id()
         );
         origin.revalidate().unwrap();
+        let lease = crate::activity::ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+        let carrier = crate::media::RootActivityCarrier::prepare(Arc::clone(&lease)).unwrap();
+        let lock_path = path.join("backup-activity.lock");
+        let lock_bytes = std::fs::read(&lock_path).unwrap();
+        let binding = carrier
+            .observe_recovery_binding(&origin, &"a".repeat(64))
+            .unwrap();
+        assert_eq!(binding.origin(), origin.evidence());
+        assert_eq!(binding.repository_id(), "a".repeat(64));
+        carrier.revalidate().unwrap();
+        assert_eq!(std::fs::read(&lock_path).unwrap(), lock_bytes);
+        let reopened = Arc::new(JournalRoot::open(&path).unwrap());
+        let other_origin = observe_archive_origin(reopened).unwrap();
+        assert!(
+            carrier
+                .observe_recovery_binding(&other_origin, &"a".repeat(64))
+                .is_err()
+        );
+        let alias = path.join("lock-alias");
+        std::fs::hard_link(&lock_path, &alias).unwrap();
+        lease.revalidate().unwrap();
+        assert!(
+            carrier
+                .observe_recovery_binding(&origin, &"a".repeat(64))
+                .is_err()
+        );
+        std::fs::remove_file(alias).unwrap();
+        carrier
+            .observe_recovery_binding(&origin, &"a".repeat(64))
+            .unwrap();
+        let payload = carrier.diagnostic_path().join("unexpected");
+        std::fs::write(&payload, b"held").unwrap();
+        assert!(
+            carrier
+                .observe_recovery_binding(&origin, &"a".repeat(64))
+                .is_err()
+        );
+        std::fs::remove_file(payload).unwrap();
+        let displaced_lock = path.join("old-lock");
+        std::fs::rename(&lock_path, &displaced_lock).unwrap();
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            carrier
+                .observe_recovery_binding(&origin, &"a".repeat(64))
+                .is_err()
+        );
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::rename(displaced_lock, &lock_path).unwrap();
         let json = serde_json::to_vec(origin.evidence()).unwrap();
         assert_eq!(
             ArchiveOriginEvidence::from_json(&json).unwrap(),

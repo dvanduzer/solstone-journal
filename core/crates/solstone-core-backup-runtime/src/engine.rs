@@ -2436,9 +2436,66 @@ impl OwnedInstalledArchiveRead {
     }
 }
 
+#[derive(Clone, Copy)]
 enum DirectBrokerCompletion {
     CapturedByo,
     JoinedOperated,
+}
+
+pub enum RecoveryBindingRefusal {
+    Pairing(ReadbackError),
+    Read(solstone_core_backup::archive_readback::ArchiveRecoveryReadRefusal),
+    Changed,
+}
+impl std::fmt::Display for RecoveryBindingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Pairing(_) => "original recovery read pairing changed",
+            Self::Read(_) => "original recovery read observation refused",
+            Self::Changed => "original recovery observations changed",
+        })
+    }
+}
+impl std::fmt::Debug for RecoveryBindingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for RecoveryBindingRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pairing(error) => Some(error),
+            Self::Read(error) => Some(error),
+            Self::Changed => None,
+        }
+    }
+}
+
+/// Original current input. Serialized DATA alone cannot construct this value.
+#[must_use = "Retain this input while local effects borrow its original read"]
+pub struct QualifiedArchiveRecoveryBinding {
+    original: DirectReadFinishOwner,
+    data: solstone_core_journal_io::archive_recovery::ArchiveRecoveryBinding,
+}
+impl QualifiedArchiveRecoveryBinding {
+    pub fn data(&self) -> &solstone_core_journal_io::archive_recovery::ArchiveRecoveryBinding {
+        &self.data
+    }
+    pub fn revalidate_for_read(
+        &self,
+        read: &OwnedReadOperation,
+    ) -> Result<(), RecoveryBindingRefusal> {
+        self.original
+            .validate_identity(read.carrier(), Some(read.owned_clock()))
+            .map_err(RecoveryBindingRefusal::Pairing)?;
+        let current = read
+            .observe_recovery_binding()
+            .map_err(RecoveryBindingRefusal::Read)?;
+        if current != self.data {
+            return Err(RecoveryBindingRefusal::Changed);
+        }
+        Ok(())
+    }
 }
 
 /// Outside custody for the actual root/carrier and original owned clock.
@@ -2449,6 +2506,29 @@ pub struct DirectReadFinishOwner {
     broker: DirectBrokerCompletion,
 }
 impl DirectReadFinishOwner {
+    /// Binds forward observations to this original installed read and broker owner.
+    /// No recovery, settlement or retirement follows from minting this input.
+    pub fn observe_recovery_binding(
+        &self,
+        read: &OwnedReadOperation,
+    ) -> Result<QualifiedArchiveRecoveryBinding, RecoveryBindingRefusal> {
+        self.validate_identity(read.carrier(), Some(read.owned_clock()))
+            .map_err(RecoveryBindingRefusal::Pairing)?;
+        match self.broker {
+            DirectBrokerCompletion::CapturedByo | DirectBrokerCompletion::JoinedOperated => {}
+        }
+        let data = read
+            .observe_recovery_binding()
+            .map_err(RecoveryBindingRefusal::Read)?;
+        Ok(QualifiedArchiveRecoveryBinding {
+            original: DirectReadFinishOwner {
+                carrier: Arc::clone(&self.carrier),
+                clock: Arc::clone(&self.clock),
+                broker: self.broker,
+            },
+            data,
+        })
+    }
     pub fn carrier(&self) -> &Arc<solstone_core_journal_io::media::RootActivityCarrier> {
         &self.carrier
     }
@@ -3762,6 +3842,131 @@ mod tests {
             write_backup_section(journal.path(), valid_backup_section(valid_destination()));
             let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
             (journal, root)
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[test]
+        #[ignore = "requires an actual copied installed package and supported origin fixture"]
+        fn installed_forward_recovery_binding_uses_original_read_and_current_native_facts() {
+            use std::os::unix::fs::MetadataExt;
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Input {
+                journal: PathBuf,
+                restic_path: PathBuf,
+                repository_id: String,
+            }
+            let input: Input = serde_json::from_slice(
+                &std::fs::read(std::env::var_os("ROOT_FORWARD_PROBE_JSON").unwrap()).unwrap(),
+            )
+            .unwrap();
+            let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
+            let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+            let cancellation = ArchiveCancellation::new();
+            let prepared = OwnedPreparedArchiveOperation::prepare(
+                Arc::clone(&root),
+                ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone()).unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap_or_else(|e| panic!("prepare: {}", e.reason()));
+            let installed = admit_prepared_archive_owned_read_installed(
+                prepared,
+                input.repository_id.clone(),
+                &input.restic_path,
+                env!("CARGO_PKG_VERSION"),
+                &UreqHttpTransport,
+            )
+            .unwrap_or_else(|e| panic!("installed read: {:?}", e.error()));
+            let (read, outside) = installed.into_parts();
+            let qualified = outside.observe_recovery_binding(&read).unwrap();
+            qualified.revalidate_for_read(&read).unwrap();
+            assert_eq!(qualified.data().repository_id(), read.repository_id());
+            assert_eq!(read.repository_id(), input.repository_id);
+            assert!(read.archive_origin_failure().is_none());
+            assert!(Arc::ptr_eq(read.carrier(), outside.carrier()));
+            let reservation = std::fs::metadata(read.carrier().diagnostic_path()).unwrap();
+            assert_eq!(
+                qualified.data().reservation_identity(),
+                solstone_core_journal_io::media::MediaIdentity::Unix {
+                    device: reservation.dev(),
+                    inode: reservation.ino()
+                }
+            );
+            assert_eq!(
+                qualified.data().reservation_name(),
+                read.carrier()
+                    .diagnostic_path()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            );
+            let (_other_temp, other_root) = fixture();
+            let other = OwnedPreparedArchiveOperation::prepare(
+                other_root,
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap_or_else(|e| panic!("other carrier: {}", e.reason()));
+            let wrong_carrier = DirectReadFinishOwner {
+                carrier: Arc::clone(other.carrier()),
+                clock: Arc::clone(&clock),
+                broker: DirectBrokerCompletion::CapturedByo,
+            };
+            assert!(matches!(
+                wrong_carrier.observe_recovery_binding(&read),
+                Err(RecoveryBindingRefusal::Pairing(_))
+            ));
+            let wrong_clock = DirectReadFinishOwner {
+                carrier: Arc::clone(read.carrier()),
+                clock: Arc::new(FixedClock),
+                broker: DirectBrokerCompletion::CapturedByo,
+            };
+            assert!(matches!(
+                wrong_clock.observe_recovery_binding(&read),
+                Err(RecoveryBindingRefusal::Pairing(_))
+            ));
+            let lock = input.journal.join("backup-activity.lock");
+            std::fs::write(&lock, b"actual later native stamp").unwrap();
+            assert!(matches!(
+                qualified.revalidate_for_read(&read),
+                Err(RecoveryBindingRefusal::Changed)
+            ));
+            let current = outside.observe_recovery_binding(&read).unwrap();
+            let alias = input.journal.join("lock-alias");
+            std::fs::hard_link(&lock, &alias).unwrap();
+            assert!(matches!(
+                current.revalidate_for_read(&read),
+                Err(RecoveryBindingRefusal::Read(_))
+            ));
+            std::fs::remove_file(alias).unwrap();
+            cancellation.cancel();
+            assert!(matches!(
+                current.revalidate_for_read(&read),
+                Err(RecoveryBindingRefusal::Read(_))
+            ));
+            assert!(matches!(
+                solstone_core_journal_io::activity::ActivityLease::try_acquire(Arc::clone(&root)),
+                Err(solstone_core_journal_io::activity::ActivityAdmissionError::Busy)
+            ));
+            read.carrier().revalidate().unwrap();
+            let data = serde_json::to_value(qualified.data()).unwrap();
+            println!(
+                "ROOT_FORWARD_BINDING_RESULT={}",
+                serde_json::json!({
+                "repository_id":read.repository_id(),"binding":data,
+                "same_read_revalidated":true,"actual_pair_mismatches_refused":true,
+                "actual_stale_native_refused":true,"cancellation_refused":true,"owners_retained":true})
+            );
+            drop((
+                current,
+                qualified,
+                wrong_clock,
+                wrong_carrier,
+                other,
+                read,
+                outside,
+            ));
         }
 
         #[test]

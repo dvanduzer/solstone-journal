@@ -18,6 +18,12 @@ use crate::archive_admission::{AdmissionError, ArchiveBudget, ArchiveConfigurati
 #[must_use = "Retain the original activity until its actual owning work has ended"]
 pub(crate) struct ArchiveActivity {
     carrier: Arc<RootActivityCarrier>,
+    origin: Box<
+        Result<
+            solstone_core_journal_io::archive_origin::LocalArchiveOrigin,
+            solstone_core_journal_io::archive_origin::OriginObservationFailure,
+        >,
+    >,
 }
 
 #[must_use = "Preparation failure may retain an original lease and partial reservation"]
@@ -118,6 +124,9 @@ impl ArchiveActivity {
         match RootActivityCarrier::prepare(lease) {
             Ok(carrier) => Ok(Self {
                 carrier: Arc::new(carrier),
+                origin: Box::new(
+                    solstone_core_journal_io::archive_origin::observe_archive_origin(root),
+                ),
             }),
             Err(partial) => {
                 failure.error = io::Error::new(partial.error().kind(), partial.error().to_string());
@@ -131,6 +140,14 @@ impl ArchiveActivity {
 
     pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
         &self.carrier
+    }
+    pub(crate) fn origin(
+        &self,
+    ) -> Result<
+        &solstone_core_journal_io::archive_origin::LocalArchiveOrigin,
+        &solstone_core_journal_io::archive_origin::OriginObservationFailure,
+    > {
+        self.origin.as_ref().as_ref()
     }
     pub fn activity(&self) -> &Arc<ActivityLease> {
         self.carrier.activity()
