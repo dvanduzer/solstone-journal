@@ -1560,6 +1560,7 @@ pub enum ArchiveError {
     CredentialsExpired,
     DeadlineExceeded,
     ClockChanged,
+    Cancelled,
     RepositoryIdentityInvalid,
     RepositoryIdentityChanged,
     ToolFailed { reason: &'static str },
@@ -1580,6 +1581,7 @@ impl fmt::Display for ArchiveError {
             Self::CredentialsExpired => "archive credentials expired",
             Self::DeadlineExceeded => "the archive operation deadline was reached",
             Self::ClockChanged => "the archive clock moved backward",
+            Self::Cancelled => "the archive operation was cancelled",
             Self::RepositoryIdentityInvalid => "the backup could not be identified",
             Self::RepositoryIdentityChanged => "the backup no longer matches",
             Self::InvalidSelection => {
@@ -1602,6 +1604,7 @@ impl From<AdmissionError> for ArchiveError {
             AdmissionError::DeadlineExceeded => Self::DeadlineExceeded,
             AdmissionError::ClockChanged => Self::ClockChanged,
             AdmissionError::CredentialsExpired => Self::CredentialsExpired,
+            AdmissionError::Cancelled => Self::Cancelled,
         }
     }
 }
