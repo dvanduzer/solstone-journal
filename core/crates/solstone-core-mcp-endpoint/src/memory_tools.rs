@@ -89,11 +89,12 @@ pub(crate) fn execute(
     }
 }
 
-fn invalid_params(request: &JsonRpcRequest) -> HttpResponse {
+fn invalid_params(request: &JsonRpcRequest, tool: ToolName) -> HttpResponse {
+    let message = crate::registry::invalid_memory_arguments_message(tool, tool_arguments(request));
     HttpResponse::json(
         200,
         "OK",
-        JsonRpcResponse::invalid_params(request.id.as_ref())
+        JsonRpcResponse::invalid_arguments(request.id.as_ref(), message)
             .to_bytes()
             .expect("parameter error serializes"),
     )
@@ -178,7 +179,7 @@ fn save(
     list_changed: bool,
 ) -> HttpResponse {
     let Some((content, operation)) = save_args(tool_arguments(request)) else {
-        return invalid_params(request);
+        return invalid_params(request, ToolName::SaveMemory);
     };
     let prepared = match prepare_connection_memory(
         journal,
@@ -390,7 +391,7 @@ fn recall_response(
     list_changed: bool,
 ) -> HttpResponse {
     let Some(args) = recall_args(tool_arguments(request)) else {
-        return invalid_params(request);
+        return invalid_params(request, ToolName::RecallMemory);
     };
     let source = SourceKey::from_verified_id(authority.id());
     let mut arguments = Map::new();

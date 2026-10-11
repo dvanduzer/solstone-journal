@@ -449,6 +449,24 @@ fn prepared_enabled_root() -> TempDir {
 }
 
 #[test]
+fn turning_on_after_the_local_door_ran_narrows_its_directory() {
+    // The local door is on by default and writes its state first, leaving the
+    // directory at the process umask before the owner ever turns this on.
+    let root = prepared_enabled_root();
+    crate::local_door::write_local_door_state(root.path(), true, None);
+    let endpoint = endpoint_path(root.path());
+    set_mode(&endpoint, 0o775);
+
+    let _context = bootstrap_context(root.path());
+    let mode = fs::metadata(&endpoint)
+        .expect("endpoint stats")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+    let _again = bootstrap_context(root.path());
+}
+
+#[test]
 fn root_path_swaps_are_rejected_before_endpoint_work() {
     for primitive in [
         OwnerBootstrapPrimitive::CommittedIdentityLoad,

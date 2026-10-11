@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use solstone_core_indexer_query::AdmittedCategory;
 
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision};
@@ -36,6 +36,8 @@ pub(crate) struct SchemaContext<'a> {
 pub(crate) struct ToolEntry {
     pub(crate) tool_name: crate::jsonrpc::ToolName,
     pub(crate) wire_name: &'static str,
+    /// The short label a client shows the owner for this tool.
+    pub(crate) title: &'static str,
     pub(crate) description: &'static str,
     pub(crate) input_schema: fn(&SchemaContext<'_>) -> Value,
     pub(crate) requires: ToolRequirement,
@@ -55,6 +57,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::SaveMemory,
         wire_name: "save_memory",
+        title: "save to the journal",
         description: "save a note in the owner's journal when they ask you to remember something. content is exact UTF-8, up to 32,768 bytes. retry with the same operation_id and content if the outcome is uncertain.",
         input_schema: save_memory_input_schema,
         requires: NOTHING,
@@ -63,6 +66,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::RecallMemory,
         wire_name: "recall_memory",
+        title: "recall notes this agent saved",
         description: "recall this connection's original agent memories from the index. omit query to browse; pages contain whole notes, up to 20 notes and 65,536 content bytes. an incomplete result does not prove there are no memories.",
         input_schema: recall_memory_input_schema,
         requires: NOTHING,
@@ -71,6 +75,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::ListFacets,
         wire_name: "list_facets",
+        title: "list facets",
         description: "List the facets this connection may see: the areas the owner sorts their journal into, such as work or personal.",
         input_schema: list_facets_input_schema,
         requires: NOTHING,
@@ -79,6 +84,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::Search,
         wire_name: "search",
+        title: "search the journal",
         description: "Search what this connection may see of the owner's journal: short summaries of conversations and work sessions, activities and their stories, imported documents and calendar events, and notes about people and projects. Use a few keywords such as names or topics, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. Search does not read conversations word for word. When a result lists transcript segments, read them with get_transcript before saying who said, promised or decided something. When a result shows more_segments, fetch it for more. When nothing matches, say so rather than guessing.",
         input_schema: search_input_schema,
         requires: TRANSCRIPTS,
@@ -87,6 +93,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::Fetch,
         wire_name: "fetch",
+        title: "read a journal entry",
         description: "Read the full text of an entry returned by search. Pass its reference unchanged. When the entry lists transcript segments, read them with get_transcript. If it still shows more_segments, call list_transcripts for that day and the entry's time.",
         input_schema: fetch_input_schema,
         requires: TRANSCRIPTS,
@@ -95,6 +102,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::ListTranscripts,
         wire_name: "list_transcripts",
+        title: "list transcripts",
         description: "List transcript segments this connection may read, each with its time. Give one day (YYYYMMDD or YYYY-MM-DD), and a time range within it when you know one; without a day, the newest days come first. When more remain, pass next_cursor as cursor to continue. Read one with get_transcript.",
         input_schema: list_transcripts_input_schema,
         requires: TRANSCRIPTS,
@@ -103,6 +111,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::GetTranscript,
         wire_name: "get_transcript",
+        title: "read a transcript",
         description: "Read what was said in one transcript segment, from a search result or from list_transcripts. When it returns next_cursor, pass it as cursor to read the rest. When it says untimed, the times are not real. If a segment can't be read, search again or list that day.",
         input_schema: transcript_input_schema,
         requires: TRANSCRIPTS,
@@ -111,6 +120,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::ListEntities,
         wire_name: "list_entities",
+        title: "list people and projects",
         description: "List the people, projects and other entities this connection may see. To learn who or what one is, call get_entity with its reference.",
         input_schema: list_entities_input_schema,
         requires: ENTITIES,
@@ -119,6 +129,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::GetEntity,
         wire_name: "get_entity",
+        title: "read about a person or project",
         description: "Read what the journal has noted about an entity returned by list_entities: its type and, in that facet, its description, the last day it came up, and notes about it.",
         input_schema: fetch_input_schema,
         requires: ENTITIES,
@@ -163,15 +174,7 @@ pub(crate) fn advertised_tools_list(journal_root: &Path, permission: &Permission
         PermissionDecision::Denied { .. } => None,
     };
     let empty_categories = BTreeSet::new();
-    let facet_ids = snapshot
-        .and_then(|snapshot| crate::dispatch::available_facets(journal_root, snapshot).ok())
-        .map(|facets| {
-            facets
-                .into_iter()
-                .map(|(id, _, _)| id)
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
+    let facet_ids = connection_facet_ids(journal_root, permission);
     let context = SchemaContext {
         categories: snapshot
             .map(|snapshot| &snapshot.categories)
@@ -180,17 +183,210 @@ pub(crate) fn advertised_tools_list(journal_root: &Path, permission: &Permission
     };
     let tools = TOOLS
         .iter()
-        .filter(|entry| entry.tool_name.is_memory() || snapshot.is_some_and(|snapshot| snapshot_allows(snapshot, entry)))
+        .filter(|entry| {
+            entry.tool_name.is_memory()
+                || snapshot.is_some_and(|snapshot| snapshot_allows(snapshot, entry))
+        })
         .map(|entry| {
             json!({
                 "name": entry.wire_name,
                 "description": entry.description,
                 "inputSchema": (entry.input_schema)(&context),
-                "annotations": { "readOnlyHint": entry.tool_name != crate::jsonrpc::ToolName::SaveMemory },
+                "title": entry.title,
+                "annotations": annotations(entry),
             })
         })
         .collect::<Vec<_>>();
     json!({ "tools": tools })
+}
+
+/// What a client may assume about a tool's effects. Every tool reads only
+/// this journal. `save_memory` adds a note and changes nothing already there,
+/// and a retry with the same `operation_id` and content stores it once.
+fn annotations(entry: &ToolEntry) -> Value {
+    if entry.tool_name == crate::jsonrpc::ToolName::SaveMemory {
+        json!({
+            "title": entry.title,
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        })
+    } else {
+        json!({ "title": entry.title, "readOnlyHint": true, "openWorldHint": false })
+    }
+}
+
+fn connection_facet_ids(journal_root: &Path, permission: &PermissionDecision) -> Vec<String> {
+    match permission {
+        PermissionDecision::Snapshot(snapshot) => {
+            crate::dispatch::available_facets(journal_root, snapshot)
+                .map(|facets| facets.into_iter().map(|(id, _, _)| id).collect())
+                .unwrap_or_default()
+        }
+        PermissionDecision::Denied { .. } => Vec::new(),
+    }
+}
+
+/// Say what is wrong with a refused call's arguments, checked against the
+/// schema this connection is advertised, so the agent can correct the call.
+///
+/// ⚠ Only a refusal reaches this, and the schema it reads names nothing the
+/// connection's own `tools/list` did not already show it.
+pub(crate) fn invalid_arguments_message(
+    journal_root: &Path,
+    permission: &PermissionDecision,
+    tool: crate::jsonrpc::ToolName,
+    arguments: Option<&Value>,
+) -> String {
+    let entry = find_tool(tool);
+    let empty_categories = BTreeSet::new();
+    let facet_ids = connection_facet_ids(journal_root, permission);
+    let context = SchemaContext {
+        categories: match permission {
+            PermissionDecision::Snapshot(snapshot) => &snapshot.categories,
+            PermissionDecision::Denied { .. } => &empty_categories,
+        },
+        facet_ids: &facet_ids,
+    };
+    explain_arguments(entry.wire_name, &(entry.input_schema)(&context), arguments)
+}
+
+/// The same, for the paired memory tools, whose schemas name no facet or
+/// category and so never read the grant.
+pub(crate) fn invalid_memory_arguments_message(
+    tool: crate::jsonrpc::ToolName,
+    arguments: Option<&Value>,
+) -> String {
+    let entry = find_tool(tool);
+    let context = SchemaContext {
+        categories: &BTreeSet::new(),
+        facet_ids: &[],
+    };
+    explain_arguments(entry.wire_name, &(entry.input_schema)(&context), arguments)
+}
+
+fn explain_arguments(name: &str, schema: &Value, arguments: Option<&Value>) -> String {
+    let empty = Map::new();
+    let properties = schema["properties"].as_object().unwrap_or(&empty);
+    let arguments = match arguments {
+        None | Some(Value::Null) => &empty,
+        Some(Value::Object(arguments)) => arguments,
+        Some(_) => return format!("{name} takes its arguments as a JSON object."),
+    };
+    for key in arguments.keys() {
+        if !properties.contains_key(key) {
+            return if properties.is_empty() {
+                format!("{name} takes no arguments, so `{key}` is not one.")
+            } else {
+                let accepted = properties.keys().map(String::as_str).collect::<Vec<_>>();
+                format!(
+                    "{name} has no `{key}` argument. It accepts: {}.",
+                    accepted.join(", ")
+                )
+            };
+        }
+    }
+    for key in schema["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !arguments.contains_key(key) {
+            return format!("{name} needs `{key}`.");
+        }
+    }
+    for (key, value) in arguments {
+        if let Some(problem) = explain_value(key, &properties[key], value) {
+            return format!("{name}: {problem}");
+        }
+    }
+    let day_bounded = ["day", "day_from", "day_to"]
+        .iter()
+        .any(|key| arguments.contains_key(*key));
+    let query_empty = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .is_none_or(|query| query.trim().is_empty());
+    if name == "search" && query_empty && !day_bounded {
+        return "search needs `query`, or `day`, `day_from` or `day_to` to list what those days hold."
+            .to_owned();
+    }
+    let formats = arguments
+        .keys()
+        .filter_map(|key| format_rule(key).map(|rule| format!("`{key}` {rule}")))
+        .collect::<Vec<_>>();
+    if formats.is_empty() {
+        format!("{name} could not use these arguments together.")
+    } else {
+        format!(
+            "{name} could not use these arguments. Check that {}.",
+            formats.join(", and ")
+        )
+    }
+}
+
+/// The shape a formatted argument must take, for arguments whose format the
+/// type, length and range checks cannot see.
+fn format_rule(key: &str) -> Option<&'static str> {
+    match key {
+        "day" | "day_from" | "day_to" => Some("is YYYYMMDD or YYYY-MM-DD"),
+        "time_from" | "time_to" => Some("is HH:MM"),
+        "operation_id" => Some("uses only letters, digits, '.', '_', ':' or '-'"),
+        _ => None,
+    }
+}
+
+fn explain_value(key: &str, property: &Value, value: &Value) -> Option<String> {
+    match property["type"].as_str() {
+        Some("string") => {
+            let Some(text) = value.as_str() else {
+                return Some(format!("`{key}` must be a string."));
+            };
+            if property["minLength"]
+                .as_u64()
+                .is_some_and(|minimum| minimum > 0)
+                && text.is_empty()
+            {
+                return Some(format!("`{key}` must not be empty."));
+            }
+            if let Some(maximum) = property["maxLength"].as_u64()
+                && text.len() as u64 > maximum
+            {
+                return Some(format!("`{key}` is too long: at most {maximum} bytes."));
+            }
+            if let Some(allowed) = property["enum"].as_array()
+                && !allowed.contains(value)
+            {
+                let allowed = allowed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                return Some(format!("`{key}` must be one of: {}.", allowed.join(", ")));
+            }
+            None
+        }
+        Some("integer") => {
+            let Some(number) = value.as_i64() else {
+                return Some(format!("`{key}` must be a whole number."));
+            };
+            let minimum = property["minimum"].as_i64();
+            let maximum = property["maximum"].as_i64();
+            if minimum.is_some_and(|minimum| number < minimum)
+                || maximum.is_some_and(|maximum| number > maximum)
+            {
+                return Some(match (minimum, maximum) {
+                    (Some(minimum), Some(maximum)) => {
+                        format!("`{key}` must be from {minimum} to {maximum}.")
+                    }
+                    (Some(minimum), None) => format!("`{key}` must be at least {minimum}."),
+                    (None, _) => {
+                        format!("`{key}` must be at most {}.", maximum.unwrap_or_default())
+                    }
+                });
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn save_memory_input_schema(_context: &SchemaContext<'_>) -> Value {
@@ -199,7 +395,7 @@ fn save_memory_input_schema(_context: &SchemaContext<'_>) -> Value {
         "required": ["content", "operation_id"],
         "properties": {
             "content": {"type": "string", "minLength": 1, "maxLength": 32768, "description": "exact UTF-8 content, limited to 32,768 decoded bytes"},
-            "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"}
+            "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$", "description": "an id you choose for this save, made of letters, digits, '.', '_', ':' or '-'; reuse it only to retry the same note"}
         }
     })
 }
@@ -548,7 +744,75 @@ mod tests {
                 "{} is not marked read-only",
                 tool["name"]
             );
+            // Connector directories require a title and an effect hint on
+            // every tool.
+            assert!(
+                tool["title"]
+                    .as_str()
+                    .is_some_and(|title| !title.is_empty()),
+                "{} has no title",
+                tool["name"]
+            );
+            assert_eq!(tool["annotations"]["title"], tool["title"]);
         }
+        let save = tools
+            .iter()
+            .find(|tool| tool["name"] == "save_memory")
+            .unwrap();
+        assert_eq!(save["annotations"]["destructiveHint"], false);
+    }
+
+    #[test]
+    fn a_refused_call_names_the_argument_to_correct() {
+        let journal = journal_with_two_facets();
+        let snapshot = ConnectionReadSnapshot {
+            categories: all_categories(),
+            scope: ConnectionScope::ChosenFacets {
+                ids: [FACET_A.to_owned()].into_iter().collect(),
+            },
+            generation: 1,
+        };
+        let permission = PermissionDecision::Snapshot(snapshot);
+        let explain = |tool, arguments: Value| {
+            invalid_arguments_message(journal.path(), &permission, tool, Some(&arguments))
+        };
+        use crate::jsonrpc::ToolName;
+        for (tool, arguments, named) in [
+            (
+                ToolName::Search,
+                json!({"query": "x", "limit": 0}),
+                "`limit`",
+            ),
+            (
+                ToolName::Search,
+                json!({"query": "x", "colour": "red"}),
+                "`colour`",
+            ),
+            (
+                ToolName::Search,
+                json!({"query": "x", "category": "audio"}),
+                "`category`",
+            ),
+            (ToolName::Search, json!({}), "`query`"),
+            (ToolName::Fetch, json!({}), "`reference`"),
+            (
+                ToolName::ListTranscripts,
+                json!({"day": "tuesday"}),
+                "`day`",
+            ),
+        ] {
+            let message = explain(tool, arguments);
+            assert!(message.contains(named), "{message} does not name {named}");
+        }
+        // ⛔ A refusal discloses no facet beyond what tools/list already showed.
+        let message = explain(ToolName::Search, json!({"query": "x", "facet": "other"}));
+        assert!(
+            message.contains(FACET_A) && !message.contains(FACET_B),
+            "{message}"
+        );
+        let message =
+            invalid_memory_arguments_message(ToolName::SaveMemory, Some(&json!({"content": "x"})));
+        assert!(message.contains("`operation_id`"), "{message}");
     }
 
     #[test]

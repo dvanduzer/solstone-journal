@@ -623,7 +623,12 @@ fn create_or_open_endpoint_directory(
         return Err(identity_changed());
     }
 
-    if created {
+    // The door state files share this directory and are written first on most
+    // journals, so it usually already exists at the process umask. It is this
+    // owner's own directory, opened without following links, so narrow it to
+    // the owner alone rather than refusing; every entry the bootstrap reads is
+    // still checked for this owner and its exact mode.
+    if created || !is_exact_directory(&after, owner, DIRECTORY_MODE) {
         checkpoint(OwnerBootstrapPrimitive::DirectoryFchmod)?;
         fchmod(&file, mode(DIRECTORY_MODE)).map_err(errno_error)?;
         checkpoint(OwnerBootstrapPrimitive::DirectoryFstat)?;
@@ -633,8 +638,6 @@ fn create_or_open_endpoint_directory(
         {
             return Err(identity_changed());
         }
-    } else if !is_exact_directory(&after, owner, DIRECTORY_MODE) {
-        return Err(invalid_entry());
     }
 
     checkpoint(OwnerBootstrapPrimitive::RootRevalidateAndFsync)?;
