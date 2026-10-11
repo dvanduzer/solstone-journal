@@ -14,6 +14,7 @@ use solstone_core_convey_http::owner_read::{OwnerReadRole, spawn_blocking_respon
 
 mod assets;
 mod clock;
+pub mod removal_report;
 mod removals;
 mod week;
 
