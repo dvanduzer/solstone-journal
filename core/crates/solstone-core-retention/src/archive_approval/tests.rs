@@ -267,5 +267,6 @@ fn valid_offers_require_exact_source_repository_for_every_row() -> TestResult {
     Ok(())
 }
 
-#[cfg(all(unix, feature = "full-tests"))]
+#[cfg(unix)]
+#[cfg(all(test, feature = "full-tests"))]
 mod packaged;
