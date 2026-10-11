@@ -10,14 +10,16 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use solstone_core_backup::archive_activity::PreparedArchiveOperation;
+use solstone_core_backup::archive_readback::{ReadOperation, ReadbackError};
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::media::{MediaDirectory, MediaObservation};
 use solstone_core_journal_io::paths::SegmentLayout;
 
-use crate::archive_proof::AcceptedProcessingObservation;
+use crate::archive_proof::{AcceptedProcessingObservation, OffloadProof};
+use crate::marks::Mark;
 #[cfg(unix)]
-use crate::marks::{Mark, MarkId, RemovalClass};
+use crate::marks::{MarkId, RemovalClass};
 use crate::receipt::Target;
 
 /// Requested coordinates only; the owning capture independently reads them.
@@ -39,11 +41,133 @@ pub enum OffloadOfferRefusal {
     Io(std::io::Error),
     Review(crate::review_context::ReviewRefusal),
     Policy(Box<crate::remove_marked::ReviewedRemovalRefusal>),
+    Proof(crate::archive_proof::ProofError),
+    Readback(ReadbackError),
+    Approval,
+    Cleanup(solstone_core_journal_io::media::Cleanup),
+    InsufficientSpace { available: u64, required: u64 },
+    Metadata,
+    Catalog(String),
+    Register(Box<crate::mark_mutation::BoundMutationRefusal>),
 }
 
 impl From<std::io::Error> for OffloadOfferRefusal {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+enum OfferArchiveOwner<'clock> {
+    Pending(Box<ReadOperation<'clock>>),
+    Failed(crate::archive_approval::ArchiveApprovalFailure<'clock>),
+}
+
+/// Failed verification keeps the original read, inputs and attempted targets.
+#[must_use]
+pub struct OffloadOfferFailure<'clock> {
+    observed: Box<ObservedOffloadOffers>,
+    owner: OfferArchiveOwner<'clock>,
+    reason: OffloadOfferRefusal,
+}
+
+impl OffloadOfferFailure<'_> {
+    pub fn reason(&self) -> &OffloadOfferRefusal {
+        &self.reason
+    }
+    pub fn observed(&self) -> &ObservedOffloadOffers {
+        &self.observed
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        match &self.owner {
+            OfferArchiveOwner::Pending(read) => read.journal_root(),
+            OfferArchiveOwner::Failed(failure) => failure.journal_root(),
+        }
+    }
+    pub fn activity(&self) -> &Arc<ActivityLease> {
+        match &self.owner {
+            OfferArchiveOwner::Pending(read) => read.activity(),
+            OfferArchiveOwner::Failed(failure) => failure.activity(),
+        }
+    }
+    pub fn archive_reads(
+        &self,
+    ) -> impl Iterator<Item = crate::remove_marked::ArchiveReadState<'_>> {
+        match &self.owner {
+            OfferArchiveOwner::Pending(_) => crate::archive_approval::ArchiveReadStates::empty(),
+            OfferArchiveOwner::Failed(failure) => failure.read_states(),
+        }
+    }
+    pub fn readback_error(&self) -> Option<ReadbackError> {
+        match &self.owner {
+            OfferArchiveOwner::Failed(failure) => match failure.reason() {
+                crate::archive_approval::ArchiveApprovalError::Readback(error) => Some(*error),
+                _ => None,
+            },
+            OfferArchiveOwner::Pending(_) => None,
+        }
+    }
+    pub fn cleanup(&self) -> Option<solstone_core_journal_io::media::Cleanup> {
+        match &self.owner {
+            OfferArchiveOwner::Failed(failure) => match failure.reason() {
+                crate::archive_approval::ArchiveApprovalError::Cleanup(cleanup) => Some(*cleanup),
+                _ => None,
+            },
+            OfferArchiveOwner::Pending(_) => None,
+        }
+    }
+    pub fn native_error(&self) -> Option<&std::io::Error> {
+        match &self.owner {
+            OfferArchiveOwner::Failed(failure) => match failure.reason() {
+                crate::archive_approval::ArchiveApprovalError::Native(error) => Some(error),
+                _ => None,
+            },
+            OfferArchiveOwner::Pending(_) => None,
+        }
+    }
+}
+
+/// Actual archive confirmation; no public constructor or removal authority.
+#[must_use]
+pub struct VerifiedOffloadOffers<'clock> {
+    observed: Box<ObservedOffloadOffers>,
+    approval: crate::archive_approval::ArchiveApprovalBatch<'clock>,
+}
+
+impl VerifiedOffloadOffers<'_> {
+    pub fn observed(&self) -> &ObservedOffloadOffers {
+        &self.observed
+    }
+    pub fn marks(&self) -> &[crate::marks::Mark] {
+        self.approval.expected_marks()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.approval.journal_root()
+    }
+    pub fn activity(&self) -> &Arc<ActivityLease> {
+        self.approval.activity()
+    }
+    pub fn archive_reads(
+        &self,
+    ) -> impl Iterator<Item = crate::remove_marked::ArchiveReadState<'_>> {
+        self.approval.read_states()
+    }
+}
+
+/// Publication facts and all original verification owners remain together.
+#[must_use]
+pub struct OffloadOfferOutcome<'clock> {
+    verified: VerifiedOffloadOffers<'clock>,
+    publication: Result<crate::mark_mutation::BoundMutationOutcome, OffloadOfferRefusal>,
+}
+
+impl OffloadOfferOutcome<'_> {
+    pub fn verified(&self) -> &VerifiedOffloadOffers<'_> {
+        &self.verified
+    }
+    pub fn publication(
+        &self,
+    ) -> &Result<crate::mark_mutation::BoundMutationOutcome, OffloadOfferRefusal> {
+        &self.publication
     }
 }
 
@@ -74,7 +198,6 @@ pub struct ObservedOffloadGroup {
     #[cfg(unix)]
     scan: crate::scan::CheckedSegment,
     files: Vec<ObservedOffloadFile>,
-    #[cfg(unix)]
     expected: Option<Mark>,
 }
 
@@ -87,6 +210,9 @@ impl ObservedOffloadGroup {
     }
     pub fn files(&self) -> &[ObservedOffloadFile] {
         &self.files
+    }
+    pub fn expected_mark(&self) -> Option<&Mark> {
+        self.expected.as_ref()
     }
 }
 
@@ -451,6 +577,482 @@ fn check_capture(
         .map_err(OffloadOfferRefusal::Admission)
 }
 
+#[cfg(unix)]
+fn candidate_marks(
+    observed: &ObservedOffloadOffers,
+    read: &ReadOperation<'_>,
+    proofs: Vec<OffloadProof>,
+    now: DateTime<Utc>,
+) -> Result<Vec<Mark>, OffloadOfferRefusal> {
+    use std::collections::BTreeMap;
+
+    use crate::marks::Register;
+
+    if proofs.len() != observed.groups.len()
+        || !Arc::ptr_eq(read.journal_root(), &observed.root)
+        || !Arc::ptr_eq(read.activity(), &observed.activity)
+    {
+        return Err(OffloadOfferRefusal::InvalidSelection);
+    }
+    let mut by_id = BTreeMap::new();
+    for proof in proofs {
+        proof.validate().map_err(OffloadOfferRefusal::Proof)?;
+        let names = proof
+            .files
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<Vec<_>>();
+        let id = MarkId::derive(RemovalClass::OffloadRawRelease, &proof.target, &names);
+        if by_id.insert(id, proof).is_some() {
+            return Err(OffloadOfferRefusal::InvalidSelection);
+        }
+    }
+    let mut marks = Vec::new();
+    for group in &observed.groups {
+        let id = selected_id(&group.selection);
+        let proof = by_id
+            .remove(&id)
+            .ok_or(OffloadOfferRefusal::InvalidSelection)?;
+        if proof.target != group.selection.target
+            || proof.layout != group.selection.layout
+            || proof.journal_id != observed.root.identity().observation_id()
+            || proof.repository_id != read.repository_id()
+            || proof.files.len() != group.files.len()
+            || proof
+                .files
+                .iter()
+                .zip(&group.files)
+                .any(|(file, captured)| {
+                    file.name != captured.name
+                        || file.bytes != captured.observation.digest.size
+                        || file.sha256 != captured.observation.digest.sha256
+                        || file.processing != captured.processing
+                })
+        {
+            return Err(OffloadOfferRefusal::Changed);
+        }
+        marks.push(candidate_mark(group, proof, now)?);
+    }
+    let register = Register {
+        version: 2,
+        marks: marks
+            .iter()
+            .map(|mark| (mark.id.clone(), mark.clone()))
+            .collect(),
+    };
+    crate::marks::validate(&register).map_err(|error| {
+        OffloadOfferRefusal::Review(crate::review_context::ReviewRefusal::Register(error))
+    })?;
+    if serde_json::to_vec_pretty(&register)
+        .map_err(|_| OffloadOfferRefusal::Metadata)?
+        .len()
+        > crate::review_context::MAX_REGISTER_BYTES
+    {
+        return Err(OffloadOfferRefusal::Metadata);
+    }
+    Ok(marks)
+}
+
+#[cfg(unix)]
+fn candidate_mark(
+    group: &ObservedOffloadGroup,
+    proof: OffloadProof,
+    now: DateTime<Utc>,
+) -> Result<Mark, OffloadOfferRefusal> {
+    use crate::archive_proof::OffloadOffer;
+    use crate::marks::{MarkState, Proposal};
+    if let Some(expected) = &group.expected
+        && expected.state == MarkState::Marked
+        && expected
+            .offload
+            .as_ref()
+            .is_some_and(|offer| offer.proof == proof)
+    {
+        return Ok(expected.clone());
+    }
+    let bytes = proof.bytes().map_err(OffloadOfferRefusal::Proof)?;
+    let reason = format!("restic-snapshot:{}", proof.snapshot_id);
+    let offload = OffloadOffer::new(proof).map_err(OffloadOfferRefusal::Proof)?;
+    Ok(Mark {
+        id: selected_id(&group.selection),
+        class: RemovalClass::OffloadRawRelease,
+        target: group.selection.target.clone(),
+        marked_at: now.to_rfc3339(),
+        proposal: Proposal {
+            names: group.selection.names.clone(),
+            bytes,
+            reason,
+        },
+        state: MarkState::Marked,
+        offload: Some(offload),
+    })
+}
+
+#[cfg(unix)]
+fn check_current_metadata(
+    observed: &ObservedOffloadOffers,
+    policy: &crate::remove_marked::ReviewedPolicy,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<(), OffloadOfferRefusal> {
+    if policy.observation() != (&observed.configuration, &observed.config_entry) {
+        return Err(OffloadOfferRefusal::Changed);
+    }
+    policy
+        .revalidate()
+        .map_err(|error| OffloadOfferRefusal::Policy(Box::new(error)))?;
+    let current =
+        crate::review_context::load_at_root(&observed.root).map_err(OffloadOfferRefusal::Review)?;
+    for group in &observed.groups {
+        if current.marks.get(&selected_id(&group.selection)) != group.expected.as_ref() {
+            return Err(OffloadOfferRefusal::Changed);
+        }
+        check_group(group)?;
+        let inspection = crate::grouped::inspect_grouped(
+            &group.scan,
+            &group.selection.target,
+            group.selection.layout,
+            policy.policy(),
+            today,
+            now,
+            crate::grouped::DecisionPurpose::OffloadProposal,
+        );
+        for captured in &group.files {
+            if !inspection
+                .eligible()
+                .any(|file| file.name() == captured.name)
+            {
+                return Err(OffloadOfferRefusal::Changed);
+            }
+        }
+    }
+    policy
+        .revalidate()
+        .map_err(|error| OffloadOfferRefusal::Policy(Box::new(error)))
+}
+
+#[cfg(unix)]
+fn check_current_inputs(
+    observed: &ObservedOffloadOffers,
+    policy: &crate::remove_marked::ReviewedPolicy,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<(), OffloadOfferRefusal> {
+    use std::ffi::OsStr;
+    check_current_metadata(observed, policy, today, now)?;
+    for group in &observed.groups {
+        for captured in &group.files {
+            let current = group
+                .directory
+                .observe_file(OsStr::new(&captured.name))?
+                .ok_or(OffloadOfferRefusal::Changed)?;
+            if current != captured.observation {
+                return Err(OffloadOfferRefusal::Changed);
+            }
+        }
+    }
+    check_current_metadata(observed, policy, today, now)
+}
+
+#[cfg(unix)]
+fn admission_refusal(error: crate::archive_approval::ArchiveApprovalError) -> OffloadOfferRefusal {
+    use crate::archive_approval::ArchiveApprovalError;
+    match error {
+        ArchiveApprovalError::Readback(error) => OffloadOfferRefusal::Readback(error),
+        ArchiveApprovalError::Native(error) => OffloadOfferRefusal::Io(error),
+        ArchiveApprovalError::Cleanup(cleanup) => OffloadOfferRefusal::Cleanup(cleanup),
+        ArchiveApprovalError::InvalidSelection => OffloadOfferRefusal::InvalidSelection,
+        ArchiveApprovalError::SourceRootChanged
+        | ArchiveApprovalError::RepositoryChanged
+        | ArchiveApprovalError::RootChanged => OffloadOfferRefusal::Changed,
+    }
+}
+
+#[cfg(unix)]
+fn offer_metadata_bytes(marks: &[Mark]) -> Result<u64, OffloadOfferRefusal> {
+    let initial = (crate::review_context::MAX_REGISTER_BYTES as u64)
+        .checked_add(1024 * 1024)
+        .ok_or(OffloadOfferRefusal::Metadata)?;
+    marks.iter().try_fold(initial, |bytes, mark| {
+        let proof = &mark
+            .offload
+            .as_ref()
+            .ok_or(OffloadOfferRefusal::InvalidSelection)?
+            .proof;
+        let event = crate::archive_catalog::codec::Event::ArchiveV2 {
+            schema_version: 2,
+            time: u64::MAX,
+            day: proof.target.day.clone(),
+            stream: proof.target.stream.clone(),
+            segment: solstone_core_format::segment::segment_key(&proof.target.dir)
+                .ok_or(OffloadOfferRefusal::InvalidSelection)?,
+            segment_dir: proof.target.dir.clone(),
+            layout: proof.layout,
+            journal_id: proof.journal_id.clone(),
+            manifest_id: proof.manifest_id.clone(),
+            repository_id: proof.repository_id.clone(),
+            snapshot_id: proof.snapshot_id.clone(),
+            files: proof.files.clone(),
+        };
+        let encoded = serde_json::to_vec(&event).map_err(|_| OffloadOfferRefusal::Metadata)?;
+        bytes
+            .checked_add(u64::try_from(encoded.len()).map_err(|_| OffloadOfferRefusal::Metadata)?)
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or(OffloadOfferRefusal::Metadata)
+    })
+}
+
+#[cfg(unix)]
+fn preflight_verification(
+    read: &ReadOperation<'_>,
+    observed: &ObservedOffloadOffers,
+    marks: &[Mark],
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<(), OffloadOfferRefusal> {
+    read.revalidate_admission()
+        .map_err(OffloadOfferRefusal::Readback)?;
+    let selections = observed
+        .groups
+        .iter()
+        .map(|group| group.selection.clone())
+        .collect::<Vec<_>>();
+    let claimed = acquire_claims(&observed.root, &selections)?;
+    let mut commits = Vec::new();
+    for segment in &claimed {
+        let absolute = observed.root.canonical_path().join(&segment.relative);
+        let commit = segment.claims.commit(&absolute)?;
+        commit.require_outputs(
+            &segment.claims,
+            &absolute,
+            selections
+                .iter()
+                .filter(|selection| selection_path(selection) == segment.relative)
+                .flat_map(|selection| &selection.names)
+                .map(|name| absolute.join(name).with_extension("jsonl")),
+        )?;
+        if observed
+            .groups
+            .iter()
+            .filter(|group| selection_path(&group.selection) == segment.relative)
+            .any(|group| group.directory.object_identity() != segment.directory.object_identity())
+        {
+            return Err(OffloadOfferRefusal::Changed);
+        }
+        commits.push(commit);
+    }
+    let policy = crate::remove_marked::ReviewedPolicy::capture(&observed.root)
+        .map_err(|error| OffloadOfferRefusal::Policy(Box::new(error)))?;
+    check_current_inputs(observed, &policy, today, now)?;
+    let maximum = marks
+        .iter()
+        .filter_map(|mark| mark.offload.as_ref())
+        .flat_map(|offer| &offer.proof.files)
+        .map(|file| file.bytes)
+        .max()
+        .ok_or(OffloadOfferRefusal::InvalidSelection)?;
+    let required = read
+        .offload_required_bytes(maximum, offer_metadata_bytes(marks)?)
+        .map_err(OffloadOfferRefusal::Readback)?;
+    let parent = MediaDirectory::open(Arc::clone(read.journal_root()), Path::new(""))?;
+    let available = parent.available_bytes()?;
+    if available < required {
+        return Err(OffloadOfferRefusal::InsufficientSpace {
+            available,
+            required,
+        });
+    }
+    parent.revalidate()?;
+    for commit in &commits {
+        commit.revalidate()?;
+    }
+    read.revalidate_admission()
+        .map_err(OffloadOfferRefusal::Readback)
+}
+
+/// Verify captured inputs through actual sequential archive readback. All short
+/// locks end before helper work; every result retains the original read owners.
+/// Runtime cooperation/settlement remains a prerequisite for invocation.
+pub fn verify_offload_offers<'clock>(
+    read: ReadOperation<'clock>,
+    observed: ObservedOffloadOffers,
+    proofs: Vec<OffloadProof>,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<VerifiedOffloadOffers<'clock>, OffloadOfferFailure<'clock>> {
+    let observed = Box::new(observed);
+    #[cfg(unix)]
+    let candidates = candidate_marks(&observed, &read, proofs, now).and_then(|marks| {
+        preflight_verification(&read, &observed, &marks, today, now)?;
+        Ok(marks)
+    });
+    #[cfg(not(unix))]
+    let candidates: Result<Vec<crate::marks::Mark>, OffloadOfferRefusal> = {
+        let _parameters = (proofs, today, now);
+        Err(OffloadOfferRefusal::Unsupported)
+    };
+    let marks = match candidates {
+        Ok(marks) => marks,
+        Err(reason) => {
+            return Err(OffloadOfferFailure {
+                observed,
+                owner: OfferArchiveOwner::Pending(Box::new(read)),
+                reason,
+            });
+        }
+    };
+    let carrier = Arc::clone(read.carrier());
+    match crate::archive_approval::create_archive_approval_batch(read, carrier, &marks) {
+        Ok(approval) => Ok(VerifiedOffloadOffers { observed, approval }),
+        Err(failure) => Err(OffloadOfferFailure {
+            observed,
+            owner: OfferArchiveOwner::Failed(failure),
+            reason: OffloadOfferRefusal::Approval,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn check_active_witnesses(verified: &VerifiedOffloadOffers<'_>) -> Result<(), OffloadOfferRefusal> {
+    let catalog = crate::archive_catalog::read_complete_catalog(verified.journal_root())
+        .map_err(OffloadOfferRefusal::Catalog)?;
+    let segments = || catalog.days.iter().flat_map(|day| &day.segments);
+    if catalog.degraded()
+        || catalog.days.iter().any(|day| day.degraded())
+        || segments().any(|segment| segment.degraded())
+    {
+        return Err(OffloadOfferRefusal::Changed);
+    }
+    for mark in verified.marks() {
+        let proof = &mark
+            .offload
+            .as_ref()
+            .ok_or(OffloadOfferRefusal::InvalidSelection)?
+            .proof;
+        if segments()
+            .flat_map(|segment| &segment.history)
+            .filter(|manifest| manifest.manifest_id == proof.manifest_id)
+            .count()
+            != 1
+        {
+            return Err(OffloadOfferRefusal::Changed);
+        }
+        for file in &proof.files {
+            if catalog.active_witness(proof, file).is_none()
+                || segments()
+                    .flat_map(|segment| &segment.history)
+                    .flat_map(|manifest| &manifest.files)
+                    .filter(|witness| witness.witness_id == file.witness_id)
+                    .count()
+                    != 1
+            {
+                return Err(OffloadOfferRefusal::Changed);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn publish_verified(
+    verified: &VerifiedOffloadOffers<'_>,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<crate::mark_mutation::BoundMutationOutcome, OffloadOfferRefusal> {
+    verified
+        .approval
+        .revalidate_admission()
+        .map_err(admission_refusal)?;
+    if !Arc::ptr_eq(verified.journal_root(), &verified.observed.root)
+        || !Arc::ptr_eq(verified.activity(), &verified.observed.activity)
+    {
+        return Err(OffloadOfferRefusal::Changed);
+    }
+    let selections = verified
+        .observed
+        .groups
+        .iter()
+        .map(|group| group.selection.clone())
+        .collect::<Vec<_>>();
+    let claimed = acquire_claims(&verified.observed.root, &selections)?;
+    let mut commits = Vec::new();
+    for segment in &claimed {
+        let absolute = verified
+            .journal_root()
+            .canonical_path()
+            .join(&segment.relative);
+        let commit = segment.claims.commit(&absolute)?;
+        commit.require_outputs(
+            &segment.claims,
+            &absolute,
+            selections
+                .iter()
+                .filter(|selection| selection_path(selection) == segment.relative)
+                .flat_map(|selection| &selection.names)
+                .map(|name| absolute.join(name).with_extension("jsonl")),
+        )?;
+        if verified
+            .observed
+            .groups
+            .iter()
+            .filter(|group| selection_path(&group.selection) == segment.relative)
+            .any(|group| group.directory.object_identity() != segment.directory.object_identity())
+        {
+            return Err(OffloadOfferRefusal::Changed);
+        }
+        commits.push(commit);
+    }
+    // Governing claims precede every current catalog read and remain held until
+    // final register publication, including the fresh read after register lock.
+    let policy = crate::remove_marked::ReviewedPolicy::capture(verified.journal_root())
+        .map_err(|error| OffloadOfferRefusal::Policy(Box::new(error)))?;
+    check_current_metadata(&verified.observed, &policy, today, now)?;
+    check_active_witnesses(verified)?;
+    let selected = verified
+        .observed
+        .groups
+        .iter()
+        .zip(verified.marks())
+        .map(|(group, mark)| (group.expected.as_ref(), mark))
+        .collect::<Vec<_>>();
+    let guard = crate::mark_mutation::OfferMarkGuard::begin(verified.journal_root(), &selected)
+        .map_err(|error| OffloadOfferRefusal::Register(Box::new(error)))?;
+    check_current_inputs(&verified.observed, &policy, today, now)?;
+    check_active_witnesses(verified)?;
+    for commit in &commits {
+        commit.revalidate()?;
+    }
+    verified
+        .approval
+        .revalidate_admission()
+        .map_err(admission_refusal)?;
+    guard
+        .publish()
+        .map_err(|error| OffloadOfferRefusal::Register(Box::new(error)))
+}
+
+/// Publish only after the private orchestrator retains confirmed, fully synced
+/// witness-write receipts. This entry checks fresh current identity, not append
+/// durability; readable history alone cannot satisfy the caller's receipt gate.
+/// The returned outcome retains all verification and native owners on failure.
+pub fn publish_offload_offers<'clock>(
+    verified: VerifiedOffloadOffers<'clock>,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> OffloadOfferOutcome<'clock> {
+    #[cfg(unix)]
+    let publication = publish_verified(&verified, today, now);
+    #[cfg(not(unix))]
+    let publication = {
+        let _parameters = (today, now);
+        Err(OffloadOfferRefusal::Unsupported)
+    };
+    OffloadOfferOutcome {
+        verified,
+        publication,
+    }
+}
+
 #[cfg(all(test, unix))]
 #[allow(
     clippy::unwrap_used,
@@ -544,6 +1146,139 @@ mod tests {
     ) -> Result<ObservedOffloadOffers, OffloadOfferRefusal> {
         let (today, now) = time();
         capture_offload_offers(operation, selections, today, now)
+    }
+
+    fn proof(observed: &ObservedOffloadOffers) -> OffloadProof {
+        let group = &observed.groups()[0];
+        OffloadProof {
+            journal_id: observed.journal_root().identity().observation_id(),
+            manifest_id: "manifest".into(),
+            target: group.selection().target.clone(),
+            layout: group.selection().layout,
+            repository_id: "a".repeat(64),
+            snapshot_id: "b".repeat(64),
+            files: group
+                .files()
+                .iter()
+                .map(|file| crate::archive_proof::ArchiveFileProof {
+                    witness_id: format!("witness-{}", file.name()),
+                    name: file.name().into(),
+                    bytes: file.observation().digest.size,
+                    sha256: file.observation().digest.sha256.clone(),
+                    archive_path: format!("/owned/{}", file.name()),
+                    processing: file.processing().clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn save_mark(root: &JournalRoot, mark: &Mark) {
+        let mut register = crate::marks::Register::empty();
+        register.version = 2;
+        register.marks.insert(mark.id.clone(), mark.clone());
+        crate::marks::validate(&register).unwrap();
+        fs::create_dir_all(root.canonical_path().join("health")).unwrap();
+        fs::write(
+            root.canonical_path().join("health/retention-marks.json"),
+            serde_json::to_vec(&register).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn actual_captured_pending_offer_reuses_full_row_and_reoffer_renews_consent() {
+        let (_journal, root) = fixture();
+        let selected = selection(SegmentLayout::Named, &["audio.flac"]);
+        seed(&root, &selected, "audio.flac", "analyzed");
+        let operation = operation(&root);
+        let observed = capture(&operation, std::slice::from_ref(&selected)).unwrap();
+        let proof = proof(&observed);
+        let (_, now) = time();
+        let mut first = candidate_mark(&observed.groups()[0], proof.clone(), now).unwrap();
+        first.proposal.reason = "original proposal".into();
+        first.marked_at = "original time".into();
+        save_mark(&root, &first);
+        let observed = capture(&operation, std::slice::from_ref(&selected)).unwrap();
+        assert_eq!(
+            candidate_mark(&observed.groups()[0], proof.clone(), now).unwrap(),
+            first
+        );
+        let mut changed = proof.clone();
+        changed.snapshot_id = "c".repeat(64);
+        let renewed = candidate_mark(&observed.groups()[0], changed, now).unwrap();
+        assert_ne!(
+            renewed.offload.as_ref().unwrap().nonce,
+            first.offload.as_ref().unwrap().nonce
+        );
+        assert_ne!(
+            renewed.offload.as_ref().unwrap().revision,
+            first.offload.as_ref().unwrap().revision
+        );
+        let mut failed = first.clone();
+        failed.state = crate::marks::MarkState::Failed(crate::marks::Failure {
+            at: "failed time".into(),
+            reason: "failed before raw claim".into(),
+            staged: None,
+        });
+        save_mark(&root, &failed);
+        let observed = capture(&operation, std::slice::from_ref(&selected)).unwrap();
+        let renewed = candidate_mark(&observed.groups()[0], proof, now).unwrap();
+        assert_ne!(
+            renewed.offload.as_ref().unwrap().nonce,
+            first.offload.as_ref().unwrap().nonce
+        );
+        assert_eq!(renewed.state, crate::marks::MarkState::Marked);
+        assert_eq!(
+            crate::review_context::load_at_root(&root)
+                .unwrap()
+                .marks
+                .get(&failed.id),
+            Some(&failed)
+        );
+    }
+
+    #[test]
+    fn private_offer_register_phase_supports_absence_and_refuses_full_row_drift() {
+        let (_journal, root) = fixture();
+        let selected = selection(SegmentLayout::Named, &["audio.flac"]);
+        seed(&root, &selected, "audio.flac", "analyzed");
+        let operation = operation(&root);
+        let observed = capture(&operation, std::slice::from_ref(&selected)).unwrap();
+        let (_, now) = time();
+        let first = candidate_mark(&observed.groups()[0], proof(&observed), now).unwrap();
+        fs::create_dir(root.canonical_path().join("health")).unwrap();
+        let result = crate::mark_mutation::OfferMarkGuard::begin(&root, &[(None, &first)])
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert!(matches!(
+            result,
+            crate::mark_mutation::BoundMutationOutcome::Published(_)
+        ));
+        let result = crate::mark_mutation::OfferMarkGuard::begin(&root, &[(Some(&first), &first)])
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert!(
+            matches!(result, crate::mark_mutation::BoundMutationOutcome::Unchanged(ref result) if result.status == crate::mark_mutation::MutationStatus::AlreadyApplied)
+        );
+        let mut newer = first.clone();
+        newer.proposal.reason = "newer row".into();
+        save_mark(&root, &newer);
+        let path = root.canonical_path().join("health/retention-marks.json");
+        let bytes = fs::read(&path).unwrap();
+        assert!(matches!(
+            crate::mark_mutation::OfferMarkGuard::begin(&root, &[(Some(&first), &first)]),
+            Err(crate::mark_mutation::BoundMutationRefusal::Review(
+                crate::review_context::ReviewRefusal::Stale { .. }
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::write(&path, b"{torn").unwrap();
+        assert!(crate::mark_mutation::OfferMarkGuard::begin(&root, &[(None, &first)]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{torn");
+        // This private writer-leaf control does not manufacture a Verified offer
+        // or claim the mandatory actual actor/current-witness composition gate.
     }
 
     #[test]

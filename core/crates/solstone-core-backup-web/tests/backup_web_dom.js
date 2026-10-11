@@ -269,6 +269,11 @@ function fixture(document) {
   add(banner, 'span', { class: 'backup-spinner' });
   add(banner, 'span', { 'data-operation-phase': '' });
   add(banner, 'span', { 'data-operation-error': '' });
+  const restoreReport = add(root, 'div', { 'data-operation-restore-report': '', hidden: '' });
+  add(restoreReport, 'p', { 'data-operation-restore-summary': '', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
+  const restoreDetails = add(restoreReport, 'details', { 'data-operation-restore-details': '', hidden: '' });
+  add(restoreDetails, 'summary', { 'data-copy': 'offload.restore_report.files' });
+  add(restoreDetails, 'ol', { 'data-operation-restore-files': '' });
   const cleanupBanner = add(root, 'div', { 'data-cleanup-banner': '', hidden: '' });
   add(cleanupBanner, 'span', { 'data-cleanup-heading': '' });
   add(cleanupBanner, 'span', { 'data-cleanup-reason': '' });
@@ -545,6 +550,23 @@ testCase('workspace has only the new restore lane contract', () => {
   assert.ok(!operatedSection.includes('data-copy="action_labels.restore"'));
   assert.ok(byoSection.includes('data-copy="restore.hosted.key_label"'));
   assert.ok(!byoSection.includes('data-copy="confirm.prompt"'));
+});
+
+testCase('restore report markup has a live summary and closed native disclosure', () => {
+  const workspace = fs.readFileSync(path.join(crateDir, 'assets', 'workspace.html'), 'utf8');
+  const start = workspace.indexOf('data-operation-restore-report');
+  assert.ok(start >= 0);
+  const report = workspace.slice(workspace.lastIndexOf('<div', start), workspace.indexOf('</div>', start));
+  assert.match(report, /^<div[^>]*data-operation-restore-report[^>]*\bhidden\b/);
+  const summary = report.match(/<p\b[^>]*data-operation-restore-summary[^>]*>/)[0];
+  assert.match(summary, /role="status"/);
+  assert.match(summary, /aria-live="polite"/);
+  assert.match(summary, /aria-atomic="true"/);
+  const details = report.match(/<details\b[^>]*data-operation-restore-details[^>]*>/)[0];
+  assert.match(details, /\bhidden\b/);
+  assert.doesNotMatch(details, /\bopen(?:\s|=|>)/);
+  assert.match(report, /<summary\b[^>]*data-copy="offload\.restore_report\.files"[^>]*><\/summary>/);
+  assert.match(report, /<ol\b[^>]*data-operation-restore-files[^>]*><\/ol>/);
 });
 
 testCase('offload byte units are binary, matching settings’ unit family (g3-108)', () => {
@@ -824,6 +846,152 @@ asyncCase('a successful operation has no failure fallback or active spinner', as
   assert.strictEqual(harness.root.querySelector('[data-operation-error]').textContent, '');
   assert.ok(harness.banner.querySelector('.backup-spinner').hidden);
   assert.ok(harness.cleanupBanner.hidden);
+});
+
+function offloadRestoreOperation(report, phase = 'error', reason = null) {
+  return { kind: 'offload_restore', phase, reason_code: reason, report, elapsed_ms: 0 };
+}
+
+function restoreReportNodes(harness) {
+  const query = (selector) => harness.root.querySelector(selector);
+  return {
+    container: query('[data-operation-restore-report]'),
+    summary: query('[data-operation-restore-summary]'),
+    details: query('[data-operation-restore-details]'),
+    rows: query('[data-operation-restore-files]'),
+  };
+}
+
+asyncCase('restore reports preserve ordered dispositions, effects and literal locations', async () => {
+  const dispositions = ['published', 'already_present', 'conflict', 'unverified', 'unattempted'];
+  const files = dispositions.map((disposition, index) => ({
+    day: '20261010', stream: 'stream-' + index, segment: 'segment', name: 'same.wav',
+    disposition, files_restored: index === 0 || index === 3 ? 1 : 0,
+    bytes_restored: index === 0 || index === 3 ? 2 * 1024 * 1024 : 0,
+    evidence: index === 3 ? { completed: false, register: { status: 'refused' }, hold: { detail_available: false } } : {},
+  }));
+  files[4].name = '<img src=x onerror=alert(1)>.wav';
+  files[4].stream = '<script>private</script>';
+  const harness = createHarness({ statusQueue: [status(offloadRestoreOperation({
+    status: 'partial', files_restored: 7, bytes_restored: 9 * 1024 * 1024, files,
+    reason_detail: 'PRIVATE DIAGNOSTIC',
+  }))] });
+  await ready(harness);
+  const { container, summary, details, rows } = restoreReportNodes(harness);
+  assert.ok(!container.hidden && !details.hidden);
+  assert.strictEqual(details.getAttribute('open'), null);
+  assert.ok(summary.textContent.includes('7') && summary.textContent.includes('9 MiB'));
+  assert.strictEqual(rows.children.length, 5);
+  assert.deepStrictEqual(rows.children.map((row) => row.getAttribute('data-restore-disposition')), dispositions);
+  for (let index = 0; index < rows.children.length; index += 1) {
+    const row = rows.children[index];
+    assert.ok(row.textContent.includes([files[index].day, files[index].stream, files[index].segment, files[index].name].join('/')));
+    assert.strictEqual(row.children.length, 0);
+    assert.ok(!row.textContent.includes('PRIVATE DIAGNOSTIC'));
+  }
+  assert.ok(rows.children[0].textContent.includes('2 MiB'));
+  assert.ok(rows.children[1].textContent.includes('0 GiB'));
+  assert.ok(rows.children[3].textContent.includes('2 MiB'));
+  assert.strictEqual(rows.querySelectorAll('img').length, 0);
+  assert.ok(harness.banner.querySelector('.backup-spinner').hidden);
+  assert.deepStrictEqual(harness.calls, []);
+});
+
+asyncCase('restore attention comes only from an explicit hold, independently of effects', async () => {
+  const files = [undefined, null, { detail_available: false }].map((hold, index) => ({
+    name: 'same.wav', disposition: 'unverified', files_restored: 1, bytes_restored: 2 * 1024 * 1024,
+    evidence: { completed: false, register: { status: 'refused' }, ...(index === 0 ? {} : { hold }) },
+  }));
+  const harness = createHarness({ statusQueue: [status(offloadRestoreOperation({ files_restored: 3, bytes_restored: 6 * 1024 * 1024, files }))] });
+  await ready(harness);
+  const { rows } = restoreReportNodes(harness);
+  assert.strictEqual(rows.children[0].textContent, rows.children[1].textContent);
+  assert.ok(rows.children[2].textContent.startsWith(rows.children[0].textContent + ' · '));
+  for (const row of rows.children) assert.ok(row.textContent.includes('2 MiB'));
+});
+
+asyncCase('unavailable restore counts and malformed rows never become zero or success', async () => {
+  const invalid = [undefined, null, -1, 1.5, '4', Number.MAX_SAFE_INTEGER + 1];
+  const files = invalid.map((value) => ({ disposition: 'future', files_restored: value, bytes_restored: value }));
+  files.push(null, 'invalid', [], { disposition: ['published'], files_restored: 0, bytes_restored: 0 });
+  const harness = createHarness({ statusQueue: [status(offloadRestoreOperation({ files_restored: null, bytes_restored: Number.MAX_SAFE_INTEGER + 1, files }))] });
+  await ready(harness);
+  const { summary, rows } = restoreReportNodes(harness);
+  const unavailable = harness.root.querySelector('[data-offload-proposed-bytes]').textContent;
+  assert.ok(unavailable.length > 0);
+  assert.strictEqual(summary.textContent.split(unavailable).length - 1, 2);
+  for (let index = 0; index < invalid.length; index += 1) {
+    assert.strictEqual(rows.children[index].textContent.split(unavailable).length - 1, 2);
+  }
+  assert.ok(rows.children.every((row) => row.getAttribute('data-restore-disposition') === 'unknown'));
+  for (const row of rows.children.slice(invalid.length, -1)) {
+    assert.ok(row.textContent.length > 0);
+    assert.ok(!row.textContent.includes('0 GiB'));
+  }
+  assert.ok(rows.children.at(-1).textContent.includes('0 GiB'));
+});
+
+asyncCase('current restore snapshots replace populated rows and clear missing reports', async () => {
+  const report = (name, count) => ({ files_restored: count, bytes_restored: count * 1024 * 1024,
+    files: [{ day: '20261010', name, disposition: 'published', files_restored: count, bytes_restored: count * 1024 * 1024 }] });
+  const first = offloadRestoreOperation(report('first.wav', 1), 'restoring');
+  const updated = { ...first, report: report('updated.wav', 2) };
+  const next = offloadRestoreOperation(report('next.wav', 3), 'restoring');
+  const harness = createHarness({ statusQueue: [first, updated, next,
+    offloadRestoreOperation({ files_restored: 0, bytes_restored: 0, files: [] }, 'restoring'),
+    offloadRestoreOperation(undefined, 'restoring'),
+    offloadRestoreOperation({}, 'restoring'),
+    restoreOperation('done'),
+  ].map((operation) => status(operation)) });
+  await ready(harness);
+  const { container, summary, details, rows } = restoreReportNodes(harness);
+  for (const [name, count] of [['first.wav', 1], ['updated.wav', 2], ['next.wav', 3]]) {
+    assert.strictEqual(rows.children.length, 1);
+    assert.ok(rows.children[0].textContent.includes(name));
+    assert.ok(summary.textContent.includes(count + ' MiB'));
+    assert.ok(!harness.banner.querySelector('.backup-spinner').hidden);
+    details.setAttribute('open', '');
+    await harness.runTimer(800);
+    assert.strictEqual(details.getAttribute('open'), null);
+  }
+  assert.ok(!container.hidden && details.hidden && rows.children.length === 0);
+  assert.ok(summary.textContent.includes('0 GiB'));
+  await harness.runTimer(800);
+  assert.ok(container.hidden && details.hidden);
+  assert.strictEqual(summary.textContent, '');
+  assert.strictEqual(rows.children.length, 0);
+  await harness.runTimer(800);
+  assert.ok(!container.hidden && details.hidden);
+  assert.ok(!summary.textContent.includes('0 GiB'));
+  await harness.runTimer(800);
+  assert.ok(container.hidden);
+  assert.strictEqual(summary.textContent, '');
+  assert.strictEqual(rows.children.length, 0);
+  assert.ok(harness.banner.querySelector('.backup-spinner').hidden);
+  assert.ok(harness.calls.every((call) => call.url === '/app/backup/status' && !call.request.method));
+});
+
+asyncCase('held summary-only restore reports keep zero and explain actual refusal tokens', async () => {
+  const explanations = [];
+  for (const reason of ['archive_unbound', 'restore_held', 'future_reason', '__proto__']) {
+    const harness = createHarness({ statusQueue: [status(offloadRestoreOperation({ files_restored: 0, bytes_restored: 0 }, 'refused', reason))] });
+    const missingCopy = [];
+    harness.window.logError = (error) => missingCopy.push(error);
+    await ready(harness);
+    const { container, summary, details, rows } = restoreReportNodes(harness);
+    assert.ok(!container.hidden && details.hidden);
+    assert.ok(summary.textContent.includes('0 GiB'));
+    assert.strictEqual(rows.children.length, 0);
+    const explanation = harness.root.querySelector('[data-operation-error]').textContent;
+    assert.ok(explanation.length > 0 && !explanation.includes(reason));
+    explanations.push(explanation);
+    assert.strictEqual(missingCopy.length, reason === 'archive_unbound' || reason === 'restore_held' ? 0 : 1);
+    assert.ok(harness.banner.querySelector('.backup-spinner').hidden);
+    assert.deepStrictEqual(harness.calls, []);
+  }
+  assert.notStrictEqual(explanations[0], explanations[1]);
+  assert.notStrictEqual(explanations[0], explanations[2]);
+  assert.strictEqual(explanations[2], explanations[3]);
 });
 
 asyncCase('contended admission is visible and recoverable with no invented operation', async () => {
@@ -1227,6 +1395,7 @@ asyncCase('restore prepare consent-window expiry has its own copy', async () => 
 asyncCase('hosted recovery-key ARIA separates local validation from C3 failures', async () => {
   const harness = createHarness({ popupFactory: () => null });
   await ready(harness);
+  click(harness.showRestore);
   selectOperated(harness);
   assert.ok(harness.primary.disabled);
   click(harness.primary);
@@ -1242,7 +1411,12 @@ asyncCase('hosted recovery-key ARIA separates local validation from C3 failures'
   assert.strictEqual(harness.key.getAttribute('aria-invalid'), null);
   assert.strictEqual(harness.key.getAttribute('aria-errormessage'), null);
   assert.strictEqual(harness.key.getAttribute('aria-describedby'), harness.heading.id);
-  assert.strictEqual(harness.root.querySelectorAll('[role="status"]').filter((element) => !element.hidden).length, 1);
+  assert.strictEqual(harness.root.querySelectorAll('[role="status"]').filter((element) => {
+    for (let current = element; current; current = current.parentElement) {
+      if (current.hidden) return false;
+    }
+    return true;
+  }).length, 1);
 });
 
 asyncCase('server invalid_key marks the hosted recovery key invalid', async () => {

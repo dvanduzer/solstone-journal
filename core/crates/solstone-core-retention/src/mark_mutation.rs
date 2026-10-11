@@ -312,6 +312,19 @@ fn begin_bound_read(
     root: &JournalRoot,
     health: &HealthDirectory,
 ) -> Result<(BoundParentLock, Register), BoundMutationRefusal> {
+    let (lock, register) = begin_bound_optional(root, health)?;
+    let register = register.ok_or_else(|| {
+        BoundMutationRefusal::Review(ReviewRefusal::Register(invalid(
+            "the retained removal register disappeared",
+        )))
+    })?;
+    Ok((lock, register))
+}
+
+fn begin_bound_optional(
+    root: &JournalRoot,
+    health: &HealthDirectory,
+) -> Result<(BoundParentLock, Option<Register>), BoundMutationRefusal> {
     // Windows publication remains held pending the owning adapter's qualification.
     if cfg!(windows) {
         return Err(BoundMutationRefusal::Unsupported);
@@ -326,15 +339,86 @@ fn begin_bound_read(
     )
     .map_err(BoundMutationRefusal::Lock)?;
     revalidate_health(root, health)?;
-    let register = read_at_health(health)?.ok_or_else(|| {
-        BoundMutationRefusal::Review(ReviewRefusal::Register(invalid(
-            "the retained removal register disappeared",
-        )))
-    })?;
+    let register = read_at_health(health)?;
     #[cfg(unix)]
     lock.revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
         .map_err(BoundMutationRefusal::Lock)?;
     Ok((lock, register))
+}
+
+/// Private final publication phase after owning archive verification. No WAN
+/// or bookkeeping runs while this retained register exclusion is held.
+#[cfg(unix)]
+pub(crate) struct OfferMarkGuard<'a> {
+    root: &'a JournalRoot,
+    health: HealthDirectory,
+    lock: BoundParentLock,
+    result: ConditionalResult,
+}
+
+#[cfg(unix)]
+impl<'a> OfferMarkGuard<'a> {
+    pub(crate) fn begin(
+        root: &'a JournalRoot,
+        selected: &[(Option<&Mark>, &Mark)],
+    ) -> Result<Self, BoundMutationRefusal> {
+        let health = open_health(root, OsStr::new("health"), root.canonical_path())
+            .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Read(error)))?
+            .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
+        let (lock, register) = begin_bound_optional(root, &health)?;
+        let mut register = register.unwrap_or_else(Register::empty);
+        let mut ids = BTreeSet::new();
+        if selected.is_empty() {
+            return Err(BoundMutationRefusal::Review(ReviewRefusal::Empty));
+        }
+        let mut changed = register.version != 2;
+        for (expected, candidate) in selected {
+            if !ids.insert(&candidate.id)
+                || candidate.offload.is_none()
+                || candidate.class != crate::marks::RemovalClass::OffloadRawRelease
+                || !matches!(candidate.state, MarkState::Marked)
+            {
+                return Err(BoundMutationRefusal::Review(ReviewRefusal::Duplicate));
+            }
+            if register.marks.get(&candidate.id) != *expected {
+                return Err(BoundMutationRefusal::Review(ReviewRefusal::Stale {
+                    id: candidate.id.clone(),
+                }));
+            }
+            changed |= register.marks.get(&candidate.id) != Some(candidate);
+        }
+        register.version = 2;
+        for (_, candidate) in selected {
+            register
+                .marks
+                .insert(candidate.id.clone(), (*candidate).clone());
+        }
+        validate(&register)
+            .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+        let status = if changed {
+            MutationStatus::Applied
+        } else {
+            MutationStatus::AlreadyApplied
+        };
+        Ok(Self {
+            root,
+            health,
+            lock,
+            result: ConditionalResult { status, register },
+        })
+    }
+
+    pub(crate) fn publish(self) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
+        if self.result.status == MutationStatus::Applied {
+            publish_bound(self.root, &self.health, &self.lock, self.result)
+        } else {
+            revalidate_health(self.root, &self.health)?;
+            self.lock
+                .revalidate_bound(&self.health, OsStr::new("retention-marks.json.lock"))
+                .map_err(BoundMutationRefusal::Lock)?;
+            Ok(BoundMutationOutcome::Unchanged(self.result))
+        }
+    }
 }
 
 #[cfg(unix)]
