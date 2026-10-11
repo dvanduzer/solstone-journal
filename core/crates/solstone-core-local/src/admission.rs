@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Cross-process FIFO admission for bundled local inference.
+//! Cross-process priority admission for bundled local inference.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use nix::time::{ClockId, clock_gettime};
+use solstone_core_journal_config::work_priority::WorkPriority;
 use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -43,8 +42,7 @@ struct WaitTicket {
 
 impl Drop for WaitTicket {
     fn drop(&mut self) {
-        // Python unlinks before releasing its fd.  Keep the same ordering: an
-        // error removing an already-raced path must not retain the flock.
+        // Unlink before releasing ownership; failed cleanup must not retain the lock.
         if let Err(error) = fs::remove_file(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -59,12 +57,13 @@ pub fn admission_dir(journal_path: &Path) -> PathBuf {
     journal_path.join("health/local-inference-admission")
 }
 
-/// Acquire a FIFO local slot, optionally requiring every serving slot.
+/// Acquire the highest-ranked waiting call, optionally requiring every slot.
 pub fn acquire_local_slot(
     root: &Path,
     capacity: u32,
     timeout: Option<Duration>,
     exclusive_admission: bool,
+    priority: WorkPriority,
 ) -> Result<LocalSlotPermit, AdmissionError> {
     if capacity == 0 {
         return Err(AdmissionError::Io(std::io::Error::new(
@@ -72,23 +71,34 @@ pub fn acquire_local_slot(
             "local admission capacity must be positive",
         )));
     }
-    fs::create_dir_all(root)?;
     let started = Instant::now();
-    let ticket = create_ticket(root)?;
+    fs::create_dir_all(root)?;
+    let mut ticket = None;
     loop {
-        if ticket_has_turn(root, &ticket.path)? {
-            let permit = if exclusive_admission {
-                try_acquire_exclusive(root, capacity, started)?
-            } else {
-                try_acquire(root, capacity, started)?
-            };
-            if let Some(permit) = permit {
-                return Ok(permit);
+        check_deadline(started, timeout)?;
+        if let Some(arbitration) = try_arbitrate(root)? {
+            check_deadline(started, timeout)?;
+            if ticket.is_none() {
+                ticket = Some(create_ticket(root, priority)?);
             }
+            if ticket_has_turn(root, &ticket.as_ref().expect("published ticket").path)? {
+                check_deadline(started, timeout)?;
+                let permit = if exclusive_admission {
+                    try_acquire_exclusive(root, capacity, started)?
+                } else {
+                    try_acquire(root, capacity, started)?
+                };
+                if let Some(permit) = permit {
+                    check_deadline(started, timeout)?;
+                    // Publication and selection share arbitration. Retire this
+                    // waiter before letting another caller select the next one.
+                    drop(ticket.take());
+                    return Ok(permit);
+                }
+            }
+            drop(arbitration);
         }
-        if timeout.is_some_and(|deadline| started.elapsed() >= deadline) {
-            return Err(AdmissionError::Timeout);
-        }
+        check_deadline(started, timeout)?;
         let sleep_for = timeout
             .and_then(|deadline| deadline.checked_sub(started.elapsed()))
             .map(|remaining| remaining.min(POLL_INTERVAL))
@@ -99,8 +109,51 @@ pub fn acquire_local_slot(
     }
 }
 
-fn create_ticket(root: &Path) -> Result<WaitTicket, AdmissionError> {
-    let identity = ticket_identity()?;
+fn check_deadline(started: Instant, timeout: Option<Duration>) -> Result<(), AdmissionError> {
+    if timeout.is_some_and(|deadline| started.elapsed() >= deadline) {
+        Err(AdmissionError::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
+fn try_arbitrate(root: &Path) -> Result<Option<File>, AdmissionError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("arbitration.lock"))?;
+    match lock_exclusive(file) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+// The caller holds arbitration. Sequence is after every published waiter;
+// clocks, platform timer resolution and process ids cannot reverse equal keys.
+fn create_ticket(root: &Path, priority: WorkPriority) -> Result<WaitTicket, AdmissionError> {
+    let sequence = wait_tickets(root)?
+        .iter()
+        .filter_map(|path| {
+            path.file_name()?
+                .to_str()?
+                .split('-')
+                .nth(3)?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("local admission sequence exhausted"))?;
+    let identity = format!(
+        "{}-{:020}-{sequence:020}-{}",
+        priority.band as u8,
+        u64::MAX - priority.source_time,
+        Uuid::new_v4().simple()
+    );
     let creating = root.join(format!(".creating-{identity}.ticket"));
     let ticket = root.join(format!("wait-{identity}.ticket"));
     let file = OpenOptions::new()
@@ -118,42 +171,6 @@ fn create_ticket(root: &Path) -> Result<WaitTicket, AdmissionError> {
         path: ticket,
         lock: Some(lock),
     })
-}
-
-fn ticket_identity() -> Result<String, AdmissionError> {
-    let nanos = monotonic_nanos()?;
-    Ok(format!(
-        "{nanos:020}-{}-{}",
-        std::process::id(),
-        Uuid::new_v4().simple()
-    ))
-}
-
-#[cfg(unix)]
-fn monotonic_nanos() -> Result<u128, AdmissionError> {
-    let now = clock_gettime(ClockId::CLOCK_MONOTONIC)
-        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
-    Ok(
-        (u128::try_from(now.tv_sec()).unwrap_or_default() * 1_000_000_000)
-            + u128::try_from(now.tv_nsec()).unwrap_or_default(),
-    )
-}
-
-#[cfg(windows)]
-fn monotonic_nanos() -> Result<u128, AdmissionError> {
-    // SAFETY: GetTickCount64 reads the system's monotonic boot-duration counter
-    // and has no pointer or ownership preconditions.
-    #[allow(unsafe_code)]
-    let milliseconds = unsafe { GetTickCount64() };
-    Ok(u128::from(milliseconds) * 1_000_000)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn monotonic_nanos() -> Result<u128, AdmissionError> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(std::io::Error::other)?
-        .as_nanos())
 }
 
 fn ticket_has_turn(root: &Path, own_ticket: &Path) -> Result<bool, AdmissionError> {
@@ -201,7 +218,8 @@ fn is_delete_pending(_error: &std::io::Error) -> bool {
 
 fn wait_tickets(root: &Path) -> Result<Vec<PathBuf>, AdmissionError> {
     let mut tickets = fs::read_dir(root)?
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name().is_some_and(|name| {
@@ -287,18 +305,11 @@ fn lock_error(error: TryLockError) -> AdmissionError {
     }
 }
 
-#[cfg(windows)]
-#[link(name = "kernel32")]
-#[allow(unsafe_code)]
-unsafe extern "system" {
-    fn GetTickCount64() -> u64;
-}
-
 fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1_000.0
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -323,18 +334,42 @@ mod tests {
     #[test]
     fn capacity_and_release_are_process_safe() {
         let root = root();
-        let first = acquire_local_slot(&root, 2, Some(Duration::from_millis(50)), false)
-            .expect("first permit");
-        let second = acquire_local_slot(&root, 2, Some(Duration::from_millis(50)), false)
-            .expect("second permit");
+        let first = acquire_local_slot(
+            &root,
+            2,
+            Some(Duration::from_millis(50)),
+            false,
+            WorkPriority::default(),
+        )
+        .expect("first permit");
+        let second = acquire_local_slot(
+            &root,
+            2,
+            Some(Duration::from_millis(50)),
+            false,
+            WorkPriority::default(),
+        )
+        .expect("second permit");
         assert_ne!(first.slot_index, second.slot_index);
         assert!(matches!(
-            acquire_local_slot(&root, 2, Some(Duration::from_millis(30)), false),
+            acquire_local_slot(
+                &root,
+                2,
+                Some(Duration::from_millis(30)),
+                false,
+                WorkPriority::default()
+            ),
             Err(AdmissionError::Timeout)
         ));
         drop(first);
-        let replacement = acquire_local_slot(&root, 2, Some(Duration::from_millis(50)), false)
-            .expect("released slot is reusable");
+        let replacement = acquire_local_slot(
+            &root,
+            2,
+            Some(Duration::from_millis(50)),
+            false,
+            WorkPriority::default(),
+        )
+        .expect("released slot is reusable");
         assert!(replacement.slot_index < 2);
         drop(replacement);
         drop(second);
@@ -346,8 +381,14 @@ mod tests {
         let root = root();
         fs::write(root.join("wait-00000000000000000000-1-dead.ticket"), b"")
             .expect("create stale ticket");
-        let permit = acquire_local_slot(&root, 1, Some(Duration::from_millis(100)), false)
-            .expect("stale ticket should be reclaimed");
+        let permit = acquire_local_slot(
+            &root,
+            1,
+            Some(Duration::from_millis(100)),
+            false,
+            WorkPriority::default(),
+        )
+        .expect("stale ticket should be reclaimed");
         assert_eq!(permit.slot_index, 0);
         drop(permit);
         assert!(
@@ -361,18 +402,42 @@ mod tests {
     #[test]
     fn exclusive_admission_holds_all_slots_but_normal_does_not() {
         let root = root();
-        let exclusive = acquire_local_slot(&root, 2, Some(Duration::from_millis(50)), true)
-            .expect("exclusive permit");
+        let exclusive = acquire_local_slot(
+            &root,
+            2,
+            Some(Duration::from_millis(50)),
+            true,
+            WorkPriority::default(),
+        )
+        .expect("exclusive permit");
         assert!(matches!(
-            acquire_local_slot(&root, 2, Some(Duration::from_millis(30)), false),
+            acquire_local_slot(
+                &root,
+                2,
+                Some(Duration::from_millis(30)),
+                false,
+                WorkPriority::default()
+            ),
             Err(AdmissionError::Timeout)
         ));
         drop(exclusive);
 
-        let normal = acquire_local_slot(&root, 2, Some(Duration::from_millis(50)), false)
-            .expect("normal permit");
-        let concurrent = acquire_local_slot(&root, 2, Some(Duration::from_millis(50)), false)
-            .expect("normal admission must not take every slot");
+        let normal = acquire_local_slot(
+            &root,
+            2,
+            Some(Duration::from_millis(50)),
+            false,
+            WorkPriority::default(),
+        )
+        .expect("normal permit");
+        let concurrent = acquire_local_slot(
+            &root,
+            2,
+            Some(Duration::from_millis(50)),
+            false,
+            WorkPriority::default(),
+        )
+        .expect("normal admission must not take every slot");
         assert_ne!(normal.slot_index, concurrent.slot_index);
         drop(concurrent);
         drop(normal);
@@ -414,13 +479,168 @@ mod tests {
     #[test]
     fn timeout_is_reported_after_waiting_for_the_head_slot() {
         let root = root();
-        let held = acquire_local_slot(&root, 1, Some(Duration::from_millis(50)), false)
-            .expect("held permit");
+        let held = acquire_local_slot(
+            &root,
+            1,
+            Some(Duration::from_millis(50)),
+            false,
+            WorkPriority::default(),
+        )
+        .expect("held permit");
         assert!(matches!(
-            acquire_local_slot(&root, 1, Some(Duration::from_millis(30)), false),
+            acquire_local_slot(
+                &root,
+                1,
+                Some(Duration::from_millis(30)),
+                false,
+                WorkPriority::default()
+            ),
             Err(AdmissionError::Timeout)
         ));
         drop(held);
         cleanup(&root);
+    }
+
+    fn await_tickets(root: &Path, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while wait_tickets(root).unwrap().len() != count {
+            assert!(Instant::now() < deadline, "waiters did not publish");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn published_waiters_admit_by_band_newest_and_equal_key_fifo() {
+        let root = tempfile::tempdir().unwrap();
+        let held = acquire_local_slot(
+            root.path(),
+            1,
+            Some(Duration::from_secs(5)),
+            false,
+            WorkPriority::default(),
+        )
+        .unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let inputs = ["6:9", "5:9", "4:9", "3:9", "2:9", "1:1", "1:9", "1:9"];
+        let mut workers = Vec::new();
+        for (index, input) in inputs.into_iter().enumerate() {
+            let path = root.path().to_owned();
+            let sent = sent.clone();
+            workers.push(thread::spawn(move || {
+                let permit = acquire_local_slot(
+                    &path,
+                    1,
+                    Some(Duration::from_secs(10)),
+                    false,
+                    input.parse().unwrap(),
+                )
+                .unwrap();
+                sent.send(index).unwrap();
+                drop(permit);
+            }));
+            await_tickets(root.path(), index + 1);
+        }
+        drop(held);
+        for expected in [6, 7, 5, 4, 3, 2, 1, 0] {
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(5)).unwrap(),
+                expected
+            );
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(wait_tickets(root.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn higher_normal_waiter_passes_lower_exclusive_without_interrupting_running_call() {
+        let root = tempfile::tempdir().unwrap();
+        let running =
+            acquire_local_slot(root.path(), 2, None, false, WorkPriority::default()).unwrap();
+        let path = root.path().to_owned();
+        let lower = thread::spawn(move || {
+            acquire_local_slot(
+                &path,
+                2,
+                Some(Duration::from_secs(5)),
+                true,
+                "6:9".parse().unwrap(),
+            )
+            .unwrap()
+        });
+        await_tickets(root.path(), 1);
+        let high = acquire_local_slot(
+            root.path(),
+            2,
+            Some(Duration::from_secs(2)),
+            false,
+            "1:9".parse().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(running.slot_index, high.slot_index);
+        assert!(!lower.is_finished());
+        drop(high);
+        drop(running);
+        drop(lower.join().unwrap());
+    }
+
+    #[test]
+    fn arbitration_serializes_publication_and_admission_and_obeys_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let held =
+            acquire_local_slot(root.path(), 1, None, false, WorkPriority::default()).unwrap();
+        let path = root.path().to_owned();
+        let low = thread::spawn(move || {
+            acquire_local_slot(
+                &path,
+                1,
+                Some(Duration::from_millis(100)),
+                false,
+                "6:9".parse().unwrap(),
+            )
+        });
+        await_tickets(root.path(), 1);
+        let arbitration = loop {
+            if let Some(lock) = try_arbitrate(root.path()).unwrap() {
+                break lock;
+            }
+            thread::yield_now();
+        };
+        drop(held);
+        let path = root.path().to_owned();
+        let high = thread::spawn(move || {
+            acquire_local_slot(
+                &path,
+                1,
+                Some(Duration::from_millis(100)),
+                false,
+                "1:9".parse().unwrap(),
+            )
+        });
+        assert!(matches!(high.join().unwrap(), Err(AdmissionError::Timeout)));
+        assert!(matches!(low.join().unwrap(), Err(AdmissionError::Timeout)));
+        assert!(wait_tickets(root.path()).unwrap().is_empty());
+        drop(arbitration);
+        assert!(matches!(
+            acquire_local_slot(
+                root.path(),
+                1,
+                Some(Duration::ZERO),
+                false,
+                WorkPriority::default()
+            ),
+            Err(AdmissionError::Timeout)
+        ));
+        drop(
+            acquire_local_slot(
+                root.path(),
+                1,
+                Some(Duration::from_secs(1)),
+                false,
+                WorkPriority::default(),
+            )
+            .unwrap(),
+        );
     }
 }

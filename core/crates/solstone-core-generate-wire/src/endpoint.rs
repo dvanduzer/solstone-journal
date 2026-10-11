@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use solstone_core_generate::{ContentPart, GenerateRequest};
+use solstone_core_journal_config::work_priority::WorkPriority;
 use solstone_core_local::admission::{
     AdmissionError, LocalSlotPermit, acquire_local_slot, admission_dir,
 };
@@ -394,6 +395,7 @@ fn acquire_endpoint_slot(
         endpoint.parallel_slots.unwrap_or(1),
         Some(timeout),
         exclusive_admission,
+        WorkPriority::from_environment().map_err(|_| "provider_response_invalid")?,
     )
     .map_err(|error| match error {
         AdmissionError::Timeout => "local_queue_timeout",
@@ -2217,6 +2219,7 @@ mod tests {
             1,
             Some(Duration::from_secs(2)),
             false,
+            WorkPriority::default(),
         )
         .expect("held permit");
         assert_eq!(

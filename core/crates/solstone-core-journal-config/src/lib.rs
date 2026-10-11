@@ -12,6 +12,7 @@ pub mod parakeet_coreml;
 mod path;
 pub mod processing;
 mod read;
+pub mod work_priority;
 mod zone;
 
 #[cfg(test)]

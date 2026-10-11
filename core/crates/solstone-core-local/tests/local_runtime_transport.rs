@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use solstone_core_journal_config::work_priority::WorkPriority;
 use solstone_core_local::LoopbackAddr;
 use solstone_core_local::admission::{AdmissionError, acquire_local_slot};
 use solstone_core_local::connect::{ConnectInput, ConnectOutcome, connect};
@@ -174,8 +175,14 @@ fn child_holds_slot_until_killed() {
     }
     let root =
         std::path::PathBuf::from(std::env::var("SOLSTONE_ADMISSION_ROOT").expect("child root"));
-    let _permit = acquire_local_slot(&root, 1, Some(std::time::Duration::from_secs(2)), false)
-        .expect("child permit");
+    let _permit = acquire_local_slot(
+        &root,
+        1,
+        Some(std::time::Duration::from_secs(2)),
+        false,
+        WorkPriority::default(),
+    )
+    .expect("child permit");
     let ready_socket = std::env::var("SOLSTONE_ADMISSION_READY_SOCKET").expect("ready socket");
     let ready = UnixDatagram::unbound().expect("create readiness socket");
     ready
@@ -202,7 +209,13 @@ fn killed_holder_releases_slot_without_repair() {
     let length = ready.recv(&mut message).expect("receive child readiness");
     assert_eq!(&message[..length], b"ready");
     assert!(matches!(
-        acquire_local_slot(root.path(), 1, Some(Duration::from_millis(200)), false),
+        acquire_local_slot(
+            root.path(),
+            1,
+            Some(Duration::from_millis(200)),
+            false,
+            WorkPriority::default()
+        ),
         Err(AdmissionError::Timeout)
     ));
     child.kill_wait();
@@ -211,6 +224,7 @@ fn killed_holder_releases_slot_without_repair() {
         1,
         Some(std::time::Duration::from_millis(200)),
         false,
+        WorkPriority::default(),
     )
     .expect("kernel releases flock on process death");
     drop(reclaimed);
@@ -230,8 +244,14 @@ fn rust_waits_for_a_released_child_slot() {
     assert_eq!(&message[..length], b"ready");
 
     let started = std::time::Instant::now();
-    let permit = acquire_local_slot(root.path(), 1, Some(Duration::from_secs(2)), false)
-        .expect("waiter acquires after the child releases");
+    let permit = acquire_local_slot(
+        root.path(),
+        1,
+        Some(Duration::from_secs(2)),
+        false,
+        WorkPriority::default(),
+    )
+    .expect("waiter acquires after the child releases");
     assert!(
         started.elapsed() >= TIMED_HOLD / 2,
         "waiter acquired before the child released its flock: {:?}",
@@ -239,4 +259,177 @@ fn rust_waits_for_a_released_child_slot() {
     );
     drop(permit);
     child.wait_success();
+}
+
+#[test]
+fn child_holds_arbitration_until_killed() {
+    let Some(root) = std::env::var_os("SOLSTONE_ARBITRATION_ROOT") else {
+        return;
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(Path::new(&root).join("arbitration.lock"))
+        .unwrap();
+    file.try_lock().unwrap();
+    let socket = UnixDatagram::unbound().unwrap();
+    socket
+        .connect(std::env::var_os("SOLSTONE_ADMISSION_READY_SOCKET").unwrap())
+        .unwrap();
+    socket.send(b"ready").unwrap();
+    std::thread::park();
+}
+
+#[test]
+fn killed_arbitrator_cannot_brick_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let socket_path = root.path().join("arbitrator.sock");
+    let socket = UnixDatagram::bind(&socket_path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut child = ReapChild(Some(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_holds_arbitration_until_killed"])
+            .env("SOLSTONE_ARBITRATION_ROOT", root.path())
+            .env("SOLSTONE_ADMISSION_READY_SOCKET", &socket_path)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    let mut ready = [0; 5];
+    assert_eq!(socket.recv(&mut ready).unwrap(), 5);
+    assert!(matches!(
+        acquire_local_slot(
+            root.path(),
+            1,
+            Some(Duration::from_millis(100)),
+            false,
+            WorkPriority::default()
+        ),
+        Err(AdmissionError::Timeout)
+    ));
+    child.kill_wait();
+    drop(
+        acquire_local_slot(
+            root.path(),
+            1,
+            Some(Duration::from_secs(1)),
+            false,
+            WorkPriority::default(),
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+fn child_reads_priority_context() {
+    let Some(expected) = std::env::var_os("SOLSTONE_PRIORITY_EXPECTED") else {
+        return;
+    };
+    match expected.to_str().unwrap() {
+        "invalid" => assert!(WorkPriority::from_environment().is_err()),
+        value => assert_eq!(WorkPriority::from_environment().unwrap().to_string(), value),
+    }
+}
+
+#[test]
+fn inherited_priority_is_preserved_and_invalid_context_is_refused() {
+    for (input, expected) in [
+        (None, "1:0"),
+        (Some("6:20260101000000"), "6:20260101000000"),
+        (Some("invalid"), "invalid"),
+    ] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "child_reads_priority_context"])
+            .env_remove("SOLSTONE_WORK_PRIORITY")
+            .env("SOLSTONE_PRIORITY_EXPECTED", expected);
+        if let Some(input) = input {
+            command.env("SOLSTONE_WORK_PRIORITY", input);
+        }
+        assert!(command.status().unwrap().success());
+    }
+}
+
+#[test]
+fn child_waits_at_priority() {
+    let Some(root) = std::env::var_os("SOLSTONE_PRIORITY_ROOT") else {
+        return;
+    };
+    let priority = WorkPriority::from_environment().unwrap();
+    let permit = acquire_local_slot(
+        Path::new(&root),
+        1,
+        Some(Duration::from_secs(10)),
+        false,
+        priority,
+    )
+    .unwrap();
+    let socket = UnixDatagram::unbound().unwrap();
+    socket
+        .connect(std::env::var_os("SOLSTONE_ADMISSION_READY_SOCKET").unwrap())
+        .unwrap();
+    socket
+        .send(std::env::var("SOLSTONE_PRIORITY_ID").unwrap().as_bytes())
+        .unwrap();
+    drop(permit);
+}
+
+#[test]
+fn independent_processes_obey_the_ladder_and_source_order() {
+    let root = tempfile::tempdir().unwrap();
+    let socket_path = root.path().join("order.sock");
+    let socket = UnixDatagram::bind(&socket_path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let held = acquire_local_slot(root.path(), 1, None, false, WorkPriority::default()).unwrap();
+    let mut children = Vec::new();
+    for (index, priority) in ["6:9", "5:9", "4:9", "3:9", "2:9", "1:1", "1:9", "1:9"]
+        .into_iter()
+        .enumerate()
+    {
+        children.push(ReapChild(Some(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child_waits_at_priority"])
+                .env("SOLSTONE_PRIORITY_ROOT", root.path())
+                .env("SOLSTONE_WORK_PRIORITY", priority)
+                .env("SOLSTONE_PRIORITY_ID", index.to_string())
+                .env("SOLSTONE_ADMISSION_READY_SOCKET", &socket_path)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_name().to_str().unwrap().starts_with("wait-"))
+                .count();
+            if count == index + 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not publish its ticket"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    drop(held);
+    for expected in [6, 7, 5, 4, 3, 2, 1, 0] {
+        let mut buffer = [0; 16];
+        let size = socket.recv(&mut buffer).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&buffer[..size]).unwrap(),
+            expected.to_string()
+        );
+    }
+    for child in &mut children {
+        child.wait_success();
+    }
 }

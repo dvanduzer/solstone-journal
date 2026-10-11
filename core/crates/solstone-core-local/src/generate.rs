@@ -443,6 +443,8 @@ fn generate_with_connected_server_at<T: GenerateTransport>(
             server.parallel_slots,
             Some(remaining),
             input.exclusive_admission,
+            solstone_core_journal_config::work_priority::WorkPriority::from_environment()
+                .map_err(RemainingTimeout::AdmissionError)?,
         )
         .map_err(|error| match error {
             AdmissionError::Timeout => RemainingTimeout::AdmissionTimeout,
