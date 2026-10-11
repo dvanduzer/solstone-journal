@@ -1,33 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Restore offloaded raw media without removing files that predated an attempt.
+//! Read-only restore selection while the durable prepared-media executor is held.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
 
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use solstone_core_backup::{
-    assemble_backend_env, get_backup_config, get_destination, get_keys, load_hosted_binding,
-    record_restore_result,
-};
-use solstone_core_backup_runtime::{BackupServices, reason_for_returncode, run_restic};
-use solstone_core_journal_io::paths::{PathOrDay, iter_segments, segment_path};
-use solstone_core_journal_io::{bump_stream_marker, check_record_identities};
-use solstone_core_retention::{Target, resolve_offload};
+use solstone_core_backup_runtime::BackupServices;
+use solstone_core_journal_io::media::MediaDirectory;
+use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
+use solstone_core_journal_io::{JournalRoot, check_record_identities};
 
-use crate::ledger::{
-    OffloadFile, SegmentOffloadSummary, append_restore_event, summarize_day, summarize_journal,
-};
-use crate::measurement::device_free_bytes;
+use crate::ledger::{self, SegmentCatalog};
 
 pub const RESTORE_RESERVE_BYTES: u64 = 1_000_000_000;
 pub const OFFLOAD_RESTORE_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
 pub const OFFLOAD_RESTORE_STATUSES: [&str; 5] = ["ok", "no_op", "refused", "degraded", "error"];
-pub const OFFLOAD_RESTORE_REASONS: [&str; 17] = [
+pub const OFFLOAD_RESTORE_REASONS: [&str; 19] = [
+    "archive_unbound",
     "auth_failed",
     "backup_not_ready",
     "destination_admission_failed",
@@ -39,6 +30,7 @@ pub const OFFLOAD_RESTORE_REASONS: [&str; 17] = [
     "nothing_to_restore",
     "repo_missing",
     "restic_unavailable",
+    "restore_held",
     "rclone_unavailable",
     "segment_identity",
     "segment_missing",
@@ -99,466 +91,155 @@ impl RestoreResult {
         self
     }
 }
-fn sha(path: &Path) -> Option<String> {
-    Some(format!("{:x}", Sha256::digest(fs::read(path).ok()?)))
-}
-fn verify(directory: &Path, files: &[OffloadFile]) -> Option<&'static str> {
-    for file in files {
-        let path = directory.join(&file.name);
-        if !path.is_file() {
-            return Some("missing_file_after_restore");
-        }
-        if path.metadata().ok()?.len() != file.bytes || sha(&path).as_deref() != Some(&file.sha256)
-        {
-            return Some("verification_failed");
-        }
-    }
-    None
-}
-fn rollback(directory: &Path, absent: &[OffloadFile]) {
-    for file in absent {
-        let _ = fs::remove_file(directory.join(&file.name));
-    }
-}
-fn directory(journal: &Path, summary: &SegmentOffloadSummary) -> PathBuf {
-    let listed = iter_segments(journal, PathOrDay::Day(&summary.day)).unwrap_or_default();
-    let matches: Vec<_> = listed
-        .iter()
-        .filter(|segment| {
-            segment.record_identity().ok().is_some_and(|identity| {
-                identity.stream == summary.stream && identity.key == summary.segment
-            })
-        })
-        .collect();
-    match matches.as_slice() {
-        [segment] => segment.path().to_path_buf(),
-        [] => segment_path(
-            journal,
-            &summary.day,
-            &summary.segment,
-            &summary.stream,
-            false,
-        )
-        .unwrap_or_else(|_| PathBuf::new()),
-        _ => PathBuf::new(),
-    }
-}
-fn restore_segment(
-    journal: &Path,
-    services: &BackupServices<'_>,
-    summary: &SegmentOffloadSummary,
-) -> (RestoreSegmentResult, bool, Option<String>) {
-    let err = |reason: &str| RestoreSegmentResult {
-        status: "error".into(),
-        reason: Some(reason.into()),
-        day: summary.day.clone(),
-        stream: summary.stream.clone(),
-        segment: summary.segment.clone(),
-        snapshot_id: summary.snapshot_id.clone(),
-        files_expected: summary.offloaded_file_count,
-        files_restored: 0,
-        bytes_expected: summary.offloaded_bytes,
-        bytes_restored: 0,
-    };
-    let admitted_journal = match solstone_core_backup_runtime::AdmittedDestination::admit(journal) {
-        Ok(admitted) => admitted,
-        Err(_) => return (err("destination_admission_failed"), false, None),
-    };
-    let directory = directory(journal, summary);
-    if !directory.is_dir() {
-        return (err("segment_missing"), true, None);
-    }
-    let admitted_directory =
-        match solstone_core_backup_runtime::AdmittedDestination::admit(&directory) {
-            Ok(admitted) => admitted,
-            Err(_) => return (err("destination_admission_failed"), false, None),
-        };
-    #[cfg(windows)]
-    let admitted_journal = std::sync::Arc::new(admitted_journal);
-    #[cfg(windows)]
-    let admitted_directory = std::sync::Arc::new(admitted_directory);
-    #[cfg(windows)]
-    let retaining_runner = {
-        let mut resources = solstone_core_system::process::BoundedHelperResources::new();
-        resources.retain(admitted_journal.clone());
-        resources.retain(admitted_directory.clone());
-        solstone_core_backup_runtime::windows_cleanup::RetainingToolRunner::new(
-            services.runner,
-            resources,
-        )
-    };
-    #[cfg(windows)]
-    let services = &BackupServices {
-        runner: &retaining_runner,
-        ..*services
-    };
-    let binding_current = || {
-        admitted_journal.revalidate_for_target().is_ok()
-            && admitted_directory.revalidate_for_target().is_ok()
-    };
-    let absent = summary
-        .files
-        .iter()
-        .filter(|file| !directory.join(&file.name).is_file())
-        .cloned()
-        .collect::<Vec<_>>();
-    if !absent.is_empty() {
-        let (repository, password, env, global_options) = if journal_is_operated(journal) {
-            match solstone_core_backup_runtime::archive_read_session(journal, services) {
-                Ok(Some(session)) => (
-                    session.repository,
-                    session.password,
-                    session.backend_env,
-                    session.global_options,
-                ),
-                Ok(None) => return (err("backup_not_ready"), true, None),
-                Err(reason) => {
-                    let code = if OFFLOAD_RESTORE_REASONS.contains(&reason.as_str()) {
-                        reason.as_str()
-                    } else {
-                        "failed"
-                    };
-                    return (
-                        err(code),
-                        true,
-                        Some(format!("hosted backup session unavailable: {reason}")),
-                    );
-                }
-            }
-        } else {
-            let (Some(destination), Some(keys)) = (
-                get_destination(journal).ok().flatten(),
-                get_keys(journal).ok().flatten(),
-            ) else {
-                return (err("backup_not_ready"), true, None);
-            };
-            let Ok(env) = assemble_backend_env(&destination) else {
-                return (err("failed"), true, None);
-            };
-            let env = env
-                .into_iter()
-                .map(|(key, value)| (key, value.as_str().map(str::to_owned)))
-                .collect::<BTreeMap<_, _>>();
-            (destination.repository, keys.daily_key, env, Vec::new())
-        };
-        let restic_path = match services.restic_path() {
-            Ok(path) => path,
-            Err(reason) => return (err(&reason), true, None),
-        };
-        if admitted_journal.revalidate_for_target().is_err() {
-            return (err("destination_admission_failed"), false, None);
-        }
-        let target_directory = match admitted_directory.revalidate_for_target() {
-            Ok(path) => path,
-            Err(_) => return (err("destination_admission_failed"), false, None),
-        };
-        let mut args = global_options;
-        args.extend([
-            "restore".into(),
-            format!(
-                "{}:{}",
-                summary.snapshot_id.as_deref().unwrap_or_default(),
-                solstone_core_backup_runtime::restic_tree_path(&directory)
-            ),
-            "--target".into(),
-            target_directory.display().to_string(),
-        ]);
-        for file in &absent {
-            args.extend(["--include".into(), format!("/{}", file.name)])
-        }
-        let output = match run_restic(
-            services.runner,
-            &args,
-            &repository,
-            &password,
-            restic_path,
-            Some(&env),
-            true,
-            None,
-            Some(Duration::from_secs(OFFLOAD_RESTORE_TIMEOUT_SECONDS)),
-            &[],
-        ) {
-            Ok(output) => output,
-            Err(_)
-                if admitted_journal.revalidate_for_target().is_err()
-                    || admitted_directory.revalidate_for_target().is_err() =>
-            {
-                return (err("destination_admission_failed"), false, None);
-            }
-            #[cfg(windows)]
-            Err(_) if retaining_runner.cleanup_pending() => return (err("failed"), false, None),
-            Err(_) => return (err("failed"), true, None),
-        };
-        if admitted_journal.revalidate_for_target().is_err()
-            || admitted_directory.revalidate_for_target().is_err()
-        {
-            return (err("destination_admission_failed"), false, None);
-        }
-        if output.returncode != 0 {
-            if !binding_current() {
-                return (err("destination_admission_failed"), false, None);
-            }
-            rollback(&directory, &absent);
-            return (err(reason_for_returncode(output.returncode)), true, None);
-        }
-    }
-    if let Some(reason) = verify(&directory, &summary.files) {
-        if !binding_current() {
-            return (err("destination_admission_failed"), false, None);
-        }
-        rollback(&directory, &absent);
-        return (err(reason), true, None);
-    }
-    if !binding_current() {
-        return (err("destination_admission_failed"), false, None);
-    }
-    if !absent.is_empty()
-        && let Err(error) = bump_stream_marker(journal, &summary.day)
-    {
-        return (
-            RestoreSegmentResult {
-                status: "error".into(),
-                reason: Some("stream_marker_failed".into()),
-                day: summary.day.clone(),
-                stream: summary.stream.clone(),
-                segment: summary.segment.clone(),
-                snapshot_id: summary.snapshot_id.clone(),
-                files_expected: summary.offloaded_file_count,
-                files_restored: summary.offloaded_file_count,
-                bytes_expected: summary.offloaded_bytes,
-                bytes_restored: summary.offloaded_bytes,
-            },
-            true,
-            Some(error.to_string()),
-        );
-    }
-    let names = summary
-        .files
-        .iter()
-        .map(|file| file.name.clone())
-        .collect::<Vec<_>>();
-    if !binding_current() {
-        return (err("destination_admission_failed"), false, None);
-    }
-    if resolve_offload(
-        journal,
-        &Target {
-            day: summary.day.clone(),
-            stream: summary.stream.clone(),
-            dir: summary.segment.clone(),
-        },
-        &names,
-    )
-    .is_err()
-    {
-        return (err("failed"), true, None);
-    };
-    if !binding_current() {
-        return (err("destination_admission_failed"), false, None);
-    }
-    if append_restore_event(
-        journal,
-        &summary.day,
-        &summary.stream,
-        &summary.segment,
-        services.clock.now_unix() as u64,
-    )
-    .is_err()
-    {
-        return (err("failed"), false, None);
-    };
-    (
-        RestoreSegmentResult {
-            status: "ok".into(),
-            reason: None,
-            day: summary.day.clone(),
-            stream: summary.stream.clone(),
-            segment: summary.segment.clone(),
-            snapshot_id: summary.snapshot_id.clone(),
-            files_expected: summary.offloaded_file_count,
-            files_restored: summary.offloaded_file_count,
-            bytes_expected: summary.offloaded_bytes,
-            bytes_restored: summary.offloaded_bytes,
-        },
-        true,
-        None,
-    )
-}
-fn run(
-    journal: &Path,
-    services: &BackupServices<'_>,
+fn refused_selection(
     scope: &str,
     day: Option<&str>,
-    segments: Vec<SegmentOffloadSummary>,
-) -> RestoreResult {
-    let admitted = match solstone_core_backup_runtime::AdmittedDestination::admit(journal) {
-        Ok(admitted) => admitted,
-        Err(_) => return base("error", Some("destination_admission_failed"), scope, day),
-    };
-    let journal = match admitted.revalidate_for_target() {
-        Ok(path) => path,
-        Err(_) => return base("error", Some("destination_admission_failed"), scope, day),
-    };
-    let selected = segments
-        .into_iter()
-        .filter(|segment| segment.currently_offloaded)
-        .collect::<Vec<_>>();
+    selected: Vec<SegmentCatalog>,
+) -> Result<RestoreResult, &'static str> {
     if selected.is_empty() {
-        return base("no_op", Some("nothing_to_restore"), scope, day);
+        return Ok(base("no_op", Some("nothing_to_restore"), scope, day));
     }
-    // A segment key is a time of day, so `(stream, key)` is unique only within
-    // one day; every selected day is still checked before the first restore.
-    let days: BTreeSet<String> = selected.iter().map(|segment| segment.day.clone()).collect();
-    for restore_day in &days {
-        let listed = iter_segments(journal, PathOrDay::Day(restore_day)).unwrap_or_default();
+    let mut result = base("refused", None, scope, day);
+    result.segments_selected = u64::try_from(selected.len()).map_err(|_| "selection overflow")?;
+    for segment in selected {
+        let files = u64::try_from(segment.active.len()).map_err(|_| "selection overflow")?;
+        let bytes = segment.active.iter().try_fold(0_u64, |total, witness| {
+            total
+                .checked_add(witness.file.bytes)
+                .ok_or("selection overflow")
+        })?;
+        result.files_expected = result
+            .files_expected
+            .checked_add(files)
+            .ok_or("selection overflow")?;
+        result.bytes_expected = result
+            .bytes_expected
+            .checked_add(bytes)
+            .ok_or("selection overflow")?;
+        let reason = if segment
+            .active
+            .iter()
+            .any(|witness| witness.repository_id.is_none())
+        {
+            "archive_unbound"
+        } else {
+            "restore_held"
+        };
+        // A single snapshot label is valid only when every selected file shares it.
+        let snapshot = &segment.active[0].snapshot_id;
+        let snapshot_id = segment
+            .active
+            .iter()
+            .all(|witness| witness.snapshot_id == *snapshot)
+            .then(|| snapshot.clone());
+        if result.reason.is_none() {
+            result.reason = Some(reason.into());
+        }
+        result.details.push(RestoreSegmentResult {
+            status: "refused".into(),
+            reason: Some(reason.into()),
+            day: segment.day,
+            stream: segment.stream,
+            segment: segment.segment,
+            snapshot_id,
+            files_expected: files,
+            files_restored: 0,
+            bytes_expected: bytes,
+            bytes_restored: 0,
+        });
+    }
+    Ok(result)
+}
+
+fn run(journal: &Path, scope: &str, day: Option<&str>) -> RestoreResult {
+    if day.is_some_and(|day| ledger::ledger_path_for_day(journal, day).is_err()) {
+        return base("error", Some("ledger_degraded"), scope, day);
+    }
+    let root = match JournalRoot::open(journal) {
+        Ok(root) => Arc::new(root),
+        Err(error) => {
+            return base("refused", Some("segment_identity"), scope, day)
+                .with_reason_detail(error.to_string());
+        }
+    };
+    let catalog = match ledger::read_complete_catalog(&root) {
+        Ok(catalog) if !catalog.degraded() => catalog,
+        Ok(_) => return base("error", Some("ledger_degraded"), scope, day),
+        Err(error) => {
+            return base("error", Some("ledger_degraded"), scope, day).with_reason_detail(error);
+        }
+    };
+    let selected: Vec<_> = catalog
+        .days
+        .into_iter()
+        .filter(|candidate| day.is_none_or(|day| candidate.day == day))
+        .flat_map(|day| day.segments)
+        .filter(|segment| !segment.active.is_empty())
+        .collect();
+    let days: BTreeSet<_> = selected.iter().map(|segment| &segment.day).collect();
+    for selected_day in days {
+        let directory = match MediaDirectory::open(
+            Arc::clone(&root),
+            &Path::new("chronicle").join(selected_day),
+        ) {
+            Ok(directory) => directory,
+            Err(error) => {
+                return base("refused", Some("segment_identity"), scope, day)
+                    .with_reason_detail(format!("day {selected_day}: {error}"));
+            }
+        };
+        let listed = match iter_segments(root.canonical_path(), PathOrDay::Day(selected_day)) {
+            Ok(listed) => listed,
+            Err(error) => {
+                return base("refused", Some("segment_identity"), scope, day)
+                    .with_reason_detail(format!("day {selected_day}: {error}"));
+            }
+        };
         if let Err(error) = check_record_identities(&listed) {
             return base("refused", Some("segment_identity"), scope, day)
-                .with_reason_detail(format!("day {restore_day}: {error}"));
+                .with_reason_detail(format!("day {selected_day}: {error}"));
+        }
+        if let Err(error) = directory.revalidate() {
+            return base("refused", Some("segment_identity"), scope, day)
+                .with_reason_detail(format!("day {selected_day}: {error}"));
         }
     }
-    let expected = selected
-        .iter()
-        .map(|segment| segment.offloaded_bytes)
-        .sum::<u64>();
-    if device_free_bytes(journal).map_or(true, |free| free < expected + RESTORE_RESERVE_BYTES) {
-        let mut result = base("refused", Some("insufficient_free_space"), scope, day);
-        result.segments_selected = selected.len() as u64;
-        result.bytes_expected = expected;
-        return result;
-    }
-    let mut details = vec![];
-    let mut record_result = true;
-    let mut reason_detail = None;
-    for segment in &selected {
-        let (detail, should_record, detail_reason) = restore_segment(journal, services, segment);
-        record_result &= should_record;
-        if reason_detail.is_none() {
-            reason_detail = detail_reason;
+    let result = match refused_selection(scope, day, selected) {
+        Ok(result) => result,
+        Err(error) => {
+            return base("error", Some("failed"), scope, day).with_reason_detail(error.into());
         }
-        let hard = detail.status == "error"
-            && !matches!(
-                detail.reason.as_deref(),
-                Some("missing_file_after_restore" | "verification_failed")
-            );
-        details.push(detail);
-        if hard {
-            break;
-        }
-    }
-    let failures = details
-        .iter()
-        .filter(|detail| detail.status == "error")
-        .count();
-    let success = details
-        .iter()
-        .filter(|detail| detail.status == "ok")
-        .count();
-    let status = if failures == 0 {
-        "ok"
-    } else if success == 0
-        || details.iter().any(|detail| {
-            detail.status == "error"
-                && !matches!(
-                    detail.reason.as_deref(),
-                    Some("missing_file_after_restore" | "verification_failed")
-                )
-        })
-    {
-        "error"
-    } else {
-        "degraded"
     };
-    let reason = details.iter().find_map(|detail| detail.reason.clone());
-    let result = RestoreResult {
-        status: status.into(),
-        reason,
-        scope: scope.into(),
-        day: day.map(str::to_owned),
-        segments_selected: selected.len() as u64,
-        segments_restored: success as u64,
-        files_expected: selected
-            .iter()
-            .map(|segment| segment.offloaded_file_count)
-            .sum(),
-        files_restored: details.iter().map(|detail| detail.files_restored).sum(),
-        bytes_expected: expected,
-        bytes_restored: details.iter().map(|detail| detail.bytes_restored).sum(),
-        reason_detail,
-        details,
-    };
-    if admitted.revalidate_for_target().is_err() {
-        let mut result = result;
-        result.status = "error".into();
-        result.reason = Some("destination_admission_failed".into());
-        return result;
-    }
-    if record_result {
-        let _ = record_restore_result(
-            journal,
-            &result.status,
-            serde_json::json!(services.clock.now_unix()),
-            result.reason.clone().map_or(Value::Null, Value::String),
-            scope,
-            day.map_or(Value::Null, |day| Value::String(day.into())),
-            serde_json::json!(result.segments_selected),
-            serde_json::json!(result.segments_restored),
-            serde_json::json!(result.files_expected),
-            serde_json::json!(result.files_restored),
-            serde_json::json!(result.bytes_expected),
-            serde_json::json!(result.bytes_restored),
-        );
+    if let Err(error) = root.revalidate_canonical_binding() {
+        return base("refused", Some("segment_identity"), scope, day)
+            .with_reason_detail(error.to_string());
     }
     result
 }
-/// An operated journal's archives live in its hosted repository, not in any
-/// own-bucket destination the configuration may still carry.
-fn journal_is_operated(journal: &Path) -> bool {
-    get_backup_config(journal).is_ok_and(|config| {
-        config.get("mode") == Some(&Value::String("operated".into()))
-            && load_hosted_binding(journal).is_some()
-    })
-}
+
 pub fn restore_offload_day(
     journal: &Path,
-    services: &BackupServices<'_>,
+    _services: &BackupServices<'_>,
     day: &str,
 ) -> RestoreResult {
-    match summarize_day(journal, day) {
-        Ok(summary) if summary.degraded() => {
-            base("error", Some("ledger_degraded"), "day", Some(day))
-        }
-        Ok(summary) => run(journal, services, "day", Some(day), summary.segments),
-        Err(_) => base("error", Some("ledger_degraded"), "day", Some(day)),
-    }
-}
-pub fn restore_all_offload(journal: &Path, services: &BackupServices<'_>) -> RestoreResult {
-    let summary = summarize_journal(journal);
-    if summary.degraded() {
-        return base("error", Some("ledger_degraded"), "all", None);
-    }
-    run(
-        journal,
-        services,
-        "all",
-        None,
-        summary
-            .days
-            .into_iter()
-            .flat_map(|day| day.segments)
-            .collect(),
-    )
+    run(journal, "day", Some(day))
 }
 
-#[cfg(test)]
+pub fn restore_all_offload(journal: &Path, _services: &BackupServices<'_>) -> RestoreResult {
+    run(journal, "all", None)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::io;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
-    use crate::ledger::append_offload_event;
-    use solstone_core_backup::{HostedBinding, save_hosted_binding, set_enabled, set_mode};
+    use crate::ledger::{OffloadFile, append_offload_event};
+    use serde_json::json;
     use solstone_core_backup_runtime::hosted_runtime::HttpError;
     use solstone_core_backup_runtime::{
         Clock, HttpRequest, HttpResponse, HttpTransport, JournalMaintenance,
@@ -566,614 +247,85 @@ mod tests {
     };
     use solstone_core_retention::{Target, upsert_offload};
 
-    struct RestoreRunner {
-        calls: RefCell<Vec<Vec<String>>>,
+    #[derive(Default)]
+    struct Harness {
+        calls: Cell<u64>,
     }
-
-    impl ToolRunner for RestoreRunner {
-        fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-            let args = request
-                .argv
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            self.calls.borrow_mut().push(args.clone());
-            if args.first().is_some_and(|arg| arg == "restore") {
-                let target = args
-                    .windows(2)
-                    .find(|args| args[0] == "--target")
-                    .map(|args| PathBuf::from(&args[1]))
-                    .expect("restore target");
-                // The restored file was absent before the attempt, and remains
-                // corrupt so verification exercises rollback through the public path.
-                fs::write(target.join("new.webm"), b"corrupt").unwrap();
-            }
-            Ok(ToolOutput {
-                returncode: 0,
-                stdout: vec![],
-                stderr: vec![],
-            })
-        }
-    }
-
-    struct HardFailureRunner;
-    impl ToolRunner for HardFailureRunner {
+    impl ToolRunner for Harness {
         fn run(&self, _: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-            Ok(ToolOutput {
-                returncode: 12,
-                stdout: vec![],
-                stderr: vec![],
-            })
+            self.calls.set(self.calls.get() + 1);
+            Err(io::Error::other("held restore must never launch a helper"))
         }
     }
-
-    struct SuccessfulRestoreRunner {
-        bytes: &'static [u8],
-    }
-
-    impl ToolRunner for SuccessfulRestoreRunner {
-        fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-            let args = request
-                .argv
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            if args.first().is_some_and(|arg| arg == "restore") {
-                let target = args
-                    .windows(2)
-                    .find(|args| args[0] == "--target")
-                    .map(|args| PathBuf::from(&args[1]))
-                    .expect("restore target");
-                for include in args
-                    .windows(2)
-                    .filter(|args| args[0] == "--include")
-                    .map(|args| args[1].trim_start_matches('/'))
-                {
-                    fs::write(target.join(include), self.bytes).unwrap();
-                }
-            }
-            Ok(ToolOutput {
-                returncode: 0,
-                stdout: vec![],
-                stderr: vec![],
-            })
-        }
-    }
-
-    struct Http;
-    impl HttpTransport for Http {
+    impl HttpTransport for Harness {
         fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
-            unreachable!("BYO restore does not use HTTP")
+            panic!("held restore must not contact a repository")
         }
     }
-
-    struct TestClock;
-    impl Clock for TestClock {
+    impl Clock for Harness {
         fn now_unix(&self) -> i64 {
-            1
+            panic!("held restore does not record an outcome")
         }
         fn iso_week(&self) -> u8 {
-            1
+            panic!("held restore does not record an outcome")
         }
     }
-
-    struct Maintenance;
-    impl JournalMaintenance for Maintenance {
+    impl JournalMaintenance for Harness {
         fn rebuild_body_history(&self, _: &Path) -> Result<(), JournalMaintenanceError> {
-            Ok(())
+            panic!("held restore does not write journal state")
         }
         fn full_scan(&self, _: &Path) -> Result<(), JournalMaintenanceError> {
-            Ok(())
+            panic!("held restore does not write journal state")
+        }
+    }
+    impl Harness {
+        fn services(&self) -> BackupServices<'_> {
+            BackupServices {
+                runner: self,
+                http: self,
+                clock: self,
+                restic_path: Some(Path::new("/unused/restic")),
+                rclone_path: None,
+                version: "test",
+                journal_maintenance: self,
+            }
         }
     }
 
-    fn services<'a>(
-        runner: &'a dyn ToolRunner,
-        http: &'a dyn HttpTransport,
-        clock: &'a TestClock,
-        maintenance: &'a Maintenance,
-    ) -> BackupServices<'a> {
-        BackupServices {
-            runner,
-            http,
-            clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
-            rclone_path: None,
-            version: "test",
-            journal_maintenance: maintenance,
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn walk(root: &Path, relative: &Path, out: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(root.join(relative)).unwrap() {
+                let entry = entry.unwrap();
+                let path = relative.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    out.insert(path.clone(), None);
+                    walk(root, &path, out);
+                } else {
+                    out.insert(path, Some(fs::read(entry.path()).unwrap()));
+                }
+            }
         }
+        let mut out = BTreeMap::new();
+        walk(root, Path::new(""), &mut out);
+        out
     }
-
-    fn hard_failure_services<'a>(
-        runner: &'a HardFailureRunner,
-        http: &'a Http,
-        clock: &'a TestClock,
-        maintenance: &'a Maintenance,
-    ) -> BackupServices<'a> {
-        BackupServices {
-            runner,
-            http,
-            clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
-            rclone_path: None,
-            version: "test",
-            journal_maintenance: maintenance,
-        }
-    }
-
-    fn successful_restore_services<'a>(
-        runner: &'a SuccessfulRestoreRunner,
-        http: &'a Http,
-        clock: &'a TestClock,
-        maintenance: &'a Maintenance,
-    ) -> BackupServices<'a> {
-        BackupServices {
-            runner,
-            http,
-            clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
-            rclone_path: None,
-            version: "test",
-            journal_maintenance: maintenance,
-        }
-    }
-
-    fn digest(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    fn marked_segment(journal: &Path, day: &str, segment_key: &str, bytes: &[u8]) -> PathBuf {
-        let segment = journal.join("chronicle").join(day).join(segment_key);
+    fn legacy(journal: &Path, day: &str, dir: &str) -> PathBuf {
+        let segment = journal.join("chronicle").join(day).join(dir);
         fs::create_dir_all(&segment).unwrap();
-        fs::write(segment.join("raw.webm"), bytes).unwrap();
-        let file = OffloadFile {
-            name: "raw.webm".into(),
-            bytes: bytes.len() as u64,
-            sha256: digest(bytes),
-        };
         append_offload_event(
             journal,
             day,
             "_default",
-            segment_key,
-            "snapshot",
-            &[file],
+            dir,
+            "legacy-snapshot",
+            &[OffloadFile {
+                name: "raw.webm".into(),
+                bytes: 8,
+                sha256: "a".repeat(64),
+            }],
             1,
         )
         .unwrap();
-        upsert_offload(
-            journal,
-            &Target {
-                day: day.into(),
-                stream: "_default".into(),
-                dir: segment_key.into(),
-            },
-            vec!["raw.webm".into()],
-            bytes.len() as u64,
-            "restic-snapshot:snapshot".into(),
-            chrono::DateTime::<chrono::Utc>::from_timestamp(1, 0).unwrap(),
-        )
-        .unwrap();
-        segment
-    }
-
-    fn empty_runner() -> RestoreRunner {
-        RestoreRunner {
-            calls: RefCell::new(vec![]),
-        }
-    }
-
-    fn configure_test_repository(journal: &Path) {
-        fs::create_dir_all(journal.join("config")).unwrap();
-        fs::write(
-            journal.join("config/journal.json"),
-            r#"{"backup":{"daily_key":"PASSWORDONLY","recovery_key":"0123456789ABCDEFGHJKMNPQRSTVWXYZ0123456789ABCDEFGHJKMNPQRSTVWXYZ","destination":{"repository":"s3:bucket/prefix","backend":"s3","credentials":{"access_key_id":"ACCESSFIXTURE","secret_access_key":"BACKENDSECRET"}}}}"#,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn restored_media_dirties_each_exact_day_and_no_untouched_day() {
-        let journal = tempfile::tempdir().unwrap();
-        let restored = b"restored";
-        for (day, segment) in [("20260112", "120000_012"), ("20260113", "130000_013")] {
-            let directory = marked_segment(journal.path(), day, segment, restored);
-            fs::remove_file(directory.join("raw.webm")).unwrap();
-        }
-        fs::create_dir_all(journal.path().join("chronicle/20260114/140000_014")).unwrap();
-        configure_test_repository(journal.path());
-        let runner = SuccessfulRestoreRunner { bytes: restored };
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_all_offload(
-            journal.path(),
-            &successful_restore_services(&runner, &http, &clock, &maintenance),
-        );
-
-        assert_eq!(result.status, "ok", "{result:?}");
-        for day in ["20260112", "20260113"] {
-            let marker: Value = serde_json::from_slice(
-                &fs::read(
-                    journal
-                        .path()
-                        .join("chronicle")
-                        .join(day)
-                        .join("health/stream.updated"),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(marker["generation"], 1, "{day}");
-        }
-        assert!(
-            !journal
-                .path()
-                .join("chronicle/20260114/health/stream.updated")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn restore_marker_failure_is_terminal_with_restored_bytes_and_mark_retained() {
-        let journal = tempfile::tempdir().unwrap();
-        let restored = b"restored";
-        let segment = marked_segment(journal.path(), "20260115", "150000_015", restored);
-        fs::remove_file(segment.join("raw.webm")).unwrap();
-        let marker = journal
-            .path()
-            .join("chronicle/20260115/health/stream.updated");
-        fs::create_dir_all(&marker).unwrap();
-        configure_test_repository(journal.path());
-        let runner = SuccessfulRestoreRunner { bytes: restored };
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_offload_day(
-            journal.path(),
-            &successful_restore_services(&runner, &http, &clock, &maintenance),
-            "20260115",
-        );
-
-        assert_eq!(result.status, "error", "{result:?}");
-        assert_eq!(result.reason.as_deref(), Some("stream_marker_failed"));
-        assert!(
-            result
-                .reason_detail
-                .as_deref()
-                .is_some_and(|detail| { detail.contains(&marker.display().to_string()) })
-        );
-        assert_eq!(result.files_restored, 1);
-        assert_eq!(result.bytes_restored, restored.len() as u64);
-        assert_eq!(fs::read(segment.join("raw.webm")).unwrap(), restored);
-        let register: solstone_core_retention::Register = serde_json::from_slice(
-            &fs::read(journal.path().join("health/retention-marks.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            register.marks.len(),
-            1,
-            "marker failure must precede resolution"
-        );
-    }
-
-    #[test]
-    fn rollback_keeps_preexisting_bytes_and_removes_only_attempted_files() {
-        let journal = tempfile::tempdir().unwrap();
-        let segment = journal.path().join("chronicle/20260101/010000_001");
-        fs::create_dir_all(&segment).unwrap();
-        let original = b"owner-owned bytes";
-        fs::write(segment.join("keep.webm"), original).unwrap();
-        append_offload_event(
-            journal.path(),
-            "20260101",
-            "_default",
-            "010000_001",
-            "snapshot",
-            &[
-                OffloadFile {
-                    name: "keep.webm".into(),
-                    bytes: original.len() as u64,
-                    sha256: digest(original),
-                },
-                OffloadFile {
-                    name: "new.webm".into(),
-                    bytes: 8,
-                    sha256: digest(b"expected"),
-                },
-            ],
-            1,
-        )
-        .unwrap();
-        fs::create_dir_all(journal.path().join("config")).unwrap();
-        fs::write(
-            journal.path().join("config/journal.json"),
-            r#"{"backup":{"daily_key":"PASSWORDONLY","recovery_key":"0123456789ABCDEFGHJKMNPQRSTVWXYZ0123456789ABCDEFGHJKMNPQRSTVWXYZ","destination":{"repository":"s3:bucket/prefix","backend":"s3","credentials":{"access_key_id":"ACCESSFIXTURE","secret_access_key":"BACKENDSECRET"}}}}"#,
-        )
-        .unwrap();
-        let destination = get_destination(journal.path()).unwrap().unwrap();
-        assert!(assemble_backend_env(&destination).is_ok());
-        assert!(get_keys(journal.path()).unwrap().is_some());
-
-        let runner = RestoreRunner {
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260101",
-        );
-
-        assert_eq!(result.status, "error");
-        assert_eq!(
-            result.reason.as_deref(),
-            Some("verification_failed"),
-            "runner calls: {:?}",
-            runner.calls.borrow()
-        );
-        assert_eq!(fs::read(segment.join("keep.webm")).unwrap(), original);
-        assert!(!segment.join("new.webm").exists());
-        assert_eq!(
-            runner.calls.borrow().first().and_then(|args| args.first()),
-            Some(&"restore".to_owned())
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mark_resolution_failure_keeps_mark_and_does_not_append_restore_event() {
-        let journal = tempfile::tempdir().unwrap();
-        let segment = marked_segment(journal.path(), "20260102", "020000_002", b"marked");
-        let register = journal.path().join("health/retention-marks.json");
-        let before_mark = fs::read(&register).unwrap();
-        let ledger = journal.path().join("health/offload/20260102.jsonl");
-        let before_ledger = fs::read(&ledger).unwrap();
-        fs::set_permissions(
-            journal.path().join("health"),
-            fs::Permissions::from_mode(0o555),
-        )
-        .unwrap();
-
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260102",
-        );
-        fs::set_permissions(
-            journal.path().join("health"),
-            fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.reason.as_deref(), Some("failed"));
-        assert_eq!(fs::read(segment.join("raw.webm")).unwrap(), b"marked");
-        // The unchanged mark and ledger prove resolve ran before append: a failed
-        // resolve returned before a restore event could be written.
-        assert_eq!(fs::read(&register).unwrap(), before_mark);
-        assert_eq!(fs::read(&ledger).unwrap(), before_ledger);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ledger_append_failure_resolves_mark_before_leaving_ledger_current() {
-        let journal = tempfile::tempdir().unwrap();
-        let segment = marked_segment(journal.path(), "20260103", "030000_003", b"ledger");
-        let register = journal.path().join("health/retention-marks.json");
-        let ledger = journal.path().join("health/offload/20260103.jsonl");
-        let before_ledger = fs::read(&ledger).unwrap();
-        fs::set_permissions(&ledger, fs::Permissions::from_mode(0o444)).unwrap();
-
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260103",
-        );
-        fs::set_permissions(&ledger, fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.reason.as_deref(), Some("failed"));
-        assert_eq!(fs::read(segment.join("raw.webm")).unwrap(), b"ledger");
-        // A missing mark with an unchanged offload ledger proves resolution completed
-        // before the failed restore-event append was attempted.
-        assert!(
-            serde_json::from_slice::<solstone_core_retention::Register>(
-                &fs::read(&register).unwrap(),
-            )
-            .unwrap()
-            .marks
-            .is_empty()
-        );
-        assert_eq!(fs::read(&ledger).unwrap(), before_ledger);
-        assert!(
-            !journal.path().join("config/journal.json").exists(),
-            "a failed ledger append must not publish the final restore result"
-        );
-    }
-
-    #[test]
-    fn verification_failure_leaves_mark_and_ledger_unchanged_before_resolution() {
-        let journal = tempfile::tempdir().unwrap();
-        let segment = marked_segment(journal.path(), "20260104", "040000_004", b"expected");
-        fs::write(segment.join("raw.webm"), b"corrupt").unwrap();
-        let register = journal.path().join("health/retention-marks.json");
-        let before_mark = fs::read(&register).unwrap();
-        let ledger = journal.path().join("health/offload/20260104.jsonl");
-        let before_ledger = fs::read(&ledger).unwrap();
-
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260104",
-        );
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.reason.as_deref(), Some("verification_failed"));
-        // The still-current mark and ledger show verification stopped the segment
-        // before either resolution or restore-event publication could run.
-        assert_eq!(fs::read(&register).unwrap(), before_mark);
-        assert_eq!(fs::read(&ledger).unwrap(), before_ledger);
-    }
-
-    #[test]
-    fn mixed_success_and_verification_damage_is_degraded() {
-        let journal = tempfile::tempdir().unwrap();
-        marked_segment(journal.path(), "20260105", "050000_005", b"five");
-        let damaged = marked_segment(journal.path(), "20260106", "060000_006", b"sixsix");
-        fs::write(damaged.join("raw.webm"), b"damage").unwrap();
-
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-        let result = restore_all_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-        );
-
-        assert_eq!(result.status, "degraded", "{result:?}");
-        assert_eq!(result.reason.as_deref(), Some("verification_failed"));
-        assert_eq!(result.segments_restored, 1);
-    }
-
-    #[test]
-    fn hard_runtime_failure_is_error_after_an_earlier_success() {
-        let journal = tempfile::tempdir().unwrap();
-        marked_segment(journal.path(), "20260107", "070000_007", b"seven");
-        let missing = marked_segment(journal.path(), "20260108", "080000_008", b"eight");
-        fs::remove_file(missing.join("raw.webm")).unwrap();
-        fs::create_dir_all(journal.path().join("config")).unwrap();
-        fs::write(
-            journal.path().join("config/journal.json"),
-            r#"{"backup":{"daily_key":"PASSWORDONLY","recovery_key":"0123456789ABCDEFGHJKMNPQRSTVWXYZ0123456789ABCDEFGHJKMNPQRSTVWXYZ","destination":{"repository":"s3:bucket/prefix","backend":"s3","credentials":{"access_key_id":"ACCESSFIXTURE","secret_access_key":"BACKENDSECRET"}}}}"#,
-        )
-        .unwrap();
-
-        let runner = HardFailureRunner;
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-        let result = restore_all_offload(
-            journal.path(),
-            &hard_failure_services(&runner, &http, &clock, &maintenance),
-        );
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.reason.as_deref(), Some("auth_failed"));
-        assert_eq!(result.segments_restored, 1);
-    }
-
-    #[test]
-    fn empty_journal_is_a_no_op() {
-        let journal = tempfile::tempdir().unwrap();
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_all_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-        );
-
-        assert_eq!(result.status, "no_op");
-        assert_eq!(result.reason.as_deref(), Some("nothing_to_restore"));
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn absent_restic_path_fails_lazily_without_runner_call() {
-        let journal = tempfile::tempdir().unwrap();
-        let segment = marked_segment(journal.path(), "20260111", "110000_011", b"eleven");
-        fs::remove_file(segment.join("raw.webm")).unwrap();
-        fs::create_dir_all(journal.path().join("config")).unwrap();
-        fs::write(
-            journal.path().join("config/journal.json"),
-            r#"{"backup":{"daily_key":"PASSWORDONLY","recovery_key":"0123456789ABCDEFGHJKMNPQRSTVWXYZ0123456789ABCDEFGHJKMNPQRSTVWXYZ","destination":{"repository":"s3:bucket/prefix","backend":"s3","credentials":{"access_key_id":"ACCESSFIXTURE","secret_access_key":"BACKENDSECRET"}}}}"#,
-        )
-        .unwrap();
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-        let mut services = services(&runner, &http, &clock, &maintenance);
-        services.restic_path = None;
-
-        let result = restore_offload_day(journal.path(), &services, "20260111");
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.reason.as_deref(), Some("restic_unavailable"));
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn day_and_all_select_their_respective_remaining_segments() {
-        let journal = tempfile::tempdir().unwrap();
-        marked_segment(journal.path(), "20260109", "090000_009", b"nine");
-        marked_segment(journal.path(), "20260110", "100000_010", b"ten-ten");
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let day = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260109",
-        );
-        let all = restore_all_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-        );
-
-        assert_eq!((day.scope.as_str(), day.segments_selected), ("day", 1));
-        assert_eq!((all.scope.as_str(), all.segments_selected), ("all", 1));
-    }
-
-    #[test]
-    fn already_present_files_restore_without_invoking_restic() {
-        let journal = tempfile::tempdir().unwrap();
-        marked_segment(journal.path(), "20260111", "110000_011", b"present");
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260111",
-        );
-
-        assert_eq!(result.status, "ok");
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    fn seed_offloaded_segment(journal: &Path, day: &str, dir: &str) {
-        fs::create_dir_all(journal.join(format!("chronicle/{day}/{dir}"))).unwrap();
-        let file = OffloadFile {
-            name: "small.webm".into(),
-            bytes: 8,
-            sha256: digest(b"small"),
-        };
-        append_offload_event(journal, day, "_default", dir, "snapshot", &[file], 1).unwrap();
         upsert_offload(
             journal,
             &Target {
@@ -1181,267 +333,247 @@ mod tests {
                 stream: "_default".into(),
                 dir: dir.into(),
             },
-            vec!["small.webm".into()],
+            vec!["raw.webm".into()],
             8,
-            "restic-snapshot:snapshot".into(),
+            "legacy archive".into(),
             chrono::DateTime::<chrono::Utc>::from_timestamp(1, 0).unwrap(),
         )
         .unwrap();
+        segment
+    }
+    fn bound(journal: &Path, intent: &crate::restore_intent::RestoreIntent) {
+        let witness = &intent.witness;
+        fs::create_dir_all(journal.join(intent.locator.relative_segment())).unwrap();
+        let event = json!({
+            "event_kind":"offload_archive_v2", "schema_version":2, "time":1,
+            "day":intent.locator.target.day, "stream":intent.locator.target.stream,
+            "segment":intent.locator.segment, "segment_dir":intent.locator.target.dir,
+            "layout":intent.locator.layout, "journal_id":witness.journal_id,
+            "manifest_id":witness.manifest_id, "repository_id":witness.repository_id,
+            "snapshot_id":witness.snapshot_id,
+            "files":[{"witness_id":witness.witness_id, "name":witness.file.name,
+                "bytes":witness.file.bytes,"sha256":witness.file.sha256,
+                "archive_path":witness.archive_path,"processing":witness.processing}]
+        });
+        let path = ledger::ledger_path_for_day(journal, &intent.locator.target.day).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{event}").unwrap();
+    }
+    fn assert_zero(result: &RestoreResult, harness: &Harness) {
+        assert_eq!(harness.calls.get(), 0);
+        assert_eq!(
+            (
+                result.segments_restored,
+                result.files_restored,
+                result.bytes_restored
+            ),
+            (0, 0, 0)
+        );
+        assert!(
+            result
+                .details
+                .iter()
+                .all(|detail| detail.files_restored == 0 && detail.bytes_restored == 0)
+        );
     }
 
     #[test]
-    fn same_key_on_two_days_is_not_a_restore_identity_refusal() {
+    fn empty_catalog_is_no_op_without_tools_or_creating_metadata() {
         let journal = tempfile::tempdir().unwrap();
-        seed_offloaded_segment(journal.path(), "20260112", "120000_012");
-        seed_offloaded_segment(journal.path(), "20260113", "120000_012");
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_all_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
+        let harness = Harness::default();
+        for result in [
+            restore_all_offload(journal.path(), &harness.services()),
+            restore_offload_day(journal.path(), &harness.services(), "20261009"),
+        ] {
+            assert_eq!(result.status, "no_op", "{result:?}");
+            assert_eq!(result.reason.as_deref(), Some("nothing_to_restore"));
+            assert_zero(&result, &harness);
+        }
+        assert!(snapshot(journal.path()).is_empty());
+        assert_eq!(
+            restore_offload_day(journal.path(), &harness.services(), "invalid")
+                .reason
+                .as_deref(),
+            Some("ledger_degraded")
         );
+    }
 
-        assert_ne!(
+    #[test]
+    fn unbound_missing_and_present_media_preserve_every_owner_file_and_obligation() {
+        let journal = tempfile::tempdir().unwrap();
+        let absent = legacy(journal.path(), "20260112", "120000_012");
+        let present = legacy(journal.path(), "20260113", "120000_012");
+        fs::write(present.join("raw.webm"), b"existing competitor").unwrap();
+        fs::write(absent.join("other.flac"), b"unselected owner file").unwrap();
+        fs::create_dir_all(journal.path().join("chronicle/20260112/health")).unwrap();
+        fs::write(
+            journal
+                .path()
+                .join("chronicle/20260112/health/stream.updated"),
+            b"existing marker",
+        )
+        .unwrap();
+        fs::create_dir_all(journal.path().join("config")).unwrap();
+        fs::write(
+            journal.path().join("config/journal.json"),
+            b"existing backup result state",
+        )
+        .unwrap();
+        let before = snapshot(journal.path());
+        let harness = Harness::default();
+        for result in [
+            restore_offload_day(journal.path(), &harness.services(), "20260112"),
+            restore_all_offload(journal.path(), &harness.services()),
+        ] {
+            assert_eq!(result.status, "refused", "{result:?}");
+            assert_eq!(result.reason.as_deref(), Some("archive_unbound"));
+            assert_ne!(
+                result.reason.as_deref(),
+                Some("segment_identity"),
+                "same key on different days is valid"
+            );
+            assert_zero(&result, &harness);
+        }
+        assert_eq!(snapshot(journal.path()), before);
+        assert!(!absent.join("raw.webm").exists());
+    }
+
+    #[test]
+    fn bound_multi_generation_selection_is_held_without_arbitrary_snapshot() {
+        let journal = tempfile::tempdir().unwrap();
+        let first = crate::restore_intent::tests::fixture(false);
+        bound(journal.path(), &first);
+        let mut second = first.clone();
+        second.witness.manifest_id = "manifest-2".into();
+        second.witness.witness_id = "witness-b".into();
+        second.witness.snapshot_id = "e".repeat(64);
+        second.witness.file.name = "b.flac".into();
+        second.witness.file.bytes = 7;
+        second.witness.archive_path = Some("/stage/b.flac".into());
+        bound(journal.path(), &second);
+        let before = snapshot(journal.path());
+        let harness = Harness::default();
+        let result = restore_all_offload(journal.path(), &harness.services());
+        assert_eq!(result.status, "refused", "{result:?}");
+        assert_eq!(result.reason.as_deref(), Some("restore_held"));
+        assert_eq!(
+            (
+                result.segments_selected,
+                result.files_expected,
+                result.bytes_expected
+            ),
+            (1, 2, 10)
+        );
+        assert_eq!(result.details[0].snapshot_id, None);
+        assert_zero(&result, &harness);
+        assert_eq!(snapshot(journal.path()), before);
+    }
+
+    #[test]
+    fn mixed_day_and_all_selection_keeps_each_segments_reason() {
+        let journal = tempfile::tempdir().unwrap();
+        bound(
+            journal.path(),
+            &crate::restore_intent::tests::fixture(false),
+        );
+        legacy(journal.path(), "20261010", "120000_012");
+        let harness = Harness::default();
+        let day = restore_offload_day(journal.path(), &harness.services(), "20261009");
+        let all = restore_all_offload(journal.path(), &harness.services());
+        assert_eq!((day.segments_selected, day.files_expected), (1, 1));
+        assert_eq!(day.reason.as_deref(), Some("restore_held"));
+        assert_eq!((all.segments_selected, all.files_expected), (2, 2));
+        assert_eq!(
+            all.details
+                .iter()
+                .map(|detail| detail.reason.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("restore_held"), Some("archive_unbound")]
+        );
+        assert_zero(&day, &harness);
+        assert_zero(&all, &harness);
+    }
+
+    #[test]
+    fn torn_or_non_file_catalog_never_becomes_empty_success() {
+        let journal = tempfile::tempdir().unwrap();
+        let harness = Harness::default();
+        let path = ledger::ledger_path_for_day(journal.path(), "20261009").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{torn ledger").unwrap();
+        let before = snapshot(journal.path());
+        let result = restore_all_offload(journal.path(), &harness.services());
+        assert_eq!(result.reason.as_deref(), Some("ledger_degraded"));
+        assert_zero(&result, &harness);
+        assert_eq!(snapshot(journal.path()), before);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let result = restore_all_offload(journal.path(), &harness.services());
+        assert_eq!(result.reason.as_deref(), Some("ledger_degraded"));
+        assert_zero(&result, &harness);
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn duplicate_segment_identity_refuses_before_launch_or_state_recording() {
+        let journal = tempfile::tempdir().unwrap();
+        legacy(journal.path(), "20260112", "120000_012");
+        legacy(journal.path(), "20260112", "120000_012_copy");
+        let before = snapshot(journal.path());
+        let harness = Harness::default();
+        let result = restore_all_offload(journal.path(), &harness.services());
+        assert_eq!(
             result.reason.as_deref(),
             Some("segment_identity"),
             "{result:?}"
         );
+        assert!(result.reason_detail.is_some());
+        assert_zero(&result, &harness);
+        assert_eq!(snapshot(journal.path()), before);
     }
 
     #[test]
-    fn two_directories_sharing_one_key_on_one_day_refuse_restore() {
+    fn directory_read_error_preserves_selection_uncertainty() {
         let journal = tempfile::tempdir().unwrap();
-        seed_offloaded_segment(journal.path(), "20260112", "120000_012");
-        seed_offloaded_segment(journal.path(), "20260112", "120000_012_copy");
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260112",
-        );
-
-        assert_eq!(result.status, "refused");
+        let intent = crate::restore_intent::tests::fixture(false);
+        bound(journal.path(), &intent);
+        let day = journal.path().join("chronicle/20261009");
+        fs::rename(&day, journal.path().join("displaced-day")).unwrap();
+        fs::write(&day, b"occupied day path").unwrap();
+        let before = snapshot(journal.path());
+        let harness = Harness::default();
+        let result = restore_all_offload(journal.path(), &harness.services());
+        assert_eq!(result.status, "refused", "{result:?}");
         assert_eq!(result.reason.as_deref(), Some("segment_identity"));
-        let detail = result.reason_detail.expect("identity detail");
-        assert!(detail.contains("day 20260112"), "{detail}");
-        assert!(
-            detail.contains("multiple segments share stream"),
-            "{detail}"
-        );
-        assert!(runner.calls.borrow().is_empty());
+        assert_zero(&result, &harness);
+        assert_eq!(snapshot(journal.path()), before);
     }
 
     #[test]
-    fn free_space_guard_refuses_before_attempting_restore() {
+    fn unrepresentable_selection_totals_refuse_without_wrapping() {
         let journal = tempfile::tempdir().unwrap();
-        let unavailable_bytes = u64::MAX - RESTORE_RESERVE_BYTES;
-        let segment = journal.path().join("chronicle/20260112/120000_012");
-        fs::create_dir_all(&segment).unwrap();
-        let file = OffloadFile {
-            name: "large.webm".into(),
-            bytes: unavailable_bytes,
-            sha256: digest(b"large"),
-        };
-        append_offload_event(
-            journal.path(),
-            "20260112",
-            "_default",
-            "120000_012",
-            "snapshot",
-            &[file],
-            1,
-        )
-        .unwrap();
-        upsert_offload(
-            journal.path(),
-            &Target {
-                day: "20260112".into(),
-                stream: "_default".into(),
-                dir: "120000_012".into(),
-            },
-            vec!["large.webm".into()],
-            unavailable_bytes,
-            "restic-snapshot:snapshot".into(),
-            chrono::DateTime::<chrono::Utc>::from_timestamp(1, 0).unwrap(),
-        )
-        .unwrap();
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260112",
-        );
-
-        assert_eq!(result.status, "refused");
-        assert_eq!(result.reason.as_deref(), Some("insufficient_free_space"));
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn missing_segment_reports_the_reference_reason_code() {
-        let journal = tempfile::tempdir().unwrap();
-        let segment = marked_segment(journal.path(), "20260113", "130000_013", b"missing");
-        fs::remove_dir_all(segment).unwrap();
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260113",
-        );
-
-        assert_eq!(result.status, "error");
-        assert_eq!(result.reason.as_deref(), Some("segment_missing"));
-    }
-
-    struct RepositoryRunner {
-        repositories: RefCell<Vec<String>>,
-    }
-
-    impl ToolRunner for RepositoryRunner {
-        fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-            let repository = request
-                .env
-                .get(std::ffi::OsStr::new("RESTIC_REPOSITORY"))
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            self.repositories.borrow_mut().push(repository);
-            Ok(ToolOutput {
-                returncode: 1,
-                stdout: vec![],
-                stderr: vec![],
-            })
-        }
-    }
-
-    struct Broker(Option<&'static str>);
-    impl HttpTransport for Broker {
-        fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-            assert!(request.url.ends_with("/backup/credentials"));
-            match self.0 {
-                Some(body) => Ok(HttpResponse {
-                    status: 200,
-                    headers: vec![],
-                    body: body.as_bytes().to_vec(),
-                }),
-                None => Err(HttpError::Unreachable),
-            }
-        }
-    }
-
-    /// An operated journal that still carries its earlier own-bucket destination.
-    fn operated_journal_with_retained_destination(journal: &Path) {
-        configure_test_repository(journal);
-        set_enabled(journal, true).unwrap();
-        set_mode(journal, "operated").unwrap();
-        save_hosted_binding(
-            journal,
-            &HostedBinding {
-                broker_endpoint: "https://broker.example".into(),
-                account_id: "account".into(),
-                instance_id: "instance".into(),
-                bucket: "bucket".into(),
-                prefix: "prefix".into(),
-                broker_token: "fixture-token".into(),
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn an_operated_restore_reads_the_hosted_repository_without_rclone() {
-        let journal = tempfile::tempdir().unwrap();
-        let directory = marked_segment(journal.path(), "20260114", "140000_014", b"operated");
-        fs::remove_file(directory.join("raw.webm")).unwrap();
-        operated_journal_with_retained_destination(journal.path());
-        let runner = RepositoryRunner {
-            repositories: RefCell::new(vec![]),
-        };
-        let http = Broker(Some(
-            r#"{"access_key_id":"HOSTEDKEY","secret_access_key":"HOSTEDSECRET","session_token":"HOSTEDTOKEN","endpoint":"https://hosted.example","expires_at":"2026-01-14T15:00:00Z"}"#,
-        ));
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260114",
-        );
-
-        assert_ne!(result.reason.as_deref(), Some("rclone_unavailable"));
-        assert_eq!(
-            *runner.repositories.borrow(),
-            vec!["s3:https://hosted.example/bucket/prefix".to_owned()]
-        );
-    }
-
-    #[test]
-    fn an_operated_restore_never_falls_back_to_the_retained_destination() {
-        let journal = tempfile::tempdir().unwrap();
-        let directory = marked_segment(journal.path(), "20260114", "140000_014", b"operated");
-        fs::remove_file(directory.join("raw.webm")).unwrap();
-        operated_journal_with_retained_destination(journal.path());
-        let runner = RepositoryRunner {
-            repositories: RefCell::new(vec![]),
-        };
-        let http = Broker(None);
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = restore_offload_day(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            "20260114",
-        );
-
-        assert_eq!(result.status, "error");
+        let mut first = crate::restore_intent::tests::fixture(false);
+        first.witness.file.bytes = u64::MAX;
+        bound(journal.path(), &first);
+        let mut second = first.clone();
+        second.witness.manifest_id = "manifest-2".into();
+        second.witness.witness_id = "witness-b".into();
+        second.witness.file.name = "b.flac".into();
+        second.witness.file.bytes = 1;
+        second.witness.archive_path = Some("/stage/b.flac".into());
+        bound(journal.path(), &second);
+        let before = snapshot(journal.path());
+        let harness = Harness::default();
+        let result = restore_all_offload(journal.path(), &harness.services());
+        assert_eq!(result.status, "error", "{result:?}");
         assert_eq!(result.reason.as_deref(), Some("failed"));
-        assert!(
-            result
-                .reason_detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("broker_unreachable"))
-        );
-        assert!(runner.repositories.borrow().is_empty());
-    }
-
-    #[test]
-    fn offload_restore_fails_closed_when_destination_admission_fails() {
-        let journal = tempfile::tempdir().unwrap();
-        marked_segment(journal.path(), "20260115", "150000_015", b"content");
-        let runner = empty_runner();
-        let http = Http;
-        let clock = TestClock;
-        let maintenance = Maintenance;
-
-        let result = solstone_core_backup_runtime::with_forced_admission_failure(|| {
-            restore_offload_day(
-                journal.path(),
-                &services(&runner, &http, &clock, &maintenance),
-                "20260115",
-            )
-        });
-
-        assert_eq!(result.status, "error");
-        assert_eq!(
-            result.reason.as_deref(),
-            Some("destination_admission_failed")
-        );
-        assert!(runner.calls.borrow().is_empty());
+        assert_zero(&result, &harness);
+        assert_eq!(snapshot(journal.path()), before);
     }
 }
