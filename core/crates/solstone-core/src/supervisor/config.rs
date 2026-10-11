@@ -5,27 +5,13 @@
 
 use std::path::Path;
 
-use serde_json::Value;
-use solstone_core_journal_config::read_journal_config;
-
 pub(crate) fn processing_is_deferred(journal: &Path) -> bool {
-    let Some(config) = read_config(journal) else {
-        return false;
-    };
-    config
-        .get("processing")
-        .and_then(Value::as_object)
-        .and_then(|processing| processing.get("mode"))
-        .and_then(Value::as_str)
-        == Some("deferred")
+    // A broken policy holds live analysis until it can be read again.
+    solstone_core_system::processing::is_deferred(journal).unwrap_or(true)
 }
 
 pub(crate) fn no_thinking_engine_chosen(journal: &Path) -> bool {
     solstone_core_journal_config::no_thinking_engine_chosen(journal)
-}
-
-fn read_config(journal: &Path) -> Option<serde_json::Map<String, Value>> {
-    read_journal_config(journal).ok()?.config
 }
 
 #[cfg(test)]
@@ -54,7 +40,7 @@ mod tests {
         assert!(!processing_is_deferred(&path));
         assert!(no_thinking_engine_chosen(&path));
         fs::write(path.join("config/journal.json"), b"{").expect("malformed config");
-        assert!(!processing_is_deferred(&path));
+        assert!(processing_is_deferred(&path));
         assert!(no_thinking_engine_chosen(&path));
         let _ = fs::remove_dir_all(path);
     }
@@ -67,7 +53,7 @@ mod tests {
             br#"{"processing":{"mode":true},"providers":{"active":{"provider":"  "}}}"#,
         )
         .expect("wrong type config");
-        assert!(!processing_is_deferred(&path));
+        assert!(processing_is_deferred(&path));
         assert!(no_thinking_engine_chosen(&path));
         fs::write(
             path.join("config/journal.json"),

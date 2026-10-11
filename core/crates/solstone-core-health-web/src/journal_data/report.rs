@@ -203,13 +203,15 @@ pub(crate) fn build_health_report(
             .then(left.message.cmp(&right.message))
     });
     let consumer_signal = build_consumer_signal_health(journal_root)?;
-    // Native has no display-power poller; this is the reference monitor's pre-poll state.
+    let display = solstone_core_system::processing::read_display_snapshot(journal_root);
     let segment_backlog = build_segment_backlog_health(
         journal_root,
         utc_now,
-        DisplayPowersaveReading::UNAVAILABLE,
-        false,
-        now.time(),
+        display,
+        display.available,
+        utc_now
+            .with_timezone(&solstone_core_journal_config::owner_zone(journal_root))
+            .time(),
     )?;
     Ok(HealthReport {
         generated_at,
@@ -690,118 +692,14 @@ fn build_consumer_signal_health(journal_root: &Path) -> Result<ConsumerSignalHea
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TimeWindowSettings {
-    pub(crate) enabled: bool,
-    pub(crate) start: NaiveTime,
-    pub(crate) end: NaiveTime,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DisplayPowersaveSettings {
-    pub(crate) enabled: bool,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GateSettings {
-    pub(crate) time_window: TimeWindowSettings,
-    pub(crate) display_powersave: DisplayPowersaveSettings,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProcessingSettings {
-    pub(crate) deferred: bool,
-    pub(crate) gate: GateSettings,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DisplayPowersaveReading {
-    pub(crate) available: bool,
-    pub(crate) asleep: bool,
-    pub(crate) debounced: bool,
-}
-impl DisplayPowersaveReading {
-    pub(crate) const UNAVAILABLE: Self = Self {
-        available: false,
-        asleep: false,
-        debounced: false,
-    };
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConditionState {
-    pub(crate) enabled: bool,
-    pub(crate) available: bool,
-    pub(crate) open: bool,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GateState {
-    pub(crate) open: bool,
-    pub(crate) time_window: ConditionState,
-    pub(crate) display_powersave: ConditionState,
-}
-
-pub(crate) fn evaluate_time_window(settings: TimeWindowSettings, now: NaiveTime) -> ConditionState {
-    let open = if settings.start < settings.end {
-        now >= settings.start && now < settings.end
-    } else if settings.start > settings.end {
-        now >= settings.start || now < settings.end
-    } else {
-        false
-    };
-    ConditionState {
-        enabled: settings.enabled,
-        available: true,
-        open,
-    }
-}
-pub(crate) fn evaluate_display_powersave(
-    settings: DisplayPowersaveSettings,
-    reading: DisplayPowersaveReading,
-) -> ConditionState {
-    if !settings.enabled {
-        return ConditionState {
-            enabled: false,
-            available: false,
-            open: false,
-        };
-    }
-    ConditionState {
-        enabled: true,
-        available: reading.available,
-        open: reading.asleep && reading.debounced,
-    }
-}
-pub(crate) fn evaluate_drain_gate(
-    settings: ProcessingSettings,
-    now: NaiveTime,
-    reading: DisplayPowersaveReading,
-) -> GateState {
-    let time_window = evaluate_time_window(settings.gate.time_window, now);
-    let display_powersave = evaluate_display_powersave(settings.gate.display_powersave, reading);
-    GateState {
-        open: [time_window, display_powersave]
-            .into_iter()
-            .any(|condition| condition.enabled && condition.available && condition.open),
-        time_window,
-        display_powersave,
-    }
-}
-pub(crate) fn derive_drain_state(
-    settings: ProcessingSettings,
-    gate: &GateState,
-    no_engine: bool,
-) -> &'static str {
-    if no_engine {
-        "no_engine"
-    } else if !settings.deferred {
-        "realtime"
-    } else if gate.open {
-        "window_open"
-    } else if [gate.time_window, gate.display_powersave]
-        .into_iter()
-        .any(|condition| condition.enabled && condition.available)
-    {
-        "waiting_for_window"
-    } else {
-        "no_active_condition"
-    }
-}
+use solstone_core_system::processing::{
+    DisplayPowersaveReading, derive_drain_state, evaluate_drain_gate, processing_settings,
+};
+#[cfg(test)]
+use solstone_core_system::processing::{
+    DisplayPowersaveSettings, GateSettings, ProcessingSettings, TimeWindowSettings,
+    evaluate_display_powersave,
+};
 
 fn build_segment_backlog_health(
     journal_root: &Path,
@@ -863,7 +761,7 @@ fn build_segment_backlog_health(
     }
     let config = solstone_core_thinking::read_config(journal_root)
         .map_err(|error| HealthError::internal(error.to_string()))?;
-    let settings = processing_settings(&config);
+    let settings = processing_settings(&config).map_err(HealthError::internal)?;
     let gate = evaluate_drain_gate(settings, local_now, display_reading);
     let no_engine = no_thinking_engine_chosen(&config);
     let awaiting_total = not_sensed + not_thought;
@@ -890,51 +788,6 @@ fn build_segment_backlog_health(
         drain_state: derive_drain_state(settings, &gate, no_engine).to_owned(),
         display_powersave_detectable: display_detectable,
     })
-}
-
-fn processing_settings(config: &Map<String, Value>) -> ProcessingSettings {
-    let processing = config.get("processing").and_then(Value::as_object);
-    let gate = processing
-        .and_then(|value| value.get("gate"))
-        .and_then(Value::as_object);
-    let window = gate
-        .and_then(|value| value.get("time_window"))
-        .and_then(Value::as_object);
-    let display = gate
-        .and_then(|value| value.get("display_powersave"))
-        .and_then(Value::as_object);
-    ProcessingSettings {
-        deferred: processing
-            .and_then(|value| value.get("mode"))
-            .and_then(Value::as_str)
-            == Some("deferred"),
-        gate: GateSettings {
-            time_window: TimeWindowSettings {
-                enabled: window
-                    .and_then(|value| value.get("enabled"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
-                start: parse_time(
-                    window
-                        .and_then(|value| value.get("start"))
-                        .and_then(Value::as_str),
-                )
-                .unwrap_or_else(|| NaiveTime::from_hms_opt(2, 0, 0).expect("valid default")),
-                end: parse_time(
-                    window
-                        .and_then(|value| value.get("end"))
-                        .and_then(Value::as_str),
-                )
-                .unwrap_or_else(|| NaiveTime::from_hms_opt(6, 0, 0).expect("valid default")),
-            },
-            display_powersave: DisplayPowersaveSettings {
-                enabled: display
-                    .and_then(|value| value.get("enabled"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            },
-        },
-    }
 }
 
 fn no_thinking_engine_chosen(config: &Map<String, Value>) -> bool {
@@ -1049,9 +902,6 @@ fn parse_start(value: &str) -> Option<DateTime<Utc>> {
         })
 }
 
-fn parse_time(value: Option<&str>) -> Option<NaiveTime> {
-    value.and_then(|value| NaiveTime::parse_from_str(value, "%H:%M").ok())
-}
 fn values(value: Option<&Value>) -> &[Value] {
     value
         .and_then(Value::as_array)
@@ -2337,6 +2187,31 @@ mod tests {
             };
             (rank(pair[0].0), pair[0].1, pair[0].2) <= (rank(pair[1].0), pair[1].1, pair[1].2)
         }));
+    }
+
+    #[test]
+    fn processing_report_reads_supervisor_display_snapshot_and_expires_it() {
+        let temporary = temporary();
+        let root = temporary.path();
+        configured(
+            root,
+            json!({"mode":"deferred","gate":{"time_window":{"enabled":false},"display_powersave":{"enabled":true}}}),
+        );
+        for (age, expected) in [
+            (0, "window_open"),
+            (60_000, "no_active_condition"),
+            (-60_000, "no_active_condition"),
+        ] {
+            write_json(
+                &root.join("health/processing-display.json"),
+                json!({
+                    "sampled_at":Utc::now().timestamp_millis()-age,"available":true,"asleep":true,"debounced":true
+                }),
+            );
+            let report =
+                build_health_report(root, (now().date_naive(), now().date_naive()), now()).unwrap();
+            assert_eq!(report.segment_backlog.drain_state, expected);
+        }
     }
 
     #[test]

@@ -26,6 +26,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- deferred processing now starts during your chosen time window, or when all connected displays have been asleep for two minutes on mac or linux and that option is enabled. new material keeps reaching your journal while processing waits. work already running can finish after the window closes or a display wakes.
 - when a screen summary runs out of room, your journal now retries it more concisely while keeping the same source material.
 - your agents can now see speaker names in transcripts when the speaker is named for those sentences in your journal.
 

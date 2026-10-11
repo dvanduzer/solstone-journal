@@ -10,6 +10,7 @@ mod name;
 mod notification_labels;
 pub mod parakeet_coreml;
 mod path;
+pub mod processing;
 mod read;
 mod zone;
 

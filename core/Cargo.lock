@@ -4755,6 +4755,7 @@ dependencies = [
 name = "solstone-core-journal-config"
 version = "2.0.40"
 dependencies = [
+ "chrono",
  "chrono-tz",
  "iana-time-zone",
  "serde",

@@ -126,12 +126,9 @@ pub fn describe_per_proc_jobs(
 }
 
 pub fn processing_deferred(config: &Map<String, Value>) -> bool {
-    config
-        .get("processing")
-        .and_then(Value::as_object)
-        .and_then(|v| v.get("mode"))
-        .and_then(Value::as_str)
-        == Some("deferred")
+    solstone_core_journal_config::processing::processing_settings(config)
+        .map(|settings| settings.deferred)
+        .unwrap_or(true)
 }
 
 pub fn no_thinking_engine(config: &Map<String, Value>) -> bool {
