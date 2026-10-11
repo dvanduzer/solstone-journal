@@ -8,10 +8,14 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- when an agent you've connected searches your journal and may see transcripts, a result about a conversation now links to the transcript behind it, with its time, so the agent can read what was actually said before telling you who said what.
+- each segment your journal processes from now on also gets a list of what it was about and up to eight short passages copied word for word from what was said, so a search can find a conversation by its subject or by a line someone said in it. a passage is kept only when it matches the transcript exactly.
 - `solstone journal reprocess FIRST --through LAST --owed --json` reports, for each day in the range, whether the day is marked finished, the state of its daily results, how many there are, and how many are owed and why.
 
 ### Changed
 
+- a connected agent can now list what a day or a range of days holds without searching for a word, and its list of transcripts shows each one's time, can be narrowed to part of a day, and continues past its first page.
+- when you ask a connected agent to remember something, it's now told to save it in your journal.
 - your journal no longer makes separate lists of decisions or commitments, counts them in profiles, or lets you mark them complete. your morning briefing no longer tells you what you owe or what you're waiting on. activities still describe what happened and who did it, and your weekly page still includes quotations from audio in which your voice is recognized. existing records stay as written.
 - older solstone apps must update to keep syncing with your journal. minimum versions: tmux 2.0.6, linux 2.0.7, macos 2.0.15, windows 2.0.10, android 2.1.9, and ios 2.0.5 (build 107).
 - when you import a text or markdown transcript and the journal can't find turn times in it, the import now says so, both in the command's output and on the import's page, with a link to ask us to support how your transcript marks times. the file still lands as one segment at the import's start time, each line as written.
@@ -21,6 +25,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- on mac, installing local thinking or transcription now also clears quarantine, macos's marker for downloaded files, inside the downloaded folder.
+
+- a connected agent can now read transcripts of imported audio, and reads imported AI conversations and imported text transcripts as plain text with their times. before, imported audio couldn't be opened, and the others came back as raw data.
+- a transcript your journal can't read no longer stops a connected agent from listing that day's other transcripts.
 - if the model returns no text for an activity's story, your journal can now try once more through the same thinking provider.
 - home now names devices with rejected uploads, even when another source is still arriving, and shows queued work held for a safety check. both link to their details in health. when status is unavailable, the last known issues stay labeled as such.
 

@@ -21,6 +21,11 @@ use crate::JournalRoot;
 
 mod observation;
 pub use observation::{MediaEntry, MediaRead};
+mod removal;
+pub use removal::{
+    MediaRemoval, OriginalName, RemovalEffect, RemovalFailure, RemovalPhase, RemovalReceipt,
+    StageObservation,
+};
 
 #[cfg(unix)]
 mod unix;
@@ -53,6 +58,18 @@ pub enum MediaPrimitive {
     BeforeEntryObservation,
     BeforePrefixRead,
     AfterPrefixRead,
+    BeforeRemovalClaim,
+    NativeClaimCut,
+    AfterRemovalClaim,
+    BeforeClaimRead,
+    BeforeClaimDelete,
+    AfterClaimDelete,
+    RemovalSourceSync,
+    RemovalClaimSync,
+    RemovalParentSync,
+    RemovalCompletion,
+    ClaimAppliedError,
+    DeleteAppliedError,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]

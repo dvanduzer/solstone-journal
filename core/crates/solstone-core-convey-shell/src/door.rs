@@ -816,9 +816,9 @@ pub(super) async fn start(options: DoorStartOptions) -> DoorStart {
             };
         }
     };
-    // `spl_transport::tls::mtls_config` pins the CA fingerprint but does not
-    // check certificate validity. The fresh server leaf therefore retains a
-    // 30-day validity window; successful mTLS tests do not exercise that window.
+    // `spl_transport::tls::mtls_config` pins the CA fingerprint and checks the
+    // server leaf's validity dates and server-auth usage. Admission renews the
+    // leaf before its 30-day validity window ends.
     let mut roots = RootCertStore::empty();
     if roots
         .add(CertificateDer::from(identity.certificate_der().to_vec()))

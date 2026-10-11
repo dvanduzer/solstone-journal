@@ -27,7 +27,7 @@ Read the transcript and screen data. Produce a JSON object with ALL of the follo
 
 ## Output Schema
 
-Authoritative schema: `sense.schema.json`. The output is a single JSON object with these top-level fields: `density`, `content_type`, `activity_summary`, `entities`, `facets`, `speculative_facet`, `meeting_detected`, `speakers`, `recommend`, `emotional_register`. See Field-by-Field Instructions below for semantics and enum values.
+Authoritative schema: `sense.schema.json`. The output is a single JSON object with these top-level fields: `density`, `content_type`, `activity_summary`, `entities`, `facets`, `speculative_facet`, `meeting_detected`, `speakers`, `recommend`, `emotional_register`, `topics`, `quotes`. See Field-by-Field Instructions below for semantics and enum values.
 
 ## Field-by-Field Instructions
 
@@ -98,6 +98,12 @@ How central the entity was to this segment — distinct from `role`. `role` is w
 
 Centrality is independent of `role`: an entity can be `role: mentioned` yet `level: high` (the whole segment was about it, though it wasn't present), or `role: attendee` yet `level: low` (present but barely involved). Judge centrality from what the segment was actually about, not from whether the entity was attending.
 
+### topics
+What this segment was about, as short phrases someone would type to find it again later: the plans, problems, decisions under discussion, documents, events, places, purchases and numbers that came up, each with enough words to be specific ("Q3 pricing page", "flight to Barcelona in November", "index rebuild taking six hours"). Use the words the content itself uses. Name subjects, not outcomes: never write that something was decided, agreed, promised or done. Up to 12, most central first. A topic may include a name when the pairing matters ("Priya's launch deck"), but do not list names on their own: they belong in `entities`. Empty array when the segment is idle or has nothing to name.
+
+### quotes
+Up to 8 short passages of spoken words from the transcript that someone would most want to find again: plans, agreements, requests, offers, dates, amounts and opinions. Copy each `text` exactly from the transcript, 3 to 30 words, without fixing, shortening, summarizing or completing it. Copy only the spoken words: leave out emotion labels, annotations in parentheses or asterisks, timestamps and speaker prefixes. Never quote screen text; what was on screen belongs in `topics`. `speaker` is the label the transcript gives that line ("Speaker 2", a name the transcript itself shows, or the role an AI conversation gives the line); write "unknown" when the line has no label. Never guess a name, and never write that the owner said it unless the transcript labels the line that way. Do not judge whether anything was done. Empty array when nothing was said, and always empty when the segment has no transcript.
+
 ### facets
 Classify into the owner's configured facets. Always include at least one facet — pick the closest configured facet. If multiple facets fit, include the dominant one as `level: high` and others at `level: medium` or `level: low`. For each:
 - `facet`: The facet ID slug — MUST be one of the configured facets listed in the input
@@ -163,5 +169,7 @@ A segment that holds only body data, such as a workout or a set of readings, is 
 8. If `meeting_detected=true`, `speakers` must contain at least one entry (use generic labels if no names are identifiable). If `activity_summary` mentions specific named people, projects, or tools, those names should also appear in `entities` (subject to the per-type rules above) — don't reference an entity by name in the summary and then omit it from `entities`.
 9. Emit a `speculative_facet` name only when all `facets[]` entries are `level: low`; otherwise emit `null`. Never invent a `facets[]` ID.
 10. `activity_summary` and every `facets[].activity` begin with a past-tense verb and name no subject — never "I", "You", "We", "The user", "The owner", "The person", or "This person".
+11. Every `quotes[].text` appears word for word in the transcript.
+12. `topics` and `quotes` never repeat each other; a quote is the words, a topic is the subject.
 
 Return ONLY the JSON object, no other text or explanation.

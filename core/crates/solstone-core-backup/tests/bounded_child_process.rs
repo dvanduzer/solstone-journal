@@ -14,7 +14,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-use solstone_core_backup::bounded_child::{Request, run};
+use solstone_core_backup::archive_admission::ArchiveCancellation;
+use solstone_core_backup::bounded_child::{Request, run, run_cancellable};
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity, MediaStage, digest_reader};
 
@@ -215,6 +216,109 @@ fn timeout_retains_partial_output_and_parent_descriptor_flags() {
     assert!(cloexec(secret));
 }
 
+#[test]
+fn cancellation_probe() {
+    if std::env::var("CANCELLATION_PROBE").as_deref() != Ok("active") {
+        return;
+    }
+    let descriptor = |name| std::env::var(name).unwrap().parse::<i32>().unwrap();
+    // SAFETY: the probe exclusively owns its explicitly inherited descriptors.
+    #[allow(unsafe_code)]
+    let (mut target, mut ready, mut control) = unsafe {
+        (
+            File::from_raw_fd(descriptor("TARGET_FD")),
+            File::from_raw_fd(descriptor("READY_FD")),
+            File::from_raw_fd(descriptor("CONTROL_FD")),
+        )
+    };
+    target.write_all(b"before cancellation").unwrap();
+    ready.write_all(&std::process::id().to_le_bytes()).unwrap();
+    let mut release = [0u8];
+    control.read_exact(&mut release).unwrap();
+    target.write_all(b"; completed").unwrap();
+}
+
+#[test]
+fn active_cancellation_reaps_the_root_and_retains_parent_descriptor_flags() {
+    use solstone_core_journal_io::media::Cleanup;
+    for cancel in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("media")).unwrap();
+        let root = JournalRoot::open(directory.path()).unwrap();
+        let parent = MediaDirectory::open(root.into(), Path::new("media")).unwrap();
+        let mut target = MediaStage::create(parent).unwrap().create_target().unwrap();
+        let (mut ready_parent, ready_child) = UnixStream::pair().unwrap();
+        let (mut control_parent, control_child) = UnixStream::pair().unwrap();
+        ready_parent
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let transport = target.helper_transport().unwrap();
+        let request = Request {
+            program: std::env::current_exe().unwrap().into_os_string(),
+            argv: vec![
+                "--exact".into(),
+                "cancellation_probe".into(),
+                "--nocapture".into(),
+            ],
+            env: BTreeMap::from([
+                ("CANCELLATION_PROBE".into(), "active".into()),
+                (
+                    "TARGET_FD".into(),
+                    transport.descriptor.as_raw_fd().to_string().into(),
+                ),
+                (
+                    "READY_FD".into(),
+                    ready_child.as_raw_fd().to_string().into(),
+                ),
+                (
+                    "CONTROL_FD".into(),
+                    control_child.as_raw_fd().to_string().into(),
+                ),
+            ]),
+            timeout: Some(Duration::from_secs(5)),
+            pass_fds: vec![
+                transport.descriptor,
+                ready_child.as_fd(),
+                control_child.as_fd(),
+            ],
+        };
+        let cancellation = ArchiveCancellation::new();
+        std::thread::scope(|scope| {
+            let child = scope.spawn(|| run_cancellable(&request, &cancellation));
+            let mut pid = [0u8; 4];
+            ready_parent.read_exact(&mut pid).unwrap();
+            assert!(cloexec(transport.descriptor));
+            if cancel {
+                cancellation.cancel();
+                assert_eq!(
+                    child.join().unwrap().err().unwrap().kind(),
+                    std::io::ErrorKind::Interrupted
+                );
+            } else {
+                control_parent.write_all(b"g").unwrap();
+                assert_eq!(child.join().unwrap().unwrap().returncode, 0);
+            }
+            assert_eq!(
+                nix::sys::wait::waitpid(
+                    nix::unistd::Pid::from_raw(u32::from_le_bytes(pid) as i32),
+                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                ),
+                Err(nix::errno::Errno::ECHILD)
+            );
+        });
+        assert!(cloexec(transport.descriptor));
+        drop(transport);
+        if !cancel {
+            let expected =
+                digest_reader(&mut std::io::Cursor::new(b"before cancellation; completed"))
+                    .unwrap();
+            let mut prepared = target.prepare_after_successful_helper(&expected).unwrap();
+            assert_eq!(prepared.cleanup(), Cleanup::Complete);
+        }
+        // Cancelled generic probes do not manufacture cleanup qualification.
+    }
+}
+
 /// Explicit operator target: execute this compiled harness from an admitted
 /// copied package with the real restic member and a synthetic direct-S3 fixture.
 #[test]
@@ -410,4 +514,157 @@ fn packaged_readback_entry() {
         member.bytes(),
         member.sha256()
     );
+}
+
+/// Operator-only cancellation cuts use the actual installed tool and a synthetic
+/// S3 server that keeps the selected query or dump response blocked until return.
+#[test]
+#[ignore = "requires an admitted copied package and controlled synthetic S3 fixture"]
+fn packaged_cancellation_entry() {
+    use solstone_core_backup::archive_admission::{
+        AdmissionError, ArchiveBudget, ArchiveConfiguration, Clock,
+    };
+    use solstone_core_backup::archive_readback::{
+        ExactArchiveFile, ReadAdmission, ReadOperation, ReadbackError,
+    };
+    use solstone_core_journal_io::media::Cleanup;
+    struct LocalClock(std::cell::Cell<i64>);
+    impl Clock for LocalClock {
+        fn now_unix(&self) -> i64 {
+            self.0.get()
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    let input: serde_json::Value = serde_json::from_slice(
+        &fs::read(std::env::var_os("READBACK_PROBE_JSON").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let root = std::sync::Arc::new(
+        JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap(),
+    );
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let clock = LocalClock(std::cell::Cell::new(started));
+    let member =
+        solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
+            .unwrap();
+    let admit = |cancellation: ArchiveCancellation| {
+        let configuration = ArchiveConfiguration::capture(&root).unwrap();
+        let destination = configuration.destination().unwrap();
+        let password = configuration.keys().unwrap().unwrap().daily_key;
+        ReadOperation::admit(ReadAdmission {
+            root: root.clone(),
+            configuration,
+            budget: ArchiveBudget::new_cancellable(&clock, cancellation).unwrap(),
+            clock: &clock,
+            destination,
+            password,
+            repository_id: input["repository_id"].as_str().unwrap().into(),
+            expected_restic_path: member.path().into(),
+        })
+        .unwrap()
+    };
+    let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
+    let fresh = || {
+        MediaStage::create(parent.clone())
+            .unwrap()
+            .create_target()
+            .unwrap()
+    };
+    let file = ExactArchiveFile {
+        repository_id: input["repository_id"].as_str().unwrap().into(),
+        snapshot_id: input["snapshot_id"].as_str().unwrap().into(),
+        name: input["name"].as_str().unwrap().into(),
+        archive_path: input["archive_path"].as_str().unwrap().into(),
+        bytes: input["bytes"].as_u64().unwrap(),
+        sha256: input["sha256"].as_str().unwrap().into(),
+    };
+    let mut positive = admit(ArchiveCancellation::new())
+        .read_exact(&file, fresh())
+        .unwrap();
+    assert_eq!(positive.digest().size, file.bytes);
+    assert_eq!(positive.digest().sha256, file.sha256);
+    assert_eq!(positive.cleanup(), Cleanup::Complete);
+
+    for mode in ["query", "dump"] {
+        let cancellation = ArchiveCancellation::new();
+        let mut operation = admit(cancellation.clone());
+        let target = fresh();
+        let identity = target.identity();
+        let mut control = UnixStream::connect(input["control"].as_str().unwrap()).unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        control.write_all(mode.as_bytes()).unwrap();
+        let mut armed = [0u8];
+        control.read_exact(&mut armed).unwrap();
+        assert_eq!(armed, [b'a']);
+        let (result, mut control, pid) = std::thread::scope(|scope| {
+            let cancel = scope.spawn(|| {
+                let mut reached = [0u8; 5];
+                control.read_exact(&mut reached).unwrap();
+                assert_eq!(reached[0], b'c');
+                let pid = u32::from_le_bytes(reached[1..].try_into().unwrap());
+                cancellation.cancel();
+                control.write_all(b"d").unwrap();
+                (control, pid)
+            });
+            let result = operation.read_exact(&file, target);
+            let (control, pid) = cancel.join().unwrap();
+            (result, control, pid)
+        });
+        let mut failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("active cancellation must refuse"),
+        };
+        assert_eq!(
+            failure.reason(),
+            ReadbackError::Admission(AdmissionError::Cancelled)
+        );
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(pid as i32),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+            ),
+            Err(nix::errno::Errno::ECHILD)
+        );
+        if mode == "dump" {
+            assert_eq!(failure.cleanup(), Cleanup::Refused);
+            let expected = match identity {
+                MediaIdentity::Unix { device, inode } => (device, inode),
+                _ => unreachable!(),
+            };
+            let media = Path::new(input["journal"].as_str().unwrap()).join("media");
+            let retained = fs::read_dir(media).unwrap().any(|stage| {
+                fs::read_dir(stage.unwrap().path()).unwrap().any(|entry| {
+                    let metadata = entry.unwrap().metadata().unwrap();
+                    (metadata.dev(), metadata.ino()) == expected
+                })
+            });
+            assert!(retained, "cancelled dump retains the exact owned target");
+        } else {
+            assert_eq!(failure.cleanup(), Cleanup::Complete);
+        }
+        // The server remains blocked until after read_exact and root reap returned.
+        control.write_all(b"r").unwrap();
+        control.read_exact(&mut armed).unwrap();
+        assert_eq!(armed, [b'r']);
+        let mut untouched = operation.read_exact(&file, fresh()).err().unwrap();
+        assert_eq!(
+            untouched.reason(),
+            ReadbackError::Admission(AdmissionError::Cancelled)
+        );
+        assert_eq!(untouched.cleanup(), Cleanup::Complete);
+        let mut issued = fresh();
+        drop(issued.helper_transport().unwrap());
+        let mut unknown = operation.read_exact(&file, issued).err().unwrap();
+        assert_eq!(unknown.cleanup(), Cleanup::Refused);
+        println!(
+            "active {mode} cancellation retained exact refusal, root reap and target ownership"
+        );
+    }
 }

@@ -3289,6 +3289,17 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests", unix))]
+    fn rclone_preservation_mark(
+        platform: PlatformTag,
+    ) -> crate::clean_uninstall::CleanUninstallMark {
+        if platform == PlatformTag::Linux {
+            crate::clean_uninstall::CleanUninstallMark::ProtectedJournal
+        } else {
+            crate::clean_uninstall::CleanUninstallMark::NoOwnedPath
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests", unix))]
     fn identity_snapshot(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         fn visit(path: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
             let metadata = fs::symlink_metadata(path).unwrap();
@@ -3443,10 +3454,12 @@ mod tests {
             assert!(outcome.results.iter().any(|result| {
                 result.name == "rclone"
                     && result.state == crate::clean_uninstall::CleanUninstallState::Preserved
-                    && result.mark == crate::clean_uninstall::CleanUninstallMark::ProtectedJournal
+                    && result.mark == rclone_preservation_mark(owner.platform())
             }));
             assert!(manifest.exists());
+            assert_eq!(fs::read(&manifest).unwrap(), b"manifest canary");
             assert!(canary.exists());
+            assert_eq!(fs::read(&canary).unwrap(), b"journal data");
         }
     }
 
@@ -3483,10 +3496,12 @@ mod tests {
         assert!(outcome.results.iter().any(|result| {
             result.name == "rclone"
                 && result.state == crate::clean_uninstall::CleanUninstallState::Preserved
-                && result.mark == crate::clean_uninstall::CleanUninstallMark::ProtectedJournal
+                && result.mark == rclone_preservation_mark(owner.platform())
         }));
         assert!(manifest_a.exists());
+        assert_eq!(fs::read(&manifest_a).unwrap(), b"old manifest");
         assert!(manifest_b.exists());
+        assert_eq!(fs::read(&manifest_b).unwrap(), b"current manifest");
         assert!(!config_path(&home).exists());
         assert_ne!(binding_a.namespace, binding_b.namespace);
     }
@@ -3702,11 +3717,14 @@ mod tests {
         assert!(outcome.results.iter().any(|result| {
             result.name == "rclone"
                 && result.state == crate::clean_uninstall::CleanUninstallState::Preserved
-                && result.mark == crate::clean_uninstall::CleanUninstallMark::ProtectedJournal
+                && result.mark == rclone_preservation_mark(owner.platform())
         }));
         assert!(rclone.is_symlink());
+        assert_eq!(fs::read_link(&rclone).unwrap(), journal);
         assert!(manifest.exists());
+        assert_eq!(fs::read(&manifest).unwrap(), b"manifest canary");
         assert!(canary.exists());
+        assert_eq!(fs::read(&canary).unwrap(), b"journal data");
     }
     #[cfg(all(test, feature = "full-tests", unix))]
     #[test]

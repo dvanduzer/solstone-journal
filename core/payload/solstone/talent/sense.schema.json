@@ -11,7 +11,9 @@
     "meeting_detected",
     "speakers",
     "recommend",
-    "emotional_register"
+    "emotional_register",
+    "topics",
+    "quotes"
   ],
   "properties": {
     "density": {
@@ -182,6 +184,24 @@
         "strained",
         "neutral"
       ]
+    },
+    "topics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "quotes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["speaker", "text"],
+        "properties": {
+          "speaker": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      }
     }
   }
 }
