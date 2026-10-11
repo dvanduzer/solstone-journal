@@ -1659,7 +1659,39 @@ impl HttpTransport for ArchiveAdmissionHttp<'_> {
             .map_err(|_| crate::hosted_runtime::HttpError::Timeout)?;
         let mut request = request.clone();
         request.timeout = request.timeout.min(remaining);
+        if self.budget.cancellation().is_some() {
+            // Operated cancellation requires an explicit controlled HTTP transport.
+            return Err(crate::hosted_runtime::HttpError::Other);
+        }
         self.inner.execute(&request)
+    }
+}
+
+struct ArchiveRunner<'a> {
+    inner: &'a dyn ToolRunner,
+    clock: &'a dyn Clock,
+    budget: &'a ArchiveBudget,
+}
+
+impl ToolRunner for ArchiveRunner<'_> {
+    fn run(
+        &self,
+        request: &crate::runner::ToolRequest<'_>,
+    ) -> std::io::Result<crate::runner::ToolOutput> {
+        let remaining = self
+            .budget
+            .remaining(self.clock)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Interrupted, error))?;
+        let mut request = request.clone();
+        request.timeout = Some(
+            request
+                .timeout
+                .map_or(remaining, |timeout| timeout.min(remaining)),
+        );
+        match self.budget.cancellation() {
+            Some(cancellation) => self.inner.run_cancellable(&request, cancellation),
+            None => self.inner.run(&request),
+        }
     }
 }
 
@@ -1691,7 +1723,17 @@ pub fn admit_archive<'a>(
     root: Arc<JournalRoot>,
     services: &BackupServices<'a>,
 ) -> Result<AdmittedArchive<'a>, ArchiveError> {
-    let mut budget = ArchiveBudget::new(services.clock)?;
+    let budget = ArchiveBudget::new(services.clock)?;
+    admit_archive_with_budget(root, services, budget)
+}
+
+/// Admit paired transports using the original operation lifetime and stop signal.
+pub fn admit_archive_with_budget<'a>(
+    root: Arc<JournalRoot>,
+    services: &BackupServices<'a>,
+    mut budget: ArchiveBudget,
+) -> Result<AdmittedArchive<'a>, ArchiveError> {
+    budget.remaining(services.clock)?;
     let config = ArchiveConfiguration::capture(&root)?;
     if !config.enabled() {
         return Err(ArchiveError::NotConfigured);
@@ -1837,8 +1879,13 @@ impl<'a> AdmittedArchive<'a> {
             .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
         let mut args = runtime.global_options.clone();
         args.extend(["cat".into(), "config".into(), "--no-cache".into()]);
+        let runner = ArchiveRunner {
+            inner: self.runner,
+            clock: self.clock,
+            budget: &self.budget,
+        };
         let output = run_restic(
-            self.runner,
+            &runner,
             &args,
             &runtime.destination.repository,
             &runtime.password,
@@ -1848,9 +1895,9 @@ impl<'a> AdmittedArchive<'a> {
             None,
             Some(timeout),
             &[],
-        )
-        .map_err(|_| ArchiveError::ToolFailed { reason: "failed" })?;
+        );
         self.revalidate_local()?;
+        let output = output.map_err(|_| ArchiveError::ToolFailed { reason: "failed" })?;
         if output.returncode != 0 {
             return Err(ArchiveError::ToolFailed {
                 reason: reason_for_returncode(output.returncode),
@@ -1903,8 +1950,13 @@ impl<'a> AdmittedArchive<'a> {
             REPOSITORY_RETRY_LOCK.into(),
         ]);
         args.extend(paths.iter().map(|path| crate::restic_filesystem_path(path)));
+        let runner = ArchiveRunner {
+            inner: self.runner,
+            clock: self.clock,
+            budget: &self.budget,
+        };
         let output = run_restic(
-            self.runner,
+            &runner,
             &args,
             &self.write.destination.repository,
             &self.write.password,
@@ -1930,6 +1982,7 @@ impl<'a> AdmittedArchive<'a> {
             error,
             remote_effects: effects.clone(),
         };
+        self.revalidate_local().map_err(after)?;
         let output = output.map_err(|_| after(ArchiveError::ToolFailed { reason: "failed" }))?;
         self.revalidate().map_err(after)?;
         if output.returncode != 0 {
@@ -2321,6 +2374,7 @@ mod tests {
 
     mod archive_admission {
         use super::*;
+        use solstone_core_backup::archive_admission::ArchiveCancellation;
 
         const REPOSITORY_ID: &str =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2365,6 +2419,18 @@ mod tests {
                     .borrow_mut()
                     .pop_front()
                     .expect("script exhausted")
+            }
+
+            fn run_cancellable(
+                &self,
+                request: &ToolRequest<'_>,
+                cancellation: &ArchiveCancellation,
+            ) -> io::Result<ToolOutput> {
+                assert!(
+                    !cancellation.is_cancelled(),
+                    "owner must refuse before launch"
+                );
+                self.run(request)
             }
         }
 
@@ -2421,6 +2487,172 @@ mod tests {
             ScriptedHttp {
                 responses: RefCell::new(VecDeque::from([Ok(response)])),
                 requests: RefCell::new(vec![]),
+            }
+        }
+
+        #[test]
+        fn inherited_budget_keeps_elapsed_time_expiry_and_cancellation_through_readback() {
+            for capped in [false, true] {
+                let (_journal, root) = fixture();
+                let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                let now = Rc::new(Cell::new(50));
+                let clock = MutableClock(Rc::clone(&now));
+                let cancellation = ArchiveCancellation::new();
+                let mut budget =
+                    ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+                let deadline = 50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64;
+                if capped {
+                    budget.cap_credential_expiry(deadline - 2);
+                }
+                now.set(deadline - 5);
+                let services = services(&runner, &PanicHttp, &clock, &Maintenance);
+                let admitted = admit_archive_with_budget(root, &services, budget).unwrap();
+                let seconds = if capped { 3 } else { 5 };
+                assert!(
+                    runner
+                        .requests
+                        .borrow()
+                        .iter()
+                        .all(|r| r.timeout == Some(Duration::from_secs(seconds)))
+                );
+                let transferred = admitted.into_read_admission().unwrap();
+                assert_eq!(
+                    transferred.budget.remaining(&clock).unwrap(),
+                    Duration::from_secs(seconds)
+                );
+                now.set(if capped { deadline - 2 } else { deadline });
+                assert_eq!(
+                    transferred.budget.remaining(&clock),
+                    Err(if capped {
+                        AdmissionError::CredentialsExpired
+                    } else {
+                        AdmissionError::DeadlineExceeded
+                    })
+                );
+                cancellation.cancel();
+                assert!(transferred.budget.cancellation().unwrap().is_cancelled());
+                assert_eq!(
+                    transferred.budget.remaining(&clock),
+                    Err(AdmissionError::Cancelled)
+                );
+            }
+        }
+
+        #[test]
+        fn inherited_cancelled_or_poisoned_budget_refuses_before_any_transport() {
+            for cancelled in [false, true] {
+                let (_journal, root) = fixture();
+                let now = Rc::new(Cell::new(50));
+                let clock = MutableClock(Rc::clone(&now));
+                let cancellation = ArchiveCancellation::new();
+                let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+                let expected = if cancelled {
+                    cancellation.cancel();
+                    ArchiveError::Cancelled
+                } else {
+                    now.set(49);
+                    assert_eq!(budget.remaining(&clock), Err(AdmissionError::ClockChanged));
+                    now.set(51);
+                    ArchiveError::ClockChanged
+                };
+                let services = services(&PanicRunner, &PanicHttp, &clock, &Maintenance);
+                assert_eq!(
+                    refusal(admit_archive_with_budget(root, &services, budget)),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn cancellation_on_either_pairing_leg_refuses_exactly_without_next_query() {
+            for leg in [0, 1] {
+                for fails in [false, true] {
+                    let (_journal, root) = fixture();
+                    let cancellation = ArchiveCancellation::new();
+                    let mut runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                    let count = Rc::new(Cell::new(0));
+                    let observed = count.clone();
+                    let stop = cancellation.clone();
+                    runner.hook = Some(Box::new(move |_| {
+                        let index = observed.get();
+                        observed.set(index + 1);
+                        if index == leg {
+                            stop.cancel();
+                        }
+                    }));
+                    if fails {
+                        runner.outputs.borrow_mut()[leg] =
+                            Err(io::Error::other("interrupted tool"));
+                    }
+                    let budget = ArchiveBudget::new_cancellable(&FixedClock, cancellation).unwrap();
+                    let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                    assert_eq!(
+                        refusal(admit_archive_with_budget(root, &services, budget)),
+                        ArchiveError::Cancelled
+                    );
+                    assert_eq!(count.get(), leg + 1);
+                }
+            }
+        }
+
+        #[test]
+        fn unsupported_cancellable_runner_and_http_never_fall_back_to_ordinary_execution() {
+            let (journal, root) = fixture();
+            let budget =
+                ArchiveBudget::new_cancellable(&FixedClock, ArchiveCancellation::new()).unwrap();
+            let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+            assert_eq!(
+                refusal(admit_archive_with_budget(root.clone(), &services, budget)),
+                ArchiveError::ToolFailed { reason: "failed" }
+            );
+            let _ = hosted(journal.path(), "1970-01-01T00:02:00Z");
+            let budget =
+                ArchiveBudget::new_cancellable(&FixedClock, ArchiveCancellation::new()).unwrap();
+            assert!(matches!(
+                refusal(admit_archive_with_budget(root, &services, budget)),
+                ArchiveError::CredentialsUnavailable { .. }
+            ));
+        }
+
+        #[test]
+        fn cancelled_archive_preserves_actual_output_or_unknown_attempt_before_refusal() {
+            for code in [Some(0), Some(3), None] {
+                let (journal, root) = fixture();
+                let cancellation = ArchiveCancellation::new();
+                let mut runner = script(vec![
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    snapshot(code.unwrap_or(0), SNAPSHOT_ID),
+                ]);
+                if code.is_none() {
+                    runner.outputs.borrow_mut()[4] = Err(io::Error::other("interrupted backup"));
+                }
+                let stop = cancellation.clone();
+                runner.hook = Some(Box::new(move |request| {
+                    if request.argv.iter().any(|arg| arg == "backup") {
+                        stop.cancel();
+                    }
+                }));
+                let budget = ArchiveBudget::new_cancellable(&FixedClock, cancellation).unwrap();
+                let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                let mut admitted = admit_archive_with_budget(root, &services, budget).unwrap();
+                assert_eq!(
+                    admitted.archive(&source(journal.path())).unwrap_err(),
+                    ArchiveFailure {
+                        error: ArchiveError::Cancelled,
+                        remote_effects: ArchiveRemoteEffects::Attempted {
+                            returncode: code,
+                            observed_snapshot_id: code.map(|_| SNAPSHOT_ID.to_owned())
+                        }
+                    }
+                );
+                assert_eq!(runner.requests.borrow().len(), 5);
+                assert!(matches!(
+                    admitted.into_read_operation(),
+                    Err(ReadbackAdmissionError::Admission(AdmissionError::Cancelled))
+                ));
             }
         }
 
