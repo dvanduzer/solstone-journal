@@ -21,6 +21,7 @@ use std::time::Duration;
 pub(super) enum Point {
     AfterInitialMark,
     AfterPublication,
+    BeforeNoEffectPersist,
 }
 
 type Hook = (Point, Box<dyn FnOnce()>);
@@ -284,6 +285,246 @@ fn identical_is_zero_bytes_while_different_and_nonfile_are_conflicts() {
         }
         assert_eq!(record.intent.event_recorded, Obligation::Complete);
     }
+}
+
+#[test]
+fn settled_conflict_preserves_original_mark_and_late_matching_bytes_without_reclassification() {
+    for late_match in [false, true] {
+        let f = Fixture::new(true);
+        let allowed = Cell::new(true);
+        fs::write(f.raw(), b"old").unwrap();
+        let register = f.temp.path().join("health/retention-marks.json");
+        let original = fs::read(&register).unwrap();
+        let staged = f.staged(&allowed);
+        let raw = f.raw();
+        let result = with_hook(
+            Point::AfterPublication,
+            move || {
+                if late_match {
+                    fs::write(raw, b"abc").unwrap();
+                }
+            },
+            || staged.commit(2, options()),
+        )
+        .retire_intent(options());
+        assert!(result.hold.is_none(), "{:?}", result.hold);
+        assert_eq!(result.effects, AttemptEffects::default());
+        assert!(result.retirement.as_ref().unwrap().retired);
+        assert!(result.no_effect_cleanup.as_ref().unwrap().confirmed());
+        assert!(result.marker.is_none());
+        assert!(result.register.is_none());
+        assert!(!f.marker().exists());
+        assert_eq!(fs::read(register).unwrap(), original);
+        assert_eq!(
+            fs::read(f.raw()).unwrap(),
+            if late_match { b"abc" } else { b"old" }
+        );
+        let intent = &result.record.as_ref().unwrap().intent;
+        assert_eq!(
+            intent.event.files[0].disposition,
+            RestoreDisposition::Conflict
+        );
+        assert_eq!(intent.marker, Obligation::NotRequired);
+        assert_eq!(intent.register, Obligation::NotRequired);
+        let catalog = read_complete_catalog(&f.root).unwrap();
+        let operations = &catalog.days[0].segments[0].restores;
+        assert_eq!(operations, std::slice::from_ref(&intent.event));
+    }
+}
+
+#[test]
+fn not_published_attempt_records_unattempted_and_retires_only_owned_metadata() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let staged = f.staged(&allowed);
+    let (result, fired) = run_with_media_hook(
+        MediaPrimitive::BeforePublish,
+        || Err(std::io::Error::other("before native publication")),
+        || staged.commit(2, options()),
+    );
+    assert!(fired);
+    let result = result.retire_intent(options());
+    assert!(result.hold.is_none(), "{:?}", result.hold);
+    assert_eq!(
+        result.publication.as_ref().unwrap().effect,
+        PublicationEffect::NotPublished
+    );
+    assert_eq!(result.effects, AttemptEffects::default());
+    assert!(!f.raw().exists());
+    assert!(!f.marker().exists());
+    assert!(result.register.is_none());
+    assert_eq!(
+        result.record.as_ref().unwrap().intent.event.files[0].disposition,
+        RestoreDisposition::Unattempted
+    );
+    assert!(result.no_effect_cleanup.as_ref().unwrap().confirmed());
+    assert!(result.retirement.as_ref().unwrap().retired);
+}
+
+#[test]
+fn no_effect_cleanup_and_parent_sync_failures_keep_obligations_and_store_exclusion() {
+    for primitive in [MediaPrimitive::StageUnlink, MediaPrimitive::ParentSync] {
+        let f = Fixture::new(false);
+        let allowed = Cell::new(true);
+        fs::write(f.raw(), b"old").unwrap();
+        let staged = f.staged(&allowed);
+        let stage = f
+            .temp
+            .path()
+            .join("chronicle/20261009/camera")
+            .join(&staged.stage.stage_name);
+        let (result, fired) = run_with_media_hook(
+            primitive,
+            || Err(std::io::Error::other("no-effect cleanup cut")),
+            || staged.commit(2, options()),
+        );
+        assert!(fired);
+        let result = result.retire_intent(options()).into_owned();
+        assert!(!result.completed());
+        assert!(result.facts().store_exclusion_retained);
+        assert!(result.facts().retirement.is_none());
+        let cleanup = result.facts().no_effect_cleanup.unwrap();
+        if primitive == MediaPrimitive::StageUnlink {
+            assert_eq!(cleanup.cleanup, Cleanup::Pending);
+            assert!(cleanup.parent_sync.is_none());
+            assert!(stage.is_dir());
+        } else {
+            assert_eq!(cleanup.cleanup, Cleanup::Complete);
+            assert!(cleanup.parent_sync.unwrap().is_err());
+            assert!(!stage.exists());
+        }
+        assert_eq!(fs::read(f.raw()).unwrap(), b"old");
+        assert!(!f.marker().exists());
+    }
+}
+
+#[test]
+fn no_effect_source_substitution_refuses_cleanup_and_preserves_both_files() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    fs::write(f.raw(), b"old").unwrap();
+    let staged = f.staged(&allowed);
+    let stage = f
+        .temp
+        .path()
+        .join("chronicle/20261009/camera")
+        .join(&staged.stage.stage_name);
+    let payload = stage.join("payload");
+    let saved = stage.join("admitted-payload");
+    let changed = payload.clone();
+    let retained = saved.clone();
+    let result = with_hook(
+        Point::AfterPublication,
+        move || {
+            fs::rename(&changed, retained).unwrap();
+            fs::write(changed, b"foreign").unwrap();
+        },
+        || staged.commit(2, options()),
+    );
+    assert!(matches!(result.hold, Some(Hold::Retirement)));
+    assert_eq!(
+        result.no_effect_cleanup.as_ref().unwrap().cleanup,
+        Cleanup::Refused
+    );
+    assert_eq!(fs::read(saved).unwrap(), b"abc");
+    assert_eq!(fs::read(payload).unwrap(), b"foreign");
+    assert_eq!(fs::read(f.raw()).unwrap(), b"old");
+    assert!(result.retirement.is_none());
+}
+
+#[test]
+fn no_effect_ledger_uncertainty_stops_before_source_cleanup() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    fs::write(f.raw(), b"old").unwrap();
+    let staged = f.staged(&allowed);
+    let ledger = f.ledger();
+    let result = with_hook(
+        Point::AfterPublication,
+        move || {
+            let mut contents = fs::read(&ledger).unwrap();
+            contents.extend_from_slice(b"{\n");
+            fs::write(ledger, contents).unwrap();
+        },
+        || staged.commit(2, options()),
+    );
+    assert!(matches!(
+        result.hold,
+        Some(Hold::Repair(RepairHold::DegradedCatalog))
+    ));
+    assert!(result.no_effect_cleanup.is_none());
+    assert!(result.retirement.is_none());
+    assert_eq!(fs::read(f.raw()).unwrap(), b"old");
+}
+
+#[test]
+fn no_effect_final_write_uncertainty_retains_cleanup_receipt_and_intent() {
+    use solstone_core_journal_io::atomic::{
+        BoundPublicationPrimitive, run_with_bound_publication_fault,
+    };
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    fs::write(f.raw(), b"old").unwrap();
+    let staged = f.staged(&allowed);
+    let (result, fired) = run_with_bound_publication_fault(
+        BoundPublicationPrimitive::FileSync,
+        4,
+        nix::libc::EIO,
+        || staged.commit(2, options()),
+    );
+    assert!(fired);
+    assert!(result.hold.is_some());
+    assert!(result.no_effect_cleanup.as_ref().unwrap().confirmed());
+    assert!(
+        !result
+            .record
+            .as_ref()
+            .unwrap()
+            .writes
+            .last()
+            .unwrap()
+            .fully_confirmed()
+    );
+    let path = intent_path(&f, &result);
+    let result = result.retire_intent(options()).into_owned();
+    assert!(!result.completed());
+    assert!(result.facts().store_exclusion_retained);
+    assert!(result.facts().retirement.is_none());
+    assert!(path.is_file());
+    assert_eq!(fs::read(f.raw()).unwrap(), b"old");
+}
+
+#[test]
+fn no_effect_changed_mark_stops_before_prepared_source_cleanup() {
+    let f = Fixture::new(true);
+    let allowed = Cell::new(true);
+    fs::write(f.raw(), b"old").unwrap();
+    let staged = f.staged(&allowed);
+    let stage = f
+        .temp
+        .path()
+        .join("chronicle/20261009/camera")
+        .join(&staged.stage.stage_name);
+    let path = f.temp.path().join("health/retention-marks.json");
+    let mut register = review_context::load_at_root(&f.root).unwrap();
+    register.marks.values_mut().next().unwrap().marked_at = "2026-10-10T00:00:01Z".into();
+    let bytes = serde_json::to_vec(&register).unwrap();
+    let expected = bytes.clone();
+    let changed = path.clone();
+    let result = with_hook(
+        Point::AfterPublication,
+        move || fs::write(changed, bytes).unwrap(),
+        || staged.commit(2, options()),
+    );
+    assert!(matches!(
+        result.hold,
+        Some(Hold::Repair(RepairHold::MarkChanged))
+    ));
+    assert!(result.no_effect_cleanup.is_none());
+    assert!(result.ledger.is_none());
+    assert!(stage.is_dir());
+    assert_eq!(fs::read(path).unwrap(), expected);
+    assert_eq!(fs::read(f.raw()).unwrap(), b"old");
 }
 
 #[test]
@@ -892,8 +1133,20 @@ fn capacity_exact_boundary_passes_and_one_below_or_query_failure_refuses() {
 
 #[test]
 fn detached_confirmed_retirement_releases_store_for_second_file_under_original_carrier() {
+    two_files_under_original_carrier(false);
+}
+
+#[test]
+fn settled_conflict_releases_store_for_next_file_without_earning_restored_bytes() {
+    two_files_under_original_carrier(true);
+}
+
+fn two_files_under_original_carrier(conflict: bool) {
     let mut f = Fixture::new(false);
     let allowed = Cell::new(true);
+    if conflict {
+        fs::write(f.raw(), b"old").unwrap();
+    }
     let first = f.staged(&allowed);
     let carrier = Arc::clone(&first.owner.carrier);
     let mut second = f.witness.clone();
@@ -929,10 +1182,22 @@ fn detached_confirmed_retirement_releases_store_for_second_file_under_original_c
     assert!(facts.retirement.unwrap().retired);
     assert_eq!(
         facts.publication.unwrap().effect,
-        PublicationEffect::Published
+        if conflict {
+            PublicationEffect::Conflict
+        } else {
+            PublicationEffect::Published
+        }
     );
-    assert_eq!(first.effects(), AttemptEffects { files: 1, bytes: 3 });
-    assert_eq!(fs::read(f.raw()).unwrap(), b"abc");
+    let first_effects = if conflict {
+        AttemptEffects::default()
+    } else {
+        AttemptEffects { files: 1, bytes: 3 }
+    };
+    assert_eq!(first.effects(), first_effects);
+    assert_eq!(
+        fs::read(f.raw()).unwrap(),
+        if conflict { b"old" } else { b"abc" }
+    );
 
     f.witness = second;
     let second = f
@@ -944,11 +1209,24 @@ fn detached_confirmed_retirement_releases_store_for_second_file_under_original_c
     assert!(!second.facts().store_exclusion_retained);
     assert_eq!(second.effects(), AttemptEffects { files: 1, bytes: 3 });
     assert_eq!(fs::read(f.raw().with_file_name("b.flac")).unwrap(), b"abc");
-    assert_eq!(first.effects().files + second.effects().files, 2);
-    assert_eq!(first.effects().bytes + second.effects().bytes, 6);
+    let (expected_files, expected_bytes) = if conflict { (1, 3) } else { (2, 6) };
+    assert_eq!(
+        first.effects().files + second.effects().files,
+        expected_files
+    );
+    assert_eq!(
+        first.effects().bytes + second.effects().bytes,
+        expected_bytes
+    );
     assert!(carrier.revalidate().is_ok());
     assert!(first.facts().preparation.as_ref().unwrap().confirmed);
-    crate::restore::owned::tests::check_actual_accounting(vec![first, second], 2, 6, false);
+    crate::restore::owned::tests::check_actual_accounting(
+        vec![first, second],
+        expected_files,
+        expected_bytes,
+        false,
+        conflict,
+    );
 }
 
 #[test]
@@ -970,7 +1248,7 @@ fn detached_hold_keeps_store_exclusion_and_published_bytes() {
     );
     let refused = RestoreIntentStore::create(activity).err().unwrap();
     assert_eq!(refused.problem, StoreProblem::Busy);
-    crate::restore::owned::tests::check_actual_accounting(vec![outcome], 1, 3, true);
+    crate::restore::owned::tests::check_actual_accounting(vec![outcome], 1, 3, true, false);
 }
 
 #[test]

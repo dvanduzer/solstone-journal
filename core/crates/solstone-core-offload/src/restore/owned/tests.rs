@@ -102,6 +102,7 @@ pub(crate) fn check_actual_accounting(
     expected_files: u64,
     expected_bytes: u64,
     held: bool,
+    settled_conflict: bool,
 ) {
     let mut segment = selected();
     let mut second = segment.active[0].clone();
@@ -120,7 +121,20 @@ pub(crate) fn check_actual_accounting(
         (report.files_restored, report.bytes_restored),
         (expected_files, expected_bytes)
     );
-    assert_eq!(report.status, if held { "degraded" } else { "ok" });
+    assert_eq!(
+        report.status,
+        if held || settled_conflict {
+            "degraded"
+        } else {
+            "ok"
+        }
+    );
+    if settled_conflict {
+        assert_eq!(files[0].disposition, RestoreDisposition::Conflict);
+        assert_eq!((files[0].files, files[0].bytes), (0, 0));
+        assert_eq!(report.reason.as_deref(), Some("restore_conflict"));
+        assert_eq!(report.segments_restored, 0);
+    }
     if held {
         assert_eq!(files[1].disposition, RestoreDisposition::Unattempted);
     }

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use solstone_core_backup::archive_readback::{ReadOperation, ReadbackFailure};
 use solstone_core_journal_io::media::{
-    Durability, MediaDirectory, PublicationReceipt, RemovalReceipt,
+    Cleanup, Durability, MediaDirectory, PublicationReceipt, RemovalReceipt,
 };
 use solstone_core_journal_io::paths::{PathOrDay, Segment, iter_segments};
 use solstone_core_journal_io::{JournalRoot, LockOptions, check_record_identities};
@@ -81,6 +81,11 @@ pub struct StorePreparationFacts<'a> {
     pub failures: Vec<String>,
 }
 
+pub struct NoEffectCleanupFacts<'a> {
+    pub cleanup: Cleanup,
+    pub parent_sync: Option<&'a std::io::Result<()>>,
+}
+
 pub struct TransactionFacts<'a> {
     pub publication: Option<&'a PublicationReceipt>,
     pub intent_writes: Vec<IntentWriteFacts<'a>>,
@@ -95,6 +100,7 @@ pub struct TransactionFacts<'a> {
     pub marker_ancestor_sync: &'a [std::io::Result<()>],
     pub ledger: Option<LedgerFacts>,
     pub register: Option<&'a Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    pub no_effect_cleanup: Option<NoEffectCleanupFacts<'a>>,
     pub retirement: Option<RetirementFacts<'a>>,
     pub operation_id: Option<&'a str>,
     pub store_exclusion_retained: bool,
@@ -157,7 +163,15 @@ impl FileRecord {
         self.bytes = effects.bytes;
         self.disposition = outcome.disposition();
         let stopped = !outcome.completed();
-        self.reason = stopped.then_some("restore_held");
+        self.reason = if stopped {
+            Some("restore_held")
+        } else {
+            match self.disposition {
+                RestoreDisposition::Conflict => Some("restore_conflict"),
+                RestoreDisposition::Unattempted => Some("restore_not_published"),
+                _ => None,
+            }
+        };
         self.owner = FileOwner::Transaction(Box::new(outcome));
         stopped
     }
@@ -405,7 +419,11 @@ fn summarize(report: &mut RestoreResult, files: &[FileRecord]) {
             // contributes at most its own declared bytes once.
             detail.files_restored += file.files;
             detail.bytes_restored += file.bytes;
-            let done = matches!(&file.owner, FileOwner::Transaction(result) if result.completed());
+            let done = matches!(&file.owner, FileOwner::Transaction(result) if result.completed())
+                && matches!(
+                    file.disposition,
+                    RestoreDisposition::Published | RestoreDisposition::AlreadyPresent
+                );
             detail_complete &= done;
             attempted |= !matches!(file.owner, FileOwner::None);
             if detail.reason.is_none() && !done {

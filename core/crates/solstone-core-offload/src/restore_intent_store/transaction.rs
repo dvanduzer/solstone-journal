@@ -10,8 +10,8 @@ use std::sync::Arc;
 use solstone_core_backup::archive_readback::{ExactArchiveFile, ReadOperation, ReadbackFailure};
 use solstone_core_journal_io::activity_obligations::observe_with_carrier;
 use solstone_core_journal_io::media::{
-    Confirmation, Durability, MediaStage, OwnedMediaFailure, PreparedMedia, PublicationEffect,
-    PublicationReceipt, RootActivityCarrier,
+    Cleanup, Confirmation, Durability, MediaStage, OwnedMediaFailure, PreparedMedia,
+    PublicationEffect, PublicationReceipt, RootActivityCarrier,
 };
 use solstone_core_journal_io::{JournalRoot, LockOptions};
 use solstone_core_retention::archive_catalog::{
@@ -341,6 +341,17 @@ struct Record {
     writes: Vec<StoreWriteReceipt>,
 }
 
+struct NoEffectCleanup {
+    cleanup: Cleanup,
+    parent_sync: Option<std::io::Result<()>>,
+}
+
+impl NoEffectCleanup {
+    fn confirmed(&self) -> bool {
+        self.cleanup == Cleanup::Complete && self.parent_sync.as_ref().is_some_and(Result::is_ok)
+    }
+}
+
 impl Record {
     fn persist(&mut self) -> Result<(), Hold> {
         let store = self
@@ -393,6 +404,7 @@ pub(crate) struct TransactionOutcome<'operation, 'clock> {
     marker_ancestor_sync: Vec<std::io::Result<()>>,
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
     register: Option<Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    no_effect_cleanup: Option<NoEffectCleanup>,
     retirement: Option<retirement::RetirementFacts>,
     effects: AttemptEffects,
     hold: Option<Hold>,
@@ -411,6 +423,7 @@ impl<'operation, 'clock> TransactionOutcome<'operation, 'clock> {
             marker_ancestor_sync: Vec::new(),
             ledger: None,
             register: None,
+            no_effect_cleanup: None,
             retirement: None,
             effects: AttemptEffects::default(),
             hold: None,
@@ -593,6 +606,13 @@ impl TransactionOutcome<'_, '_> {
         options: LockOptions,
         replay: bool,
     ) -> Result<(), Hold> {
+        if self.record()?.intent.no_effect_outcome() {
+            if replay {
+                // Saved dispositions do not reconstruct the prepared source.
+                return Err(Hold::Retirement);
+            }
+            return self.finish_no_effect(commit, time);
+        }
         let intent = &self.record()?.intent;
         let unproven = intent.outcome.as_ref().is_some_and(|facts| {
             (matches!(
@@ -647,26 +667,7 @@ impl TransactionOutcome<'_, '_> {
                     .map_err(Hold::Repair)?;
                 self.persist()?;
             }
-            self.owner.effect_check(commit)?;
-            let intent = &self.record()?.intent;
-            let appended = append_restore_operation(
-                self.owner.root(),
-                &intent.locator.target,
-                intent.locator.layout,
-                &intent.event,
-                time,
-            );
-            let confirmed = appended.as_ref().is_ok_and(|receipt| {
-                receipt.confirmation() == LedgerConfirmation::Confirmed
-                    && receipt.durability() == [LedgerSync::Confirmed; 4]
-                    && receipt.failures().is_empty()
-            });
-            self.ledger = Some(appended);
-            if !confirmed {
-                return Err(Hold::Ledger);
-            }
-            self.record_mut()?.intent.event_recorded = Obligation::Complete;
-            self.persist()?;
+            self.record_event(commit, time)?;
         }
         let decision = self.inspect()?;
         match decision.register {
@@ -694,6 +695,108 @@ impl TransactionOutcome<'_, '_> {
             _ => return Err(Hold::Register),
         }
         Ok(())
+    }
+
+    fn record_event(&mut self, commit: &SegmentCommit<'_>, time: u64) -> Result<(), Hold> {
+        self.owner.effect_check(commit)?;
+        let intent = &self.record()?.intent;
+        let appended = append_restore_operation(
+            self.owner.root(),
+            &intent.locator.target,
+            intent.locator.layout,
+            &intent.event,
+            time,
+        );
+        let confirmed = appended.as_ref().is_ok_and(|receipt| {
+            receipt.confirmation() == LedgerConfirmation::Confirmed
+                && receipt.durability() == [LedgerSync::Confirmed; 4]
+                && receipt.failures().is_empty()
+        });
+        self.ledger = Some(appended);
+        if !confirmed {
+            return Err(Hold::Ledger);
+        }
+        self.record_mut()?.intent.event_recorded = Obligation::Complete;
+        self.persist()
+    }
+
+    fn unchanged_mark(&self) -> Result<(), Hold> {
+        use crate::restore_intent::MarkRetirement;
+        let intent = &self.record()?.intent;
+        let marks = review_context::load_at_root(self.owner.root())
+            .map_err(|error| Hold::Admission(format!("{error:?}")))?;
+        let selected = current_mark(&self.owner, &intent.witness, &marks)?;
+        if selected != intent.retirement.expected() {
+            return Err(Hold::Repair(RepairHold::MarkChanged));
+        }
+        if let MarkRetirement::Exact { plan } = &intent.retirement
+            && plan.replacement().is_some_and(|replacement| {
+                replacement.id != plan.expected().id && marks.marks.contains_key(&replacement.id)
+            })
+        {
+            return Err(Hold::Repair(RepairHold::MarkChanged));
+        }
+        Ok(())
+    }
+
+    fn finish_no_effect(&mut self, commit: &SegmentCommit<'_>, time: u64) -> Result<(), Hold> {
+        let receipt = self.publication.as_ref().ok_or(Hold::Retirement)?;
+        if !matches!(
+            receipt.effect,
+            PublicationEffect::Conflict | PublicationEffect::NotPublished
+        ) || receipt.identity.is_some()
+            || self.effects != AttemptEffects::default()
+            || self.record()?.intent.outcome.as_ref()
+                != Some(&crate::restore_intent::PublicationFacts::from(receipt))
+        {
+            return Err(Hold::Retirement);
+        }
+        self.owner.effect_check(commit)?;
+        self.unchanged_mark()?;
+        // Inspect fresh history and current names, but keep the actual native
+        // prospective event even if matching bytes appeared after the attempt.
+        let decision = self.inspect()?;
+        if !decision.event_recorded && self.record()?.intent.event_recorded == Obligation::Complete
+        {
+            return Err(Hold::Ledger);
+        }
+        if self.record()?.intent.event_recorded != Obligation::Complete {
+            self.record_event(commit, time)?;
+        }
+        self.owner.effect_check(commit)?;
+        self.unchanged_mark()?;
+        if !self.inspect()?.event_recorded {
+            return Err(Hold::Ledger);
+        }
+        let cleanup = self.owner.media.as_mut().ok_or(Hold::Retirement)?.cleanup();
+        self.no_effect_cleanup = Some(NoEffectCleanup {
+            cleanup,
+            parent_sync: None,
+        });
+        if cleanup != Cleanup::Complete {
+            return Err(Hold::Retirement);
+        }
+        let parent_sync = self.owner.destination.stage_parent().sync();
+        let synced = parent_sync.is_ok();
+        self.no_effect_cleanup
+            .as_mut()
+            .ok_or(Hold::Retirement)?
+            .parent_sync = Some(parent_sync);
+        if !synced {
+            return Err(Hold::Retirement);
+        }
+        #[cfg(all(test, feature = "full-tests", unix))]
+        tests::checkpoint(tests::Point::BeforeNoEffectPersist);
+        self.owner.effect_check(commit)?;
+        self.unchanged_mark()?;
+        if !self.inspect()?.event_recorded {
+            return Err(Hold::Ledger);
+        }
+        let intent = &mut self.record_mut()?.intent;
+        intent.cleanup = Obligation::Complete;
+        intent.marker = Obligation::NotRequired;
+        intent.register = Obligation::NotRequired;
+        self.persist()
     }
 
     #[cfg(unix)]

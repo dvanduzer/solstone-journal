@@ -419,15 +419,21 @@ impl RestoreIntent {
             })
             || matches!(self.event_recorded, Obligation::NotRequired)
             || matches!(self.cleanup, Obligation::NotRequired)
-            || matches!(self.marker, Obligation::NotRequired)
         {
             return Err(RepairHold::InvalidIntent);
         }
         let expected =
             MarkRetirement::plan(&self.locator, &self.witness, self.retirement.expected())?;
+        let no_effect_complete = self.no_effect_outcome()
+            && self.event_recorded == Obligation::Complete
+            && self.cleanup == Obligation::Complete
+            && self.marker == Obligation::NotRequired
+            && self.register == Obligation::NotRequired;
         if self.retirement != expected
+            || (self.marker == Obligation::NotRequired && !no_effect_complete)
             || (matches!(self.retirement, MarkRetirement::NoMark)
-                != matches!(self.register, Obligation::NotRequired))
+                != matches!(self.register, Obligation::NotRequired)
+                && !no_effect_complete)
             || self
                 .confirmed
                 .as_ref()
@@ -596,6 +602,23 @@ impl RestoreIntent {
             .files
             .first()
             .map_or(RestoreDisposition::Unattempted, |file| file.disposition)
+    }
+
+    /// Evidence classification only; cleanup still needs the actual native owner.
+    pub(super) fn no_effect_outcome(&self) -> bool {
+        self.confirmed.is_none()
+            && self.outcome.as_ref().is_some_and(|outcome| {
+                outcome.identity.is_none()
+                    && outcome.confirmation == Confirmation::Unverified
+                    && matches!(
+                        (outcome.effect, self.disposition()),
+                        (PublicationEffect::Conflict, RestoreDisposition::Conflict)
+                            | (
+                                PublicationEffect::NotPublished,
+                                RestoreDisposition::Unattempted
+                            )
+                    )
+            })
     }
 
     /// Snapshot a single native attempt. Callers must persist this even if the
@@ -1157,6 +1180,39 @@ pub(super) mod tests {
             },
             error: (confirmation == Confirmation::Unverified)
                 .then(|| io::Error::other("cut after native effect")),
+        }
+    }
+
+    #[test]
+    fn no_effect_completion_preserves_mark_plan_and_requires_exact_recorded_cleanup() {
+        for with_mark in [false, true] {
+            for effect in [PublicationEffect::Conflict, PublicationEffect::NotPublished] {
+                let mut before = fixture(with_mark);
+                before
+                    .record_outcome(&receipt(&before, effect, Confirmation::Unverified))
+                    .unwrap();
+                before.event_recorded = Obligation::Complete;
+                let mut complete = before.clone();
+                complete.cleanup = Obligation::Complete;
+                complete.marker = Obligation::NotRequired;
+                complete.register = Obligation::NotRequired;
+                assert_eq!(before.validate_successor(&complete), Ok(()));
+                assert_eq!(complete.retirement, before.retirement);
+                for missing in 0..3 {
+                    let mut invalid = complete.clone();
+                    match missing {
+                        0 => invalid.cleanup = Obligation::Pending,
+                        1 => invalid.event_recorded = Obligation::Pending,
+                        _ => {
+                            invalid.event.files[0].disposition = RestoreDisposition::AlreadyPresent
+                        }
+                    }
+                    assert!(invalid.validate().is_err());
+                }
+                let mut reopened = complete.clone();
+                reopened.register = Obligation::Pending;
+                assert!(complete.validate_successor(&reopened).is_err());
+            }
         }
     }
 

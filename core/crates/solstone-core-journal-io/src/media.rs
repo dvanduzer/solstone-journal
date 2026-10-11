@@ -249,6 +249,15 @@ impl MediaDirectory {
         self.inner.revalidate()
     }
 
+    /// Sync this retained directory, bracketing native IO with binding checks.
+    /// Success reports durability only, never cleanup or writer settlement.
+    pub fn sync(&self) -> io::Result<()> {
+        self.revalidate()?;
+        step(MediaPrimitive::ParentSync)?;
+        self.inner.sync()?;
+        self.revalidate()
+    }
+
     /// Available bytes on this retained directory's filesystem, with checked
     /// arithmetic and binding validation surrounding the native query.
     pub fn available_bytes(&self) -> io::Result<u64> {

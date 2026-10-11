@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::restore::owned::{
-    IntentWriteFacts, LedgerEffect, LedgerFacts, RetirementFacts, StagingFacts,
-    StorePreparationFacts, TransactionFacts,
+    IntentWriteFacts, LedgerEffect, LedgerFacts, NoEffectCleanupFacts, RetirementFacts,
+    StagingFacts, StorePreparationFacts, TransactionFacts,
 };
 
 struct DetachedOwner {
@@ -33,6 +33,7 @@ pub(crate) struct DetachedTransaction {
     marker_ancestor_sync: Vec<std::io::Result<()>>,
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
     register: Option<Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    no_effect_cleanup: Option<NoEffectCleanup>,
     retirement: Option<retirement::RetirementFacts>,
     effects: AttemptEffects,
     hold: Option<Hold>,
@@ -51,6 +52,7 @@ impl TransactionOutcome<'_, '_> {
             marker_ancestor_sync,
             ledger,
             register,
+            no_effect_cleanup,
             retirement,
             effects,
             hold,
@@ -86,6 +88,7 @@ impl TransactionOutcome<'_, '_> {
             marker_ancestor_sync,
             ledger,
             register,
+            no_effect_cleanup,
             retirement,
             effects,
             hold,
@@ -220,6 +223,13 @@ impl DetachedTransaction {
             marker_ancestor_sync: &self.marker_ancestor_sync,
             ledger,
             register: self.register.as_ref(),
+            no_effect_cleanup: self
+                .no_effect_cleanup
+                .as_ref()
+                .map(|facts| NoEffectCleanupFacts {
+                    cleanup: facts.cleanup,
+                    parent_sync: facts.parent_sync.as_ref(),
+                }),
             retirement,
             operation_id: self
                 .record

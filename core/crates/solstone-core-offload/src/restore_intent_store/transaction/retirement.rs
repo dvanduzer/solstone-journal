@@ -69,28 +69,51 @@ impl TransactionOutcome<'_, '_> {
 
         self.owner.native_check()?;
         self.owner.admission.check()?;
+        let no_effect = self
+            .no_effect_cleanup
+            .as_ref()
+            .is_some_and(NoEffectCleanup::confirmed)
+            && self.effects == AttemptEffects::default()
+            && self.publication.as_ref().is_some_and(|receipt| {
+                matches!(
+                    receipt.effect,
+                    PublicationEffect::Conflict | PublicationEffect::NotPublished
+                ) && receipt.identity.is_none()
+                    && self.record.as_ref().is_some_and(|record| {
+                        record.intent.no_effect_outcome()
+                            && record.intent.outcome.as_ref()
+                                == Some(&crate::restore_intent::PublicationFacts::from(receipt))
+                    })
+            });
         let record = self.record()?;
         let intent = &record.intent;
         if record.persisted.as_ref() != Some(intent)
-            || intent.marker != Obligation::Complete
+            || intent.marker
+                != if no_effect {
+                    Obligation::NotRequired
+                } else {
+                    Obligation::Complete
+                }
             || intent.event_recorded != Obligation::Complete
             || !matches!(
                 intent.register,
                 Obligation::Complete | Obligation::NotRequired
             )
             || intent.cleanup != Obligation::Complete
-            || !intent.event.files.iter().all(|file| {
-                matches!(
-                    file.disposition,
-                    RestoreDisposition::Published | RestoreDisposition::AlreadyPresent
-                )
-            })
-            || intent.outcome.as_ref().is_none_or(|facts| {
-                facts.confirmation != Confirmation::Confirmed
-                    || (facts.effect == PublicationEffect::Published
-                        && (facts.file_durability != Durability::Synced
-                            || facts.parent_durability != Durability::Synced))
-            })
+            || !no_effect
+                && !intent.event.files.iter().all(|file| {
+                    matches!(
+                        file.disposition,
+                        RestoreDisposition::Published | RestoreDisposition::AlreadyPresent
+                    )
+                })
+            || !no_effect
+                && intent.outcome.as_ref().is_none_or(|facts| {
+                    facts.confirmation != Confirmation::Confirmed
+                        || (facts.effect == PublicationEffect::Published
+                            && (facts.file_durability != Durability::Synced
+                                || facts.parent_durability != Durability::Synced))
+                })
         {
             return Err(Hold::Retirement);
         }
@@ -117,13 +140,18 @@ impl TransactionOutcome<'_, '_> {
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
         self.owner.effect_check(&commit)?;
-        self.live_matches()?;
+        if no_effect {
+            self.unchanged_mark()?;
+        } else {
+            self.live_matches()?;
+        }
         let decision = self.inspect()?;
         if !decision.event_recorded
-            || !matches!(
-                decision.register,
-                RegisterDecision::NoMark | RegisterDecision::Complete
-            )
+            || !no_effect
+                && !matches!(
+                    decision.register,
+                    RegisterDecision::NoMark | RegisterDecision::Complete
+                )
         {
             return Err(Hold::Retirement);
         }
@@ -255,6 +283,9 @@ impl TransactionOutcome<'_, '_> {
             .revalidate()
             .map_err(Hold::Store)?;
         self.owner.native_check()?;
+        if no_effect {
+            self.unchanged_mark()?;
+        }
         let census = observe_with_carrier(self.owner.root(), self.owner.carrier.observation())
             .map_err(|error| Hold::Admission(error.to_string()))?;
         if census.unresolved_entries().next().is_some() {
