@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::journal_root::{JournalEntryKind, JournalRoot};
-use crate::media::{MediaDirectory, MediaEntry};
+use crate::media::{MediaDirectory, MediaEntry, RootCarrierObservation};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryBudget {
@@ -90,6 +90,28 @@ impl NativeObligations {
     }
     pub fn into_entries(self) -> Vec<NativeObligation> {
         self.entries
+    }
+}
+
+/// Complete evidence retaining a borrow of the actual live original owner.
+/// Recognition excludes no creator and grants no settlement or cleanup authority.
+pub struct CarrierObligations<'a> {
+    _carrier: RootCarrierObservation<'a>,
+    all: NativeObligations,
+    owned_index: usize,
+}
+
+impl CarrierObligations<'_> {
+    pub fn entries(&self) -> &[NativeObligation] {
+        self.all.entries()
+    }
+
+    pub fn unresolved_entries(&self) -> impl Iterator<Item = &NativeObligation> {
+        self.all
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (index != self.owned_index).then_some(entry))
     }
 }
 
@@ -217,6 +239,69 @@ pub fn observe_obligations(
     root: &Arc<JournalRoot>,
 ) -> Result<NativeObligations, RecoveryObservationError> {
     observe_with(root, Limits::default(), |_, _| {})
+}
+
+/// Fresh complete census recognizing only this borrowed live empty root carrier.
+/// Every other stage/intent remains unresolved; errors never yield partial success.
+pub fn observe_with_carrier<'a>(
+    root: &Arc<JournalRoot>,
+    carrier: RootCarrierObservation<'a>,
+) -> Result<CarrierObligations<'a>, RecoveryObservationError> {
+    observe_carrier_with(root, carrier, |_, _| {})
+}
+
+fn observe_carrier_with<'a>(
+    root: &Arc<JournalRoot>,
+    carrier: RootCarrierObservation<'a>,
+    checkpoint: impl FnMut(Checkpoint, &Path),
+) -> Result<CarrierObligations<'a>, RecoveryObservationError> {
+    let before = carrier
+        .validate(root)
+        .map_err(|source| io_error(Path::new(""), source))?;
+    let all = observe_with(root, Limits::default(), checkpoint)?;
+    let after = carrier
+        .validate(root)
+        .map_err(|source| io_error(Path::new(""), source))?;
+    if before != after {
+        return Err(error(
+            RecoveryObservationFailure::Changed,
+            Path::new(&before.name),
+        ));
+    }
+    let owned_index = matching_carrier(all.entries(), &before.name, before.identity)?;
+    Ok(CarrierObligations {
+        _carrier: carrier,
+        all,
+        owned_index,
+    })
+}
+
+fn matching_carrier(
+    entries: &[NativeObligation],
+    name: &OsStr,
+    identity: crate::media::MediaIdentity,
+) -> Result<usize, RecoveryObservationError> {
+    let mut matches = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| match record {
+            NativeObligation::Stage { relative, entry }
+                if relative == Path::new(name)
+                    && entry.name == name
+                    && entry.identity == identity
+                    && entry.kind == JournalEntryKind::Directory =>
+            {
+                Some(index)
+            }
+            _ => None,
+        });
+    let index = matches
+        .next()
+        .ok_or_else(|| error(RecoveryObservationFailure::Changed, Path::new(name)))?;
+    if matches.next().is_some() {
+        return Err(error(RecoveryObservationFailure::Changed, Path::new(name)));
+    }
+    Ok(index)
 }
 
 // Private instrumentation cannot return admission or grant mutation authority.
@@ -572,6 +657,145 @@ mod tests {
         fn intents(&self) -> PathBuf {
             self.directory("health/offload/restore-intents");
             self.path("health/offload/restore-intents")
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn borrowed_activity_recognition_keeps_all_evidence_and_unrelated_stage_and_intent() {
+        use crate::activity::ActivityLease;
+        use crate::media::RootActivityCarrier;
+        let f = Fixture::new();
+        let activity = ActivityLease::try_acquire(f.root.clone()).unwrap();
+        let carrier = RootActivityCarrier::prepare(activity).unwrap();
+        let raw = f.observed().unwrap();
+        assert_eq!(raw.entries().len(), 1);
+        let recognized = observe_with_carrier(&f.root, carrier.observation()).unwrap();
+        assert_eq!(recognized.entries(), raw.entries());
+        assert_eq!(recognized.unresolved_entries().count(), 0);
+        let NativeObligation::Stage { entry, .. } = &raw.entries()[0] else {
+            panic!("missing own stage")
+        };
+        assert!(
+            matching_carrier(
+                &[raw.entries()[0].clone(), raw.entries()[0].clone()],
+                &entry.name,
+                entry.identity
+            )
+            .is_err()
+        );
+        drop(recognized);
+        f.directory("chronicle/20260101/stream/.tmp-offload-unrelated");
+        let intent = f.intents().join(format!("{}.json", "a".repeat(32)));
+        fs::write(&intent, b"raw intent remains a hold").unwrap();
+        let recognized = observe_with_carrier(&f.root, carrier.observation()).unwrap();
+        assert_eq!(recognized.entries().len(), 3);
+        let unresolved: Vec<_> = recognized.unresolved_entries().collect();
+        assert_eq!(unresolved.len(), 2);
+        assert!(unresolved.iter().any(|entry| matches!(entry, NativeObligation::Stage { relative, .. } if relative == Path::new("chronicle/20260101/stream/.tmp-offload-unrelated"))));
+        assert!(unresolved.iter().any(|entry| matches!(entry, NativeObligation::Intent { contents: IntentRead::Complete { bytes, .. }, .. } if bytes == b"raw intent remains a hold")));
+        assert_eq!(f.observed().unwrap().entries(), recognized.entries());
+        assert_eq!(fs::read(intent).unwrap(), b"raw intent remains a hold");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn carrier_recognition_requires_original_root_arc_and_preserves_valid_owner() {
+        use crate::activity::ActivityLease;
+        use crate::media::RootActivityCarrier;
+        let f = Fixture::new();
+        let other = Fixture::new();
+        let carrier =
+            RootActivityCarrier::prepare(ActivityLease::try_acquire(f.root.clone()).unwrap())
+                .unwrap();
+        let reopened = Arc::new(JournalRoot::open(f.temp.path()).unwrap());
+        assert_eq!(reopened.identity(), f.root.identity());
+        assert!(observe_with_carrier(&other.root, carrier.observation()).is_err());
+        assert!(observe_with_carrier(&reopened, carrier.observation()).is_err());
+        assert_eq!(
+            observe_with_carrier(&f.root, carrier.observation())
+                .unwrap()
+                .unresolved_entries()
+                .count(),
+            0
+        );
+        carrier.revalidate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonempty_missing_moved_and_full_identity_replaced_carrier_never_recognize() {
+        use crate::activity::ActivityLease;
+        use crate::media::RootActivityCarrier;
+        for change in 0..4 {
+            let f = Fixture::new();
+            let carrier =
+                RootActivityCarrier::prepare(ActivityLease::try_acquire(f.root.clone()).unwrap())
+                    .unwrap();
+            let path = carrier.diagnostic_path();
+            let saved = f.path(".tmp-offload-saved-original");
+            match change {
+                0 => fs::write(path.join("payload"), b"sole content").unwrap(),
+                1 => fs::remove_dir(&path).unwrap(),
+                2 => fs::rename(&path, &saved).unwrap(),
+                _ => {
+                    fs::rename(&path, &saved).unwrap();
+                    fs::create_dir(&path).unwrap();
+                    fs::write(path.join("competitor"), b"preserve").unwrap();
+                }
+            }
+            assert!(observe_with_carrier(&f.root, carrier.observation()).is_err());
+            drop(carrier);
+            match change {
+                0 => assert_eq!(fs::read(path.join("payload")).unwrap(), b"sole content"),
+                1 => assert!(!path.exists()),
+                2 => assert!(saved.is_dir()),
+                _ => {
+                    assert!(saved.is_dir());
+                    assert_eq!(fs::read(path.join("competitor")).unwrap(), b"preserve");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_carrier_loss_rebind_and_nonempty_change_refuse_after_complete_raw_walk() {
+        use crate::activity::ActivityLease;
+        use crate::media::RootActivityCarrier;
+        for change in 0..3 {
+            let f = Fixture::new();
+            let carrier =
+                RootActivityCarrier::prepare(ActivityLease::try_acquire(f.root.clone()).unwrap())
+                    .unwrap();
+            let path = carrier.diagnostic_path();
+            let saved = f.path(".tmp-offload-saved-original");
+            let mut hit = false;
+            let observed =
+                observe_carrier_with(&f.root, carrier.observation(), |point, relative| {
+                    if point == Checkpoint::FinishedDirectory && relative == Path::new("") {
+                        match change {
+                            0 => fs::remove_dir(&path).unwrap(),
+                            1 => {
+                                fs::rename(&path, &saved).unwrap();
+                                fs::create_dir(&path).unwrap();
+                                fs::write(path.join("competitor"), b"preserve").unwrap();
+                            }
+                            _ => fs::write(path.join("payload"), b"sole content").unwrap(),
+                        }
+                        hit = true;
+                    }
+                });
+            assert!(hit);
+            assert!(observed.is_err());
+            match change {
+                0 => assert!(!path.exists()),
+                1 => {
+                    assert!(saved.is_dir());
+                    assert_eq!(fs::read(path.join("competitor")).unwrap(), b"preserve");
+                }
+                _ => assert_eq!(fs::read(path.join("payload")).unwrap(), b"sole content"),
+            }
         }
     }
 

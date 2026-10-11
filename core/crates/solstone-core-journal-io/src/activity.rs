@@ -144,7 +144,8 @@ impl ActivityLease {
 }
 
 /// Exclusive admission for fresh checks and cooperating destructive boundaries.
-/// This guard cannot create stages and does not certify an empty census.
+/// Only its opaque root carrier may reserve an empty stage; it grants no
+/// writable media stage and does not certify an empty census.
 pub struct TeardownLease {
     inner: Admission,
 }
