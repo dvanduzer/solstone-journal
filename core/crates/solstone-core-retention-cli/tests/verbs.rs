@@ -1735,18 +1735,37 @@ fn mark_does_not_change_marks_owned_by_other_classes() {
 
 #[test]
 fn marks_refuses_unsupported_and_unknown_register_shapes() {
+    for version in [1, 2] {
+        let bed = Bed::new(&format!("supported-{version}"));
+        let register = bed.journal().join("health/retention-marks.json");
+        let contents = format!("{{\"version\":{version},\"marks\":{{}}}}");
+        fs::create_dir_all(register.parent().unwrap()).unwrap();
+        fs::write(&register, &contents).unwrap();
+        let output = bed.run("marks", &["--journal", bed.journal().to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            receipt(&output),
+            json!({"ok": true, "verb": "marks", "marks": {"version": version, "marks": {}}})
+        );
+        assert_eq!(fs::read(&register).unwrap(), contents.as_bytes());
+    }
     for (name, contents, expected) in [
-        ("version", r#"{"version":2,"marks":{}}"#, "version"),
+        ("version", r#"{"version":3,"marks":{}}"#, "version"),
         (
-            "unknown",
+            "unknown-v1",
             r#"{"version":1,"marks":{},"extra":true}"#,
+            "valid JSON",
+        ),
+        (
+            "unknown-v2",
+            r#"{"version":2,"marks":{},"extra":true}"#,
             "valid JSON",
         ),
     ] {
         let bed = Bed::new(name);
         let register = bed.journal().join("health/retention-marks.json");
         fs::create_dir_all(register.parent().unwrap()).unwrap();
-        fs::write(register, contents).unwrap();
+        fs::write(&register, contents).unwrap();
         let output = bed.run("marks", &["--journal", bed.journal().to_str().unwrap()]);
         assert_eq!(output.status.code(), Some(3));
         assert!(
@@ -1755,6 +1774,7 @@ fn marks_refuses_unsupported_and_unknown_register_shapes() {
                 .unwrap()
                 .contains(expected)
         );
+        assert_eq!(fs::read(&register).unwrap(), contents.as_bytes());
     }
 }
 
