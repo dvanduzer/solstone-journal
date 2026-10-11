@@ -35,6 +35,13 @@
   let root = null;
   let surface = null;
   let lastPulse = null;
+  let pulseReadVersion = 0;
+  let pulseAppliedVersion = 0;
+  let pulseReadFailed = false;
+  let pulseObservedAt = null;
+  let heldWorkSnapshot = null;
+  let heldWorkCurrent = false;
+  let heldWorkExpiry = null;
   let briefingSections = {};
   const ACTIVITY_PREVIEW = 6;
   let todayActivitiesExpanded = false;
@@ -201,11 +208,16 @@
   function loadPulse() {
     if (!surface) return;
     surface.innerHTML = surfaceLoading('loading your day…');
-    apiJson(PULSE_URL)
+    const read = ++pulseReadVersion;
+    return apiJson(PULSE_URL)
       .then(function (data) {
+        if (read < pulseAppliedVersion) return;
+        pulseAppliedVersion = read;
         renderPulse(data);
       })
       .catch(function (error) {
+        if (read < pulseAppliedVersion) return;
+        pulseAppliedVersion = read;
         logError(error, 'home: loadPulse failed');
         surface.innerHTML = surfaceError(error, "Couldn't load pulse");
         bindSurfaceRetry();
@@ -251,6 +263,8 @@
   function renderPulse(data) {
     validatePulse(data);
     lastPulse = data;
+    pulseReadFailed = false;
+    pulseObservedAt = Date.now();
     paintedCardOrder = cardOrder(data);
     briefingSections = isPlainObject(data.briefing_sections) ? data.briefing_sections : {};
     const cards = [renderVitalsHtml(data)];
@@ -268,13 +282,56 @@
     refreshBriefing();
   }
 
+  function heldWorkIssues() {
+    if (!heldWorkSnapshot) return [];
+    const queues = heldWorkSnapshot.queues;
+    const names = { daily: 'daily processing', activity: 'activity processing',
+      segment: 'segment processing', flush: 'finishing activities', weekly: 'weekly reflection',
+      indexer: 'search updates' };
+    const scopes = heldWorkSnapshot.held.filter(hold => queues[hold.partition] > 0)
+      .map(hold => names[hold.partition] || 'queued processing');
+    if (heldWorkSnapshot.queue_hold && Object.values(queues).some(count => count > 0)) {
+      scopes.unshift('all queued work');
+    }
+    return scopes.map(scope => ({ text: scope + ' is on hold for a safety check.',
+      severity: 'amber', href: '/app/health/#processingHolds' }));
+  }
+
+  function homeHealthGlance(pulse) {
+    const g = Object.assign({}, pulse.health_glance || {});
+    const baseIssues = g.issues || [];
+    const holds = heldWorkIssues();
+    const workCurrent = heldWorkCurrent && heldWorkSnapshot
+      && Date.now() - heldWorkSnapshot.observedAt < 30000;
+    const current = (pulseReadFailed ? [] : baseIssues).concat(workCurrent ? holds : []);
+    const retained = issue => Object.assign({}, issue, { text: 'last known: ' + issue.text, severity: 'amber' });
+    g.issues = baseIssues.map(issue => pulseReadFailed ? retained(issue) : issue)
+      .concat(holds.map(issue => workCurrent ? issue : retained(issue)));
+    const notes = [];
+    const checked = at => at ? ' last check: ' + new Date(at).toLocaleString() + '.' : '';
+    if (pulseReadFailed) notes.push({text:'service status is unavailable.' + checked(pulseObservedAt), href:'/app/health/'});
+    if (!workCurrent) notes.push({text:'queued work status is unavailable.' + checked(heldWorkSnapshot?.observedAt), href:'/app/health/#processingHolds'});
+    if (current.length) {
+      g.verdict = 'attention';
+      g.severity = current.some(issue => issue.severity === 'red') ? 'red' : 'amber';
+      g.headline = current.length === 1 ? '1 thing needs your attention' : current.length + ' things need your attention';
+    } else if (notes.length) {
+      g.verdict = 'unavailable';
+      g.severity = 'amber';
+      g.headline = pulseReadFailed ? 'service status is unavailable right now.' : 'queued work status is unavailable right now.';
+      g.last_observation = null;
+      g.cta = null;
+    }
+    return { glance: g, notes };
+  }
+
   function renderVitalsHtml(pulse) {
-    const g = pulse.health_glance || {};
+    const { glance: g, notes } = homeHealthGlance(pulse);
     const severity = g.severity || 'amber'; // 'neutral' is truthy; do not fold it into this fallback
     let html = '<div class="pulse-vitals" id="pulse-vitals" data-home-surface="vitals" role="status" aria-live="polite">'
       + '<div class="pulse-vitals-item"><span class="pulse-vitals-dot ' + esc(severity) + '" aria-hidden="true"></span>'
       + '<span class="pulse-vitals-verdict ' + esc(severity) + '">' + esc(g.headline || '') + '</span></div>';
-    if (g.verdict === 'attention') {
+    if (g.issues?.length) {
       (g.issues || []).forEach(function (issue) {
         html += '<a class="pulse-vitals-chip ' + esc(issue.severity || 'amber') + '" href="' + esc(issue.href || '#') + '">'
           + esc(issue.text || '') + ' →</a>';
@@ -288,6 +345,9 @@
           + esc(g.cta.text || '') + '</a>';
       }
     }
+    notes.forEach(note => {
+      html += '<a class="pulse-vitals-note" href="' + esc(note.href) + '">' + esc(note.text) + ' →</a>';
+    });
     html += '<a class="pulse-vitals-health-link" href="/app/health/#registeredClientsCard">health →</a>';
     // Not yet, and that's fine: a calm row on any verdict, never a chip and
     // never in the count (the day-0 rule).
@@ -303,7 +363,16 @@
 
   function renderVitals(pulse) {
     validatePulse(pulse);
-    replaceHomeSurface('vitals', renderVitalsHtml(pulse), []);
+    const current = document.getElementById('pulse-vitals');
+    const active = document.activeElement;
+    const focusedHref = current?.contains(active) && active.tagName === 'A' ? active.getAttribute('href') : null;
+    const html = renderVitalsHtml(pulse);
+    if (current?.outerHTML === html) return;
+    replaceHomeSurface('vitals', html, []);
+    if (focusedHref) {
+      Array.from(document.querySelectorAll('#pulse-vitals a'))
+        .find(link => link.getAttribute('href') === focusedHref)?.focus({ preventScroll: true });
+    }
   }
 
   function renderWelcomeHtml() {
@@ -988,32 +1057,66 @@
   }
 
   function refreshVitals() {
-    apiJson(PULSE_URL)
+    const read = ++pulseReadVersion;
+    return apiJson(PULSE_URL)
       .then(function (data) {
+        if (read < pulseAppliedVersion) return;
+        pulseAppliedVersion = read;
         validatePulse(data);
+        if (!lastPulse) { renderPulse(data); return; }
         lastPulse = Object.assign({}, lastPulse || {}, data);
+        pulseReadFailed = false;
+        pulseObservedAt = Date.now();
         renderNeedsYou(data);
         renderConnections(data);
         renderVitals(data);
         clearPulseRefreshError('pulse-vitals');
       })
       .catch(function (error) {
+        if (read < pulseAppliedVersion) return;
+        pulseAppliedVersion = read;
+        pulseReadFailed = true;
+        if (!lastPulse && surface) {
+          surface.innerHTML = surfaceError(error, "Couldn't load pulse");
+          bindSurfaceRetry();
+        }
+        if (lastPulse) renderVitals(lastPulse);
         logError(error, 'home: refreshVitals failed');
         renderRefreshError('pulse-vitals', error, "couldn't refresh service status. showing last known state.");
       });
   }
 
   function refreshNarrative() {
-    apiJson(PULSE_URL)
+    const read = ++pulseReadVersion;
+    return apiJson(PULSE_URL)
       .then(function (data) {
         validatePulse(data);
+        // A newer vitals read does not paint the narrative. Keep this
+        // refresher's own result even when its health evidence was superseded.
+        if (lastPulse) {
+          renderNarrative(data);
+          clearPulseRefreshError('pulse-narrative');
+        }
+        if (read < pulseAppliedVersion) return;
+        pulseAppliedVersion = read;
+        if (!lastPulse) { renderPulse(data); return; }
         lastPulse = Object.assign({}, lastPulse || {}, data);
-        renderNarrative(data);
+        pulseReadFailed = false;
+        pulseObservedAt = Date.now();
+        renderVitals(data);
         renderNeedsYou(data);
         renderConnections(data);
-        clearPulseRefreshError('pulse-narrative');
+        clearPulseRefreshError('pulse-vitals');
       })
       .catch(function (error) {
+        if (read < pulseAppliedVersion) return;
+        pulseAppliedVersion = read;
+        pulseReadFailed = true;
+        if (!lastPulse && surface) {
+          surface.innerHTML = surfaceError(error, "Couldn't load pulse");
+          bindSurfaceRetry();
+        }
+        if (lastPulse) renderVitals(lastPulse);
         logError(error, 'home: refreshNarrative failed');
         renderRefreshError('pulse-narrative', error, "couldn't refresh narrative. showing last known state.");
       });
@@ -1224,16 +1327,43 @@
     };
   }
 
+  function invalidateHeldWork() {
+    heldWorkCurrent = false;
+    if (lastPulse) renderVitals(lastPulse);
+  }
+
+  function receiveSupervisorStatus(msg) {
+    if (msg.event === 'status-error') {
+      invalidateHeldWork();
+      return;
+    }
+    if (msg.event !== 'status') return;
+    heldWorkSnapshot = { queues: msg.queues || {}, held: msg.held || [],
+      queue_hold: msg.queue_hold || null, observedAt: Date.now() };
+    heldWorkCurrent = true;
+    window.clearTimeout(heldWorkExpiry);
+    // Match Health's freshness boundary; unrelated bus activity cannot renew it.
+    heldWorkExpiry = window.setTimeout(invalidateHeldWork, 30000);
+    if (lastPulse) renderVitals(lastPulse);
+    refreshVitals();
+  }
+
   function wireRealtime() {
     if (realtimeWired || !window.appEvents) return;
-    window.appEvents.onConnectionState?.(connectionRecovery(function () {
+    const recover = connectionRecovery(function () {
       refreshVitals();
       refreshNarrative();
       refreshBriefing();
-    }));
-    window.appEvents.listen('supervisor', function (msg) {
-      if (msg.event === 'status') refreshVitals();
     });
+    window.appEvents.onConnectionState?.(function (state) {
+      if (!state?.connected) {
+        pulseAppliedVersion = ++pulseReadVersion;
+        pulseReadFailed = true;
+        invalidateHeldWork();
+      }
+      recover(state);
+    });
+    window.appEvents.listen('supervisor', receiveSupervisorStatus);
     window.appEvents.listen('observe', function (msg) {
       if (msg.event === 'observed' || msg.event === 'status') refreshVitals();
     });

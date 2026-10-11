@@ -486,6 +486,11 @@ impl OwnedMediaTarget {
         self.stage.parent.inner.journal_root()
     }
 
+    /// Refusal evidence only: true never establishes helper quiescence.
+    pub fn helper_transport_issued(&self) -> bool {
+        self.helper_taken
+    }
+
     pub fn identity(&self) -> MediaIdentity {
         self.identity
     }

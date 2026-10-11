@@ -1929,14 +1929,20 @@ mod tests {
         assert_eq!(retry.created_segment.segment, "120000_0");
         assert_eq!(bind(&retry), first_advance);
 
-        let segments = fs::read_dir(&stream_dir)
+        let mut segments = fs::read_dir(&stream_dir)
             .unwrap()
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_dir())
-            .map(|entry| entry.file_name().into_string().unwrap())
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .file_type()
+                    .unwrap()
+                    .is_dir()
+                    .then(|| entry.file_name().into_string().unwrap())
+            })
             .filter(|name| !name.starts_with('.'))
-            .count();
-        assert_eq!(segments, 2);
+            .collect::<Vec<_>>();
+        segments.sort();
+        assert_eq!(segments, ["120000_0", "130000_0"]);
         assert_eq!(
             fs::read(stream_dir.join("120000_0/stream.json")).unwrap(),
             first_marker

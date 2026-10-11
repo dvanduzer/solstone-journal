@@ -118,10 +118,39 @@ pub fn full_hex_identity(value: &str) -> bool {
 }
 
 fn exact_archive_path(value: &str) -> bool {
-    value.starts_with('/')
-        && !value.chars().any(char::is_control)
-        && !value.contains('\\')
-        && value.split('/').skip(1).all(plain_component)
+    let Some(path) = value.strip_prefix('/') else {
+        return false;
+    };
+    let mut components = path.split('/');
+    let Some(first) = components.next() else {
+        return false;
+    };
+    if snapshot_volume(first) {
+        // The virtual volume is a directory, never the selected file itself.
+        let Some(next) = components.next() else {
+            return false;
+        };
+        plain_component(next) && components.all(plain_component)
+    } else {
+        plain_component(first) && components.all(plain_component)
+    }
+}
+
+fn snapshot_volume(value: &str) -> bool {
+    let Some(guid) = value
+        .strip_prefix(r"\\?\Volume{")
+        .and_then(|guid| guid.strip_suffix('}'))
+    else {
+        return false;
+    };
+    guid.len() == 36
+        && guid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 impl OffloadProof {
@@ -341,6 +370,60 @@ mod tests {
                 .revision,
             first.revision
         );
+    }
+
+    #[test]
+    fn snapshot_volume_paths_roundtrip_and_refuse_alternatives() {
+        let exact = r"/\\?\Volume{08fa948d-3336-40fd-b369-dd44a1c89601}/Users/solbuild/AppData/Local/Temp/offload-native-ntfs/.tmp8AdIlH/day/.tmp-offload-d3e400a3875111b7235a56b48c3298dd/audio.flac";
+        for path in [
+            exact.to_owned(),
+            exact
+                .to_uppercase()
+                .replace("AUDIO.FLAC", "audio.flac")
+                .replace("VOLUME", "Volume"),
+            "/C:/audio.flac".into(),
+        ] {
+            let mut proof = proof();
+            proof.files[0].archive_path = path.clone();
+            let offered = OffloadOffer::new(proof).unwrap();
+            let decoded: OffloadOffer =
+                serde_json::from_slice(&serde_json::to_vec(&offered).unwrap()).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(decoded.proof.files[0].archive_path, path);
+        }
+        for component in [
+            r"\\?\Volume{08fa948d-3336-40fd-b369-dd44a1c8960}",
+            r"\\?\Volume{08fa948d3336-40fd-b369-dd44a1c89601}",
+            r"\\?\Volume{08fa948d-3336-40fd-b369-dd44a1c8960g}",
+            r"\\?\Volume{08fa948d-3336-40fd-b369-dd44a1c89601}}",
+            r"\?\Volume{08fa948d-3336-40fd-b369-dd44a1c89601}",
+            r"\\.\Volume{08fa948d-3336-40fd-b369-dd44a1c89601}",
+            r"\\?\volume{08fa948d-3336-40fd-b369-dd44a1c89601}",
+            r"\\?\C:",
+            r"\\server\share",
+        ] {
+            let mut value = proof();
+            value.files[0].archive_path = format!("/{component}/audio.flac");
+            assert!(value.validate().is_err());
+        }
+        let volume = r"/\\?\Volume{08fa948d-3336-40fd-b369-dd44a1c89601}";
+        for tail in [
+            "",
+            "/",
+            "//audio.flac",
+            "/../audio.flac",
+            "/./audio.flac",
+            r"/stage\part/audio.flac",
+            "/stage/other.flac",
+            "/stage/\naudio.flac",
+        ] {
+            let mut value = proof();
+            value.files[0].archive_path = format!("{volume}{tail}");
+            assert!(value.validate().is_err());
+        }
+        let mut nested = proof();
+        nested.files[0].archive_path = format!("/stage{volume}/audio.flac");
+        assert!(nested.validate().is_err());
     }
 
     #[test]

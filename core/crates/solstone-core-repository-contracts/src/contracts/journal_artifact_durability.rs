@@ -175,6 +175,10 @@ fn every_artifact_has_owning_production_mention_outside_durability() {
                 combined_source.contains("oplog--")
                     || combined_source.contains("classify_oplog_name")
             }
+            ArtifactId::OffloadLedger => {
+                combined_source.contains("fn catalog_day(")
+                    && combined_source.contains("\"health/offload\"")
+            }
             _ => false,
         };
         assert!(

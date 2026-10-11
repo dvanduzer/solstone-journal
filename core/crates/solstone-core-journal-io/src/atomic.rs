@@ -605,12 +605,8 @@ pub fn atomic_replace_detailed(
 
 /// Failure before a capability-bound Windows publication can begin.
 #[cfg(windows)]
-#[allow(
-    dead_code,
-    reason = "retained for the generic capability-bound publication primitive"
-)]
 #[derive(Debug)]
-pub(crate) enum BoundAtomicPublishError {
+pub enum BoundAtomicPublishError {
     /// The retained alias parent or its fresh pathname binding was no longer authorized.
     NamespaceChanged,
     /// Ordinary staging/publication failure before an outcome exists.
@@ -641,11 +637,7 @@ impl std::error::Error for BoundAtomicPublishError {
 
 /// Publish through the held lock's retained parent authority.
 #[cfg(windows)]
-#[allow(
-    dead_code,
-    reason = "retained as the generic capability-bound publication primitive"
-)]
-pub(crate) fn atomic_replace_detailed_bound(
+pub fn atomic_replace_detailed_bound(
     parent: &crate::windows_sync_dir::WindowsFlatDirectory,
     lock: &crate::locking::BoundParentLock,
     destination_name: &OsStr,
