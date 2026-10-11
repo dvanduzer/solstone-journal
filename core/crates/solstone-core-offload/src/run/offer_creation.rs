@@ -260,6 +260,7 @@ mod unix {
             verify_offload_offers,
         },
         archive_proof::{ArchiveFileProof, OffloadProof},
+        mark_mutation::BoundMutationOutcome,
         marks::{Register, RemovalClass},
         receipt::Target,
         review_context::{MAX_REGISTER_BYTES, load_at_root},
@@ -284,6 +285,18 @@ mod unix {
 
     fn inputs(error: OffloadOfferRefusal) -> OffloadCreationRefusal {
         OffloadCreationRefusal::Inputs(error)
+    }
+
+    fn record_publication(
+        resources: &mut Resources,
+        publication: &Result<BoundMutationOutcome, OffloadOfferRefusal>,
+    ) {
+        if !matches!(
+            publication,
+            Ok(BoundMutationOutcome::Published(_) | BoundMutationOutcome::Unchanged(_))
+        ) {
+            resources.reason = Some(OffloadCreationRefusal::Publication);
+        }
     }
 
     fn located(witness: &ArchiveWitness, selection: &OffloadOfferSelection) -> bool {
@@ -922,12 +935,67 @@ mod unix {
             }
         }
         let outcome = publish_offload_offers(verified, today, now);
-        if outcome.publication().is_err() {
-            resources.reason = Some(OffloadCreationRefusal::Publication);
-        }
+        record_publication(&mut resources, outcome.publication());
         OffloadCreation {
             owner: Owner::Published(Box::new(outcome)),
             resources,
+        }
+    }
+
+    #[cfg(test)]
+    mod publication_tests {
+        use solstone_core_retention::mark_mutation::{
+            ConditionalResult, MutationStatus, RegisterUncertainty,
+        };
+
+        use super::*;
+
+        #[test]
+        fn publication_report_preserves_uncertainty_and_candidate() {
+            let outcomes = [
+                Ok(BoundMutationOutcome::Published(ConditionalResult {
+                    status: MutationStatus::Applied,
+                    register: Register::empty(),
+                })),
+                Ok(BoundMutationOutcome::Unchanged(ConditionalResult {
+                    status: MutationStatus::AlreadyApplied,
+                    register: Register::empty(),
+                })),
+                Ok(BoundMutationOutcome::PublishedUncertain {
+                    candidate: ConditionalResult {
+                        status: MutationStatus::Applied,
+                        register: Register::empty(),
+                    },
+                    uncertainty: RegisterUncertainty {
+                        durability: Some(std::io::Error::from_raw_os_error(13)),
+                        ..RegisterUncertainty::default()
+                    },
+                }),
+                Err(OffloadOfferRefusal::Unproven),
+            ];
+            for (index, publication) in outcomes.iter().enumerate() {
+                let mut resources = Resources::default();
+                record_publication(&mut resources, publication);
+                assert_eq!(
+                    matches!(resources.reason, Some(OffloadCreationRefusal::Publication)),
+                    index >= 2,
+                );
+                if let Ok(BoundMutationOutcome::PublishedUncertain {
+                    candidate,
+                    uncertainty,
+                }) = publication
+                {
+                    assert_eq!(candidate.status, MutationStatus::Applied);
+                    assert_eq!(candidate.register, Register::empty());
+                    assert_eq!(
+                        uncertainty
+                            .durability
+                            .as_ref()
+                            .and_then(std::io::Error::raw_os_error),
+                        Some(13),
+                    );
+                }
+            }
         }
     }
 
