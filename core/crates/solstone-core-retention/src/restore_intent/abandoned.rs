@@ -6,7 +6,9 @@
 //! published file matches the archive exactly is released the same way: the
 //! file is local again, and a later restore of it records the event and retires
 //! its mark as already present. Marks and the ledger are untouched either way,
-//! so nothing is counted twice. Any other published state is held.
+//! so nothing is counted twice. Any other published state is held. A restore
+//! that ended mid-download, before its intent, is recognised only by its
+//! dedicated download leaf and loses that stage the same way.
 
 use std::sync::Arc;
 
@@ -65,18 +67,22 @@ pub fn recover_abandoned_restores(activity: &Arc<ActivityLease>) -> Vec<Abandone
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::BTreeSet;
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Component, Path, PathBuf};
+
+    use solstone_core_format::segment::segment_key;
+    use solstone_core_journal_io::journal_root::JournalEntryKind;
 
     use solstone_core_journal_io::activity_obligations::{
         IntentRead, NativeObligation, intent_filename, observe_obligations,
     };
     use solstone_core_journal_io::media::{
         Cleanup, Confirmation, MediaDirectory, MediaEntry, MediaStage, OriginalName, RemovalEffect,
-        digest_reader, exclusive_local_activity, retire_recorded_stage,
+        digest_reader, exclusive_local_activity, retire_recorded_stage, retire_unrecorded_stage,
     };
 
-    use super::super::{MarkRetirement, Obligation, selected_name};
+    use super::super::{MarkRetirement, Obligation, RESTORE_DOWNLOAD_LEAF, selected_name};
     use super::*;
 
     type Hold = AbandonedRestoreHold;
@@ -88,7 +94,7 @@ mod linux {
         let Ok(census) = observe_obligations(activity.journal_root()) else {
             return Vec::new();
         };
-        census
+        let mut recovered: Vec<_> = census
             .entries()
             .iter()
             .filter_map(|obligation| match obligation {
@@ -110,7 +116,87 @@ mod linux {
                     outcome: Err(Hold::Unreadable),
                 },
             })
+            .collect();
+        recovered.extend(retire_unrecorded_downloads(activity));
+        recovered
+    }
+
+    /// A restore that ended mid-download, before writing its intent, leaves a
+    /// stage holding only its dedicated download leaf. Only such a stage, in a
+    /// segment's parent directory and named by no intent, is removed.
+    fn retire_unrecorded_downloads(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
+        let Ok(census) = observe_obligations(activity.journal_root()) else {
+            return Vec::new();
+        };
+        let mut referenced = BTreeSet::new();
+        for obligation in census.entries() {
+            let NativeObligation::Intent { contents, .. } = obligation else {
+                continue;
+            };
+            let IntentRead::Complete { bytes, .. } = contents else {
+                return Vec::new();
+            };
+            match RestoreIntent::decode(Ok(bytes)) {
+                Ok(intent) => referenced.insert(intent.stage.stage_name),
+                Err(_) => return Vec::new(),
+            };
+        }
+        census
+            .entries()
+            .iter()
+            .filter_map(|obligation| match obligation {
+                NativeObligation::Stage { relative, entry }
+                    if entry.kind == JournalEntryKind::Directory
+                        && entry
+                            .name
+                            .to_str()
+                            .is_some_and(|name| !referenced.contains(name)) =>
+                {
+                    Some((restore_stage_parent(relative)?, entry))
+                }
+                _ => None,
+            })
+            .filter_map(|(parent, entry)| {
+                let parent =
+                    MediaDirectory::open(Arc::clone(activity.journal_root()), &parent).ok()?;
+                retire_unrecorded_stage(
+                    activity,
+                    &parent,
+                    &entry.name,
+                    entry.identity,
+                    OsStr::new(RESTORE_DOWNLOAD_LEAF),
+                )
+                .ok()
+                .filter(|retired| *retired)
+                .map(|_| AbandonedRestore {
+                    operation_id: None,
+                    outcome: Ok(AbandonedRestoreRelease::Undone),
+                })
+            })
             .collect()
+    }
+
+    /// Restores stage in a segment's parent: a day directory, or a stream
+    /// directory under it. Never the journal root, a segment or anywhere else.
+    fn restore_stage_parent(relative: &Path) -> Option<PathBuf> {
+        let parts = relative
+            .components()
+            .map(|part| match part {
+                Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let day = |name: &str| name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit());
+        let stream = |name: &str| !name.starts_with('.') && segment_key(name).is_none();
+        match parts.as_slice() {
+            ["chronicle", day_name, _] if day(day_name) => {
+                Some(Path::new("chronicle").join(day_name))
+            }
+            ["chronicle", day_name, stream_name, _] if day(day_name) && stream(stream_name) => {
+                Some(Path::new("chronicle").join(day_name).join(stream_name))
+            }
+            _ => None,
+        }
     }
 
     fn recover_one(

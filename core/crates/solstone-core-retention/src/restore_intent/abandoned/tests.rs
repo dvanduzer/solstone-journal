@@ -38,6 +38,10 @@ struct Interrupted {
 /// A crash-like drop after staging: the stage holds the unpublished copy and
 /// the intent is durable, but nothing was published, recorded or marked.
 fn interrupted() -> Interrupted {
+    interrupted_with("payload")
+}
+
+fn interrupted_with(leaf: &str) -> Interrupted {
     let temp = tempfile::tempdir().unwrap();
     let journal = temp.path().to_owned();
     let mut intent = fixture(false);
@@ -47,7 +51,7 @@ fn interrupted() -> Interrupted {
     let parent = segment.parent().unwrap().to_owned();
     let stage = parent.join(&intent.stage.stage_name);
     fs::create_dir(&stage).unwrap();
-    fs::write(stage.join("payload"), RESTORED).unwrap();
+    fs::write(stage.join(leaf), RESTORED).unwrap();
     let root = Arc::new(JournalRoot::open(&journal).unwrap());
     let digest = digest_reader(&mut &RESTORED[..]).unwrap();
     intent.witness.file.bytes = digest.size;
@@ -57,7 +61,8 @@ fn interrupted() -> Interrupted {
     intent.destination.segment = identity(&segment);
     intent.stage.parent = identity(&parent);
     intent.stage.directory = identity(&stage);
-    intent.stage.leaf = identity(&stage.join("payload"));
+    intent.stage.leaf = identity(&stage.join(leaf));
+    intent.stage.leaf_name = leaf.into();
     let intents = journal.join("health/offload/restore-intents");
     fs::create_dir_all(&intents).unwrap();
     let path = intents.join(format!("{OPERATION}.json"));
@@ -91,26 +96,29 @@ fn recover(fixture: &Interrupted) -> Vec<AbandonedRestore> {
 
 #[test]
 fn unpublished_restore_is_undone_and_owner_deletion_then_proceeds() {
-    let interrupted = interrupted();
-    assert_eq!(
-        observe_obligations(&interrupted.root)
-            .unwrap()
-            .entries()
-            .len(),
-        2
-    );
-    // Owner deletion itself recovers the interrupted restore under its lease.
-    let removed = delete(&interrupted);
-    assert!(removed.targets[0].not_removed.is_empty(), "{removed:?}");
-    assert!(!removed.targets[0].removed.is_empty());
-    assert!(!interrupted.stage.exists());
-    assert!(!interrupted.intent.exists());
-    assert!(
-        observe_obligations(&interrupted.root)
-            .unwrap()
-            .entries()
-            .is_empty()
-    );
+    // Earlier intents recorded the shared leaf; current ones the dedicated one.
+    for leaf in ["payload", super::super::RESTORE_DOWNLOAD_LEAF] {
+        let interrupted = interrupted_with(leaf);
+        assert_eq!(
+            observe_obligations(&interrupted.root)
+                .unwrap()
+                .entries()
+                .len(),
+            2
+        );
+        // Owner deletion itself recovers the interrupted restore under its lease.
+        let removed = delete(&interrupted);
+        assert!(removed.targets[0].not_removed.is_empty(), "{removed:?}");
+        assert!(!removed.targets[0].removed.is_empty());
+        assert!(!interrupted.stage.exists());
+        assert!(!interrupted.intent.exists());
+        assert!(
+            observe_obligations(&interrupted.root)
+                .unwrap()
+                .entries()
+                .is_empty()
+        );
+    }
 }
 
 #[test]
@@ -190,4 +198,76 @@ fn a_stage_holding_anything_else_is_held() {
     assert_eq!(outcome[0].outcome, Err(AbandonedRestoreHold::StageChanged));
     assert!(interrupted.stage.join("payload").exists());
     assert!(interrupted.intent.exists());
+}
+
+/// A restore that ended mid-download, before writing its intent.
+fn unrecorded(journal: &Path, relative: &str, leaves: &[&str]) -> PathBuf {
+    let stage = journal.join(relative);
+    fs::create_dir_all(&stage).unwrap();
+    for leaf in leaves {
+        fs::write(stage.join(leaf), RESTORED).unwrap();
+    }
+    stage
+}
+
+#[test]
+fn download_stage_without_intent_is_recovered_and_deletion_then_proceeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = temp.path();
+    let segment = journal.join("chronicle/20261009/camera/120000_60_suffix");
+    fs::create_dir_all(&segment).unwrap();
+    fs::write(segment.join("other.jsonl"), b"{}\n").unwrap();
+    let named = unrecorded(
+        journal,
+        "chronicle/20261009/camera/.tmp-offload-0123456789abcdef0123456789abcdef",
+        &[super::super::RESTORE_DOWNLOAD_LEAF],
+    );
+    let direct = unrecorded(
+        journal,
+        "chronicle/20261009/.tmp-offload-fedcba9876543210fedcba9876543210",
+        &[super::super::RESTORE_DOWNLOAD_LEAF],
+    );
+    let root = Arc::new(JournalRoot::open(journal).unwrap());
+    // Owner deletion recovers both under its own lease, then proceeds.
+    let removed = remove_segments(
+        journal,
+        &[Target {
+            day: "20261009".into(),
+            stream: "camera".into(),
+            dir: "120000_60_suffix".into(),
+        }],
+        "2026-10-11T00:00:00Z",
+        RemovalReason::OwnerSegmentDelete,
+        "fixture",
+    );
+    assert!(removed.targets[0].not_removed.is_empty(), "{removed:?}");
+    assert!(!named.exists() && !direct.exists());
+    assert!(observe_obligations(&root).unwrap().entries().is_empty());
+}
+
+#[test]
+fn any_other_stage_without_intent_is_held_untouched() {
+    let leaf = super::super::RESTORE_DOWNLOAD_LEAF;
+    for (relative, leaves) in [
+        // A shared leaf is also how removal and readback stages look.
+        ("chronicle/20261009/.tmp-offload-a", vec!["payload"]),
+        ("chronicle/20261009/.tmp-offload-b", vec!["audio.flac"]),
+        ("chronicle/20261009/.tmp-offload-c", vec![leaf, "extra"]),
+        // Never at the journal root or inside a segment.
+        (".tmp-offload-d", vec![leaf]),
+        ("chronicle/20261009/120000_60/.tmp-offload-e", vec![leaf]),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = unrecorded(temp.path(), relative, &leaves);
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let activity = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+        assert!(
+            recover_abandoned_restores(&activity).is_empty(),
+            "{relative}"
+        );
+        drop(activity);
+        for name in &leaves {
+            assert_eq!(fs::read(stage.join(name)).unwrap(), RESTORED, "{relative}");
+        }
+    }
 }

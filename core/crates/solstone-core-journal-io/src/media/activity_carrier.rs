@@ -689,6 +689,31 @@ pub fn retire_recorded_stage(
     leaf_name: &OsStr,
     leaf: MediaIdentity,
 ) -> io::Result<bool> {
+    retire_stage(activity, parent, name, directory, leaf_name, Some(leaf))
+}
+
+/// Remove one stage nothing records, which holds exactly one regular file named
+/// `leaf_name` and nothing else: the observed directory and its observed file,
+/// then the directory. Its caller must know that name is made only by a
+/// producer whose unpublished copies are disposable. Anything else refuses.
+pub fn retire_unrecorded_stage(
+    activity: &Arc<ActivityLease>,
+    parent: &Arc<MediaDirectory>,
+    name: &OsStr,
+    directory: MediaIdentity,
+    leaf_name: &OsStr,
+) -> io::Result<bool> {
+    retire_stage(activity, parent, name, directory, leaf_name, None)
+}
+
+fn retire_stage(
+    activity: &Arc<ActivityLease>,
+    parent: &Arc<MediaDirectory>,
+    name: &OsStr,
+    directory: MediaIdentity,
+    leaf_name: &OsStr,
+    recorded: Option<MediaIdentity>,
+) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
         plain_name(name)?;
@@ -708,13 +733,15 @@ pub fn retire_recorded_stage(
             return Err(changed());
         }
         let entries = platform::entries(&stage, 2)?.ok_or_else(changed)?;
-        match entries.as_slice() {
-            [] => {}
-            [entry]
+        match (entries.as_slice(), recorded) {
+            // Only a recorded stage may already be empty.
+            ([], Some(_)) => {}
+            ([entry], _)
                 if entry.name == leaf_name
-                    && entry.identity == leaf
+                    && recorded.is_none_or(|leaf| entry.identity == leaf)
                     && entry.kind == crate::journal_root::JournalEntryKind::RegularFile =>
             {
+                let leaf = entry.identity;
                 activity
                     .revalidate()
                     .map_err(crate::activity::ActivityAdmissionError::into_io)?;
@@ -736,7 +763,7 @@ pub fn retire_recorded_stage(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (activity, parent, name, directory, leaf_name, leaf);
+        let _ = (activity, parent, name, directory, leaf_name, recorded);
         Err(shared_storage())
     }
 }
