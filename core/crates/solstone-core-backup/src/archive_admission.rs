@@ -8,6 +8,8 @@ use serde_json::{Map, Value};
 use solstone_core_journal_io::JournalRoot;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const ARCHIVE_BACKUP_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
@@ -18,6 +20,26 @@ pub trait Clock {
     fn iso_week(&self) -> u8;
 }
 
+/// A shared refusal signal. Cancellation is irreversible and grants no authority.
+#[derive(Clone, Default)]
+pub struct ArchiveCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ArchiveCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionError {
     ConfigurationUnavailable,
@@ -26,6 +48,7 @@ pub enum AdmissionError {
     DeadlineExceeded,
     ClockChanged,
     CredentialsExpired,
+    Cancelled,
 }
 
 impl fmt::Display for AdmissionError {
@@ -37,6 +60,7 @@ impl fmt::Display for AdmissionError {
             Self::DeadlineExceeded => "the archive operation deadline was reached",
             Self::ClockChanged => "the archive clock moved backward",
             Self::CredentialsExpired => "archive credentials expired",
+            Self::Cancelled => "the archive operation was cancelled",
         })
     }
 }
@@ -168,6 +192,7 @@ pub struct ArchiveBudget {
     deadline: i64,
     last_now: std::cell::Cell<Option<i64>>,
     credential_expiry: Option<i64>,
+    cancellation: Option<ArchiveCancellation>,
 }
 
 impl ArchiveBudget {
@@ -177,6 +202,24 @@ impl ArchiveBudget {
     }
 
     pub fn new(clock: &dyn Clock) -> Result<Self, AdmissionError> {
+        Self::start(clock, None)
+    }
+
+    pub fn new_cancellable(
+        clock: &dyn Clock,
+        cancellation: ArchiveCancellation,
+    ) -> Result<Self, AdmissionError> {
+        Self::start(clock, Some(cancellation))
+    }
+
+    pub fn cancellation(&self) -> Option<&ArchiveCancellation> {
+        self.cancellation.as_ref()
+    }
+
+    fn start(
+        clock: &dyn Clock,
+        cancellation: Option<ArchiveCancellation>,
+    ) -> Result<Self, AdmissionError> {
         let now = clock.now_unix();
         let deadline = now
             .checked_add(ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64)
@@ -185,10 +228,18 @@ impl ArchiveBudget {
             deadline,
             last_now: std::cell::Cell::new(Some(now)),
             credential_expiry: None,
+            cancellation,
         })
     }
 
     pub fn remaining(&self, clock: &dyn Clock) -> Result<Duration, AdmissionError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(ArchiveCancellation::is_cancelled)
+        {
+            return Err(AdmissionError::Cancelled);
+        }
         let now = clock.now_unix();
         let last_now = self.last_now.get().ok_or(AdmissionError::ClockChanged)?;
         if now < last_now {
@@ -226,6 +277,42 @@ mod tests {
         fn iso_week(&self) -> u8 {
             1
         }
+    }
+    #[test]
+    fn cancellation_and_original_lifetime_survive_worker_budget_transfer() {
+        fn worker_entry(budget: ArchiveBudget, now: i64) -> ArchiveBudget {
+            let local_clock = TestClock(Cell::new(now));
+            assert_eq!(
+                budget.remaining(&local_clock).unwrap(),
+                Duration::from_secs(1)
+            );
+            budget
+        }
+        let admission_clock = TestClock(Cell::new(100));
+        let cancellation = ArchiveCancellation::new();
+        let mut budget =
+            ArchiveBudget::new_cancellable(&admission_clock, cancellation.clone()).unwrap();
+        budget.cap_credential_expiry(100 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64);
+        budget.cap_credential_expiry(100 + 2 * ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64);
+        let near_deadline = 100 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - 1;
+        let transferred = worker_entry(budget, near_deadline);
+        let worker_clock = TestClock(Cell::new(near_deadline + 1));
+        assert_eq!(
+            transferred.remaining(&worker_clock),
+            Err(AdmissionError::DeadlineExceeded)
+        );
+        cancellation.cancel();
+        assert!(transferred.cancellation().unwrap().is_cancelled());
+        assert!(!ArchiveCancellation::new().is_cancelled());
+        assert_eq!(
+            transferred.remaining(&worker_clock),
+            Err(AdmissionError::Cancelled)
+        );
+        let moved_again = transferred;
+        assert_eq!(
+            moved_again.remaining(&worker_clock),
+            Err(AdmissionError::Cancelled)
+        );
     }
     #[test]
     fn moved_budget_keeps_deadline_and_sticky_clock_refusal() {
