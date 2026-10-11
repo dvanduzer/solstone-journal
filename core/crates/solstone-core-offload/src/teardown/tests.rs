@@ -117,6 +117,96 @@ mod unix {
     }
 
     #[test]
+    fn live_own_carrier_preserves_known_archive_policy_before_and_after_clear() {
+        for bound in [false, true] {
+            for present in [false, true] {
+                let f = Fixture::new();
+                let media = f.archive(bound);
+                if present {
+                    fs::write(&media, b"different local bytes").unwrap();
+                }
+                let prepared = f
+                    .admit()
+                    .prepare_carrier(&mut read_teardown_coverage)
+                    .unwrap_or_else(|failure| panic!("{failure:?}"));
+                assert_eq!(
+                    solstone_core_journal_io::activity_obligations::observe_obligations(&f.root)
+                        .unwrap()
+                        .entries()
+                        .len(),
+                    1
+                );
+                assert_eq!(prepared.check(&mut read_teardown_coverage), Ok(()));
+                let cleared = prepared
+                    .clear_configuration(&mut read_teardown_coverage)
+                    .unwrap_or_else(|failure| panic!("{failure:?}"));
+                assert_eq!(cleared.check(&mut read_teardown_coverage), Ok(()));
+                if present {
+                    assert_eq!(fs::read(media).unwrap(), b"different local bytes");
+                } else {
+                    assert!(!media.exists());
+                }
+                drop(cleared);
+                assert_eq!(
+                    check(&f.admit()),
+                    Err(TeardownAdmissionRefusal::Reader(
+                        TeardownReaderRefusal::RecoveryHeld
+                    ))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_carrier_checks_retain_every_other_raw_hold_and_catalog_uncertainty() {
+        let f = Fixture::new();
+        f.archive(false);
+        let prepared = f
+            .admit()
+            .prepare_carrier(&mut read_teardown_coverage)
+            .unwrap_or_else(|failure| panic!("{failure:?}"));
+        for relative in [
+            ".tmp-offload-unrelated",
+            "chronicle/20260101/.tmp-offload-unrelated",
+        ] {
+            let other = f.path(relative);
+            fs::create_dir(&other).unwrap();
+            assert_eq!(
+                prepared.check(&mut read_teardown_coverage),
+                Err(TeardownAdmissionRefusal::Reader(
+                    TeardownReaderRefusal::RecoveryHeld
+                ))
+            );
+            fs::remove_dir(other).unwrap();
+        }
+        let cleared = prepared
+            .clear_configuration(&mut read_teardown_coverage)
+            .unwrap_or_else(|failure| panic!("{failure:?}"));
+        let intent_directory = f.path("health/offload/restore-intents");
+        fs::create_dir_all(&intent_directory).unwrap();
+        let intent = intent_directory.join(
+            solstone_core_journal_io::activity_obligations::intent_filename(&"a".repeat(32))
+                .unwrap(),
+        );
+        fs::write(&intent, b"not a known intent").unwrap();
+        assert_eq!(
+            cleared.check(&mut read_teardown_coverage),
+            Err(TeardownAdmissionRefusal::Reader(
+                TeardownReaderRefusal::RecoveryHeld
+            ))
+        );
+        fs::remove_file(intent).unwrap();
+        let ledger = ledger_path_for_day(f.temp.path(), "20260101").unwrap();
+        fs::write(ledger, b"{broken\n").unwrap();
+        assert_eq!(
+            cleared.check(&mut read_teardown_coverage),
+            Err(TeardownAdmissionRefusal::Reader(
+                TeardownReaderRefusal::CatalogUnavailable
+            ))
+        );
+    }
+
+    #[test]
     fn empty_known_coverage_is_fresh_and_read_only() {
         let f = Fixture::new();
         let admission = f.admit();

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
@@ -90,9 +90,8 @@ impl SpeakerJoin {
 pub(crate) fn load(dir: &Path, journal_root: &Path, now: DateTime<Utc>) -> SpeakerJoin {
     let path = dir.join("talents/speaker_labels.json");
     let present = path.is_file();
-    let audio_sources = audio_sources(dir);
     let (source, ambiguous) = if present {
-        source(dir, &audio_sources)
+        solstone_core_transcripts::speaker_label_source(dir)
     } else {
         (None, false)
     };
@@ -223,53 +222,12 @@ pub(crate) fn embedding_ids(dir: &Path, source: &str) -> BTreeSet<i64> {
         .collect()
 }
 pub(crate) fn statement_ordinals(text: &str) -> Vec<Option<i64>> {
-    let mut next = 1;
+    let mut ordinal = 0;
     text.lines()
-        .map(|line| match serde_json::from_str::<Value>(line.trim()) {
-            Ok(Value::Object(value)) if value.contains_key("start") => {
-                let id = next;
-                next += 1;
-                Some(id)
-            }
-            _ => None,
-        })
+        .map(|line| solstone_core_transcripts::next_statement_ordinal(line, &mut ordinal))
         .collect()
 }
 
-fn audio_sources(dir: &Path) -> Vec<String> {
-    let mut values = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            name.ends_with("audio.jsonl")
-                .then(|| name.trim_end_matches(".jsonl").into())
-        })
-        .collect::<Vec<String>>();
-    values.sort();
-    values
-}
-fn source(dir: &Path, audio: &[String]) -> (Option<String>, bool) {
-    let mut npz = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let stem = name.strip_suffix(".npz")?;
-            (stem == "audio" || stem.ends_with("_audio")).then(|| stem.into())
-        })
-        .collect::<Vec<String>>();
-    npz.sort();
-    if let Some(value) = npz.into_iter().next() {
-        (Some(value), false)
-    } else if audio.len() == 1 {
-        (Some(audio[0].clone()), false)
-    } else {
-        (None, audio.len() > 1)
-    }
-}
 fn warning(path: &Path, message: &str, now: DateTime<Utc>) -> crate::segment::WarningDetail {
     crate::segment::WarningDetail {
         kind: "speaker_labels".into(),

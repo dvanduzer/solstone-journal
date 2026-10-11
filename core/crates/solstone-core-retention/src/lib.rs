@@ -50,6 +50,10 @@
 )]
 
 pub mod age;
+// Private and unactivated. The genuine consuming integration must remove this
+// temporary allowance; final combined-source audit owns that closure.
+#[allow(dead_code)]
+mod archive_approval;
 pub mod archive_catalog;
 pub mod archive_proof;
 pub mod class;

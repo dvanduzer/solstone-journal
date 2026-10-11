@@ -13,6 +13,10 @@ use solstone_core_journal_config_write::{
 };
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
+use solstone_core_journal_io::media::{
+    ActivityCarrierPreparationReceipt, RootCarrierObservation, RootTeardownCarrier,
+    TeardownCarrierPreparationFailure,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TeardownReaderRefusal {
@@ -21,14 +25,19 @@ pub enum TeardownReaderRefusal {
     RecoveryHeld,
 }
 
-pub type TeardownReader<'a> =
-    dyn FnMut(&Arc<JournalRoot>, &TeardownConfiguration) -> Result<(), TeardownReaderRefusal> + 'a;
+pub type TeardownReader<'a> = dyn for<'carrier> FnMut(
+        &Arc<JournalRoot>,
+        &TeardownConfiguration,
+        Option<RootCarrierObservation<'carrier>>,
+    ) -> Result<(), TeardownReaderRefusal>
+    + 'a;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TeardownAdmissionRefusal {
     Unsupported,
     ActivityBusy,
     ActivityUnavailable,
+    CarrierUnavailable,
     Configuration(TeardownConfigurationRefusal),
     Reader(TeardownReaderRefusal),
 }
@@ -84,7 +93,141 @@ impl TeardownAdmission {
     /// Postcheck admission refusal takes precedence over a simultaneous reader refusal.
     pub fn check(&self, reader: &mut TeardownReader<'_>) -> Result<(), TeardownAdmissionRefusal> {
         self.revalidate()?;
-        let result = reader(self.journal_root(), self.configuration());
+        let result = reader(self.journal_root(), self.configuration(), None);
+        self.revalidate()?;
+        result.map_err(TeardownAdmissionRefusal::Reader)
+    }
+
+    /// Prepare only under fresh evidence and keep the original lease on every outcome.
+    pub fn prepare_carrier(
+        self,
+        reader: &mut TeardownReader<'_>,
+    ) -> Result<CarrierTeardownAdmission, TeardownCarrierFailure> {
+        if let Err(refusal) = self.check(reader) {
+            return Err(TeardownCarrierFailure::new(
+                self,
+                None,
+                TeardownCarrierRefusal::Admission(refusal),
+            ));
+        }
+        let carrier = match RootTeardownCarrier::prepare(self.lease.clone()) {
+            Ok(carrier) => carrier,
+            Err(failure) => {
+                return Err(TeardownCarrierFailure::new(
+                    self,
+                    Some(RetainedCarrier::Failed(failure)),
+                    TeardownCarrierRefusal::Preparation,
+                ));
+            }
+        };
+        let prepared = CarrierTeardownAdmission {
+            admission: self,
+            carrier,
+        };
+        if let Err(refusal) = prepared.check(reader) {
+            return Err(TeardownCarrierFailure::new(
+                prepared.admission,
+                Some(RetainedCarrier::Prepared(prepared.carrier)),
+                TeardownCarrierRefusal::Admission(refusal),
+            ));
+        }
+        Ok(prepared)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeardownCarrierRefusal {
+    Admission(TeardownAdmissionRefusal),
+    Preparation,
+}
+
+enum RetainedCarrier {
+    Prepared(RootTeardownCarrier),
+    Failed(TeardownCarrierPreparationFailure),
+}
+
+/// Retains actual preparation facts and reservations without authorizing cleanup or retry.
+pub struct TeardownCarrierFailure {
+    admission: Box<TeardownAdmission>,
+    carrier: Option<Box<RetainedCarrier>>,
+    refusal: TeardownCarrierRefusal,
+}
+
+impl TeardownCarrierFailure {
+    fn new(
+        admission: TeardownAdmission,
+        carrier: Option<RetainedCarrier>,
+        refusal: TeardownCarrierRefusal,
+    ) -> Self {
+        Self {
+            admission: Box::new(admission),
+            carrier: carrier.map(Box::new),
+            refusal,
+        }
+    }
+
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.admission.journal_root()
+    }
+    pub fn refusal(&self) -> TeardownCarrierRefusal {
+        self.refusal
+    }
+    pub fn preparation_error(&self) -> Option<&std::io::Error> {
+        match self.carrier.as_deref()? {
+            RetainedCarrier::Failed(failure) => Some(failure.error()),
+            RetainedCarrier::Prepared(_) => None,
+        }
+    }
+    pub fn preparation(&self) -> Option<&ActivityCarrierPreparationReceipt> {
+        Some(match self.carrier.as_deref()? {
+            RetainedCarrier::Prepared(carrier) => carrier.preparation(),
+            RetainedCarrier::Failed(failure) => failure.receipt(),
+        })
+    }
+    pub fn reservation_path(&self) -> Option<std::path::PathBuf> {
+        match self.carrier.as_deref()? {
+            RetainedCarrier::Prepared(carrier) => Some(carrier.diagnostic_path()),
+            RetainedCarrier::Failed(failure) => failure.diagnostic_path(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TeardownCarrierFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TeardownCarrierFailure")
+            .field("refusal", &self.refusal)
+            .field("preparation_observed", &self.carrier.is_some())
+            .finish()
+    }
+}
+
+/// Original admission and its actual live reservation. No public constructor.
+pub struct CarrierTeardownAdmission {
+    admission: TeardownAdmission,
+    carrier: RootTeardownCarrier,
+}
+
+impl CarrierTeardownAdmission {
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.admission.journal_root()
+    }
+    pub fn configuration(&self) -> &TeardownConfiguration {
+        self.admission.configuration()
+    }
+    pub fn revalidate(&self) -> Result<(), TeardownAdmissionRefusal> {
+        self.admission.revalidate()?;
+        self.carrier
+            .revalidate()
+            .map_err(|_| TeardownAdmissionRefusal::CarrierUnavailable)?;
+        self.admission.revalidate()
+    }
+    pub fn check(&self, reader: &mut TeardownReader<'_>) -> Result<(), TeardownAdmissionRefusal> {
+        self.revalidate()?;
+        let result = reader(
+            self.journal_root(),
+            self.configuration(),
+            Some(self.carrier.observation()),
+        );
         self.revalidate()?;
         result.map_err(TeardownAdmissionRefusal::Reader)
     }
@@ -104,7 +247,7 @@ impl TeardownAdmission {
         }
         run_clear_hook(ClearCheckpoint::BeforeClear);
         let attempted = true;
-        let outcome = self.configuration.clear_configuration();
+        let outcome = self.admission.configuration.clear_configuration();
         let outcome = match outcome {
             Err(refusal) => {
                 return Err(TeardownClearFailure::new(
@@ -150,11 +293,21 @@ impl TeardownAdmission {
         &self,
         publication: &BoundConfigPublication,
     ) -> Result<(), TeardownAdmissionRefusal> {
-        self.lease.revalidate().map_err(activity_refusal)?;
-        self.configuration
+        self.admission
+            .lease
+            .revalidate()
+            .map_err(activity_refusal)?;
+        self.carrier
+            .revalidate()
+            .map_err(|_| TeardownAdmissionRefusal::CarrierUnavailable)?;
+        self.admission
+            .configuration
             .revalidate_published_clear(publication)
             .map_err(TeardownAdmissionRefusal::Configuration)?;
-        self.lease.revalidate().map_err(activity_refusal)
+        self.carrier
+            .revalidate()
+            .map_err(|_| TeardownAdmissionRefusal::CarrierUnavailable)?;
+        self.admission.lease.revalidate().map_err(activity_refusal)
     }
 }
 
@@ -179,7 +332,7 @@ impl std::fmt::Debug for TeardownClearRefusal {
 
 /// Keeps exclusion and all observed effect facts until explicitly dropped.
 pub struct TeardownClearFailure {
-    admission: Box<TeardownAdmission>,
+    admission: Box<CarrierTeardownAdmission>,
     attempted: bool,
     refusal: TeardownClearRefusal,
     publication: Option<Box<BoundConfigPublication>>,
@@ -187,7 +340,7 @@ pub struct TeardownClearFailure {
 
 impl TeardownClearFailure {
     fn new(
-        admission: TeardownAdmission,
+        admission: CarrierTeardownAdmission,
         attempted: bool,
         refusal: TeardownClearRefusal,
         publication: Option<BoundConfigPublication>,
@@ -226,7 +379,7 @@ impl std::fmt::Debug for TeardownClearFailure {
 
 /// Original admission plus its own exact confirmed publication. No public factory.
 pub struct ClearedTeardownAdmission {
-    admission: TeardownAdmission,
+    admission: CarrierTeardownAdmission,
     publication: BoundConfigPublication,
 }
 
@@ -247,7 +400,11 @@ impl ClearedTeardownAdmission {
     /// Fresh callback under the exact owned transition; drift takes precedence.
     pub fn check(&self, reader: &mut TeardownReader<'_>) -> Result<(), TeardownAdmissionRefusal> {
         self.revalidate()?;
-        let result = reader(self.journal_root(), self.configuration());
+        let result = reader(
+            self.journal_root(),
+            self.configuration(),
+            Some(self.admission.carrier.observation()),
+        );
         self.revalidate()?;
         result.map_err(TeardownAdmissionRefusal::Reader)
     }

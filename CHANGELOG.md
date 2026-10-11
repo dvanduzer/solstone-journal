@@ -27,6 +27,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - when a screen summary runs out of room, your journal now retries it more concisely while keeping the same source material.
+- your agents can now see speaker names in transcripts when the speaker is named for those sentences in your journal.
+
 - when a connected agent searches for a person's or project's full name, the results can now include a short description and notes from the facets you shared with it. for names such as "Project Juniper", the search also finds entries that call the project "Juniper".
 - starting the same connected agent repeatedly for short tasks no longer stops it with "MCP bearer session limit reached". your journal makes room by closing that connection's least recently used session. a quiet agent whose session was closed may have to reconnect.
 - security fix: agents on your network now stay disconnected while your journal's settings file is missing, unreadable or malformed. before, a file that couldn't be read could turn network access on even when you had turned it off. access resumes when the file is readable and network access is on.

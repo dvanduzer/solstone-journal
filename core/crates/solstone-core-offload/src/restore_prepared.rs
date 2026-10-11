@@ -3,15 +3,16 @@
 
 //! Existing-only restore admission and short recovery inspection. Directory
 //! handles survive staging; claims and segment exclusion are acquired afterward.
-//! No publication is reachable until the bound durable-intent adapter is added.
+//! The private transaction consumes this admission; public execution stays held.
 
 use std::sync::Arc;
 
 use solstone_core_journal_io::media::MediaDirectory;
 use solstone_core_journal_io::paths::Segment;
 use solstone_core_journal_io::{JournalRoot, LockOptions};
-use solstone_core_retention::{archive_catalog::read_complete_catalog, marks};
+use solstone_core_retention::{archive_catalog::read_complete_catalog, review_context};
 use solstone_core_segment::output_attempt::OutputClaims;
+use solstone_core_segment::{OwnerDeletionState, RetainedOwnerDeletion};
 
 use crate::restore_intent::{
     DestinationObservation, RecoveryDecision, RepairHold, RestoreIntent, RestoreLocator,
@@ -67,14 +68,6 @@ impl PreparedRestore {
             .map_err(|e| refused(RepairHold::DestinationChanged, e))?;
         let live = MediaDirectory::open(root.clone(), &relative)
             .map_err(|e| refused(RepairHold::DestinationChanged, e))?;
-        if solstone_core_segment::owner_deleted(live.diagnostic_path())
-            .map_err(|e| refused(RepairHold::DestinationChanged, e))?
-        {
-            return Err(refused(
-                RepairHold::DestinationChanged,
-                "segment was deleted by its owner",
-            ));
-        }
         let destination = DestinationObservation {
             root: root.identity().observation_id(),
             parent: parent.identity(),
@@ -104,7 +97,15 @@ impl PreparedRestore {
         self.parent.clone()
     }
 
-    fn revalidate(&self) -> Result<(), PreparedRefusal> {
+    pub(super) fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+
+    pub(super) fn live(&self) -> &Arc<MediaDirectory> {
+        &self.live
+    }
+
+    pub(super) fn revalidate(&self) -> Result<(), PreparedRefusal> {
         self.root
             .revalidate_canonical_binding()
             .map_err(|e| refused(RepairHold::DestinationChanged, e))?;
@@ -114,6 +115,24 @@ impl PreparedRestore {
         self.live
             .revalidate()
             .map_err(|e| refused(RepairHold::DestinationChanged, e))?;
+        let owner = RetainedOwnerDeletion::open(
+            Arc::clone(&self.parent),
+            std::ffi::OsStr::new(&self.locator.target.dir),
+            Some(self.live.as_ref()),
+            131_072,
+        )
+        .map_err(|e| refused(RepairHold::DestinationChanged, e))?;
+        if owner.directory().is_none()
+            || owner
+                .state()
+                .map_err(|e| refused(RepairHold::DestinationChanged, e))?
+                != OwnerDeletionState::Live
+        {
+            return Err(refused(
+                RepairHold::DestinationChanged,
+                "segment is not an existing live destination",
+            ));
+        }
         if self.root.identity().observation_id() != self.destination.root
             || self.parent.identity() != self.destination.parent
             || self.live.identity() != self.destination.segment
@@ -150,11 +169,27 @@ impl PreparedRestore {
         let _commit = claims
             .commit(self.live.diagnostic_path())
             .map_err(|e| refused(RepairHold::DestinationChanged, e))?;
+        if claims
+            .segment_identity(self.live.diagnostic_path())
+            .map_err(|e| refused(RepairHold::DestinationChanged, e))?
+            != self.live.object_identity()
+        {
+            return Err(refused(
+                RepairHold::DestinationChanged,
+                "claims cover another segment",
+            ));
+        }
         self.revalidate()?;
         // Consume the owning fresh complete catalog, including degradation that
         // would otherwise disappear when selection is absent.
         let catalog = read_complete_catalog(&self.root)
             .map_err(|e| refused(RepairHold::DegradedCatalog, e))?;
+        if catalog.degraded() {
+            return Err(refused(
+                RepairHold::DegradedCatalog,
+                "catalog coverage is incomplete",
+            ));
+        }
         let selected = catalog
             .days
             .iter()
@@ -170,8 +205,8 @@ impl PreparedRestore {
                     "exact restore history is absent",
                 )
             })?;
-        let register = marks::load(self.root.canonical_path())
-            .map_err(|e| refused(RepairHold::MarkChanged, e))?;
+        let register = review_context::load_at_root(&self.root)
+            .map_err(|e| refused(RepairHold::MarkChanged, format!("{e:?}")))?;
         let content = content_observation(intent, self.live.observe_file(selected_name(intent)));
         self.revalidate()?;
         inspect_recovery(intent, &self.destination, selected, &register, content)

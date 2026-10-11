@@ -1,0 +1,641 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::disallowed_methods,
+    reason = "isolated real retained execution and race controls"
+)]
+
+use super::*;
+use crate::mark_mutation::BoundMutationOutcome;
+use crate::marks::{MarkState, Proposal, Register};
+use crate::review_context::{
+    CheckedReviewContext, check_review_context, load_at_root, read_review_context,
+};
+use chrono::TimeZone;
+use serde_json::json;
+use solstone_core_journal_io::media::{
+    Cleanup, MediaPrimitive, RemovalEffect, run_with_media_hook,
+};
+use solstone_core_journal_io::{FlatDirectory, JournalRoot, acquire_existing_parent_lock_bound};
+use std::{ffi::OsStr, fs, sync::Arc, time::Duration};
+
+struct Fixture {
+    temp: tempfile::TempDir,
+    root: Arc<JournalRoot>,
+    marks: Vec<Mark>,
+}
+impl Fixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("config")).unwrap();
+        fs::create_dir(temp.path().join("health")).unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let f = Self {
+            temp,
+            root,
+            marks: Vec::new(),
+        };
+        f.config(json!({"retention":{"raw_media":"days","raw_media_days":1}}));
+        f
+    }
+    fn config(&self, value: serde_json::Value) {
+        fs::write(
+            self.path("config/journal.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+    }
+    fn path(&self, relative: &str) -> std::path::PathBuf {
+        self.temp.path().join(relative)
+    }
+    fn target(&self, named: bool) -> crate::Target {
+        crate::Target {
+            day: "20260701".into(),
+            stream: if named { "field.audio" } else { "_default" }.into(),
+            dir: "prefix_070000_17_suffix".into(),
+        }
+    }
+    fn raw(&self, target: &crate::Target, name: &str, empty: bool) -> std::path::PathBuf {
+        let segment = self.path(&crate::layout::segment_rel(
+            &target.day,
+            &target.stream,
+            &target.dir,
+        ));
+        fs::create_dir_all(&segment).unwrap();
+        fs::create_dir_all(self.path(&crate::layout::day_health_rel(&target.day))).unwrap();
+        let path = segment.join(name);
+        fs::write(&path, b"raw").unwrap();
+        let record = json!({"_solstone_processing":{"schema":"solstone.processing.v1","state":if empty { "empty" } else { "analyzed" },"reason_code":if empty { "no_decodable_audio" } else { "ok" },"handler":"transcribe","input_size":3,"attempted_at":"2026-07-01T00:00:00Z"}});
+        let stem = name.rsplit_once('.').unwrap().0;
+        fs::write(
+            segment.join(format!("{stem}.jsonl")),
+            format!(
+                "{record}\n{}",
+                if empty {
+                    ""
+                } else {
+                    "{\"start\":0,\"text\":\"x\"}\n"
+                }
+            ),
+        )
+        .unwrap();
+        path
+    }
+    fn mark(&mut self, target: crate::Target, names: &[&str], class: RemovalClass) -> Mark {
+        let names = names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mark = Mark {
+            id: MarkId::derive(class, &target, &names),
+            target,
+            class,
+            marked_at: "first".into(),
+            proposal: Proposal {
+                names,
+                bytes: 3,
+                reason: "release".into(),
+            },
+            state: MarkState::Marked,
+            offload: None,
+        };
+        self.marks.push(mark.clone());
+        self.save();
+        mark
+    }
+    fn save(&self) {
+        let mut r = Register::empty();
+        for m in &self.marks {
+            if m.offload.is_some() {
+                r.version = 2;
+            }
+            r.marks.insert(m.id.clone(), m.clone());
+        }
+        fs::write(
+            self.path("health/retention-marks.json"),
+            serde_json::to_vec(&r).unwrap(),
+        )
+        .unwrap();
+    }
+    fn checked(&self, selected: &[Mark]) -> CheckedReviewContext {
+        let ids = selected.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let ctx = read_review_context(&self.root, &ids).unwrap();
+        check_review_context(Arc::clone(&self.root), &ctx).unwrap()
+    }
+    fn run(&self, checked: CheckedReviewContext) -> ReviewedRemoval {
+        remove_reviewed(checked, NaiveDate::from_ymd_opt(2026, 8, 6).unwrap(), now())
+    }
+    fn with(
+        &self,
+        checked: CheckedReviewContext,
+        hook: impl FnMut(ReviewedCheckpoint, &Path),
+    ) -> ReviewedRemoval {
+        let mut execution = ReviewedExecution {
+            outcome: Outcome {
+                targets: Vec::new(),
+                halted: None,
+            },
+            refusal: None,
+            carrier: None,
+            carrier_failure: None,
+            attempts: Vec::new(),
+            stage_failures: Vec::new(),
+            mutation: None,
+        };
+        if let Err(error) = execute_reviewed_with(
+            &checked,
+            NaiveDate::from_ymd_opt(2026, 8, 6).unwrap(),
+            now(),
+            &mut execution,
+            hook,
+        ) {
+            execution.refusal = Some(error);
+        }
+        ReviewedRemoval { checked, execution }
+    }
+}
+fn now() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 8, 6, 0, 0, 0).single().unwrap()
+}
+
+#[test]
+fn current_config_age_groups_layouts_and_legacy_partial_govern() {
+    for named in [false, true] {
+        for (raw_rule, preserve, empty, expected) in [
+            ("days", false, false, true),
+            ("keep", false, false, false),
+            ("keep", false, true, true),
+            ("days", true, true, false),
+        ] {
+            let mut f = Fixture::new();
+            let target = f.target(named);
+            let raw = f.raw(&target, "audio.flac", empty);
+            f.config(json!({"retention":{"raw_media":raw_rule,"raw_media_days":1},"transcribe":{"preserve_all":preserve}}));
+            let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+            let result = f.run(f.checked(&[mark]));
+            assert!(result.refusal().is_none(), "{:?}", result.refusal());
+            assert_eq!(!raw.exists(), expected);
+            assert_eq!(
+                result.outcome().removed_paths().count(),
+                usize::from(expected)
+            );
+            assert_eq!(load_at_root(&f.root).unwrap().marks.is_empty(), expected);
+            assert!(result.carrier_preparation().is_some());
+        }
+    }
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let empty = f.raw(&target, "a.flac", true);
+    let ordinary = f.raw(&target, "b.flac", false);
+    f.config(json!({"retention":{"raw_media":"keep"}}));
+    let mark = f.mark(
+        target,
+        &["a.flac", "b.flac"],
+        RemovalClass::OffloadRawRelease,
+    );
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    assert!(!empty.exists());
+    assert!(ordinary.exists());
+    assert_eq!(result.outcome().removed_paths().count(), 1);
+    assert_eq!(
+        load_at_root(&f.root).unwrap().marks.get(&mark.id),
+        Some(&mark)
+    );
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+    let result = remove_reviewed(
+        f.checked(&[mark]),
+        NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).single().unwrap(),
+    );
+    assert!(raw.exists());
+    assert_eq!(result.outcome().removed_paths().count(), 0);
+}
+
+#[test]
+fn whole_selection_refuses_stale_unsupported_coordinates_and_metadata() {
+    for bad in 0..6 {
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        let raw = f.raw(&target, "audio.flac", false);
+        let first = f.mark(
+            target.clone(),
+            &["audio.flac"],
+            RemovalClass::PolicyRawRelease,
+        );
+        let mut second = f.mark(target, &["b.flac"], RemovalClass::OffloadRawRelease);
+        match bad {
+            0 => {}
+            1 => second.target.dir = "a/b".into(),
+            2 => second.target.stream = "a/b".into(),
+            3 => second.proposal.names = vec!["events.jsonl".into()],
+            4 => second.class = RemovalClass::OwnerSegmentRemoval,
+            _ => {
+                second.offload = Some(
+                    crate::archive_proof::OffloadOffer::new(crate::archive_proof::OffloadProof {
+                        journal_id: f.root.identity().observation_id(),
+                        manifest_id: "manifest".into(),
+                        target: second.target.clone(),
+                        layout: solstone_core_journal_io::paths::SegmentLayout::Direct,
+                        repository_id: "a".repeat(64),
+                        snapshot_id: "b".repeat(64),
+                        files: vec![crate::archive_proof::ArchiveFileProof {
+                            witness_id: "witness".into(),
+                            name: "b.flac".into(),
+                            bytes: 3,
+                            sha256: "c".repeat(64),
+                            archive_path: "/stage/b.flac".into(),
+                            processing: crate::archive_proof::AcceptedProcessingObservation {
+                                record: None,
+                                has_analysis_row: true,
+                            },
+                        }],
+                    })
+                    .unwrap(),
+                );
+            }
+        }
+        second.id = MarkId::derive(second.class, &second.target, &second.proposal.names);
+        f.marks[1] = second.clone();
+        f.save();
+        if bad == 4 {
+            let context = read_review_context(&f.root, &[first.id, second.id]).unwrap();
+            assert!(check_review_context(Arc::clone(&f.root), &context).is_err());
+            assert!(raw.exists());
+            continue;
+        }
+        let checked = f.checked(&[first, second.clone()]);
+        if bad == 0 {
+            f.marks[1].marked_at = "newer".into();
+            f.save();
+        }
+        let before = fs::read(f.path("health/retention-marks.json")).unwrap();
+        let result = f.run(checked);
+        assert!(result.refusal().is_some());
+        assert!(raw.exists());
+        assert!(result.attempts().is_empty());
+        assert_eq!(
+            fs::read(f.path("health/retention-marks.json")).unwrap(),
+            before
+        );
+    }
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let first = f.mark(
+        target.clone(),
+        &["audio.flac"],
+        RemovalClass::PolicyRawRelease,
+    );
+    f.mark(target, &["bad.flac"], RemovalClass::OffloadRawRelease);
+    f.marks[1].state = MarkState::Failed(Failure {
+        at: "before".into(),
+        reason: "failed".into(),
+        staged: None,
+    });
+    f.save();
+    let result = f.run(f.checked(&[first]));
+    assert!(!raw.exists());
+    assert!(result.refusal().is_none());
+    assert_eq!(load_at_root(&f.root).unwrap().marks.len(), 1);
+}
+
+#[test]
+fn overlapping_class_rows_attempt_once_and_share_settlement() {
+    for reverse in [false, true] {
+        for unsettled in [false, true] {
+            let mut f = Fixture::new();
+            let target = f.target(false);
+            f.raw(&target, "audio.flac", false);
+            let a = f.mark(
+                target.clone(),
+                &["audio.flac"],
+                RemovalClass::PolicyRawRelease,
+            );
+            let b = f.mark(target, &["audio.flac"], RemovalClass::OffloadRawRelease);
+            let selected = if reverse { vec![b, a] } else { vec![a, b] };
+            if unsettled {
+                fs::create_dir(f.path(&crate::layout::content_rel(
+                    &selected[0].target.day,
+                    &selected[0].target.stream,
+                    &selected[0].target.dir,
+                    "events.jsonl",
+                )))
+                .unwrap();
+            }
+            let result = f.run(f.checked(&selected));
+            assert_eq!(result.attempts().len(), 1);
+            assert_eq!(result.outcome().removed_paths().count(), 1);
+            assert_eq!(result.outcome().targets[0].removed.len(), 1);
+            assert!(result.outcome().targets[1].removed.is_empty());
+            assert_eq!(result.attempts()[0].class(), selected[0].class);
+            let stored = load_at_root(&f.root).unwrap();
+            if unsettled {
+                assert_eq!(stored.marks.len(), 2);
+                assert!(
+                    stored
+                        .marks
+                        .values()
+                        .all(|m| matches!(m.state, MarkState::Failed(_)))
+                );
+                assert!(
+                    result
+                        .outcome()
+                        .targets
+                        .iter()
+                        .all(|r| r.post_commit_failure.is_some())
+                );
+            } else {
+                assert!(stored.marks.is_empty());
+                let event: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(f.path(&crate::layout::content_rel(
+                        &selected[0].target.day,
+                        &selected[0].target.stream,
+                        &selected[0].target.dir,
+                        "events.jsonl",
+                    )))
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    event["class"],
+                    if reverse {
+                        "offload_raw_release"
+                    } else {
+                        "policy_raw_release"
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_claim_and_sync_uncertainty_preserve_owners_and_exact_failures() {
+    for primitive in [
+        MediaPrimitive::AfterRemovalClaim,
+        MediaPrimitive::RemovalSourceSync,
+        MediaPrimitive::StageRemove,
+    ] {
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        let raw = f.raw(&target, "a.flac", false);
+        let later = f.raw(&target, "b.flac", false);
+        let mark = f.mark(
+            target,
+            &["a.flac", "b.flac"],
+            RemovalClass::PolicyRawRelease,
+        );
+        let (result, fired) = run_with_media_hook(
+            primitive,
+            || Err(std::io::Error::other("injected")),
+            || f.run(f.checked(std::slice::from_ref(&mark))),
+        );
+        assert!(fired);
+        assert!(!raw.exists());
+        let first = &result.attempts()[0];
+        if primitive == MediaPrimitive::AfterRemovalClaim {
+            assert!(later.exists());
+            assert_eq!(result.attempts().len(), 1);
+            assert_eq!(first.native().receipt().effect, RemovalEffect::Claimed);
+            assert_eq!(result.outcome().removed_paths().count(), 0);
+            assert!(first.native().stage_observation().is_some());
+        } else {
+            assert!(result.outcome().removed_paths().count() > 0);
+            assert_eq!(first.native().receipt().effect, RemovalEffect::Deleted);
+        }
+        assert!(matches!(
+            load_at_root(&f.root).unwrap().marks[&mark.id].state,
+            MarkState::Failed(_)
+        ));
+        if primitive == MediaPrimitive::StageRemove {
+            assert_ne!(first.native().receipt().cleanup, Cleanup::Complete);
+            assert!(later.exists());
+        }
+    }
+}
+
+#[test]
+fn actual_claim_config_contention_and_native_obligations_refuse() {
+    for admission in 0..3 {
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        let raw = f.raw(&target, "audio.flac", false);
+        let mark = f.mark(
+            target.clone(),
+            &["audio.flac"],
+            RemovalClass::PolicyRawRelease,
+        );
+        let checked = f.checked(std::slice::from_ref(&mark));
+        let claim = if admission == 0 {
+            Some(
+                solstone_core_segment::output_attempt::OutputClaims::discover(
+                    &f.path(&crate::layout::segment_rel(
+                        &target.day,
+                        &target.stream,
+                        &target.dir,
+                    )),
+                    LockOptions {
+                        timeout: Duration::ZERO,
+                        ..LockOptions::default()
+                    },
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let parent = FlatDirectory::open(&f.root, Path::new("config")).unwrap();
+        let guard = if admission == 1 {
+            Some(
+                acquire_existing_parent_lock_bound(
+                    &parent,
+                    OsStr::new("journal.json.lock"),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        if admission == 2 {
+            fs::create_dir(f.path(".tmp-offload-held")).unwrap();
+        }
+        let result = f.run(checked);
+        assert!(result.refusal().is_some());
+        assert!(raw.exists());
+        assert!(result.attempts().is_empty());
+        assert!(claim.is_some() || guard.is_some() || admission == 2);
+    }
+}
+
+#[test]
+fn post_hash_and_between_file_drift_stop_before_later_raw() {
+    for drift in 0..5 {
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        let a = f.raw(&target, "a.flac", false);
+        let b = f.raw(&target, "b.flac", false);
+        let mark = f.mark(
+            target.clone(),
+            &["a.flac", "b.flac"],
+            RemovalClass::PolicyRawRelease,
+        );
+        let checked = f.checked(std::slice::from_ref(&mark));
+        let mut fired = false;
+        let result = f.with(checked, |point, path| {
+            if !fired
+                && ((drift < 4 && point == ReviewedCheckpoint::Hashed)
+                    || (drift == 4 && point == ReviewedCheckpoint::AfterRaw))
+            {
+                match drift {
+                    0 => fs::write(path, b"bad").unwrap(),
+                    1 => fs::write(path.with_extension("jsonl"), b"{}\n").unwrap(),
+                    2 => {
+                        f.raw(&target, "new.flac", false);
+                    }
+                    3 => f.config(json!({"retention":{"raw_media":"keep"}})),
+                    _ => f.config(json!({"retention":{"raw_media":"keep"}})),
+                }
+                fired = true;
+            }
+        });
+        assert!(fired);
+        assert!(b.exists());
+        if drift == 4 {
+            assert!(!a.exists());
+            assert_eq!(result.outcome().removed_paths().count(), 1);
+            assert!(result.outcome().targets[0].post_commit_failure.is_some());
+            assert!(result.mutation().is_none());
+        } else {
+            assert!(a.exists());
+            assert_eq!(result.attempts().len(), 0);
+        }
+    }
+}
+
+#[test]
+fn register_handoff_preserves_unrelated_updates_and_refuses_selected_drift() {
+    for change in 0..3 {
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        let raw = f.raw(&target, "audio.flac", false);
+        let mark = f.mark(
+            target.clone(),
+            &["audio.flac"],
+            RemovalClass::PolicyRawRelease,
+        );
+        let checked = f.checked(std::slice::from_ref(&mark));
+        let mut fired = false;
+        let result = f.with(checked, |point, _| {
+            if point == ReviewedCheckpoint::BeforeBookkeeping {
+                // Real acquisition proves the raw-phase register guard has ended.
+                let health = FlatDirectory::open(&f.root, Path::new("health")).unwrap();
+                let _guard = acquire_existing_parent_lock_bound(
+                    &health,
+                    OsStr::new("retention-marks.json.lock"),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+                let mut register = load_at_root(&f.root).unwrap();
+                if change == 0 {
+                    let mut other = mark.clone();
+                    other.proposal.names = vec!["other.flac".into()];
+                    other.id = MarkId::derive(other.class, &other.target, &other.proposal.names);
+                    register.marks.insert(other.id.clone(), other);
+                } else if change == 1 {
+                    register.marks.get_mut(&mark.id).unwrap().marked_at = "newer".into();
+                } else {
+                    fs::rename(
+                        f.path("health/retention-marks.json.lock"),
+                        f.path("health/retained-old.lock"),
+                    )
+                    .unwrap();
+                    fs::write(f.path("health/retention-marks.json.lock"), b"competitor").unwrap();
+                }
+                fs::write(
+                    f.path("health/retention-marks.json"),
+                    serde_json::to_vec(&register).unwrap(),
+                )
+                .unwrap();
+                fired = true;
+            }
+        });
+        assert!(fired);
+        assert!(!raw.exists());
+        assert_eq!(result.outcome().removed_paths().count(), 1);
+        let register = load_at_root(&f.root).unwrap();
+        if change == 0 {
+            assert_eq!(register.marks.len(), 1);
+            assert!(!register.marks.contains_key(&mark.id));
+            assert!(matches!(
+                result.mutation(),
+                Some(Ok(BoundMutationOutcome::Published(_)))
+            ));
+        } else {
+            assert!(result.mutation().unwrap().is_err());
+            assert!(register.marks.contains_key(&mark.id));
+            assert!(result.outcome().targets[0].post_commit_failure.is_some());
+        }
+    }
+}
+
+#[test]
+fn owning_guard_refuses_prepublication_swap_and_preserves_published_late_swap() {
+    use solstone_core_journal_io::atomic::{
+        BoundPublicationPrimitive, run_with_bound_publication_barrier,
+    };
+    for after in [false, true] {
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        f.raw(&target, "audio.flac", false);
+        let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+        let checked = f.checked(std::slice::from_ref(&mark));
+        if !after {
+            let guard = crate::mark_mutation::CheckedMarkGuard::acquire(&checked).unwrap();
+            fs::rename(
+                f.path("health/retention-marks.json.lock"),
+                f.path("health/old.lock"),
+            )
+            .unwrap();
+            fs::write(f.path("health/retention-marks.json.lock"), b"new").unwrap();
+            assert!(
+                guard
+                    .publish(&[PlannedMarkMutation::resolve(&mark).unwrap()])
+                    .is_err()
+            );
+            assert!(load_at_root(&f.root).unwrap().marks.contains_key(&mark.id));
+        } else {
+            let path = f.temp.path().to_owned();
+            let (outcome, fired) = run_with_bound_publication_barrier(
+                BoundPublicationPrimitive::ParentSync,
+                1,
+                move || {
+                    fs::rename(
+                        path.join("health/retention-marks.json.lock"),
+                        path.join("health/old.lock"),
+                    )
+                    .unwrap();
+                    fs::write(path.join("health/retention-marks.json.lock"), b"new").unwrap();
+                },
+                || crate::mark_mutation::decline_reviewed(checked),
+            );
+            assert!(fired);
+            let BoundMutationOutcome::PublishedUncertain {
+                candidate,
+                uncertainty,
+            } = outcome.unwrap()
+            else {
+                panic!("publication lost")
+            };
+            assert!(candidate.register.marks.is_empty());
+            assert!(uncertainty.lock.is_some());
+        }
+    }
+}

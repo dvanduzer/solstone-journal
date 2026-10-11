@@ -35,6 +35,10 @@ const DOOR: &str = "door";
 
 const SOURCES: &[(&str, &str)] = &[
     ("age", include_str!("../src/age.rs")),
+    (
+        "archive_approval",
+        include_str!("../src/archive_approval.rs"),
+    ),
     ("archive_catalog", include_str!("../src/archive_catalog.rs")),
     ("archive_proof", include_str!("../src/archive_proof.rs")),
     ("class", include_str!("../src/class.rs")),
@@ -80,6 +84,7 @@ const REMOVAL_PRIMITIVES: &[&str] = &[
     "remove_file(",
     "remove_dir_all(",
     "rename_within(",
+    "remove_observed(",
 ];
 
 /// Forms that silence `#[must_use]`.

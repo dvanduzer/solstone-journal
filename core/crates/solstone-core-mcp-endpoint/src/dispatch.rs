@@ -1806,8 +1806,11 @@ fn list_transcripts(
 
             last_examined = Some((day.clone(), stream.clone(), name.clone()));
 
-            let page = match solstone_core_transcripts::read_segment_transcript_page(&segment, None)
-            {
+            let page = match solstone_core_transcripts::read_segment_transcript_page(
+                journal_root,
+                &segment,
+                None,
+            ) {
                 Ok(page) => page,
                 Err(_) => {
                     unreadable += 1;
@@ -1826,6 +1829,7 @@ fn list_transcripts(
                         version: page.version.fingerprint(),
                         source_index: None,
                         byte_offset: None,
+                        statement_ordinal: None,
                     }),
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
@@ -1947,15 +1951,21 @@ fn get_transcript(
                 byte_offset: cursor
                     .byte_offset
                     .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?,
+                statement_ordinal: cursor
+                    .statement_ordinal
+                    .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?,
                 version: solstone_core_transcripts::SegmentTranscriptVersion::from_fingerprint(
                     cursor.version,
                 ),
             })
         })
         .transpose()?;
-    let page =
-        solstone_core_transcripts::read_segment_transcript_page(&segment, continuation.as_ref())
-            .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
+    let page = solstone_core_transcripts::read_segment_transcript_page(
+        journal_root,
+        &segment,
+        continuation.as_ref(),
+    )
+    .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
     if page.version.fingerprint() != reference.version {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }
@@ -1973,6 +1983,7 @@ fn get_transcript(
                         version: reference.version,
                         source_index: Some(next.source_index),
                         byte_offset: Some(next.byte_offset),
+                        statement_ordinal: Some(next.statement_ordinal),
                     }),
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))

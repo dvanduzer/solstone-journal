@@ -18,6 +18,9 @@ use solstone_core_journal_io::paths::{PathOrDay, StreamLocation, iter_segments};
 use solstone_core_memory_original::{OriginalRead, read_original};
 
 mod segment_page;
+mod speaker_coordinates;
+
+pub use speaker_coordinates::{next_statement_ordinal, speaker_label_source};
 
 pub use segment_page::{
     MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS, SegmentClock, SegmentTranscriptCursor,
