@@ -714,3 +714,6 @@ fn packaged_native_restore_finish_entry() {
         serde_json::json!({"mode":input.mode,"result":result})
     );
 }
+
+#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+mod recovered;

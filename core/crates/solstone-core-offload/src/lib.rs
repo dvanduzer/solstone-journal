@@ -10,6 +10,7 @@ pub mod measurement;
 pub mod pruning_audit;
 pub mod recovery;
 pub mod restore;
+pub mod restore_recovered;
 // Private, uncalled coordination while durable intent publication is held.
 #[allow(dead_code)]
 mod restore_intent_store;
