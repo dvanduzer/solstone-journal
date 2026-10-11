@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use solstone_core_journal_io::media::MediaDirectory;
+use solstone_core_journal_io::media::{MediaDirectory, MediaEntry};
 #[cfg(unix)]
 use solstone_core_journal_io::{JournalRoot, open_flat_directory_bound, read_bytes_bound};
 
@@ -115,21 +115,35 @@ pub fn read_journal_config_in_directory(
     directory: &MediaDirectory,
     max_bytes: usize,
 ) -> Result<JournalConfigRead, ConfigLoadError> {
+    read_journal_config_observed_in_directory(directory, max_bytes).map(|(read, _)| read)
+}
+
+/// Decode and fingerprint the same complete byte buffer as its retained file observation.
+#[cfg(unix)]
+pub fn read_journal_config_observed_in_directory(
+    directory: &MediaDirectory,
+    max_bytes: usize,
+) -> Result<(JournalConfigRead, Option<MediaEntry>), ConfigLoadError> {
     let path = directory.diagnostic_path().join("journal.json");
     let read = directory
         .read_file_bounded(OsStr::new("journal.json"), max_bytes)
         .map_err(|source| corrupt(&path, source))?;
-    let bytes = match read {
-        Some(read) if read.complete => Some(read.bytes),
+    let (bytes, entry) = match read {
+        Some(read) if read.complete => (Some(read.bytes), Some(read.entry)),
         Some(_) => {
             return Err(corrupt(
                 &path,
                 io::Error::new(io::ErrorKind::InvalidData, "incomplete configuration read"),
             ));
         }
-        None => None,
+        None => (None, None),
     };
-    parse_config_bytes(&path, bytes)
+    parse_config_bytes(&path, bytes).map(|read| (read, entry))
+}
+
+/// Fingerprint supplied bytes using the journal configuration reader's encoding.
+pub fn fingerprint_journal_config_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 /// Load the single-read config basis used by the journal-I/O mutation owner.
@@ -199,7 +213,7 @@ fn parse_config_bytes(
             config: None,
         });
     };
-    let sha256 = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let sha256 = fingerprint_journal_config_bytes(&bytes);
     let value = serde_json::from_slice::<Value>(&bytes).map_err(|source| corrupt(path, source))?;
     let config = value.as_object().cloned().ok_or_else(|| {
         corrupt(

@@ -2754,3 +2754,1541 @@ fn no_links_without_the_transcripts_grant() {
     assert!(subs_no_tr[0].segments.is_empty());
     assert!(!subs_no_tr[0].more_segments);
 }
+
+fn write_chronicle_segment(
+    journal: &Path,
+    day: &str,
+    stream: &str,
+    name: &str,
+    facet: &str,
+    text: &str,
+) {
+    let seg = journal.join("chronicle").join(day).join(stream).join(name);
+    fs::create_dir_all(seg.join("talents")).unwrap();
+    fs::write(
+        seg.join("talents/facets.json"),
+        format!("[{{\"facet\":\"{facet}\"}}]"),
+    )
+    .unwrap();
+    fs::write(seg.join("talents/brief.md"), format!("{text}\n")).unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_entity_fixture(
+    journal: &Path,
+    facet: &str,
+    rel_dir: &str,
+    entity_id: &str,
+    name: &str,
+    kind: Option<&str>,
+    description: Option<&str>,
+    note: Option<&str>,
+) {
+    let link = journal
+        .join("facets")
+        .join(facet)
+        .join("entities")
+        .join(rel_dir);
+    fs::create_dir_all(&link).unwrap();
+    let mut rel_val = json!({"entity_id": entity_id, "last_seen": "20261010"});
+    if let Some(desc) = description {
+        rel_val["description"] = json!(desc);
+    }
+    fs::write(link.join("entity.json"), rel_val.to_string()).unwrap();
+    if let Some(n) = note {
+        fs::write(
+            link.join("observations.jsonl"),
+            format!("{{\"content\":\"{n}\"}}\n"),
+        )
+        .unwrap();
+    }
+    let ent_dir = journal.join("entities").join(rel_dir);
+    fs::create_dir_all(&ent_dir).unwrap();
+    let mut id_val = json!({"id": entity_id, "name": name});
+    if let Some(k) = kind {
+        id_val["type"] = json!(k);
+    }
+    fs::write(ent_dir.join("entity.json"), id_val.to_string()).unwrap();
+}
+
+#[test]
+fn entity_name_derivation_walk_across_pages() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-derivation-walk-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Core infrastructure project"),
+        Some("Telemetry pipeline updates"),
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper initial kick-off announcement.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper first milestone completed on schedule.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261003",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper deployment to canary group verified.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261004",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Unrelated maintenance window scheduled.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let mut walk_full = Vec::new();
+    let mut cursor = None;
+    loop {
+        let mut args = json!({"query": "Project Juniper", "limit": 1});
+        if let Some(c) = cursor {
+            args["cursor"] = json!(c);
+        }
+        let page = probe(&journal, "search", args).unwrap();
+        let results = page["results"].as_array().unwrap();
+        if results.is_empty() {
+            break;
+        }
+        assert_eq!(results.len(), 1);
+        walk_full.push((
+            results[0]["date"].as_str().unwrap().to_owned(),
+            results[0]["snippet"].as_str().unwrap().to_owned(),
+        ));
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut walk_short = Vec::new();
+    cursor = None;
+    loop {
+        let mut args = json!({"query": "Juniper", "limit": 1});
+        if let Some(c) = cursor {
+            args["cursor"] = json!(c);
+        }
+        let page = probe(&journal, "search", args).unwrap();
+        let results = page["results"].as_array().unwrap();
+        if results.is_empty() {
+            break;
+        }
+        assert_eq!(results.len(), 1);
+        walk_short.push((
+            results[0]["date"].as_str().unwrap().to_owned(),
+            results[0]["snippet"].as_str().unwrap().to_owned(),
+        ));
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(walk_full.len(), 3);
+    assert_eq!(walk_full, walk_short);
+    assert!(!walk_full.iter().any(|(_, s)| s.contains("Unrelated")));
+}
+
+#[test]
+fn project_space_juniper_whitespace_and_case_folding() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-case-fold-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Core project"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper launched.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper second day update.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res1 = probe(&journal, "search", json!({"query": "Project Juniper"})).unwrap();
+    let res2 = probe(&journal, "search", json!({"query": "project  juniper"})).unwrap();
+    assert_eq!(
+        visible_search_page(&res1)["results"],
+        visible_search_page(&res2)["results"]
+    );
+    assert_eq!(res1["results"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn canonical_name_equal_to_type_does_not_become_empty() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-name-equal-type-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "milestone",
+        "milestone-1",
+        "Milestone",
+        Some("Milestone"),
+        Some("Key milestone entity"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Q3 Milestone achieved successfully.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Milestone"})).unwrap();
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Milestone")
+    );
+}
+
+#[test]
+fn type_prefix_token_boundary_prevents_partial_word_match() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-prefix-token-boundary-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "projector",
+        "tool-projector",
+        "Projector",
+        Some("Project"),
+        Some("Hardware display device"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Projector installed in conference room.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project status review meeting.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Projector"})).unwrap();
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Projector")
+    );
+    assert!(!results[0]["snippet"].as_str().unwrap().contains("meeting"));
+}
+
+#[test]
+fn person_card_emitted_when_type_not_leading_token() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-person-card-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "alice",
+        "entity-alice",
+        "Alice Smith",
+        Some("Person"),
+        Some("Lead architect on platform."),
+        Some("Joined the foundation team."),
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Alice Smith"})).unwrap();
+    assert_no_coordinate_keys(&res);
+    assert!(res["results"].as_array().unwrap().is_empty());
+    let matches = res["entity_matches"]
+        .as_array()
+        .expect("emits entity_matches");
+    assert_eq!(matches.len(), 1);
+    let card = &matches[0];
+    assert_eq!(card["name"], "Alice Smith");
+    assert_eq!(card["type"], "Person");
+    assert_eq!(card["facet"], FACET_A);
+    assert_eq!(card["description"], "Lead architect on platform.");
+    assert_eq!(card["observations"], "Joined the foundation team.");
+    assert!(card.get("entity_id").is_none());
+    assert!(card.get("aka").is_none());
+    let card_ref = card["reference"].as_str().unwrap();
+
+    let entity = probe(&journal, "get_entity", json!({"reference": card_ref})).unwrap();
+    assert_eq!(entity["name"], "Alice Smith");
+    assert_eq!(entity["type"], "Person");
+    assert_eq!(entity["description"], "Lead architect on platform.");
+
+    let output = dispatch_output(&journal, "search", json!({"query": "Alice Smith"}));
+    assert!(output.empty_note.is_none());
+    let rendered = crate::jsonrpc::tool_result(output.value, output.empty_note.as_deref());
+    let rendered_text = rendered.to_string();
+    assert!(!rendered_text.contains("No results"));
+
+    let activity = crate::activity::read_activity(
+        journal.path(),
+        &crate::activity::ActivityQuery {
+            limit: 10,
+            ..crate::activity::ActivityQuery::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        activity.entries[0].outcome,
+        crate::activity::RecordedOutcome::Served
+    );
+    let shape = activity.entries[0].result.as_ref().unwrap();
+    assert_eq!(shape.count, 1);
+    assert!(
+        shape
+            .targets
+            .iter()
+            .any(|t| t == &format!("facet:{FACET_A}/entity:entity-alice"))
+    );
+    assert!(
+        shape
+            .targets
+            .iter()
+            .any(|t| t.contains("observations.jsonl"))
+    );
+}
+
+#[test]
+fn card_description_and_observations_truncation() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-card-truncation-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    let long_desc = "D".repeat(450);
+    let long_note = "N".repeat(500);
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "longitem",
+        "entity-long",
+        "Long Entity",
+        Some("Project"),
+        Some(&long_desc),
+        Some(&long_note),
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Long Entity"})).unwrap();
+    let matches = res["entity_matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    let card = &matches[0];
+    assert_eq!(card["truncated"], true);
+    assert_eq!(card["description"].as_str().unwrap().chars().count(), 400);
+    assert_eq!(card["observations"].as_str().unwrap().chars().count(), 400);
+}
+
+#[test]
+fn entity_matches_truncated_flag_when_exceeding_limit() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-matches-truncated-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "shared-a",
+        "entity-shared-a",
+        "Shared Name",
+        None,
+        Some("Alpha relation"),
+        None,
+    );
+    write_entity_fixture(
+        journal.path(),
+        "beta",
+        "shared-b",
+        "entity-shared-b",
+        "Shared Name",
+        None,
+        Some("Beta relation"),
+        None,
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::WholeJournal,
+            },
+        )
+        .unwrap();
+
+    let res = probe(
+        &journal,
+        "search",
+        json!({"query": "Shared Name", "limit": 1}),
+    )
+    .unwrap();
+    assert_eq!(res["entity_matches_truncated"], true);
+    let matches = res["entity_matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["facet"], FACET_A);
+}
+
+#[test]
+fn identity_aka_and_description_sentinels_ignored() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-aka-sentinel-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    let root = journal.path();
+    let link = root.join("facets/alpha/entities/sentinel");
+    fs::create_dir_all(&link).unwrap();
+    fs::write(
+        link.join("entity.json"),
+        json!({"entity_id": "entity-sentinel", "description": "Known description"}).to_string(),
+    )
+    .unwrap();
+    let ent_dir = root.join("entities/sentinel");
+    fs::create_dir_all(&ent_dir).unwrap();
+    fs::write(
+        ent_dir.join("entity.json"),
+        json!({
+            "id": "entity-sentinel",
+            "name": "Canonical Project",
+            "type": "Project",
+            "aka": ["Sentinel Alias"],
+            "description": "Sentinel Description"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    write_chronicle_segment(
+        root,
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Canonical Project kick-off line 1.",
+    );
+    write_chronicle_segment(
+        root,
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Canonical Project line 2.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(root, true).unwrap();
+    PermissionStore::open(root)
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res_aka = probe(&journal, "search", json!({"query": "Sentinel Alias"})).unwrap();
+    assert!(res_aka.get("entity_matches").is_none());
+
+    let res_canon = probe(
+        &journal,
+        "search",
+        json!({"query": "Canonical Project", "limit": 1}),
+    )
+    .unwrap();
+    let card = &res_canon["entity_matches"].as_array().unwrap()[0];
+    let card_str = card.to_string();
+    assert!(!card_str.contains("Sentinel Alias"));
+    assert!(!card_str.contains("Sentinel Description"));
+    let cursor = res_canon["next_cursor"].as_str().unwrap().to_owned();
+
+    fs::write(
+        ent_dir.join("entity.json"),
+        json!({
+            "id": "entity-sentinel",
+            "name": "Canonical Project",
+            "type": "Project",
+            "aka": ["Updated Another Alias"],
+            "description": "Sentinel Description"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let p2 = probe(
+        &journal,
+        "search",
+        json!({"query": "Canonical Project", "limit": 1, "cursor": cursor}),
+    )
+    .unwrap();
+    assert_eq!(p2["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn transcripts_only_and_category_transcripts_do_not_derive() {
+    let journal = tempfile::Builder::new()
+        .prefix("transcripts-only-no-derive-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Alpha project"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper full name line.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper short name only.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+    let res = probe(&journal, "search", json!({"query": "Project Juniper"})).unwrap();
+    assert!(res.get("entity_matches").is_none());
+    assert_eq!(res["results"].as_array().unwrap().len(), 1);
+    assert!(
+        res["results"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Project Juniper")
+    );
+
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+    let res_cat = probe(
+        &journal,
+        "search",
+        json!({"query": "Project Juniper", "category": "transcripts"}),
+    )
+    .unwrap();
+    assert!(res_cat.get("entity_matches").is_none());
+    assert_eq!(res_cat["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn entities_only_grant_denied_search_and_fetch() {
+    let journal = tempfile::Builder::new()
+        .prefix("entities-only-denied-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["entities".to_owned()],
+                scope: ReadScope::WholeJournal,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&journal, "search", json!({"query": "Project Juniper"})),
+        Err(McpProbeError::PermissionDenied)
+    );
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": "dummy-ref"})),
+        Err(McpProbeError::PermissionDenied)
+    );
+}
+
+#[test]
+fn facet_filter_and_chosen_facet_isolation() {
+    let journal = tempfile::Builder::new()
+        .prefix("facet-isolation-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "alpha-tool",
+        "tool-alpha",
+        "Alpha Tool",
+        Some("Tool"),
+        Some("Tool for alpha"),
+        None,
+    );
+    write_entity_fixture(
+        journal.path(),
+        "beta",
+        "beta-tool",
+        "tool-beta",
+        "Beta Tool",
+        Some("Tool"),
+        Some("Tool for beta"),
+        None,
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::WholeJournal,
+            },
+        )
+        .unwrap();
+
+    let res = probe(
+        &journal,
+        "search",
+        json!({"query": "Beta Tool", "facet": FACET_A}),
+    )
+    .unwrap();
+    assert!(res.get("entity_matches").is_none());
+
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+    let res_scoped = probe(&journal, "search", json!({"query": "Beta Tool"})).unwrap();
+    assert!(res_scoped.get("entity_matches").is_none());
+}
+
+#[test]
+fn same_name_in_two_facets_emits_two_cards() {
+    let journal = tempfile::Builder::new()
+        .prefix("same-name-two-facets-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "shared",
+        "entity-shared",
+        "Shared Identity",
+        None,
+        Some("Alpha unique relation"),
+        None,
+    );
+    write_entity_fixture(
+        journal.path(),
+        "beta",
+        "shared",
+        "entity-shared",
+        "Shared Identity",
+        None,
+        Some("Beta unique relation"),
+        None,
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::WholeJournal,
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Shared Identity"})).unwrap();
+    let cards = res["entity_matches"].as_array().unwrap();
+    assert_eq!(cards.len(), 2);
+    assert_eq!(cards[0]["description"], "Alpha unique relation");
+    assert_eq!(cards[1]["description"], "Beta unique relation");
+}
+
+#[test]
+fn disagreeing_derivations_keep_original_query() {
+    let journal = tempfile::Builder::new()
+        .prefix("disagreeing-derivations-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "ent-a",
+        "ent-alpha",
+        "Project Alpha Team",
+        Some("Project"),
+        Some("Alpha desc"),
+        None,
+    );
+    write_entity_fixture(
+        journal.path(),
+        "beta",
+        "ent-b",
+        "ent-beta",
+        "Project Alpha Team",
+        Some("Team"),
+        Some("Beta desc"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Alpha Team full name.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Alpha Team short name only.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::WholeJournal,
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Project Alpha Team"})).unwrap();
+    assert_eq!(res["entity_matches"].as_array().unwrap().len(), 2);
+    let hits = res["results"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Project Alpha Team")
+    );
+}
+
+#[test]
+fn detached_blocked_and_removed_relationships_excluded() {
+    let journal = tempfile::Builder::new()
+        .prefix("detached-blocked-removed-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "active",
+        "entity-active",
+        "Active Entity",
+        Some("Person"),
+        Some("Active desc"),
+        None,
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Active Entity"})).unwrap();
+    let card_ref = res["entity_matches"].as_array().unwrap()[0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(probe(&journal, "get_entity", json!({"reference": card_ref})).is_ok());
+
+    // Detach relationship
+    fs::write(
+        journal
+            .path()
+            .join("facets/alpha/entities/active/entity.json"),
+        json!({"entity_id": "entity-active", "detached": true}).to_string(),
+    )
+    .unwrap();
+    let res_detached = probe(&journal, "search", json!({"query": "Active Entity"})).unwrap();
+    assert!(res_detached.get("entity_matches").is_none());
+    assert_eq!(
+        probe(&journal, "get_entity", json!({"reference": card_ref})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    // Re-attach, then block identity
+    fs::write(
+        journal
+            .path()
+            .join("facets/alpha/entities/active/entity.json"),
+        json!({"entity_id": "entity-active", "detached": false}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        journal.path().join("entities/active/entity.json"),
+        json!({"id": "entity-active", "name": "Active Entity", "blocked": true}).to_string(),
+    )
+    .unwrap();
+    let res_blocked = probe(&journal, "search", json!({"query": "Active Entity"})).unwrap();
+    assert!(res_blocked.get("entity_matches").is_none());
+    assert_eq!(
+        probe(&journal, "get_entity", json!({"reference": card_ref})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    // Unblock, then remove relationship directory
+    fs::write(
+        journal.path().join("entities/active/entity.json"),
+        json!({"id": "entity-active", "name": "Active Entity", "blocked": false}).to_string(),
+    )
+    .unwrap();
+    fs::remove_dir_all(journal.path().join("facets/alpha/entities/active")).unwrap();
+    let res_removed = probe(&journal, "search", json!({"query": "Active Entity"})).unwrap();
+    assert!(res_removed.get("entity_matches").is_none());
+    assert_eq!(
+        probe(&journal, "get_entity", json!({"reference": card_ref})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "active",
+        "entity-active",
+        "Active Entity",
+        Some("Person"),
+        Some("Active desc"),
+        None,
+    );
+    let res_recreated = probe(&journal, "search", json!({"query": "Active Entity"})).unwrap();
+    assert!(res_recreated.get("entity_matches").is_some());
+    assert_eq!(res_recreated["entity_matches"].as_array().unwrap().len(), 1);
+
+    fs::write(journal.path().join("facets/alpha/facet.json"), b"not json").unwrap();
+    let res_corrupt = probe(&journal, "search", json!({"query": "Active Entity"})).unwrap();
+    assert!(res_corrupt.get("entity_matches").is_none());
+}
+
+#[test]
+fn date_filters_suppress_cards_and_bound_derivation() {
+    let journal = tempfile::Builder::new()
+        .prefix("date-filters-suppress-cards-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Core project"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper kick-off.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper day two.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261003",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper day three.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(
+        &journal,
+        "search",
+        json!({"query": "Project Juniper", "day": "20261002"}),
+    )
+    .unwrap();
+    assert!(res.get("entity_matches").is_none());
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["date"], "20261002");
+    assert!(
+        results[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Juniper day two")
+    );
+
+    let res_range = probe(
+        &journal,
+        "search",
+        json!({
+            "query": "Project Juniper",
+            "day_from": "20261001",
+            "day_to": "20261002"
+        }),
+    )
+    .unwrap();
+    assert!(res_range.get("entity_matches").is_none());
+    let range_results = res_range["results"].as_array().unwrap();
+    assert_eq!(range_results.len(), 2);
+    let range_dates: Vec<_> = range_results
+        .iter()
+        .map(|r| r["date"].as_str().unwrap())
+        .collect();
+    assert!(range_dates.contains(&"20261001"));
+    assert!(range_dates.contains(&"20261002"));
+    assert!(!range_dates.contains(&"20261003"));
+
+    let res_to = probe(
+        &journal,
+        "search",
+        json!({
+            "query": "Project Juniper",
+            "day_to": "20261001"
+        }),
+    )
+    .unwrap();
+    assert!(res_to.get("entity_matches").is_none());
+    let to_results = res_to["results"].as_array().unwrap();
+    assert_eq!(to_results.len(), 1);
+    assert_eq!(to_results[0]["date"], "20261001");
+
+    let res_from = probe(
+        &journal,
+        "search",
+        json!({
+            "query": "Project Juniper",
+            "day_from": "20261003"
+        }),
+    )
+    .unwrap();
+    assert!(res_from.get("entity_matches").is_none());
+    let from_results = res_from["results"].as_array().unwrap();
+    assert_eq!(from_results.len(), 1);
+    assert_eq!(from_results[0]["date"], "20261003");
+}
+
+#[test]
+fn empty_query_with_day_bound_lists_indexed_without_cards() {
+    let journal = tempfile::Builder::new()
+        .prefix("empty-query-day-bound-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Core project"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Day one content item.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "", "day": "20261001"})).unwrap();
+    assert!(res.get("entity_matches").is_none());
+    assert_eq!(res["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn syntax_and_operators_bypass_resolution() {
+    let journal = tempfile::Builder::new()
+        .prefix("syntax-operators-bypass-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Core project"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper name:Project kick-off announcement.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper second day update without prefix.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    for query in [
+        "\"Project Juniper\"",
+        "Project AND Juniper",
+        "name:Project Juniper",
+    ] {
+        let res = probe(&journal, "search", json!({"query": query})).unwrap();
+        assert!(
+            res.get("entity_matches").is_none(),
+            "query {query} emitted cards"
+        );
+        let results = res["results"].as_array().unwrap();
+        assert!(
+            !results
+                .iter()
+                .any(|r| r["snippet"].as_str().unwrap().contains("second day update")),
+            "query {query} derived short name"
+        );
+    }
+}
+
+#[test]
+fn cursor_unavailable_after_rename_removal_or_type_change() {
+    let journal = tempfile::Builder::new()
+        .prefix("cursor-unavailable-shift-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Core project"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper item one.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper item two.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let p1 = probe(
+        &journal,
+        "search",
+        json!({"query": "Project Juniper", "limit": 1}),
+    )
+    .unwrap();
+    let cursor = p1["next_cursor"].as_str().unwrap().to_owned();
+
+    let p2_ok = probe(
+        &journal,
+        "search",
+        json!({"query": "Project Juniper", "limit": 1, "cursor": cursor}),
+    )
+    .unwrap();
+    assert_eq!(p2_ok["results"].as_array().unwrap().len(), 1);
+
+    let p1_for_rename = probe(
+        &journal,
+        "search",
+        json!({"query": "Project Juniper", "limit": 1}),
+    )
+    .unwrap();
+    let cursor_rename = p1_for_rename["next_cursor"].as_str().unwrap().to_owned();
+    fs::write(
+        journal.path().join("entities/juniper/entity.json"),
+        json!({"id": "project-juniper", "name": "Project Cedar", "type": "Project"}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(
+            &journal,
+            "search",
+            json!({"query": "Project Juniper", "limit": 1, "cursor": cursor_rename})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+
+    fs::write(
+        journal.path().join("entities/juniper/entity.json"),
+        json!({"id": "project-juniper", "name": "Project Juniper", "type": "Project"}).to_string(),
+    )
+    .unwrap();
+    let p1_for_type = probe(
+        &journal,
+        "search",
+        json!({"query": "Project Juniper", "limit": 1}),
+    )
+    .unwrap();
+    let cursor_type = p1_for_type["next_cursor"].as_str().unwrap().to_owned();
+    fs::write(
+        journal.path().join("entities/juniper/entity.json"),
+        json!({"id": "project-juniper", "name": "Project Juniper", "type": "Initiative"})
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        probe(
+            &journal,
+            "search",
+            json!({"query": "Project Juniper", "limit": 1, "cursor": cursor_type})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+
+    fs::write(
+        journal.path().join("entities/juniper/entity.json"),
+        json!({"id": "project-juniper", "name": "Project Juniper", "type": "Project"}).to_string(),
+    )
+    .unwrap();
+    let p1_for_removal = probe(
+        &journal,
+        "search",
+        json!({"query": "Project Juniper", "limit": 1}),
+    )
+    .unwrap();
+    let cursor_removal = p1_for_removal["next_cursor"].as_str().unwrap().to_owned();
+    fs::remove_dir_all(journal.path().join("facets/alpha/entities/juniper")).unwrap();
+    assert_eq!(
+        probe(
+            &journal,
+            "search",
+            json!({"query": "Project Juniper", "limit": 1, "cursor": cursor_removal})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+}
+
+#[test]
+fn malformed_relationship_in_granted_facet_sets_incomplete() {
+    let journal = tempfile::Builder::new()
+        .prefix("malformed-relationship-fallback-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Project Juniper",
+        Some("Project"),
+        Some("Core project"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Project Juniper full name line.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper short name only.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+
+    let link_bad = journal.path().join("facets/alpha/entities/badrel");
+    fs::create_dir_all(&link_bad).unwrap();
+    fs::write(link_bad.join("entity.json"), "[]").unwrap();
+
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Project Juniper"})).unwrap();
+    assert_eq!(res["entity_context_incomplete"], true);
+    assert!(res.get("entity_matches").is_none());
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("Project Juniper")
+    );
+
+    fs::remove_dir_all(&link_bad).unwrap();
+    let link_bad_beta = journal.path().join("facets/beta/entities/badrel");
+    fs::create_dir_all(&link_bad_beta).unwrap();
+    fs::write(link_bad_beta.join("entity.json"), "[]").unwrap();
+
+    let res_beta_bad = probe(&journal, "search", json!({"query": "Project Juniper"})).unwrap();
+    assert!(res_beta_bad.get("entity_context_incomplete").is_none());
+    assert_eq!(res_beta_bad["results"].as_array().unwrap().len(), 2);
+
+    let ent_bad = journal.path().join("entities/badid");
+    fs::create_dir_all(&ent_bad).unwrap();
+    fs::write(ent_bad.join("entity.json"), "[]").unwrap();
+    let link_bad_id = journal.path().join("facets/alpha/entities/badid");
+    fs::create_dir_all(&link_bad_id).unwrap();
+    fs::write(
+        link_bad_id.join("entity.json"),
+        json!({"entity_id": "bad-id"}).to_string(),
+    )
+    .unwrap();
+
+    let res_id_bad = probe(&journal, "search", json!({"query": "Project Juniper"})).unwrap();
+    assert!(res_id_bad.get("entity_context_incomplete").is_none());
+    assert_eq!(res_id_bad["results"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn card_responses_adhere_to_coordinate_and_security_invariants() {
+    let journal = tempfile::Builder::new()
+        .prefix("card-security-invariants-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "project",
+        "entity-proj",
+        "Secure Project",
+        Some("Project"),
+        Some("Detailed relationship description"),
+        Some("Note observation line"),
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Secure Project"})).unwrap();
+    assert_no_coordinate_keys(&res);
+    let card = &res["entity_matches"].as_array().unwrap()[0];
+    assert!(card.get("entity_id").is_none());
+    assert!(card.get("aka").is_none());
+    assert!(card.get("path").is_none());
+    assert!(card.get("stream").is_none());
+    assert!(card.get("idx").is_none());
+    assert!(card.get("row_id").is_none());
+    assert!(card.get("last_seen").is_none());
+}
+
+#[test]
+fn a_multi_word_type_derives_the_remainder() {
+    let journal = tempfile::Builder::new()
+        .prefix("multi-word-type-derive-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "juniper",
+        "project-juniper",
+        "Research Project Juniper",
+        Some("Research Project"),
+        Some("Core research initiative"),
+        None,
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261001",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Research Project Juniper kick-off announcement.",
+    );
+    write_chronicle_segment(
+        journal.path(),
+        "20261002",
+        "stream1",
+        "090000_300",
+        "alpha",
+        "Juniper second day update without prefix.",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(
+        &journal,
+        "search",
+        json!({"query": "Research Project Juniper"}),
+    )
+    .unwrap();
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    let dates: Vec<_> = results
+        .iter()
+        .map(|r| r["date"].as_str().unwrap())
+        .collect();
+    assert!(dates.contains(&"20261001"));
+    assert!(dates.contains(&"20261002"));
+}
