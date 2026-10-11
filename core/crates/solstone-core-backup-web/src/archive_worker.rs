@@ -27,9 +27,11 @@ use solstone_core_backup_runtime::{
     DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
     OwnedDirectReadFinish, UreqHttpTransport, admit_prepared_archive_owned_read_installed,
 };
+use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_offload::restore::owned::{OwnedRestoreFinishHold, SettledRestoreReport};
 use solstone_core_retention::remove_marked::{OwnedReviewedArchiveRemoval, ReviewedArchiveReport};
+use solstone_core_retention::restore_intent::recover_abandoned_restores;
 
 use crate::archive_operation::ArchiveBeginRefusal;
 use crate::operation::{self, SharedOperationSlot, Terminal};
@@ -688,6 +690,10 @@ pub fn prepare_read(
         return None;
     }
     let (ticket, root, budget, clock) = begin.into_parts();
+    // A restore interrupted before it published would refuse this admission.
+    if let Ok(activity) = ActivityLease::try_acquire(Arc::clone(&root)) {
+        recover_abandoned_restores(&activity);
+    }
     let (input, custody) = match OwnedArchivePreparationInput::capture(root, budget, clock) {
         Ok(pair) => pair,
         Err(failure) => {

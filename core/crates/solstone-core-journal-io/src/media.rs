@@ -26,7 +26,8 @@ pub use activity_carrier::{
     ActivityCarrierPreparationFailure, ActivityCarrierPreparationReceipt,
     ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,
     RootActivityCarrier, RootCarrierObservation, RootTeardownCarrier,
-    TeardownCarrierPreparationFailure, retire_orphan_root_carriers,
+    TeardownCarrierPreparationFailure, exclusive_local_activity, retire_orphan_root_carriers,
+    retire_recorded_stage,
 };
 mod observation;
 pub use observation::{MediaEntry, MediaRead};

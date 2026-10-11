@@ -616,10 +616,10 @@ fn retire_orphans(activity: &Arc<ActivityLease>, retired: &mut usize) -> io::Res
     activity
         .revalidate()
         .map_err(crate::activity::ActivityAdmissionError::into_io)?;
-    let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
-    if !local_storage(nix::sys::statfs::fstatfs(&root.inner)?.filesystem_type()) {
+    if !exclusive_local_activity(activity)? {
         return Ok(());
     }
+    let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
     let census = observe_obligations(activity.journal_root()).map_err(io::Error::other)?;
     let entries = census.entries();
     if entries
@@ -655,6 +655,97 @@ fn retire_orphans(activity: &Arc<ActivityLease>, retired: &mut usize) -> io::Res
         root.sync()?;
     }
     Ok(())
+}
+
+/// Whether holding this lease excludes every writer of its journal: Linux, on
+/// local storage only. Elsewhere nothing an ended owner left may be retired.
+pub fn exclusive_local_activity(activity: &Arc<ActivityLease>) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
+        Ok(local_storage(
+            nix::sys::statfs::fstatfs(&root.inner)?.filesystem_type(),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = activity;
+        Ok(false)
+    }
+}
+
+/// Remove one recorded stage whose owner ended: `name` under `parent`, holding
+/// nothing but `leaf_name` with exactly the recorded identity. Its caller must
+/// know that nothing was published from it. Returns false when it is already
+/// absent; anything unexpected refuses and leaves the stage in place.
+pub fn retire_recorded_stage(
+    activity: &Arc<ActivityLease>,
+    parent: &Arc<MediaDirectory>,
+    name: &OsStr,
+    directory: MediaIdentity,
+    leaf_name: &OsStr,
+    leaf: MediaIdentity,
+) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        plain_name(name)?;
+        plain_name(leaf_name)?;
+        if !crate::activity_obligations::is_stage_namespace_name(name)
+            || !Arc::ptr_eq(parent.inner.journal_root(), activity.journal_root())
+        {
+            return Err(invalid("not a stage of this journal"));
+        }
+        if !exclusive_local_activity(activity)? {
+            return Err(shared_storage());
+        }
+        let Some(stage) = parent.inner.open_child(name)? else {
+            return Ok(false);
+        };
+        if stage.identity() != directory {
+            return Err(changed());
+        }
+        let entries = platform::entries(&stage, 2)?.ok_or_else(changed)?;
+        match entries.as_slice() {
+            [] => {}
+            [entry]
+                if entry.name == leaf_name
+                    && entry.identity == leaf
+                    && entry.kind == crate::journal_root::JournalEntryKind::RegularFile =>
+            {
+                activity
+                    .revalidate()
+                    .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+                let file = platform::open_plain(&stage, leaf_name)?.ok_or_else(changed)?;
+                if platform::identity(&file)? != leaf {
+                    return Err(changed());
+                }
+                platform::check_leaf(&stage, leaf_name, leaf)?;
+                platform::remove_leaf(&stage, leaf_name, &file)?;
+            }
+            _ => return Err(changed()),
+        }
+        activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        platform::remove_directory(&parent.inner, name, &stage)?;
+        parent.sync()?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (activity, parent, name, directory, leaf_name, leaf);
+        Err(shared_storage())
+    }
+}
+
+fn shared_storage() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the activity lease does not exclude every writer here",
+    )
 }
 
 /// Filesystems where this host's lock excludes every writer. Anything else,
