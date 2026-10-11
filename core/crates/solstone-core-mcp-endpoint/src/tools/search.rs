@@ -28,6 +28,7 @@ pub(crate) struct ValidatedSearch {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchParams {
+    #[serde(default)]
     query: String,
     #[serde(default = "default_limit")]
     limit: usize,
@@ -53,7 +54,9 @@ pub(crate) fn validate(params: Option<&Value>) -> Result<ValidatedSearch, ToolEr
     let params = params.cloned().ok_or(ToolError::InvalidInput)?;
     let params =
         serde_json::from_value::<SearchParams>(params).map_err(|_| ToolError::InvalidInput)?;
-    if params.query.is_empty()
+    // Without words, a search lists entries, so it needs a day bound.
+    let day_bounded = params.day.is_some() || params.day_from.is_some() || params.day_to.is_some();
+    if (params.query.trim().is_empty() && !day_bounded)
         || params.query.len() > MAX_QUERY_BYTES
         || !(1..=MAX_LIMIT).contains(&params.limit)
         || params
@@ -84,4 +87,34 @@ pub(crate) fn validate(params: Option<&Value>) -> Result<ValidatedSearch, ToolEr
         category,
         facet_id: params.facet,
     })
+}
+
+#[cfg(all(test, not(feature = "full-tests")))]
+mod tests {
+    use serde_json::json;
+
+    use super::validate;
+
+    #[test]
+    fn a_search_without_words_needs_a_day_bound() {
+        for listed in [
+            json!({"day": "20261005"}),
+            json!({"query": "", "day": "2026-10-05"}),
+            json!({"query": "  ", "day_from": "20261001", "day_to": "20261005"}),
+            json!({"day_from": "20261001"}),
+            json!({"day_to": "20261005"}),
+        ] {
+            let validated = validate(Some(&listed)).expect("a day-bounded listing is accepted");
+            assert!(validated.query.trim().is_empty(), "{listed}");
+        }
+        for refused in [
+            json!({}),
+            json!({"query": ""}),
+            json!({"query": "   "}),
+            json!({"limit": 5}),
+        ] {
+            assert!(validate(Some(&refused)).is_err(), "{refused}");
+        }
+        assert!(validate(Some(&json!({"query": "launch"}))).is_ok());
+    }
 }

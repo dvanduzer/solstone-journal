@@ -47,6 +47,7 @@ mod references;
 mod registry;
 #[cfg(unix)]
 mod rlimit;
+pub(crate) mod segment_links;
 mod server;
 mod service_process;
 mod session;

@@ -1,0 +1,7 @@
+{"id":"61cc73a4bf7d520b6c28f68ab7f5402df357899c4613a4a6ea6dd9ea00b1804c","message_type":"snapshot","struct_type":"snapshot"}
+{"name":"var","type":"dir","path":"/var","message_type":"node","struct_type":"node"}
+{"name":"tmp","type":"dir","path":"/var/tmp","message_type":"node","struct_type":"node"}
+{"name":"offload-owned-ls-schema-261010-uiqgyzpw","type":"dir","path":"/var/tmp/offload-owned-ls-schema-261010-uiqgyzpw","message_type":"node","struct_type":"node"}
+{"name":"source","type":"dir","path":"/var/tmp/offload-owned-ls-schema-261010-uiqgyzpw/source","message_type":"node","struct_type":"node"}
+{"name":"audio.flac","type":"file","path":"/var/tmp/offload-owned-ls-schema-261010-uiqgyzpw/source/audio.flac","size":29,"message_type":"node","struct_type":"node"}
+{"name":"screen.mp4","type":"file","path":"/var/tmp/offload-owned-ls-schema-261010-uiqgyzpw/source/screen.mp4","size":30,"message_type":"node","struct_type":"node"}

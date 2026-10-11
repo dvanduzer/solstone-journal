@@ -166,7 +166,7 @@ fn retention_client_has_no_unapproved_workspace_dependents() {
 }
 
 #[test]
-fn home_uses_the_bounded_client_without_a_direct_retention_edge() {
+fn home_uses_the_bounded_client_and_owning_review_types() {
     let metadata = metadata(&repository_root());
     let home = metadata["packages"]
         .as_array()
@@ -184,8 +184,8 @@ fn home_uses_the_bounded_client_without_a_direct_retention_edge() {
     assert!(
         dependencies
             .iter()
-            .all(|dependency| dependency["name"] != RETENTION),
-        "home must not declare retention directly, including for tests"
+            .any(|dependency| dependency["name"] == RETENTION),
+        "home must use retention's owning rendered-review types"
     );
 }
 

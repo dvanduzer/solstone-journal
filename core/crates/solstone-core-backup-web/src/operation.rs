@@ -621,8 +621,9 @@ pub fn backdate_started(slot: &SharedOperationSlot, age: Duration) {
 
 #[cfg(test)]
 mod tests {
+    use super::terminal_tests::admitted_slot;
     use super::{
-        HandoffError, begin, mark_prepare_lease_expired, match_handoff, new_slot, portal_url,
+        HandoffError, mark_prepare_lease_expired, match_handoff, new_slot, portal_url,
         restore_portal_url,
     };
 
@@ -692,9 +693,14 @@ mod tests {
     #[test]
     fn match_handoff_classifies_prepare_lease_expiry_as_expired_not_invalid() {
         let slot = new_slot();
-        let begun =
-            begin(&slot, "restore_hosted", None, Some("nonce-1".into()), None).expect("begin");
-        mark_prepare_lease_expired(&slot, begun.generation);
+        *slot.lock().unwrap() = Some(admitted_slot(
+            "restore_hosted",
+            1,
+            None,
+            Some("nonce-1".into()),
+            None,
+        ));
+        mark_prepare_lease_expired(&slot, 1);
 
         let result = match_handoff(&slot, "nonce-1");
 
@@ -707,24 +713,40 @@ mod terminal_tests {
     use super::*;
 
     pub(super) fn running_slot() -> SharedOperationSlot {
-        Arc::new(Mutex::new(Some(Slot {
+        Arc::new(Mutex::new(Some(admitted_slot(
+            "restore_hosted",
+            2,
+            Some("https://example.test/restore".into()),
+            Some("test-nonce".into()),
+            Some("test-key".into()),
+        ))))
+    }
+
+    pub(super) fn admitted_slot(
+        kind: &str,
+        generation: u64,
+        portal_url: Option<String>,
+        nonce: Option<String>,
+        restore_key: Option<String>,
+    ) -> Slot {
+        Slot {
             view: Operation {
-                kind: "restore_hosted".into(),
-                phase: "restoring".into(),
+                kind: kind.into(),
+                phase: running_phase(kind).into(),
                 reason_code: None,
                 detail: None,
                 guidance: None,
                 recording_failure: None,
-                portal_url: Some("https://example.test/restore".into()),
+                portal_url,
             },
-            nonce: Some("test-nonce".into()),
-            restore_key: Some("test-key".into()),
+            nonce,
+            restore_key,
             started: Instant::now(),
-            generation: 2,
+            generation,
             worker_active: false,
             #[cfg(windows)]
             cleanup: None,
-        })))
+        }
     }
 
     pub(super) fn failure() -> Terminal {
@@ -820,8 +842,20 @@ mod terminal_tests {
         assert!(slot.lock().unwrap().as_ref().unwrap().worker_active);
         settle(&slot, 2, failure());
         assert_failure(&slot);
+        #[cfg(not(windows))]
         assert!(!is_busy(&slot));
 
+        #[cfg(windows)]
+        let next = {
+            let mut guard = slot.lock().unwrap();
+            let settled = guard.as_ref().unwrap();
+            assert!(!settled.worker_active);
+            assert!(settled.cleanup.is_none());
+            let generation = settled.generation.wrapping_add(1);
+            *guard = Some(admitted_slot("restore", generation, None, None, None));
+            generation
+        };
+        #[cfg(not(windows))]
         let next = begin(&slot, "restore", None, None, None)
             .unwrap()
             .generation;
@@ -967,20 +1001,20 @@ mod worker_tests {
 
 #[cfg(all(test, windows))]
 mod cleanup_state_tests {
+    use super::terminal_tests::admitted_slot;
     use super::*;
 
     #[test]
     fn active_worker_keeps_ownership_across_cancel_and_hosted_expiry() {
         let slot = new_slot();
-        let generation = begin(
-            &slot,
+        let generation = 1;
+        *slot.lock().unwrap() = Some(admitted_slot(
             "restore_hosted",
+            generation,
             Some("portal".into()),
             Some("nonce".into()),
             Some("key".into()),
-        )
-        .unwrap()
-        .generation;
+        ));
         assert!(start_worker(&slot, generation));
         slot.lock().unwrap().as_mut().unwrap().started =
             Instant::now() - HANDOFF_TTL - Duration::from_secs(1);
@@ -1001,6 +1035,7 @@ mod cleanup_state_tests {
         let guard = slot.lock().unwrap();
         let current = guard.as_ref().unwrap();
         assert!(!current.worker_active);
+        assert!(current.cleanup.is_none());
         assert!(
             current.nonce.is_none()
                 && current.restore_key.is_none()
@@ -1011,12 +1046,20 @@ mod cleanup_state_tests {
     #[test]
     fn stale_worker_and_recovery_cannot_clear_a_new_generation() {
         let slot = new_slot();
-        let first = begin(&slot, "rotate", None, None, None).unwrap().generation;
+        let first = 1;
+        *slot.lock().unwrap() = Some(admitted_slot("rotate", first, None, None, None));
         assert!(start_worker(&slot, first));
         finish_worker(&slot, first, Terminal::done(), Vec::new());
-        let second = begin(&slot, "restore", None, None, None)
-            .unwrap()
-            .generation;
+        let second = {
+            let mut guard = slot.lock().unwrap();
+            let settled = guard.as_ref().unwrap();
+            assert_eq!(settled.view.phase, "done");
+            assert!(!settled.worker_active);
+            assert!(settled.cleanup.is_none());
+            let generation = settled.generation.wrapping_add(1);
+            *guard = Some(admitted_slot("restore", generation, None, None, None));
+            generation
+        };
         assert!(start_worker(&slot, second));
         finish_worker(&slot, first, Terminal::error("stale"), Vec::new());
         assert!(observed_generation(&slot, Some(first)).is_err());
