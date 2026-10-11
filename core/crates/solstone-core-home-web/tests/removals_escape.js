@@ -134,7 +134,12 @@ async function boot(source, lists, responses) {
     apiJson(url, options) {
       calls.push({ url, options: options || null });
       if (url === '/app/home/api/removals') {
-        const response = listResponses[Math.min(listIndex, listResponses.length - 1)];
+        let response = listResponses[Math.min(listIndex, listResponses.length - 1)];
+        if (typeof response === 'function') response = response();
+        if (response && !Object.prototype.hasOwnProperty.call(response, 'review_context')
+            && (response.state === 'list.ready' || response.state === 'list.empty')) {
+          response = { ...response, review_context: JSON.stringify({ root_observation: 'fixture', marks: response.removals }) };
+        }
         listIndex += 1;
         return Promise.resolve(response);
       }
@@ -162,6 +167,10 @@ async function boot(source, lists, responses) {
   const card = root.children[0];
   assert(card, 'card mounted');
   card.calls = calls;
+  card.refresh = async function () {
+    for (const listener of listeners['workspace:mounted'] || []) listener({ detail: { appName: 'home' } });
+    await settle();
+  };
   return card;
 }
 
@@ -229,11 +238,60 @@ function assertDeclineOutcomeHasNoDeletingCopy(card, copy) {
   }
 }
 
+async function reviewTransportCases(source) {
+  const row = marked('same-id', 'policy', 1, 'camera');
+  const first = '{"root_observation":"root-a","marks":[{"id":"same-id","bytes":9007199254740993,"text":"quote\\\" and \\\\ and é"}]}';
+  const changed = first.replace('9007199254740993', '9007199254740994');
+  const rootChanged = first.replace('root-a', 'root-b');
+  const list = context => ({ state: 'list.ready', removals: [row], review_context: context });
+  for (const next of [changed, rootChanged, null]) {
+    const card = await boot(source, [list(first), list(next)], {});
+    clickSelect(card, row.id);
+    click(card, 'delete-selected');
+    const oldConfirm = card.controls.find(item => item.dataset.removalAction === 'confirm');
+    const oldDecline = card.controls.find(item => item.dataset.removalAction === 'decline');
+    const oldSelect = card.selects[0];
+    assert(oldConfirm && oldDecline && oldSelect);
+    await card.refresh();
+    assert(!card.innerHTML.includes('removals-card-confirm'), 'changed context clears confirmation');
+    assert(!card.innerHTML.includes(' checked'), 'changed context clears selection');
+    oldConfirm.click(); oldDecline.click(); oldSelect.click();
+    await settle();
+    assert.strictEqual(posts(card, '/app/home/api/approve').length, 0);
+    assert.strictEqual(posts(card, '/app/home/api/decline').length, 0);
+    assert(!card.innerHTML.includes(' checked'), 'detached checkbox cannot revive selection');
+  }
+  const unchanged = await boot(source, [list(first), list(first)], { approve: { state: 'approve.refused_before_start' } });
+  clickSelect(unchanged, row.id);
+  click(unchanged, 'delete-selected');
+  await unchanged.refresh();
+  assert(unchanged.innerHTML.includes(' checked'), 'unchanged context retains selection');
+  assert(unchanged.innerHTML.includes('removals-card-confirm'), 'unchanged context retains confirmation');
+  click(unchanged, 'confirm'); await settle();
+  const approved = JSON.parse(posts(unchanged, '/app/home/api/approve')[0].options.body);
+  assert.strictEqual(approved.review_context, first, 'opaque values survive outer JSON round trip');
+  assert.deepStrictEqual(approved.mark_ids, [row.id]);
+  const decline = await boot(source, list(changed), { decline: { state: 'declined.refused' } });
+  click(decline, 'decline', row.id); await settle();
+  assert.strictEqual(JSON.parse(posts(decline, '/app/home/api/decline')[0].options.body).review_context, changed);
+  let resolveOld;
+  const late = new Promise(resolve => { resolveOld = resolve; });
+  const overlap = await boot(source, [list(first), () => late, list(changed)], {});
+  clickSelect(overlap, row.id);
+  const olderRefresh = overlap.refresh();
+  await overlap.refresh();
+  resolveOld(list(first)); await olderRefresh; await settle();
+  assert(!overlap.innerHTML.includes(' checked'), 'older refresh cannot restore selection');
+  const oldMissing = await boot(source, { state: 'list.ready', removals: [row], review_context: null }, {});
+  assert(!oldMissing.controls.some(item => item.dataset.removalAction === 'approve'), 'missing context has no action fallback');
+}
+
 async function main() {
   const manifestDir = process.argv[2];
   if (!manifestDir) throw new Error('manifest directory required');
   const source = fs.readFileSync(path.join(manifestDir, 'assets/removals.js'), 'utf8');
   const copy = copyTable(source);
+  await reviewTransportCases(source);
 
   const stream = '<img src=x onerror=stream>';
   const staged = 'chronicle/<img src=x onerror=staged>';

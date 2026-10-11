@@ -767,12 +767,13 @@ runtime = "none"
 [[package_suites]]
 id = "package::solstone-core-home-web"
 package = "solstone-core-home-web"
+features = ["full-tests"]
 set = "component"
 areas = ["home"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
 
 [[package_suites]]
@@ -3022,6 +3023,19 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-home-web::review_transport"
+package = "solstone-core-home-web"
+target = "review_transport"
+set = "component"
+areas = ["home"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]

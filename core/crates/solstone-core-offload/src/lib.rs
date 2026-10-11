@@ -8,6 +8,11 @@ pub mod marks;
 pub mod measurement;
 pub mod pruning_audit;
 pub mod restore;
+// Private, uncalled coordination while durable intent publication is held.
+#[allow(dead_code)]
+mod restore_intent;
+#[allow(dead_code)]
+mod restore_prepared;
 pub mod run;
 pub mod status;
 
