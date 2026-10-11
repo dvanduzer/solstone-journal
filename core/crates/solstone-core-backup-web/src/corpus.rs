@@ -1067,6 +1067,8 @@ struct HttpScript {
     hold: Option<Arc<Hold>>,
     #[cfg(feature = "full-tests")]
     hold_after: usize,
+    #[cfg(all(test, feature = "full-tests"))]
+    hold_url_suffix: Option<&'static str>,
     #[cfg(feature = "full-tests")]
     hold_skips: AtomicUsize,
     active: AtomicUsize,
@@ -1093,6 +1095,8 @@ impl HttpScript {
             hold: None,
             #[cfg(feature = "full-tests")]
             hold_after: 0,
+            #[cfg(all(test, feature = "full-tests"))]
+            hold_url_suffix: None,
             #[cfg(feature = "full-tests")]
             hold_skips: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
@@ -1119,6 +1123,15 @@ impl HttpScript {
         Self {
             hold: Some(hold),
             hold_after: skip,
+            ..self
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    fn with_hold_for_url_suffix(self, suffix: &'static str, hold: Arc<Hold>) -> Self {
+        Self {
+            hold: Some(hold),
+            hold_url_suffix: Some(suffix),
             ..self
         }
     }
@@ -1161,8 +1174,12 @@ impl HttpTransport for HttpScript {
         let now = self.active.fetch_add(1, Ordering::AcqRel) + 1;
         self.max_active.fetch_max(now, Ordering::AcqRel);
         let _active = ActiveGuard(&self.active);
-        #[cfg(feature = "full-tests")]
-        if let Some(hold) = &self.hold {
+        #[cfg(all(test, feature = "full-tests"))]
+        if let Some(hold) = &self.hold
+            && self
+                .hold_url_suffix
+                .is_none_or(|suffix| request.url.ends_with(suffix))
+        {
             let seen = self.hold_skips.fetch_add(1, Ordering::Relaxed);
             if seen >= self.hold_after {
                 hold.arrive_and_wait().map_err(|_| HttpError::Other)?;
@@ -2358,7 +2375,7 @@ async fn handoff_binding_enables_operated_mode() {
     assert!(!rendered.contains(crate::test_support::RECOVERY_KEY));
 }
 
-#[cfg(feature = "full-tests")]
+#[cfg(all(test, feature = "full-tests"))]
 #[tokio::test]
 async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_held() {
     let root = crate::test_support::root("healthy");
@@ -2369,7 +2386,8 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
     let restic = tempfile::tempdir().unwrap();
     crate::test_support::write_ready_restic(restic.path());
     let http = Arc::new(
-        HttpScript::with_responses(vec![Ok(credentials_response())]).with_hold(hold.clone()),
+        HttpScript::with_responses(vec![Ok(credentials_response())])
+            .with_hold_for_url_suffix("/backup/credentials", hold.clone()),
     );
     let mut deps = engine_deps(
         journal_path.as_path().to_path_buf(),
@@ -2411,6 +2429,13 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
             wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
                 .await
                 .expect("fixture did not enter Hold");
+            assert!(
+                http.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.ends_with("/backup/credentials"))
+            );
             assert_eq!(
                 solstone_core_backup::load_hosted_binding(journal_path.as_path()),
                 Some(crate::test_support::hosted_binding())
@@ -2883,29 +2908,69 @@ async fn bound_restore_hosted_returns_running_then_done_while_held() {
     .await;
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 #[tokio::test]
 async fn expired_hosted_wait_clears_busy_on_status_and_begin() {
     let root = crate::test_support::root("healthy");
-    let (deps, _restic) = prepared(
-        root.path().to_path_buf(),
-        Arc::new(ScriptRunner::with_outputs(vec![])),
+    let journal_path = root.path().to_path_buf();
+    let hold = Hold::new();
+    let http = Arc::new(HttpScript::default().with_hold(hold.clone()));
+    let restic = tempfile::tempdir().unwrap();
+    crate::test_support::write_ready_restic(restic.path());
+    let deps = engine_deps(
+        journal_path.clone(),
+        Arc::new(ScriptRunner::with_outputs(init_outputs())),
+        http.clone(),
+        Some(restic.path().to_path_buf()),
     );
-    let (status, body) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["operation"]["phase"], "setting_up");
-    crate::operation::backdate_started(
-        &deps.operations,
-        crate::operation::HANDOFF_TTL + Duration::from_secs(1),
-    );
-    let (status, expired) = get_status_json(&deps).await;
-    assert_eq!(status, 200);
-    assert_eq!(expired["operation"]["phase"], "error");
-    assert_eq!(expired["operation"]["reason_code"], "expired");
-    disable_backup(root.path());
-    let (status, enable) = post_json(&deps, "/app/backup/enable", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(enable["reason_code"], Value::Null);
-    assert_eq!(enable["operation"]["kind"], "enable");
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root, restic],
+        async {
+            let (status, body) = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(body["operation"]["phase"], "setting_up");
+            let generation = fixture_generation(&deps).await;
+            wait_started_or_terminal(&hold, &deps, generation)
+                .await
+                .expect("fixture did not enter poll Hold");
+            let cancellation = http.poll_cancellations.lock().unwrap()[0].clone();
+            crate::operation::backdate_started(
+                &deps.operations,
+                crate::operation::HANDOFF_TTL + Duration::from_secs(1),
+            );
+            let (status, stopping) = get_status_json(&deps).await;
+            assert_eq!(status, 200);
+            assert_eq!(stopping["operation"]["phase"], "cancelling");
+            assert_eq!(stopping["operation"]["reason_code"], "expired");
+            assert!(stopping["operation"]["portal_url"].is_null());
+            assert!(cancellation.is_cancelled());
+            assert!(crate::operation::is_busy(&deps.operations));
+            disable_backup(&journal_path);
+            let (status, busy) = post_json(&deps, "/app/backup/enable", None).await;
+            assert_eq!(status, 400);
+            assert_eq!(busy["reason_code"], "backup_busy");
+            assert_eq!(fixture_generation(&deps).await, generation);
+
+            hold.release().await;
+            let expired = wait_terminal(&deps).await;
+            assert_eq!(expired["operation"]["phase"], "error");
+            assert_eq!(expired["operation"]["reason_code"], "expired");
+            assert!(!deps.handoff_poll_lease.load(Ordering::Acquire));
+            assert_eq!(http.active_executions(), 0);
+            let (status, enable) = post_json(&deps, "/app/backup/enable", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(enable["reason_code"], Value::Null);
+            assert_eq!(enable["operation"]["kind"], "enable");
+            assert_ne!(fixture_generation(&deps).await, generation);
+            let done = wait_terminal(&deps).await;
+            assert_eq!(done["operation"]["kind"], "enable");
+            assert_eq!(done["operation"]["phase"], "done");
+        },
+    )
+    .await;
 }
 
 #[cfg(feature = "full-tests")]
