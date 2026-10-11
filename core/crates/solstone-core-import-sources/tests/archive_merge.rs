@@ -788,8 +788,22 @@ fn facet_failure_after_staged_segments_leaves_target_unchanged() {
         error,
         ImportSourcesError::MergePublishFailed { .. }
     ));
-    assert_eq!(family_snapshot(&target), before);
-    assert!(!target.join("chronicle/20260311").exists());
+    let mut after = family_snapshot(&target);
+    // A segment claim keeps its stable lock entry even when publication rolls back.
+    assert_eq!(
+        after.remove("chronicle/20260311/120000_60.lock"),
+        Some(Vec::new())
+    );
+    assert_eq!(after, before);
+    let claimed_day = target.join("chronicle/20260311");
+    let entries = fs::read_dir(&claimed_day)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file_name(), "120000_60.lock");
+    assert!(entries[0].file_type().unwrap().is_file());
+    assert!(!claimed_day.join("120000_60").exists());
     assert!(find_named(&tree.path.join("work"), "publish-undo").is_none());
 }
 

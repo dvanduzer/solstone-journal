@@ -36,6 +36,28 @@ const PDF_WORKER_STDERR_MAX_BYTES: usize = 64 * 1024;
 const WORKER_SUCCESS_RESPONSE: &str =
     r#"{"schema":"sol-pdf/1","engine":"test","page_count":1,"pages":[{"index":1,"text":"text"}]}"#;
 
+fn only_segment_directory(stream: &Path) -> PathBuf {
+    let entries = fs::read_dir(stream)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect::<Vec<_>>();
+    let segments = entries
+        .iter()
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(segments.len(), 1, "one partial segment in {stream:?}");
+    let segment = segments[0].path();
+    let mut lock_name = segment.file_name().unwrap().to_os_string();
+    lock_name.push(".lock");
+    for entry in entries {
+        if entry.path() != segment {
+            assert!(entry.file_type().unwrap().is_file());
+            assert_eq!(entry.file_name(), lock_name);
+        }
+    }
+    segment
+}
+
 #[test]
 fn ac1_document_text_layer_imports_verbatim_with_zero_model_calls() {
     let tree = TestTree::new();
@@ -471,12 +493,7 @@ fn document_original_is_dirtied_before_a_later_raster_install_failure() {
         .join("chronicle")
         .join(day)
         .join("import.document");
-    let segment_dir = fs::read_dir(stream_dir)
-        .unwrap()
-        .next()
-        .expect("partial document segment")
-        .unwrap()
-        .path();
+    let segment_dir = only_segment_directory(&stream_dir);
     assert_eq!(
         fs::read(segment_dir.join("original.pdf")).unwrap(),
         b"source"
@@ -513,17 +530,13 @@ fn document_install_marker_failure_is_typed_terminal_and_retains_original() {
     assert!(!tree.import_dir().join("imported.json").exists());
     let days = publication.days();
     let day = &days[0];
-    let segment_dir = fs::read_dir(
-        tree.journal()
+    let segment_dir = only_segment_directory(
+        &tree
+            .journal()
             .join("chronicle")
             .join(day)
             .join("import.document"),
-    )
-    .unwrap()
-    .next()
-    .expect("partial document segment")
-    .unwrap()
-    .path();
+    );
     assert_eq!(
         fs::read(segment_dir.join("original.pdf")).unwrap(),
         b"source"
@@ -604,10 +617,8 @@ fn same_bytes_readded_after_failed_install_complete_in_the_original_segment() {
             .any(|error| error.contains("already imported"))
     );
     assert_eq!(
-        fs::read_dir(original_segment.parent().unwrap())
-            .unwrap()
-            .count(),
-        1
+        only_segment_directory(original_segment.parent().unwrap()),
+        original_segment
     );
 }
 
@@ -1413,12 +1424,7 @@ impl PublicationOperations for FakePublication {
         };
         if self.sabotage_first_raster && call == 1 {
             let stream_dir = journal.join("chronicle").join(day).join("import.document");
-            let segment_dir = fs::read_dir(stream_dir)
-                .map_err(|error| error.to_string())?
-                .next()
-                .ok_or_else(|| "missing document segment".to_owned())?
-                .map_err(|error| error.to_string())?
-                .path();
+            let segment_dir = only_segment_directory(&stream_dir);
             fs::create_dir(segment_dir.join("pages/page-0001.png"))
                 .map_err(|error| error.to_string())?;
         }

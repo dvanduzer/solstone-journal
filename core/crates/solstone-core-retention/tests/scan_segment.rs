@@ -286,3 +286,361 @@ fn checked_scan_refuses_media_symlinks_instead_of_omitting_siblings() {
     std::os::unix::fs::symlink("target", root.path().join("audio.flac")).unwrap();
     assert!(scan_segment_checked(root.path(), &ClosedHandlerSet, &JournalMedia).is_err());
 }
+
+mod bound {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use solstone_core_journal_io::JournalRoot;
+    use solstone_core_journal_io::media::{MediaDirectory, MediaPrimitive, run_with_media_hook};
+    use solstone_core_retention::scan::{scan_segment_bound, scan_segment_checked};
+
+    struct Bed {
+        temp: tempfile::TempDir,
+        directory: Arc<MediaDirectory>,
+    }
+
+    impl Bed {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir(temp.path().join("segment")).unwrap();
+            let root =
+                Arc::new(JournalRoot::open(&fs::canonicalize(temp.path()).unwrap()).unwrap());
+            let directory = MediaDirectory::open(root, Path::new("segment")).unwrap();
+            Self { temp, directory }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.temp.path().join("segment")
+        }
+
+        fn write(&self, name: &str, bytes: impl AsRef<[u8]>) {
+            fs::write(self.path().join(name), bytes).unwrap();
+        }
+
+        fn scan(
+            &self,
+            maximum: usize,
+        ) -> std::io::Result<solstone_core_retention::scan::CheckedSegment> {
+            scan_segment_bound(&self.directory, &ClosedHandlerSet, &JournalMedia, maximum)
+        }
+    }
+
+    #[test]
+    fn bound_empty_exact_cap_and_all_entry_overflow_are_distinct() {
+        let bed = Bed::new();
+        assert!(bed.scan(0).unwrap().files().is_empty());
+        bed.write("audio.flac", b"1234567");
+        bed.write("photo.png", b"12345");
+        bed.write("screen.mp4", b"123");
+        bed.write("notes.txt", b"ignored");
+        fs::create_dir(bed.path().join("subdir")).unwrap();
+        assert!(bed.scan(0).is_err());
+        assert!(bed.scan(3).is_err());
+        assert!(bed.scan(4).is_err());
+        let observed = bed.scan(5).unwrap();
+        assert_eq!(
+            observed
+                .files()
+                .iter()
+                .map(|file| (file.name.as_str(), file.size))
+                .collect::<Vec<_>>(),
+            vec![("audio.flac", 7), ("photo.png", 5), ("screen.mp4", 3)]
+        );
+        for file in observed.files() {
+            let entry = observed.bound_entry(&file.name).unwrap();
+            assert_eq!(entry.name, OsStr::new(file.name.as_str()));
+            assert_eq!(entry.size, file.size);
+            assert_eq!(
+                *entry,
+                bed.directory
+                    .read_prefix(&entry.name, 0)
+                    .unwrap()
+                    .unwrap()
+                    .entry
+            );
+        }
+        assert!(observed.bound_entry(&content("notes.txt")).is_none());
+    }
+
+    #[test]
+    fn bound_and_path_facts_match_with_independent_header_and_marker_parsing() {
+        let bed = Bed::new();
+        bed.write("audio.flac", b"1234567");
+        let header = format!(
+            "{{\"_solstone_processing\": {{\"schema\": \"{}\", \"state\": \"analyzed\"}}}}",
+            vocab::SCHEMA
+        );
+        for (sidecar, record, rows) in [
+            (format!("{header}\n\n  \n{{\"start\": 0}}\n"), true, true),
+            (format!("{header}\n{{\"timestamp\": 0}}\n"), true, false),
+            ("{\"start\": 0}\n".into(), false, false),
+            ("invalid header\n{\"start\": 0}\n".into(), false, true),
+            (format!("{header}\ninvalid row\n"), true, false),
+        ] {
+            bed.write("audio.jsonl", sidecar);
+            let bound = bed.scan(2).unwrap();
+            let path = scan_segment_checked(&bed.path(), &ClosedHandlerSet, &JournalMedia).unwrap();
+            let b = &bound.files()[0];
+            let p = &path.files()[0];
+            assert_eq!(b.name, p.name);
+            assert_eq!(b.size, p.size);
+            assert_eq!(b.sidecar.record, p.sidecar.record);
+            assert_eq!(b.sidecar.has_analysis_row, p.sidecar.has_analysis_row);
+            assert_eq!(b.sidecar.record.is_some(), record);
+            assert_eq!(b.sidecar.has_analysis_row, rows);
+            assert!(bound.bound_entry(&b.name).is_some());
+            assert!(path.bound_entry(&p.name).is_none());
+        }
+        fs::remove_file(bed.path().join("audio.jsonl")).unwrap();
+        let missing = bed.scan(1).unwrap();
+        assert!(missing.files()[0].sidecar.record.is_none());
+        assert!(!missing.files()[0].sidecar.has_analysis_row);
+    }
+
+    #[test]
+    fn bound_prefix_accepts_long_transcripts_and_does_not_manufacture_oversize_headers() {
+        let bed = Bed::new();
+        bed.write("audio.flac", b"1234567");
+        let long = format!(
+            "{{}}\n{{\"start\": 0}}\n{}",
+            "x".repeat(READ_BOUND as usize + 1024)
+        );
+        bed.write("audio.jsonl", long);
+        let prefix = bed
+            .directory
+            .read_prefix(OsStr::new("audio.jsonl"), READ_BOUND as usize)
+            .unwrap()
+            .unwrap();
+        assert!(!prefix.complete);
+        assert_eq!(prefix.bytes.len(), READ_BOUND as usize);
+        assert!(bed.scan(2).unwrap().files()[0].sidecar.has_analysis_row);
+        bed.write(
+            "audio.jsonl",
+            format!(
+                "{{\"pad\": \"{}\", \"_solstone_processing\": {{}}}}\n{{\"start\": 0}}\n",
+                "x".repeat(READ_BOUND as usize + 1024)
+            ),
+        );
+        let observed = bed.scan(2).unwrap();
+        assert!(observed.files()[0].sidecar.record.is_none());
+        assert!(!observed.files()[0].sidecar.has_analysis_row);
+    }
+
+    #[test]
+    fn bound_nonplain_raw_or_sidecar_and_invalid_utf8_refuse() {
+        let bed = Bed::new();
+        fs::create_dir(bed.path().join("audio.flac")).unwrap();
+        assert!(bed.scan(1).is_err());
+        fs::remove_dir(bed.path().join("audio.flac")).unwrap();
+        bed.write("audio.flac", b"1234567");
+        fs::create_dir(bed.path().join("audio.jsonl")).unwrap();
+        assert!(bed.scan(2).is_err());
+        fs::remove_dir(bed.path().join("audio.jsonl")).unwrap();
+        bed.write("audio.jsonl", [0xff, b'\n']);
+        assert!(bed.scan(2).is_err());
+        bed.write("audio.jsonl", b"{}\n{\"start\": 0}\n");
+        assert!(bed.scan(2).unwrap().files()[0].sidecar.has_analysis_row);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_symlink_raw_sidecar_and_non_utf8_name_refuse() {
+        use std::os::unix::ffi::OsStringExt;
+        let bed = Bed::new();
+        bed.write("target", b"1234567");
+        std::os::unix::fs::symlink("target", bed.path().join("audio.flac")).unwrap();
+        assert!(bed.scan(2).is_err());
+        fs::remove_file(bed.path().join("audio.flac")).unwrap();
+        bed.write("audio.flac", b"1234567");
+        std::os::unix::fs::symlink("target", bed.path().join("audio.jsonl")).unwrap();
+        assert!(bed.scan(3).is_err());
+        fs::remove_file(bed.path().join("audio.jsonl")).unwrap();
+        let odd = bed.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        fs::write(&odd, b"ignored but unbound name").unwrap();
+        assert!(bed.scan(3).is_err());
+        fs::remove_file(odd).unwrap();
+        assert_eq!(bed.scan(2).unwrap().files().len(), 1);
+    }
+
+    #[test]
+    fn bound_final_coverage_refuses_sidecar_appearing_after_initial_listing() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let bed = Bed::new();
+        bed.write("audio.flac", b"1234567");
+        let (unchanged, fired) =
+            run_with_media_hook(MediaPrimitive::AfterPrefixRead, || Ok(()), || bed.scan(2));
+        assert!(fired && unchanged.is_ok());
+        let path = bed.path().join("audio.jsonl");
+        let mutated = Rc::new(Cell::new(false));
+        let completed = Rc::clone(&mutated);
+        let (changed, fired) = run_with_media_hook(
+            MediaPrimitive::AfterPrefixRead,
+            move || {
+                fs::write(path, b"{}\n{\"start\": 0}\n")?;
+                completed.set(true);
+                Ok(())
+            },
+            || bed.scan(2),
+        );
+        assert!(fired && mutated.get());
+        assert!(changed.is_err());
+        assert!(bed.scan(2).unwrap().files()[0].sidecar.has_analysis_row);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_raw_same_length_mutation_and_replacement_during_read_refuse() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        for replace in [false, true] {
+            let bed = Bed::new();
+            bed.write("audio.flac", b"1234567");
+            let path = bed.path().join("audio.flac");
+            let mutated = Rc::new(Cell::new(false));
+            let completed = Rc::clone(&mutated);
+            let (result, fired) = run_with_media_hook(
+                MediaPrimitive::BeforePrefixRead,
+                move || {
+                    if replace {
+                        fs::rename(&path, path.with_extension("moved"))?;
+                    }
+                    fs::write(path, b"7654321")?;
+                    completed.set(true);
+                    Ok(())
+                },
+                || bed.scan(2),
+            );
+            assert!(fired && mutated.get());
+            assert!(result.is_err());
+            assert_eq!(bed.scan(2).unwrap().files()[0].size, 7);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_sidecar_list_read_mismatch_and_late_previous_sidecar_change_refuse() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let bed = Bed::new();
+        bed.write("a.flac", b"1234567");
+        bed.write("a.jsonl", b"{}\n{\"start\": 0}\n");
+        let path = bed.path().join("a.jsonl");
+        let mutated = Rc::new(Cell::new(false));
+        let completed = Rc::clone(&mutated);
+        let (result, fired) = run_with_media_hook(
+            MediaPrimitive::AfterPrefixRead,
+            move || {
+                fs::write(path, b"{}\n{\"start\": 1}\n")?;
+                completed.set(true);
+                Ok(())
+            },
+            || bed.scan(2),
+        );
+        assert!(fired && mutated.get());
+        assert!(result.is_err());
+        assert!(bed.scan(2).is_ok());
+
+        bed.write("z.flac", b"1234567");
+        let changed = Cell::new(false);
+        let classifier = |name: &ContentName| {
+            if name.as_str() == "z.flac" {
+                fs::write(bed.path().join("a.jsonl"), b"{}\n{\"start\": 0}\n").unwrap();
+                changed.set(true);
+            }
+            solstone_core_retention::content::MediaClassifier::is_owner_media(&JournalMedia, name)
+        };
+        assert!(scan_segment_bound(&bed.directory, &ClosedHandlerSet, &classifier, 3).is_err());
+        assert!(changed.get());
+        assert_eq!(bed.scan(3).unwrap().files().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_directory_and_root_replacement_refuse_even_identical_contents() {
+        let bed = Bed::new();
+        bed.write("audio.flac", b"1234567");
+        fs::rename(bed.path(), bed.temp.path().join("old-segment")).unwrap();
+        fs::create_dir(bed.path()).unwrap();
+        bed.write("audio.flac", b"1234567");
+        assert!(bed.scan(1).is_err());
+        let current = Bed::new();
+        current.write("audio.flac", b"1234567");
+        let parent = current.temp.path().parent().unwrap();
+        let moved = parent.join(format!(
+            "root-held-{}",
+            current.temp.path().file_name().unwrap().to_string_lossy()
+        ));
+        fs::rename(current.temp.path(), &moved).unwrap();
+        fs::create_dir(current.temp.path()).unwrap();
+        fs::create_dir(current.path()).unwrap();
+        current.write("audio.flac", b"1234567");
+        assert!(current.scan(1).is_err());
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn bound_all_siblings_feed_existing_independent_group_decisions() {
+        use chrono::{TimeZone, Utc};
+        use serde_json::json;
+        use solstone_core_journal_io::paths::SegmentLayout;
+        use solstone_core_retention::grouped::{DecisionPurpose, GroupVerdict, inspect_grouped};
+        use solstone_core_retention::policy::{Days, policy_from_retention};
+        use solstone_core_retention::receipt::Target;
+        let bed = Bed::new();
+        for (name, state, row) in [
+            ("a", "analyzed", true),
+            ("blocked", "pending", false),
+            ("empty", "empty", false),
+        ] {
+            bed.write(&format!("{name}.flac"), b"1234567");
+            let mut record = json!({"schema": vocab::SCHEMA, "handler": "transcribe", "state": state,
+                "input_size": 7, "attempted_at": "2026-10-10T00:00:00Z"});
+            if state == "empty" {
+                record["reason_code"] = json!("no_speech");
+            }
+            bed.write(
+                &format!("{name}.jsonl"),
+                format!(
+                    "{}\n{}",
+                    json!({"_solstone_processing": record}),
+                    if row { "{\"start\":0}\n" } else { "" }
+                ),
+            );
+        }
+        let observed = bed.scan(6).unwrap();
+        let mut policy = policy_from_retention(json!({}).as_object().unwrap());
+        policy.minimum_age = Days(90);
+        let target = Target {
+            day: "20261010".into(),
+            stream: "_default".into(),
+            dir: "prefix_120000_60_suffix".into(),
+        };
+        let now = Utc.with_ymd_and_hms(2026, 10, 10, 1, 0, 0).unwrap();
+        let result = inspect_grouped(
+            &observed,
+            &target,
+            SegmentLayout::Named,
+            &policy,
+            now.date_naive(),
+            now,
+            DecisionPurpose::OffloadProposal,
+        );
+        assert_eq!(result.layout(), SegmentLayout::Named);
+        assert_eq!(result.ordinary().members().len(), 2);
+        assert!(matches!(
+            result.ordinary().verdict(),
+            GroupVerdict::Unproven(_)
+        ));
+        assert_eq!(
+            result
+                .eligible()
+                .map(|file| file.name())
+                .collect::<Vec<_>>(),
+            vec!["empty.flac"]
+        );
+    }
+}
