@@ -585,7 +585,7 @@ testCase('offload byte units are binary, matching settings’ unit family (g3-10
   assert.ok(!source.includes('"mb_suffix": "MB"'), 'no leftover decimal MB suffix');
 });
 
-asyncCase('offload current results stay distinct from historical success through refresh', async () => {
+asyncCase('offload history stays distinct from current operation effects through refresh', async () => {
   const earlier = 1760000000;
   const current = 1770000000;
   let payload = {
@@ -593,8 +593,14 @@ asyncCase('offload current results stay distinct from historical success through
     last_offload: { status: 'stalled', time: current, reason: 'confirm_failed', last_ok_time: earlier },
     last_verification: { status: 'error', time: current, reason: 'timeout', last_ok_time: earlier },
   };
+  const currentOperation = offloadRestoreOperation({
+    status: 'partial', files_restored: 1, bytes_restored: 2 * 1024 * 1024,
+    files: [{ day: '20261010', stream: 'stream', segment: 'segment', name: 'audio.flac',
+      disposition: 'published', files_restored: 1, bytes_restored: 2 * 1024 * 1024,
+      evidence: { completed: false, hold: { detail_available: false } } }],
+  });
   const harness = createHarness({ respond(call) {
-    if (call.url === '/app/backup/status') return response({ ...status(), enabled: true, recovery_key_confirmed: true });
+    if (call.url === '/app/backup/status') return response({ ...status(currentOperation), enabled: true, recovery_key_confirmed: true });
     if (['/app/backup/offload/status', '/app/backup/offload/config'].includes(call.url)) return response(payload);
   } });
   await ready(harness);
@@ -607,7 +613,20 @@ asyncCase('offload current results stay distinct from historical success through
   assert.strictEqual(harness.runSuccessTime.getAttribute('title'), title(earlier));
   assert.strictEqual(harness.verifySuccessTime.getAttribute('title'), title(earlier));
   assert.ok(!harness.runHistory.hidden && !harness.verifyHistory.hidden);
-  assert.ok(!harness.stallReason.hidden && harness.stallReason.textContent);
+  assert.ok(harness.stallReason.hidden);
+  assert.strictEqual(harness.stallReason.textContent, '');
+  const currentReport = restoreReportNodes(harness);
+  const effects = currentReport.summary.textContent;
+  const fileRows = currentReport.rows.children.map((row) => row.textContent);
+  function currentEffectsRemain() {
+    assert.ok(!currentReport.container.hidden);
+    assert.strictEqual(currentReport.summary.textContent, effects);
+    assert.deepStrictEqual(currentReport.rows.children.map((row) => row.textContent), fileRows);
+    assert.strictEqual(currentReport.rows.children[0].getAttribute('data-restore-disposition'), 'published');
+  }
+  assert.ok(effects.includes('2 MiB'));
+  assert.strictEqual(fileRows.length, 1);
+  currentEffectsRemain();
   const failedOffload = harness.lastOffload.textContent;
   const failedVerify = harness.lastVerify.textContent;
 
@@ -620,6 +639,9 @@ asyncCase('offload current results stay distinct from historical success through
   assert.notStrictEqual(harness.lastOffload.textContent, failedOffload);
   assert.notStrictEqual(harness.lastVerify.textContent, failedVerify);
 
+  currentEffectsRemain();
+  harness.stallReason.hidden = false;
+  harness.stallReason.textContent = 'stale warning';
   const lockedOffload = harness.lastOffload.textContent;
   const lockedVerify = harness.lastVerify.textContent;
   payload = { ...payload,
@@ -629,6 +651,10 @@ asyncCase('offload current results stay distinct from historical success through
   click(harness.saveOffload);
   await settle();
   assert.notStrictEqual(harness.lastOffload.textContent, lockedOffload);
+  assert.ok(harness.stallReason.hidden);
+  assert.strictEqual(harness.stallReason.textContent, '');
+  assert.strictEqual(harness.lastOffload.getAttribute('title'), title(current));
+  currentEffectsRemain();
   assert.notStrictEqual(harness.lastVerify.textContent, lockedVerify);
   const unknownReason = harness.lastOffload.textContent;
   payload = { ...payload, last_offload: { ...payload.last_offload, reason: null } };
@@ -642,6 +668,7 @@ asyncCase('offload current results stay distinct from historical success through
   };
   click(harness.saveOffload);
   await settle();
+  currentEffectsRemain();
   assert.strictEqual(harness.lastOffload.getAttribute('data-result-status'), 'ok');
   assert.strictEqual(harness.lastVerify.getAttribute('data-result-status'), 'ok');
   assert.strictEqual(harness.lastOffload.getAttribute('title'), title(current + 10));
@@ -654,6 +681,7 @@ asyncCase('offload current results stay distinct from historical success through
   payload = { ...payload, last_offload: null, last_verification: null };
   click(harness.saveOffload);
   await settle();
+  currentEffectsRemain();
   for (const element of [harness.lastOffload, harness.lastVerify]) {
     assert.strictEqual(element.getAttribute('data-result-status'), 'missing');
     assert.ok(!element.hasAttribute('title'));
@@ -670,6 +698,7 @@ asyncCase('offload current results stay distinct from historical success through
   };
   click(harness.saveOffload);
   await settle();
+  currentEffectsRemain();
   assert.strictEqual(harness.lastOffload.getAttribute('data-result-status'), 'unknown');
   assert.strictEqual(harness.lastVerify.getAttribute('data-result-status'), 'missing');
   assert.strictEqual(harness.lastOffload.getAttribute('title'), title(current));
