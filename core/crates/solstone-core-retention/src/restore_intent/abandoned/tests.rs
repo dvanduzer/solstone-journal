@@ -114,30 +114,56 @@ fn unpublished_restore_is_undone_and_owner_deletion_then_proceeds() {
 }
 
 #[test]
-fn published_restores_are_held_and_never_touched() {
-    for (content, expected) in [
-        (RESTORED, AbandonedRestoreHold::PublishedAwaitingCompletion),
-        (
-            &b"other content"[..],
-            AbandonedRestoreHold::PublishedContentMismatch,
-        ),
-    ] {
+fn exactly_published_restore_is_released_and_deletion_then_proceeds() {
+    for linked in [true, false] {
         let interrupted = interrupted();
         let published = interrupted.segment.join("a.flac");
-        fs::write(&published, content).unwrap();
+        if linked {
+            // Crash right after the create-only link, before its outcome persisted.
+            fs::hard_link(interrupted.stage.join("payload"), &published).unwrap();
+        } else {
+            fs::write(&published, RESTORED).unwrap();
+        }
         let outcome = recover(&interrupted);
         assert_eq!(outcome.len(), 1);
         assert_eq!(outcome[0].operation_id.as_deref(), Some(OPERATION));
-        assert_eq!(outcome[0].outcome, Err(expected));
-        let held = delete(&interrupted);
-        assert!(held.targets[0].removed.is_empty());
-        assert_eq!(fs::read(&published).unwrap(), content);
         assert_eq!(
-            fs::read(interrupted.stage.join("payload")).unwrap(),
-            RESTORED
+            outcome[0].outcome,
+            Ok(AbandonedRestoreRelease::PublishedExact)
         );
-        assert!(interrupted.intent.exists());
+        assert_eq!(fs::read(&published).unwrap(), RESTORED);
+        assert!(!interrupted.stage.exists());
+        assert!(!interrupted.intent.exists());
+        // Nothing was recorded: the ledger and marks were never written.
+        assert!(
+            !interrupted
+                .journal
+                .join("health/retention-marks.json")
+                .exists()
+        );
+        let removed = delete(&interrupted);
+        assert!(removed.targets[0].not_removed.is_empty(), "{removed:?}");
     }
+}
+
+#[test]
+fn mismatched_published_file_is_held_and_never_touched() {
+    let interrupted = interrupted();
+    let published = interrupted.segment.join("a.flac");
+    fs::write(&published, b"other content").unwrap();
+    let outcome = recover(&interrupted);
+    assert_eq!(
+        outcome[0].outcome,
+        Err(AbandonedRestoreHold::PublishedContentMismatch)
+    );
+    let held = delete(&interrupted);
+    assert!(held.targets[0].removed.is_empty());
+    assert_eq!(fs::read(&published).unwrap(), b"other content");
+    assert_eq!(
+        fs::read(interrupted.stage.join("payload")).unwrap(),
+        RESTORED
+    );
+    assert!(interrupted.intent.exists());
 }
 
 #[test]

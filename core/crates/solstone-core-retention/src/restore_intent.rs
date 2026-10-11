@@ -27,7 +27,9 @@ use crate::archive_catalog::{
 };
 
 mod abandoned;
-pub use abandoned::{AbandonedRestore, AbandonedRestoreHold, recover_abandoned_restores};
+pub use abandoned::{
+    AbandonedRestore, AbandonedRestoreHold, AbandonedRestoreRelease, recover_abandoned_restores,
+};
 
 const INTENT_VERSION: u32 = 1;
 
