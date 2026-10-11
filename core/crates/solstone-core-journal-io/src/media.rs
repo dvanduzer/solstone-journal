@@ -43,6 +43,7 @@ pub enum MediaPrimitive {
     StageUnlink,
     StageRemove,
     Completion,
+    ArchiveAccessGap,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -182,6 +183,23 @@ impl MediaDirectory {
         self.inner.identity()
     }
 
+    /// Lossless identity of this admitted directory for equality with other
+    /// retained native capabilities. This does not perform fresh validation.
+    pub fn object_identity(&self) -> crate::journal_root::ObjectIdentity {
+        match self.identity() {
+            #[cfg(unix)]
+            MediaIdentity::Unix { device, inode } => {
+                crate::journal_root::ObjectIdentity::from_device_inode(device, inode)
+            }
+            #[cfg(windows)]
+            MediaIdentity::Windows { volume, file_id } => {
+                crate::journal_root::ObjectIdentity::from_volume_and_file_id(volume, file_id)
+            }
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("retained native directory has the current platform identity"),
+        }
+    }
+
     /// Diagnostic spelling only, unsuitable for helper targets or cleanup.
     pub fn diagnostic_path(&self) -> &Path {
         self.inner.path()
@@ -242,8 +260,11 @@ impl<T> std::fmt::Debug for OwnedMediaFailure<T> {
 }
 
 struct Leaf {
+    name: OsString,
     file: File,
     identity: Option<MediaIdentity>,
+    #[cfg(windows)]
+    mutation_access: bool,
 }
 
 /// Exactly one private sibling stage. Drop only closes handles, never unlinks.
@@ -251,12 +272,12 @@ pub struct MediaStage {
     parent: Arc<MediaDirectory>,
     name: OsString,
     directory: Option<Arc<MediaDirectory>>,
-    leaf: Option<Leaf>,
+    leaf: Option<Box<Leaf>>,
     removed: bool,
     #[cfg(windows)]
     published: bool,
     #[cfg(windows)]
-    payload_delete_pending: bool,
+    payload_delete_pending: Option<OsString>,
     #[cfg(windows)]
     directory_delete_pending: bool,
 }
@@ -285,7 +306,7 @@ impl MediaStage {
             #[cfg(windows)]
             published: false,
             #[cfg(windows)]
-            payload_delete_pending: false,
+            payload_delete_pending: None,
             #[cfg(windows)]
             directory_delete_pending: false,
         };
@@ -324,15 +345,27 @@ impl MediaStage {
     }
 
     /// Create the sole fresh, empty, offset-zero payload and transfer stage ownership.
-    pub fn create_target(mut self) -> Result<OwnedMediaTarget, OwnedMediaFailure<Self>> {
+    pub fn create_target(self) -> Result<OwnedMediaTarget, OwnedMediaFailure<Self>> {
+        self.create_named_target(OsStr::new("payload"))
+    }
+
+    /// Create a fresh target retaining the original archive basename.
+    pub fn create_named_target(
+        mut self,
+        name: &OsStr,
+    ) -> Result<OwnedMediaTarget, OwnedMediaFailure<Self>> {
         let result = (|| {
+            plain_name(name)?;
             let directory = self.directory.as_ref().ok_or_else(changed)?;
             directory.revalidate()?;
-            let file = platform::create_file(&directory.inner, OsStr::new("payload"))?;
-            self.leaf = Some(Leaf {
+            let file = platform::create_file(&directory.inner, name)?;
+            self.leaf = Some(Box::new(Leaf {
+                name: name.to_owned(),
                 file,
                 identity: None,
-            });
+                #[cfg(windows)]
+                mutation_access: true,
+            }));
             let leaf = self.leaf.as_mut().expect("created leaf retained");
             leaf.identity = Some(platform::identity(&leaf.file)?);
             if leaf.file.metadata()?.len() != 0 || leaf.file.stream_position()? != 0 {
@@ -376,10 +409,10 @@ impl MediaStage {
         directory.revalidate()?;
         if let Some(leaf) = &self.leaf {
             let identity = leaf.identity.ok_or_else(changed)?;
-            platform::check_leaf(&directory.inner, OsStr::new("payload"), identity)?;
+            platform::check_leaf(&directory.inner, &leaf.name, identity)?;
             step(MediaPrimitive::StageUnlink)?;
-            platform::check_leaf(&directory.inner, OsStr::new("payload"), identity)?;
-            platform::remove_leaf(&directory.inner, OsStr::new("payload"), &leaf.file)?;
+            platform::check_leaf(&directory.inner, &leaf.name, identity)?;
+            platform::remove_leaf(&directory.inner, &leaf.name, &leaf.file)?;
             self.leaf = None;
         }
         step(MediaPrimitive::StageRemove)?;
@@ -405,18 +438,22 @@ impl MediaStage {
         // A successful rename made this handle live destination content. Keep
         // it retained; cleanup must never set its delete disposition.
         if !self.published {
-            if let Some(leaf) = &self.leaf {
+            if let Some(leaf) = &mut self.leaf {
                 let identity = leaf.identity.ok_or_else(changed)?;
-                platform::check_leaf(&directory.inner, OsStr::new("payload"), identity)?;
+                if !leaf.mutation_access {
+                    platform::transition_access(&mut leaf.file, true)?;
+                    leaf.mutation_access = true;
+                }
+                platform::check_leaf(&directory.inner, &leaf.name, identity)?;
                 step(MediaPrimitive::StageUnlink)?;
-                platform::check_leaf(&directory.inner, OsStr::new("payload"), identity)?;
+                platform::check_leaf(&directory.inner, &leaf.name, identity)?;
                 platform::mark_delete(&leaf.file)?;
-                self.payload_delete_pending = true;
+                self.payload_delete_pending = Some(leaf.name.clone());
                 self.leaf = None; // Close our owned handle before confirming absence.
             }
-            if self.payload_delete_pending {
-                platform::ensure_absent(&directory.inner, OsStr::new("payload"))?;
-                self.payload_delete_pending = false;
+            if let Some(name) = &self.payload_delete_pending {
+                platform::ensure_absent(&directory.inner, name)?;
+                self.payload_delete_pending = None;
             }
         }
         step(MediaPrimitive::StageRemove)?;
@@ -444,6 +481,11 @@ pub struct HelperTransport<'a> {
 }
 
 impl OwnedMediaTarget {
+    /// Actual retained destination root; observations do not mint this handle.
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.stage.parent.inner.journal_root()
+    }
+
     pub fn identity(&self) -> MediaIdentity {
         self.identity
     }
@@ -544,7 +586,7 @@ impl OwnedMediaTarget {
         if platform::identity(&leaf.file)? != self.identity() {
             return Err(changed());
         }
-        platform::check_leaf(&directory.inner, OsStr::new("payload"), self.identity())
+        platform::check_leaf(&directory.inner, &leaf.name, self.identity())
     }
 
     fn prepare(mut self, expected: &MediaDigest) -> Result<PreparedMedia, OwnedMediaFailure<Self>> {
@@ -585,6 +627,65 @@ pub struct PreparedMedia {
     target: OwnedMediaTarget,
     digest: MediaDigest,
     stamp: platform::Stamp,
+}
+
+/// Read-only helper input borrowed from an immutable prepared source. The
+/// caller brackets the actual archive/readback operation with revalidation.
+pub struct ArchiveSource<'a> {
+    prepared: &'a PreparedMedia,
+    path: PathBuf,
+}
+
+impl ArchiveSource<'_> {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn name(&self) -> &OsStr {
+        &self
+            .prepared
+            .target
+            .stage
+            .leaf
+            .as_ref()
+            .expect("prepared leaf")
+            .name
+    }
+
+    pub fn digest(&self) -> &MediaDigest {
+        self.prepared.digest()
+    }
+
+    pub fn identity(&self) -> MediaIdentity {
+        self.prepared.identity()
+    }
+
+    /// Pass this exact descriptor through the existing helper pass_fds adapter.
+    #[cfg(unix)]
+    pub fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsFd;
+            Some(
+                self.prepared
+                    .target
+                    .stage
+                    .directory
+                    .as_ref()
+                    .expect("prepared stage")
+                    .inner
+                    .as_fd(),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.prepared.revalidate_source()
+    }
 }
 
 impl std::fmt::Debug for PreparedMedia {
@@ -636,6 +737,46 @@ pub struct PublicationReceipt {
 }
 
 impl PreparedMedia {
+    /// Borrow an original-basename read-only input; no writable clone escapes.
+    /// A successful helper exit alone does not establish archive recoverability.
+    pub fn archive_source(&mut self) -> io::Result<ArchiveSource<'_>> {
+        self.check_source_binding()?;
+        #[cfg(windows)]
+        {
+            let leaf = self.target.stage.leaf.as_mut().ok_or_else(changed)?;
+            // Even a failed transition may have closed mutation access. Keep
+            // that uncertainty until a fresh retained-object admission succeeds.
+            leaf.mutation_access = false;
+            platform::transition_access(&mut leaf.file, false)?;
+        }
+        self.revalidate_source()?;
+        let directory = self.target.stage.directory.as_ref().ok_or_else(changed)?;
+        let leaf = self.target.stage.leaf.as_ref().ok_or_else(changed)?;
+        let path = platform::archive_path(&directory.inner, &leaf.name)?;
+        Ok(ArchiveSource {
+            prepared: self,
+            path,
+        })
+    }
+
+    fn revalidate_source(&self) -> io::Result<()> {
+        self.check_source_binding()?;
+        let mut reader = &self.target.stage.leaf.as_ref().ok_or_else(changed)?.file;
+        reader.seek(SeekFrom::Start(0))?;
+        if stream(&mut reader, &mut io::sink(), Some(self.digest.size))? != self.digest {
+            return Err(changed());
+        }
+        self.check_source_binding()
+    }
+
+    fn check_source_binding(&self) -> io::Result<()> {
+        self.target.revalidate()?;
+        let file = &self.target.stage.leaf.as_ref().ok_or_else(changed)?.file;
+        if platform::stamp(file)? != self.stamp {
+            return Err(changed());
+        }
+        Ok(())
+    }
     pub fn digest(&self) -> &MediaDigest {
         &self.digest
     }
@@ -652,7 +793,11 @@ impl PreparedMedia {
         let mut receipt = PublicationReceipt {
             effect: PublicationEffect::NotPublished,
             confirmation: Confirmation::Unverified,
-            file_durability: Durability::Synced,
+            file_durability: if cfg!(windows) {
+                Durability::Unproven
+            } else {
+                Durability::Synced
+            },
             parent_durability: Durability::Unproven,
             cleanup: Cleanup::Pending,
             identity: None,
@@ -661,6 +806,30 @@ impl PreparedMedia {
         let result = (|| {
             plain_name(name)?;
             platform::supported_mutation()?;
+            #[cfg(windows)]
+            {
+                let leaf = self.target.stage.leaf.as_mut().ok_or_else(changed)?;
+                if !leaf.mutation_access {
+                    platform::transition_access(&mut leaf.file, true)?;
+                    leaf.mutation_access = true;
+                }
+                // The sharing transition briefly permits other writers.
+                // ReFS stamps can remain unchanged after a same-size write.
+                // Repeat on retries, including after a prior digest refusal.
+                self.revalidate_source()?;
+                // A same-content rewrite during the bridge can invalidate the
+                // preparation flush even when the digest and stamp still match.
+                step(MediaPrimitive::FileSync)?;
+                self.target
+                    .stage
+                    .leaf
+                    .as_ref()
+                    .ok_or_else(changed)?
+                    .file
+                    .sync_all()?;
+                self.check_source_binding()?;
+                receipt.file_durability = Durability::Synced;
+            }
             self.target.revalidate()?;
             if platform::stamp(&self.target.stage.leaf.as_ref().expect("prepared leaf").file)?
                 != self.stamp
@@ -687,7 +856,7 @@ impl PreparedMedia {
             destination.revalidate()?;
             match platform::publish(
                 &directory.inner,
-                OsStr::new("payload"),
+                &self.target.stage.leaf.as_ref().expect("prepared leaf").name,
                 &self.target.stage.leaf.as_ref().expect("prepared leaf").file,
                 &destination.inner,
                 name,

@@ -48,6 +48,10 @@ impl AsFd for Directory {
 }
 
 impl Directory {
+    pub(super) fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+
     pub(super) fn open(root: Arc<JournalRoot>, names: &[OsString]) -> io::Result<Self> {
         root.revalidate_canonical_binding()
             .map_err(io::Error::other)?;
@@ -163,6 +167,18 @@ impl Directory {
 
 pub(super) fn supported_mutation() -> io::Result<()> {
     Ok(())
+}
+
+pub(super) fn archive_path(directory: &Directory, name: &OsStr) -> io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        Ok(PathBuf::from(format!("/proc/self/fd/{}", directory.as_fd().as_raw_fd())).join(name))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(directory.path().join(name))
+    }
 }
 
 pub(super) fn identity(file: &File) -> io::Result<MediaIdentity> {

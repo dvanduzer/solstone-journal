@@ -164,7 +164,7 @@
         "why": "🔴 the honesty probe: the full status view an owner's page renders from"
       },
       {
-        "body_sha256": "c1216953aa43dbc04e8f9689f9e9b4038e112a9249010b1b42d0ce246cac8a4d",
+        "body_sha256": "a44fa8b1fadf41ace15c40558c4ba43a093a9879352d82745921933c43a08a9d",
         "body_sha256_basis": "canonical-json",
         "content_type": "application/json",
         "json": {
@@ -175,10 +175,17 @@
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": []
+            "unreadable_ledgers": [],
+            "known_bytes": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "known_days": 0,
+            "complete": true,
+            "unbound_files": 0,
+            "unknown_files": 0,
+            "present_files": 0
           },
           "days": [],
-          "has_ambiguous_ledger_matches": false,
           "device": {
             "free_bytes": 250000000000,
             "total_bytes": 1000000000000
@@ -219,19 +226,29 @@
           },
           "operation": null,
           "pending_release": {
-            "total_bytes": 0,
-            "total_days": 0,
-            "total_files": 0,
-            "total_segments": 0
+            "total_bytes": null,
+            "total_days": null,
+            "total_files": null,
+            "total_segments": null
           },
           "raw_media": {
             "total_bytes": 0,
-            "total_files": 0
+            "total_files": 0,
+            "known_bytes": 0,
+            "known_files": 0,
+            "complete": true,
+            "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
+          },
+          "proposed_release": {
+            "structural_bytes": null,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "available": false
           }
         },
         "method": "GET",
@@ -649,7 +666,7 @@
         "why": "🔴 the honesty probe: the full status view an owner's page renders from"
       },
       {
-        "body_sha256": "ce3a4800ce2220312658172c0708b9aefeaca5dcaeefd22f4c918652f7ebbfbe",
+        "body_sha256": "dfb2a5280faa4df8ea0a9b99dc4341d2c83c6cbbe581ded351534b24bd919c55",
         "body_sha256_basis": "canonical-json",
         "content_type": "application/json",
         "json": {
@@ -660,10 +677,17 @@
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": []
+            "unreadable_ledgers": [],
+            "known_bytes": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "known_days": 0,
+            "complete": true,
+            "unbound_files": 0,
+            "unknown_files": 0,
+            "present_files": 0
           },
           "days": [],
-          "has_ambiguous_ledger_matches": false,
           "device": {
             "free_bytes": 250000000000,
             "total_bytes": 1000000000000
@@ -704,19 +728,29 @@
           },
           "operation": null,
           "pending_release": {
-            "total_bytes": 0,
-            "total_days": 0,
-            "total_files": 0,
-            "total_segments": 0
+            "total_bytes": null,
+            "total_days": null,
+            "total_files": null,
+            "total_segments": null
           },
           "raw_media": {
             "total_bytes": 0,
-            "total_files": 0
+            "total_files": 0,
+            "known_bytes": 0,
+            "known_files": 0,
+            "complete": true,
+            "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
+          },
+          "proposed_release": {
+            "structural_bytes": null,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "available": false
           }
         },
         "method": "GET",
@@ -951,7 +985,7 @@
         "why": "🔴 the honesty probe: the full status view an owner's page renders from"
       },
       {
-        "body_sha256": "ce3a4800ce2220312658172c0708b9aefeaca5dcaeefd22f4c918652f7ebbfbe",
+        "body_sha256": "dfb2a5280faa4df8ea0a9b99dc4341d2c83c6cbbe581ded351534b24bd919c55",
         "body_sha256_basis": "canonical-json",
         "content_type": "application/json",
         "json": {
@@ -962,10 +996,17 @@
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": []
+            "unreadable_ledgers": [],
+            "known_bytes": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "known_days": 0,
+            "complete": true,
+            "unbound_files": 0,
+            "unknown_files": 0,
+            "present_files": 0
           },
           "days": [],
-          "has_ambiguous_ledger_matches": false,
           "device": {
             "free_bytes": 250000000000,
             "total_bytes": 1000000000000
@@ -1006,19 +1047,29 @@
           },
           "operation": null,
           "pending_release": {
-            "total_bytes": 0,
-            "total_days": 0,
-            "total_files": 0,
-            "total_segments": 0
+            "total_bytes": null,
+            "total_days": null,
+            "total_files": null,
+            "total_segments": null
           },
           "raw_media": {
             "total_bytes": 0,
-            "total_files": 0
+            "total_files": 0,
+            "known_bytes": 0,
+            "known_files": 0,
+            "complete": true,
+            "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
+          },
+          "proposed_release": {
+            "structural_bytes": null,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "available": false
           }
         },
         "method": "GET",
@@ -1253,7 +1304,7 @@
         "why": "🔴 the honesty probe: the full status view an owner's page renders from"
       },
       {
-        "body_sha256": "d69d24559aa8663ad8562424fe8dd4f79da8f5c6af579d8ee8720d1f2d11a45f",
+        "body_sha256": "14424b0d1ed9881501b3bffd9014e1e93c195aa37948d66b4af307ca8a3d714c",
         "body_sha256_basis": "canonical-json",
         "content_type": "application/json",
         "json": {
@@ -1264,10 +1315,17 @@
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": []
+            "unreadable_ledgers": [],
+            "known_bytes": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "known_days": 0,
+            "complete": true,
+            "unbound_files": 0,
+            "unknown_files": 0,
+            "present_files": 0
           },
           "days": [],
-          "has_ambiguous_ledger_matches": false,
           "device": {
             "free_bytes": 250000000000,
             "total_bytes": 1000000000000
@@ -1308,19 +1366,29 @@
           },
           "operation": null,
           "pending_release": {
-            "total_bytes": 0,
-            "total_days": 0,
-            "total_files": 0,
-            "total_segments": 0
+            "total_bytes": null,
+            "total_days": null,
+            "total_files": null,
+            "total_segments": null
           },
           "raw_media": {
             "total_bytes": 0,
-            "total_files": 0
+            "total_files": 0,
+            "known_bytes": 0,
+            "known_files": 0,
+            "complete": true,
+            "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
+          },
+          "proposed_release": {
+            "structural_bytes": null,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "available": false
           }
         },
         "method": "GET",

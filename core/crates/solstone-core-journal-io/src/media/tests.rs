@@ -380,6 +380,214 @@ mod native {
     }
 }
 
+#[cfg(feature = "full-tests")]
+mod archive_input {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+
+    fn fixture() -> tempfile::TempDir {
+        match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires pinned native restic and a disposable repository"]
+    fn named_input_is_guarded_and_keeps_original_basename_through_real_archive() {
+        let temp = fixture();
+        fs::create_dir_all(temp.path().join("day/segment")).unwrap();
+        fs::write(
+            temp.path().join("day/input"),
+            b"archive original basename\n",
+        )
+        .unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let parent = MediaDirectory::open(root.clone(), Path::new("day")).unwrap();
+        let destination = MediaDirectory::open(root, Path::new("day/segment")).unwrap();
+        let expected = MediaDigest {
+            size: 26,
+            sha256: "75120243cd13919b80d6f64ae1b1fa974cdf99b8c7d95c7f02d3e5d943d182d3".into(),
+        };
+        let mut prepared = MediaStage::create(parent.clone())
+            .unwrap()
+            .create_named_target(OsStr::new("audio.flac"))
+            .unwrap()
+            .copy_from(&parent, OsStr::new("input"), &expected)
+            .unwrap();
+        let identity = prepared.identity();
+        let input = prepared.archive_source().unwrap();
+        assert_eq!(input.name(), "audio.flac");
+        assert_eq!(input.path().file_name(), Some(OsStr::new("audio.flac")));
+        assert_eq!(input.identity(), identity);
+        assert_eq!(input.digest(), &expected);
+        input.revalidate().unwrap();
+        let repo = temp.path().join("repo");
+        let restic = std::env::var_os("SOLSTONE_NATIVE_RESTIC").unwrap_or_else(|| "restic".into());
+        let command = || {
+            let mut c = Command::new(&restic);
+            c.env("RESTIC_PASSWORD", "synthetic-native-test")
+                .arg("--repo")
+                .arg(&repo);
+            c
+        };
+        let version = Command::new(&restic).arg("version").output().unwrap();
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        assert!(version.starts_with("restic 0.19.0 "), "{version}");
+        println!("NATIVE_ARCHIVE_TOOL {}", version.trim());
+        let init = command().arg("init").output().unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let mut backup = command();
+        backup
+            .arg("backup")
+            .arg("--force")
+            .arg("--json")
+            .arg(input.path());
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fd = input.descriptor().unwrap().as_raw_fd();
+            // SAFETY: child-only fcntl, no allocation/locks in pre_exec; the
+            // borrowed directory remains retained through wait_with_output.
+            #[allow(unsafe_code)]
+            unsafe {
+                backup.pre_exec(move || {
+                    nix::libc::fcntl(fd, nix::libc::F_SETFD, 0)
+                        .eq(&0)
+                        .then_some(())
+                        .ok_or_else(io::Error::last_os_error)
+                });
+            }
+        }
+        let output = backup.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        input.revalidate().unwrap();
+        let summary: serde_json::Value = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|value| value["message_type"] == "summary")
+            .unwrap();
+        let snapshot = summary["snapshot_id"].as_str().unwrap();
+        assert_eq!(snapshot.len(), 64);
+        assert!(snapshot.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        // Query the actual full snapshot and exact entry; no suffix/name guess
+        // is used as readback authority.
+        let listing = command()
+            .arg("ls")
+            .arg("--json")
+            .arg(snapshot)
+            .output()
+            .unwrap();
+        assert!(listing.status.success());
+        let entries: Vec<serde_json::Value> = String::from_utf8(listing.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|value| value["type"] == "file")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "audio.flac");
+        let archived_path = entries[0]["path"].as_str().unwrap();
+        let dump = command()
+            .arg("dump")
+            .arg(snapshot)
+            .arg(archived_path)
+            .output()
+            .unwrap();
+        assert!(dump.status.success());
+        assert_eq!(dump.stdout, b"archive original basename\n");
+        assert_eq!(
+            digest_reader(&mut dump.stdout.as_slice()).unwrap(),
+            expected
+        );
+        println!(
+            "NATIVE_ARCHIVE_READBACK snapshot={snapshot} path={archived_path} identity={:?} digest={expected:?}",
+            input.identity()
+        );
+        input.revalidate().unwrap();
+        drop(input);
+        let receipt = prepared.publish(&destination, OsStr::new("audio.flac"));
+        assert_eq!(receipt.effect, PublicationEffect::Published);
+        assert_eq!(receipt.confirmation, Confirmation::Confirmed);
+        assert_eq!(receipt.cleanup, Cleanup::Complete);
+    }
+
+    #[test]
+    fn invalid_names_never_create_leaf_and_source_substitution_refuses() {
+        let temp = fixture();
+        fs::create_dir(temp.path().join("day")).unwrap();
+        fs::write(temp.path().join("day/input"), b"abc").unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let root_directory = MediaDirectory::open(root.clone(), Path::new("")).unwrap();
+        assert_eq!(root_directory.object_identity(), root.identity());
+        let parent = MediaDirectory::open(root.clone(), Path::new("day")).unwrap();
+        for invalid in ["", "..", "../audio.flac", "CON", "x:y", "x\\y"] {
+            let mut failed = MediaStage::create(parent.clone())
+                .unwrap()
+                .create_named_target(OsStr::new(invalid))
+                .err()
+                .unwrap();
+            assert!(failed.owned.leaf.is_none());
+            assert_eq!(
+                fs::read_dir(failed.owned.diagnostic_path())
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert_eq!(failed.owned.cleanup(), Cleanup::Complete);
+        }
+        let expected = MediaDigest {
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        };
+        let target = MediaStage::create(parent.clone())
+            .unwrap()
+            .create_named_target(OsStr::new("audio.flac"))
+            .unwrap();
+        assert!(Arc::ptr_eq(target.journal_root(), &root));
+        let mut prepared = target
+            .copy_from(&parent, OsStr::new("input"), &expected)
+            .unwrap();
+        let path = prepared.target.stage.diagnostic_path().join("audio.flac");
+        let source = prepared.archive_source().unwrap();
+        #[cfg(unix)]
+        {
+            fs::write(&path, b"xyz").unwrap();
+            assert!(source.revalidate().is_err());
+            drop(source);
+            assert!(prepared.archive_source().is_err());
+            // Retained source pathname and ancestor substitution are refused.
+            let stage = prepared.target.stage.diagnostic_path();
+            fs::rename(&stage, stage.with_extension("moved")).unwrap();
+            fs::create_dir(&stage).unwrap();
+            fs::write(stage.join("audio.flac"), b"abc").unwrap();
+            assert!(prepared.archive_source().is_err());
+            assert_eq!(fs::read(stage.join("audio.flac")).unwrap(), b"abc");
+        }
+        #[cfg(windows)]
+        {
+            assert!(fs::write(&path, b"xyz").is_err());
+            assert!(fs::rename(&path, path.with_extension("moved")).is_err());
+            source.revalidate().unwrap();
+            drop(source);
+            drop(prepared);
+            fs::write(&path, b"xyz").unwrap();
+        }
+    }
+}
+
 #[cfg(all(windows, feature = "full-tests"))]
 mod windows_native {
     use super::*;
@@ -561,6 +769,115 @@ mod windows_native {
         let renamed = root_path.with_extension("moved");
         fs::rename(&root_path, &renamed).unwrap();
         fs::rename(renamed, root_path).unwrap();
+    }
+
+    #[test]
+    fn archive_access_late_failures_retain_actual_object_in_both_directions() {
+        let f = Fixture::new();
+        let mut prepared = f.prepared();
+        let path = prepared.target.stage.diagnostic_path().join("payload");
+        let before = prepared.identity();
+        let (result, fired) = run_with_media_hook(
+            MediaPrimitive::ArchiveAccessGap,
+            || Err(io::Error::other("final read admission failed")),
+            || prepared.archive_source().map(|_| ()),
+        );
+        assert!(fired && result.is_err());
+        assert_eq!(prepared.identity(), before);
+        assert_eq!(fs::read(&path).unwrap(), b"source media");
+        let source = prepared.archive_source().unwrap();
+        assert_shared(fs::write(&path, b"competitor").unwrap_err());
+        source.revalidate().unwrap();
+        drop(source);
+        let (receipt, fired) = run_with_media_hook(
+            MediaPrimitive::ArchiveAccessGap,
+            || Err(io::Error::other("final mutation admission failed")),
+            || prepared.publish(&f.destination, OsStr::new("audio.flac")),
+        );
+        assert!(fired);
+        assert_eq!(receipt.effect, PublicationEffect::NotPublished);
+        assert!(receipt.error.is_some());
+        assert_eq!(prepared.identity(), before);
+        assert_eq!(fs::read(&path).unwrap(), b"source media");
+        assert!(!f.live("audio.flac").exists());
+        let receipt = prepared.publish(&f.destination, OsStr::new("audio.flac"));
+        assert_eq!(receipt.effect, PublicationEffect::Published);
+        assert_eq!(receipt.confirmation, Confirmation::Confirmed);
+        assert_eq!(receipt.identity, Some(before));
+    }
+
+    #[test]
+    fn archive_transition_needs_fresh_flush_before_publication() {
+        let f = Fixture::new();
+        let mut prepared = f.prepared();
+        prepared.archive_source().unwrap().revalidate().unwrap();
+        let (receipt, fired) = run_with_media_hook(
+            MediaPrimitive::FileSync,
+            || Err(io::Error::other("post-transition flush failed")),
+            || prepared.publish(&f.destination, OsStr::new("audio.flac")),
+        );
+        assert!(fired);
+        assert_eq!(receipt.effect, PublicationEffect::NotPublished);
+        assert_eq!(receipt.file_durability, Durability::Unproven);
+        assert!(receipt.error.is_some());
+        assert!(!f.live("audio.flac").exists());
+        let receipt = prepared.publish(&f.destination, OsStr::new("audio.flac"));
+        assert_eq!(receipt.effect, PublicationEffect::Published);
+        assert_eq!(receipt.file_durability, Durability::Synced);
+    }
+
+    #[test]
+    fn archive_access_gap_content_and_name_substitution_never_admit_competitor() {
+        for (replace, mutation) in [(false, false), (true, false), (false, true), (true, true)] {
+            let f = Fixture::new();
+            let mut prepared = f.prepared();
+            if mutation {
+                prepared.archive_source().unwrap().revalidate().unwrap();
+            }
+            let identity = prepared.identity();
+            let path = prepared.target.stage.diagnostic_path().join("payload");
+            let altered = path.clone();
+            let (result, fired) = run_with_media_hook(
+                MediaPrimitive::ArchiveAccessGap,
+                move || {
+                    if replace {
+                        fs::rename(&altered, altered.with_extension("moved"))?;
+                    }
+                    // Same size; in-place mode retains the exact native ID.
+                    fs::write(&altered, b"newer bytes!")
+                },
+                || {
+                    if mutation {
+                        let receipt = prepared.publish(&f.destination, OsStr::new("audio.flac"));
+                        assert_eq!(receipt.effect, PublicationEffect::NotPublished);
+                        Err(receipt.error.expect("changed source refuses publication"))
+                    } else {
+                        prepared.archive_source().map(|_| ())
+                    }
+                },
+            );
+            assert!(fired && result.is_err());
+            assert_eq!(prepared.identity(), identity);
+            assert_eq!(fs::read(&path).unwrap(), b"newer bytes!");
+            assert!(!f.live("audio.flac").exists());
+            assert_eq!(
+                prepared
+                    .publish(&f.destination, OsStr::new("audio.flac"))
+                    .effect,
+                PublicationEffect::NotPublished
+            );
+            assert!(prepared.archive_source().is_err());
+            if replace {
+                assert_eq!(prepared.cleanup(), Cleanup::Refused);
+                assert_eq!(
+                    fs::read(path.with_extension("moved")).unwrap(),
+                    b"source media"
+                );
+                assert_eq!(fs::read(&path).unwrap(), b"newer bytes!");
+            }
+            drop(prepared);
+            assert_eq!(fs::read(&path).unwrap(), b"newer bytes!");
+        }
     }
 
     #[test]

@@ -163,6 +163,12 @@ class Element {
     this.append(...children);
   }
 
+  removeChild(child) {
+    this.children = this.children.filter(item => item !== child);
+    child.parentElement = null;
+    return child;
+  }
+
   querySelector(selector) { return queryAll(this, selector)[0] || null; }
   querySelectorAll(selector) { return queryAll(this, selector); }
   matches(selector) { return matchesSelector(this, selector); }
@@ -379,7 +385,7 @@ test('search index line renders when present and hides when absent', async () =>
 });
 
 function extractGlanceFunction(source) {
-  const start = source.indexOf('function selectGlanceSentence(');
+  const start = source.indexOf('function queuedWorkHolds(');
   const end = source.indexOf('function formatGlanceSentence(');
   assert.ok(start >= 0 && end > start, 'selectGlanceSentence found in health.js');
   return source.slice(start, end);
@@ -407,7 +413,7 @@ function glanceFor(crashed, staleHeartbeats, searchIndex = null, attention = {})
       crashed: new Map(crashedEntries.map(name => [name, {}])),
       health: { stale_heartbeats: staleHeartbeats },
       searchIndex,
-      connected: true,
+      connected: true, heldWorkCurrent: true, heldWorkSnapshot: null,
     };
     ${extractGlanceFunction(loadHealthSource())}
     result = selectGlanceSentence(state, 0);
@@ -510,6 +516,7 @@ function createDeviceEnvironment() {
     registeredClients: null, registeredClientsFailed: false, registeredClientsObservedAt: null,
     clients: new Map(), localHost: 'local', agents: new Map(), imports: new Map(),
     services: new Map([['observe', {}]]), crashed: new Map(), health: {}, connected: true,
+    heldWorkCurrent: true, heldWorkSnapshot: null,
   };
   const context = vm.createContext({
     document: doc, elements, state, Date: ControlledDate, clock, console: { warn() {} },
@@ -728,6 +735,110 @@ test('rejection details preserve disclosure and keyboard focus without taking ou
   env.doc.body.focus();
   env.render();
   assert.strictEqual(env.doc.activeElement, env.doc.body);
+});
+
+function createHeldWorkEnvironment() {
+  const env = createDeviceEnvironment();
+  const { doc, context, state } = env;
+  state.registeredClients = [];
+  state.heldWorkCurrent = false;
+  const section = doc.createElement('section');
+  section.id = 'processingHolds';
+  for (const attr of ['notice', 'rows', 'support']) {
+    const child = doc.createElement('div');
+    child.setAttribute('data-held-work-' + attr, '');
+    section.appendChild(child);
+  }
+  doc.body.appendChild(section);
+  context.scheduleName = () => null;
+  context.updateVitals = () => {
+    vm.runInContext('renderHeldWork()', context);
+    context.updateStatusSummary();
+  };
+  for (const name of ['updateCortexGrid', 'updateImporterGrid', 'updateThinkCard',
+    'updateObserve', 'updateConnectionHealth']) context[name] = () => {};
+  state.schedules = [];
+  const source = loadHealthSource();
+  vm.runInContext(sourceBlock(source, 'function handleSupervisorEvent(', 'function handleCortexEvent(')
+    + sourceBlock(source, 'function invalidateRealtime(', 'function initHealthRealtime(')
+    + sourceBlock(source, 'function updateConnectionHealth(', '// Sweep stale agents')
+      .replace('function updateConnectionHealth(', 'function expireRealtime('), context);
+  env.receive = payload => {
+    context.message = { event: 'status', services: [{name: 'convey'}], queues: {}, ...payload };
+    vm.runInContext('handleSupervisorEvent(message)', context);
+  };
+  env.section = section;
+  return env;
+}
+
+test('holds require queued work at their scope even while unrelated work is active', async () => {
+  const env = createHeldWorkEnvironment();
+  const hold = { partition: 'daily', ref: 'day-task', reasons: ['root_live'] };
+  env.state.agents.set('busy', { event: 'start' });
+  env.receive({ held: [hold], queues: { daily: 2, activity: 1 } });
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_HELD');
+  assert.strictEqual(env.verdict().action.href, '#processingHolds');
+  assert.strictEqual(env.doc.querySelectorAll('.held-work-row').length, 1);
+  assert.ok(env.doc.querySelector('pre').textContent.includes('day-task'));
+  env.receive({ held: [hold], queues: { activity: 1 } });
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_CATCHING_UP');
+  assert.strictEqual(env.section.hidden, true);
+  env.receive({ held: [hold], queues: {}, queue_hold: { reason: 'records_unreadable', detail: 'read error' } });
+  assert.strictEqual(env.section.hidden, true);
+  env.receive({ held: [hold, { ...hold, partition: 'activity', ref: 'activity-task' }],
+    queues: { daily: 2, activity: 1 }, queue_hold: { reason: 'records_unreadable', detail: '<unsafe>' } });
+  assert.strictEqual(env.doc.querySelectorAll('.held-work-row').length, 3);
+  assert.deepStrictEqual(Array.from(env.doc.querySelectorAll('.held-work-row'), row => row.dataset.key),
+    ['queue', 'partition:daily', 'partition:activity']);
+  assert.ok(env.doc.querySelector('pre').textContent.includes('<unsafe>'));
+  assert.strictEqual(env.doc.querySelector('unsafe'), null);
+});
+
+test('failed or expired status retains dated hold evidence and only a snapshot clears it', async () => {
+  const env = createHeldWorkEnvironment();
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
+  env.context.window.location.hash = '#processingHolds';
+  env.receive({ held: [{ partition: 'daily', reasons: ['root_live'] }], queues: { daily: 1 } });
+  assert.strictEqual(env.section.scrolledIntoView, true);
+  const at = env.state.heldWorkSnapshot.observedAt;
+  const details = env.doc.querySelector('details');
+  details.open = true;
+  details.querySelector('summary').focus();
+  env.clock.now += 1000;
+  env.receive({ event: 'status-error' });
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
+  assert.strictEqual(env.state.heldWorkSnapshot.observedAt, at);
+  assert.strictEqual(env.section.dataset.current, 'false');
+  assert.strictEqual(env.doc.querySelector('details'), details);
+  assert.strictEqual(details.open, true);
+  assert.strictEqual(env.doc.activeElement, details.querySelector('summary'));
+  env.receive({ event: 'held', service: 'daily', reasons: ['root_live'] });
+  assert.strictEqual(env.state.heldWorkCurrent, false);
+  env.receive({ queues: { daily: 1 } }); // omitted optional fields are a supported clearance
+  assert.strictEqual(env.section.hidden, true);
+  assert.strictEqual(env.doc.querySelectorAll('.held-work-row').length, 0);
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_OK');
+  assert.strictEqual(env.state.heldWorkSnapshot.observedAt, env.clock.now);
+  env.clock.now += 30000;
+  vm.runInContext('expireRealtime()', env.context);
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
+  assert.strictEqual(env.state.heldWorkCurrent, false);
+});
+
+test('known service device brain and index faults retain priority over held work', async () => {
+  const env = createHeldWorkEnvironment();
+  env.receive({ held: [{ partition: 'daily', reasons: ['root_live'] }], queues: { daily: 1 } });
+  env.state.crashed.set('convey', {});
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_SERVICE_ATTENTION');
+  env.state.crashed.clear();
+  env.context.brainSnapshot = { state: 'blocked', headline: 'known brain fault' };
+  assert.strictEqual(env.verdict().vars.headline, 'known brain fault');
+  env.context.brainSnapshot = null;
+  env.state.registeredClients = [device('phone', { audio: rejection() })];
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_DEVICE_FAILING');
+  env.state.registeredClients = [];
+  env.state.searchIndex = { state: 'failing', text: 'known index fault' };
+  assert.strictEqual(env.verdict().vars.headline, 'known index fault');
 });
 
 async function runAsyncCases() {
