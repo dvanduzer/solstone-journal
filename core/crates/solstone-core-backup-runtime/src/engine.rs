@@ -25,14 +25,15 @@ use crate::hosted_runtime::{
 use crate::runner::{ToolRunner, reason_for_returncode, run_restic, select_summary};
 
 pub const ARCHIVE_TAG: &str = "solstone-archive";
+use solstone_core_backup::archive_activity::{
+    ArchiveOperationPreparationFailure, PreparedArchiveOperation,
+};
 pub use solstone_core_backup::archive_admission::{
     ARCHIVE_BACKUP_TIMEOUT_SECONDS, ARCHIVE_LS_TIMEOUT_SECONDS, Clock,
 };
-use solstone_core_backup::archive_admission::{
-    AdmissionError, ArchiveBudget, ArchiveConfiguration,
-};
+use solstone_core_backup::archive_admission::{AdmissionError, ArchiveBudget, ArchiveCancellation};
 use solstone_core_backup::archive_readback::{
-    ReadAdmission, ReadOperation, ReadbackAdmissionError,
+    ReadAdmission, ReadOperation, ReadbackAdmissionError, ReadbackError,
 };
 // Repository contention is coordinated by Restic, within each operation’s deadline.
 const REPOSITORY_RETRY_LOCK: &str = "30m";
@@ -1644,52 +1645,58 @@ pub struct ArchiveSnapshot {
 }
 
 // Keep the existing broker protocol while bounding its request by this operation.
-struct ArchiveAdmissionHttp<'a> {
-    inner: &'a dyn HttpTransport,
-    clock: &'a dyn Clock,
-    budget: &'a ArchiveBudget,
+struct ArchiveAdmissionHttp<'operation, 'clock> {
+    inner: &'operation dyn HttpTransport,
+    operation: &'operation PreparedArchiveOperation<'clock>,
 }
 
-impl HttpTransport for ArchiveAdmissionHttp<'_> {
+impl HttpTransport for ArchiveAdmissionHttp<'_, '_> {
     fn execute(
         &self,
         request: &crate::hosted_runtime::HttpRequest,
     ) -> Result<crate::hosted_runtime::HttpResponse, crate::hosted_runtime::HttpError> {
+        self.operation
+            .revalidate()
+            .map_err(|_| crate::hosted_runtime::HttpError::Timeout)?;
         let remaining = self
-            .budget
-            .remaining(self.clock)
+            .operation
+            .budget()
+            .remaining(self.operation.clock())
             .map_err(|_| crate::hosted_runtime::HttpError::Timeout)?;
         let mut request = request.clone();
         request.timeout = request.timeout.min(remaining);
-        match self.budget.cancellation() {
+        match self.operation.budget().cancellation() {
             Some(cancellation) => self.inner.execute_cancellable(&request, cancellation),
-            None => self.inner.execute(&request),
+            None => self
+                .inner
+                .execute_cancellable(&request, &ArchiveCancellation::new()),
         }
     }
 }
 
-struct ArchiveRunner<'a> {
-    inner: &'a dyn ToolRunner,
-    clock: &'a dyn Clock,
-    budget: &'a ArchiveBudget,
+struct ArchiveRunner<'operation, 'clock> {
+    inner: &'operation dyn ToolRunner,
+    operation: &'operation PreparedArchiveOperation<'clock>,
 }
 
-impl ToolRunner for ArchiveRunner<'_> {
+impl ToolRunner for ArchiveRunner<'_, '_> {
     fn run(
         &self,
         request: &crate::runner::ToolRequest<'_>,
     ) -> std::io::Result<crate::runner::ToolOutput> {
+        self.operation.revalidate().map_err(std::io::Error::other)?;
         let remaining = self
-            .budget
-            .remaining(self.clock)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Interrupted, error))?;
+            .operation
+            .budget()
+            .remaining(self.operation.clock())
+            .map_err(std::io::Error::other)?;
         let mut request = request.clone();
         request.timeout = Some(
             request
                 .timeout
                 .map_or(remaining, |timeout| timeout.min(remaining)),
         );
-        match self.budget.cancellation() {
+        match self.operation.budget().cancellation() {
             Some(cancellation) => self.inner.run_cancellable(&request, cancellation),
             None => self.inner.run(&request),
         }
@@ -1700,15 +1707,12 @@ impl ToolRunner for ArchiveRunner<'_> {
 /// transports. Fields and services are private; this is neither serializable
 /// evidence nor authority to remove media. Source ownership is the caller's job.
 pub struct AdmittedArchive<'a> {
-    root: Arc<JournalRoot>,
-    config: ArchiveConfiguration,
+    operation: PreparedArchiveOperation<'a>,
     runner: &'a dyn ToolRunner,
-    clock: &'a dyn Clock,
     restic_path: PathBuf,
     write: Runtime,
     read: Runtime,
     repository_id: String,
-    budget: ArchiveBudget,
 }
 
 fn full_archive_id(value: &str) -> bool {
@@ -1718,135 +1722,260 @@ fn full_archive_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Admit write and read transports from one captured backup configuration.
-/// No journal state is written and no repository is initialized or repaired.
+/// Actual attempted admission calls, independently of later retained ownership.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArchiveAdmissionEffects {
+    pub broker_requested: bool,
+    pub write_repository_requested: bool,
+    pub read_repository_requested: bool,
+}
+
+#[must_use = "Retain the original archive activity after admission refusal"]
+pub struct ArchiveAdmissionFailure<'a> {
+    inner: Box<ArchiveAdmissionFailureInner<'a>>,
+}
+
+struct ArchiveAdmissionFailureInner<'a> {
+    error: ArchiveError,
+    effects: ArchiveAdmissionEffects,
+    root: Arc<JournalRoot>,
+    operation: Option<PreparedArchiveOperation<'a>>,
+    preparation: Option<ArchiveOperationPreparationFailure<'a>>,
+}
+impl fmt::Debug for ArchiveAdmissionFailure<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArchiveAdmissionFailure")
+            .field("error", &self.inner.error)
+            .field("effects", &self.inner.effects)
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Display for ArchiveAdmissionFailure<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.error.fmt(f)
+    }
+}
+impl std::error::Error for ArchiveAdmissionFailure<'_> {}
+impl ArchiveAdmissionFailure<'_> {
+    pub fn error(&self) -> ArchiveError {
+        self.inner.error
+    }
+    pub fn effects(&self) -> &ArchiveAdmissionEffects {
+        &self.inner.effects
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.inner.root
+    }
+    pub fn carrier(&self) -> Option<&Arc<solstone_core_journal_io::media::RootActivityCarrier>> {
+        self.inner
+            .operation
+            .as_ref()
+            .map(PreparedArchiveOperation::carrier)
+            .or_else(|| {
+                self.inner
+                    .preparation
+                    .as_ref()
+                    .and_then(ArchiveOperationPreparationFailure::carrier)
+            })
+    }
+    pub fn preparation(&self) -> Option<&ArchiveOperationPreparationFailure<'_>> {
+        self.inner.preparation.as_ref()
+    }
+}
+
+/// Prepare one original activity before admitting paired archive transports.
 pub fn admit_archive<'a>(
     root: Arc<JournalRoot>,
     services: &BackupServices<'a>,
-) -> Result<AdmittedArchive<'a>, ArchiveError> {
-    let budget = ArchiveBudget::new(services.clock)?;
+) -> Result<AdmittedArchive<'a>, ArchiveAdmissionFailure<'a>> {
+    let budget = match ArchiveBudget::new(services.clock) {
+        Ok(budget) => budget,
+        Err(error) => {
+            return Err(ArchiveAdmissionFailure {
+                inner: Box::new(ArchiveAdmissionFailureInner {
+                    error: error.into(),
+                    effects: ArchiveAdmissionEffects::default(),
+                    root,
+                    operation: None,
+                    preparation: None,
+                }),
+            });
+        }
+    };
     admit_archive_with_budget(root, services, budget)
 }
 
-/// Admit paired transports using the original operation lifetime and stop signal.
+/// Fresh admission only. Already-owned operations use admit_prepared_archive.
 pub fn admit_archive_with_budget<'a>(
     root: Arc<JournalRoot>,
     services: &BackupServices<'a>,
-    mut budget: ArchiveBudget,
-) -> Result<AdmittedArchive<'a>, ArchiveError> {
-    budget.remaining(services.clock)?;
-    let config = ArchiveConfiguration::capture(&root)?;
-    if !config.enabled() {
-        return Err(ArchiveError::NotConfigured);
-    }
-    let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
-    let restic_path = services
-        .restic_path
-        .ok_or(ArchiveError::ToolUnavailable)?
-        .to_path_buf();
-    let (write, read) = if let Some(binding) = config.binding() {
-        let http = ArchiveAdmissionHttp {
-            inner: services.http,
-            clock: services.clock,
-            budget: &budget,
+    budget: ArchiveBudget,
+) -> Result<AdmittedArchive<'a>, ArchiveAdmissionFailure<'a>> {
+    let operation =
+        match PreparedArchiveOperation::prepare(Arc::clone(&root), budget, services.clock) {
+            Ok(operation) => operation,
+            Err(preparation) => {
+                return Err(ArchiveAdmissionFailure {
+                    inner: Box::new(ArchiveAdmissionFailureInner {
+                        error: preparation.reason().into(),
+                        effects: ArchiveAdmissionEffects::default(),
+                        root,
+                        operation: None,
+                        preparation: Some(preparation),
+                    }),
+                });
+            }
         };
-        let credentials = fetch_hosted_credentials(&http, binding, "operated", services.version);
-        budget.remaining(services.clock)?;
-        let credentials = credentials.map_err(|error| ArchiveError::CredentialsUnavailable {
-            reason: error.reason_code,
-        })?;
-        let expiry = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
-            .map_err(|_| ArchiveError::InvalidCredentialExpiry)?
-            .timestamp();
-        budget.cap_credential_expiry(expiry);
-        budget.remaining(services.clock)?;
-        let rclone = services.rclone_path.ok_or(ArchiveError::ToolUnavailable)?;
-        let write = hosted_append_only_session(binding, &credentials, rclone)
-            .map_err(|_| ArchiveError::ToolUnavailable)?;
-        let read = hosted_session(binding, &credentials)
-            .map_err(|_| ArchiveError::ConfigurationUnavailable)?;
-        let runtime = |session: crate::hosted_runtime::HostedResticSession| Runtime {
-            destination: session.destination,
-            password: keys.daily_key.clone(),
-            backend_env: session
-                .backend_env
-                .into_iter()
-                .map(|(key, value)| (key, Some(value)))
-                .collect(),
-            global_options: session.global_options,
-        };
-        (runtime(write), runtime(read))
-    } else {
-        if config.mode() != Some("byo") {
+    admit_prepared_archive(operation, services)
+}
+
+/// Consume the original operation without any replaceable lifetime inputs.
+pub fn admit_prepared_archive<'a>(
+    mut operation: PreparedArchiveOperation<'a>,
+    services: &BackupServices<'a>,
+) -> Result<AdmittedArchive<'a>, ArchiveAdmissionFailure<'a>> {
+    let root = Arc::clone(operation.journal_root());
+    let mut effects = ArchiveAdmissionEffects::default();
+    let admission = (|| {
+        operation.revalidate()?;
+        let config = operation.configuration();
+        if !config.enabled() {
             return Err(ArchiveError::NotConfigured);
         }
-        let destination = config.destination().ok_or(ArchiveError::NotConfigured)?;
-        let backend_env = value_env(&destination).ok_or(ArchiveError::ConfigurationUnavailable)?;
-        let read = Runtime {
-            destination: destination.clone(),
-            password: keys.daily_key.clone(),
-            backend_env: backend_env.clone(),
-            global_options: vec![],
+        let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
+        let restic_path = services
+            .restic_path
+            .ok_or(ArchiveError::ToolUnavailable)?
+            .to_path_buf();
+        let (write, read) = if let Some(binding) = config.binding() {
+            let http = ArchiveAdmissionHttp {
+                inner: services.http,
+                operation: &operation,
+            };
+            effects.broker_requested = true;
+            let credentials =
+                fetch_hosted_credentials(&http, binding, "operated", services.version);
+            operation.revalidate()?;
+            let credentials =
+                credentials.map_err(|error| ArchiveError::CredentialsUnavailable {
+                    reason: error.reason_code,
+                })?;
+            let expiry = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
+                .map_err(|_| ArchiveError::InvalidCredentialExpiry)?
+                .timestamp();
+            let rclone = services.rclone_path.ok_or(ArchiveError::ToolUnavailable)?;
+            let write = hosted_append_only_session(binding, &credentials, rclone)
+                .map_err(|_| ArchiveError::ToolUnavailable)?;
+            let read = hosted_session(binding, &credentials)
+                .map_err(|_| ArchiveError::ConfigurationUnavailable)?;
+            operation.cap_credential_expiry(expiry);
+            operation.budget().remaining(operation.clock())?;
+            let runtime = |session: crate::hosted_runtime::HostedResticSession| Runtime {
+                destination: session.destination,
+                password: keys.daily_key.clone(),
+                backend_env: session
+                    .backend_env
+                    .into_iter()
+                    .map(|(key, value)| (key, Some(value)))
+                    .collect(),
+                global_options: session.global_options,
+            };
+            (runtime(write), runtime(read))
+        } else {
+            if config.mode() != Some("byo") {
+                return Err(ArchiveError::NotConfigured);
+            }
+            let destination = config.destination().ok_or(ArchiveError::NotConfigured)?;
+            let backend_env =
+                value_env(&destination).ok_or(ArchiveError::ConfigurationUnavailable)?;
+            let read = Runtime {
+                destination: destination.clone(),
+                password: keys.daily_key.clone(),
+                backend_env: backend_env.clone(),
+                global_options: vec![],
+            };
+            let write = Runtime {
+                destination,
+                password: keys.daily_key,
+                backend_env,
+                global_options: vec![],
+            };
+            (write, read)
         };
-        let write = Runtime {
-            destination,
-            password: keys.daily_key,
-            backend_env,
-            global_options: vec![],
-        };
-        (write, read)
+        Ok((restic_path, write, read))
+    })();
+    let (restic_path, write, read) = match admission {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            return Err(ArchiveAdmissionFailure {
+                inner: Box::new(ArchiveAdmissionFailureInner {
+                    error,
+                    effects,
+                    root,
+                    operation: Some(operation),
+                    preparation: None,
+                }),
+            });
+        }
     };
     let mut admitted = AdmittedArchive {
-        root,
-        config,
+        operation,
         runner: services.runner,
-        clock: services.clock,
         restic_path,
         write,
         read,
         repository_id: String::new(),
-        budget,
     };
-    let write_id = admitted.read_repository_id(&admitted.write)?;
-    let read_id = admitted.read_repository_id(&admitted.read)?;
-    if write_id != read_id {
-        return Err(ArchiveError::RepositoryIdentityChanged);
+    let repositories = (|| {
+        effects.write_repository_requested = true;
+        let write_id = admitted.read_repository_id(&admitted.write)?;
+        effects.read_repository_requested = true;
+        let read_id = admitted.read_repository_id(&admitted.read)?;
+        if write_id != read_id {
+            return Err(ArchiveError::RepositoryIdentityChanged);
+        }
+        Ok(write_id)
+    })();
+    match repositories {
+        Ok(repository) => {
+            admitted.repository_id = repository;
+            Ok(admitted)
+        }
+        Err(error) => Err(ArchiveAdmissionFailure {
+            inner: Box::new(ArchiveAdmissionFailureInner {
+                error,
+                effects,
+                root,
+                operation: Some(admitted.operation),
+                preparation: None,
+            }),
+        }),
     }
-    admitted.repository_id = write_id;
-    Ok(admitted)
 }
 
 impl<'a> AdmittedArchive<'a> {
     /// Move this operation's original configuration, credentials and budget into
     /// the concrete installed-tool readback door without renewing its lifetime.
-    pub fn into_read_operation(self) -> Result<ReadOperation<'a>, ReadbackAdmissionError> {
-        ReadOperation::admit(self.into_read_admission()?)
+    pub fn into_read_operation(self) -> Result<ReadOperation<'a>, ReadbackAdmissionError<'a>> {
+        let unsupported = !self.read.global_options.is_empty();
+        let input = ReadAdmission::bind(
+            self.operation,
+            self.read.destination,
+            self.read.password,
+            self.repository_id,
+            self.restic_path,
+        );
+        if unsupported {
+            return Err(input.refuse(ReadbackError::UnsupportedBackend));
+        }
+        ReadOperation::admit(input)
     }
 
-    fn into_read_admission(self) -> Result<ReadAdmission<'a>, ReadbackAdmissionError> {
-        if !self.read.global_options.is_empty() {
-            return Err(ReadbackAdmissionError::UnsupportedBackend);
-        }
-        let Self {
-            root,
-            config,
-            budget,
-            clock,
-            read,
-            repository_id,
-            restic_path,
-            ..
-        } = self;
-        Ok(ReadAdmission {
-            root,
-            configuration: config,
-            budget,
-            clock,
-            destination: read.destination,
-            password: read.password,
-            repository_id,
-            expected_restic_path: restic_path,
-        })
+    pub fn carrier(&self) -> &Arc<solstone_core_journal_io::media::RootActivityCarrier> {
+        self.operation.carrier()
+    }
+    pub fn activity(&self) -> &Arc<solstone_core_journal_io::activity::ActivityLease> {
+        self.operation.activity()
     }
 
     pub fn repository_id(&self) -> &str {
@@ -1854,36 +1983,35 @@ impl<'a> AdmittedArchive<'a> {
     }
 
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
-        &self.root
+        self.operation.journal_root()
     }
 
     /// Sample the admitted clock after checking the original local lifetime.
     /// This observation cannot extend the operation's deadline or credentials.
     pub fn current_time(&self) -> Result<i64, ArchiveError> {
         self.revalidate_local()?;
-        Ok(self.clock.now_unix())
+        Ok(self.operation.clock().now_unix())
     }
 
     /// Recheck the retained root, captured backup configuration and remaining
     /// lifetime without issuing any remote request.
     pub fn revalidate_local(&self) -> Result<(), ArchiveError> {
-        self.budget.remaining(self.clock)?;
-        self.config.revalidate(&self.root)?;
+        self.operation.revalidate()?;
         Ok(())
     }
 
     fn read_repository_id(&self, runtime: &Runtime) -> Result<String, ArchiveError> {
         self.revalidate_local()?;
         let timeout = self
-            .budget
-            .remaining(self.clock)?
+            .operation
+            .budget()
+            .remaining(self.operation.clock())?
             .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
         let mut args = runtime.global_options.clone();
         args.extend(["cat".into(), "config".into(), "--no-cache".into()]);
         let runner = ArchiveRunner {
             inner: self.runner,
-            clock: self.clock,
-            budget: &self.budget,
+            operation: &self.operation,
         };
         let output = run_restic(
             &runner,
@@ -2001,8 +2129,9 @@ impl<'a> AdmittedArchive<'a> {
         self.revalidate().map_err(before)?;
         self.revalidate_sources(sources).map_err(before)?;
         let timeout = self
-            .budget
-            .remaining(self.clock)
+            .operation
+            .budget()
+            .remaining(self.operation.clock())
             .map_err(|error| before(error.into()))?;
         let mut args = self.write.global_options.clone();
         args.extend([
@@ -2017,8 +2146,7 @@ impl<'a> AdmittedArchive<'a> {
         args.extend(paths.iter().cloned());
         let runner = ArchiveRunner {
             inner: self.runner,
-            clock: self.clock,
-            budget: &self.budget,
+            operation: &self.operation,
         };
         let output = run_restic(
             &runner,
@@ -2063,47 +2191,6 @@ impl<'a> AdmittedArchive<'a> {
             snapshot_id,
         })
     }
-}
-
-/// The repository an archive read goes through, resolved for this journal's
-/// current mode.
-///
-/// Operated reads use the direct hosted session, as archive checks,
-/// verification and the hosted fresh restore do; only append-only writes need
-/// rclone.
-pub struct ArchiveReadSession {
-    pub repository: String,
-    pub password: String,
-    pub backend_env: BTreeMap<String, Option<String>>,
-    pub global_options: Vec<String>,
-}
-
-impl fmt::Debug for ArchiveReadSession {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ArchiveReadSession")
-            .field("repository", &self.repository)
-            .field("password", &"<redacted>")
-            .field("backend_env", &"<redacted>")
-            .field("global_options", &self.global_options)
-            .finish()
-    }
-}
-
-/// Resolve the session [`check_archive_snapshot_files`] reads through, for a
-/// caller that runs its own restic read (an offload restore).
-pub fn archive_read_session(
-    journal: &Path,
-    services: &BackupServices<'_>,
-) -> Result<Option<ArchiveReadSession>, String> {
-    Ok(
-        runtime(journal, services, "backup", false)?.map(|runtime| ArchiveReadSession {
-            repository: runtime.destination.repository,
-            password: runtime.password,
-            backend_env: runtime.backend_env,
-            global_options: runtime.global_options,
-        }),
-    )
 }
 
 pub fn check_archive_snapshot_files(
@@ -2314,6 +2401,14 @@ mod tests {
             self.requests.borrow_mut().push(request.clone());
             self.responses.borrow_mut().pop_front().expect("response")
         }
+        fn execute_cancellable(
+            &self,
+            request: &HttpRequest,
+            cancellation: &ArchiveCancellation,
+        ) -> Result<HttpResponse, HttpError> {
+            assert!(!cancellation.is_cancelled());
+            self.execute(request)
+        }
     }
     struct FixedClock;
     impl Clock for FixedClock {
@@ -2438,6 +2533,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "full-tests")]
     mod archive_admission {
         use super::*;
         use solstone_core_backup::archive_admission::ArchiveCancellation;
@@ -2535,7 +2631,9 @@ mod tests {
             vec![journal.join("staged/audio.flac")]
         }
 
-        fn refusal(result: Result<AdmittedArchive<'_>, ArchiveError>) -> ArchiveError {
+        fn refusal<'a>(
+            result: Result<AdmittedArchive<'a>, ArchiveAdmissionFailure<'a>>,
+        ) -> ArchiveAdmissionFailure<'a> {
             match result {
                 Ok(_) => panic!("unexpected admission"),
                 Err(error) => error,
@@ -2639,7 +2737,7 @@ mod tests {
                     ArchiveBudget::new_cancellable(&FixedClock, cancellation.clone()).unwrap();
                 let services = services(&PanicRunner, &http, &FixedClock, &Maintenance);
                 assert_eq!(
-                    refusal(admit_archive_with_budget(root, &services, budget)),
+                    refusal(admit_archive_with_budget(root, &services, budget)).error(),
                     ArchiveError::Cancelled
                 );
                 assert!(cancellation.is_cancelled());
@@ -2656,11 +2754,151 @@ mod tests {
             cancellation.cancel();
             let services = services(&PanicRunner, &http, &FixedClock, &Maintenance);
             assert_eq!(
-                refusal(admit_archive_with_budget(root, &services, budget)),
+                refusal(admit_archive_with_budget(root, &services, budget)).error(),
                 ArchiveError::Cancelled
             );
             assert!(http.requests.borrow().is_empty());
             assert!(http.observed.borrow().is_none());
+        }
+
+        #[test]
+        #[cfg(feature = "full-tests")]
+        fn prepared_archive_refusal_retains_same_owner_after_second_repository_request() {
+            let (_journal, root) = fixture();
+            let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+            runner.outputs.borrow_mut()[1] = Err(io::Error::other("unknown repository completion"));
+            let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+            let original = PreparedArchiveOperation::prepare(
+                root.clone(),
+                ArchiveBudget::new(&FixedClock).unwrap(),
+                &FixedClock,
+            )
+            .unwrap();
+            let carrier = original.carrier().clone();
+            let failure = refusal(admit_prepared_archive(original, &services));
+            assert_eq!(
+                failure.error(),
+                ArchiveError::ToolFailed { reason: "failed" }
+            );
+            assert!(Arc::ptr_eq(failure.carrier().unwrap(), &carrier));
+            assert!(!failure.effects().broker_requested);
+            assert!(failure.effects().write_repository_requested);
+            assert!(failure.effects().read_repository_requested);
+            assert_eq!(runner.requests.borrow().len(), 2);
+            let next = PreparedArchiveOperation::prepare(
+                root,
+                ArchiveBudget::new(&FixedClock).unwrap(),
+                &FixedClock,
+            )
+            .err()
+            .expect("same retained owner excludes fresh admission");
+            assert!(next.preparation().is_some());
+            assert_eq!(runner.requests.borrow().len(), 2);
+        }
+
+        #[test]
+        #[cfg(feature = "full-tests")]
+        fn prepared_archive_public_entrance_keeps_original_expiry_and_stop() {
+            for cancelled in [false, true] {
+                let (_journal, root) = fixture();
+                let now = Rc::new(Cell::new(50));
+                let clock = MutableClock(now.clone());
+                let cancellation = ArchiveCancellation::new();
+                let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+                let original = PreparedArchiveOperation::prepare(root, budget, &clock).unwrap();
+                let carrier = original.carrier().clone();
+                if cancelled {
+                    cancellation.cancel();
+                } else {
+                    now.set(50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64);
+                }
+                let services = services(&PanicRunner, &PanicHttp, &clock, &Maintenance);
+                let failure = refusal(admit_prepared_archive(original, &services));
+                assert_eq!(
+                    failure.error(),
+                    if cancelled {
+                        ArchiveError::Cancelled
+                    } else {
+                        ArchiveError::DeadlineExceeded
+                    }
+                );
+                assert!(Arc::ptr_eq(failure.carrier().unwrap(), &carrier));
+                assert!(!failure.effects().broker_requested);
+                assert!(!failure.effects().write_repository_requested);
+                assert!(!failure.effects().read_repository_requested);
+            }
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn original_native_carrier_loss_refuses_before_adapter_dispatch() {
+            for occupied in [false, true] {
+                let (journal, root) = fixture();
+                if occupied {
+                    // This twin would enter the operated broker if its original
+                    // native carrier were not revalidated before dispatch.
+                    let _ = hosted(journal.path(), "2030-01-01T00:00:00Z");
+                }
+                let operation = PreparedArchiveOperation::prepare(
+                    root,
+                    ArchiveBudget::new(&FixedClock).unwrap(),
+                    &FixedClock,
+                )
+                .unwrap();
+                let original = operation.carrier().clone();
+                let path = original.diagnostic_path();
+                if occupied {
+                    fs::write(path.join("foreign"), b"unresolved owner").unwrap();
+                } else {
+                    fs::rename(&path, path.with_extension("held")).unwrap();
+                }
+                let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+                let failure = refusal(admit_prepared_archive(operation, &services));
+                assert_eq!(failure.error(), ArchiveError::JournalIdentityChanged);
+                assert!(Arc::ptr_eq(failure.carrier().unwrap(), &original));
+                assert!(original.revalidate().is_err());
+                assert_eq!(*failure.effects(), ArchiveAdmissionEffects::default());
+            }
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn original_native_carrier_loss_during_final_cat_rejects_valid_repository() {
+            for occupied in [false, true] {
+                let (_journal, root) = fixture();
+                let operation = PreparedArchiveOperation::prepare(
+                    root,
+                    ArchiveBudget::new(&FixedClock).unwrap(),
+                    &FixedClock,
+                )
+                .unwrap();
+                let original = operation.carrier().clone();
+                let path = original.diagnostic_path();
+                let calls = Rc::new(Cell::new(0));
+                let observed = calls.clone();
+                let mut runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                runner.hook = Some(Box::new(move |_| {
+                    observed.set(observed.get() + 1);
+                    if observed.get() == 2 {
+                        if occupied {
+                            fs::write(path.join("foreign"), b"unresolved owner").unwrap();
+                        } else {
+                            fs::rename(&path, path.with_extension("held")).unwrap();
+                        }
+                    }
+                }));
+                let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                let failure = refusal(admit_prepared_archive(operation, &services));
+                assert_eq!(failure.error(), ArchiveError::JournalIdentityChanged);
+                assert!(Arc::ptr_eq(failure.carrier().unwrap(), &original));
+                assert!(original.revalidate().is_err());
+                assert!(!failure.effects().broker_requested);
+                assert!(failure.effects().write_repository_requested);
+                assert!(failure.effects().read_repository_requested);
+                assert_eq!(calls.get(), 2);
+                assert_eq!(runner.requests.borrow().len(), 2);
+                assert!(runner.outputs.borrow().is_empty());
+            }
         }
 
         #[cfg(all(test, feature = "full-tests", unix))]
@@ -2672,7 +2910,13 @@ mod tests {
             use std::ffi::OsStr;
             use std::os::fd::AsRawFd;
 
-            fn prepared(root: &Arc<JournalRoot>, journal: &Path) -> (PreparedMedia, PathBuf) {
+            fn prepared(
+                root: &Arc<JournalRoot>,
+                journal: &Path,
+                budget: ArchiveBudget,
+            ) -> (PreparedMedia, PathBuf, PreparedArchiveOperation<'static>) {
+                let operation =
+                    PreparedArchiveOperation::prepare(root.clone(), budget, &FixedClock).unwrap();
                 let parent_path = journal.join("owned");
                 fs::create_dir(&parent_path).unwrap();
                 fs::write(
@@ -2686,9 +2930,7 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .digest;
-                let activity =
-                    solstone_core_journal_io::activity::ActivityLease::try_acquire(root.clone())
-                        .unwrap();
+                let activity = operation.activity().clone();
                 let stage = MediaStage::create(parent.clone(), activity).unwrap();
                 let path = stage.diagnostic_path();
                 let media = stage
@@ -2696,7 +2938,7 @@ mod tests {
                     .unwrap()
                     .copy_from(&parent, OsStr::new("audio.flac"), &digest)
                     .unwrap();
-                (media, path)
+                (media, path, operation)
             }
 
             fn archive_script() -> ArchiveScript {
@@ -2729,7 +2971,11 @@ mod tests {
             #[test]
             fn exact_named_source_transport_is_only_passed_to_forced_backup() {
                 let (journal, root) = fixture();
-                let (mut media, stage) = prepared(&root, journal.path());
+                let (mut media, stage, operation) = prepared(
+                    &root,
+                    journal.path(),
+                    ArchiveBudget::new(&FixedClock).unwrap(),
+                );
                 let source = media.archive_source().unwrap();
                 let exact_path = source.path().to_str().unwrap().to_owned();
                 let descriptor = source.descriptor().map(|fd| fd.as_raw_fd());
@@ -2757,7 +3003,7 @@ mod tests {
                     }
                 }));
                 let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
-                let mut admitted = admit_archive(root, &services).unwrap();
+                let mut admitted = admit_prepared_archive(operation, &services).unwrap();
                 assert_eq!(
                     admitted
                         .archive_owned(std::slice::from_ref(&source))
@@ -2787,11 +3033,15 @@ mod tests {
             fn changed_or_substituted_source_refuses_before_any_archive_query() {
                 for substitute in [false, true] {
                     let (journal, root) = fixture();
-                    let (mut media, stage) = prepared(&root, journal.path());
+                    let (mut media, stage, operation) = prepared(
+                        &root,
+                        journal.path(),
+                        ArchiveBudget::new(&FixedClock).unwrap(),
+                    );
                     let source = media.archive_source().unwrap();
                     let runner = archive_script();
                     let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
-                    let mut admitted = admit_archive(root, &services).unwrap();
+                    let mut admitted = admit_prepared_archive(operation, &services).unwrap();
                     invalidate(&stage, substitute);
                     assert_eq!(
                         admitted.archive_owned(&[source]).unwrap_err(),
@@ -2810,7 +3060,11 @@ mod tests {
                 for cut in [2, 3, 5, 6] {
                     for substitute in [false, true] {
                         let (journal, root) = fixture();
-                        let (mut media, stage) = prepared(&root, journal.path());
+                        let (mut media, stage, operation) = prepared(
+                            &root,
+                            journal.path(),
+                            ArchiveBudget::new(&FixedClock).unwrap(),
+                        );
                         let source = media.archive_source().unwrap();
                         let hook_path = stage.clone();
                         let count = Cell::new(0);
@@ -2823,7 +3077,7 @@ mod tests {
                             }
                         }));
                         let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
-                        let mut admitted = admit_archive(root, &services).unwrap();
+                        let mut admitted = admit_prepared_archive(operation, &services).unwrap();
                         assert_eq!(
                             admitted.archive_owned(&[source]).unwrap_err(),
                             ArchiveFailure {
@@ -2849,9 +3103,12 @@ mod tests {
                 for code in [Some(0), Some(3), None] {
                     for cancelled in [false, true] {
                         let (journal, root) = fixture();
-                        let (mut media, stage) = prepared(&root, journal.path());
-                        let source = media.archive_source().unwrap();
                         let cancellation = ArchiveCancellation::new();
+                        let budget =
+                            ArchiveBudget::new_cancellable(&FixedClock, cancellation.clone())
+                                .unwrap();
+                        let (mut media, stage, operation) = prepared(&root, journal.path(), budget);
+                        let source = media.archive_source().unwrap();
                         let stop = cancellation.clone();
                         let hook_path = stage.clone();
                         let mut runner = archive_script();
@@ -2867,11 +3124,8 @@ mod tests {
                                 }
                             }
                         }));
-                        let budget =
-                            ArchiveBudget::new_cancellable(&FixedClock, cancellation).unwrap();
                         let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
-                        let mut admitted =
-                            admit_archive_with_budget(root, &services, budget).unwrap();
+                        let mut admitted = admit_prepared_archive(operation, &services).unwrap();
                         assert_eq!(
                             admitted.archive_owned(&[source]).unwrap_err(),
                             ArchiveFailure {
@@ -2918,25 +3172,24 @@ mod tests {
                         .iter()
                         .all(|r| r.timeout == Some(Duration::from_secs(seconds)))
                 );
-                let transferred = admitted.into_read_admission().unwrap();
+                let carrier = admitted.carrier().clone();
                 assert_eq!(
-                    transferred.budget.remaining(&clock).unwrap(),
+                    admitted.operation.budget().remaining(&clock).unwrap(),
                     Duration::from_secs(seconds)
                 );
                 now.set(if capped { deadline - 2 } else { deadline });
+                let failure = admitted
+                    .into_read_operation()
+                    .err()
+                    .expect("original lifetime must expire");
+                assert!(Arc::ptr_eq(failure.carrier(), &carrier));
                 assert_eq!(
-                    transferred.budget.remaining(&clock),
-                    Err(if capped {
+                    failure.reason(),
+                    solstone_core_backup::archive_readback::ReadbackError::Admission(if capped {
                         AdmissionError::CredentialsExpired
                     } else {
                         AdmissionError::DeadlineExceeded
                     })
-                );
-                cancellation.cancel();
-                assert!(transferred.budget.cancellation().unwrap().is_cancelled());
-                assert_eq!(
-                    transferred.budget.remaining(&clock),
-                    Err(AdmissionError::Cancelled)
                 );
             }
         }
@@ -2960,7 +3213,7 @@ mod tests {
                 };
                 let services = services(&PanicRunner, &PanicHttp, &clock, &Maintenance);
                 assert_eq!(
-                    refusal(admit_archive_with_budget(root, &services, budget)),
+                    refusal(admit_archive_with_budget(root, &services, budget)).error(),
                     expected
                 );
             }
@@ -2990,7 +3243,7 @@ mod tests {
                     let budget = ArchiveBudget::new_cancellable(&FixedClock, cancellation).unwrap();
                     let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
                     assert_eq!(
-                        refusal(admit_archive_with_budget(root, &services, budget)),
+                        refusal(admit_archive_with_budget(root, &services, budget)).error(),
                         ArchiveError::Cancelled
                     );
                     assert_eq!(count.get(), leg + 1);
@@ -3000,19 +3253,20 @@ mod tests {
 
         #[test]
         fn unsupported_cancellable_runner_and_http_never_fall_back_to_ordinary_execution() {
-            let (journal, root) = fixture();
+            let (_journal, root) = fixture();
             let budget =
                 ArchiveBudget::new_cancellable(&FixedClock, ArchiveCancellation::new()).unwrap();
             let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
             assert_eq!(
-                refusal(admit_archive_with_budget(root.clone(), &services, budget)),
+                refusal(admit_archive_with_budget(root.clone(), &services, budget)).error(),
                 ArchiveError::ToolFailed { reason: "failed" }
             );
+            let (journal, root) = fixture();
             let _ = hosted(journal.path(), "1970-01-01T00:02:00Z");
             let budget =
                 ArchiveBudget::new_cancellable(&FixedClock, ArchiveCancellation::new()).unwrap();
             assert!(matches!(
-                refusal(admit_archive_with_budget(root, &services, budget)),
+                refusal(admit_archive_with_budget(root, &services, budget)).error(),
                 ArchiveError::CredentialsUnavailable { .. }
             ));
         }
@@ -3052,41 +3306,37 @@ mod tests {
                     }
                 );
                 assert_eq!(runner.requests.borrow().len(), 5);
-                assert!(matches!(
-                    admitted.into_read_operation(),
-                    Err(ReadbackAdmissionError::Admission(AdmissionError::Cancelled))
-                ));
+                let failure = admitted.into_read_operation().err().unwrap();
+                assert_eq!(
+                    failure.reason(),
+                    solstone_core_backup::archive_readback::ReadbackError::Admission(
+                        AdmissionError::Cancelled
+                    )
+                );
             }
         }
 
         #[test]
-        fn readback_transfer_moves_original_admission_and_remaining_lifetime() {
+        fn expired_readback_handoff_retains_original_admission() {
             let (_journal, root) = fixture();
             let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
             let now = Rc::new(Cell::new(50));
             let clock = MutableClock(Rc::clone(&now));
             let services = services(&runner, &PanicHttp, &clock, &Maintenance);
             let admitted = admit_archive(Arc::clone(&root), &services).unwrap();
-            now.set(50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - 5);
-            let transferred = admitted.into_read_admission().unwrap();
-            assert!(Arc::ptr_eq(&transferred.root, &root));
-            assert!(std::ptr::eq(transferred.clock, services.clock));
-            assert_eq!(transferred.repository_id, REPOSITORY_ID);
-            assert_eq!(
-                transferred.expected_restic_path,
-                Path::new("/fixture/bin/restic")
-            );
-            assert_eq!(transferred.destination.repository, "s3:repo");
-            assert_eq!(transferred.password, "daily");
-            transferred.configuration.revalidate(&root).unwrap();
-            assert_eq!(
-                transferred.budget.remaining(&clock).unwrap(),
-                Duration::from_secs(5)
-            );
+            let carrier = admitted.carrier().clone();
+            assert!(Arc::ptr_eq(admitted.operation.journal_root(), &root));
             now.set(50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64);
+            let failure = admitted
+                .into_read_operation()
+                .err()
+                .expect("original deadline must refuse");
+            assert!(Arc::ptr_eq(failure.carrier(), &carrier));
             assert_eq!(
-                transferred.budget.remaining(&clock),
-                Err(AdmissionError::DeadlineExceeded)
+                failure.reason(),
+                solstone_core_backup::archive_readback::ReadbackError::Admission(
+                    AdmissionError::DeadlineExceeded
+                )
             );
             assert_eq!(runner.requests.borrow().len(), 2);
         }
@@ -3111,8 +3361,11 @@ mod tests {
                     now.set(60);
                     AdmissionError::CredentialsExpired
                 };
-                assert!(matches!(admitted.into_read_operation(),
-                    Err(ReadbackAdmissionError::Admission(error)) if error == expected));
+                let failure = admitted.into_read_operation().err().unwrap();
+                assert_eq!(
+                    failure.reason(),
+                    solstone_core_backup::archive_readback::ReadbackError::Admission(expected)
+                );
                 assert_eq!(runner.requests.borrow().len(), 2);
                 assert_eq!(http.requests.borrow().len(), 1);
             }
@@ -3128,10 +3381,11 @@ mod tests {
                 .read
                 .global_options
                 .push("--password-command=helper".into());
-            assert!(matches!(
-                admitted.into_read_operation(),
-                Err(ReadbackAdmissionError::UnsupportedBackend)
-            ));
+            let failure = admitted.into_read_operation().err().unwrap();
+            assert_eq!(
+                failure.reason(),
+                solstone_core_backup::archive_readback::ReadbackError::UnsupportedBackend
+            );
             assert_eq!(runner.requests.borrow().len(), 2);
         }
 
@@ -3246,7 +3500,7 @@ mod tests {
                 let runner = script(vec![repo(id)]);
                 let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
                 assert_eq!(
-                    refusal(admit_archive(root, &services)),
+                    refusal(admit_archive(root, &services)).error(),
                     ArchiveError::RepositoryIdentityInvalid
                 );
                 assert_eq!(runner.requests.borrow().len(), 1);
@@ -3255,7 +3509,7 @@ mod tests {
             let runner = script(vec![repo(REPOSITORY_ID), repo(OTHER_ID)]);
             let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
             assert_eq!(
-                refusal(admit_archive(root, &services)),
+                refusal(admit_archive(root, &services)).error(),
                 ArchiveError::RepositoryIdentityChanged
             );
         }
@@ -3272,7 +3526,7 @@ mod tests {
                 let (_journal, root) = fixture();
                 let runner = script(vec![output(0, body)]);
                 let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
-                let error = refusal(admit_archive(root, &services));
+                let error = refusal(admit_archive(root, &services)).error();
                 assert_eq!(error, ArchiveError::RepositoryIdentityInvalid);
                 assert!(!format!("{error:?} {error}").contains("secret"));
             }
@@ -3281,7 +3535,7 @@ mod tests {
                 let runner = script(vec![output(code, "secret")]);
                 let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
                 assert_eq!(
-                    refusal(admit_archive(root, &services)),
+                    refusal(admit_archive(root, &services)).error(),
                     ArchiveError::ToolFailed {
                         reason: reason_for_returncode(code)
                     }
@@ -3295,7 +3549,7 @@ mod tests {
                 .push_back(Err(io::Error::other("secret")));
             let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
             assert_eq!(
-                refusal(admit_archive(root, &services)),
+                refusal(admit_archive(root, &services)).error(),
                 ArchiveError::ToolFailed { reason: "failed" }
             );
         }
@@ -3311,7 +3565,7 @@ mod tests {
                 let http = hosted(journal.path(), expiry);
                 let mut services = services(&PanicRunner, &http, &FixedClock, &Maintenance);
                 services.rclone_path = Some(Path::new("/fixture/bin/rclone"));
-                assert_eq!(refusal(admit_archive(root, &services)), expected);
+                assert_eq!(refusal(admit_archive(root, &services)).error(), expected);
                 assert_eq!(http.requests.borrow().len(), 1);
             }
         }
@@ -3352,6 +3606,14 @@ mod tests {
                     self.now.set(50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64);
                     self.inner.execute(request)
                 }
+                fn execute_cancellable(
+                    &self,
+                    request: &HttpRequest,
+                    cancellation: &ArchiveCancellation,
+                ) -> Result<HttpResponse, HttpError> {
+                    assert!(!cancellation.is_cancelled());
+                    self.execute(request)
+                }
             }
             let (journal, root) = fixture();
             let http = hosted(journal.path(), "1970-01-02T00:00:00Z");
@@ -3364,21 +3626,23 @@ mod tests {
             let mut services = services(&PanicRunner, &timed_http, &clock, &Maintenance);
             services.rclone_path = Some(Path::new("/fixture/bin/rclone"));
             assert_eq!(
-                refusal(admit_archive(root, &services)),
+                refusal(admit_archive(root, &services)).error(),
                 ArchiveError::DeadlineExceeded
             );
             assert_eq!(http.requests.borrow().len(), 1);
 
             let budget = ArchiveBudget::new(&FixedClock).unwrap();
             now.set(FixedClock.now_unix() + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - 5);
+            let (_bounded_journal, bounded_root) = fixture();
+            let operation =
+                PreparedArchiveOperation::prepare(bounded_root, budget, &clock).unwrap();
             let http = ScriptedHttp {
                 requests: RefCell::new(vec![]),
                 responses: RefCell::new(VecDeque::from([Ok(credentials_response())])),
             };
             let bounded = ArchiveAdmissionHttp {
                 inner: &http,
-                clock: &clock,
-                budget: &budget,
+                operation: &operation,
             };
             let request = HttpRequest {
                 method: "POST".into(),
@@ -3512,7 +3776,7 @@ mod tests {
                 fs::remove_file(journal.path().join(relative)).unwrap();
                 let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
                 assert_eq!(
-                    refusal(admit_archive(root, &services)),
+                    refusal(admit_archive(root, &services)).error(),
                     ArchiveError::ConfigurationUnavailable
                 );
             }
@@ -3527,7 +3791,7 @@ mod tests {
                     fs::write(journal.path().join(relative), contents).unwrap();
                     let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
                     assert_eq!(
-                        refusal(admit_archive(root, &services)),
+                        refusal(admit_archive(root, &services)).error(),
                         ArchiveError::ConfigurationUnavailable
                     );
                 }
@@ -3540,7 +3804,7 @@ mod tests {
                 fs::write(path, serde_json::to_vec(&oversized).unwrap()).unwrap();
                 let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
                 assert_eq!(
-                    refusal(admit_archive(root, &services)),
+                    refusal(admit_archive(root, &services)).error(),
                     ArchiveError::ConfigurationUnavailable
                 );
             }
@@ -3566,7 +3830,7 @@ mod tests {
                     fs::write(&path, serde_json::to_vec(&binding).unwrap()).unwrap();
                     let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
                     assert_eq!(
-                        refusal(admit_archive(root, &services)),
+                        refusal(admit_archive(root, &services)).error(),
                         ArchiveError::ConfigurationUnavailable
                     );
                 }
@@ -3590,7 +3854,7 @@ mod tests {
                 std::os::unix::fs::symlink(&retained, &path).unwrap();
                 let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
                 assert_eq!(
-                    refusal(admit_archive(root, &services)),
+                    refusal(admit_archive(root, &services)).error(),
                     ArchiveError::ConfigurationUnavailable
                 );
             }
@@ -3612,7 +3876,7 @@ mod tests {
                     }
                     let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
                     assert_eq!(
-                        refusal(admit_archive(root, &services)),
+                        refusal(admit_archive(root, &services)).error(),
                         ArchiveError::ConfigurationUnavailable
                     );
                 }
@@ -3648,7 +3912,7 @@ mod tests {
                 let mut services = services(&runner, &http, &FixedClock, &Maintenance);
                 services.rclone_path = Some(Path::new("/fixture/bin/rclone"));
                 assert_eq!(
-                    refusal(admit_archive(root, &services)),
+                    refusal(admit_archive(root, &services)).error(),
                     ArchiveError::ConfigurationChanged
                 );
                 assert_eq!(runner.requests.borrow().len(), 1);

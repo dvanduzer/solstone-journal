@@ -55,9 +55,42 @@ enum HeldResource {
     Readback(Box<FailedRead>),
 }
 
+pub(crate) struct ArchiveReadStates<'a> {
+    held: std::slice::Iter<'a, HeldResource>,
+}
+
+impl ArchiveReadStates<'_> {
+    pub(crate) fn empty() -> Self {
+        Self { held: [].iter() }
+    }
+}
+
+impl<'a> Iterator for ArchiveReadStates<'a> {
+    type Item = crate::remove_marked::ArchiveReadState<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::remove_marked::ArchiveReadState;
+        self.held.next().map(|held| match held {
+            HeldResource::Stage(stage) => ArchiveReadState::Stage(stage.as_ref()),
+            HeldResource::Target(target) => ArchiveReadState::Target(target),
+            HeldResource::Prepared(prepared) => ArchiveReadState::Prepared {
+                file: &prepared.file,
+                target_identity: &prepared.target_identity,
+                media: &prepared.media,
+                cleanup: prepared.cleanup,
+            },
+            HeldResource::Readback(failed) => ArchiveReadState::Readback {
+                file: &failed.file,
+                target_identity: &failed.target_identity,
+                failure: &failed.failure,
+            },
+        })
+    }
+}
+
 struct ApprovalOwner<'a> {
     read: ReadOperation<'a>,
-    carrier: RootActivityCarrier,
+    carrier: Arc<RootActivityCarrier>,
     expected: Vec<Mark>,
     held: Vec<HeldResource>,
 }
@@ -73,7 +106,9 @@ pub(crate) struct ArchiveApprovalFailure<'a> {
 
 impl ApprovalOwner<'_> {
     fn revalidate_admission(&self) -> Result<(), ArchiveApprovalError> {
-        if !Arc::ptr_eq(self.read.journal_root(), self.carrier.journal_root()) {
+        if !Arc::ptr_eq(self.read.carrier(), &self.carrier)
+            || !Arc::ptr_eq(self.read.journal_root(), self.carrier.journal_root())
+        {
             return Err(ArchiveApprovalError::RootChanged);
         }
         self.read
@@ -94,6 +129,12 @@ impl ApprovalOwner<'_> {
 }
 
 impl ArchiveApprovalBatch<'_> {
+    pub(crate) fn read_states(&self) -> ArchiveReadStates<'_> {
+        ArchiveReadStates {
+            held: self.owner.held.iter(),
+        }
+    }
+
     pub(crate) fn journal_root(&self) -> &Arc<JournalRoot> {
         self.owner.carrier.journal_root()
     }
@@ -112,6 +153,12 @@ impl ArchiveApprovalBatch<'_> {
 }
 
 impl ArchiveApprovalFailure<'_> {
+    pub(crate) fn read_states(&self) -> ArchiveReadStates<'_> {
+        ArchiveReadStates {
+            held: self.owner.held.iter(),
+        }
+    }
+
     pub(crate) fn reason(&self) -> &ArchiveApprovalError {
         &self.reason
     }
@@ -191,7 +238,7 @@ fn selected_files(
 /// carrier, and both return variants keep the original admission and resources.
 pub(crate) fn create_archive_approval_batch<'a>(
     read: ReadOperation<'a>,
-    carrier: RootActivityCarrier,
+    carrier: Arc<RootActivityCarrier>,
     expected: &[Mark],
 ) -> Result<ArchiveApprovalBatch<'a>, ArchiveApprovalFailure<'a>> {
     let mut owner = Box::new(ApprovalOwner {

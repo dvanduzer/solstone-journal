@@ -446,13 +446,14 @@ pub fn conditional_mutate_at_root(
 
 /// One short phase under the existing register protocol. Never spans bookkeeping.
 #[cfg(unix)]
-pub(crate) struct CheckedMarkGuard<'a> {
+pub(crate) struct CheckedMarkGuard<'a, 'op> {
     checked: &'a CheckedReviewContext,
     lock: BoundParentLock,
+    archive: Option<&'a crate::archive_approval::ArchiveApprovalBatch<'op>>,
 }
 
 #[cfg(unix)]
-impl<'a> CheckedMarkGuard<'a> {
+impl<'a, 'op> CheckedMarkGuard<'a, 'op> {
     pub(crate) fn acquire(checked: &'a CheckedReviewContext) -> Result<Self, BoundMutationRefusal> {
         let (lock, register) = begin_bound(checked.root(), checked.health())?;
         check_marks(
@@ -460,7 +461,48 @@ impl<'a> CheckedMarkGuard<'a> {
             checked.marks(),
             &checked.root().identity().observation_id(),
         )?;
-        Ok(Self { checked, lock })
+        Ok(Self {
+            checked,
+            lock,
+            archive: None,
+        })
+    }
+
+    pub(crate) fn acquire_archive(
+        checked: &'a CheckedReviewContext,
+        archive: &'a crate::archive_approval::ArchiveApprovalBatch<'op>,
+    ) -> Result<Self, BoundMutationRefusal> {
+        Self::check_archive(checked, archive)?;
+        let (lock, register) = begin_bound_read(checked.root(), checked.health())?;
+        check_marks(
+            &register,
+            checked.marks(),
+            &checked.root().identity().observation_id(),
+        )?;
+        Ok(Self {
+            checked,
+            lock,
+            archive: Some(archive),
+        })
+    }
+
+    fn check_archive(
+        checked: &CheckedReviewContext,
+        archive: &crate::archive_approval::ArchiveApprovalBatch<'_>,
+    ) -> Result<(), BoundMutationRefusal> {
+        if !std::sync::Arc::ptr_eq(checked.root_arc(), archive.journal_root())
+            || checked
+                .marks()
+                .iter()
+                .filter(|m| m.offload.is_some())
+                .ne(archive.expected_marks())
+            || archive.revalidate_admission().is_err()
+        {
+            return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+                invalid("archive approval no longer matches the checked selection"),
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn revalidate(&self) -> Result<Register, BoundMutationRefusal> {
@@ -472,7 +514,9 @@ impl<'a> CheckedMarkGuard<'a> {
             .map_err(BoundMutationRefusal::Lock)?;
         let register = read_at_health(health)?
             .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
-        if register.version != 1 {
+        if let Some(archive) = self.archive {
+            Self::check_archive(self.checked, archive)?;
+        } else if register.version != 1 {
             return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
                 StoreError::WriterHeld,
             )));

@@ -25,7 +25,7 @@ pub(super) struct RetirementFacts {
 impl TransactionOutcome<'_, '_> {
     /// Only an actual confirmed in-process store write supplies record continuity.
     /// Replay without that native observation needs separately qualified adoption.
-    pub(super) fn retire_intent(mut self, options: LockOptions) -> Self {
+    pub(crate) fn retire_intent(mut self, options: LockOptions) -> Self {
         if self.hold.is_some() || self.retirement.is_some() {
             return self;
         }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Read-only restore selection while the durable prepared-media executor is held.
+//! Restore selection and owning prepared-media execution.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -11,6 +11,8 @@ use solstone_core_backup_runtime::BackupServices;
 use solstone_core_journal_io::media::MediaDirectory;
 use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
 use solstone_core_journal_io::{JournalRoot, check_record_identities};
+
+pub mod owned;
 
 use crate::ledger;
 use solstone_core_retention::archive_catalog::{SegmentCatalog, read_complete_catalog};

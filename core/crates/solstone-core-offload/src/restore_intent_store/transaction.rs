@@ -69,7 +69,7 @@ impl Admission<'_, '_> {
 }
 
 struct Owner<'operation, 'clock> {
-    carrier: RootActivityCarrier,
+    carrier: Arc<RootActivityCarrier>,
     destination: PreparedRestore,
     admission: Admission<'operation, 'clock>,
     media: Option<PreparedMedia>,
@@ -85,7 +85,8 @@ impl Owner<'_, '_> {
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
         if let Admission::Readback(operation) = &self.admission
-            && !Arc::ptr_eq(operation.journal_root(), self.root())
+            && (!Arc::ptr_eq(operation.journal_root(), self.root())
+                || !Arc::ptr_eq(operation.carrier(), &self.carrier))
         {
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
@@ -115,15 +116,15 @@ enum StagingEvidence {
 }
 
 #[must_use]
-pub(super) struct StagingFailure {
-    carrier: RootActivityCarrier,
+pub(crate) struct StagingFailure {
+    carrier: Arc<RootActivityCarrier>,
     destination: PreparedRestore,
     evidence: StagingEvidence,
     hold: Hold,
 }
 
 /// Minted only after an actual retained stage and exact neutral readback.
-pub(super) struct StagedRestore<'operation, 'clock> {
+pub(crate) struct StagedRestore<'operation, 'clock> {
     owner: Owner<'operation, 'clock>,
     witness: ArchiveWitness,
     stage: StageEvidence,
@@ -201,12 +202,13 @@ fn current_content(owner: &Owner<'_, '_>, intent: &RestoreIntent) -> Result<Curr
 }
 
 impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
-    pub(super) fn read(
-        carrier: RootActivityCarrier,
+    pub(crate) fn read(
         destination: PreparedRestore,
         operation: &'operation mut ReadOperation<'clock>,
         witness: ArchiveWitness,
+        required_capacity: u64,
     ) -> Result<Self, Box<StagingFailure>> {
+        let carrier = Arc::clone(operation.carrier());
         let owner = Owner {
             carrier,
             destination,
@@ -258,6 +260,12 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 ));
             }
         };
+        if let Err(hold) = capacity_allows(stage.available_bytes(), required_capacity)
+            .and_then(|()| owner.native_check())
+            .and_then(|()| owner.admission.check())
+        {
+            return Err(fail(owner, hold, StagingEvidence::Unconsumed(stage)));
+        }
         let observation = match stage.observation() {
             Ok(observation) => observation,
             Err(error) => {
@@ -369,7 +377,7 @@ impl Record {
 }
 
 #[must_use = "retain native effects, receipts, owner and unresolved durable intent"]
-pub(super) struct TransactionOutcome<'operation, 'clock> {
+pub(crate) struct TransactionOutcome<'operation, 'clock> {
     owner: Owner<'operation, 'clock>,
     record: Option<Record>,
     store_failure: Option<StoreAdmissionFailure>,
@@ -452,7 +460,7 @@ impl<'operation, 'clock> TransactionOutcome<'operation, 'clock> {
 }
 
 impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
-    pub(super) fn commit(
+    pub(crate) fn commit(
         self,
         time: u64,
         options: LockOptions,
@@ -743,7 +751,6 @@ impl TransactionOutcome<'_, '_> {
 
 /// Replay advances metadata only. Missing/unowned stages never mint a new attempt.
 pub(super) fn replay<'operation, 'clock>(
-    carrier: RootActivityCarrier,
     destination: PreparedRestore,
     operation: &'operation ReadOperation<'clock>,
     operation_id: &str,
@@ -751,7 +758,7 @@ pub(super) fn replay<'operation, 'clock>(
     options: LockOptions,
 ) -> TransactionOutcome<'operation, 'clock> {
     let owner = Owner {
-        carrier,
+        carrier: Arc::clone(operation.carrier()),
         destination,
         admission: Admission::Readback(operation),
         media: None,
@@ -826,3 +833,14 @@ fn replay_local<'operation, 'clock>(
 mod tests;
 
 mod retirement;
+
+mod owned;
+pub(crate) use owned::DetachedTransaction;
+
+fn capacity_allows(available: std::io::Result<u64>, required: u64) -> Result<(), Hold> {
+    match available {
+        Ok(bytes) if required > 0 && bytes >= required => Ok(()),
+        Ok(_) => Err(Hold::Admission("insufficient stage capacity".into())),
+        Err(error) => Err(Hold::Admission(error.to_string())),
+    }
+}

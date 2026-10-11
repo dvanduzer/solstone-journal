@@ -17,13 +17,16 @@ use solstone_core_journal_io::media::MediaDigest;
 use solstone_core_journal_io::media::{ArchiveSource, Cleanup, OwnedMediaTarget, PreparedMedia};
 
 use crate::Destination;
+use crate::archive_activity::PreparedArchiveOperation;
 #[cfg(unix)]
 use crate::archive_admission::ARCHIVE_LS_TIMEOUT_SECONDS;
-use crate::archive_admission::{AdmissionError, ArchiveBudget, ArchiveConfiguration, Clock};
+use crate::archive_admission::AdmissionError;
 #[cfg(unix)]
 use crate::bounded_child::{self, CompletedChild, Request};
 #[cfg(unix)]
 use solstone_core_installed_payload::CurrentInstalledMember;
+use solstone_core_journal_io::activity::ActivityLease;
+use solstone_core_journal_io::media::RootActivityCarrier;
 
 #[cfg(unix)]
 const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
@@ -34,14 +37,34 @@ const MAX_QUERY_BYTES: usize = 1024 * 1024;
 
 /// Captured inputs remain unverified until actual admission succeeds.
 pub struct ReadAdmission<'a> {
-    pub root: Arc<JournalRoot>,
-    pub configuration: ArchiveConfiguration,
-    pub budget: ArchiveBudget,
-    pub clock: &'a dyn Clock,
-    pub destination: Destination,
-    pub password: String,
-    pub repository_id: String,
-    pub expected_restic_path: PathBuf,
+    operation: PreparedArchiveOperation<'a>,
+    destination: Destination,
+    password: String,
+    repository_id: String,
+    expected_restic_path: PathBuf,
+}
+impl<'a> ReadAdmission<'a> {
+    pub fn bind(
+        operation: PreparedArchiveOperation<'a>,
+        destination: Destination,
+        password: String,
+        repository_id: String,
+        expected_restic_path: PathBuf,
+    ) -> Self {
+        Self {
+            operation,
+            destination,
+            password,
+            repository_id,
+            expected_restic_path,
+        }
+    }
+    pub fn refuse(self, reason: ReadbackError) -> ReadbackAdmissionError<'a> {
+        ReadbackAdmissionError {
+            reason,
+            owned: AdmissionOwner::Input(Box::new(self)),
+        }
+    }
 }
 
 pub struct ExactArchiveFile {
@@ -107,20 +130,48 @@ impl fmt::Display for ReadbackError {
 }
 impl std::error::Error for ReadbackError {}
 
-pub type ReadbackAdmissionError = ReadbackError;
+enum AdmissionOwner<'a> {
+    Input(Box<ReadAdmission<'a>>),
+    Admitted(Box<ReadOperation<'a>>),
+}
+#[must_use = "Retain the original archive admission after refusal"]
+pub struct ReadbackAdmissionError<'a> {
+    reason: ReadbackError,
+    owned: AdmissionOwner<'a>,
+}
+impl fmt::Debug for ReadbackAdmissionError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadbackAdmissionError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Display for ReadbackAdmissionError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+impl std::error::Error for ReadbackAdmissionError<'_> {}
+impl ReadbackAdmissionError<'_> {
+    pub fn reason(&self) -> ReadbackError {
+        self.reason
+    }
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        match &self.owned {
+            AdmissionOwner::Input(input) => input.operation.carrier(),
+            AdmissionOwner::Admitted(read) => read.carrier(),
+        }
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.carrier().journal_root()
+    }
+}
 
 pub struct ReadOperation<'a> {
+    operation: PreparedArchiveOperation<'a>,
     root: Arc<JournalRoot>,
     #[cfg(all(unix, feature = "full-tests"))]
     source_observations: std::cell::Cell<(usize, usize)>,
-    #[cfg(unix)]
-    configuration: ArchiveConfiguration,
-    #[cfg(unix)]
-    budget: ArchiveBudget,
-    #[cfg(unix)]
-    clock: &'a dyn Clock,
-    #[cfg(not(unix))]
-    clock: std::marker::PhantomData<&'a dyn Clock>,
     #[cfg(unix)]
     member: CurrentInstalledMember,
     #[cfg(unix)]
@@ -144,6 +195,7 @@ enum OwnedReadback {
 }
 
 pub struct ReadbackFailure {
+    carrier: Arc<RootActivityCarrier>,
     reason: ReadbackError,
     writer: WriterState,
     owned: Box<OwnedReadback>,
@@ -164,6 +216,9 @@ impl fmt::Display for ReadbackFailure {
 impl std::error::Error for ReadbackFailure {}
 
 impl ReadbackFailure {
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        &self.carrier
+    }
     pub fn reason(&self) -> ReadbackError {
         self.reason
     }
@@ -197,8 +252,14 @@ impl ReadbackFailure {
         }
     }
 
-    fn target(reason: ReadbackError, writer: WriterState, target: OwnedMediaTarget) -> Self {
+    fn target(
+        reason: ReadbackError,
+        writer: WriterState,
+        target: OwnedMediaTarget,
+        carrier: Arc<RootActivityCarrier>,
+    ) -> Self {
         Self {
+            carrier,
             reason,
             writer,
             owned: Box::new(OwnedReadback::Target(target)),
@@ -321,64 +382,91 @@ fn direct_environment(
 }
 
 impl<'a> ReadOperation<'a> {
-    pub fn admit(input: ReadAdmission<'a>) -> Result<Self, ReadbackAdmissionError> {
+    pub fn admit(input: ReadAdmission<'a>) -> Result<Self, ReadbackAdmissionError<'a>> {
         #[cfg(not(unix))]
         {
-            let _ = input;
-            Err(ReadbackError::Unsupported)
+            Err(ReadbackAdmissionError {
+                reason: ReadbackError::Unsupported,
+                owned: AdmissionOwner::Input(Box::new(input)),
+            })
         }
         #[cfg(unix)]
         {
-            input.budget.remaining(input.clock)?;
-            input.configuration.revalidate(&input.root)?;
-            if !input.configuration.enabled() {
-                return Err(ReadbackError::NotConfigured);
-            }
-            let keys = input
-                .configuration
-                .keys()?
-                .ok_or(ReadbackError::NotConfigured)?;
-            if input.password != keys.daily_key {
-                return Err(ReadbackError::CredentialsUnavailable);
-            }
-            match input.configuration.mode() {
-                Some("byo")
-                    if input.configuration.destination().as_ref() == Some(&input.destination) => {}
-                Some("operated")
-                    if input.configuration.binding().is_some()
-                        && input.destination.backend == "s3" => {}
-                _ => return Err(ReadbackError::NotConfigured),
-            }
-            if !full_hex_identity(&input.repository_id) {
-                return Err(ReadbackError::InvalidRepositoryIdentity);
-            }
-            let env = direct_environment(&input.destination, &input.password)?;
-            let member = solstone_core_installed_payload::resolve_current_member(RESTIC_MEMBER)
-                .map_err(|_| ReadbackError::ToolUnavailable)?;
-            if member.path() != input.expected_restic_path {
-                return Err(ReadbackError::ToolChanged);
-            }
+            let admission = (|| {
+                input.operation.revalidate()?;
+                let configuration = input.operation.configuration();
+                if !configuration.enabled() {
+                    return Err(ReadbackError::NotConfigured);
+                }
+                let keys = configuration.keys()?.ok_or(ReadbackError::NotConfigured)?;
+                if input.password != keys.daily_key {
+                    return Err(ReadbackError::CredentialsUnavailable);
+                }
+                match configuration.mode() {
+                    Some("byo")
+                        if configuration.destination().as_ref() == Some(&input.destination) => {}
+                    Some("operated")
+                        if configuration.binding().is_some()
+                            && input.destination.backend == "s3" => {}
+                    _ => return Err(ReadbackError::NotConfigured),
+                }
+                if !full_hex_identity(&input.repository_id) {
+                    return Err(ReadbackError::InvalidRepositoryIdentity);
+                }
+                let env = direct_environment(&input.destination, &input.password)?;
+                let member = solstone_core_installed_payload::resolve_current_member(RESTIC_MEMBER)
+                    .map_err(|_| ReadbackError::ToolUnavailable)?;
+                if member.path() != input.expected_restic_path {
+                    return Err(ReadbackError::ToolChanged);
+                }
+                Ok((env, member))
+            })();
+            let (env, member) = match admission {
+                Ok(admitted) => admitted,
+                Err(reason) => {
+                    return Err(ReadbackAdmissionError {
+                        reason,
+                        owned: AdmissionOwner::Input(Box::new(input)),
+                    });
+                }
+            };
             let admitted = Self {
-                root: input.root,
+                root: Arc::clone(input.operation.journal_root()),
+                operation: input.operation,
                 #[cfg(feature = "full-tests")]
                 source_observations: std::cell::Cell::new((0, 0)),
-                configuration: input.configuration,
-                budget: input.budget,
-                clock: input.clock,
                 member,
                 env,
                 repository_id: input.repository_id,
             };
-            let version = admitted.query(vec!["version".into()])?;
-            let version = std::str::from_utf8(&version.output().stdout)
-                .map_err(|_| ReadbackError::UnsupportedToolVersion)?;
-            let mut fields = version.split_whitespace();
-            if fields.next() != Some("restic") || fields.next() != Some(SUPPORTED_RESTIC_VERSION) {
-                return Err(ReadbackError::UnsupportedToolVersion);
+            let qualification = (|| {
+                let version = admitted.query(vec!["version".into()])?;
+                let version = std::str::from_utf8(&version.output().stdout)
+                    .map_err(|_| ReadbackError::UnsupportedToolVersion)?;
+                let mut fields = version.split_whitespace();
+                if fields.next() != Some("restic")
+                    || fields.next() != Some(SUPPORTED_RESTIC_VERSION)
+                {
+                    return Err(ReadbackError::UnsupportedToolVersion);
+                }
+                admitted.check_repository()?;
+                Ok(())
+            })();
+            match qualification {
+                Ok(()) => Ok(admitted),
+                Err(reason) => Err(ReadbackAdmissionError {
+                    reason,
+                    owned: AdmissionOwner::Admitted(Box::new(admitted)),
+                }),
             }
-            admitted.check_repository()?;
-            Ok(admitted)
         }
+    }
+
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.operation.carrier()
+    }
+    pub fn activity(&self) -> &Arc<ActivityLease> {
+        self.operation.activity()
     }
 
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
@@ -408,13 +496,21 @@ impl<'a> ReadOperation<'a> {
         }
     }
 
+    pub fn offload_required_bytes(
+        &self,
+        max_payload: u64,
+        metadata: u64,
+    ) -> Result<u64, ReadbackError> {
+        self.revalidate_admission()?;
+        Ok(self
+            .operation
+            .configuration()
+            .offload_required_bytes(max_payload, metadata)?)
+    }
+
     #[cfg(unix)]
     fn revalidate_local(&self) -> Result<(), ReadbackError> {
-        self.budget.remaining(self.clock)?;
-        self.root
-            .revalidate()
-            .map_err(|_| ReadbackError::Admission(AdmissionError::JournalIdentityChanged))?;
-        self.configuration.revalidate(&self.root)?;
+        self.operation.revalidate()?;
         #[cfg(unix)]
         self.member
             .revalidate()
@@ -426,8 +522,9 @@ impl<'a> ReadOperation<'a> {
     fn query(&self, argv: Vec<std::ffi::OsString>) -> Result<CompletedChild, ReadbackError> {
         self.revalidate_local()?;
         let timeout = self
-            .budget
-            .remaining(self.clock)?
+            .operation
+            .budget()
+            .remaining(self.operation.clock())?
             .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
         let output = bounded_child::run_owned(
             &Request {
@@ -438,7 +535,7 @@ impl<'a> ReadOperation<'a> {
                 pass_fds: vec![],
             },
             Some(MAX_QUERY_BYTES),
-            self.budget.cancellation(),
+            self.operation.budget().cancellation(),
         )
         .map_err(|_| self.execution_error())?;
         self.revalidate_local()?;
@@ -450,7 +547,7 @@ impl<'a> ReadOperation<'a> {
 
     #[cfg(unix)]
     fn execution_error(&self) -> ReadbackError {
-        match self.budget.remaining(self.clock) {
+        match self.operation.budget().remaining(self.operation.clock()) {
             Err(error) => error.into(),
             Ok(_) => ReadbackError::ToolFailed,
         }
@@ -513,6 +610,7 @@ impl<'a> ReadOperation<'a> {
                 ReadbackError::Unsupported,
                 WriterState::NotLaunched,
                 target,
+                Arc::clone(self.carrier()),
             ))
         }
         #[cfg(unix)]
@@ -522,6 +620,7 @@ impl<'a> ReadOperation<'a> {
                     ReadbackError::NativeFailure,
                     WriterState::Unknown,
                     target,
+                    Arc::clone(self.carrier()),
                 ));
             }
             let discovery = (|| {
@@ -559,12 +658,14 @@ impl<'a> ReadOperation<'a> {
                         reason,
                         WriterState::NotLaunched,
                         target,
+                        Arc::clone(self.carrier()),
                     ));
                 }
             };
             let prepared = self.read_exact(&file, target)?;
             if let Err(reason) = self.revalidate_source(source) {
                 return Err(ReadbackFailure {
+                    carrier: Arc::clone(self.carrier()),
                     reason,
                     writer: WriterState::QualifiedCompletion,
                     owned: Box::new(OwnedReadback::Prepared(prepared)),
@@ -586,6 +687,7 @@ impl<'a> ReadOperation<'a> {
                 ReadbackError::Unsupported,
                 WriterState::NotLaunched,
                 target,
+                Arc::clone(self.carrier()),
             ))
         }
         #[cfg(unix)]
@@ -598,6 +700,7 @@ impl<'a> ReadOperation<'a> {
                     ReadbackError::NativeFailure,
                     WriterState::Unknown,
                     target,
+                    Arc::clone(self.carrier()),
                 ));
             }
             let mut writer = WriterState::NotLaunched;
@@ -606,7 +709,7 @@ impl<'a> ReadOperation<'a> {
                 if file.repository_id != self.repository_id {
                     return Err(ReadbackError::RepositoryIdentityChanged);
                 }
-                if target.journal_root().identity() != self.root.identity() {
+                if !Arc::ptr_eq(target.journal_root(), &self.root) {
                     return Err(ReadbackError::TargetRootChanged);
                 }
                 target
@@ -618,11 +721,16 @@ impl<'a> ReadOperation<'a> {
                 Ok(())
             })();
             if let Err(reason) = preflight {
-                return Err(ReadbackFailure::target(reason, writer, target));
+                return Err(ReadbackFailure::target(
+                    reason,
+                    writer,
+                    target,
+                    Arc::clone(self.carrier()),
+                ));
             }
             let execution = (|| {
                 self.revalidate_local()?;
-                let timeout = self.budget.remaining(self.clock)?;
+                let timeout = self.operation.budget().remaining(self.operation.clock())?;
                 let transport = target
                     .helper_transport()
                     .map_err(|_| ReadbackError::NativeFailure)?;
@@ -644,10 +752,10 @@ impl<'a> ReadOperation<'a> {
                 let completed = bounded_child::run_owned(
                     &request,
                     Some(MAX_QUERY_BYTES),
-                    self.budget.cancellation(),
+                    self.operation.budget().cancellation(),
                 )
                 .map_err(|_| self.execution_error())?;
-                self.budget.remaining(self.clock)?;
+                self.operation.budget().remaining(self.operation.clock())?;
                 if !completed.successful() {
                     return Err(ReadbackError::ToolFailed);
                 }
@@ -662,7 +770,12 @@ impl<'a> ReadOperation<'a> {
                 Ok(())
             })();
             if let Err(reason) = execution {
-                return Err(ReadbackFailure::target(reason, writer, target));
+                return Err(ReadbackFailure::target(
+                    reason,
+                    writer,
+                    target,
+                    Arc::clone(self.carrier()),
+                ));
             }
             let expected = MediaDigest {
                 size: file.bytes,
@@ -672,10 +785,16 @@ impl<'a> ReadOperation<'a> {
                 target
                     .prepare_after_successful_helper(&expected)
                     .map_err(|failure| {
-                        ReadbackFailure::target(ReadbackError::NativeFailure, writer, failure.owned)
+                        ReadbackFailure::target(
+                            ReadbackError::NativeFailure,
+                            writer,
+                            failure.owned,
+                            Arc::clone(self.carrier()),
+                        )
                     })?;
             if let Err(reason) = self.revalidate_local() {
                 return Err(ReadbackFailure {
+                    carrier: Arc::clone(self.carrier()),
                     reason,
                     writer,
                     owned: Box::new(OwnedReadback::Prepared(prepared)),

@@ -150,8 +150,19 @@ impl Fixture {
 
     fn staged<'a>(&self, allowed: &'a Cell<bool>) -> StagedRestore<'a, 'static> {
         let activity = ActivityLease::try_acquire(Arc::clone(&self.root)).unwrap();
-        let carrier = RootActivityCarrier::prepare(Arc::clone(&activity))
-            .unwrap_or_else(|error| panic!("carrier {:?}", error.error()));
+        let carrier = Arc::new(
+            RootActivityCarrier::prepare(Arc::clone(&activity))
+                .unwrap_or_else(|error| panic!("carrier {:?}", error.error())),
+        );
+        self.staged_with_carrier(allowed, carrier)
+    }
+
+    fn staged_with_carrier<'a>(
+        &self,
+        allowed: &'a Cell<bool>,
+        carrier: Arc<RootActivityCarrier>,
+    ) -> StagedRestore<'a, 'static> {
+        let activity = Arc::clone(carrier.activity());
         let segment = iter_segments(self.root.canonical_path(), PathOrDay::Day("20261009"))
             .unwrap()
             .remove(0);
@@ -168,7 +179,7 @@ impl Fixture {
         let media = stage
             .create_target()
             .unwrap()
-            .copy_from(&source, OsStr::new("a.flac"), &expected)
+            .copy_from(&source, OsStr::new(&self.witness.file.name), &expected)
             .unwrap();
         StagedRestore {
             stage: StageEvidence {
@@ -869,4 +880,122 @@ fn retirement_preserves_actual_deleted_effect_when_ancestor_sync_fails_or_final_
             assert_eq!(facts.ancestors[2], Durability::Unproven);
         }
     }
+}
+
+#[test]
+fn capacity_exact_boundary_passes_and_one_below_or_query_failure_refuses() {
+    assert!(capacity_allows(Ok(100), 100).is_ok());
+    assert!(capacity_allows(Ok(99), 100).is_err());
+    assert!(capacity_allows(Ok(100), 0).is_err());
+    assert!(capacity_allows(Err(std::io::Error::other("capacity query failed")), 100).is_err());
+}
+
+#[test]
+fn detached_confirmed_retirement_releases_store_for_second_file_under_original_carrier() {
+    let mut f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let first = f.staged(&allowed);
+    let carrier = Arc::clone(&first.owner.carrier);
+    let mut second = f.witness.clone();
+    second.file.name = "b.flac".into();
+    second.manifest_id = "second-manifest".into();
+    second.witness_id = "second-witness".into();
+    second.archive_path = Some("/source/b.flac".into());
+    fs::write(f.temp.path().join("source/b.flac"), b"abc").unwrap();
+    let proof = OffloadProof {
+        journal_id: second.journal_id.clone().unwrap(),
+        manifest_id: second.manifest_id.clone(),
+        target: f.locator.target.clone(),
+        layout: f.locator.layout,
+        repository_id: second.repository_id.clone().unwrap(),
+        snapshot_id: second.snapshot_id.clone(),
+        files: vec![ArchiveFileProof {
+            witness_id: second.witness_id.clone(),
+            name: second.file.name.clone(),
+            bytes: second.file.bytes,
+            sha256: second.file.sha256.clone(),
+            archive_path: second.archive_path.clone().unwrap(),
+            processing: second.processing.clone().unwrap(),
+        }],
+    };
+    crate::ledger::writer::append_archive_witness(&f.root, &proof, 3).unwrap();
+    let first = first
+        .commit(2, options())
+        .retire_intent(options())
+        .into_owned();
+    assert!(first.completed());
+    let facts = first.facts();
+    assert!(!facts.store_exclusion_retained);
+    assert!(facts.retirement.unwrap().retired);
+    assert_eq!(
+        facts.publication.unwrap().effect,
+        PublicationEffect::Published
+    );
+    assert_eq!(first.effects(), AttemptEffects { files: 1, bytes: 3 });
+    assert_eq!(fs::read(f.raw()).unwrap(), b"abc");
+
+    f.witness = second;
+    let second = f
+        .staged_with_carrier(&allowed, Arc::clone(&carrier))
+        .commit(4, options())
+        .retire_intent(options())
+        .into_owned();
+    assert!(second.completed(), "{:?}", second.facts().hold);
+    assert!(!second.facts().store_exclusion_retained);
+    assert_eq!(second.effects(), AttemptEffects { files: 1, bytes: 3 });
+    assert_eq!(fs::read(f.raw().with_file_name("b.flac")).unwrap(), b"abc");
+    assert_eq!(first.effects().files + second.effects().files, 2);
+    assert_eq!(first.effects().bytes + second.effects().bytes, 6);
+    assert!(carrier.revalidate().is_ok());
+    assert!(first.facts().preparation.as_ref().unwrap().confirmed);
+    crate::restore::owned::tests::check_actual_accounting(vec![first, second], 2, 6, false);
+}
+
+#[test]
+fn detached_hold_keeps_store_exclusion_and_published_bytes() {
+    let f = Fixture::new(true);
+    let allowed = Cell::new(true);
+    let staged = f.staged(&allowed);
+    let activity = Arc::clone(staged.owner.carrier.activity());
+    let outcome = staged
+        .commit(2, options())
+        .retire_intent(options())
+        .into_owned();
+    assert!(!outcome.completed());
+    assert_eq!(outcome.effects(), AttemptEffects { files: 1, bytes: 3 });
+    assert!(outcome.facts().store_exclusion_retained);
+    assert_eq!(
+        outcome.facts().publication.unwrap().effect,
+        PublicationEffect::Published
+    );
+    let refused = RestoreIntentStore::create(activity).err().unwrap();
+    assert_eq!(refused.problem, StoreProblem::Busy);
+    crate::restore::owned::tests::check_actual_accounting(vec![outcome], 1, 3, true);
+}
+
+#[test]
+fn actual_stage_capacity_query_failure_preserves_empty_stage_before_target_issuance() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let staged = f.staged(&allowed);
+    let parent = staged.owner.destination.stage_parent();
+    let stage = MediaStage::create(
+        Arc::clone(&parent),
+        Arc::clone(staged.owner.carrier.activity()),
+    )
+    .unwrap();
+    let observed = stage.observation().unwrap();
+    let (result, fired) = run_with_media_hook(
+        MediaPrimitive::CapacityQuery,
+        || Err(std::io::Error::other("capacity unavailable")),
+        || capacity_allows(stage.available_bytes(), 1),
+    );
+    assert!(fired);
+    assert!(result.is_err());
+    assert_eq!(stage.observation().unwrap(), observed);
+    let directory = parent
+        .open_child(OsStr::new(&observed.directory_name))
+        .unwrap()
+        .unwrap();
+    assert!(directory.entries(8).unwrap().unwrap().is_empty());
 }

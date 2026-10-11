@@ -49,14 +49,15 @@ pub use destination_admission::{
     AdmittedDestination, DestinationAdmissionError, admit_restore_destination,
 };
 pub use engine::{
-    ARCHIVE_TAG, AdmittedArchive, AdmittedCapability, ArchiveCheckResult, ArchiveError,
-    ArchiveFailure, ArchiveFileVerdict, ArchiveReadSession, ArchiveRemoteEffects, ArchiveSnapshot,
-    BACKUP_EXCLUDES, BackupResult, BackupServices, Clock, ClosedToolError, JournalMaintenance,
-    JournalMaintenanceError, NativeJournalMaintenance, NativeRestoreRecorder, PruneResult,
-    RestoreRecorder, UnreadableSources, VerificationResult, admit_archive,
-    admit_archive_with_budget, archive_read_session, check_archive_snapshot_files, prepare,
-    run_archive_backup, run_prune, run_verification,
+    ARCHIVE_TAG, AdmittedArchive, AdmittedCapability, ArchiveAdmissionEffects,
+    ArchiveAdmissionFailure, ArchiveCheckResult, ArchiveError, ArchiveFailure, ArchiveFileVerdict,
+    ArchiveRemoteEffects, ArchiveSnapshot, BACKUP_EXCLUDES, BackupResult, BackupServices, Clock,
+    ClosedToolError, JournalMaintenance, JournalMaintenanceError, NativeJournalMaintenance,
+    NativeRestoreRecorder, PruneResult, RestoreRecorder, UnreadableSources, VerificationResult,
+    admit_archive, admit_archive_with_budget, admit_prepared_archive, check_archive_snapshot_files,
+    prepare, run_archive_backup, run_prune, run_verification,
 };
+
 // The legacy direct entry points: production goes through admission, so only
 // test builds can reach these.
 #[cfg(feature = "test-hooks")]

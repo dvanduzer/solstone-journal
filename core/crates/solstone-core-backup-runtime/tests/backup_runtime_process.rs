@@ -317,15 +317,17 @@ impl JournalMaintenance for Maintenance {
 #[test]
 #[ignore = "requires an admitted copied package and synthetic direct S3 fixture"]
 fn packaged_owned_archive_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
     use solstone_core_backup::archive_admission::{
         AdmissionError, ArchiveBudget, ArchiveCancellation,
     };
     use solstone_core_backup::archive_readback::ReadbackError;
-    use solstone_core_backup_runtime::admit_archive_with_budget;
+    use solstone_core_backup_runtime::admit_prepared_archive;
     use solstone_core_journal_io::{
         JournalRoot,
         media::{Cleanup, MediaDirectory, MediaStage, digest_reader},
     };
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
     struct ProbeClock(Cell<i64>);
@@ -369,8 +371,6 @@ fn packaged_owned_archive_entry() {
         std::env::var_os("OWNED_ARCHIVE_PROBE_JSON").expect("explicit fixture required");
     let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
     let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
-    let activity =
-        solstone_core_journal_io::activity::ActivityLease::try_acquire(root.clone()).unwrap();
     let member =
         solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
             .unwrap();
@@ -393,11 +393,14 @@ fn packaged_owned_archive_entry() {
         journal_maintenance: &Maintenance,
     };
     let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
-    let mut archive = admit_archive_with_budget(root.clone(), &services, budget).unwrap();
-    assert_eq!(
-        archive.repository_id(),
-        input["repository_id"].as_str().unwrap()
-    );
+    let operation = PreparedArchiveOperation::prepare(root.clone(), budget, &clock).unwrap();
+    let carrier = operation.carrier().clone();
+    let activity = operation.activity().clone();
+    let carrier_identity = || {
+        let observed = fs::metadata(carrier.diagnostic_path()).unwrap();
+        (observed.dev(), observed.ino())
+    };
+    let original_carrier_identity = carrier_identity();
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let fresh = || {
         MediaStage::create(parent.clone(), activity.clone())
@@ -461,9 +464,21 @@ fn packaged_owned_archive_entry() {
     for flags in initial_fd_flags.iter().flatten() {
         assert_ne!(flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
     }
+    let mut archive = admit_prepared_archive(operation, &services).unwrap();
+    assert!(Arc::ptr_eq(archive.carrier(), &carrier));
+    archive.carrier().revalidate().unwrap();
+    assert_eq!(carrier_identity(), original_carrier_identity);
+    assert_eq!(
+        archive.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
     let snapshot = archive.archive_owned(&sources).unwrap();
     let duplicate_snapshot = archive.archive_owned(&duplicates).unwrap();
     let mut reader = archive.into_read_operation().unwrap();
+    assert!(Arc::ptr_eq(reader.carrier(), &carrier));
+    assert!(Arc::ptr_eq(reader.activity(), &activity));
+    reader.carrier().revalidate().unwrap();
+    assert_eq!(carrier_identity(), original_carrier_identity);
     let mut results = Vec::new();
     for source in &sources {
         let (exact, mut prepared) = reader
@@ -550,7 +565,9 @@ fn packaged_owned_archive_entry() {
         serde_json::json!({"snapshot_id":snapshot.snapshot_id,
         "duplicate_snapshot_id":duplicate_snapshot.snapshot_id, "repository_id":snapshot.repository_id,
         "files":results, "original_budget_exhausted":true, "original_stop_observed":true,
-        "duplicate_and_wrong_bytes_refused":true, "issued_target_cleanup":"refused"})
+        "duplicate_and_wrong_bytes_refused":true, "issued_target_cleanup":"refused",
+        "original_carrier_identity":{"device":original_carrier_identity.0,
+            "inode":original_carrier_identity.1},"same_physical_carrier":true})
     );
     drop(sources);
     drop(duplicates);
@@ -568,14 +585,14 @@ fn packaged_owned_archive_entry() {
 #[cfg(feature = "full-tests")]
 #[ignore = "requires an admitted copied package and synthetic direct S3 race fixture"]
 fn packaged_owned_archive_race_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
     use solstone_core_backup::archive_admission::{
         ARCHIVE_BACKUP_TIMEOUT_SECONDS, AdmissionError, ArchiveBudget, ArchiveCancellation,
     };
     use solstone_core_backup::archive_readback::ReadbackError;
-    use solstone_core_backup_runtime::admit_archive_with_budget;
+    use solstone_core_backup_runtime::admit_prepared_archive;
     use solstone_core_journal_io::{
         JournalRoot,
-        activity::ActivityLease,
         media::{Cleanup, MediaDigest, MediaDirectory, MediaStage, digest_reader},
     };
     use std::os::unix::fs::MetadataExt;
@@ -692,7 +709,9 @@ fn packaged_owned_archive_race_entry() {
     };
     let cancellation = ArchiveCancellation::new();
     let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
-    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
+    let operation = PreparedArchiveOperation::prepare(root.clone(), budget, &clock).unwrap();
+    let carrier = operation.carrier().clone();
+    let activity = operation.activity().clone();
     let member =
         solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
             .unwrap();
@@ -708,11 +727,6 @@ fn packaged_owned_archive_race_entry() {
         version: "2.0.40",
         journal_maintenance: &Maintenance,
     };
-    let mut archive = admit_archive_with_budget(root.clone(), &services, budget).unwrap();
-    assert_eq!(
-        archive.repository_id(),
-        input["repository_id"].as_str().unwrap()
-    );
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let file = &input["files"][0];
     let name = std::ffi::OsStr::new(file["name"].as_str().unwrap());
@@ -728,10 +742,18 @@ fn packaged_owned_archive_race_entry() {
         .copy_from(&parent, name, &digest)
         .unwrap();
     let source = copied.archive_source().unwrap();
+    let mut archive = admit_prepared_archive(operation, &services).unwrap();
+    assert!(Arc::ptr_eq(archive.carrier(), &carrier));
+    assert_eq!(
+        archive.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
     let snapshot = archive
         .archive_owned(std::slice::from_ref(&source))
         .unwrap();
     let mut reader = archive.into_read_operation().unwrap();
+    assert!(Arc::ptr_eq(reader.carrier(), &carrier));
+    assert!(Arc::ptr_eq(reader.activity(), &activity));
     let stage = MediaStage::create(parent, activity.clone()).unwrap();
     let target_path = stage.diagnostic_path().join("payload");
     let target = stage.create_target().unwrap();

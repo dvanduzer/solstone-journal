@@ -369,6 +369,14 @@ pub enum ReviewedRemovalRefusal {
     Directory(solstone_core_journal_io::FlatDirectoryError),
     Changed,
     CarrierPreparation,
+    ArchiveApproval,
+    Catalog(String),
+    Readback(solstone_core_backup::archive_readback::ReadbackError),
+    OffloadFloorRequired,
+    InsufficientSpace {
+        available: u64,
+        required: u64,
+    },
 }
 
 impl From<std::io::Error> for ReviewedRemovalRefusal {
@@ -456,6 +464,23 @@ struct ReviewedExecution {
     >,
 }
 
+impl ReviewedExecution {
+    fn new() -> Self {
+        Self {
+            outcome: Outcome {
+                targets: Vec::new(),
+                halted: None,
+            },
+            refusal: None,
+            carrier: None,
+            carrier_failure: None,
+            attempts: Vec::new(),
+            stage_failures: Vec::new(),
+            mutation: None,
+        }
+    }
+}
+
 /// Owns the original review and every local effect through the caller's settlement.
 /// This additive entry does not retire its carrier or certify hold-free recovery.
 #[must_use]
@@ -513,18 +538,7 @@ pub fn remove_reviewed(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> ReviewedRemoval {
-    let mut execution = ReviewedExecution {
-        outcome: Outcome {
-            targets: Vec::new(),
-            halted: None,
-        },
-        refusal: None,
-        carrier: None,
-        carrier_failure: None,
-        attempts: Vec::new(),
-        stage_failures: Vec::new(),
-        mutation: None,
-    };
+    let mut execution = ReviewedExecution::new();
     #[cfg(unix)]
     let result = execute_reviewed(&checked, today, now, &mut execution);
     #[cfg(not(unix))]
@@ -545,6 +559,373 @@ pub fn remove_reviewed(
         });
     }
     ReviewedRemoval { checked, execution }
+}
+
+/// Retains exact archive confirmation and all effects through caller settlement.
+#[must_use]
+pub struct ReviewedArchiveRemoval<'a> {
+    checked: crate::review_context::CheckedReviewContext,
+    approval: ArchiveReviewOwner<'a>,
+    execution: ReviewedExecution,
+}
+
+enum ArchiveReviewOwner<'a> {
+    Pending {
+        _read: Box<solstone_core_backup::archive_readback::ReadOperation<'a>>,
+    },
+    Approval(
+        Result<
+            crate::archive_approval::ArchiveApprovalBatch<'a>,
+            crate::archive_approval::ArchiveApprovalFailure<'a>,
+        >,
+    ),
+}
+
+/// Borrowed retained resources and observed facts, without cleanup authority.
+pub enum ArchiveReadState<'a> {
+    Stage(Option<&'a solstone_core_journal_io::media::MediaStage>),
+    Target(&'a solstone_core_journal_io::media::OwnedMediaTarget),
+    Prepared {
+        file: &'a solstone_core_backup::archive_readback::ExactArchiveFile,
+        target_identity: &'a solstone_core_journal_io::media::MediaIdentity,
+        media: &'a solstone_core_journal_io::media::PreparedMedia,
+        cleanup: Option<solstone_core_journal_io::media::Cleanup>,
+    },
+    Readback {
+        file: &'a solstone_core_backup::archive_readback::ExactArchiveFile,
+        target_identity: &'a solstone_core_journal_io::media::MediaIdentity,
+        failure: &'a solstone_core_backup::archive_readback::ReadbackFailure,
+    },
+}
+
+impl ReviewedArchiveRemoval<'_> {
+    pub fn outcome(&self) -> &Outcome {
+        &self.execution.outcome
+    }
+    pub fn refusal(&self) -> Option<&ReviewedRemovalRefusal> {
+        self.execution.refusal.as_ref()
+    }
+    pub fn attempts(&self) -> &[ReviewedFileRemoval] {
+        &self.execution.attempts
+    }
+    pub fn stage_failures(
+        &self,
+    ) -> &[solstone_core_journal_io::media::OwnedMediaFailure<
+        Option<solstone_core_journal_io::media::MediaStage>,
+    >] {
+        &self.execution.stage_failures
+    }
+    pub fn mutation(
+        &self,
+    ) -> Option<
+        &Result<
+            crate::mark_mutation::BoundMutationOutcome,
+            crate::mark_mutation::BoundMutationRefusal,
+        >,
+    > {
+        self.execution.mutation.as_ref()
+    }
+    pub fn journal_root(&self) -> &solstone_core_journal_io::JournalRoot {
+        self.checked.root()
+    }
+    pub fn approval_readback_error(
+        &self,
+    ) -> Option<&solstone_core_backup::archive_readback::ReadbackError> {
+        if let Some(ReviewedRemovalRefusal::Readback(error)) = self.refusal() {
+            return Some(error);
+        }
+        let ArchiveReviewOwner::Approval(approval) = &self.approval else {
+            return None;
+        };
+        match approval.as_ref().err()?.reason() {
+            crate::archive_approval::ArchiveApprovalError::Readback(error) => Some(error),
+            _ => None,
+        }
+    }
+    pub fn approval_cleanup(&self) -> Option<solstone_core_journal_io::media::Cleanup> {
+        let ArchiveReviewOwner::Approval(approval) = &self.approval else {
+            return None;
+        };
+        match approval.as_ref().err()?.reason() {
+            crate::archive_approval::ArchiveApprovalError::Cleanup(cleanup) => Some(*cleanup),
+            _ => None,
+        }
+    }
+    pub fn approval_native_error(&self) -> Option<&std::io::Error> {
+        let ArchiveReviewOwner::Approval(approval) = &self.approval else {
+            return None;
+        };
+        match approval.as_ref().err()?.reason() {
+            crate::archive_approval::ArchiveApprovalError::Native(error) => Some(error),
+            _ => None,
+        }
+    }
+    pub fn archive_journal_root(&self) -> &std::sync::Arc<solstone_core_journal_io::JournalRoot> {
+        match &self.approval {
+            ArchiveReviewOwner::Pending { _read: read } => read.journal_root(),
+            ArchiveReviewOwner::Approval(Ok(batch)) => batch.journal_root(),
+            ArchiveReviewOwner::Approval(Err(failure)) => failure.journal_root(),
+        }
+    }
+    pub fn archive_activity(
+        &self,
+    ) -> &std::sync::Arc<solstone_core_journal_io::activity::ActivityLease> {
+        match &self.approval {
+            ArchiveReviewOwner::Pending { _read: read } => read.activity(),
+            ArchiveReviewOwner::Approval(Ok(batch)) => batch.activity(),
+            ArchiveReviewOwner::Approval(Err(failure)) => failure.activity(),
+        }
+    }
+    pub fn archive_expected_marks(&self) -> Option<&[Mark]> {
+        match &self.approval {
+            ArchiveReviewOwner::Pending { .. } => None,
+            ArchiveReviewOwner::Approval(Ok(batch)) => Some(batch.expected_marks()),
+            ArchiveReviewOwner::Approval(Err(failure)) => Some(failure.expected_marks()),
+        }
+    }
+    pub fn archive_reads(&self) -> impl Iterator<Item = ArchiveReadState<'_>> {
+        match &self.approval {
+            ArchiveReviewOwner::Pending { .. } => {
+                crate::archive_approval::ArchiveReadStates::empty()
+            }
+            ArchiveReviewOwner::Approval(Ok(batch)) => batch.read_states(),
+            ArchiveReviewOwner::Approval(Err(failure)) => failure.read_states(),
+        }
+    }
+}
+
+/// Confirm the selected typed offers using the original admitted archive operation.
+/// Refusal retains that operation; successful readback remains subject to fresh
+/// processing, catalog, consent and native checks at the removal door.
+pub fn remove_reviewed_with_archive<'a>(
+    checked: crate::review_context::CheckedReviewContext,
+    read: solstone_core_backup::archive_readback::ReadOperation<'a>,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> ReviewedArchiveRemoval<'a> {
+    #[cfg(unix)]
+    let selected = preflight_archive_review(&checked, &read);
+    #[cfg(not(unix))]
+    let selected: Result<Vec<Mark>, ReviewedRemovalRefusal> =
+        Err(ReviewedRemovalRefusal::Unsupported);
+    let selected = match selected {
+        Ok(selected) => selected,
+        Err(reason) => {
+            return finish_archive_review_owner(
+                checked,
+                ArchiveReviewOwner::Pending {
+                    _read: Box::new(read),
+                },
+                ReviewedExecution::new(),
+                Err(reason),
+            );
+        }
+    };
+    let carrier = std::sync::Arc::clone(read.carrier());
+    let approval = crate::archive_approval::create_archive_approval_batch(read, carrier, &selected);
+    remove_reviewed_approved(checked, approval, today, now)
+}
+
+#[cfg(unix)]
+fn preflight_archive_review(
+    checked: &crate::review_context::CheckedReviewContext,
+    read: &solstone_core_backup::archive_readback::ReadOperation<'_>,
+) -> Result<Vec<Mark>, ReviewedRemovalRefusal> {
+    use crate::review_context::{check_marks, read_at_health, revalidate_health};
+    use solstone_core_journal_io::media::MediaDirectory;
+    if !valid_reviewed_coordinates(checked.marks())
+        || !std::sync::Arc::ptr_eq(checked.root_arc(), read.journal_root())
+    {
+        return Err(ReviewedRemovalRefusal::InvalidSelection);
+    }
+    read.revalidate_admission()
+        .map_err(ReviewedRemovalRefusal::Readback)?;
+    revalidate_health(checked.root(), checked.health())
+        .map_err(crate::mark_mutation::BoundMutationRefusal::from)?;
+    let current = read_at_health(checked.health())
+        .map_err(crate::mark_mutation::BoundMutationRefusal::from)?
+        .ok_or(ReviewedRemovalRefusal::Changed)?;
+    check_marks(
+        &current,
+        checked.marks(),
+        &checked.root().identity().observation_id(),
+    )
+    .map_err(crate::mark_mutation::BoundMutationRefusal::from)?;
+    let selected = checked
+        .marks()
+        .iter()
+        .filter(|mark| mark.offload.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty()
+        || selected.iter().any(|mark| {
+            mark.class != RemovalClass::OffloadRawRelease
+                || mark.offload.as_ref().is_none_or(|offer| {
+                    offer.proof.repository_id != read.repository_id()
+                        || offer.proof.target != mark.target
+                        || offer.proof.validate().is_err()
+                })
+        })
+    {
+        return Err(ReviewedRemovalRefusal::InvalidSelection);
+    }
+    let maximum = selected
+        .iter()
+        .filter_map(|mark| mark.offload.as_ref())
+        .flat_map(|offer| &offer.proof.files)
+        .map(|file| file.bytes)
+        .max()
+        .ok_or(ReviewedRemovalRefusal::InvalidSelection)?;
+    let config_directory = MediaDirectory::open(
+        std::sync::Arc::clone(read.journal_root()),
+        Path::new("config"),
+    )?;
+    let (config, entry) = solstone_core_journal_config::read_journal_config_observed_in_directory(
+        &config_directory,
+        REVIEW_MAX_CONFIG,
+    )
+    .map_err(ReviewedRemovalRefusal::Configuration)?;
+    let metadata = (crate::review_context::MAX_REGISTER_BYTES as u64)
+        .checked_add(REVIEW_MAX_CONFIG as u64)
+        .ok_or(ReviewedRemovalRefusal::OffloadFloorRequired)?;
+    let required = read
+        .offload_required_bytes(maximum, metadata)
+        .map_err(|error| match error {
+            solstone_core_backup::archive_readback::ReadbackError::Admission(
+                solstone_core_backup::archive_admission::AdmissionError::ConfigurationUnavailable,
+            ) => ReviewedRemovalRefusal::OffloadFloorRequired,
+            other => ReviewedRemovalRefusal::Readback(other),
+        })?;
+    let parent = MediaDirectory::open(std::sync::Arc::clone(read.journal_root()), Path::new(""))?;
+    let available = parent.available_bytes()?;
+    if available < required {
+        return Err(ReviewedRemovalRefusal::InsufficientSpace {
+            available,
+            required,
+        });
+    }
+    let (current_config, current_entry) =
+        solstone_core_journal_config::read_journal_config_observed_in_directory(
+            &config_directory,
+            REVIEW_MAX_CONFIG,
+        )
+        .map_err(ReviewedRemovalRefusal::Configuration)?;
+    if current_config != config || current_entry != entry {
+        return Err(ReviewedRemovalRefusal::Changed);
+    }
+    parent.revalidate()?;
+    read.revalidate_admission()
+        .map_err(ReviewedRemovalRefusal::Readback)?;
+    revalidate_health(checked.root(), checked.health())
+        .map_err(crate::mark_mutation::BoundMutationRefusal::from)?;
+    Ok(selected)
+}
+
+pub(crate) fn remove_reviewed_approved<'a>(
+    checked: crate::review_context::CheckedReviewContext,
+    approval: Result<
+        crate::archive_approval::ArchiveApprovalBatch<'a>,
+        crate::archive_approval::ArchiveApprovalFailure<'a>,
+    >,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> ReviewedArchiveRemoval<'a> {
+    #[cfg(unix)]
+    {
+        remove_reviewed_approved_with(checked, approval, today, now, |_, _| {})
+    }
+    #[cfg(not(unix))]
+    {
+        let _parameters = (today, now);
+        finish_archive_review(
+            checked,
+            approval,
+            ReviewedExecution::new(),
+            Err(ReviewedRemovalRefusal::Unsupported),
+        )
+    }
+}
+
+#[cfg(unix)]
+fn remove_reviewed_approved_with<'a>(
+    checked: crate::review_context::CheckedReviewContext,
+    approval: Result<
+        crate::archive_approval::ArchiveApprovalBatch<'a>,
+        crate::archive_approval::ArchiveApprovalFailure<'a>,
+    >,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+    checkpoint: impl FnMut(ReviewedCheckpoint, &Path),
+) -> ReviewedArchiveRemoval<'a> {
+    let mut execution = ReviewedExecution::new();
+    let result = match &approval {
+        Ok(batch) => execute_reviewed_mode(
+            &checked,
+            today,
+            now,
+            &mut execution,
+            Some(batch),
+            checkpoint,
+        ),
+        Err(_) => Err(ReviewedRemovalRefusal::ArchiveApproval),
+    };
+    finish_archive_review(checked, approval, execution, result)
+}
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+pub(crate) fn remove_reviewed_approved_with_test_hook<'a>(
+    checked: crate::review_context::CheckedReviewContext,
+    approval: Result<
+        crate::archive_approval::ArchiveApprovalBatch<'a>,
+        crate::archive_approval::ArchiveApprovalFailure<'a>,
+    >,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+    checkpoint: impl FnMut(ReviewedCheckpoint, &Path),
+) -> ReviewedArchiveRemoval<'a> {
+    remove_reviewed_approved_with(checked, approval, today, now, checkpoint)
+}
+
+fn finish_archive_review<'a>(
+    checked: crate::review_context::CheckedReviewContext,
+    approval: Result<
+        crate::archive_approval::ArchiveApprovalBatch<'a>,
+        crate::archive_approval::ArchiveApprovalFailure<'a>,
+    >,
+    execution: ReviewedExecution,
+    result: Result<(), ReviewedRemovalRefusal>,
+) -> ReviewedArchiveRemoval<'a> {
+    finish_archive_review_owner(
+        checked,
+        ArchiveReviewOwner::Approval(approval),
+        execution,
+        result,
+    )
+}
+
+fn finish_archive_review_owner<'a>(
+    checked: crate::review_context::CheckedReviewContext,
+    approval: ArchiveReviewOwner<'a>,
+    mut execution: ReviewedExecution,
+    result: Result<(), ReviewedRemovalRefusal>,
+) -> ReviewedArchiveRemoval<'a> {
+    if let Err(error) = result {
+        execution.refusal = Some(error);
+        reviewed_mark_unsaved_deletions(&mut execution.outcome);
+        execution.outcome.halted = Some(RunHalt {
+            reason: if execution.attempts.is_empty() {
+                REVIEW_REFUSED
+            } else {
+                REVIEW_HALTED
+            }
+            .to_owned(),
+        });
+    }
+    ReviewedArchiveRemoval {
+        checked,
+        approval,
+        execution,
+    }
 }
 
 fn reviewed_mark_unsaved_deletions(outcome: &mut Outcome) {
@@ -660,6 +1041,7 @@ impl ReviewedPolicy {
 #[cfg(unix)]
 struct ReviewedGroup {
     target: crate::Target,
+    layout: solstone_core_journal_io::paths::SegmentLayout,
     directory: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
     parent: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
     events: solstone_core_journal_io::FlatDirectory,
@@ -667,7 +1049,48 @@ struct ReviewedGroup {
     scan: crate::scan::CheckedSegment,
     files: BTreeMap<String, (ProvenRaw, solstone_core_journal_io::media::MediaObservation)>,
     refusals: BTreeMap<String, String>,
+    archive_refusals: BTreeMap<String, String>,
+    policy_names: BTreeSet<String>,
+    owner_deletion: Option<solstone_core_segment::RetainedOwnerDeletion>,
     deleted: BTreeSet<String>,
+}
+
+#[cfg(unix)]
+impl ReviewedGroup {
+    fn relative(&self) -> String {
+        crate::layout::segment_rel_with_layout(
+            &self.target.day,
+            &self.target.stream,
+            &self.target.dir,
+            self.layout,
+        )
+    }
+}
+
+#[cfg(unix)]
+fn reviewed_layout(mark: &Mark) -> solstone_core_journal_io::paths::SegmentLayout {
+    use solstone_core_journal_io::paths::{DEFAULT_STREAM, SegmentLayout};
+    mark.offload.as_ref().map_or_else(
+        || {
+            if mark.target.stream == DEFAULT_STREAM {
+                SegmentLayout::Direct
+            } else {
+                SegmentLayout::Named
+            }
+        },
+        |offer| offer.proof.layout,
+    )
+}
+
+#[cfg(unix)]
+fn reviewed_relative(mark: &Mark, name: &str) -> String {
+    crate::layout::content_rel_with_layout(
+        &mark.target.day,
+        &mark.target.stream,
+        &mark.target.dir,
+        name,
+        reviewed_layout(mark),
+    )
 }
 
 #[cfg(unix)]
@@ -686,6 +1109,14 @@ fn reviewed_scan(
 fn revalidate_reviewed_group(group: &ReviewedGroup) -> Result<(), ReviewedRemovalRefusal> {
     group.directory.revalidate()?;
     group.parent.revalidate()?;
+    if let Some(owner) = &group.owner_deletion
+        && owner
+            .state()
+            .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?
+            != solstone_core_segment::OwnerDeletionState::Live
+    {
+        return Err(ReviewedRemovalRefusal::Changed);
+    }
     let current = reviewed_scan(&group.directory)?;
     let expected = group
         .scan
@@ -708,7 +1139,40 @@ fn revalidate_reviewed_group(group: &ReviewedGroup) -> Result<(), ReviewedRemova
 }
 
 #[cfg(unix)]
-fn valid_reviewed_selection(marks: &[Mark]) -> bool {
+fn reviewed_candidates(
+    scan: &crate::scan::CheckedSegment,
+    policy: &Policy,
+    target: &crate::Target,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+    purpose: DecisionPurpose,
+) -> (Vec<ProvenRaw>, BTreeMap<String, String>) {
+    let (empty, ordinary) = partition_empty_audio(scan.files().to_vec(), &ClosedHandlerSet);
+    let decide = |side: &[FoundContent]| match crate::grouped::decide_side(
+        side,
+        &ClosedHandlerSet,
+        &JournalMedia,
+        policy,
+        target,
+        today,
+        now,
+        purpose,
+    ) {
+        SideDecision::NoMedia => SideOutcome::None,
+        SideDecision::Kept(verdict) => SideOutcome::Policy(verdict),
+        SideDecision::Unproven(blockers) => SideOutcome::Held(blockers),
+        SideDecision::Eligible { proven, .. } => SideOutcome::Proved(proven),
+    };
+    let empty_decision = decide(&empty);
+    let ordinary_decision = decide(&ordinary);
+    let mut refusals = BTreeMap::new();
+    record_side_refusal(&empty, &empty_decision, &mut refusals);
+    record_side_refusal(&ordinary, &ordinary_decision, &mut refusals);
+    (ready_union(empty_decision, ordinary_decision), refusals)
+}
+
+#[cfg(unix)]
+fn valid_reviewed_coordinates(marks: &[Mark]) -> bool {
     use crate::content::{ContentName, MediaClassifier};
     let plain = |s: &str| {
         !s.is_empty()
@@ -718,12 +1182,10 @@ fn valid_reviewed_selection(marks: &[Mark]) -> bool {
     };
     !marks.is_empty()
         && marks.iter().all(|mark| {
-            mark.offload.is_none()
-                && matches!(
-                    mark.class,
-                    RemovalClass::PolicyRawRelease | RemovalClass::OffloadRawRelease
-                )
-                && mark.target.day.len() == 8
+            matches!(
+                mark.class,
+                RemovalClass::PolicyRawRelease | RemovalClass::OffloadRawRelease
+            ) && mark.target.day.len() == 8
                 && mark.target.day.bytes().all(|b| b.is_ascii_digit())
                 && NaiveDate::parse_from_str(&mark.target.day, "%Y%m%d").is_ok()
                 && plain(&mark.target.stream)
@@ -734,6 +1196,168 @@ fn valid_reviewed_selection(marks: &[Mark]) -> bool {
                             .is_some_and(|name| JournalMedia.is_owner_media(&name))
                 })
         })
+}
+
+#[cfg(unix)]
+fn valid_reviewed_selection(marks: &[Mark]) -> bool {
+    valid_reviewed_coordinates(marks) && marks.iter().all(|mark| mark.offload.is_none())
+}
+
+#[cfg(unix)]
+fn reviewed_admission(
+    archive: Option<&crate::archive_approval::ArchiveApprovalBatch<'_>>,
+    execution: &ReviewedExecution,
+) -> Result<(), ReviewedRemovalRefusal> {
+    if let Some(archive) = archive {
+        archive
+            .revalidate_admission()
+            .map_err(|_| ReviewedRemovalRefusal::ArchiveApproval)
+    } else {
+        execution
+            .carrier
+            .as_ref()
+            .ok_or(ReviewedRemovalRefusal::Changed)?
+            .revalidate()
+            .map_err(ReviewedRemovalRefusal::Io)
+    }
+}
+
+#[cfg(unix)]
+fn reviewed_archive_processing<'a>(
+    archive: &crate::archive_approval::ArchiveApprovalBatch<'_>,
+    mark: &'a Mark,
+    group: &ReviewedGroup,
+    name: &str,
+) -> Result<&'a crate::archive_proof::ArchiveFileProof, ReviewedRemovalRefusal> {
+    if !archive.expected_marks().contains(mark) {
+        return Err(ReviewedRemovalRefusal::InvalidSelection);
+    }
+    archive
+        .revalidate_admission()
+        .map_err(|_| ReviewedRemovalRefusal::ArchiveApproval)?;
+    revalidate_reviewed_group(group)?;
+    let offer = mark
+        .offload
+        .as_ref()
+        .ok_or(ReviewedRemovalRefusal::InvalidSelection)?;
+    let file = offer
+        .proof
+        .files
+        .iter()
+        .find(|file| file.name == name)
+        .ok_or(ReviewedRemovalRefusal::InvalidSelection)?;
+    let found = group
+        .scan
+        .files()
+        .iter()
+        .find(|file| file.name.as_str() == name)
+        .ok_or(ReviewedRemovalRefusal::Changed)?;
+    let processing = crate::archive_proof::AcceptedProcessingObservation::capture(
+        &ClosedHandlerSet,
+        &mark.target,
+        &found.name,
+        found.size,
+        &found.sidecar,
+    )
+    .map_err(|_| ReviewedRemovalRefusal::Changed)?;
+    if offer.proof.target != group.target
+        || offer.proof.layout != group.layout
+        || offer.proof.journal_id != archive.journal_root().identity().observation_id()
+        || file.bytes != found.size
+        || file.processing != processing
+    {
+        return Err(ReviewedRemovalRefusal::Changed);
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn reviewed_archive_file(
+    archive: &crate::archive_approval::ArchiveApprovalBatch<'_>,
+    mark: &Mark,
+    group: &ReviewedGroup,
+    name: &str,
+) -> Result<(), ReviewedRemovalRefusal> {
+    let file = reviewed_archive_processing(archive, mark, group, name)?;
+    let (proven, observed) = group
+        .files
+        .get(name)
+        .ok_or(ReviewedRemovalRefusal::Changed)?;
+    if file.bytes != proven.size()
+        || file.bytes != observed.digest.size
+        || file.sha256 != observed.digest.sha256
+    {
+        return Err(ReviewedRemovalRefusal::Changed);
+    }
+    let offer = mark
+        .offload
+        .as_ref()
+        .ok_or(ReviewedRemovalRefusal::InvalidSelection)?;
+    let catalog = crate::archive_catalog::read_complete_catalog(archive.journal_root())
+        .map_err(ReviewedRemovalRefusal::Catalog)?;
+    if catalog.active_witness(&offer.proof, file).is_none() {
+        return Err(ReviewedRemovalRefusal::Changed);
+    }
+    Ok(())
+}
+
+/// Only the retained current verifier can mint the ordinary-age exception.
+#[cfg(unix)]
+pub(crate) struct ArchiveRelease<'a, 'op> {
+    archive: &'a crate::archive_approval::ArchiveApprovalBatch<'op>,
+    register: &'a crate::mark_mutation::CheckedMarkGuard<'a, 'op>,
+    policy: &'a ReviewedPolicy,
+    group: &'a ReviewedGroup,
+    mark: &'a Mark,
+    name: &'a str,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+}
+
+#[cfg(unix)]
+impl ArchiveRelease<'_, '_> {
+    pub(crate) fn revalidate(&self) -> Result<(), ReviewedRemovalRefusal> {
+        self.register.revalidate()?;
+        self.policy.revalidate()?;
+        reviewed_archive_file(self.archive, self.mark, self.group, self.name)?;
+        let current = reviewed_scan(&self.group.directory)?;
+        let (ready, _) = reviewed_candidates(
+            &current,
+            &self.policy.policy,
+            &self.group.target,
+            self.today,
+            self.now,
+            DecisionPurpose::OffloadProposal,
+        );
+        if !ready.iter().any(|file| file.name() == self.name) {
+            return Err(ReviewedRemovalRefusal::Changed);
+        }
+        Ok(())
+    }
+    pub(crate) fn into_parts(
+        self,
+    ) -> Result<
+        (
+            std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
+            ProvenRaw,
+            solstone_core_journal_io::media::MediaObservation,
+            String,
+        ),
+        ReviewedRemovalRefusal,
+    > {
+        let (proven, observed) = self
+            .group
+            .files
+            .get(self.name)
+            .cloned()
+            .ok_or(ReviewedRemovalRefusal::Changed)?;
+        Ok((
+            self.group.directory.clone(),
+            proven,
+            observed,
+            reviewed_relative(self.mark, self.name),
+        ))
+    }
 }
 
 /// Minted only by the current ordinary executor after its full retained checks.
@@ -759,7 +1383,7 @@ impl OrdinaryRelease {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReviewedCheckpoint {
+pub(crate) enum ReviewedCheckpoint {
     Hashed,
     BeforeRaw,
     AfterRaw,
@@ -783,6 +1407,18 @@ fn execute_reviewed_with(
     today: NaiveDate,
     now: DateTime<Utc>,
     execution: &mut ReviewedExecution,
+    checkpoint: impl FnMut(ReviewedCheckpoint, &Path),
+) -> Result<(), ReviewedRemovalRefusal> {
+    execute_reviewed_mode(checked, today, now, execution, None, checkpoint)
+}
+
+#[cfg(unix)]
+fn execute_reviewed_mode(
+    checked: &crate::review_context::CheckedReviewContext,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+    execution: &mut ReviewedExecution,
+    archive: Option<&crate::archive_approval::ArchiveApprovalBatch<'_>>,
     mut checkpoint: impl FnMut(ReviewedCheckpoint, &Path),
 ) -> Result<(), ReviewedRemovalRefusal> {
     use crate::mark_mutation::CheckedMarkGuard;
@@ -796,30 +1432,59 @@ fn execute_reviewed_with(
     use std::sync::Arc;
     use std::time::Duration;
 
-    if !valid_reviewed_selection(checked.marks()) {
+    if !valid_reviewed_coordinates(checked.marks())
+        || (archive.is_none() && !valid_reviewed_selection(checked.marks()))
+    {
         return Err(ReviewedRemovalRefusal::InvalidSelection);
     }
     let root = Arc::clone(checked.root_arc());
-    let activity =
-        ActivityLease::try_acquire(Arc::clone(&root)).map_err(ReviewedRemovalRefusal::Activity)?;
-    let obligations = solstone_core_journal_io::activity_obligations::observe_obligations(&root)
-        .map_err(ReviewedRemovalRefusal::Census)?;
-    if !obligations.entries().is_empty() {
-        return Err(ReviewedRemovalRefusal::Obligations(obligations));
-    }
-    match RootActivityCarrier::prepare(Arc::clone(&activity)) {
-        Ok(carrier) => execution.carrier = Some(carrier),
-        Err(failure) => {
-            execution.carrier_failure = Some(failure);
-            return Err(ReviewedRemovalRefusal::CarrierPreparation);
+    let activity = if let Some(archive) = archive {
+        if !Arc::ptr_eq(&root, archive.journal_root())
+            || checked
+                .marks()
+                .iter()
+                .filter(|m| m.offload.is_some())
+                .ne(archive.expected_marks())
+        {
+            return Err(ReviewedRemovalRefusal::InvalidSelection);
         }
-    }
+        archive
+            .revalidate_admission()
+            .map_err(|_| ReviewedRemovalRefusal::ArchiveApproval)?;
+        Arc::clone(archive.activity())
+    } else {
+        let activity = ActivityLease::try_acquire(Arc::clone(&root))
+            .map_err(ReviewedRemovalRefusal::Activity)?;
+        let obligations =
+            solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+                .map_err(ReviewedRemovalRefusal::Census)?;
+        if !obligations.entries().is_empty() {
+            return Err(ReviewedRemovalRefusal::Obligations(obligations));
+        }
+        match RootActivityCarrier::prepare(Arc::clone(&activity)) {
+            Ok(carrier) => execution.carrier = Some(carrier),
+            Err(failure) => {
+                execution.carrier_failure = Some(failure);
+                return Err(ReviewedRemovalRefusal::CarrierPreparation);
+            }
+        }
+        activity
+    };
+    let acquire_register = || {
+        if let Some(archive) = archive {
+            CheckedMarkGuard::acquire_archive(checked, archive)
+        } else {
+            CheckedMarkGuard::acquire(checked)
+        }
+    };
     let mut targets = checked
         .marks()
         .iter()
-        .map(|m| m.target.clone())
+        .map(|m| (m.target.clone(), reviewed_layout(m)))
         .collect::<Vec<_>>();
-    targets.sort_by_key(|t| crate::layout::segment_rel(&t.day, &t.stream, &t.dir));
+    targets.sort_by_key(|(t, layout)| {
+        crate::layout::segment_rel_with_layout(&t.day, &t.stream, &t.dir, *layout)
+    });
     targets.dedup();
     let options = LockOptions {
         timeout: Duration::ZERO,
@@ -827,8 +1492,13 @@ fn execute_reviewed_with(
     };
     let mut claims = Vec::new();
     let mut directories = Vec::new();
-    for target in &targets {
-        let relative = crate::layout::segment_rel(&target.day, &target.stream, &target.dir);
+    for (target, layout) in &targets {
+        let relative = crate::layout::segment_rel_with_layout(
+            &target.day,
+            &target.stream,
+            &target.dir,
+            *layout,
+        );
         let directory = MediaDirectory::open(Arc::clone(&root), Path::new(&relative))?;
         let path = root.canonical_path().join(&relative);
         let claim = OutputClaims::discover(&path, options)?;
@@ -839,23 +1509,33 @@ fn execute_reviewed_with(
         directories.push(directory);
     }
     let mut commits = Vec::new();
-    for (target, claim) in targets.iter().zip(&claims) {
-        let relative = crate::layout::segment_rel(&target.day, &target.stream, &target.dir);
+    for ((target, layout), claim) in targets.iter().zip(&claims) {
+        let relative = crate::layout::segment_rel_with_layout(
+            &target.day,
+            &target.stream,
+            &target.dir,
+            *layout,
+        );
         commits.push(claim.commit(&root.canonical_path().join(relative))?);
     }
     let policy = ReviewedPolicy::capture(&root)?;
     let mut groups = Vec::new();
-    for (target, directory) in targets.into_iter().zip(directories) {
+    for ((target, layout), directory) in targets.into_iter().zip(directories) {
         let parent = MediaDirectory::open(
             Arc::clone(&root),
-            Path::new(&crate::layout::stream_rel(&target.day, &target.stream)),
+            Path::new(&crate::layout::stream_rel_with_layout(
+                &target.day,
+                &target.stream,
+                layout,
+            )),
         )?;
         let events = solstone_core_journal_io::FlatDirectory::open(
             &root,
-            Path::new(&crate::layout::segment_rel(
+            Path::new(&crate::layout::segment_rel_with_layout(
                 &target.day,
                 &target.stream,
                 &target.dir,
+                layout,
             )),
         )?;
         let health = solstone_core_journal_io::FlatDirectory::open(
@@ -866,38 +1546,65 @@ fn execute_reviewed_with(
             return Err(ReviewedRemovalRefusal::Changed);
         }
         let scan = reviewed_scan(&directory)?;
-        let (empty, ordinary) = partition_empty_audio(scan.files().to_vec(), &ClosedHandlerSet);
-        let decide = |side: &[FoundContent]| match crate::grouped::decide_side(
-            side,
-            &ClosedHandlerSet,
-            &JournalMedia,
+        let (mut ready, refusals) = reviewed_candidates(
+            &scan,
             &policy.policy,
             &target,
             today,
             now,
             DecisionPurpose::PolicyRelease,
-        ) {
-            SideDecision::NoMedia => SideOutcome::None,
-            SideDecision::Kept(verdict) => SideOutcome::Policy(verdict),
-            SideDecision::Unproven(blockers) => SideOutcome::Held(blockers),
-            SideDecision::Eligible { proven, .. } => SideOutcome::Proved(proven),
+        );
+        let policy_names = ready
+            .iter()
+            .map(|file| file.name().to_owned())
+            .collect::<BTreeSet<_>>();
+        let typed_names = checked
+            .marks()
+            .iter()
+            .filter(|m| m.target == target && reviewed_layout(m) == layout && m.offload.is_some())
+            .flat_map(|m| m.proposal.names.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let (archive_ready, archive_refusals) = if archive.is_some() {
+            reviewed_candidates(
+                &scan,
+                &policy.policy,
+                &target,
+                today,
+                now,
+                DecisionPurpose::OffloadProposal,
+            )
+        } else {
+            (Vec::new(), BTreeMap::new())
         };
-        let empty_decision = decide(&empty);
-        let ordinary_decision = decide(&ordinary);
-        let mut refusals = BTreeMap::new();
-        record_side_refusal(&empty, &empty_decision, &mut refusals);
-        record_side_refusal(&ordinary, &ordinary_decision, &mut refusals);
+        for file in archive_ready
+            .into_iter()
+            .filter(|file| typed_names.contains(file.name()))
+        {
+            if !ready.iter().any(|prior| prior.name() == file.name()) {
+                ready.push(file);
+            }
+        }
+        let owner_deletion = if archive.is_some() {
+            Some(
+                solstone_core_segment::RetainedOwnerDeletion::open(
+                    Arc::clone(&parent),
+                    OsStr::new(&target.dir),
+                    Some(&directory),
+                    REVIEW_MAX_ENTRIES,
+                )
+                .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?,
+            )
+        } else {
+            None
+        };
         let desired = checked
             .marks()
             .iter()
-            .filter(|m| m.target == target)
+            .filter(|m| m.target == target && reviewed_layout(m) == layout)
             .flat_map(|m| m.proposal.names.iter().cloned())
             .collect::<BTreeSet<_>>();
         let mut files = BTreeMap::new();
-        for proven in ready_union(empty_decision, ordinary_decision)
-            .into_iter()
-            .filter(|p| desired.contains(p.name()))
-        {
+        for proven in ready.into_iter().filter(|p| desired.contains(p.name())) {
             let name = crate::content::ContentName::new(proven.name())
                 .ok_or(ReviewedRemovalRefusal::InvalidSelection)?;
             let entry = scan
@@ -929,6 +1636,7 @@ fn execute_reviewed_with(
         }
         let group = ReviewedGroup {
             target,
+            layout,
             directory,
             parent,
             events,
@@ -936,30 +1644,51 @@ fn execute_reviewed_with(
             scan,
             files,
             refusals,
+            archive_refusals,
+            policy_names,
+            owner_deletion,
             deleted: BTreeSet::new(),
         };
         revalidate_reviewed_group(&group)?;
+        if let Some(archive) = archive {
+            for mark in checked.marks().iter().filter(|m| {
+                m.offload.is_some()
+                    && m.target == group.target
+                    && reviewed_layout(m) == group.layout
+            }) {
+                for name in &mark.proposal.names {
+                    if group
+                        .scan
+                        .files()
+                        .iter()
+                        .any(|file| file.name.as_str() == name)
+                    {
+                        reviewed_archive_processing(archive, mark, &group, name)?;
+                    }
+                    if group.files.contains_key(name) && !group.archive_refusals.contains_key(name)
+                    {
+                        reviewed_archive_file(archive, mark, &group, name)?;
+                    }
+                }
+            }
+        }
         groups.push(group);
     }
     for commit in &commits {
         commit.revalidate()?;
     }
     policy.revalidate()?;
-    execution
-        .carrier
-        .as_ref()
-        .ok_or(ReviewedRemovalRefusal::Changed)?
-        .revalidate()?;
+    reviewed_admission(archive, execution)?;
     let mut attempted: BTreeMap<(usize, String), usize> = BTreeMap::new();
     let mut stage_failed: BTreeMap<(usize, String), usize> = BTreeMap::new();
     let mut stop = false;
     // This guard ends before any event/marker bookkeeping or final reacquisition.
     {
-        let register = CheckedMarkGuard::acquire(checked)?;
+        let register = acquire_register()?;
         for mark in checked.marks() {
             let group_index = groups
                 .iter()
-                .position(|g| g.target == mark.target)
+                .position(|g| g.target == mark.target && g.layout == reviewed_layout(mark))
                 .ok_or(ReviewedRemovalRefusal::Changed)?;
             let group = groups
                 .get_mut(group_index)
@@ -986,6 +1715,22 @@ fn execute_reviewed_with(
                         .push(reviewed_not_removed(mark, name, NO_LONGER_PRESENT, None));
                     continue;
                 }
+                let refusals = if mark.offload.is_some() {
+                    &group.archive_refusals
+                } else {
+                    &group.refusals
+                };
+                if (mark.offload.is_none() && !group.policy_names.contains(name))
+                    || refusals.contains_key(name)
+                {
+                    row.not_removed.push(reviewed_not_removed(
+                        mark,
+                        name,
+                        refusals.get(name).map_or(REVIEW_REFUSED, String::as_str),
+                        None,
+                    ));
+                    continue;
+                }
                 let Some((proven, observed)) = group.files.get(name).cloned() else {
                     row.not_removed.push(reviewed_not_removed(
                         mark,
@@ -1005,11 +1750,7 @@ fn execute_reviewed_with(
                 let recheck = (|| {
                     register.revalidate()?;
                     policy.revalidate()?;
-                    execution
-                        .carrier
-                        .as_ref()
-                        .ok_or(ReviewedRemovalRefusal::Changed)?
-                        .revalidate()?;
+                    reviewed_admission(archive, execution)?;
                     revalidate_reviewed_group(group)
                 })();
                 if let Err(error) = recheck {
@@ -1019,6 +1760,33 @@ fn execute_reviewed_with(
                         .push(reviewed_not_removed(mark, name, REVIEW_REFUSED, None));
                     continue;
                 }
+                let archive_release = if mark.offload.is_some() {
+                    let archive = archive.ok_or(ReviewedRemovalRefusal::InvalidSelection)?;
+                    let release = ArchiveRelease {
+                        archive,
+                        register: &register,
+                        policy: &policy,
+                        group,
+                        mark,
+                        name,
+                        today,
+                        now,
+                    };
+                    if let Err(error) = release.revalidate() {
+                        execution.refusal = Some(error);
+                        row.not_removed.push(reviewed_not_removed(
+                            mark,
+                            name,
+                            REVIEW_REFUSED,
+                            None,
+                        ));
+                        stop = true;
+                        continue;
+                    }
+                    Some(release)
+                } else {
+                    None
+                };
                 let stage =
                     match MediaStage::create(Arc::clone(&group.parent), Arc::clone(&activity)) {
                         Ok(stage) => stage,
@@ -1044,12 +1812,41 @@ fn execute_reviewed_with(
                             continue;
                         }
                     };
-                let release = OrdinaryRelease {
-                    source: Arc::clone(&group.directory),
-                    proven,
-                    observation: observed,
+                let released = if let Some(release) = archive_release {
+                    match crate::door::release_reviewed_archive(release, stage) {
+                        Ok(released) => released,
+                        Err(failure) => {
+                            execution.refusal = Some(failure.reason);
+                            execution.stage_failures.push(
+                                solstone_core_journal_io::media::OwnedMediaFailure {
+                                    error: std::io::Error::other(REVIEW_REFUSED),
+                                    owned: Some(failure.stage),
+                                },
+                            );
+                            stage_failed.insert(
+                                (group_index, name.clone()),
+                                execution.stage_failures.len().saturating_sub(1),
+                            );
+                            row.not_removed.push(reviewed_not_removed(
+                                mark,
+                                name,
+                                REVIEW_REFUSED,
+                                None,
+                            ));
+                            stop = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    crate::door::release_reviewed_ordinary(
+                        OrdinaryRelease {
+                            source: Arc::clone(&group.directory),
+                            proven,
+                            observation: observed,
+                        },
+                        stage,
+                    )
                 };
-                let released = crate::door::release_reviewed_ordinary(release, stage);
                 let confirmed = released.removed.is_some();
                 if let Some(removed) = released.removed {
                     row.removed.push(removed);
@@ -1077,12 +1874,7 @@ fn execute_reviewed_with(
                 }
                 let index = execution.attempts.len();
                 execution.attempts.push(ReviewedFileRemoval {
-                    relative: crate::layout::content_rel(
-                        &mark.target.day,
-                        &mark.target.stream,
-                        &mark.target.dir,
-                        name,
-                    ),
+                    relative: reviewed_relative(mark, name),
                     class: mark.class,
                     native: released.native,
                     append: None,
@@ -1124,7 +1916,7 @@ fn execute_reviewed_with(
     for (mark, row) in checked.marks().iter().zip(&mut execution.outcome.targets) {
         let group_index = groups
             .iter()
-            .position(|g| g.target == mark.target)
+            .position(|g| g.target == mark.target && g.layout == reviewed_layout(mark))
             .ok_or(ReviewedRemovalRefusal::Changed)?;
         let group = groups
             .get(group_index)
@@ -1132,6 +1924,7 @@ fn execute_reviewed_with(
         let mut complete = true;
         let mut failed = false;
         let mut staged = None;
+        let mut remaining = Vec::new();
         for name in &mark.proposal.names {
             if let Some(index) = attempted.get(&(group_index, name.clone())) {
                 let attempt = execution
@@ -1140,6 +1933,7 @@ fn execute_reviewed_with(
                     .ok_or(ReviewedRemovalRefusal::Changed)?;
                 if !attempt.settled {
                     complete = false;
+                    remaining.push(name.clone());
                     let receipt = attempt.native.receipt();
                     if receipt.effect != RemovalEffect::NotClaimed
                         || receipt.cleanup != Cleanup::Complete
@@ -1169,6 +1963,7 @@ fn execute_reviewed_with(
                 }
             } else if let Some(index) = stage_failed.get(&(group_index, name.clone())) {
                 complete = false;
+                remaining.push(name.clone());
                 failed = true;
                 staged = execution
                     .stage_failures
@@ -1183,6 +1978,7 @@ fn execute_reviewed_with(
                     });
             } else if group.scan.files().iter().any(|f| f.name.as_str() == name) {
                 complete = false;
+                remaining.push(name.clone());
             }
         }
         let plan = if failed {
@@ -1196,6 +1992,8 @@ fn execute_reviewed_with(
             ))
         } else if complete {
             Some(PlannedMarkMutation::resolve(mark))
+        } else if mark.offload.is_some() && remaining != mark.proposal.names {
+            Some(PlannedMarkMutation::remainder(mark, &remaining))
         } else {
             None
         };
@@ -1212,19 +2010,14 @@ fn execute_reviewed_with(
     checkpoint(ReviewedCheckpoint::BeforeFinalCas, root.canonical_path());
     let final_check = (|| {
         policy.revalidate()?;
-        execution
-            .carrier
-            .as_ref()
-            .ok_or(ReviewedRemovalRefusal::Changed)?
-            .revalidate()?;
+        reviewed_admission(archive, execution)?;
         Ok::<(), ReviewedRemovalRefusal>(())
     })();
     if let Err(error) = final_check {
         reviewed_mark_unsaved_deletions(&mut execution.outcome);
         return Err(error);
     }
-    execution.mutation =
-        Some(CheckedMarkGuard::acquire(checked).and_then(|guard| guard.publish(&plans)));
+    execution.mutation = Some(acquire_register().and_then(|guard| guard.publish(&plans)));
     if !matches!(
         execution.mutation.as_ref(),
         Some(Ok(crate::mark_mutation::BoundMutationOutcome::Published(_)
@@ -1248,12 +2041,7 @@ fn reviewed_not_removed(
     staged: Option<String>,
 ) -> NotRemoved {
     NotRemoved {
-        entry: crate::layout::content_rel(
-            &mark.target.day,
-            &mark.target.stream,
-            &mark.target.dir,
-            name,
-        ),
+        entry: reviewed_relative(mark, name),
         reason: reason.to_owned(),
         staged,
     }
@@ -1286,15 +2074,9 @@ fn reviewed_bookkeeping(
         group.directory.revalidate()?;
         group.events.revalidate().map_err(std::io::Error::other)?;
         group.health.revalidate().map_err(std::io::Error::other)?;
-        let events = solstone_core_journal_io::FlatDirectory::open(
-            root,
-            Path::new(&crate::layout::segment_rel(
-                &group.target.day,
-                &group.target.stream,
-                &group.target.dir,
-            )),
-        )
-        .map_err(std::io::Error::other)?;
+        let events =
+            solstone_core_journal_io::FlatDirectory::open(root, Path::new(&group.relative()))
+                .map_err(std::io::Error::other)?;
         let health = solstone_core_journal_io::FlatDirectory::open(
             root,
             Path::new(&crate::layout::day_health_rel(&group.target.day)),
