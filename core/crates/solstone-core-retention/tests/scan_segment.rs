@@ -459,9 +459,16 @@ mod bound {
         assert!(bed.scan(3).is_err());
         fs::remove_file(bed.path().join("audio.jsonl")).unwrap();
         let odd = bed.path().join(std::ffi::OsString::from_vec(vec![0xff]));
-        fs::write(&odd, b"ignored but unbound name").unwrap();
-        assert!(bed.scan(3).is_err());
-        fs::remove_file(odd).unwrap();
+        match fs::write(&odd, b"ignored but unbound name") {
+            Ok(()) => {
+                assert!(bed.scan(3).is_err());
+                fs::remove_file(odd).unwrap();
+            }
+            // macOS can reject this filename before scanner admission (EILSEQ).
+            #[cfg(target_os = "macos")]
+            Err(error) if error.raw_os_error() == Some(92) => {}
+            Err(error) => panic!("invalid-filename fixture creation failed: {error}"),
+        }
         assert_eq!(bed.scan(2).unwrap().files().len(), 1);
     }
 
