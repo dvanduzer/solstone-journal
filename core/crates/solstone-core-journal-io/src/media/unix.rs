@@ -453,6 +453,7 @@ pub(super) fn remove_directory(
     directory: &Directory,
 ) -> io::Result<()> {
     check_leaf(parent, name, directory.identity())?;
+    step(MediaPrimitive::NativeDirectoryRemoveCut)?;
     unlinkat(parent, name, UnlinkatFlags::RemoveDir).map_err(Into::into)
 }
 

@@ -19,6 +19,12 @@ use sha2::{Digest, Sha256};
 
 use crate::JournalRoot;
 
+mod activity_carrier;
+pub use activity_carrier::{
+    ActivityCarrierPreparationFailure, ActivityCarrierPreparationReceipt,
+    ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,
+    RootActivityCarrier,
+};
 mod observation;
 pub use observation::{MediaEntry, MediaRead};
 mod removal;
@@ -42,6 +48,12 @@ const BUFFER_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaPrimitive {
     StageCreated,
+    CarrierStageSync,
+    CarrierRootSync,
+    CarrierConfirmation,
+    CarrierRetirementRootSync,
+    CarrierRetirementConfirmation,
+    NativeDirectoryRemoveCut,
     CapacityQuery,
     PreparationRead,
     PreparationWrite,

@@ -13,14 +13,24 @@ use solstone_core_backup_runtime::{
     NativeRestoreRecorder, ToolOutput, ToolRequest, ToolRunner,
 };
 
+#[cfg(feature = "full-tests")]
 const RESTIC_VERSION: &str = "0.19.0";
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Barrier, Mutex};
+use std::time::Duration;
+#[cfg(feature = "full-tests")]
+use std::{
+    any::Any,
+    future::{Future, poll_fn},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{Condvar, TryLockError},
+    task::Poll,
+    time::Instant,
+};
 use tower::ServiceExt;
 
 struct Captured {
@@ -405,6 +415,7 @@ async fn unreadable_and_zero_geometry_return_non_panicking_shapes() {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn engine_routes_are_no_longer_native_refusals() {
     let destination = json!({"repository":"s3:bucket","backend":"s3","credentials":{"access_key_id":"key","secret_access_key":"secret"}});
@@ -652,42 +663,307 @@ fn corpus_declares_all_route_cases() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 struct Hold {
     released: Mutex<bool>,
     release: Condvar,
-    started: Mutex<bool>,
-    start: Condvar,
+    started: AtomicBool,
+    expired: AtomicBool,
 }
 
+#[cfg(feature = "full-tests")]
 impl Hold {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             released: Mutex::new(false),
             release: Condvar::new(),
-            started: Mutex::new(false),
-            start: Condvar::new(),
+            started: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
         })
     }
 
-    fn wait_started(&self) {
-        let mut started = self.started.lock().unwrap();
-        while !*started {
-            started = self.start.wait(started).unwrap();
+    fn has_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    fn try_release(&self) -> Result<bool, &'static str> {
+        match self.released.try_lock() {
+            Ok(mut released) => {
+                *released = true;
+                self.release.notify_all();
+                Ok(true)
+            }
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Poisoned(_)) => Err("hold release lock poisoned"),
         }
     }
 
-    fn release(&self) {
-        *self.released.lock().unwrap() = true;
-        self.release.notify_all();
+    async fn release(&self) {
+        let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+        loop {
+            if self.try_release().expect("hold release") {
+                return;
+            }
+            fixture_tick(deadline)
+                .await
+                .expect("hold release timed out");
+        }
     }
 
-    fn arrive_and_wait(&self) {
-        *self.started.lock().unwrap() = true;
-        self.start.notify_all();
-        let mut released = self.released.lock().unwrap();
+    fn arrive_and_wait(&self) -> Result<(), ()> {
+        self.started.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut released = self.released.lock().map_err(|_| ())?;
         while !*released {
-            released = self.release.wait(released).unwrap();
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                self.expired.store(true, Ordering::Release);
+                *released = true;
+                self.release.notify_all();
+                return Err(());
+            };
+            released = self
+                .release
+                .wait_timeout(released, remaining)
+                .map_err(|_| ())?
+                .0;
         }
+        if self.expired.load(Ordering::Acquire) {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "full-tests")]
+const FIXTURE_WAIT: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "full-tests")]
+async fn fixture_tick(deadline: tokio::time::Instant) -> Result<(), &'static str> {
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .ok_or("fixture observation timed out")?;
+    tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+    Ok(())
+}
+
+#[cfg(feature = "full-tests")]
+#[derive(Debug, PartialEq, Eq)]
+enum HoldStartFailure {
+    TerminalBeforeStart {
+        phase: String,
+        reason_code: Option<String>,
+    },
+    GenerationChanged,
+    NoOperation,
+    SlotUnavailable,
+    TimedOut,
+}
+
+#[cfg(feature = "full-tests")]
+async fn fixture_generation(deps: &crate::BackupWebDeps) -> u64 {
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
+        match deps.operations.try_lock() {
+            Ok(guard) => return guard.as_ref().expect("fixture operation").generation,
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(_)) => panic!("fixture operation slot poisoned"),
+        }
+        fixture_tick(deadline)
+            .await
+            .expect("fixture generation timed out");
+    }
+}
+
+#[cfg(feature = "full-tests")]
+async fn wait_started_or_terminal(
+    hold: &Hold,
+    deps: &crate::BackupWebDeps,
+    generation: u64,
+) -> Result<(), HoldStartFailure> {
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
+        if hold.has_started() {
+            return Ok(());
+        }
+        match deps.operations.try_lock() {
+            Ok(guard) => {
+                let current = guard.as_ref().ok_or(HoldStartFailure::NoOperation)?;
+                if current.generation != generation {
+                    return Err(HoldStartFailure::GenerationChanged);
+                }
+                if crate::operation::is_terminal(&current.view.phase) {
+                    return Err(HoldStartFailure::TerminalBeforeStart {
+                        phase: current.view.phase.clone(),
+                        reason_code: current.view.reason_code.clone(),
+                    });
+                }
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(_)) => return Err(HoldStartFailure::SlotUnavailable),
+        }
+        fixture_tick(deadline)
+            .await
+            .map_err(|_| HoldStartFailure::TimedOut)?;
+    }
+}
+
+#[cfg(feature = "full-tests")]
+fn fixture_worker_settled(current: &crate::operation::Slot) -> bool {
+    #[cfg(windows)]
+    if current.cleanup.as_ref().is_some_and(|pending| {
+        pending.owners.iter().any(|owner| {
+            !matches!(
+                owner.observe(),
+                solstone_core_system::process::HelperCleanupStatus::Quiescent
+            )
+        })
+    }) {
+        return false;
+    }
+    !current.worker_active
+}
+
+#[cfg(feature = "full-tests")]
+async fn catch_fixture_panic<T>(future: impl Future<Output = T>) -> std::thread::Result<T> {
+    let mut future = Box::pin(future);
+    let result = poll_fn(
+        |cx| match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(panic) => Poll::Ready(Err(panic)),
+        },
+    )
+    .await;
+    let dropped = catch_unwind(AssertUnwindSafe(|| drop(future)));
+    result.and_then(|value| dropped.map(|()| value))
+}
+
+#[cfg(feature = "full-tests")]
+fn panic_description(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string fixture panic")
+}
+
+#[cfg(feature = "full-tests")]
+async fn settle_held_fixture(
+    deps: &crate::BackupWebDeps,
+    holds: &[Arc<Hold>],
+    transports: &[Arc<HttpScript>],
+) -> Result<(), &'static str> {
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
+        let mut released = true;
+        for hold in holds {
+            released &= hold.try_release()?;
+        }
+        // Approval publishes a successor worker before releasing its poll lease.
+        // Observe that release before the final worker/helper snapshot.
+        let poll_settled = !deps.handoff_poll_lease.load(Ordering::Acquire);
+        let owner_settled = match deps.operations.try_lock() {
+            Ok(mut guard) => {
+                if let Some(current) = guard.as_mut() {
+                    // This is the existing test-only backdate state update, made
+                    // under a fallible lock rather than the blocking helper.
+                    if released
+                        && !poll_settled
+                        && !current.worker_active
+                        && matches!(
+                            current.view.kind.as_str(),
+                            "enable_hosted" | "restore_hosted"
+                        )
+                        && current.nonce.is_some()
+                        && !crate::operation::is_terminal(&current.view.phase)
+                    {
+                        current.started = Instant::now()
+                            .checked_sub(crate::operation::HANDOFF_TTL + Duration::from_secs(1))
+                            .ok_or("fixture backdate unavailable")?;
+                    }
+                    poll_settled && fixture_worker_settled(current)
+                } else {
+                    poll_settled
+                }
+            }
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("operation slot poisoned during settlement");
+            }
+        };
+        if released && owner_settled && transports.iter().all(|http| http.active_executions() == 0)
+        {
+            return Ok(());
+        }
+        fixture_tick(deadline).await?;
+    }
+}
+
+#[cfg(feature = "full-tests")]
+async fn held_fixture<T>(
+    deps: crate::BackupWebDeps,
+    holds: Vec<Arc<Hold>>,
+    transports: Vec<Arc<HttpScript>>,
+    mut roots: Vec<tempfile::TempDir>,
+    exercise: impl Future<Output = T>,
+) -> T {
+    // Cleanup stays disabled through any panic, including cleanup's own failure.
+    for root in &mut roots {
+        root.disable_cleanup(true);
+    }
+    let mut exercise = Box::pin(exercise);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        poll_fn(
+            |cx| match catch_unwind(AssertUnwindSafe(|| exercise.as_mut().poll(cx))) {
+                Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+                Ok(Poll::Pending) => Poll::Pending,
+                Err(panic) => Poll::Ready(Err(panic)),
+            },
+        ),
+    )
+    .await;
+    let drop_failure = catch_unwind(AssertUnwindSafe(|| drop(exercise)));
+    let settlement = catch_fixture_panic(settle_held_fixture(&deps, &holds, &transports)).await;
+    let settlement_failure = match &settlement {
+        Ok(Ok(())) => None,
+        Ok(Err(reason)) => Some((*reason).to_owned()),
+        Err(panic) => Some(format!(
+            "cleanup panicked: {}",
+            panic_description(panic.as_ref())
+        )),
+    };
+    if settlement_failure.is_some() || drop_failure.is_err() {
+        let retained: Vec<_> = roots.into_iter().map(tempfile::TempDir::keep).collect();
+        let exercise_failure = match &outcome {
+            Ok(Ok(_)) => "none".to_owned(),
+            Ok(Err(panic)) => format!("panic: {}", panic_description(panic.as_ref())),
+            Err(_) => "exercise timed out".to_owned(),
+        };
+        let drop_failure = drop_failure
+            .err()
+            .map(|panic| panic_description(panic.as_ref()).to_owned());
+        panic!(
+            "exercise failure: {exercise_failure}; exercise drop failure: {drop_failure:?}; settlement failure: {settlement_failure:?}; retained roots: {retained:?}"
+        );
+    }
+    for root in &mut roots {
+        root.disable_cleanup(false);
+    }
+    drop(roots);
+    match outcome {
+        Ok(Ok(value)) => {
+            assert!(
+                holds
+                    .iter()
+                    .all(|hold| !hold.expired.load(Ordering::Acquire)),
+                "fixture hold release deadline expired"
+            );
+            value
+        }
+        Ok(Err(panic)) => resume_unwind(panic),
+        Err(_) => panic!("fixture exercise timed out after settled cleanup"),
     }
 }
 
@@ -695,6 +971,7 @@ struct ScriptRunner {
     outputs: Mutex<VecDeque<ToolOutput>>,
     calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
     overruns: AtomicUsize,
+    #[cfg(feature = "full-tests")]
     hold: Option<Arc<Hold>>,
 }
 
@@ -704,10 +981,12 @@ impl ScriptRunner {
             outputs: Mutex::new(VecDeque::from(outputs)),
             calls: Mutex::new(vec![]),
             overruns: AtomicUsize::new(0),
+            #[cfg(feature = "full-tests")]
             hold: None,
         }
     }
 
+    #[cfg(feature = "full-tests")]
     fn with_hold(outputs: Vec<ToolOutput>, hold: Arc<Hold>) -> Self {
         Self {
             outputs: Mutex::new(VecDeque::from(outputs)),
@@ -717,6 +996,7 @@ impl ScriptRunner {
         }
     }
 
+    #[cfg(feature = "full-tests")]
     fn argv_heads(&self) -> Vec<String> {
         self.calls
             .lock()
@@ -726,6 +1006,7 @@ impl ScriptRunner {
             .collect()
     }
 
+    #[cfg(feature = "full-tests")]
     fn overrun_count(&self) -> usize {
         self.overruns.load(Ordering::Acquire)
     }
@@ -742,8 +1023,10 @@ impl ToolRunner for ScriptRunner {
             .lock()
             .unwrap()
             .push((PathBuf::from(&request.program), argv.clone()));
+        #[cfg(feature = "full-tests")]
         if let Some(hold) = &self.hold {
-            hold.arrive_and_wait();
+            hold.arrive_and_wait()
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fixture hold expired"))?;
         }
         let Some(output) = self.outputs.lock().unwrap().pop_front() else {
             self.overruns.fetch_add(1, Ordering::AcqRel);
@@ -755,8 +1038,10 @@ impl ToolRunner for ScriptRunner {
     }
 }
 
+#[cfg(feature = "full-tests")]
 struct PanicAfterVersionRunner;
 
+#[cfg(feature = "full-tests")]
 impl ToolRunner for PanicAfterVersionRunner {
     fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
         if request.argv.first().and_then(|a| a.to_str()) == Some("version") {
@@ -771,8 +1056,11 @@ struct HttpScript {
     responses: Mutex<VecDeque<Result<HttpResponse, HttpError>>>,
     poll_responses: Mutex<VecDeque<Result<HttpResponse, HttpError>>>,
     requests: Mutex<Vec<HttpRequest>>,
+    #[cfg(feature = "full-tests")]
     hold: Option<Arc<Hold>>,
+    #[cfg(feature = "full-tests")]
     hold_after: usize,
+    #[cfg(feature = "full-tests")]
     hold_skips: AtomicUsize,
     active: AtomicUsize,
     max_active: AtomicUsize,
@@ -787,24 +1075,30 @@ impl Drop for ActiveGuard<'_> {
 }
 
 impl HttpScript {
+    #[cfg(feature = "full-tests")]
     fn with_responses(responses: Vec<Result<HttpResponse, HttpError>>) -> Self {
         Self {
             responses: Mutex::new(VecDeque::from(responses)),
             poll_responses: Mutex::new(VecDeque::new()),
             requests: Mutex::new(vec![]),
+            #[cfg(feature = "full-tests")]
             hold: None,
+            #[cfg(feature = "full-tests")]
             hold_after: 0,
+            #[cfg(feature = "full-tests")]
             hold_skips: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
         }
     }
 
+    #[cfg(feature = "full-tests")]
     fn with_poll_responses(self, responses: Vec<Result<HttpResponse, HttpError>>) -> Self {
         *self.poll_responses.lock().unwrap() = VecDeque::from(responses);
         self
     }
 
+    #[cfg(feature = "full-tests")]
     fn with_hold(self, hold: Arc<Hold>) -> Self {
         Self {
             hold: Some(hold),
@@ -812,6 +1106,7 @@ impl HttpScript {
         }
     }
 
+    #[cfg(feature = "full-tests")]
     fn with_hold_after(self, skip: usize, hold: Arc<Hold>) -> Self {
         Self {
             hold: Some(hold),
@@ -820,6 +1115,7 @@ impl HttpScript {
         }
     }
 
+    #[cfg(feature = "full-tests")]
     fn active_executions(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
@@ -841,10 +1137,11 @@ impl HttpTransport for HttpScript {
         let now = self.active.fetch_add(1, Ordering::AcqRel) + 1;
         self.max_active.fetch_max(now, Ordering::AcqRel);
         let _active = ActiveGuard(&self.active);
+        #[cfg(feature = "full-tests")]
         if let Some(hold) = &self.hold {
             let seen = self.hold_skips.fetch_add(1, Ordering::Relaxed);
             if seen >= self.hold_after {
-                hold.arrive_and_wait();
+                hold.arrive_and_wait().map_err(|_| HttpError::Other)?;
             }
         }
         if request.url.contains("/handoff/backup") {
@@ -897,10 +1194,12 @@ fn output(code: i32, stdout: &str) -> ToolOutput {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn version_output() -> ToolOutput {
     output(0, &format!("restic {RESTIC_VERSION}\n"))
 }
 
+#[cfg(feature = "full-tests")]
 fn credentials_response() -> HttpResponse {
     HttpResponse {
         status: 200,
@@ -916,6 +1215,7 @@ fn credentials_response() -> HttpResponse {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn xml_response(body: &str) -> HttpResponse {
     HttpResponse {
         status: 200,
@@ -1026,29 +1326,56 @@ async fn get_status_json(deps: &crate::BackupWebDeps) -> (u16, Value) {
     .await
 }
 
+#[cfg(feature = "full-tests")]
 async fn wait_terminal(deps: &crate::BackupWebDeps) -> Value {
-    for _ in 0..400 {
-        let (_, body) = get_status_json(deps).await;
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
+        let (_, body) = tokio::time::timeout_at(deadline, get_status_json(deps))
+            .await
+            .expect("operation status timed out");
         let phase = body["operation"]["phase"].as_str().unwrap_or("");
-        if crate::operation::is_terminal(phase) || body["operation"].is_null() {
+        let settled = match deps.operations.try_lock() {
+            Ok(guard) => guard.as_ref().is_none_or(fixture_worker_settled),
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => panic!("operation slot poisoned"),
+        };
+        if settled && (crate::operation::is_terminal(phase) || body["operation"].is_null()) {
             return body;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        fixture_tick(deadline)
+            .await
+            .expect("operation did not terminate");
     }
-    panic!("operation did not terminate")
 }
 
+#[cfg(feature = "full-tests")]
 async fn drain_hosted_wait(deps: &crate::BackupWebDeps) {
-    crate::operation::backdate_started(
-        &deps.operations,
-        crate::operation::HANDOFF_TTL + Duration::from_secs(1),
-    );
-    let _ = wait_terminal(deps).await;
-    for _ in 0..400 {
-        if !deps.handoff_poll_lease.load(Ordering::Acquire) {
-            return;
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
+        let updated = match deps.operations.try_lock() {
+            Ok(mut guard) => {
+                if let Some(current) = guard.as_mut() {
+                    current.started = Instant::now()
+                        .checked_sub(crate::operation::HANDOFF_TTL + Duration::from_secs(1))
+                        .expect("fixture backdate");
+                }
+                true
+            }
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => panic!("operation slot poisoned"),
+        };
+        if updated {
+            break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        fixture_tick(deadline)
+            .await
+            .expect("fixture backdate timed out");
+    }
+    let _ = wait_terminal(deps).await;
+    while deps.handoff_poll_lease.load(Ordering::Acquire) {
+        fixture_tick(deadline)
+            .await
+            .expect("poll lease did not release");
     }
 }
 
@@ -1056,6 +1383,7 @@ fn disable_backup(root: &Path) {
     solstone_core_backup::set_enabled(root, false).unwrap();
 }
 
+#[cfg(feature = "full-tests")]
 fn restore_body() -> Value {
     json!({
         "recovery_key": crate::test_support::RECOVERY_KEY,
@@ -1065,21 +1393,26 @@ fn restore_body() -> Value {
     })
 }
 
+#[cfg(feature = "full-tests")]
 const JOURNAL_SNAPSHOT_ID: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+#[cfg(feature = "full-tests")]
 fn journal_catalog() -> &'static str {
     "[{\"id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"time\":\"2026-01-01T00:00:00.000000000+00:00\",\"paths\":[\"/original\"],\"summary\":{\"total_files_processed\":4}}]"
 }
 
+#[cfg(feature = "full-tests")]
 fn restore_summary() -> &'static str {
     "[{\"message_type\":\"summary\",\"total_files\":4,\"files_restored\":4,\"total_bytes\":12,\"bytes_restored\":12}]"
 }
 
+#[cfg(feature = "full-tests")]
 fn init_outputs() -> Vec<ToolOutput> {
     vec![output(10, ""), output(0, ""), output(0, ""), output(0, "")]
 }
 
+#[cfg(feature = "full-tests")]
 fn restore_outputs() -> Vec<ToolOutput> {
     vec![
         output(0, journal_catalog()),
@@ -1088,10 +1421,12 @@ fn restore_outputs() -> Vec<ToolOutput> {
     ]
 }
 
+#[cfg(feature = "full-tests")]
 fn teardown_outputs() -> Vec<ToolOutput> {
     vec![output(0, "[{\"id\":\"snap\"}]"), output(0, "")]
 }
 
+#[cfg(feature = "full-tests")]
 fn rotate_outputs() -> Vec<ToolOutput> {
     vec![
         output(0, "[{\"id\":\"old\",\"current\":true}]"),
@@ -1101,6 +1436,7 @@ fn rotate_outputs() -> Vec<ToolOutput> {
     ]
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn engine_routes_return_running_while_restic_is_held() {
     struct Case {
@@ -1147,36 +1483,192 @@ async fn engine_routes_return_running_while_restic_is_held() {
     ];
     for case in cases {
         let root = crate::test_support::root("healthy");
+        let journal_path = root.path().to_path_buf();
         if case.disable {
-            disable_backup(root.path());
+            disable_backup(journal_path.as_path());
         }
         let hold = Hold::new();
         let runner = ScriptRunner::with_hold(case.outputs, hold.clone());
-        let (deps, _restic) = prepared(root.path().to_path_buf(), Arc::new(runner));
-        let (status, body) = post_json(&deps, case.path, case.body).await;
-        assert_eq!(status, 200, "{}", case.path);
-        assert_eq!(body["operation"]["kind"], case.kind, "{}", case.path);
-        assert_eq!(body["operation"]["phase"], case.phase, "{}", case.path);
-        hold.wait_started();
-        let (status, during) = get_status_json(&deps).await;
-        assert_eq!(status, 200, "{}", case.path);
-        assert_eq!(during["operation"]["phase"], case.phase, "{}", case.path);
-        assert!(
-            !crate::operation::is_terminal(during["operation"]["phase"].as_str().unwrap()),
-            "{}",
-            case.path
-        );
-        hold.release();
-        let done = wait_terminal(&deps).await;
-        assert!(
-            crate::operation::is_terminal(done["operation"]["phase"].as_str().unwrap_or("")),
-            "{} {}",
-            case.path,
-            done["operation"]["phase"]
-        );
+        let (deps, _restic) = prepared(journal_path.as_path().to_path_buf(), Arc::new(runner));
+        held_fixture(
+            deps.clone(),
+            vec![hold.clone()],
+            vec![],
+            vec![root, _restic],
+            async {
+                let (status, body) = post_json(&deps, case.path, case.body).await;
+                assert_eq!(status, 200, "{}", case.path);
+                assert_eq!(body["operation"]["kind"], case.kind, "{}", case.path);
+                assert_eq!(body["operation"]["phase"], case.phase, "{}", case.path);
+                wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                    .await
+                    .expect("fixture did not enter Hold");
+                let (status, during) = get_status_json(&deps).await;
+                assert_eq!(status, 200, "{}", case.path);
+                assert_eq!(during["operation"]["phase"], case.phase, "{}", case.path);
+                assert!(
+                    !crate::operation::is_terminal(during["operation"]["phase"].as_str().unwrap()),
+                    "{}",
+                    case.path
+                );
+                hold.release().await;
+                let done = wait_terminal(&deps).await;
+                assert!(
+                    crate::operation::is_terminal(
+                        done["operation"]["phase"].as_str().unwrap_or("")
+                    ),
+                    "{} {}",
+                    case.path,
+                    done["operation"]["phase"]
+                );
+            },
+        )
+        .await;
     }
 }
 
+#[cfg(feature = "full-tests")]
+#[tokio::test]
+async fn engine_route_missing_package_reports_terminal_before_hold_start() {
+    let root = crate::test_support::root("healthy");
+    let journal_path = root.path().to_path_buf();
+    let hold = Hold::new();
+    let runner = Arc::new(ScriptRunner::with_hold(restore_outputs(), hold.clone()));
+    let http = Arc::new(HttpScript::default());
+    let deps = engine_deps(
+        journal_path.clone(),
+        runner.clone(),
+        http.clone(),
+        Some(journal_path.join("missing-package/bin/solstone")),
+    );
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root],
+        async {
+            let (status, _) = post_json(&deps, "/app/backup/restore", Some(restore_body())).await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await).await,
+                Err(HoldStartFailure::TerminalBeforeStart {
+                    phase: "error".into(),
+                    reason_code: Some("restic_unavailable".into()),
+                }),
+            );
+            assert!(!hold.has_started());
+            assert!(runner.calls.lock().unwrap().is_empty());
+            assert!(http.requests.lock().unwrap().is_empty());
+            let done = wait_terminal(&deps).await;
+            assert_eq!(done["operation"]["reason_code"], "restic_unavailable");
+        },
+    )
+    .await;
+    assert!(!journal_path.exists());
+}
+
+#[cfg(feature = "full-tests")]
+#[tokio::test]
+async fn held_fixture_failure_releases_and_settles_before_dropping_roots() {
+    for (hosted_poll, approved) in [(false, false), (true, false), (true, true)] {
+        let root = crate::test_support::root("healthy");
+        disable_backup(root.path());
+        let journal_path = root.path().to_path_buf();
+        let restic = tempfile::tempdir().unwrap();
+        crate::test_support::write_ready_restic(restic.path());
+        let package_path = restic.path().to_path_buf();
+        let hold = Hold::new();
+        let runner = Arc::new(if approved {
+            let mut outputs = init_outputs();
+            outputs.push(output(0, "[]"));
+            ScriptRunner::with_outputs(outputs)
+        } else {
+            ScriptRunner::with_hold(init_outputs(), hold.clone())
+        });
+        let http = Arc::new(if approved {
+            HttpScript::with_responses(vec![Ok(credentials_response())])
+                .with_poll_responses(vec![Ok(approved_poll_response())])
+                .with_hold_after(1, hold.clone())
+        } else if hosted_poll {
+            // Keep the pending-poll failure distinct from approved successor work.
+            HttpScript::default().with_hold(hold.clone())
+        } else {
+            HttpScript::default()
+        });
+        let deps = engine_deps(
+            journal_path.clone(),
+            runner.clone(),
+            http.clone(),
+            Some(package_path.clone()),
+        );
+        let result = catch_fixture_panic(held_fixture(
+            deps.clone(),
+            vec![hold.clone()],
+            vec![http.clone()],
+            vec![root, restic],
+            async {
+                let route = if hosted_poll {
+                    "/app/backup/enable-hosted"
+                } else {
+                    "/app/backup/enable"
+                };
+                assert_eq!(post_json(&deps, route, None).await.0, 200);
+                wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                    .await
+                    .expect("fixture did not enter Hold");
+                assert!(journal_path.exists() && package_path.exists());
+                if approved {
+                    assert_eq!(poll_gets(&http).len(), 1);
+                    assert_credentials_requests(&http, Some("operated"));
+                    assert_eq!(http.active_executions(), 1);
+                    let worker_active = {
+                        let guard = deps.operations.try_lock().expect("fixture slot");
+                        guard.as_ref().expect("fixture operation").worker_active
+                    };
+                    assert!(worker_active);
+                }
+                panic!("deliberate held fixture assertion failure");
+            },
+        ))
+        .await;
+        let panic = result.expect_err("exercise must fail");
+        assert_eq!(
+            panic_description(panic.as_ref()),
+            "deliberate held fixture assertion failure"
+        );
+        assert!(hold.has_started());
+        assert!(!hold.expired.load(Ordering::Acquire));
+        assert_eq!(http.active_executions(), 0);
+        assert!(!deps.handoff_poll_lease.load(Ordering::Acquire));
+        let view = {
+            let guard = deps.operations.try_lock().expect("fixture slot");
+            let current = guard.as_ref().expect("fixture operation");
+            let settled = fixture_worker_settled(current);
+            (current.view.clone(), settled)
+        };
+        assert!(view.1);
+        assert_eq!(
+            view.0.phase,
+            if hosted_poll && !approved {
+                "error"
+            } else {
+                "done"
+            }
+        );
+        if hosted_poll && !approved {
+            assert_eq!(view.0.reason_code.as_deref(), Some("expired"));
+        } else {
+            assert!(view.0.reason_code.is_none());
+        }
+        if approved {
+            argv_in_order(&runner.argv_heads(), &["cat", "init", "key"]);
+            assert_eq!(runner.overrun_count(), 0);
+        }
+        assert!(!journal_path.exists() && !package_path.exists());
+    }
+}
+
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn enable_init_failure_leaves_disabled_and_errors() {
     let root = crate::test_support::root("healthy");
@@ -1191,6 +1683,7 @@ async fn enable_init_failure_leaves_disabled_and_errors() {
     assert_eq!(done["enabled"], false);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_success_records_snapshots_then_restore() {
     let root = crate::test_support::root("healthy");
@@ -1228,6 +1721,7 @@ async fn restore_success_records_snapshots_then_restore() {
     assert_eq!(done["last_restore"]["files_restored"], 4);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_empty_snapshots_records_journal_snapshot_not_found() {
     let root = crate::test_support::root("healthy");
@@ -1245,6 +1739,7 @@ async fn restore_empty_snapshots_records_journal_snapshot_not_found() {
     assert_eq!(done["last_restore"]["scope"], "journal");
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_adapter_records_invalid_key_once_after_tool_resolution() {
     let root = crate::test_support::root("healthy");
@@ -1262,6 +1757,7 @@ async fn restore_adapter_records_invalid_key_once_after_tool_resolution() {
     assert_eq!(recorder.calls().len(), 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_worker_panic_is_restore_failed_and_records_once() {
     let root = crate::test_support::root("healthy");
@@ -1285,6 +1781,7 @@ async fn restore_worker_panic_is_restore_failed_and_records_once() {
     assert_eq!(recorder.calls().len(), 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_check_failure_is_degraded() {
     let root = crate::test_support::root("healthy");
@@ -1300,6 +1797,7 @@ async fn restore_check_failure_is_degraded() {
     assert_eq!(done["operation"]["reason_code"], "integrity_unverified");
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn teardown_byo_forgets_then_clears() {
     let root = crate::test_support::root("healthy");
@@ -1321,6 +1819,7 @@ async fn teardown_byo_forgets_then_clears() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn teardown_operated_wipes_via_http() {
     let root = crate::test_support::hosted_bound_root();
@@ -1350,9 +1849,11 @@ async fn teardown_operated_wipes_via_http() {
     assert_eq!(done["hosted"]["bound"], false);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn teardown_operated_keeps_binding_visible_while_held() {
     let root = crate::test_support::hosted_bound_root();
+    let journal_path = root.path().to_path_buf();
     let hold = Hold::new();
     let runner = ScriptRunner::with_outputs(vec![]);
     let restic = tempfile::tempdir().unwrap();
@@ -1370,33 +1871,45 @@ async fn teardown_operated_keeps_binding_visible_while_held() {
         .with_hold_after(1, hold.clone()),
     );
     let deps = engine_deps(
-        root.path().to_path_buf(),
+        journal_path.as_path().to_path_buf(),
         Arc::new(runner),
-        http,
+        http.clone(),
         Some(restic.path().to_path_buf()),
     );
 
-    let (status, body) = post_json(&deps, "/app/backup/teardown", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["operation"]["kind"], "teardown");
-    assert_eq!(body["operation"]["phase"], "tearing_down");
-    hold.wait_started();
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root, restic],
+        async {
+            let (status, body) = post_json(&deps, "/app/backup/teardown", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(body["operation"]["kind"], "teardown");
+            assert_eq!(body["operation"]["phase"], "tearing_down");
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
 
-    let (status, during) = get_status_json(&deps).await;
-    assert_eq!(status, 200);
-    assert_eq!(during["operation"]["kind"], "teardown");
-    assert_eq!(during["operation"]["phase"], "tearing_down");
-    assert_eq!(during["hosted"]["bound"], true);
-    assert_eq!(during["hosted"]["bucket"], "bucket");
-    assert_eq!(during["hosted"]["prefix"], "owner/prefix");
+            let (status, during) = get_status_json(&deps).await;
+            assert_eq!(status, 200);
+            assert_eq!(during["operation"]["kind"], "teardown");
+            assert_eq!(during["operation"]["phase"], "tearing_down");
+            assert_eq!(during["hosted"]["bound"], true);
+            assert_eq!(during["hosted"]["bucket"], "bucket");
+            assert_eq!(during["hosted"]["prefix"], "owner/prefix");
 
-    hold.release();
-    let done = wait_terminal(&deps).await;
-    assert_eq!(done["operation"]["phase"], "done");
-    assert_eq!(done["hosted"]["bound"], false);
-    assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
+            hold.release().await;
+            let done = wait_terminal(&deps).await;
+            assert_eq!(done["operation"]["phase"], "done");
+            assert_eq!(done["hosted"]["bound"], false);
+            assert!(solstone_core_backup::load_hosted_binding(journal_path.as_path()).is_none());
+        },
+    )
+    .await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn teardown_operated_superseded_binding_clears_local_state_without_wiping() {
     let root = crate::test_support::hosted_bound_root();
@@ -1426,6 +1939,7 @@ async fn teardown_operated_superseded_binding_clears_local_state_without_wiping(
     assert_eq!(http.requests.lock().unwrap().len(), 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn teardown_operated_invalid_binding_keeps_local_state() {
     let root = crate::test_support::hosted_bound_root();
@@ -1455,6 +1969,7 @@ async fn teardown_operated_invalid_binding_keeps_local_state() {
     assert_eq!(http.requests.lock().unwrap().len(), 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn rotate_does_not_echo_recovery_key() {
     let root = crate::test_support::root("healthy");
@@ -1476,6 +1991,7 @@ async fn rotate_does_not_echo_recovery_key() {
     hold_until_rotate_done(deps, runner).await;
 }
 
+#[cfg(feature = "full-tests")]
 async fn hold_until_rotate_done(deps: crate::BackupWebDeps, runner: Arc<ScriptRunner>) {
     let done = wait_terminal(&deps).await;
     assert_eq!(done["operation"]["phase"], "done");
@@ -1484,21 +2000,35 @@ async fn hold_until_rotate_done(deps: crate::BackupWebDeps, runner: Arc<ScriptRu
     assert!(runner.argv_heads().iter().any(|head| head == "key"));
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn second_engine_post_is_backup_busy() {
     let root = crate::test_support::root("healthy");
-    disable_backup(root.path());
+    let journal_path = root.path().to_path_buf();
+    disable_backup(journal_path.as_path());
     let hold = Hold::new();
     let runner = ScriptRunner::with_hold(init_outputs(), hold.clone());
-    let (deps, _restic) = prepared(root.path().to_path_buf(), Arc::new(runner));
-    let (status, body) = post_json(&deps, "/app/backup/enable", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["operation"]["phase"], "setting_up");
-    let (busy_status, busy) = post_json(&deps, "/app/backup/teardown", None).await;
-    assert_eq!(busy_status, 400);
-    assert_eq!(busy["reason_code"], "backup_busy");
-    hold.release();
-    let _ = wait_terminal(&deps).await;
+    let (deps, _restic) = prepared(journal_path.as_path().to_path_buf(), Arc::new(runner));
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![],
+        vec![root, _restic],
+        async {
+            let (status, body) = post_json(&deps, "/app/backup/enable", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(body["operation"]["phase"], "setting_up");
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            let (busy_status, busy) = post_json(&deps, "/app/backup/teardown", None).await;
+            assert_eq!(busy_status, 400);
+            assert_eq!(busy["reason_code"], "backup_busy");
+            hold.release().await;
+            let _ = wait_terminal(&deps).await;
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1534,6 +2064,7 @@ async fn destination_returns_distinct_reason_codes_from_cat_config() {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn assert_enable_portal_url(url: &str) {
     let relative = url.strip_prefix("https://services.solstone.app").unwrap();
     let (path, query) = relative.split_once('?').unwrap();
@@ -1583,6 +2114,7 @@ fn assert_enable_portal_url(url: &str) {
     assert_eq!(exp - iat, 1800);
 }
 
+#[cfg(feature = "full-tests")]
 fn assert_restore_portal_url(url: &str) {
     let relative = url.strip_prefix("https://services.solstone.app").unwrap();
     let (path, query) = relative.split_once('?').unwrap();
@@ -1603,6 +2135,7 @@ fn assert_restore_portal_url(url: &str) {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn enable_hosted_returns_portal_url() {
     let root = crate::test_support::root("healthy");
@@ -1748,6 +2281,7 @@ async fn enable_hosted_verifies_refusals_and_busy_behavior() {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn handoff_binding_enables_operated_mode() {
     let root = crate::test_support::root("healthy");
@@ -1800,10 +2334,12 @@ async fn handoff_binding_enables_operated_mode() {
     assert!(!rendered.contains(crate::test_support::RECOVERY_KEY));
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_held() {
     let root = crate::test_support::root("healthy");
-    disable_backup(root.path());
+    let journal_path = root.path().to_path_buf();
+    disable_backup(journal_path.as_path());
     let hold = Hold::new();
     let runner = ScriptRunner::with_outputs(init_outputs());
     let restic = tempfile::tempdir().unwrap();
@@ -1812,47 +2348,14 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
         HttpScript::with_responses(vec![Ok(credentials_response())]).with_hold(hold.clone()),
     );
     let mut deps = engine_deps(
-        root.path().to_path_buf(),
+        journal_path.as_path().to_path_buf(),
         Arc::new(runner),
-        http,
+        http.clone(),
         Some(restic.path().to_path_buf()),
     );
 
-    let (status, started) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    assert_eq!(status, 200);
-    let nonce = portal_nonce(&started);
-    let (status, _) = post_json(
-        &deps,
-        "/app/backup/handoff",
-        Some(hosted_handoff_payload(&nonce)),
-    )
-    .await;
-    assert_eq!(status, 200);
-    hold.wait_started();
-    assert_eq!(
-        solstone_core_backup::load_hosted_binding(root.path()),
-        Some(crate::test_support::hosted_binding())
-    );
-
-    let (status, during) = get_status_json(&deps).await;
-    assert_eq!(status, 200);
-    assert_eq!(during["operation"]["kind"], "enable_hosted");
-    assert_eq!(during["operation"]["phase"], "setting_up");
-    assert_eq!(during["hosted"]["bound"], false);
-    assert!(during["hosted"].get("bucket").is_none());
-    assert!(during["hosted"].get("prefix").is_none());
-
-    hold.release();
-    let done = wait_terminal(&deps).await;
-    assert_eq!(done["operation"]["phase"], "done");
-    assert_eq!(done["hosted"]["bound"], true);
-    assert_eq!(done["hosted"]["bucket"], "bucket");
-    assert_eq!(done["hosted"]["prefix"], "owner/prefix");
-    assert_eq!(done["mode"], "operated");
-    assert_eq!(done["enabled"], true);
-
     let teardown_hold = Hold::new();
-    deps.http = Arc::new(
+    let teardown_http = Arc::new(
         HttpScript::with_responses(vec![
             Ok(credentials_response()),
             Ok(xml_response(
@@ -1864,16 +2367,65 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
         ])
         .with_hold_after(1, teardown_hold.clone()),
     );
-    let (status, teardown) = post_json(&deps, "/app/backup/teardown", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(teardown["operation"]["kind"], "teardown");
-    assert_eq!(teardown["operation"]["phase"], "tearing_down");
-    teardown_hold.wait_started();
-    teardown_hold.release();
-    let cleanup = wait_terminal(&deps).await;
-    assert_eq!(cleanup["operation"]["phase"], "done");
+
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone(), teardown_hold.clone()],
+        vec![http.clone(), teardown_http.clone()],
+        vec![root, restic],
+        async {
+            let (status, started) = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            assert_eq!(status, 200);
+            let nonce = portal_nonce(&started);
+            let (status, _) = post_json(
+                &deps,
+                "/app/backup/handoff",
+                Some(hosted_handoff_payload(&nonce)),
+            )
+            .await;
+            assert_eq!(status, 200);
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            assert_eq!(
+                solstone_core_backup::load_hosted_binding(journal_path.as_path()),
+                Some(crate::test_support::hosted_binding())
+            );
+
+            let (status, during) = get_status_json(&deps).await;
+            assert_eq!(status, 200);
+            assert_eq!(during["operation"]["kind"], "enable_hosted");
+            assert_eq!(during["operation"]["phase"], "setting_up");
+            assert_eq!(during["hosted"]["bound"], false);
+            assert!(during["hosted"].get("bucket").is_none());
+            assert!(during["hosted"].get("prefix").is_none());
+
+            hold.release().await;
+            let done = wait_terminal(&deps).await;
+            assert_eq!(done["operation"]["phase"], "done");
+            assert_eq!(done["hosted"]["bound"], true);
+            assert_eq!(done["hosted"]["bucket"], "bucket");
+            assert_eq!(done["hosted"]["prefix"], "owner/prefix");
+            assert_eq!(done["mode"], "operated");
+            assert_eq!(done["enabled"], true);
+
+            deps.http = teardown_http.clone();
+            let (status, teardown) = post_json(&deps, "/app/backup/teardown", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(teardown["operation"]["kind"], "teardown");
+            assert_eq!(teardown["operation"]["phase"], "tearing_down");
+            wait_started_or_terminal(&teardown_hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            teardown_hold.release().await;
+            let cleanup = wait_terminal(&deps).await;
+            assert_eq!(cleanup["operation"]["phase"], "done");
+        },
+    )
+    .await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn handoff_needs_subscription_is_terminal_without_binding() {
     let root = crate::test_support::root("healthy");
@@ -1901,6 +2453,7 @@ async fn handoff_needs_subscription_is_terminal_without_binding() {
     assert_eq!(done["hosted"]["bound"], false);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn bound_restore_hosted_maps_broker_402_to_entitlement_error() {
     let root = crate::test_support::hosted_bound_root();
@@ -1931,6 +2484,7 @@ async fn bound_restore_hosted_maps_broker_402_to_entitlement_error() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn unbound_restore_hosted_returns_portal_and_restoring_phase() {
     let root = crate::test_support::root("fresh");
@@ -2200,6 +2754,7 @@ mod held_restore_tests {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn enable_records_resolved_restic_program_not_path_decoy() {
     let root = crate::test_support::root("healthy");
@@ -2236,6 +2791,7 @@ async fn enable_records_resolved_restic_program_not_path_decoy() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn enable_success_response_shape_has_operation_without_secrets() {
     let root = crate::test_support::root("healthy");
@@ -2255,38 +2811,52 @@ async fn enable_success_response_shape_has_operation_without_secrets() {
     let _ = wait_terminal(&deps).await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn bound_restore_hosted_returns_running_then_done_while_held() {
     let root = crate::test_support::hosted_bound_root();
+    let journal_path = root.path().to_path_buf();
     let hold = Hold::new();
     let runner = ScriptRunner::with_hold(restore_outputs(), hold.clone());
     let restic = tempfile::tempdir().unwrap();
     crate::test_support::write_ready_restic(restic.path());
+    let http = Arc::new(HttpScript::with_responses(vec![Ok(credentials_response())]));
     let deps = engine_deps(
-        root.path().to_path_buf(),
+        journal_path.as_path().to_path_buf(),
         Arc::new(runner),
-        Arc::new(HttpScript::with_responses(vec![Ok(credentials_response())])),
+        http.clone(),
         Some(restic.path().to_path_buf()),
     );
-    let (status, body) = post_json(
-        &deps,
-        "/app/backup/restore-hosted",
-        Some(json!({"recovery_key": crate::test_support::RECOVERY_KEY})),
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root, restic],
+        async {
+            let (status, body) = post_json(
+                &deps,
+                "/app/backup/restore-hosted",
+                Some(json!({"recovery_key": crate::test_support::RECOVERY_KEY})),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert_eq!(body["operation"]["kind"], "restore_hosted");
+            assert_eq!(body["operation"]["phase"], "restoring");
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            let (status, during) = get_status_json(&deps).await;
+            assert_eq!(status, 200);
+            assert_eq!(during["operation"]["phase"], "restoring");
+            assert_eq!(during["hosted"]["bound"], true);
+            assert_eq!(during["hosted"]["bucket"], "bucket");
+            assert_eq!(during["hosted"]["prefix"], "owner/prefix");
+            hold.release().await;
+            let done = wait_terminal(&deps).await;
+            assert_eq!(done["operation"]["phase"], "done");
+        },
     )
     .await;
-    assert_eq!(status, 200);
-    assert_eq!(body["operation"]["kind"], "restore_hosted");
-    assert_eq!(body["operation"]["phase"], "restoring");
-    hold.wait_started();
-    let (status, during) = get_status_json(&deps).await;
-    assert_eq!(status, 200);
-    assert_eq!(during["operation"]["phase"], "restoring");
-    assert_eq!(during["hosted"]["bound"], true);
-    assert_eq!(during["hosted"]["bucket"], "bucket");
-    assert_eq!(during["hosted"]["prefix"], "owner/prefix");
-    hold.release();
-    let done = wait_terminal(&deps).await;
-    assert_eq!(done["operation"]["phase"], "done");
 }
 
 #[tokio::test]
@@ -2314,6 +2884,7 @@ async fn expired_hosted_wait_clears_busy_on_status_and_begin() {
     assert_eq!(enable["operation"]["kind"], "enable");
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn second_handoff_with_the_same_nonce_is_rejected() {
     let root = crate::test_support::root("healthy");
@@ -2356,6 +2927,7 @@ async fn second_handoff_with_the_same_nonce_is_rejected() {
     let _ = wait_terminal(&deps).await;
 }
 
+#[cfg(feature = "full-tests")]
 fn hosted_handoff_payload(nonce: &str) -> Value {
     let binding = crate::test_support::hosted_binding();
     json!({
@@ -2448,6 +3020,7 @@ fn assert_handoff_state_cleared(deps: &crate::BackupWebDeps) {
     assert!(slot.restore_key.is_none());
 }
 
+#[cfg(feature = "full-tests")]
 fn refused_poll_response(reason_code: &str) -> HttpResponse {
     HttpResponse {
         status: 200,
@@ -2460,6 +3033,7 @@ fn refused_poll_response(reason_code: &str) -> HttpResponse {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_prepare_does_not_allocate_an_enable_instance_id() {
     let root = crate::test_support::root("fresh");
@@ -2492,6 +3066,41 @@ async fn restore_prepare_does_not_allocate_an_enable_instance_id() {
     assert_eq!(status, 200);
     assert_eq!(crate::operation::instance_allocations(), 0);
     drain_hosted_wait(&enabled_deps).await;
+}
+
+#[tokio::test]
+async fn restore_prepare_does_not_allocate_identity_before_activation() {
+    let root = crate::test_support::root("fresh");
+    let runner = Arc::new(ScriptRunner::with_outputs(vec![]));
+    let http = Arc::new(HttpScript::default());
+    let deps = engine_deps(
+        root.path().to_path_buf(),
+        runner.clone(),
+        http.clone(),
+        None,
+    );
+    crate::operation::reset_instance_allocations();
+    let capability = prepare_unbound_restore(&deps).await;
+    let _ = key_unbound_restore(&deps, &capability).await;
+    assert_eq!(crate::operation::instance_allocations(), 0);
+    let (status, _) = post_json(
+        &deps,
+        "/app/backup/restore-hosted/cancel",
+        Some(json!({"capability": capability})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (view, worker_active) = {
+        let guard = deps.operations.lock().unwrap();
+        let current = guard.as_ref().unwrap();
+        (current.view.clone(), current.worker_active)
+    };
+    assert_eq!(view.phase, "error");
+    assert_eq!(view.reason_code.as_deref(), Some("cancelled"));
+    assert!(!worker_active);
+    assert!(!deps.handoff_poll_lease.load(Ordering::Acquire));
+    assert!(runner.calls.lock().unwrap().is_empty());
+    assert!(http.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2636,6 +3245,7 @@ async fn restore_prepare_key_is_single_use_and_generation_bound() {
     assert_eq!(status, 200);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_prepare_arm_activate_and_cancel_enforce_the_lifecycle() {
     let root = crate::test_support::root("fresh");
@@ -2834,6 +3444,7 @@ async fn restore_prepare_prepare_self_heals_a_terminated_activated_lease() {
     assert!(body["capability"].as_str().is_some());
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_restore_refused_poll_outcomes_clear_handoff_state_without_restore_work() {
     for reason_code in ["no_hosted_backup", "hosted_backup_expired"] {
@@ -2869,6 +3480,7 @@ async fn hosted_restore_refused_poll_outcomes_clear_handoff_state_without_restor
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn refused_handoff_validation_is_shared_by_poll_and_local_transport() {
     for malformed in [
@@ -3015,6 +3627,7 @@ async fn malformed_refused_handoff_with_wrong_nonce_leaves_live_restore_unchange
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn restore_handoff_needs_subscription_can_retry_with_a_new_generation() {
     let root = crate::test_support::root("fresh");
@@ -3093,6 +3706,7 @@ async fn restore_handoff_needs_subscription_can_retry_with_a_new_generation() {
     assert_eq!(malformed_runner.calls.lock().unwrap().len(), 0);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn bound_and_byo_restore_bypass_hosted_handoff_transport() {
     let bound_root = crate::test_support::hosted_bound_root();
@@ -3142,6 +3756,7 @@ fn credentials_posts(http: &HttpScript) -> usize {
         .count()
 }
 
+#[cfg(feature = "full-tests")]
 fn assert_credentials_requests(http: &HttpScript, expected_scope: Option<&str>) {
     let requests = http
         .requests
@@ -3170,6 +3785,7 @@ fn assert_credentials_requests(http: &HttpScript, expected_scope: Option<&str>) 
     );
 }
 
+#[cfg(feature = "full-tests")]
 fn assert_runner_argv(runner: &ScriptRunner, expected: &[Vec<String>]) {
     let calls = runner.calls.lock().unwrap();
     assert_eq!(
@@ -3187,6 +3803,7 @@ fn assert_runner_argv(runner: &ScriptRunner, expected: &[Vec<String>]) {
     assert_eq!(runner.overrun_count(), 0, "scripted runner overrun");
 }
 
+#[cfg(feature = "full-tests")]
 fn assert_no_temporary_credentials_in_journal(root: &Path) {
     for sentinel in ["ACCESS", "SECRET", "SESSION"] {
         assert!(
@@ -3196,6 +3813,7 @@ fn assert_no_temporary_credentials_in_journal(root: &Path) {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn exact_poll_url(nonce: &str) -> String {
     format!(
         "{}/handoff/backup?nonce={nonce}",
@@ -3203,6 +3821,7 @@ fn exact_poll_url(nonce: &str) -> String {
     )
 }
 
+#[cfg(feature = "full-tests")]
 fn argv_in_order(heads: &[String], expected: &[&str]) {
     let mut start = 0;
     for name in expected {
@@ -3213,6 +3832,7 @@ fn argv_in_order(heads: &[String], expected: &[&str]) {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn journal_contains(root: &Path, needle: &str) -> bool {
     fn walk(path: &Path, needle: &str) -> bool {
         if path.is_dir() {
@@ -3240,6 +3860,7 @@ fn assert_json_hides_secrets(body: &Value, daily_key: Option<&str>) {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn assert_handoff_refused(status: u16, body: &Value) {
     assert_eq!(status, 400);
     assert_eq!(body["reason_code"], "invalid_operation_for_state");
@@ -3250,6 +3871,7 @@ fn assert_handoff_refused(status: u16, body: &Value) {
     assert_eq!(body["detail"], "");
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn mismatched_nonces_are_refused_without_consuming_the_handoff() {
     let root = crate::test_support::root("healthy");
@@ -3324,6 +3946,7 @@ async fn mismatched_nonces_are_refused_without_consuming_the_handoff() {
     let _ = wait_terminal(&deps).await;
 }
 
+#[cfg(feature = "full-tests")]
 fn approved_poll_response() -> HttpResponse {
     let binding = crate::test_support::hosted_binding();
     HttpResponse {
@@ -3342,6 +3965,7 @@ fn approved_poll_response() -> HttpResponse {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn needs_subscription_poll_body(subscribe_url: &str) -> HttpResponse {
     let binding = crate::test_support::hosted_binding();
     HttpResponse {
@@ -3361,6 +3985,7 @@ fn needs_subscription_poll_body(subscribe_url: &str) -> HttpResponse {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn wrong_origin_poll_response() -> HttpResponse {
     let binding = crate::test_support::hosted_binding_wrong_origin();
     HttpResponse {
@@ -3403,8 +4028,10 @@ fn poll_json(status: u16, body: Value) -> HttpResponse {
     }
 }
 
+#[cfg(feature = "full-tests")]
 async fn wait_poll_get(http: &HttpScript) -> HttpRequest {
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
         let request = http
             .requests
             .lock()
@@ -3415,9 +4042,10 @@ async fn wait_poll_get(http: &HttpScript) -> HttpRequest {
         if let Some(request) = request {
             return request;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        fixture_tick(deadline)
+            .await
+            .expect("handoff poll GET did not arrive");
     }
-    panic!("poll GET not witnessed")
 }
 
 fn poll_gets(http: &HttpScript) -> Vec<HttpRequest> {
@@ -3432,16 +4060,19 @@ fn poll_gets(http: &HttpScript) -> Vec<HttpRequest> {
 
 #[cfg(all(test, feature = "full-tests"))]
 async fn wait_poll_gets(http: &HttpScript, min: usize) -> Vec<HttpRequest> {
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
         let gets = poll_gets(http);
         if gets.len() >= min {
             return gets;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        fixture_tick(deadline)
+            .await
+            .expect("handoff poll GET did not arrive");
     }
-    panic!("expected at least {min} poll GETs")
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_gets_handoff_backup_nonce_without_instance() {
     let root = crate::test_support::root("healthy");
@@ -3475,6 +4106,7 @@ async fn hosted_poll_gets_handoff_backup_nonce_without_instance() {
     drain_hosted_wait(&deps).await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_configured_portal_base_preflight_blocks_or_allows_transport() {
     struct Case {
@@ -3801,6 +4433,7 @@ async fn hosted_poll_approved_enables_operated_mode() {
     argv_in_order(&runner.argv_heads(), &["cat", "init", "key"]);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_needs_subscription_is_terminal_without_binding() {
     let root = crate::test_support::root("healthy");
@@ -3846,6 +4479,7 @@ async fn hosted_poll_needs_subscription_is_terminal_without_binding() {
     assert_eq!(runner.calls.lock().unwrap().len(), 0);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_subscribe_url_and_secrets_stay_off_status() {
     let root = crate::test_support::root("healthy");
@@ -4067,39 +4701,53 @@ async fn hosted_poll_response_classes_retry_or_fail() {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_watchdog_expires_while_get_is_held() {
     let root = crate::test_support::root("healthy");
+    let journal_path = root.path().to_path_buf();
     let restic = tempfile::tempdir().unwrap();
     crate::test_support::write_ready_restic(restic.path());
     let hold = Hold::new();
     let http = Arc::new(HttpScript::default().with_hold(hold.clone()));
     let deps = engine_deps(
-        root.path().to_path_buf(),
+        journal_path.as_path().to_path_buf(),
         Arc::new(ScriptRunner::with_outputs(vec![])),
         http.clone(),
         Some(restic.path().to_path_buf()),
     );
-    let (status, _) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    assert_eq!(status, 200);
-    hold.wait_started();
-    assert!(
-        http.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|request| request.url.contains("/handoff/backup"))
-    );
-    crate::operation::backdate_started(
-        &deps.operations,
-        crate::operation::HANDOFF_TTL + Duration::from_secs(1),
-    );
-    let done = wait_terminal(&deps).await;
-    assert_eq!(done["operation"]["phase"], "error");
-    assert_eq!(done["operation"]["reason_code"], "expired");
-    hold.release();
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root, restic],
+        async {
+            let (status, _) = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            assert_eq!(status, 200);
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            assert!(
+                http.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.contains("/handoff/backup"))
+            );
+            crate::operation::backdate_started(
+                &deps.operations,
+                crate::operation::HANDOFF_TTL + Duration::from_secs(1),
+            );
+            let done = wait_terminal(&deps).await;
+            assert_eq!(done["operation"]["phase"], "error");
+            assert_eq!(done["operation"]["reason_code"], "expired");
+            hold.release().await;
+        },
+    )
+    .await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_needs_subscription_rejects_non_https_subscribe_url() {
     let root = crate::test_support::root("healthy");
@@ -4121,6 +4769,7 @@ async fn hosted_poll_needs_subscription_rejects_non_https_subscribe_url() {
     assert_eq!(done["hosted"]["bound"], false);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_restore_uses_slot_recovery_key() {
     let root = crate::test_support::root("fresh");
@@ -4195,6 +4844,7 @@ async fn hosted_poll_restore_uses_slot_recovery_key() {
     argv_in_order(&runner.argv_heads(), &["snapshots", "restore", "check"]);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_restore_failure_records_without_publishing_destination_or_recovery_state() {
     let root = crate::test_support::root("fresh");
@@ -4226,9 +4876,11 @@ async fn hosted_poll_restore_failure_records_without_publishing_destination_or_r
     assert_ne!(done["mode"], "operated");
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_stale_generation_cannot_persist_binding() {
     let root = crate::test_support::root("healthy");
+    let journal_path = root.path().to_path_buf();
     let restic = tempfile::tempdir().unwrap();
     crate::test_support::write_ready_restic(restic.path());
     let hold = Hold::new();
@@ -4238,32 +4890,44 @@ async fn hosted_poll_stale_generation_cannot_persist_binding() {
             .with_hold(hold.clone()),
     );
     let deps = engine_deps(
-        root.path().to_path_buf(),
+        journal_path.as_path().to_path_buf(),
         Arc::new(ScriptRunner::with_outputs(vec![])),
         http.clone(),
         Some(restic.path().to_path_buf()),
     );
-    let _ = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    hold.wait_started();
-    crate::operation::backdate_started(
-        &deps.operations,
-        crate::operation::HANDOFF_TTL + Duration::from_secs(1),
-    );
-    let expired = wait_terminal(&deps).await;
-    assert_eq!(expired["operation"]["phase"], "error");
-    assert_eq!(expired["operation"]["reason_code"], "expired");
-    hold.release();
-    wait_lease_released(&deps, &http);
-    let (status, second) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(second["operation"]["kind"], "enable_hosted");
-    assert_eq!(second["operation"]["phase"], "setting_up");
-    assert_eq!(second["hosted"]["bound"], false);
-    assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
-    drain_hosted_wait(&deps).await;
-    assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root, restic],
+        async {
+            let _ = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            crate::operation::backdate_started(
+                &deps.operations,
+                crate::operation::HANDOFF_TTL + Duration::from_secs(1),
+            );
+            let expired = wait_terminal(&deps).await;
+            assert_eq!(expired["operation"]["phase"], "error");
+            assert_eq!(expired["operation"]["reason_code"], "expired");
+            hold.release().await;
+            wait_lease_released(&deps, &http).await;
+            let (status, second) = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(second["operation"]["kind"], "enable_hosted");
+            assert_eq!(second["operation"]["phase"], "setting_up");
+            assert_eq!(second["hosted"]["bound"], false);
+            assert!(solstone_core_backup::load_hosted_binding(journal_path.as_path()).is_none());
+            drain_hosted_wait(&deps).await;
+            assert!(solstone_core_backup::load_hosted_binding(journal_path.as_path()).is_none());
+        },
+    )
+    .await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_second_local_handoff_after_poll_approval_is_rejected() {
     let root = crate::test_support::root("healthy");
@@ -4378,6 +5042,7 @@ async fn hosted_poll_get_timeout_is_bounded_by_remaining_ttl() {
     let _ = wait_terminal(&deps).await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_broker_unreachable_matches_local_handoff_broker_unreachable_contract() {
     async fn run(
@@ -4458,6 +5123,7 @@ async fn hosted_poll_broker_unreachable_matches_local_handoff_broker_unreachable
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_broker_error_matches_local_handoff_broker_error_contract() {
     async fn run(
@@ -4542,36 +5208,45 @@ async fn hosted_poll_broker_error_matches_local_handoff_broker_error_contract() 
     );
 }
 
-fn wait_watchdog_expired(slot: &crate::operation::SharedOperationSlot) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        {
-            let guard = slot.lock().expect("operation slot lock");
-            if let Some(current) = guard.as_ref()
-                && current.view.phase == "error"
-                && current.view.reason_code.as_deref() == Some("expired")
-            {
-                return;
-            }
+#[cfg(feature = "full-tests")]
+async fn wait_watchdog_expired(slot: &crate::operation::SharedOperationSlot) {
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
+        let expired = match slot.try_lock() {
+            Ok(guard) => guard.as_ref().is_some_and(|current| {
+                current.view.phase == "error"
+                    && current.view.reason_code.as_deref() == Some("expired")
+            }),
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => panic!("operation slot poisoned"),
+        };
+        if expired {
+            return;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        fixture_tick(deadline)
+            .await
+            .expect("watchdog did not expire the slot");
     }
-    panic!("watchdog did not expire the slot");
 }
 
-fn wait_lease_released(deps: &crate::BackupWebDeps, http: &HttpScript) {
-    for _ in 0..400 {
+#[cfg(feature = "full-tests")]
+async fn wait_lease_released(deps: &crate::BackupWebDeps, http: &HttpScript) {
+    let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
+    loop {
         if http.active_executions() == 0 && !deps.handoff_poll_lease.load(Ordering::Acquire) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        fixture_tick(deadline)
+            .await
+            .expect("poll lease did not release");
     }
-    panic!("poll lease did not release");
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observation() {
     let root = crate::test_support::root("fresh");
+    let journal_path = root.path().to_path_buf();
     let restic = tempfile::tempdir().unwrap();
     crate::test_support::write_ready_restic(restic.path());
     let hold = Hold::new();
@@ -4581,69 +5256,101 @@ async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observati
             .with_hold(hold.clone()),
     );
     let deps = engine_deps(
-        root.path().to_path_buf(),
+        journal_path.as_path().to_path_buf(),
         Arc::new(ScriptRunner::with_outputs(vec![])),
         http.clone(),
         Some(restic.path().to_path_buf()),
     );
-    let capability = prepare_unbound_restore(&deps).await;
-    let keyed = key_unbound_restore(&deps, &capability).await;
-    let nonce = keyed["portal_url"]
-        .as_str()
-        .unwrap()
-        .split("nonce=")
-        .nth(1)
-        .unwrap()
-        .split('&')
-        .next()
-        .unwrap()
-        .to_owned();
-    let _ = arm_unbound_restore(&deps, &capability).await;
-    let _ = activate_unbound_restore(&deps, &capability).await;
-    hold.wait_started();
-    let expected_poll = exact_poll_url(&nonce);
-    let gets = poll_gets(&http);
-    assert!(!gets.is_empty());
-    assert!(
-        gets.iter()
-            .all(|request| request.method == "GET" && request.url == expected_poll)
-    );
-    {
-        let guard = deps.operations.lock().expect("operation slot lock");
-        let slot = guard.as_ref().expect("slot");
-        assert!(slot.view.portal_url.is_some());
-        assert!(slot.nonce.is_some());
-        assert!(slot.restore_key.is_some());
-        assert!(!crate::operation::is_terminal(&slot.view.phase));
-    }
-    crate::operation::backdate_started(
-        &deps.operations,
-        crate::operation::HANDOFF_TTL + Duration::from_secs(1),
-    );
-    wait_watchdog_expired(&deps.operations);
-    {
-        let guard = deps.operations.lock().expect("operation slot lock");
-        let slot = guard.as_ref().expect("slot");
-        assert_eq!(slot.view.phase, "error");
-        assert_eq!(slot.view.reason_code.as_deref(), Some("expired"));
-        assert!(crate::operation::is_terminal(&slot.view.phase));
-        assert!(slot.view.portal_url.is_none());
-        assert!(slot.nonce.is_none());
-        assert!(slot.restore_key.is_none());
-    }
-    assert_eq!(http.active_executions(), 1);
-    hold.release();
-    wait_lease_released(&deps, &http);
-    {
-        let guard = deps.operations.lock().expect("operation slot lock");
-        let slot = guard.as_ref().expect("slot");
-        assert_eq!(slot.view.phase, "error");
-        assert_eq!(slot.view.reason_code.as_deref(), Some("expired"));
-        assert!(slot.view.portal_url.is_none());
-        assert!(slot.nonce.is_none());
-        assert!(slot.restore_key.is_none());
-    }
-    assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root, restic],
+        async {
+            let capability = prepare_unbound_restore(&deps).await;
+            let keyed = key_unbound_restore(&deps, &capability).await;
+            let nonce = keyed["portal_url"]
+                .as_str()
+                .unwrap()
+                .split("nonce=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_owned();
+            let _ = arm_unbound_restore(&deps, &capability).await;
+            let _ = activate_unbound_restore(&deps, &capability).await;
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            let expected_poll = exact_poll_url(&nonce);
+            let gets = poll_gets(&http);
+            assert!(!gets.is_empty());
+            assert!(
+                gets.iter()
+                    .all(|request| request.method == "GET" && request.url == expected_poll)
+            );
+            {
+                let (view, has_nonce, has_key) = {
+                    let guard = deps.operations.try_lock().expect("fixture slot");
+                    let slot = guard.as_ref().expect("slot");
+                    (
+                        slot.view.clone(),
+                        slot.nonce.is_some(),
+                        slot.restore_key.is_some(),
+                    )
+                };
+                assert!(view.portal_url.is_some());
+                assert!(has_nonce);
+                assert!(has_key);
+                assert!(!crate::operation::is_terminal(&view.phase));
+            }
+            crate::operation::backdate_started(
+                &deps.operations,
+                crate::operation::HANDOFF_TTL + Duration::from_secs(1),
+            );
+            wait_watchdog_expired(&deps.operations).await;
+            {
+                let (view, has_nonce, has_key) = {
+                    let guard = deps.operations.try_lock().expect("fixture slot");
+                    let slot = guard.as_ref().expect("slot");
+                    (
+                        slot.view.clone(),
+                        slot.nonce.is_some(),
+                        slot.restore_key.is_some(),
+                    )
+                };
+                assert_eq!(view.phase, "error");
+                assert_eq!(view.reason_code.as_deref(), Some("expired"));
+                assert!(crate::operation::is_terminal(&view.phase));
+                assert!(view.portal_url.is_none());
+                assert!(!has_nonce);
+                assert!(!has_key);
+            }
+            assert_eq!(http.active_executions(), 1);
+            hold.release().await;
+            wait_lease_released(&deps, &http).await;
+            {
+                let (view, has_nonce, has_key) = {
+                    let guard = deps.operations.try_lock().expect("fixture slot");
+                    let slot = guard.as_ref().expect("slot");
+                    (
+                        slot.view.clone(),
+                        slot.nonce.is_some(),
+                        slot.restore_key.is_some(),
+                    )
+                };
+                assert_eq!(view.phase, "error");
+                assert_eq!(view.reason_code.as_deref(), Some("expired"));
+                assert!(view.portal_url.is_none());
+                assert!(!has_nonce);
+                assert!(!has_key);
+            }
+            assert!(solstone_core_backup::load_hosted_binding(journal_path.as_path()).is_none());
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -4666,6 +5373,7 @@ async fn handoff_needs_subscription_missing_field_is_failed() {
     assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_approved_wrong_origin_is_failed() {
     let root = crate::test_support::root("healthy");
@@ -4722,6 +5430,7 @@ async fn handoff_approved_wrong_origin_is_rejected() {
     assert_eq!(runner.calls.lock().unwrap().len(), 0);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_wrong_origin_matches_local_wrong_origin_contract() {
     async fn run(
@@ -4776,6 +5485,7 @@ async fn hosted_poll_wrong_origin_matches_local_wrong_origin_contract() {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_needs_subscription_rejects_wrong_origin_subscribe_url() {
     let root = crate::test_support::root("healthy");
@@ -4797,6 +5507,7 @@ async fn hosted_poll_needs_subscription_rejects_wrong_origin_subscribe_url() {
     assert_eq!(done["hosted"]["bound"], false);
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_needs_subscription_rejects_userinfo_subscribe_url() {
     let root = crate::test_support::root("healthy");
@@ -4836,6 +5547,7 @@ async fn handoff_needs_subscription_rejects_non_https_subscribe_url() {
     assert_eq!(done["operation"]["reason_code"], "failed");
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_needs_subscription_matches_local_needs_subscription_contract() {
     async fn run(poll_approved: bool, handoff_locally: bool) -> Value {
@@ -4887,6 +5599,7 @@ async fn hosted_poll_needs_subscription_matches_local_needs_subscription_contrac
 #[tokio::test]
 async fn hosted_poll_second_get_is_resource_bounded_and_lease_releases_on_completion() {
     let root = crate::test_support::root("healthy");
+    let journal_path = root.path().to_path_buf();
     let restic = tempfile::tempdir().unwrap();
     crate::test_support::write_ready_restic(restic.path());
     let hold = Hold::new();
@@ -4903,64 +5616,82 @@ async fn hosted_poll_second_get_is_resource_bounded_and_lease_releases_on_comple
             .with_hold_after(1, hold.clone()),
     );
     let deps = engine_deps(
-        root.path().to_path_buf(),
+        journal_path.as_path().to_path_buf(),
         Arc::new(ScriptRunner::with_outputs(vec![])),
         http.clone(),
         Some(restic.path().to_path_buf()),
     );
-    let (status, _) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    assert_eq!(status, 200);
-    hold.wait_started();
-    assert_eq!(http.active_executions(), 1);
-    assert_eq!(http.max_concurrency(), 1);
-    assert_eq!(http.request_count(), 2);
-    assert_eq!(poll_gets(&http).len(), 2);
+    held_fixture(
+        deps.clone(),
+        vec![hold.clone()],
+        vec![http.clone()],
+        vec![root, restic],
+        async {
+            let (status, _) = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            assert_eq!(status, 200);
+            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
+                .await
+                .expect("fixture did not enter Hold");
+            assert_eq!(http.active_executions(), 1);
+            assert_eq!(http.max_concurrency(), 1);
+            assert_eq!(http.request_count(), 2);
+            assert_eq!(poll_gets(&http).len(), 2);
 
-    crate::operation::backdate_started(
-        &deps.operations,
-        crate::operation::HANDOFF_TTL + Duration::from_secs(1),
-    );
-    wait_watchdog_expired(&deps.operations);
-    assert_eq!(http.active_executions(), 1);
-    assert_eq!(http.request_count(), 2);
+            crate::operation::backdate_started(
+                &deps.operations,
+                crate::operation::HANDOFF_TTL + Duration::from_secs(1),
+            );
+            wait_watchdog_expired(&deps.operations).await;
+            assert_eq!(http.active_executions(), 1);
+            assert_eq!(http.request_count(), 2);
 
-    let (status, second) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(second["operation"]["phase"], "error");
-    assert_eq!(second["operation"]["reason_code"], "failed");
-    assert_eq!(http.active_executions(), 1);
-    assert_eq!(http.max_concurrency(), 1);
-    assert_eq!(http.request_count(), 2);
-    let second_generation = {
-        let guard = deps.operations.lock().expect("operation slot lock");
-        let slot = guard.as_ref().expect("slot");
-        assert_eq!(slot.view.phase, "error");
-        assert_eq!(slot.view.reason_code.as_deref(), Some("failed"));
-        slot.generation
-    };
+            let (status, second) = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(second["operation"]["phase"], "error");
+            assert_eq!(second["operation"]["reason_code"], "failed");
+            assert_eq!(http.active_executions(), 1);
+            assert_eq!(http.max_concurrency(), 1);
+            assert_eq!(http.request_count(), 2);
+            let second_generation = {
+                let (view, generation) = {
+                    let guard = deps.operations.try_lock().expect("fixture slot");
+                    let slot = guard.as_ref().expect("slot");
+                    (slot.view.clone(), slot.generation)
+                };
+                assert_eq!(view.phase, "error");
+                assert_eq!(view.reason_code.as_deref(), Some("failed"));
+                generation
+            };
 
-    hold.release();
-    wait_lease_released(&deps, &http);
-    assert_eq!(http.active_executions(), 0);
-    assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
-    {
-        let guard = deps.operations.lock().expect("operation slot lock");
-        let slot = guard.as_ref().expect("slot");
-        assert_eq!(slot.generation, second_generation);
-        assert_eq!(slot.view.phase, "error");
-        assert_eq!(slot.view.reason_code.as_deref(), Some("failed"));
-    }
+            hold.release().await;
+            wait_lease_released(&deps, &http).await;
+            assert_eq!(http.active_executions(), 0);
+            assert!(solstone_core_backup::load_hosted_binding(journal_path.as_path()).is_none());
+            {
+                let (view, generation) = {
+                    let guard = deps.operations.try_lock().expect("fixture slot");
+                    let slot = guard.as_ref().expect("slot");
+                    (slot.view.clone(), slot.generation)
+                };
+                assert_eq!(generation, second_generation);
+                assert_eq!(view.phase, "error");
+                assert_eq!(view.reason_code.as_deref(), Some("failed"));
+            }
 
-    let (status, third) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(third["operation"]["kind"], "enable_hosted");
-    assert_eq!(third["operation"]["phase"], "setting_up");
-    let _ = wait_poll_gets(&http, 3).await;
-    assert_eq!(http.request_count(), 3);
-    drain_hosted_wait(&deps).await;
-    assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
+            let (status, third) = post_json(&deps, "/app/backup/enable-hosted", None).await;
+            assert_eq!(status, 200);
+            assert_eq!(third["operation"]["kind"], "enable_hosted");
+            assert_eq!(third["operation"]["phase"], "setting_up");
+            let _ = wait_poll_gets(&http, 3).await;
+            assert_eq!(http.request_count(), 3);
+            drain_hosted_wait(&deps).await;
+            assert!(solstone_core_backup::load_hosted_binding(journal_path.as_path()).is_none());
+        },
+    )
+    .await;
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_binding_write_failure_matches_local_handoff_contract() {
     async fn run(
@@ -5033,6 +5764,7 @@ async fn hosted_poll_binding_write_failure_matches_local_handoff_contract() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_repository_init_failure_matches_local_handoff_contract() {
     async fn run(
@@ -5117,6 +5849,7 @@ async fn hosted_poll_repository_init_failure_matches_local_handoff_contract() {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn hosted_poll_restore_failure_matches_local_handoff_contract() {
     async fn run(
@@ -5229,6 +5962,7 @@ async fn hosted_poll_restore_failure_matches_local_handoff_contract() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[tokio::test]
 async fn handoff_restore_composition_nonce_one_use_and_command_order() {
     let root = crate::test_support::root("fresh");
