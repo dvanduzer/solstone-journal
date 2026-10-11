@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
+use solstone_core_journal_io::media::MediaDirectory;
+#[cfg(unix)]
 use solstone_core_journal_io::{JournalRoot, open_flat_directory_bound, read_bytes_bound};
 
 use crate::{get_journal_config_path, materialized_defaults};
@@ -103,6 +105,31 @@ pub fn read_journal_config_bound(root: &JournalRoot) -> Result<JournalConfigRead
     let bytes = read_bytes_bound(&config_directory, OsStr::new("journal.json"))
         .map_err(|source| corrupt(&config_path, source))?;
     parse_config_bytes(&config_path, bytes)
+}
+
+/// Strictly decode bounded, complete bytes from a retained configuration parent.
+/// The directory's spelling is diagnostic only; Native checks its chain and
+/// the final file name around the read. Missing files never materialize defaults.
+#[cfg(unix)]
+pub fn read_journal_config_in_directory(
+    directory: &MediaDirectory,
+    max_bytes: usize,
+) -> Result<JournalConfigRead, ConfigLoadError> {
+    let path = directory.diagnostic_path().join("journal.json");
+    let read = directory
+        .read_file_bounded(OsStr::new("journal.json"), max_bytes)
+        .map_err(|source| corrupt(&path, source))?;
+    let bytes = match read {
+        Some(read) if read.complete => Some(read.bytes),
+        Some(_) => {
+            return Err(corrupt(
+                &path,
+                io::Error::new(io::ErrorKind::InvalidData, "incomplete configuration read"),
+            ));
+        }
+        None => None,
+    };
+    parse_config_bytes(&path, bytes)
 }
 
 /// Load the single-read config basis used by the journal-I/O mutation owner.

@@ -27,11 +27,11 @@ pub use keys::{
 };
 pub use merge::merge_backup_config;
 pub use state::{
-    clear_backup_config, clear_backup_config_if_unchanged, generate_and_store_keys,
-    get_backup_config, get_destination, get_keys, record_backup_result, record_offload_result,
-    record_prune_result, record_restore_result, record_verification_result, set_destination,
-    set_enabled, set_mode, set_offload, set_recovery_key, set_recovery_key_confirmed,
-    set_retention, status_view,
+    clear_backup_config, clear_backup_config_at_root, clear_backup_config_if_unchanged,
+    generate_and_store_keys, get_backup_config, get_destination, get_keys, record_backup_result,
+    record_offload_result, record_prune_result, record_restore_result, record_verification_result,
+    set_destination, set_enabled, set_mode, set_offload, set_recovery_key,
+    set_recovery_key_confirmed, set_retention, status_view,
 };
 
 pub(crate) const OFFLOAD_STATUSES: [&str; 4] = ["ok", "skipped", "stalled", "error"];
