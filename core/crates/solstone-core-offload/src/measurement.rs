@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Read-only raw-media and device-space measurement.
+//! Read-only local media, device space and proposed relief.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,8 @@ use nix::sys::statvfs::statvfs;
 use solstone_core_format::segment::{is_date_key, segment_key};
 use solstone_core_journal_io::paths::SegmentLayout;
 use solstone_core_retention::content::{ContentName, JournalMedia, MediaClassifier};
+
+use crate::run::{CurrentOffloadAvailability, CurrentOffloadDecision};
 
 pub const MIN_FLOOR_BYTES: u64 = 20_000_000_000;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -98,6 +100,73 @@ impl RawMediaPopulation {
         }
         self.known_usage()
     }
+}
+
+/// Numeric pending-relief projection retaining actual local usage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposedRelief {
+    pub local: RawMediaUsage,
+    pub eligible_bytes: u64,
+    pub eligible_files: u64,
+    pub projected_local_bytes: u64,
+}
+
+/// Join a current decision with the same journal's complete local population.
+/// None means the owning inspection was unavailable. The subtraction projects
+/// proposed relief; it does not measure deletion or grant release authority.
+pub fn project_current_offload(
+    local: &RawMediaPopulation,
+    decision: &CurrentOffloadDecision,
+) -> Result<Option<ProposedRelief>, String> {
+    let usage = local.usage()?;
+    let mut files = BTreeMap::new();
+    for file in &local.files {
+        let key = (
+            file.key.day.as_str(),
+            file.key.stream.as_str(),
+            file.key.segment_dir.as_str(),
+            file.key.layout,
+            file.key.name.as_str(),
+        );
+        if files.insert(key, file.bytes).is_some() {
+            return Err("local media observation is duplicated".into());
+        }
+    }
+    match decision.availability() {
+        CurrentOffloadAvailability::Available => {}
+        CurrentOffloadAvailability::Unavailable => return Ok(None),
+    }
+    let mut credited = BTreeSet::new();
+    let (mut eligible_bytes, mut eligible_files) = (0u64, 0u64);
+    for file in decision.eligible() {
+        let target = file.target();
+        let key = (
+            target.day.as_str(),
+            target.stream.as_str(),
+            target.dir.as_str(),
+            file.layout(),
+            file.name(),
+        );
+        if files.get(&key).copied() != Some(file.bytes()) || !credited.insert(key) {
+            continue;
+        }
+        eligible_bytes = eligible_bytes
+            .checked_add(file.bytes())
+            .ok_or("eligible media byte total overflow")?;
+        eligible_files = eligible_files
+            .checked_add(1)
+            .ok_or("eligible media file total overflow")?;
+    }
+    let projected_local_bytes = usage
+        .total_bytes
+        .checked_sub(eligible_bytes)
+        .ok_or("eligible relief exceeds local media total")?;
+    Ok(Some(ProposedRelief {
+        local: usage,
+        eligible_bytes,
+        eligible_files,
+        projected_local_bytes,
+    }))
 }
 
 fn children(path: &Path, population: &mut RawMediaPopulation) -> Vec<fs::DirEntry> {
