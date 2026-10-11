@@ -1423,3 +1423,214 @@ fn packaged_direct_archive_read_entry() {
             "limit":"admission only; no native retirement or next-admission claim"})
     );
 }
+
+#[cfg(all(target_os = "linux", feature = "full-tests"))]
+#[test]
+#[ignore = "requires a copied current package and synthetic direct-finish fixture"]
+fn packaged_direct_read_finish_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
+    use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation};
+    use solstone_core_backup::archive_readback::{ExactArchiveFile, ReadbackError};
+    use solstone_core_backup_runtime::{
+        DirectReadFinishState, UreqHttpTransport, admit_prepared_archive_read_installed,
+    };
+    use solstone_core_journal_io::JournalRoot;
+    use solstone_core_journal_io::media::{Cleanup, MediaDirectory, MediaStage};
+    use std::sync::Arc;
+
+    struct OwnedClock(Instant);
+    impl Clock for OwnedClock {
+        fn now_unix(&self) -> i64 {
+            10_000 + self.0.elapsed().as_secs() as i64
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    let input_path =
+        std::env::var_os("DIRECT_FINISH_PROBE_JSON").expect("explicit fixture required");
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let mode = input["mode"].as_str().unwrap();
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
+    let cancellation = ArchiveCancellation::new();
+    let budget = ArchiveBudget::new_cancellable(clock.as_ref(), cancellation).unwrap();
+    let original =
+        PreparedArchiveOperation::prepare_owned(Arc::clone(&root), budget, Arc::clone(&clock))
+            .unwrap();
+    assert!(Arc::ptr_eq(original.owned_clock().unwrap(), &clock));
+    let lease = Arc::downgrade(original.activity());
+    let carrier = Arc::downgrade(original.carrier());
+    let path = Path::new(input["restic_path"].as_str().unwrap());
+    let repository = input["repository_id"].as_str().unwrap();
+    let installed = admit_prepared_archive_read_installed(
+        original,
+        repository.into(),
+        path,
+        "2.0.40",
+        &UreqHttpTransport,
+    )
+    .unwrap();
+    let (mut read, finish) = installed.into_parts();
+    assert!(Arc::ptr_eq(read.carrier(), finish.carrier()));
+    assert!(Arc::ptr_eq(read.owned_clock().unwrap(), &clock));
+    assert!(Arc::ptr_eq(finish.owned_clock(), &clock));
+    let parent = MediaDirectory::open(Arc::clone(&root), Path::new("media")).unwrap();
+    let file = ExactArchiveFile {
+        repository_id: repository.into(),
+        snapshot_id: input["snapshot_id"].as_str().unwrap().into(),
+        name: input["name"].as_str().unwrap().into(),
+        archive_path: input["archive_path"].as_str().unwrap().into(),
+        bytes: input["bytes"].as_u64().unwrap(),
+        sha256: input["sha256"].as_str().unwrap().into(),
+    };
+    let result = if mode == "panic" {
+        let target = MediaStage::create(parent, Arc::clone(read.activity()))
+            .unwrap()
+            .create_target()
+            .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _actual_read = read;
+            let _actual_target = target;
+            panic!("explicit lower fixture unwind with an actual native target");
+        }));
+        assert!(panic.is_err());
+        let unknown = finish.into_unknown();
+        let unknown = thread::spawn(move || unknown).join().unwrap();
+        assert_eq!(unknown.state(), DirectReadFinishState::Unknown);
+        assert!(Arc::ptr_eq(unknown.owned_clock(), &clock));
+        assert!(Arc::ptr_eq(unknown.journal_root(), &root));
+        assert!(carrier.upgrade().is_some());
+        assert!(lease.upgrade().is_some());
+        assert!(unknown.retirement().is_none());
+        let next = PreparedArchiveOperation::prepare_owned(
+            Arc::clone(&root),
+            ArchiveBudget::new(clock.as_ref()).unwrap(),
+            Arc::clone(&clock),
+        );
+        assert!(next.is_err());
+        drop(next);
+        serde_json::json!({"state":"Unknown","same_original_owner":true,"same_original_clock":true,"replacement_refused":true,"retirement":false})
+    } else {
+        if mode == "sticky" {
+            let bad = ExactArchiveFile {
+                snapshot_id: "f".repeat(64),
+                ..ExactArchiveFile {
+                    repository_id: file.repository_id.clone(),
+                    snapshot_id: file.snapshot_id.clone(),
+                    name: file.name.clone(),
+                    archive_path: file.archive_path.clone(),
+                    bytes: file.bytes,
+                    sha256: file.sha256.clone(),
+                }
+            };
+            assert_ne!(bad.snapshot_id, file.snapshot_id);
+            let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+                .unwrap()
+                .create_target()
+                .unwrap();
+            let mut failed = match read.read_exact(&bad, target) {
+                Err(failed) => failed,
+                Ok(_) => panic!("missing snapshot must fail"),
+            };
+            assert_eq!(failed.reason(), ReadbackError::ToolFailed);
+            assert_eq!(failed.cleanup(), Cleanup::Complete);
+            drop(failed);
+        } else {
+            assert_eq!(mode, "complete");
+        }
+        let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+            .unwrap()
+            .create_target()
+            .unwrap();
+        let mut prepared = read.read_exact(&file, target).unwrap();
+        assert_eq!(prepared.digest().sha256, file.sha256);
+        assert_eq!(prepared.digest().size, file.bytes);
+        assert_eq!(prepared.cleanup(), Cleanup::Complete);
+        drop(prepared);
+        drop(parent);
+        if mode == "sticky" {
+            let held = match read.settle_direct() {
+                Err(held) => held,
+                Ok(_) => panic!("valid later read must not clear failed query"),
+            };
+            assert_eq!(held.reason(), ReadbackError::ToolFailed);
+            let held = match held.into_owned_hold() {
+                Ok(held) => held,
+                Err(_) => panic!("actual owned clock must close"),
+            };
+            assert!(Arc::ptr_eq(held.carrier(), finish.carrier()));
+            let custody = thread::spawn(move || (held, finish)).join().unwrap();
+            assert!(carrier.upgrade().is_some());
+            assert!(lease.upgrade().is_some());
+            let next = PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock),
+            );
+            assert!(next.is_err());
+            drop(next);
+            assert!(Arc::ptr_eq(custody.1.owned_clock(), &clock));
+            serde_json::json!({"state":"Held","reason":"ToolFailed","later_read_succeeded":true,"same_original_owner":true,"same_original_clock":true,"replacement_refused":true,"retirement":false})
+        } else {
+            let settled = match read.settle_direct() {
+                Ok(settled) => settled,
+                Err(held) => panic!("actual direct read remained held: {}", held.reason()),
+            };
+            let completed = match finish.finish(settled).into_owned_hold() {
+                Ok(completed) => completed,
+                Err(_) => panic!("actual owned finish must close"),
+            };
+            assert_eq!(completed.state(), DirectReadFinishState::Completed);
+            assert!(Arc::ptr_eq(completed.owned_clock(), &clock));
+            assert!(lease.upgrade().is_some());
+            let receipt = completed.retirement().unwrap();
+            assert!(receipt.receipt.failures().is_empty());
+            let retirement = format!(
+                "{:?}/{:?}/{:?}",
+                receipt.receipt.effect(),
+                receipt.receipt.root_durability(),
+                receipt.receipt.confirmation()
+            );
+            let before_release = PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock),
+            );
+            assert!(before_release.is_err());
+            drop(before_release);
+            drop(completed);
+            assert!(lease.upgrade().is_none());
+            let next = PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap();
+            let second = admit_prepared_archive_read_installed(
+                next,
+                repository.into(),
+                path,
+                "2.0.40",
+                &UreqHttpTransport,
+            )
+            .unwrap();
+            let (second_read, second_finish) = second.into_parts();
+            let settled = match second_read.settle_direct() {
+                Ok(settled) => settled,
+                Err(held) => panic!("second actual read remained held: {}", held.reason()),
+            };
+            let second = match second_finish.finish(settled).into_owned_hold() {
+                Ok(second) => second,
+                Err(_) => panic!("second actual owner must close"),
+            };
+            assert_eq!(second.state(), DirectReadFinishState::Completed);
+            drop(second);
+            serde_json::json!({"state":"Completed","same_original_owner":true,"same_original_clock":true,"retirement":retirement,"held_lease_refused_next":true,"second_installed_admission":true,"second_completed":true,"target_cleanup":"Complete"})
+        }
+    };
+    println!(
+        "DIRECT_FINISH_RESULT {}",
+        serde_json::json!({"mode":mode,"result":result,"limit":"lower direct only; no consuming RestoreRunOutcome or Consumer keeper/generation qualification"})
+    );
+}

@@ -126,13 +126,73 @@ impl ArchiveActivity {
     }
 }
 
+pub(crate) enum ArchiveOperationClock<'a> {
+    Borrowed(&'a dyn Clock),
+    Owned(Arc<dyn Clock + Send + Sync>),
+}
+impl ArchiveOperationClock<'_> {
+    fn clock(&self) -> &dyn Clock {
+        match self {
+            Self::Borrowed(clock) => *clock,
+            Self::Owned(clock) => clock.as_ref(),
+        }
+    }
+}
+
+/// Closed original fields; this value admits no further work.
+#[must_use]
+pub struct OwnedPreparedArchiveHold {
+    pub(crate) activity: ArchiveActivity,
+    pub(crate) _configuration: ArchiveConfiguration,
+    pub(crate) _budget: ArchiveBudget,
+    pub(crate) clock: Arc<dyn Clock + Send + Sync>,
+}
+impl OwnedPreparedArchiveHold {
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.activity.carrier()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.activity.journal_root()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+}
+
+#[must_use]
+pub struct OwnedArchivePreparationFailure {
+    reason: AdmissionError,
+    root: Arc<JournalRoot>,
+    activity: Option<ArchiveActivity>,
+    preparation: Option<ActivityPreparationFailure>,
+    _budget: ArchiveBudget,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+impl OwnedArchivePreparationFailure {
+    pub fn reason(&self) -> AdmissionError {
+        self.reason
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+    pub fn carrier(&self) -> Option<&Arc<RootActivityCarrier>> {
+        self.activity.as_ref().map(ArchiveActivity::carrier)
+    }
+    pub fn preparation(&self) -> Option<&ActivityPreparationFailure> {
+        self.preparation.as_ref()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+}
+
 /// One unused archive admission. Its lifetime cannot be extracted or rebound.
 #[must_use = "Move the original operation through archive and read admission"]
 pub struct PreparedArchiveOperation<'a> {
     pub(crate) activity: ArchiveActivity,
     pub(crate) configuration: ArchiveConfiguration,
     pub(crate) budget: ArchiveBudget,
-    pub(crate) clock: &'a dyn Clock,
+    pub(crate) clock: ArchiveOperationClock<'a>,
 }
 
 #[must_use = "An archive preparation refusal retains its original admission"]
@@ -146,7 +206,7 @@ struct ArchiveOperationPreparationFailureInner<'a> {
     activity: Option<ArchiveActivity>,
     preparation: Option<ActivityPreparationFailure>,
     _budget: ArchiveBudget,
-    _clock: &'a dyn Clock,
+    _clock: ArchiveOperationClock<'a>,
 }
 impl fmt::Debug for ArchiveOperationPreparationFailure<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -174,6 +234,36 @@ impl ArchiveOperationPreparationFailure<'_> {
     pub fn preparation(&self) -> Option<&ActivityPreparationFailure> {
         self.inner.preparation.as_ref()
     }
+    pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
+        match &self.inner._clock {
+            ArchiveOperationClock::Owned(clock) => Some(clock),
+            ArchiveOperationClock::Borrowed(_) => None,
+        }
+    }
+    pub fn into_owned_hold(self) -> Result<OwnedArchivePreparationFailure, Self> {
+        if matches!(self.inner._clock, ArchiveOperationClock::Borrowed(_)) {
+            return Err(self);
+        }
+        let ArchiveOperationPreparationFailureInner {
+            reason,
+            root,
+            activity,
+            preparation,
+            _budget,
+            _clock,
+        } = *self.inner;
+        let ArchiveOperationClock::Owned(clock) = _clock else {
+            unreachable!()
+        };
+        Ok(OwnedArchivePreparationFailure {
+            reason,
+            root,
+            activity,
+            preparation,
+            _budget,
+            clock,
+        })
+    }
 }
 
 impl<'a> PreparedArchiveOperation<'a> {
@@ -181,6 +271,13 @@ impl<'a> PreparedArchiveOperation<'a> {
         root: Arc<JournalRoot>,
         budget: ArchiveBudget,
         clock: &'a dyn Clock,
+    ) -> Result<Self, ArchiveOperationPreparationFailure<'a>> {
+        Self::prepare_with(root, budget, ArchiveOperationClock::Borrowed(clock))
+    }
+    fn prepare_with(
+        root: Arc<JournalRoot>,
+        budget: ArchiveBudget,
+        clock: ArchiveOperationClock<'a>,
     ) -> Result<Self, ArchiveOperationPreparationFailure<'a>> {
         let mut failure = ArchiveOperationPreparationFailureInner {
             reason: AdmissionError::JournalIdentityChanged,
@@ -190,7 +287,7 @@ impl<'a> PreparedArchiveOperation<'a> {
             _budget: budget,
             _clock: clock,
         };
-        if let Err(reason) = failure._budget.remaining(clock) {
+        if let Err(reason) = failure._budget.remaining(failure._clock.clock()) {
             failure.reason = reason;
             return Err(ArchiveOperationPreparationFailure {
                 inner: Box::new(failure),
@@ -219,7 +316,7 @@ impl<'a> PreparedArchiveOperation<'a> {
             activity,
             configuration,
             budget: failure._budget,
-            clock,
+            clock: failure._clock,
         })
     }
     pub fn activity(&self) -> &Arc<ActivityLease> {
@@ -237,17 +334,54 @@ impl<'a> PreparedArchiveOperation<'a> {
     pub fn budget(&self) -> &ArchiveBudget {
         &self.budget
     }
-    pub fn clock(&self) -> &'a dyn Clock {
-        self.clock
+    pub fn clock(&self) -> &dyn Clock {
+        self.clock.clock()
+    }
+    pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
+        match &self.clock {
+            ArchiveOperationClock::Owned(clock) => Some(clock),
+            ArchiveOperationClock::Borrowed(_) => None,
+        }
+    }
+    pub fn into_owned_hold(self) -> Result<OwnedPreparedArchiveHold, Box<Self>> {
+        if matches!(self.clock, ArchiveOperationClock::Borrowed(_)) {
+            return Err(Box::new(self));
+        }
+        let Self {
+            activity,
+            configuration,
+            budget,
+            clock,
+        } = self;
+        let ArchiveOperationClock::Owned(clock) = clock else {
+            unreachable!()
+        };
+        Ok(OwnedPreparedArchiveHold {
+            activity,
+            _configuration: configuration,
+            _budget: budget,
+            clock,
+        })
     }
     pub fn cap_credential_expiry(&mut self, expiry: i64) {
         self.budget.cap_credential_expiry(expiry);
     }
     pub fn revalidate(&self) -> Result<(), AdmissionError> {
-        self.budget.remaining(self.clock)?;
+        self.budget.remaining(self.clock())?;
         self.activity
             .revalidate()
             .map_err(|_| AdmissionError::JournalIdentityChanged)?;
         self.configuration.revalidate(self.journal_root())
+    }
+}
+
+impl PreparedArchiveOperation<'static> {
+    /// Fresh admission using the actual clock captured before the original budget.
+    pub fn prepare_owned(
+        root: Arc<JournalRoot>,
+        budget: ArchiveBudget,
+        clock: Arc<dyn Clock + Send + Sync>,
+    ) -> Result<Self, ArchiveOperationPreparationFailure<'static>> {
+        Self::prepare_with(root, budget, ArchiveOperationClock::Owned(clock))
     }
 }

@@ -19,21 +19,23 @@ use solstone_core_backup::{
 use solstone_core_journal_io::{JournalRoot, media::ArchiveSource};
 
 use crate::hosted_runtime::{
-    HttpTransport, RuntimeResolution, fetch_hosted_credentials, hosted_append_only_session,
-    hosted_session, resolve_runtime,
+    HttpTransport, RuntimeResolution, UreqHttpTransport, fetch_hosted_credentials,
+    hosted_append_only_session, hosted_session, resolve_runtime,
 };
 use crate::runner::{ToolRunner, reason_for_returncode, run_restic, select_summary};
 
 pub const ARCHIVE_TAG: &str = "solstone-archive";
 use solstone_core_backup::archive_activity::{
-    ArchiveOperationPreparationFailure, PreparedArchiveOperation,
+    ArchiveOperationPreparationFailure, OwnedArchivePreparationFailure, OwnedPreparedArchiveHold,
+    PreparedArchiveOperation,
 };
 pub use solstone_core_backup::archive_admission::{
     ARCHIVE_BACKUP_TIMEOUT_SECONDS, ARCHIVE_LS_TIMEOUT_SECONDS, Clock,
 };
 use solstone_core_backup::archive_admission::{AdmissionError, ArchiveBudget, ArchiveCancellation};
 use solstone_core_backup::archive_readback::{
-    ReadAdmission, ReadOperation, ReadbackAdmissionError, ReadbackError,
+    DirectReadCompletion, OwnedDirectReadHold, OwnedReadbackAdmissionError, ReadAdmission,
+    ReadOperation, ReadbackAdmissionError, ReadbackError, SettledDirectRead,
 };
 // Repository contention is coordinated by Restic, within each operation’s deadline.
 const REPOSITORY_RETRY_LOCK: &str = "30m";
@@ -1798,6 +1800,95 @@ impl ArchiveAdmissionFailure<'_> {
             _ => None,
         }
     }
+    /// Close only an actual owned-clock refusal; borrowed owners are returned intact.
+    pub fn into_owned_hold(self) -> Result<OwnedArchiveAdmissionFailure, Self> {
+        let transferable = match &self.inner.owned {
+            ArchiveAdmissionFailureOwner::BeforePreparation(_) => true,
+            ArchiveAdmissionFailureOwner::Prepared(operation) => operation.owned_clock().is_some(),
+            ArchiveAdmissionFailureOwner::Preparation(preparation) => {
+                preparation.owned_clock().is_some()
+            }
+            ArchiveAdmissionFailureOwner::Readback(readback) => readback.owned_clock().is_some(),
+        };
+        if !transferable {
+            return Err(self);
+        }
+        let ArchiveAdmissionFailureInner {
+            error,
+            effects,
+            owned,
+        } = *self.inner;
+        let owned = match owned {
+            ArchiveAdmissionFailureOwner::BeforePreparation(root) => {
+                ClosedArchiveAdmissionOwner::BeforePreparation(root)
+            }
+            ArchiveAdmissionFailureOwner::Prepared(operation) => {
+                ClosedArchiveAdmissionOwner::Prepared(Box::new(
+                    operation
+                        .into_owned_hold()
+                        .ok()
+                        .expect("checked owned clock"),
+                ))
+            }
+            ArchiveAdmissionFailureOwner::Preparation(preparation) => {
+                ClosedArchiveAdmissionOwner::Preparation(Box::new(
+                    preparation.into_owned_hold().expect("checked owned clock"),
+                ))
+            }
+            ArchiveAdmissionFailureOwner::Readback(readback) => {
+                ClosedArchiveAdmissionOwner::Readback(Box::new(
+                    readback.into_owned_hold().expect("checked owned clock"),
+                ))
+            }
+        };
+        Ok(OwnedArchiveAdmissionFailure {
+            inner: Box::new(OwnedArchiveAdmissionFailureInner {
+                error,
+                effects,
+                owned,
+            }),
+        })
+    }
+}
+
+#[must_use = "Retain every original admission owner after refusal"]
+pub struct OwnedArchiveAdmissionFailure {
+    inner: Box<OwnedArchiveAdmissionFailureInner>,
+}
+struct OwnedArchiveAdmissionFailureInner {
+    error: ArchiveError,
+    effects: ArchiveAdmissionEffects,
+    owned: ClosedArchiveAdmissionOwner,
+}
+enum ClosedArchiveAdmissionOwner {
+    BeforePreparation(Arc<JournalRoot>),
+    Prepared(Box<OwnedPreparedArchiveHold>),
+    Preparation(Box<OwnedArchivePreparationFailure>),
+    Readback(Box<OwnedReadbackAdmissionError>),
+}
+impl OwnedArchiveAdmissionFailure {
+    pub fn error(&self) -> ArchiveError {
+        self.inner.error
+    }
+    pub fn effects(&self) -> &ArchiveAdmissionEffects {
+        &self.inner.effects
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        match &self.inner.owned {
+            ClosedArchiveAdmissionOwner::BeforePreparation(root) => root,
+            ClosedArchiveAdmissionOwner::Prepared(operation) => operation.journal_root(),
+            ClosedArchiveAdmissionOwner::Preparation(preparation) => preparation.journal_root(),
+            ClosedArchiveAdmissionOwner::Readback(readback) => readback.journal_root(),
+        }
+    }
+    pub fn carrier(&self) -> Option<&Arc<solstone_core_journal_io::media::RootActivityCarrier>> {
+        match &self.inner.owned {
+            ClosedArchiveAdmissionOwner::BeforePreparation(_) => None,
+            ClosedArchiveAdmissionOwner::Prepared(operation) => Some(operation.carrier()),
+            ClosedArchiveAdmissionOwner::Preparation(preparation) => preparation.carrier(),
+            ClosedArchiveAdmissionOwner::Readback(readback) => Some(readback.carrier()),
+        }
+    }
 }
 
 /// Prepare one original activity before admitting paired archive transports.
@@ -1963,9 +2054,25 @@ pub fn admit_prepared_archive<'a>(
 
 /// Admit the original operation directly for an existing repository identity.
 pub fn admit_prepared_archive_read<'a>(
-    mut operation: PreparedArchiveOperation<'a>,
+    operation: PreparedArchiveOperation<'a>,
     expected_repository_id: String,
     services: &BackupServices<'a>,
+) -> Result<ReadOperation<'a>, ArchiveAdmissionFailure<'a>> {
+    admit_prepared_archive_read_with(
+        operation,
+        expected_repository_id,
+        services.http,
+        services.restic_path,
+        services.version,
+    )
+}
+
+fn admit_prepared_archive_read_with<'a>(
+    mut operation: PreparedArchiveOperation<'a>,
+    expected_repository_id: String,
+    http: &dyn HttpTransport,
+    restic_path: Option<&Path>,
+    version: &str,
 ) -> Result<ReadOperation<'a>, ArchiveAdmissionFailure<'a>> {
     let mut effects = ArchiveAdmissionEffects::default();
     let admission = (|| {
@@ -1978,18 +2085,16 @@ pub fn admit_prepared_archive_read<'a>(
             return Err(ArchiveError::NotConfigured);
         }
         let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
-        let restic_path = services
-            .restic_path
+        let restic_path = restic_path
             .ok_or(ArchiveError::ToolUnavailable)?
             .to_path_buf();
         let destination = if let Some(binding) = config.binding() {
             let http = ArchiveAdmissionHttp {
-                inner: services.http,
+                inner: http,
                 operation: &operation,
             };
             effects.broker_requested = true;
-            let credentials =
-                fetch_hosted_credentials(&http, binding, "operated", services.version);
+            let credentials = fetch_hosted_credentials(&http, binding, "operated", version);
             operation.revalidate()?;
             let credentials =
                 credentials.map_err(|error| ArchiveError::CredentialsUnavailable {
@@ -2038,6 +2143,304 @@ pub fn admit_prepared_archive_read<'a>(
             owned: ArchiveAdmissionFailureOwner::Readback(Box::new(readback)),
         }),
     })
+}
+
+/// Concrete installed admission with an independent original finish owner.
+pub fn admit_prepared_archive_read_installed<'a>(
+    operation: PreparedArchiveOperation<'a>,
+    expected_repository_id: String,
+    restic_path: &Path,
+    version: &str,
+    http: &UreqHttpTransport,
+) -> Result<InstalledArchiveRead<'a>, ArchiveAdmissionFailure<'a>> {
+    let Some(clock) = operation.owned_clock().map(Arc::clone) else {
+        return Err(ArchiveAdmissionFailure {
+            inner: Box::new(ArchiveAdmissionFailureInner {
+                error: ArchiveError::Readback(ReadbackError::Unsupported),
+                effects: ArchiveAdmissionEffects::default(),
+                owned: ArchiveAdmissionFailureOwner::Prepared(Box::new(operation)),
+            }),
+        });
+    };
+    let carrier = Arc::clone(operation.carrier());
+    let operated = operation.configuration().binding().is_some();
+    let read = admit_prepared_archive_read_with(
+        operation,
+        expected_repository_id,
+        http,
+        Some(restic_path),
+        version,
+    )?;
+    // Only this concrete call can record the returned, joined Ureq request.
+    let broker = if operated {
+        DirectBrokerCompletion::JoinedOperated
+    } else {
+        DirectBrokerCompletion::CapturedByo
+    };
+    Ok(InstalledArchiveRead {
+        read,
+        finish: DirectReadFinishOwner {
+            carrier,
+            clock,
+            broker,
+        },
+    })
+}
+
+#[must_use = "Keep the original finish owner outside the consuming actor"]
+pub struct InstalledArchiveRead<'a> {
+    read: ReadOperation<'a>,
+    finish: DirectReadFinishOwner,
+}
+impl<'a> InstalledArchiveRead<'a> {
+    pub fn into_parts(self) -> (ReadOperation<'a>, DirectReadFinishOwner) {
+        (self.read, self.finish)
+    }
+}
+
+enum DirectBrokerCompletion {
+    CapturedByo,
+    JoinedOperated,
+}
+
+/// Outside custody for the actual root/carrier and original owned clock.
+#[must_use = "Keep this owner outside the actor unwind boundary"]
+pub struct DirectReadFinishOwner {
+    carrier: Arc<solstone_core_journal_io::media::RootActivityCarrier>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    broker: DirectBrokerCompletion,
+}
+impl DirectReadFinishOwner {
+    pub fn carrier(&self) -> &Arc<solstone_core_journal_io::media::RootActivityCarrier> {
+        &self.carrier
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.carrier.journal_root()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+
+    /// Actor unwind leaves lost resources unresolved; this value can never retire.
+    pub fn into_unknown(self) -> OwnedDirectReadFinish {
+        OwnedDirectReadFinish {
+            inner: Box::new(OwnedDirectReadFinishInner::Unknown(self)),
+        }
+    }
+
+    pub fn finish<'a>(self, settled: SettledDirectRead<'a>) -> DirectReadFinish<'a> {
+        let validation = (|| {
+            if !Arc::ptr_eq(&self.carrier, settled.carrier())
+                || !settled
+                    .owned_clock()
+                    .is_some_and(|clock| Arc::ptr_eq(&self.clock, clock))
+            {
+                return Err(ReadbackError::NativeFailure);
+            }
+            settled.revalidate()
+        })();
+        if let Err(reason) = validation {
+            return DirectReadFinish {
+                inner: Box::new(DirectReadFinishInner::BeforeRelease {
+                    owner: self,
+                    settled: Box::new(settled),
+                    reason,
+                }),
+            };
+        }
+        let completion = settled.release();
+        if let Err(reason) = completion.revalidate() {
+            return DirectReadFinish {
+                inner: Box::new(DirectReadFinishInner::Owned(OwnedDirectReadFinish {
+                    inner: Box::new(OwnedDirectReadFinishInner::Shared {
+                        owner: self,
+                        _completion: completion,
+                        reason,
+                    }),
+                })),
+            };
+        }
+        let Self {
+            carrier,
+            clock,
+            broker,
+        } = self;
+        let inner = match Arc::try_unwrap(carrier) {
+            Err(carrier) => OwnedDirectReadFinishInner::Shared {
+                owner: Self {
+                    carrier,
+                    clock,
+                    broker,
+                },
+                _completion: completion,
+                reason: ReadbackError::NativeFailure,
+            },
+            Ok(carrier) => {
+                let retirement = carrier.retire_after_settlement();
+                let lifetime_failure = completion.revalidate().err();
+                OwnedDirectReadFinishInner::Retired {
+                    retirement,
+                    clock,
+                    _broker: broker,
+                    _completion: completion,
+                    lifetime_failure,
+                }
+            }
+        };
+        DirectReadFinish {
+            inner: Box::new(DirectReadFinishInner::Owned(OwnedDirectReadFinish {
+                inner: Box::new(inner),
+            })),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectReadFinishState {
+    Completed,
+    Held,
+    Unknown,
+}
+
+#[must_use = "Retain the complete owning finish result through projection"]
+pub struct DirectReadFinish<'a> {
+    inner: Box<DirectReadFinishInner<'a>>,
+}
+enum DirectReadFinishInner<'a> {
+    BeforeRelease {
+        owner: DirectReadFinishOwner,
+        settled: Box<SettledDirectRead<'a>>,
+        reason: ReadbackError,
+    },
+    Owned(OwnedDirectReadFinish),
+}
+impl DirectReadFinish<'_> {
+    pub fn state(&self) -> DirectReadFinishState {
+        match &*self.inner {
+            DirectReadFinishInner::BeforeRelease { .. } => DirectReadFinishState::Held,
+            DirectReadFinishInner::Owned(owned) => owned.state(),
+        }
+    }
+    pub fn into_owned_hold(self) -> Result<OwnedDirectReadFinish, Self> {
+        match *self.inner {
+            DirectReadFinishInner::Owned(owned) => Ok(owned),
+            DirectReadFinishInner::BeforeRelease {
+                owner,
+                settled,
+                reason,
+            } => match (*settled).into_owned_hold() {
+                Ok(read) => Ok(OwnedDirectReadFinish {
+                    inner: Box::new(OwnedDirectReadFinishInner::BeforeRelease {
+                        owner,
+                        _read: Box::new(read),
+                        reason,
+                    }),
+                }),
+                Err(settled) => Err(Self {
+                    inner: Box::new(DirectReadFinishInner::BeforeRelease {
+                        owner,
+                        settled,
+                        reason,
+                    }),
+                }),
+            },
+        }
+    }
+}
+
+#[must_use = "Closed owning custody; state observation does not release it"]
+pub struct OwnedDirectReadFinish {
+    inner: Box<OwnedDirectReadFinishInner>,
+}
+enum OwnedDirectReadFinishInner {
+    Unknown(DirectReadFinishOwner),
+    BeforeRelease {
+        owner: DirectReadFinishOwner,
+        _read: Box<OwnedDirectReadHold>,
+        reason: ReadbackError,
+    },
+    Shared {
+        owner: DirectReadFinishOwner,
+        _completion: DirectReadCompletion,
+        reason: ReadbackError,
+    },
+    Retired {
+        retirement: solstone_core_journal_io::media::ActivityCarrierRetirement<
+            solstone_core_journal_io::media::RootActivityCarrier,
+        >,
+        clock: Arc<dyn Clock + Send + Sync>,
+        _broker: DirectBrokerCompletion,
+        _completion: DirectReadCompletion,
+        lifetime_failure: Option<ReadbackError>,
+    },
+}
+impl OwnedDirectReadFinish {
+    pub fn state(&self) -> DirectReadFinishState {
+        use solstone_core_journal_io::media::{
+            ActivityCarrierRetirementEffect, Confirmation, Durability,
+        };
+        match &*self.inner {
+            OwnedDirectReadFinishInner::Unknown(_) => DirectReadFinishState::Unknown,
+            OwnedDirectReadFinishInner::Retired {
+                retirement,
+                lifetime_failure: None,
+                ..
+            } if retirement.receipt.effect() == ActivityCarrierRetirementEffect::Removed
+                && retirement.receipt.root_durability() == Durability::Synced
+                && retirement.receipt.confirmation() == Confirmation::Confirmed
+                && retirement.receipt.failures().is_empty() =>
+            {
+                DirectReadFinishState::Completed
+            }
+            _ => DirectReadFinishState::Held,
+        }
+    }
+    pub fn reason(&self) -> Option<ReadbackError> {
+        match &*self.inner {
+            OwnedDirectReadFinishInner::BeforeRelease { reason, .. } => Some(*reason),
+            OwnedDirectReadFinishInner::Shared { reason, .. } => Some(*reason),
+            OwnedDirectReadFinishInner::Retired {
+                lifetime_failure: Some(reason),
+                ..
+            } => Some(*reason),
+            OwnedDirectReadFinishInner::Retired { .. }
+                if self.state() == DirectReadFinishState::Held =>
+            {
+                Some(ReadbackError::NativeFailure)
+            }
+            _ => None,
+        }
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        match &*self.inner {
+            OwnedDirectReadFinishInner::Unknown(owner)
+            | OwnedDirectReadFinishInner::BeforeRelease { owner, .. }
+            | OwnedDirectReadFinishInner::Shared { owner, .. } => owner.journal_root(),
+            OwnedDirectReadFinishInner::Retired { retirement, .. } => {
+                retirement.owned.journal_root()
+            }
+        }
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        match &*self.inner {
+            OwnedDirectReadFinishInner::Unknown(owner)
+            | OwnedDirectReadFinishInner::BeforeRelease { owner, .. }
+            | OwnedDirectReadFinishInner::Shared { owner, .. } => owner.owned_clock(),
+            OwnedDirectReadFinishInner::Retired { clock, .. } => clock,
+        }
+    }
+    pub fn retirement(
+        &self,
+    ) -> Option<
+        &solstone_core_journal_io::media::ActivityCarrierRetirement<
+            solstone_core_journal_io::media::RootActivityCarrier,
+        >,
+    > {
+        match &*self.inner {
+            OwnedDirectReadFinishInner::Retired { retirement, .. } => Some(retirement),
+            _ => None,
+        }
+    }
 }
 
 impl<'a> AdmittedArchive<'a> {
@@ -2390,6 +2793,19 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
+    #[test]
+    fn closed_archive_custody_is_send_static() {
+        fn check<T: Send + 'static>() {}
+        check::<DirectReadFinishOwner>();
+        check::<OwnedDirectReadFinish>();
+        check::<OwnedArchiveAdmissionFailure>();
+        check::<OwnedPreparedArchiveHold>();
+        check::<OwnedArchivePreparationFailure>();
+        check::<OwnedDirectReadHold>();
+        check::<OwnedReadbackAdmissionError>();
+        check::<solstone_core_backup::archive_readback::OwnedHeldDirectRead>();
+    }
+
     static CURRENT_DIRECTORY: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct CurrentDirectoryGuard(PathBuf);
@@ -2711,6 +3127,128 @@ mod tests {
             write_backup_section(journal.path(), valid_backup_section(valid_destination()));
             let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
             (journal, root)
+        }
+
+        #[test]
+        fn closed_owned_preparation_keeps_same_clock_carrier_and_reservation() {
+            let (_journal, root) = fixture();
+            let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+            let cancellation = ArchiveCancellation::new();
+            let budget =
+                ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone()).unwrap();
+            let original = PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                budget,
+                Arc::clone(&clock),
+            )
+            .unwrap();
+            assert!(Arc::ptr_eq(original.owned_clock().unwrap(), &clock));
+            let weak = Arc::downgrade(original.carrier());
+            cancellation.cancel();
+            assert_eq!(original.revalidate(), Err(AdmissionError::Cancelled));
+            let hold = match original.into_owned_hold() {
+                Ok(hold) => hold,
+                Err(_) => panic!("actual owned clock must transfer"),
+            };
+            let hold = std::thread::spawn(move || hold).join().unwrap();
+            assert!(Arc::ptr_eq(hold.owned_clock(), &clock));
+            assert!(Arc::ptr_eq(hold.journal_root(), &root));
+            assert!(weak.upgrade().is_some());
+            assert!(
+                !solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+                    .unwrap()
+                    .entries()
+                    .is_empty()
+            );
+            drop(hold);
+            assert!(weak.upgrade().is_none());
+            // Dropping closed custody never certifies or retires the reservation.
+            assert!(
+                !solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+                    .unwrap()
+                    .entries()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn installed_finish_borrowed_refusal_retains_original_before_effects() {
+            let (_journal, root) = fixture();
+            let budget = ArchiveBudget::new(&FixedClock).unwrap();
+            let original = PreparedArchiveOperation::prepare(root, budget, &FixedClock).unwrap();
+            let carrier = Arc::clone(original.carrier());
+            let refusal = match admit_prepared_archive_read_installed(
+                original,
+                REPOSITORY_ID.into(),
+                Path::new("/absent/restic"),
+                "fixture",
+                &UreqHttpTransport,
+            ) {
+                Err(refusal) => refusal,
+                Ok(_) => panic!("borrowed clock must not mint finish owner"),
+            };
+            assert_eq!(
+                refusal.error(),
+                ArchiveError::Readback(ReadbackError::Unsupported)
+            );
+            assert_eq!(*refusal.effects(), ArchiveAdmissionEffects::default());
+            assert!(Arc::ptr_eq(refusal.carrier().unwrap(), &carrier));
+            let refusal = match refusal.into_owned_hold() {
+                Err(original) => original,
+                Ok(_) => panic!("borrowed refusal must remain borrowed"),
+            };
+            assert!(Arc::ptr_eq(refusal.carrier().unwrap(), &carrier));
+        }
+
+        #[test]
+        fn closed_owned_admission_refusal_and_preparation_failure_keep_original_clock() {
+            let (_journal, root) = fixture();
+            let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+            let budget = ArchiveBudget::new(clock.as_ref()).unwrap();
+            let original = PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                budget,
+                Arc::clone(&clock),
+            )
+            .unwrap();
+            let carrier = Arc::clone(original.carrier());
+            let refusal = match admit_prepared_archive_read_installed(
+                original,
+                "bad-id".into(),
+                Path::new("/absent/restic"),
+                "fixture",
+                &UreqHttpTransport,
+            ) {
+                Err(refusal) => refusal,
+                Ok(_) => panic!("bad identity must refuse"),
+            };
+            assert_eq!(refusal.error(), ArchiveError::RepositoryIdentityInvalid);
+            assert_eq!(*refusal.effects(), ArchiveAdmissionEffects::default());
+            let refusal = refusal.into_owned_hold().unwrap();
+            let refusal = std::thread::spawn(move || refusal).join().unwrap();
+            assert!(Arc::ptr_eq(refusal.carrier().unwrap(), &carrier));
+            drop(refusal);
+            drop(carrier);
+
+            let cancellation = ArchiveCancellation::new();
+            let budget =
+                ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone()).unwrap();
+            cancellation.cancel();
+            let failure = match PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                budget,
+                Arc::clone(&clock),
+            ) {
+                Err(failure) => failure,
+                Ok(_) => panic!("cancellation must refuse before native preparation"),
+            };
+            assert_eq!(failure.reason(), AdmissionError::Cancelled);
+            assert!(Arc::ptr_eq(failure.owned_clock().unwrap(), &clock));
+            let failure = failure.into_owned_hold().unwrap();
+            let failure = std::thread::spawn(move || failure).join().unwrap();
+            assert!(Arc::ptr_eq(failure.owned_clock(), &clock));
+            assert!(Arc::ptr_eq(failure.journal_root(), &root));
+            assert!(failure.carrier().is_none());
         }
 
         fn source(journal: &Path) -> Vec<PathBuf> {

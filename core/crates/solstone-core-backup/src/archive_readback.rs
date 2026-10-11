@@ -17,10 +17,13 @@ use solstone_core_journal_io::media::MediaDigest;
 use solstone_core_journal_io::media::{ArchiveSource, Cleanup, OwnedMediaTarget, PreparedMedia};
 
 use crate::Destination;
-use crate::archive_activity::PreparedArchiveOperation;
+use crate::archive_activity::{
+    ArchiveOperationClock, OwnedPreparedArchiveHold, PreparedArchiveOperation,
+};
 #[cfg(unix)]
 use crate::archive_admission::ARCHIVE_LS_TIMEOUT_SECONDS;
-use crate::archive_admission::AdmissionError;
+use crate::archive_admission::Clock;
+use crate::archive_admission::{AdmissionError, ArchiveBudget, ArchiveConfiguration};
 #[cfg(unix)]
 use crate::bounded_child::{self, CompletedChild, Request};
 #[cfg(unix)]
@@ -167,6 +170,252 @@ impl ReadbackAdmissionError<'_> {
     }
 }
 
+#[derive(Default)]
+struct DirectExecution {
+    #[cfg(unix)]
+    pending: u64,
+    #[cfg(unix)]
+    completed: [u64; 4],
+    failure: Option<ReadbackError>,
+}
+#[cfg(unix)]
+enum DirectInvocation {
+    Version,
+    Config,
+    List,
+    Dump,
+}
+impl DirectExecution {
+    fn fail(&mut self, reason: ReadbackError) {
+        self.failure.get_or_insert(reason);
+    }
+    #[cfg(unix)]
+    fn attempt(&mut self) {
+        if let Some(next) = self.pending.checked_add(1) {
+            self.pending = next;
+        } else {
+            self.fail(ReadbackError::ToolFailed);
+        }
+    }
+    #[cfg(unix)]
+    fn accept(&mut self, kind: DirectInvocation, child: CompletedChild) {
+        if !child.successful() || self.pending == 0 {
+            self.fail(ReadbackError::ToolFailed);
+            return;
+        }
+        self.pending -= 1;
+        let index = kind as usize;
+        if let Some(next) = self.completed[index].checked_add(1) {
+            self.completed[index] = next;
+        } else {
+            self.fail(ReadbackError::ToolFailed);
+        }
+        // Only genuine owned completion reaches this compact record. The large
+        // output is released after its caller has parsed/checked the result.
+        drop(child);
+    }
+}
+
+/// Compact genuine local command completions, without an execution entrance.
+#[must_use]
+pub struct DirectReadCompletion {
+    _execution: DirectExecution,
+    root: Arc<JournalRoot>,
+    configuration: ArchiveConfiguration,
+    budget: ArchiveBudget,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+impl DirectReadCompletion {
+    /// Recheck only the genuine released operation's original local lifetime.
+    pub fn revalidate(&self) -> Result<(), ReadbackError> {
+        self.budget.remaining(self.clock.as_ref())?;
+        self.configuration.revalidate(&self.root)?;
+        Ok(())
+    }
+}
+
+#[must_use]
+pub struct SettledDirectRead<'a> {
+    read: ReadOperation<'a>,
+}
+impl SettledDirectRead<'_> {
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.read.carrier()
+    }
+    pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
+        self.read.operation.owned_clock()
+    }
+    pub fn revalidate(&self) -> Result<(), ReadbackError> {
+        self.read.revalidate_admission()
+    }
+    pub fn release(self) -> DirectReadCompletion {
+        let ReadOperation {
+            operation,
+            root,
+            execution,
+            ..
+        } = self.read;
+        let PreparedArchiveOperation {
+            activity,
+            configuration,
+            budget,
+            clock,
+        } = operation;
+        drop(activity);
+        let ArchiveOperationClock::Owned(clock) = clock else {
+            unreachable!("settled read requires an actual owned clock")
+        };
+        DirectReadCompletion {
+            _execution: execution.into_inner(),
+            root,
+            configuration,
+            budget,
+            clock,
+        }
+    }
+    pub fn into_owned_hold(self) -> Result<OwnedDirectReadHold, Box<Self>> {
+        self.read
+            .into_owned_hold()
+            .map_err(|read| Box::new(Self { read: *read }))
+    }
+}
+#[must_use]
+pub struct HeldDirectRead<'a> {
+    reason: ReadbackError,
+    read: ReadOperation<'a>,
+}
+impl HeldDirectRead<'_> {
+    pub fn reason(&self) -> ReadbackError {
+        self.reason
+    }
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.read.carrier()
+    }
+    pub fn into_owned_hold(self) -> Result<OwnedHeldDirectRead, Box<Self>> {
+        let Self { reason, read } = self;
+        read.into_owned_hold()
+            .map(|read| OwnedHeldDirectRead { reason, read })
+            .map_err(|read| {
+                Box::new(Self {
+                    reason,
+                    read: *read,
+                })
+            })
+    }
+}
+
+/// Closed original read fields. It cannot query, bind or retire a reservation.
+#[must_use]
+pub struct OwnedDirectReadHold {
+    operation: OwnedPreparedArchiveHold,
+    _root: Arc<JournalRoot>,
+    #[cfg(unix)]
+    _member: CurrentInstalledMember,
+    #[cfg(unix)]
+    _env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    _repository_id: String,
+    _execution: DirectExecution,
+}
+impl OwnedDirectReadHold {
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.operation.carrier()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.operation.journal_root()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        self.operation.owned_clock()
+    }
+}
+#[must_use]
+pub struct OwnedHeldDirectRead {
+    reason: ReadbackError,
+    read: OwnedDirectReadHold,
+}
+impl OwnedHeldDirectRead {
+    pub fn reason(&self) -> ReadbackError {
+        self.reason
+    }
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.read.carrier()
+    }
+}
+
+struct OwnedReadInput {
+    operation: OwnedPreparedArchiveHold,
+    _destination: Destination,
+    _password: String,
+    _repository_id: String,
+    _expected_restic_path: PathBuf,
+}
+enum ClosedAdmissionOwner {
+    Input(Box<OwnedReadInput>),
+    Admitted(Box<OwnedDirectReadHold>),
+}
+#[must_use]
+pub struct OwnedReadbackAdmissionError {
+    reason: ReadbackError,
+    owned: ClosedAdmissionOwner,
+}
+impl OwnedReadbackAdmissionError {
+    pub fn reason(&self) -> ReadbackError {
+        self.reason
+    }
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        match &self.owned {
+            ClosedAdmissionOwner::Input(input) => input.operation.carrier(),
+            ClosedAdmissionOwner::Admitted(read) => read.carrier(),
+        }
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.carrier().journal_root()
+    }
+}
+impl ReadbackAdmissionError<'_> {
+    pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
+        match &self.owned {
+            AdmissionOwner::Input(input) => input.operation.owned_clock(),
+            AdmissionOwner::Admitted(read) => read.owned_clock(),
+        }
+    }
+    pub fn into_owned_hold(self) -> Result<OwnedReadbackAdmissionError, Self> {
+        let owned_clock = match &self.owned {
+            AdmissionOwner::Input(input) => input.operation.owned_clock(),
+            AdmissionOwner::Admitted(read) => read.operation.owned_clock(),
+        };
+        if owned_clock.is_none() {
+            return Err(self);
+        }
+        let Self { reason, owned } = self;
+        let owned = match owned {
+            AdmissionOwner::Input(input) => {
+                let ReadAdmission {
+                    operation,
+                    destination,
+                    password,
+                    repository_id,
+                    expected_restic_path,
+                } = *input;
+                let operation = operation
+                    .into_owned_hold()
+                    .ok()
+                    .expect("checked owned clock");
+                ClosedAdmissionOwner::Input(Box::new(OwnedReadInput {
+                    operation,
+                    _destination: destination,
+                    _password: password,
+                    _repository_id: repository_id,
+                    _expected_restic_path: expected_restic_path,
+                }))
+            }
+            AdmissionOwner::Admitted(read) => ClosedAdmissionOwner::Admitted(Box::new(
+                read.into_owned_hold().ok().expect("checked owned clock"),
+            )),
+        };
+        Ok(OwnedReadbackAdmissionError { reason, owned })
+    }
+}
+
 pub struct ReadOperation<'a> {
     operation: PreparedArchiveOperation<'a>,
     root: Arc<JournalRoot>,
@@ -177,6 +426,7 @@ pub struct ReadOperation<'a> {
     #[cfg(unix)]
     env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     repository_id: String,
+    execution: std::cell::RefCell<DirectExecution>,
 }
 
 #[derive(Clone, Copy)]
@@ -382,6 +632,79 @@ fn direct_environment(
 }
 
 impl<'a> ReadOperation<'a> {
+    pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
+        self.operation.owned_clock()
+    }
+    pub fn into_owned_hold(self) -> Result<OwnedDirectReadHold, Box<Self>> {
+        if self.operation.owned_clock().is_none() {
+            return Err(Box::new(self));
+        }
+        let Self {
+            operation,
+            root,
+            #[cfg(all(unix, feature = "full-tests"))]
+                source_observations: _,
+            #[cfg(unix)]
+            member,
+            #[cfg(unix)]
+            env,
+            repository_id,
+            execution,
+        } = self;
+        let operation = operation
+            .into_owned_hold()
+            .ok()
+            .expect("checked owned clock");
+        Ok(OwnedDirectReadHold {
+            operation,
+            _root: root,
+            #[cfg(unix)]
+            _member: member,
+            #[cfg(unix)]
+            _env: env,
+            _repository_id: repository_id,
+            _execution: execution.into_inner(),
+        })
+    }
+    pub fn settle_direct(self) -> Result<SettledDirectRead<'a>, Box<HeldDirectRead<'a>>> {
+        let qualify = (|| {
+            self.revalidate_admission()?;
+            if self.operation.owned_clock().is_none() {
+                return Err(ReadbackError::Unsupported);
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                if self.member.bytes() != 30_924_962
+                    || self.member.sha256()
+                        != "ae7fe58ab3511f830fd31d157158620b209522ff1332b119199d2e938d72338c"
+                {
+                    return Err(ReadbackError::UnsupportedToolVersion);
+                }
+                let execution = self.execution.borrow();
+                if let Some(reason) = execution.failure {
+                    return Err(reason);
+                }
+                if execution.pending != 0
+                    || execution.completed[0] == 0
+                    || execution.completed[1] == 0
+                {
+                    return Err(ReadbackError::ToolFailed);
+                }
+                Ok(())
+            }
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            {
+                Err(ReadbackError::Unsupported)
+            }
+        })();
+        match qualify {
+            Ok(()) => Ok(SettledDirectRead { read: self }),
+            Err(reason) => Err(Box::new(HeldDirectRead { reason, read: self })),
+        }
+    }
+}
+
+impl<'a> ReadOperation<'a> {
     pub fn admit(input: ReadAdmission<'a>) -> Result<Self, ReadbackAdmissionError<'a>> {
         #[cfg(not(unix))]
         {
@@ -438,10 +761,11 @@ impl<'a> ReadOperation<'a> {
                 member,
                 env,
                 repository_id: input.repository_id,
+                execution: std::cell::RefCell::new(DirectExecution::default()),
             };
             let qualification = (|| {
-                let version = admitted.query(vec!["version".into()])?;
-                let version = std::str::from_utf8(&version.output().stdout)
+                let version_child = admitted.query(vec!["version".into()])?;
+                let version = std::str::from_utf8(&version_child.output().stdout)
                     .map_err(|_| ReadbackError::UnsupportedToolVersion)?;
                 let mut fields = version.split_whitespace();
                 if fields.next() != Some("restic")
@@ -449,6 +773,10 @@ impl<'a> ReadOperation<'a> {
                 {
                     return Err(ReadbackError::UnsupportedToolVersion);
                 }
+                admitted
+                    .execution
+                    .borrow_mut()
+                    .accept(DirectInvocation::Version, version_child);
                 admitted.check_repository()?;
                 Ok(())
             })();
@@ -520,6 +848,12 @@ impl<'a> ReadOperation<'a> {
 
     #[cfg(unix)]
     fn query(&self, argv: Vec<std::ffi::OsString>) -> Result<CompletedChild, ReadbackError> {
+        self.execution.borrow_mut().attempt();
+        self.query_inner(argv)
+            .inspect_err(|reason| self.execution.borrow_mut().fail(*reason))
+    }
+    #[cfg(unix)]
+    fn query_inner(&self, argv: Vec<std::ffi::OsString>) -> Result<CompletedChild, ReadbackError> {
         self.revalidate_local()?;
         let timeout = self
             .operation
@@ -566,6 +900,9 @@ impl<'a> ReadOperation<'a> {
         if id != self.repository_id {
             return Err(ReadbackError::RepositoryIdentityChanged);
         }
+        self.execution
+            .borrow_mut()
+            .accept(DirectInvocation::Config, result);
         Ok(())
     }
 
@@ -578,7 +915,11 @@ impl<'a> ReadOperation<'a> {
             file.archive_path.as_str().into(),
             "--no-cache".into(),
         ])?;
-        exact_regular_node(&output.output().stdout, file)
+        exact_regular_node(&output.output().stdout, file)?;
+        self.execution
+            .borrow_mut()
+            .accept(DirectInvocation::List, output);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -598,6 +939,15 @@ impl<'a> ReadOperation<'a> {
     /// Observe one retained source's exact snapshot path. This checks metadata;
     /// content verification still requires an independent read of its bytes.
     pub fn discover_owned_snapshot(
+        &mut self,
+        snapshot_id: &str,
+        source: &ArchiveSource<'_>,
+    ) -> Result<ExactArchiveFile, ReadbackError> {
+        self.discover_owned_snapshot_inner(snapshot_id, source)
+            .inspect_err(|reason| self.execution.borrow_mut().fail(*reason))
+    }
+
+    fn discover_owned_snapshot_inner(
         &mut self,
         snapshot_id: &str,
         source: &ArchiveSource<'_>,
@@ -634,6 +984,9 @@ impl<'a> ReadOperation<'a> {
                 source.digest(),
             )?;
             self.revalidate_source(source)?;
+            self.execution
+                .borrow_mut()
+                .accept(DirectInvocation::List, output);
             Ok(file)
         }
     }
@@ -641,6 +994,16 @@ impl<'a> ReadOperation<'a> {
     /// Discover one retained source's exact snapshot path and independently read
     /// its bytes. Other group members must have distinct original basenames.
     pub fn read_owned_snapshot(
+        &mut self,
+        snapshot_id: &str,
+        source: &ArchiveSource<'_>,
+        target: OwnedMediaTarget,
+    ) -> Result<(ExactArchiveFile, PreparedMedia), ReadbackFailure> {
+        self.read_owned_snapshot_inner(snapshot_id, source, target)
+            .inspect_err(|failure| self.execution.borrow_mut().fail(failure.reason))
+    }
+
+    fn read_owned_snapshot_inner(
         &mut self,
         snapshot_id: &str,
         source: &ArchiveSource<'_>,
@@ -692,6 +1055,15 @@ impl<'a> ReadOperation<'a> {
     }
 
     pub fn read_exact(
+        &mut self,
+        file: &ExactArchiveFile,
+        target: OwnedMediaTarget,
+    ) -> Result<PreparedMedia, ReadbackFailure> {
+        self.read_exact_inner(file, target)
+            .inspect_err(|failure| self.execution.borrow_mut().fail(failure.reason))
+    }
+
+    fn read_exact_inner(
         &mut self,
         file: &ExactArchiveFile,
         target: OwnedMediaTarget,
@@ -765,6 +1137,7 @@ impl<'a> ReadOperation<'a> {
                     pass_fds: vec![transport.descriptor],
                 };
                 writer = WriterState::Unknown;
+                self.execution.borrow_mut().attempt();
                 let completed = bounded_child::run_owned(
                     &request,
                     Some(MAX_QUERY_BYTES),
@@ -783,16 +1156,19 @@ impl<'a> ReadOperation<'a> {
                 writer = WriterState::QualifiedCompletion;
                 self.check_repository()?;
                 self.revalidate_local()?;
-                Ok(())
+                Ok(completed)
             })();
-            if let Err(reason) = execution {
-                return Err(ReadbackFailure::target(
-                    reason,
-                    writer,
-                    target,
-                    Arc::clone(self.carrier()),
-                ));
-            }
+            let completed = match execution {
+                Ok(completed) => completed,
+                Err(reason) => {
+                    return Err(ReadbackFailure::target(
+                        reason,
+                        writer,
+                        target,
+                        Arc::clone(self.carrier()),
+                    ));
+                }
+            };
             let expected = MediaDigest {
                 size: file.bytes,
                 sha256: file.sha256.clone(),
@@ -816,6 +1192,9 @@ impl<'a> ReadOperation<'a> {
                     owned: Box::new(OwnedReadback::Prepared(prepared)),
                 });
             }
+            self.execution
+                .borrow_mut()
+                .accept(DirectInvocation::Dump, completed);
             Ok(prepared)
         }
     }
