@@ -390,6 +390,7 @@ impl OwnedOffloadCliRun {
             Custody::Prelaunch { refusal, .. } => match refusal {
                 CliPrelaunchRefusal::DryRun => "dry_run_unavailable",
                 CliPrelaunchRefusal::UnsupportedPlatform => "platform_unavailable",
+                CliPrelaunchRefusal::NamespaceCooperationHeld => "namespace_cooperation_held",
                 CliPrelaunchRefusal::Root(_) => "journal_unavailable",
                 CliPrelaunchRefusal::Budget(_) => "deadline_unavailable",
             },

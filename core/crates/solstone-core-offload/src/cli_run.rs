@@ -56,6 +56,7 @@ pub enum CliRunPhase {
 pub enum CliPrelaunchRefusal {
     DryRun,
     UnsupportedPlatform,
+    NamespaceCooperationHeld,
     Root(JournalRootError),
     Budget(AdmissionError),
 }
@@ -254,8 +255,33 @@ impl OwnedOffloadCliRun {
     }
 }
 
-/// Use one original clock/budget and the installed member; dry-run never prepares.
+/// Production remains held until the supported namespace writers cooperate.
 pub fn run_cli_offload(
+    _journal: &Path,
+    clock: Arc<dyn Clock + Send + Sync>,
+    dry_run: bool,
+) -> OwnedOffloadCliRun {
+    let refusal = if dry_run {
+        CliPrelaunchRefusal::DryRun
+    } else if !cfg!(target_os = "linux") {
+        CliPrelaunchRefusal::UnsupportedPlatform
+    } else {
+        CliPrelaunchRefusal::NamespaceCooperationHeld
+    };
+    OwnedOffloadCliRun::receive(
+        Custody::Prelaunch {
+            refusal,
+            _root: None,
+            _clock: clock,
+        },
+        CliObservedEffects::default(),
+    )
+}
+
+// Preserve the qualified executor for the private installed fixture. This is not
+// a production activation entry or a caller-supplied cooperation certificate.
+#[cfg_attr(not(all(test, feature = "full-tests")), allow(dead_code))]
+fn run_cli_offload_qualified(
     journal: &Path,
     clock: Arc<dyn Clock + Send + Sync>,
     dry_run: bool,

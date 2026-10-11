@@ -120,7 +120,7 @@ fn packaged_owned_cli_finish_entry() -> TestResult {
         PANIC_AT.with(|slot| slot.set(Some(CliUnwindPhase::RuntimeFinish)));
     }
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(ActualClock);
-    let run = run_cli_offload(&input.journal, Arc::clone(&clock), false);
+    let run = run_cli_offload_qualified(&input.journal, Arc::clone(&clock), false);
     // The whole concrete aggregate crosses this boundary before any report is borrowed.
     let run = std::thread::spawn(move || run)
         .join()
@@ -200,7 +200,7 @@ fn packaged_owned_cli_finish_entry() -> TestResult {
         // Release only the completed whole result; admission still used the same coordinator.
         drop(run);
         let mut stream = CONTROL.with(|slot| slot.borrow_mut().take().unwrap());
-        let second = run_cli_offload(&input.journal, Arc::new(ActualClock), false);
+        let second = run_cli_offload_qualified(&input.journal, Arc::new(ActualClock), false);
         assert_eq!(second.output().2, 0, "{}", second.output().1);
         assert_eq!(
             second.runtime().unwrap().state(),
