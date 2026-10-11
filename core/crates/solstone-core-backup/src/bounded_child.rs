@@ -327,7 +327,15 @@ fn prepare_dns_child(command: &mut Command) {
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
-            if nix::libc::close_range(3, u32::MAX, nix::libc::CLOSE_RANGE_CLOEXEC as i32) != 0 {
+            // The raw syscall, not libc's close_range(): the release targets are musl, whose
+            // libc bindings declare no close_range wrapper (glibc's is a thin wrapper too).
+            if nix::libc::syscall(
+                nix::libc::SYS_close_range,
+                nix::libc::c_long::from(3_u8),
+                nix::libc::c_long::from(nix::libc::c_uint::MAX),
+                nix::libc::c_long::from(nix::libc::CLOSE_RANGE_CLOEXEC),
+            ) != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0 {
