@@ -1420,6 +1420,7 @@ async fn drain_hosted_wait(deps: &crate::BackupWebDeps) {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn disable_backup(root: &Path) {
     solstone_core_backup::set_enabled(root, false).unwrap();
 }
