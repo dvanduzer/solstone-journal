@@ -3,22 +3,25 @@
 
 //! Run an already admitted restore and retain its whole owning return.
 
+#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+use crate::operation;
+#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+use solstone_core_backup_runtime::DirectReadFinishState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use solstone_core_backup::archive_readback::{OwnedReadOperation, OwnedSettledDirectRead};
-use solstone_core_backup_runtime::{
-    DirectReadFinishOwner, DirectReadFinishState, OwnedDirectReadFinish, OwnedInstalledArchiveRead,
-};
+use solstone_core_backup::archive_readback::OwnedSettledDirectRead;
+use solstone_core_backup_runtime::OwnedInstalledArchiveRead;
 use solstone_core_offload::restore::RestoreResult;
 use solstone_core_offload::restore::owned::{
     self, OwnedRestoreFinishHold, OwnedRestoreRunOutcome, RestoreFinishRefusal,
     SettledRestoreReport,
 };
 
-use super::{ArchivePayload, ArchiveTicket, handoff, park_rejected};
-use crate::operation::{self, SharedOperationSlot, Terminal};
+use super::{ArchivePayload, ArchiveTicket, entry, return_owned, runtime_facts};
+use crate::operation::{SharedOperationSlot, Terminal};
 use crate::restore_report;
 
 /// Called synchronously inside the worker holding the original admission.
@@ -40,47 +43,6 @@ pub fn all(
     now: u64,
 ) {
     run(slot, ticket, installed, None, now);
-}
-
-fn entry(
-    slot: &SharedOperationSlot,
-    ticket: &ArchiveTicket,
-    read: &OwnedReadOperation,
-    outside: &DirectReadFinishOwner,
-) -> Result<(), &'static str> {
-    if !Arc::ptr_eq(read.journal_root(), &ticket.0.root)
-        || !Arc::ptr_eq(read.owned_clock(), &ticket.0.clock)
-        || !Arc::ptr_eq(read.carrier(), outside.carrier())
-        || !Arc::ptr_eq(read.journal_root(), outside.journal_root())
-        || !Arc::ptr_eq(read.owned_clock(), outside.owned_clock())
-    {
-        return Err("failed");
-    }
-    let state = slot.lock().map_err(|_| "failed")?;
-    if !state.archive.matches(ticket) || !state.archive.retained.is_empty() {
-        return Err("failed");
-    }
-    let current = state.current.as_ref().ok_or("failed")?;
-    if current.generation != ticket.generation()
-        || !current.worker_active
-        || operation::is_terminal(&current.view.phase)
-        || current.pending_handoff_terminal.is_some()
-        || current.handoff_poll.is_some()
-    {
-        return Err("failed");
-    }
-    #[cfg(windows)]
-    if current.cleanup.is_some() {
-        return Err("failed");
-    }
-    if current
-        .archive_cancellation
-        .as_ref()
-        .is_some_and(|flag| flag.is_cancelled())
-    {
-        return Err("cancelled");
-    }
-    Ok(())
 }
 
 fn run(
@@ -211,41 +173,6 @@ fn native_refusal(refusal: RestoreFinishRefusal<'_>) -> Value {
             "readback":readback.map(|error| error.to_string()),
         }),
         RestoreFinishRefusal::Lower(reason) => json!({"kind":"lower", "reason":reason.to_string()}),
-    }
-}
-
-fn runtime_facts(runtime: &OwnedDirectReadFinish) -> Value {
-    use solstone_core_journal_io::media::ActivityCarrierRetirementEffect as Effect;
-    json!({
-        "state":match runtime.state() {
-            DirectReadFinishState::Completed => "completed",
-            DirectReadFinishState::Held => "held",
-            DirectReadFinishState::Unknown => "unknown",
-        },
-        "reason":runtime.reason().map(|reason| reason.to_string()),
-        "retirement":runtime.retirement().map(|retirement| json!({
-            "effect":match retirement.receipt.effect() {
-                Effect::NotAttempted => "not_attempted",
-                Effect::Attempted => "attempted",
-                Effect::Removed => "removed",
-            },
-            "root_durability":retirement.receipt.root_durability(),
-            "confirmation":retirement.receipt.confirmation(),
-            "failures":retirement.receipt.failures().iter().map(|failure| json!({
-                "error":failure.kind().to_string(),
-            })).collect::<Vec<_>>(),
-        })),
-    })
-}
-
-fn return_owned(
-    slot: &SharedOperationSlot,
-    ticket: ArchiveTicket,
-    payload: ArchivePayload,
-    terminal: Terminal,
-) {
-    if let Err(rejected) = handoff(slot, ticket, payload, terminal) {
-        park_rejected(slot, rejected);
     }
 }
 

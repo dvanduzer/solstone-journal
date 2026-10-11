@@ -14,8 +14,9 @@ use solstone_core_journal_io::media::{
 use solstone_core_journal_io::{ExistingParentLockError, FlatDirectoryError};
 use solstone_core_retention::mark_mutation::{BoundMutationOutcome, BoundMutationRefusal};
 use solstone_core_retention::remove_marked::{
-    ArchiveReadState, ReviewedArchiveRemoval, ReviewedFileRemoval, ReviewedRemoval,
-    ReviewedRemovalRefusal,
+    ArchiveReadState, OwnedReviewedArchiveRemoval, OwnedReviewedArchiveRun,
+    ReviewedArchiveFinishRefusal, ReviewedArchiveRemoval, ReviewedArchiveReport,
+    ReviewedFileRemoval, ReviewedRemoval, ReviewedRemovalFileReport, ReviewedRemovalRefusal,
 };
 use solstone_core_retention::review_context::ReviewRefusal;
 
@@ -24,14 +25,14 @@ use solstone_core_retention::review_context::ReviewRefusal;
 /// A borrowing helper compiles without constructing an executor:
 /// ```
 /// use serde::Serialize;
-/// use solstone_core_home_web::removal_report::ordinary;
+/// use solstone_core_backup_web::removal_report::ordinary;
 /// use solstone_core_retention::remove_marked::ReviewedRemoval;
 /// fn view(owner: &ReviewedRemoval) -> impl Serialize + '_ { ordinary(owner) }
 /// ```
 /// The same view cannot escape a local owner:
 /// ```compile_fail,E0515
 /// use serde::Serialize;
-/// use solstone_core_home_web::removal_report::ordinary;
+/// use solstone_core_backup_web::removal_report::ordinary;
 /// use solstone_core_retention::remove_marked::ReviewedRemoval;
 /// fn escape<'a>(owner: ReviewedRemoval) -> impl Serialize + 'a { ordinary(&owner) }
 /// ```
@@ -43,7 +44,7 @@ pub fn ordinary(owner: &ReviewedRemoval) -> impl Serialize + '_ {
 ///
 /// ```
 /// use serde::Serialize;
-/// use solstone_core_home_web::removal_report::archive;
+/// use solstone_core_backup_web::removal_report::archive;
 /// use solstone_core_retention::remove_marked::ReviewedArchiveRemoval;
 /// fn view<'a, 'op: 'a>(owner: &'a ReviewedArchiveRemoval<'op>) -> impl Serialize + 'a {
 ///     archive(owner)
@@ -51,7 +52,7 @@ pub fn ordinary(owner: &ReviewedRemoval) -> impl Serialize + '_ {
 /// ```
 /// ```compile_fail,E0515
 /// use serde::Serialize;
-/// use solstone_core_home_web::removal_report::archive;
+/// use solstone_core_backup_web::removal_report::archive;
 /// use solstone_core_retention::remove_marked::ReviewedArchiveRemoval;
 /// fn escape<'a, 'op: 'a>(owner: ReviewedArchiveRemoval<'op>) -> impl Serialize + 'a {
 ///     archive(&owner)
@@ -60,6 +61,25 @@ pub fn ordinary(owner: &ReviewedRemoval) -> impl Serialize + '_ {
 pub fn archive<'a, 'op>(owner: &'a ReviewedArchiveRemoval<'op>) -> impl Serialize + 'a {
     ArchiveView(owner)
 }
+
+/// Borrow the actual typed active result without moving its original owners.
+pub fn owned_archive(owner: &OwnedReviewedArchiveRun) -> impl Serialize + '_ {
+    OwnedArchiveView(owner)
+}
+
+/// Borrow the closed hold, including independent consuming finish refusal.
+pub fn held_archive(owner: &OwnedReviewedArchiveRemoval) -> impl Serialize + '_ {
+    HeldArchiveView(owner)
+}
+
+/// Borrow resource-free facts kept beside the original runtime finish result.
+pub fn settled_archive(report: &ReviewedArchiveReport) -> impl Serialize + '_ {
+    SettledArchiveView(report)
+}
+
+struct OwnedArchiveView<'a>(&'a OwnedReviewedArchiveRun);
+struct HeldArchiveView<'a>(&'a OwnedReviewedArchiveRemoval);
+struct SettledArchiveView<'a>(&'a ReviewedArchiveReport);
 
 struct OrdinaryView<'a>(&'a ReviewedRemoval);
 struct ArchiveView<'a, 'op>(&'a ReviewedArchiveRemoval<'op>);
@@ -129,47 +149,110 @@ impl Serialize for OrdinaryView<'_> {
     }
 }
 
-impl Serialize for ArchiveView<'_, '_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct View<'a> {
-            #[serde(flatten)]
-            common: Common<'a>,
-            approval_readback_error: Option<String>,
-            approval_cleanup: Option<solstone_core_journal_io::media::Cleanup>,
-            approval_native_error: Option<String>,
-            archive_reads: Vec<Value>,
+#[derive(Serialize)]
+struct ArchiveFacts<'a> {
+    #[serde(flatten)]
+    common: Common<'a>,
+    approval_readback_error: Option<String>,
+    approval_cleanup: Option<solstone_core_journal_io::media::Cleanup>,
+    approval_native_error: Option<String>,
+    archive_reads: Vec<Value>,
+    finish_refusal: Option<Value>,
+}
+
+fn read_facts(read: ArchiveReadState<'_>) -> Value {
+    match read {
+        ArchiveReadState::Stage(stage) => {
+            json!({"state":"stage", "retained_stage":stage.is_some()})
         }
-        let owner = self.0;
-        View {
-            common: common(
-                owner.outcome(),
-                owner.refusal(),
-                owner.attempts(),
-                owner.stage_failures(),
-                owner.mutation(),
-            ),
-            approval_readback_error: owner.approval_readback_error().map(ToString::to_string),
-            approval_cleanup: owner.approval_cleanup(),
-            approval_native_error: owner.approval_native_error().map(io_kind),
-            archive_reads: owner
+        ArchiveReadState::Target(_) => json!({"state":"target"}),
+        ArchiveReadState::Prepared { file, cleanup, .. } => json!({
+            "state":"prepared", "name":file.name, "bytes":file.bytes, "cleanup":cleanup,
+        }),
+        ArchiveReadState::Readback { file, failure, .. } => json!({
+            "state":"readback", "name":file.name, "bytes":file.bytes,
+            "reason":failure.reason().to_string(),
+        }),
+    }
+}
+
+macro_rules! archive_view {
+    ($view:ty, $finish:expr) => {
+        impl Serialize for $view {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let owner = self.0;
+                ArchiveFacts {
+                    common: common(
+                        owner.outcome(),
+                        owner.refusal(),
+                        owner.attempts(),
+                        owner.stage_failures(),
+                        owner.mutation(),
+                    ),
+                    approval_readback_error: owner
+                        .approval_readback_error()
+                        .map(|error| error.to_string()),
+                    approval_cleanup: owner.approval_cleanup(),
+                    approval_native_error: owner.approval_native_error().map(io_kind),
+                    archive_reads: owner.archive_reads().map(read_facts).collect(),
+                    finish_refusal: $finish(owner),
+                }
+                .serialize(serializer)
+            }
+        }
+    };
+}
+archive_view!(ArchiveView<'_, '_>, |_| None);
+archive_view!(OwnedArchiveView<'_>, |_| None);
+archive_view!(
+    HeldArchiveView<'_>,
+    |owner: &OwnedReviewedArchiveRemoval| owner.finish_refusal().map(finish_refusal_facts)
+);
+
+impl Serialize for SettledArchiveView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let report = self.0;
+        ArchiveFacts {
+            common: Common {
+                outcome: report.outcome(),
+                refusal: None,
+                attempts: report
+                    .attempts()
+                    .iter()
+                    .map(settled_attempt_facts)
+                    .collect(),
+                stage_failures: Vec::new(),
+                mutation: report.mutation().map(mutation_facts),
+            },
+            approval_readback_error: None,
+            approval_cleanup: None,
+            approval_native_error: None,
+            archive_reads: report
                 .archive_reads()
-                .map(|read| match read {
-                    ArchiveReadState::Stage(stage) => {
-                        json!({"state":"stage", "retained_stage":stage.is_some()})
-                    }
-                    ArchiveReadState::Target(_) => json!({"state":"target"}),
-                    ArchiveReadState::Prepared { file, cleanup, .. } => json!({
-                        "state":"prepared", "name":file.name, "bytes":file.bytes, "cleanup":cleanup,
-                    }),
-                    ArchiveReadState::Readback { file, failure, .. } => json!({
-                        "state":"readback", "name":file.name, "bytes":file.bytes,
-                        "reason":failure.reason().to_string(),
-                    }),
+                .iter()
+                .map(|read| {
+                    json!({
+                        "state":"confirmed", "name":read.file().name, "bytes":read.file().bytes,
+                        "cleanup":read.cleanup(),
+                    })
                 })
                 .collect(),
+            finish_refusal: None,
         }
         .serialize(serializer)
+    }
+}
+
+fn finish_refusal_facts(reason: &ReviewedArchiveFinishRefusal) -> Value {
+    use ReviewedArchiveFinishRefusal as Refusal;
+    match reason {
+        Refusal::IncompleteSelection => json!({"kind":"incomplete_selection"}),
+        Refusal::ActorResources => json!({"kind":"actor_resources"}),
+        Refusal::Readback(error) => json!({"kind":"readback", "reason":error.to_string()}),
+        Refusal::NativeCleanup(cleanup) => json!({"kind":"native_cleanup", "cleanup":cleanup}),
+        Refusal::Changed(error) => json!({"kind":"changed", "error":io_kind(error)}),
+        Refusal::Census(_) => json!({"kind":"census"}),
+        Refusal::Obligations(entries) => json!({"kind":"obligations", "count":entries.len()}),
     }
 }
 
@@ -185,22 +268,38 @@ fn carrier_facts(receipt: &ActivityCarrierPreparationReceipt) -> Value {
     })
 }
 
-fn attempt_facts(attempt: &ReviewedFileRemoval) -> Value {
-    #[cfg(unix)]
-    let append = attempt.append().map(append_facts);
-    #[cfg(not(unix))]
-    let append: Option<Value> = None;
-    #[cfg(unix)]
-    let marker = attempt.marker().map(marker_facts);
-    #[cfg(not(unix))]
-    let marker: Option<Value> = None;
-    json!({
-        "relative":attempt.relative(), "class":attempt.class(),
-        "native":removal_facts(attempt.native().receipt()),
-        "append":append, "marker":marker,
-        "binding_error":attempt.binding_error().map(io_kind),
-    })
+macro_rules! attempt_view {
+    ($name:ident, $ty:ty, $receipt:expr) => {
+        fn $name(attempt: &$ty) -> Value {
+            #[cfg(unix)]
+            let append = attempt.append().map(append_facts);
+            #[cfg(not(unix))]
+            let append: Option<Value> = None;
+            #[cfg(unix)]
+            let marker = attempt.marker().map(marker_facts);
+            #[cfg(not(unix))]
+            let marker: Option<Value> = None;
+            json!({
+                "relative":attempt.relative(), "class":attempt.class(),
+                "native":removal_facts($receipt(attempt)),
+                "append":append, "marker":marker,
+                "binding_error":attempt.binding_error().map(io_kind),
+            })
+        }
+    };
 }
+fn active_receipt(attempt: &ReviewedFileRemoval) -> &RemovalReceipt {
+    attempt.native().receipt()
+}
+attempt_view!(attempt_facts, ReviewedFileRemoval, active_receipt);
+fn settled_receipt(attempt: &ReviewedRemovalFileReport) -> &RemovalReceipt {
+    attempt.native()
+}
+attempt_view!(
+    settled_attempt_facts,
+    ReviewedRemovalFileReport,
+    settled_receipt
+);
 
 fn removal_facts(receipt: &RemovalReceipt) -> Value {
     json!({

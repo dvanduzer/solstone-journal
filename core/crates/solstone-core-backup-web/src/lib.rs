@@ -47,6 +47,7 @@ mod handoff_poll;
 mod keys;
 mod measurement;
 mod operation;
+pub mod removal_report;
 mod response;
 mod restore_prepare;
 pub mod restore_report;

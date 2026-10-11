@@ -4,21 +4,24 @@
 //! Keep concrete archive owners independently of the displayed operation.
 //! Actor execution consumes the original admitted read in its owning worker.
 
+pub mod removal;
 pub mod restore;
 
 use std::sync::Arc;
 
+use serde_json::{Value, json};
 use solstone_core_backup::archive_activity::{
     OwnedArchivePreparationFailure, OwnedPreparedArchiveHold,
 };
 use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation, Clock};
-use solstone_core_backup::archive_readback::OwnedDirectReadHold;
+use solstone_core_backup::archive_readback::{OwnedDirectReadHold, OwnedReadOperation};
 use solstone_core_backup_runtime::{
     DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
     OwnedDirectReadFinish,
 };
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_offload::restore::owned::{OwnedRestoreFinishHold, SettledRestoreReport};
+use solstone_core_retention::remove_marked::{OwnedReviewedArchiveRemoval, ReviewedArchiveReport};
 
 use crate::archive_operation::ArchiveBeginRefusal;
 use crate::operation::{self, SharedOperationSlot, Terminal};
@@ -130,6 +133,17 @@ pub enum ArchivePayload {
         report: SettledRestoreReport,
         runtime: OwnedDirectReadFinish,
     },
+    ProofHeld {
+        proof: Box<OwnedReviewedArchiveRemoval>,
+        outside: DirectReadFinishOwner,
+    },
+    ProofFinished {
+        report: ReviewedArchiveReport,
+        runtime: OwnedDirectReadFinish,
+    },
+    ProofUnknown {
+        runtime: OwnedDirectReadFinish,
+    },
     Unknown {
         runtime: OwnedDirectReadFinish,
         report: Option<SettledRestoreReport>,
@@ -138,7 +152,7 @@ pub enum ArchivePayload {
 
 impl ArchivePayload {
     fn completed(&self) -> bool {
-        matches!(self, Self::NativeFinished { runtime, .. }
+        matches!(self, Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
             if runtime.state() == DirectReadFinishState::Completed)
     }
 
@@ -162,7 +176,16 @@ impl ArchivePayload {
                 }
                 (outside.journal_root(), Some(outside.owned_clock()))
             }
-            Self::NativeFinished { runtime, .. } | Self::Unknown { runtime, .. } => {
+            Self::ProofHeld { proof, outside } => {
+                if !Arc::ptr_eq(proof.archive_carrier(), outside.carrier()) {
+                    return false;
+                }
+                (outside.journal_root(), Some(outside.owned_clock()))
+            }
+            Self::NativeFinished { runtime, .. }
+            | Self::Unknown { runtime, .. }
+            | Self::ProofFinished { runtime, .. }
+            | Self::ProofUnknown { runtime } => {
                 (runtime.journal_root(), Some(runtime.owned_clock()))
             }
         };
@@ -359,3 +382,79 @@ mod type_tests {
 #[cfg(all(test, feature = "full-tests"))]
 #[cfg(unix)]
 mod tests;
+
+pub(super) fn entry(
+    slot: &SharedOperationSlot,
+    ticket: &ArchiveTicket,
+    read: &OwnedReadOperation,
+    outside: &DirectReadFinishOwner,
+) -> Result<(), &'static str> {
+    if !Arc::ptr_eq(read.journal_root(), &ticket.0.root)
+        || !Arc::ptr_eq(read.owned_clock(), &ticket.0.clock)
+        || !Arc::ptr_eq(read.carrier(), outside.carrier())
+        || !Arc::ptr_eq(read.journal_root(), outside.journal_root())
+        || !Arc::ptr_eq(read.owned_clock(), outside.owned_clock())
+    {
+        return Err("failed");
+    }
+    let state = slot.lock().map_err(|_| "failed")?;
+    if !state.archive.matches(ticket) || !state.archive.retained.is_empty() {
+        return Err("failed");
+    }
+    let current = state.current.as_ref().ok_or("failed")?;
+    if current.generation != ticket.generation()
+        || !current.worker_active
+        || operation::is_terminal(&current.view.phase)
+        || current.pending_handoff_terminal.is_some()
+        || current.handoff_poll.is_some()
+    {
+        return Err("failed");
+    }
+    #[cfg(windows)]
+    if current.cleanup.is_some() {
+        return Err("failed");
+    }
+    if current
+        .archive_cancellation
+        .as_ref()
+        .is_some_and(|flag| flag.is_cancelled())
+    {
+        return Err("cancelled");
+    }
+    Ok(())
+}
+
+pub(super) fn runtime_facts(runtime: &OwnedDirectReadFinish) -> Value {
+    use solstone_core_journal_io::media::ActivityCarrierRetirementEffect as Effect;
+    json!({
+        "state":match runtime.state() {
+            DirectReadFinishState::Completed => "completed",
+            DirectReadFinishState::Held => "held",
+            DirectReadFinishState::Unknown => "unknown",
+        },
+        "reason":runtime.reason().map(|reason| reason.to_string()),
+        "retirement":runtime.retirement().map(|retirement| json!({
+            "effect":match retirement.receipt.effect() {
+                Effect::NotAttempted => "not_attempted",
+                Effect::Attempted => "attempted",
+                Effect::Removed => "removed",
+            },
+            "root_durability":retirement.receipt.root_durability(),
+            "confirmation":retirement.receipt.confirmation(),
+            "failures":retirement.receipt.failures().iter().map(|failure| json!({
+                "error":failure.kind().to_string(),
+            })).collect::<Vec<_>>(),
+        })),
+    })
+}
+
+pub(super) fn return_owned(
+    slot: &SharedOperationSlot,
+    ticket: ArchiveTicket,
+    payload: ArchivePayload,
+    terminal: Terminal,
+) {
+    if let Err(rejected) = handoff(slot, ticket, payload, terminal) {
+        park_rejected(slot, rejected);
+    }
+}
