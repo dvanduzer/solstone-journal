@@ -299,6 +299,19 @@ fn begin_bound(
     root: &JournalRoot,
     health: &HealthDirectory,
 ) -> Result<(BoundParentLock, Register), BoundMutationRefusal> {
+    let (lock, register) = begin_bound_read(root, health)?;
+    if register.version != 1 {
+        return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+            StoreError::WriterHeld,
+        )));
+    }
+    Ok((lock, register))
+}
+
+fn begin_bound_read(
+    root: &JournalRoot,
+    health: &HealthDirectory,
+) -> Result<(BoundParentLock, Register), BoundMutationRefusal> {
     // Windows publication remains held pending the owning adapter's qualification.
     if cfg!(windows) {
         return Err(BoundMutationRefusal::Unsupported);
@@ -318,11 +331,6 @@ fn begin_bound(
             "the retained removal register disappeared",
         )))
     })?;
-    if register.version != 1 {
-        return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
-            StoreError::WriterHeld,
-        )));
-    }
     #[cfg(unix)]
     lock.revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
         .map_err(BoundMutationRefusal::Lock)?;
@@ -529,7 +537,7 @@ pub fn decline_reviewed(
 ) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
     let root = checked.root();
     let health = checked.health();
-    let (lock, mut register) = begin_bound(root, health)?;
+    let (lock, mut register) = begin_bound_read(root, health)?;
     check_marks(
         &register,
         checked.marks(),

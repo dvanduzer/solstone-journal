@@ -181,72 +181,88 @@ fn rendered_selection_keeps_full_rows_and_excludes_unselected_failures() {
 #[cfg(unix)]
 #[test]
 fn reviewed_decline_checks_all_rows_before_publication() {
-    let journal = tempfile::tempdir().unwrap();
-    let root = root(journal.path());
-    let first = mark(&root, "a.flac", false);
-    let second = mark(&root, "b.flac", false);
-    let mut failed = mark(&root, "failed.flac", false);
-    failed.state = MarkState::Failed(Failure {
-        at: "now".into(),
-        reason: "failed".into(),
-        staged: None,
-    });
-    save(&root, &[first.clone(), second.clone(), failed.clone()]);
-    let ids = [first.id.clone(), second.id.clone()];
-    let rendered = read_review_context(&root, &ids).unwrap();
-    let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
-    let mut changed = second.clone();
-    changed.marked_at = "2026-10-10T00:00:01Z".into();
-    save(&root, &[first.clone(), changed, failed.clone()]);
-    let path = journal.path().join("health/retention-marks.json");
-    let before = std::fs::read(&path).unwrap();
-    assert!(matches!(
-        decline_reviewed(checked),
-        Err(BoundMutationRefusal::Review(ReviewRefusal::Stale { .. }))
-    ));
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    save(&root, &[first, second, failed.clone()]);
-    let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
-    let BoundMutationOutcome::Published(result) = decline_reviewed(checked).unwrap() else {
-        panic!("decline was not confirmed")
-    };
-    assert_eq!(result.status, MutationStatus::Applied);
-    assert_eq!(
-        result.register.marks.values().collect::<Vec<_>>(),
-        vec![&failed]
-    );
-    assert_eq!(load_at_root(&root).unwrap(), result.register);
+    for typed in [false, true] {
+        let journal = tempfile::tempdir().unwrap();
+        let root = root(journal.path());
+        let first = mark(&root, "a.flac", typed);
+        let second = mark(&root, "b.flac", false);
+        let unrelated = mark(&root, "unrelated.flac", typed);
+        let mut failed = mark(&root, "failed.flac", false);
+        failed.state = MarkState::Failed(Failure {
+            at: "now".into(),
+            reason: "failed".into(),
+            staged: None,
+        });
+        save(
+            &root,
+            &[
+                first.clone(),
+                second.clone(),
+                failed.clone(),
+                unrelated.clone(),
+            ],
+        );
+        let ids = [first.id.clone(), second.id.clone()];
+        let rendered = read_review_context(&root, &ids).unwrap();
+        let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+        let mut changed = second.clone();
+        changed.marked_at = "2026-10-10T00:00:01Z".into();
+        save(
+            &root,
+            &[first.clone(), changed, failed.clone(), unrelated.clone()],
+        );
+        let path = journal.path().join("health/retention-marks.json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            decline_reviewed(checked),
+            Err(BoundMutationRefusal::Review(ReviewRefusal::Stale { .. }))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        save(&root, &[first, second, failed.clone(), unrelated.clone()]);
+        let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+        let BoundMutationOutcome::Published(result) = decline_reviewed(checked).unwrap() else {
+            panic!("decline was not confirmed")
+        };
+        assert_eq!(result.status, MutationStatus::Applied);
+        assert_eq!(result.register.version, if typed { 2 } else { 1 });
+        assert_eq!(result.register.marks.len(), 2);
+        assert_eq!(result.register.marks.get(&failed.id), Some(&failed));
+        assert_eq!(result.register.marks.get(&unrelated.id), Some(&unrelated));
+        assert_eq!(load_at_root(&root).unwrap(), result.register);
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn checked_decline_retains_preflight_health_and_root() {
-    for replace_root in [false, true] {
-        let parent = tempfile::tempdir().unwrap();
-        let path = parent.path().join("journal");
-        std::fs::create_dir(&path).unwrap();
-        let root = root(&path);
-        let mark = mark(&root, "a.flac", false);
-        save(&root, std::slice::from_ref(&mark));
-        let rendered = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
-        let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
-        let bytes = std::fs::read(path.join("health/retention-marks.json")).unwrap();
-        let old_register = if replace_root {
-            std::fs::rename(&path, parent.path().join("old-root")).unwrap();
-            std::fs::create_dir_all(path.join("health")).unwrap();
-            parent.path().join("old-root/health/retention-marks.json")
-        } else {
-            std::fs::rename(path.join("health"), path.join("old-health")).unwrap();
-            std::fs::create_dir(path.join("health")).unwrap();
-            path.join("old-health/retention-marks.json")
-        };
-        std::fs::write(path.join("health/retention-marks.json"), &bytes).unwrap();
-        assert!(decline_reviewed(checked).is_err());
-        assert_eq!(std::fs::read(old_register).unwrap(), bytes);
-        assert_eq!(
-            std::fs::read(path.join("health/retention-marks.json")).unwrap(),
-            bytes
-        );
+    for typed in [false, true] {
+        for replace_root in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let path = parent.path().join("journal");
+            std::fs::create_dir(&path).unwrap();
+            let root = root(&path);
+            let mark = mark(&root, "a.flac", typed);
+            save(&root, std::slice::from_ref(&mark));
+            let rendered = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
+            let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+            let bytes = std::fs::read(path.join("health/retention-marks.json")).unwrap();
+            let old_register = if replace_root {
+                std::fs::rename(&path, parent.path().join("old-root")).unwrap();
+                std::fs::create_dir_all(path.join("health")).unwrap();
+                parent.path().join("old-root/health/retention-marks.json")
+            } else {
+                std::fs::rename(path.join("health"), path.join("old-health")).unwrap();
+                std::fs::create_dir(path.join("health")).unwrap();
+                path.join("old-health/retention-marks.json")
+            };
+            std::fs::write(path.join("health/retention-marks.json"), &bytes).unwrap();
+            assert!(decline_reviewed(checked).is_err());
+            assert_eq!(std::fs::read(old_register).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(path.join("health/retention-marks.json")).unwrap(),
+                bytes
+            );
+        }
     }
 }
 
@@ -294,21 +310,13 @@ fn retained_cas_preserves_newer_full_rows_and_exact_idempotence() {
 
 #[cfg(unix)]
 #[test]
-fn retained_typed_writers_remain_held_without_rewriting() {
+fn generic_retained_typed_mutation_remains_held_without_rewriting() {
     let journal = tempfile::tempdir().unwrap();
     let root = root(journal.path());
     let mark = mark(&root, "a.flac", true);
     save(&root, std::slice::from_ref(&mark));
-    let rendered = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
-    let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
     let path = journal.path().join("health/retention-marks.json");
     let before = std::fs::read(&path).unwrap();
-    assert!(matches!(
-        decline_reviewed(checked),
-        Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
-            solstone_core_retention::marks::StoreError::WriterHeld
-        )))
-    ));
     let plan = PlannedMarkMutation::resolve(&mark).unwrap();
     assert!(matches!(
         conditional_mutate_at_root(&root, &plan),
@@ -317,6 +325,60 @@ fn retained_typed_writers_remain_held_without_rewriting() {
         )))
     ));
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_typed_decline_preserves_restart_and_refuses_reoffered_nonce() {
+    let journal = tempfile::tempdir().unwrap();
+    let first = root(journal.path());
+    let offered = mark(&first, "audio.flac", true);
+    save(&first, std::slice::from_ref(&offered));
+    let rendered = read_review_context(&first, std::slice::from_ref(&offered.id)).unwrap();
+    drop(first);
+    let restarted = root(journal.path());
+    let checked = check_review_context(Arc::clone(&restarted), &rendered).unwrap();
+    let old_checked = check_review_context(Arc::clone(&restarted), &rendered).unwrap();
+    assert!(matches!(
+        decline_reviewed(checked).unwrap(),
+        BoundMutationOutcome::Published(_)
+    ));
+    assert!(load_at_root(&restarted).unwrap().marks.is_empty());
+    assert!(matches!(
+        check_review_context(Arc::clone(&restarted), &rendered),
+        Err(ReviewRefusal::Missing { .. })
+    ));
+
+    let mut reoffered = offered.clone();
+    reoffered.offload =
+        Some(OffloadOffer::new(offered.offload.as_ref().unwrap().proof.clone()).unwrap());
+    assert_ne!(
+        reoffered.offload.as_ref().unwrap().nonce,
+        offered.offload.as_ref().unwrap().nonce
+    );
+    assert_ne!(
+        reoffered.offload.as_ref().unwrap().revision,
+        offered.offload.as_ref().unwrap().revision
+    );
+    save(&restarted, std::slice::from_ref(&reoffered));
+    let path = journal.path().join("health/retention-marks.json");
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        check_review_context(Arc::clone(&restarted), &rendered),
+        Err(ReviewRefusal::Stale { .. })
+    ));
+    assert!(matches!(
+        decline_reviewed(old_checked),
+        Err(BoundMutationRefusal::Review(ReviewRefusal::Stale { .. }))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let fresh = read_review_context(&restarted, std::slice::from_ref(&reoffered.id)).unwrap();
+    let checked = check_review_context(Arc::clone(&restarted), &fresh).unwrap();
+    assert!(matches!(
+        decline_reviewed(checked).unwrap(),
+        BoundMutationOutcome::Published(_)
+    ));
+    assert!(load_at_root(&restarted).unwrap().marks.is_empty());
 }
 
 #[cfg(windows)]
@@ -466,6 +528,8 @@ fn copied_context_and_copied_typed_offer_refuse_new_root() {
         let context = read_review_context(&original, std::slice::from_ref(&mark.id)).unwrap();
         let copied = root(destination.path());
         save(&copied, std::slice::from_ref(&mark));
+        let path = destination.path().join("health/retention-marks.json");
+        let bytes = std::fs::read(&path).unwrap();
         assert!(matches!(
             check_review_context(Arc::clone(&copied), &context),
             Err(ReviewRefusal::RootChanged)
@@ -479,6 +543,7 @@ fn copied_context_and_copied_typed_offer_refuse_new_root() {
             let fresh = read_review_context(&copied, std::slice::from_ref(&mark.id)).unwrap();
             assert!(check_review_context(copied, &fresh).is_ok());
         }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
 
