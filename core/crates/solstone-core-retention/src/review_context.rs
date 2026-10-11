@@ -24,7 +24,8 @@ use solstone_core_journal_io::{
 
 use crate::marks::{Approval, Mark, MarkId, MarkState, Register, StoreError, validate};
 
-pub(crate) const MAX_REGISTER_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum register size admitted by the retained reader and writer.
+pub const MAX_REGISTER_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ReviewRefusal {

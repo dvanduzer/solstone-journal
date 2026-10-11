@@ -70,11 +70,31 @@ impl std::error::Error for AdmissionError {}
 pub struct ArchiveConfiguration {
     settings: Map<String, Value>,
     binding: Option<HostedBinding>,
+    offload_floor: Option<Value>,
 }
 
 const MAX_ARCHIVE_CONFIGURATION_BYTES: usize = 1024 * 1024;
 
 impl ArchiveConfiguration {
+    /// Required space from this operation's captured positive reserve and bounds.
+    /// The caller must still query the retained target filesystem's capacity.
+    pub fn offload_required_bytes(
+        &self,
+        max_payload: u64,
+        metadata: u64,
+    ) -> Result<u64, AdmissionError> {
+        let floor = self
+            .offload_floor
+            .as_ref()
+            .and_then(Value::as_u64)
+            .filter(|floor| *floor > 0)
+            .ok_or(AdmissionError::ConfigurationUnavailable)?;
+        max_payload
+            .checked_add(floor)
+            .and_then(|bytes| bytes.checked_add(metadata))
+            .ok_or(AdmissionError::ConfigurationUnavailable)
+    }
+
     pub fn enabled(&self) -> bool {
         self.settings.get("enabled") == Some(&Value::Bool(true))
     }
@@ -130,6 +150,11 @@ impl ArchiveConfiguration {
         root.revalidate_canonical_binding()
             .map_err(|_| AdmissionError::JournalIdentityChanged)?;
         let raw = Self::read_object(root, Path::new("config/journal.json"))?;
+        let offload_floor = raw
+            .get("backup")
+            .and_then(|backup| backup.get("offload"))
+            .and_then(|offload| offload.get("floor_bytes"))
+            .cloned();
         let config = crate::merge_backup_config(&raw);
         let binding = if config.get("mode") == Some(&Value::String("operated".into())) {
             let raw = Self::read_object(root, Path::new("backup/hosted/binding.json"))?;
@@ -169,7 +194,11 @@ impl ArchiveConfiguration {
                 .map(|value| (key.to_owned(), value))
         })
         .collect();
-        Ok(Self { settings, binding })
+        Ok(Self {
+            settings,
+            binding,
+            offload_floor,
+        })
     }
 
     fn read_object(
@@ -278,6 +307,91 @@ mod tests {
             1
         }
     }
+    #[test]
+    fn offload_space_requires_positive_floor_and_checked_sum() {
+        let configuration = |floor| ArchiveConfiguration {
+            settings: Map::new(),
+            binding: None,
+            offload_floor: floor,
+        };
+        for floor in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(1.5)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!("7")),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!({})),
+        ] {
+            assert_eq!(
+                configuration(floor).offload_required_bytes(10, 3),
+                Err(AdmissionError::ConfigurationUnavailable)
+            );
+        }
+        let positive = configuration(Some(serde_json::json!(7)));
+        assert_eq!(positive.offload_required_bytes(10, 3), Ok(20));
+        assert_eq!(
+            positive.offload_required_bytes(u64::MAX - 7, 0),
+            Ok(u64::MAX)
+        );
+        assert_eq!(
+            positive.offload_required_bytes(u64::MAX - 6, 0),
+            Err(AdmissionError::ConfigurationUnavailable)
+        );
+        assert_eq!(
+            positive.offload_required_bytes(u64::MAX - 7, 1),
+            Err(AdmissionError::ConfigurationUnavailable)
+        );
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn offload_floor_capture_preserves_ordinary_admission_and_refuses_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("config")).unwrap();
+        let path = directory.path().join("config/journal.json");
+        let write = |config: &Value| {
+            std::fs::write(&path, serde_json::to_vec(config).unwrap()).unwrap();
+        };
+        write(&serde_json::json!({}));
+        let root = JournalRoot::open(directory.path()).unwrap();
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"backup":{"offload":{"floor_bytes":null}}}),
+            serde_json::json!({"backup":{"offload":{"floor_bytes":"7"}}}),
+            serde_json::json!({"backup":{"offload":{"floor_bytes":0}}}),
+        ] {
+            write(&config);
+            let captured = ArchiveConfiguration::capture(&root).unwrap();
+            captured.revalidate(&root).unwrap();
+            assert_eq!(
+                captured.offload_required_bytes(10, 3),
+                Err(AdmissionError::ConfigurationUnavailable)
+            );
+        }
+        let mut config = serde_json::json!({"backup":{"offload":{"floor_bytes":7}}});
+        write(&config);
+        let captured = ArchiveConfiguration::capture(&root).unwrap();
+        assert_eq!(captured.offload_required_bytes(10, 3), Ok(20));
+        config["backup"]["last_backup"] = serde_json::json!({"status":"ok"});
+        write(&config);
+        captured.revalidate(&root).unwrap();
+        config["backup"]["offload"]["floor_bytes"] = serde_json::json!(8);
+        write(&config);
+        assert_eq!(
+            captured.revalidate(&root),
+            Err(AdmissionError::ConfigurationChanged)
+        );
+        config["backup"]["offload"]["floor_bytes"] = Value::Null;
+        write(&config);
+        assert_eq!(
+            captured.revalidate(&root),
+            Err(AdmissionError::ConfigurationChanged)
+        );
+    }
+
     #[test]
     fn cancellation_and_original_lifetime_survive_worker_budget_transfer() {
         fn worker_entry(budget: ArchiveBudget, now: i64) -> ArchiveBudget {
