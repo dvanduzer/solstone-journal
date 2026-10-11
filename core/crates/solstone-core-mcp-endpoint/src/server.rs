@@ -688,6 +688,17 @@ fn post_json_rpc(
             _ => json_rpc_response(session_error_response(json_request.id.as_ref(), error)),
         };
     }
+    // A notification (no id) expects no reply, and ping is answered empty, as
+    // Streamable HTTP requires; neither touches the journal.
+    if json_request.id.is_none() {
+        return HttpResponse::empty(202, "Accepted");
+    }
+    if json_request.method == "ping" {
+        return json_rpc_response(JsonRpcResponse::success(
+            json_request.id.as_ref(),
+            serde_json::json!({}),
+        ));
+    }
     match classify_method(&json_request) {
         Ok(McpMethod::Initialize) => match sessions.create(&verified.id) {
             Ok(session_id) => json_rpc_response(JsonRpcResponse::success(
@@ -3813,6 +3824,35 @@ mod unit_tests {
     use crate::oauth::OAuthRuntime;
     use crate::session::SessionTable;
     use crate::tokens::TokenStore;
+
+    #[test]
+    fn ping_is_answered_and_notifications_get_no_reply() {
+        let journal = tempfile::tempdir().unwrap();
+        let sessions = SessionTable::new();
+        let verified = crate::tokens::VerifiedToken {
+            id: "ping-token".to_owned(),
+            agent_identity: "ping-agent".to_owned(),
+        };
+        let post = |body: serde_json::Value| {
+            super::post_json_rpc(
+                &crate::http1::HttpRequest::from_test_parts(
+                    crate::http1::HttpMethod::Post,
+                    vec![("content-type".to_owned(), "application/json".to_owned())],
+                    serde_json::to_vec(&body).unwrap(),
+                ),
+                &sessions,
+                &verified,
+                journal.path(),
+            )
+        };
+        let ping = post(json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}));
+        assert_eq!(ping.status, 200);
+        let reply: serde_json::Value = serde_json::from_slice(&ping.body).unwrap();
+        assert_eq!(reply["result"], json!({}));
+        let note = post(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        assert_eq!(note.status, 202);
+        assert!(note.body.is_empty());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn expired_post_sessions_return_404_and_can_initialize_again() {
