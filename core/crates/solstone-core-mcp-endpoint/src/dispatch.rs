@@ -21,7 +21,7 @@ use solstone_core_indexer_query::{
 };
 use solstone_core_indexer_store::classification::{FacetDeclarationSet, classify_source};
 use solstone_core_journal_io::paths::{
-    PathOrDay, day_dirs, iter_segments, iter_segments_skipping_unreadable_streams,
+    PathOrDay, day_dirs, iter_segments_skipping_unreadable_streams,
 };
 use solstone_core_memory_original::{OriginalRead, read_original};
 use solstone_core_transcripts::segment_clock;
