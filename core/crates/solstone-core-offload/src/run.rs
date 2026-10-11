@@ -924,6 +924,7 @@ mod current {
         Unproven { names: Vec<String> },
         Incomplete,
         AdmissionChanged,
+        ExecutionUnavailable,
         Prerequisite { reason: &'static str },
     }
 
@@ -1235,6 +1236,12 @@ mod current {
             eligible: Vec::new(),
             refusals: Vec::new(),
         };
+        // The exact writable archive-readback transport currently supports Unix only.
+        // Known prelaunch refusal cannot become actionable projected relief.
+        if !cfg!(unix) {
+            decision.unavailable(CurrentOffloadRefusalReason::ExecutionUnavailable);
+            return decision;
+        }
         let inspect = || -> Result<CurrentPolicyObservation, CurrentOffloadRefusalReason> {
             operation
                 .revalidate()
@@ -3004,9 +3011,12 @@ mod tests {
         assert!(!journal.path().join("health/retention-marks.json").exists());
     }
 
+    #[cfg(unix)]
     const CURRENT_NOW: i64 = 1_767_355_200;
+    #[cfg(unix)]
     const CURRENT_REPO: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    #[cfg(unix)]
     struct CurrentFixture {
         journal: tempfile::TempDir,
         root: std::sync::Arc<JournalRoot>,
@@ -3015,6 +3025,7 @@ mod tests {
         ledger: PathBuf,
     }
 
+    #[cfg(unix)]
     impl CurrentFixture {
         fn new(layout: solstone_core_journal_io::paths::SegmentLayout) -> Self {
             use solstone_core_retention::archive_proof::{
@@ -3304,6 +3315,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn dedup_current_bytes(decision: &CurrentOffloadDecision) -> u64 {
         let mut keys = std::collections::BTreeSet::new();
         decision
@@ -3322,6 +3334,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_uses_actual_admission_and_hashes_overlaps_once_per_call() {
         use solstone_core_journal_io::paths::SegmentLayout;
         use std::rc::Rc;
@@ -3383,6 +3396,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_distinguishes_available_zero_from_unavailable() {
         let fixture = CurrentFixture::new(solstone_core_journal_io::paths::SegmentLayout::Direct);
         let zero = fixture.inspect(&[]);
@@ -3399,6 +3413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_changed_missing_failed_legacy_and_other_classes() {
         use solstone_core_retention::marks::{Failure, MarkId, MarkState, RemovalClass};
         for case in 0..5 {
@@ -3457,6 +3472,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_wrong_bytes_processing_sibling_and_missing_witness() {
         for case in 0..4 {
             let fixture =
@@ -3488,6 +3504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_kept_empty_independently_from_ordinary_siblings() {
         let mut fixture =
             CurrentFixture::new(solstone_core_journal_io::paths::SegmentLayout::Direct);
@@ -3520,6 +3537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_keeps_same_names_at_distinct_exact_locators() {
         use solstone_core_journal_io::paths::SegmentLayout;
         let mut fixture = CurrentFixture::new(SegmentLayout::Direct);
@@ -3568,6 +3586,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_post_group_media_and_processing_drift_without_rehash() {
         use std::rc::Rc;
         for case in 0..4 {
@@ -3611,6 +3630,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_refuses_reoffered_nonce_and_retired_witness() {
         use std::io::Write;
         let fixture = CurrentFixture::new(solstone_core_journal_io::paths::SegmentLayout::Direct);
@@ -3665,6 +3685,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_erases_prefix_credit_on_late_config_or_catalog_failure() {
         for case in 0..3 {
             let fixture =
@@ -3703,6 +3724,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn current_batch_busy_group_does_not_block_unrelated_group() {
         use solstone_core_retention::marks::MarkId;
         use solstone_core_segment::output_attempt::OutputClaims;
@@ -3759,6 +3781,40 @@ mod tests {
                 .iter()
                 .any(|refusal| refusal.reason() == &CurrentOffloadRefusalReason::Busy)
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn current_batch_is_unavailable_without_writable_readback_transport() {
+        let journal = tempfile::tempdir().unwrap();
+        configure_offload(journal.path(), 100, Some(1));
+        let root = std::sync::Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let runner = Script {
+            outputs: RefCell::new(
+                (0..2)
+                    .map(|_| output(json!({"id":"a".repeat(64)}).to_string()))
+                    .collect(),
+            ),
+            calls: RefCell::new(vec![]),
+        };
+        let clock = TestClock { now: 100 };
+        let services = services(&runner, &Http, &clock, &Maintenance);
+        let mut operation = solstone_core_backup_runtime::admit_archive(root, &services).unwrap();
+        let decision = inspect_current_offload(
+            &mut operation,
+            &[],
+            DateTime::from_timestamp(100, 0).unwrap().fixed_offset(),
+        );
+        assert_eq!(
+            decision.availability(),
+            CurrentOffloadAvailability::Unavailable
+        );
+        assert_eq!(decision.eligible().count(), 0);
+        assert_eq!(
+            decision.refusals()[0].reason(),
+            &CurrentOffloadRefusalReason::ExecutionUnavailable
+        );
+        assert_eq!(runner.calls.borrow().len(), 2);
     }
 
     fn confirmation_failure(check: ToolOutput) -> OffloadResult {
