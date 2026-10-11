@@ -22,7 +22,8 @@ use solstone_core_retention::mark_mutation::PlannedMarkMutation;
 use solstone_core_retention::{Mark, Register, RemovalClass, Target};
 
 use solstone_core_retention::archive_catalog::{
-    ArchiveWitness, RestoreDisposition, RestoreFileV2, RestoreOperation, SegmentCatalog,
+    ArchiveWitness, LegacyRestoreBinding, LegacyRestoreOperation, RestoreDisposition,
+    RestoreFileV2, RestoreOperation, SegmentCatalog,
 };
 
 const INTENT_VERSION: u32 = 1;
@@ -160,6 +161,7 @@ pub(crate) struct StageEvidence {
 pub(crate) enum MarkRetirement {
     NoMark,
     Exact { plan: Box<PlannedMarkMutation> },
+    PreserveLegacy { expected: Option<Box<Mark>> },
 }
 
 fn proof_file(witness: &ArchiveWitness) -> Result<ArchiveFileProof, RepairHold> {
@@ -243,6 +245,7 @@ impl MarkRetirement {
         match self {
             Self::NoMark => None,
             Self::Exact { plan } => Some(plan.expected()),
+            Self::PreserveLegacy { expected } => expected.as_deref(),
         }
     }
 }
@@ -315,6 +318,8 @@ pub(crate) struct RestoreIntent {
     version: u32,
     pub locator: RestoreLocator,
     pub witness: ArchiveWitness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_binding: Option<LegacyRestoreBinding>,
     pub destination: DestinationObservation,
     pub stage: StageEvidence,
     pub retirement: MarkRetirement,
@@ -356,6 +361,45 @@ impl RestoreIntent {
         mark: Option<&Mark>,
     ) -> Result<Self, RepairHold> {
         let retirement = MarkRetirement::plan(&locator, &witness, mark)?;
+        Self::initialize(id, locator, witness, destination, stage, retirement, None)
+    }
+
+    pub fn new_legacy(
+        binding: LegacyRestoreBinding,
+        witness: ArchiveWitness,
+        destination: DestinationObservation,
+        stage: StageEvidence,
+        mark: Option<&Mark>,
+    ) -> Result<Self, RepairHold> {
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy).map_err(|_| RepairHold::InvalidIntent)?;
+        let locator = RestoreLocator {
+            segment: segment_key(&binding.target.dir).ok_or(RepairHold::InvalidIntent)?,
+            target: binding.target.clone(),
+            layout: binding.layout,
+        };
+        Self::initialize(
+            format!("{:032x}", u128::from_le_bytes(entropy)),
+            locator,
+            witness,
+            destination,
+            stage,
+            MarkRetirement::PreserveLegacy {
+                expected: mark.cloned().map(Box::new),
+            },
+            Some(binding),
+        )
+    }
+
+    fn initialize(
+        id: String,
+        locator: RestoreLocator,
+        witness: ArchiveWitness,
+        destination: DestinationObservation,
+        stage: StageEvidence,
+        retirement: MarkRetirement,
+        legacy_binding: Option<LegacyRestoreBinding>,
+    ) -> Result<Self, RepairHold> {
         let intent = Self {
             version: INTENT_VERSION,
             event: RestoreOperation {
@@ -368,12 +412,13 @@ impl RestoreIntent {
             },
             locator,
             witness,
+            legacy_binding,
             destination,
             stage,
-            register: if matches!(retirement, MarkRetirement::NoMark) {
-                Obligation::NotRequired
-            } else {
+            register: if matches!(retirement, MarkRetirement::Exact { .. }) {
                 Obligation::Pending
+            } else {
+                Obligation::NotRequired
             },
             retirement,
             outcome: None,
@@ -393,9 +438,53 @@ impl RestoreIntent {
         }
     }
 
+    pub fn legacy_operation(&self) -> Option<LegacyRestoreOperation> {
+        self.legacy_binding
+            .as_ref()
+            .map(|binding| LegacyRestoreOperation {
+                adoption_id: binding.adoption_id.clone(),
+                operation: self.event.clone(),
+            })
+    }
+
     pub fn validate(&self) -> Result<(), RepairHold> {
         self.locator.validate()?;
-        validate_witness(&self.locator, &self.witness)?;
+        match (&self.legacy_binding, &self.retirement) {
+            (None, MarkRetirement::NoMark | MarkRetirement::Exact { .. }) => {
+                validate_witness(&self.locator, &self.witness)?;
+                if self.retirement
+                    != MarkRetirement::plan(
+                        &self.locator,
+                        &self.witness,
+                        self.retirement.expected(),
+                    )?
+                {
+                    return Err(RepairHold::InvalidIntent);
+                }
+            }
+            (Some(binding), MarkRetirement::PreserveLegacy { expected }) => {
+                binding.validate().map_err(|_| RepairHold::InvalidIntent)?;
+                if binding.target != self.locator.target
+                    || binding.layout != self.locator.layout
+                    || !binding.legacy_manifest.files.contains(&self.witness)
+                    || self.register != Obligation::NotRequired
+                    || expected.as_ref().is_some_and(|mark| {
+                        mark.class != RemovalClass::OffloadRawRelease
+                            || mark.target != self.locator.target
+                            || !mark.proposal.names.contains(&self.witness.file.name)
+                            || mark.proposal.names.iter().any(|name| {
+                                solstone_core_journal_io::name_admission::check_portable_component(
+                                    name,
+                                )
+                                .is_err()
+                            })
+                    })
+                {
+                    return Err(RepairHold::InvalidIntent);
+                }
+            }
+            _ => return Err(RepairHold::InvalidIntent),
+        }
         if self.version != INTENT_VERSION
             || intent_filename(&self.event.operation_id).is_none()
             || !is_canonical_identity_observation(&self.destination.root)
@@ -422,16 +511,13 @@ impl RestoreIntent {
         {
             return Err(RepairHold::InvalidIntent);
         }
-        let expected =
-            MarkRetirement::plan(&self.locator, &self.witness, self.retirement.expected())?;
         let no_effect_complete = self.no_effect_outcome()
             && self.event_recorded == Obligation::Complete
             && self.cleanup == Obligation::Complete
             && self.marker == Obligation::NotRequired
             && self.register == Obligation::NotRequired;
-        if self.retirement != expected
-            || (self.marker == Obligation::NotRequired && !no_effect_complete)
-            || (matches!(self.retirement, MarkRetirement::NoMark)
+        if (self.marker == Obligation::NotRequired && !no_effect_complete)
+            || (!matches!(self.retirement, MarkRetirement::Exact { .. })
                 != matches!(self.register, Obligation::NotRequired)
                 && !no_effect_complete)
             || self
@@ -544,6 +630,7 @@ impl RestoreIntent {
             || self.event.operation_id != next.event.operation_id
             || self.locator != next.locator
             || self.witness != next.witness
+            || self.legacy_binding != next.legacy_binding
             || self.destination != next.destination
             || self.stage != next.stage
             || self.retirement != next.retirement
@@ -873,6 +960,28 @@ pub(crate) fn inspect_recovery(
     {
         return Err(RepairHold::CatalogChanged);
     }
+    if let Some(binding) = &intent.legacy_binding {
+        let mut bindings = catalog
+            .restore_bindings
+            .iter()
+            .filter(|current| current.adoption_id == binding.adoption_id);
+        if bindings.next() != Some(binding) || bindings.next().is_some() {
+            return Err(RepairHold::CatalogChanged);
+        }
+        let mut manifests = catalog
+            .history
+            .iter()
+            .filter(|manifest| manifest.manifest_id == binding.legacy_manifest.manifest_id);
+        if manifests.next() != Some(&binding.legacy_manifest) || manifests.next().is_some() {
+            return Err(RepairHold::CatalogChanged);
+        }
+        // Restore-only binding never retires a proposal. Even recorded history
+        // must preserve the entire selected current Mark or original absence.
+        let mut marks = related_mark(intent, register);
+        if marks.next() != intent.retirement.expected() || marks.next().is_some() {
+            return Err(RepairHold::MarkChanged);
+        }
+    }
     let history = catalog
         .history
         .iter()
@@ -895,6 +1004,22 @@ pub(crate) fn inspect_recovery(
         return Err(RepairHold::OperationCollision);
     }
     let event_recorded = !recorded.is_empty();
+    let mut legacy_records = catalog
+        .legacy_restores
+        .iter()
+        .filter(|record| record.operation.operation_id == intent.event.operation_id);
+    let legacy_record = legacy_records.next();
+    if legacy_records.next().is_some()
+        || match intent.legacy_operation() {
+            Some(expected) => match legacy_record {
+                Some(actual) => actual != &expected || !event_recorded,
+                None => event_recorded,
+            },
+            None => legacy_record.is_some(),
+        }
+    {
+        return Err(RepairHold::OperationCollision);
+    }
     if intent.event_recorded == Obligation::Complete && !event_recorded {
         return Err(RepairHold::OperationCollision);
     }
@@ -1014,6 +1139,10 @@ pub(crate) fn content_observation(
 pub(crate) fn selected_name(intent: &RestoreIntent) -> &OsStr {
     OsStr::new(&intent.witness.file.name)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod legacy_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
