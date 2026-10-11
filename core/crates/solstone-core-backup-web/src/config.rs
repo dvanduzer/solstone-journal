@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
 use serde_json::{Map, Value, json};
 use solstone_core_journal_config::read_journal_config;
 use solstone_core_journal_config_write::{
@@ -22,17 +25,31 @@ fn merge(default: &Value, source: &Value) -> Value {
         (_, value) => value.clone(),
     }
 }
+fn merge_backup(source: &Value) -> Value {
+    let mut value = merge(&defaults(), source);
+    if let Some(restored) = source.get("last_restore").and_then(Value::as_object) {
+        for counter in [
+            "files_expected",
+            "files_restored",
+            "bytes_expected",
+            "bytes_restored",
+        ] {
+            if restored.get(counter) == Some(&Value::Null) {
+                value["last_restore"][counter] = Value::Null;
+            }
+        }
+    }
+    value
+}
 pub fn backup(root: &Path) -> Result<Map<String, Value>, ()> {
     let config = read_journal_config(root)
         .map_err(|_| ())?
         .config
         .unwrap_or_default();
-    Ok(
-        merge(&defaults(), config.get("backup").unwrap_or(&Value::Null))
-            .as_object()
-            .cloned()
-            .unwrap(),
-    )
+    Ok(merge_backup(config.get("backup").unwrap_or(&Value::Null))
+        .as_object()
+        .cloned()
+        .unwrap())
 }
 pub fn mutate<T>(
     root: &Path,
@@ -53,4 +70,46 @@ pub fn mutate<T>(
     })
     .map(|result| result.value)
     .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_counters_preserve_explicit_unknown_and_known_values() {
+        for count in [Value::Null, json!(0), json!(4)] {
+            let merged = merge_backup(&json!({
+                "enabled": null,
+                "last_restore": {
+                    "segments_selected": null,
+                    "files_expected": count,
+                    "files_restored": count,
+                    "bytes_expected": count,
+                    "bytes_restored": count
+                }
+            }));
+            for counter in [
+                "files_expected",
+                "files_restored",
+                "bytes_expected",
+                "bytes_restored",
+            ] {
+                assert_eq!(merged["last_restore"][counter], count, "{counter}");
+            }
+            assert_eq!(merged["enabled"], false);
+            assert_eq!(merged["last_restore"]["segments_selected"], 0);
+        }
+        assert_eq!(merge_backup(&json!({})), defaults());
+        let missing = merge_backup(&json!({"last_restore": {"status": "ok"}}));
+        for counter in [
+            "files_expected",
+            "files_restored",
+            "bytes_expected",
+            "bytes_restored",
+        ] {
+            assert_eq!(missing["last_restore"][counter], 0, "{counter}");
+        }
+        assert_eq!(missing["last_restore"]["status"], "ok");
+    }
 }

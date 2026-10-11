@@ -1265,15 +1265,6 @@ fn credentials_response() -> HttpResponse {
     }
 }
 
-#[cfg(feature = "full-tests")]
-fn xml_response(body: &str) -> HttpResponse {
-    HttpResponse {
-        status: 200,
-        headers: vec![],
-        body: body.as_bytes().to_vec(),
-    }
-}
-
 fn engine_deps(
     journal_root: PathBuf,
     runner: Arc<dyn ToolRunner + Send + Sync>,
@@ -1752,6 +1743,10 @@ async fn restore_success_records_snapshots_then_restore() {
                 format!("{JOURNAL_SNAPSHOT_ID}:/original"),
                 "--target".into(),
                 root.path().display().to_string(),
+                #[cfg(target_os = "linux")]
+                "--exclude".into(),
+                #[cfg(target_os = "linux")]
+                "backup-activity.lock".into(),
                 "--json".into(),
             ],
             vec!["check".into()],
@@ -1760,7 +1755,14 @@ async fn restore_success_records_snapshots_then_restore() {
     assert!(runner.refusals().is_empty());
     assert_eq!(done["last_restore"]["status"], "ok");
     assert_eq!(done["last_restore"]["scope"], "journal");
-    assert_eq!(done["last_restore"]["files_restored"], 4);
+    let files = if cfg!(target_os = "linux") {
+        Value::Null
+    } else {
+        json!(4)
+    };
+    assert_eq!(done["last_restore"]["files_expected"], files);
+    assert_eq!(done["last_restore"]["files_restored"], files);
+    assert_eq!(done["last_restore"]["bytes_restored"], 12);
 }
 
 #[cfg(feature = "full-tests")]
@@ -2239,23 +2241,11 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
         Some(restic.path().to_path_buf()),
     );
 
-    let teardown_hold = Hold::new();
-    let teardown_http = Arc::new(
-        HttpScript::with_responses(vec![
-            Ok(credentials_response()),
-            Ok(xml_response(
-                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
-            )),
-            Ok(xml_response(
-                "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>",
-            )),
-        ])
-        .with_hold_after(1, teardown_hold.clone()),
-    );
+    let teardown_http = Arc::new(HttpScript::with_responses(vec![]));
 
     held_fixture(
         deps.clone(),
-        vec![hold.clone(), teardown_hold.clone()],
+        vec![hold.clone()],
         vec![http.clone(), teardown_http.clone()],
         vec![root, restic],
         async {
@@ -2301,17 +2291,36 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
             assert_eq!(done["mode"], "operated");
             assert_eq!(done["enabled"], true);
 
+            let config_before = std::fs::read(journal_path.join("config/journal.json")).unwrap();
+            let binding_before = solstone_core_backup::load_hosted_binding(journal_path.as_path());
             deps.http = teardown_http.clone();
             let (status, teardown) = post_json(&deps, "/app/backup/teardown", None).await;
             assert_eq!(status, 200);
             assert_eq!(teardown["operation"]["kind"], "teardown");
-            assert_eq!(teardown["operation"]["phase"], "tearing_down");
-            wait_started_or_terminal(&teardown_hold, &deps, fixture_generation(&deps).await)
-                .await
-                .expect("fixture did not enter Hold");
-            teardown_hold.release().await;
-            let cleanup = wait_terminal(&deps).await;
-            assert_eq!(cleanup["operation"]["phase"], "done");
+            let refused = wait_terminal(&deps).await;
+            assert_eq!(refused["operation"]["phase"], "refused");
+            assert_eq!(refused["operation"]["report"]["phase"], "prelaunch");
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                refused["operation"]["report"]["refusal"]["kind"],
+                "namespace_cooperation_held"
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(
+                refused["operation"]["report"]["refusal"]["kind"],
+                "unsupported_platform"
+            );
+            assert!(teardown_http.requests.lock().unwrap().is_empty());
+            assert_eq!(
+                std::fs::read(journal_path.join("config/journal.json")).unwrap(),
+                config_before
+            );
+            assert_eq!(
+                solstone_core_backup::load_hosted_binding(journal_path.as_path()),
+                binding_before
+            );
+            assert_eq!(refused["enabled"], true);
+            assert!(!crate::operation::is_busy(&deps.operations));
         },
     )
     .await;
@@ -5889,6 +5898,10 @@ async fn hosted_poll_restore_failure_matches_local_handoff_contract() {
                     format!("{JOURNAL_SNAPSHOT_ID}:/original"),
                     "--target".into(),
                     root.path().display().to_string(),
+                    #[cfg(target_os = "linux")]
+                    "--exclude".into(),
+                    #[cfg(target_os = "linux")]
+                    "backup-activity.lock".into(),
                     "--json".into(),
                 ],
             ],

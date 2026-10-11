@@ -78,6 +78,7 @@ fn collect_production_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
                 if !path_str.contains("/tests/")
                     && !path_str.contains("/fixtures/")
                     && !path_str.contains("repository-contracts")
+                    && file_name != "tests.rs"
                     && !file_name.ends_with("_tests.rs")
                     && !file_name.contains("test_support")
                     && file_name != "durability.rs"
@@ -87,6 +88,39 @@ fn collect_production_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+#[test]
+fn production_file_collection_excludes_test_modules_and_keeps_production_checks() {
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("src");
+    fs::create_dir_all(src.join("worker/tests")).unwrap();
+    for name in [
+        "owner.rs",
+        "contests.rs",
+        "worker/owner.rs",
+        "tests.rs",
+        "worker/tests.rs",
+        "worker/owner_tests.rs",
+        "worker/tests/fixture.rs",
+    ] {
+        fs::write(src.join(name), "").unwrap();
+    }
+    let mut files = Vec::new();
+    collect_production_rust_files(&src, &mut files);
+    let actual: BTreeSet<_> = files
+        .iter()
+        .map(|path| path.strip_prefix(&src).unwrap().to_path_buf())
+        .collect();
+    let expected: BTreeSet<_> = ["owner.rs", "contests.rs", "worker/owner.rs"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        undeclared_journal_literal("root.join(\"health/unregistered-fixture.json\")"),
+        vec!["health/unregistered-fixture.json"]
+    );
 }
 
 fn matches_glob(pattern: &str, candidate: &str) -> bool {

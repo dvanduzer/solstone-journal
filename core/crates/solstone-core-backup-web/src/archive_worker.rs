@@ -481,23 +481,6 @@ pub fn park_rejected(slot: &SharedOperationSlot, rejected: Box<RejectedArchiveRe
     state.archive.retained.push(*rejected);
 }
 
-#[cfg(test)]
-mod type_tests {
-    use super::*;
-    #[test]
-    fn closed_archive_custody_is_send_static() {
-        fn check<T: Send + 'static>() {}
-        check::<ArchivePayload>();
-        check::<RejectedArchiveReturn>();
-        check::<OwnedArchiveBegin>();
-        check::<ArchivePreparationCustody>();
-    }
-}
-
-#[cfg(all(test, feature = "full-tests"))]
-#[cfg(unix)]
-mod tests;
-
 pub(super) fn entry(
     slot: &SharedOperationSlot,
     ticket: &ArchiveTicket,
@@ -673,3 +656,20 @@ pub fn prepare_read(
     return_owned(slot, ticket, Some(custody), payload, terminal);
     None
 }
+
+#[cfg(test)]
+mod type_tests {
+    use super::*;
+    #[test]
+    fn closed_archive_custody_is_send_static() {
+        fn check<T: Send + 'static>() {}
+        check::<ArchivePayload>();
+        check::<RejectedArchiveReturn>();
+        check::<OwnedArchiveBegin>();
+        check::<ArchivePreparationCustody>();
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
+mod tests;
