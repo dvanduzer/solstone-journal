@@ -2686,3 +2686,283 @@ mod owned_finish_qualification {
         Ok(())
     }
 }
+// This appendix qualifies owning offer read/publication/settlement only. Its
+// seeded archive history is synthetic data; it does not qualify the caller's
+// durable witness writer or a forced archive creator.
+#[cfg(all(test, feature = "full-tests"))]
+mod owned_offer_qualification {
+    use super::*;
+    use crate::archive_offer::{
+        OffloadOfferSelection, capture_offload_offers, publish_owned_offload_offers,
+        verify_owned_offload_offers,
+    };
+    use crate::mark_mutation::BoundMutationOutcome;
+    use crate::remove_marked::ArchiveReadState;
+    use chrono::{Datelike, TimeZone};
+    use serde_json::json;
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    use solstone_core_backup::archive_readback::ReadbackError;
+    use solstone_core_backup_runtime::{
+        DirectReadFinishState, admit_prepared_archive_owned_read_installed,
+    };
+    use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
+    use solstone_core_journal_io::atomic::{
+        BoundPublicationPrimitive, run_with_bound_publication_fault,
+    };
+
+    struct NativeClock;
+    impl Clock for NativeClock {
+        fn now_unix(&self) -> i64 {
+            chrono::Utc::now().timestamp()
+        }
+        fn iso_week(&self) -> u8 {
+            chrono::Utc::now().iso_week().week() as u8
+        }
+    }
+
+    fn emit(case: &str, phase: &str, facts: serde_json::Value) -> TestResult {
+        println!(
+            "OWNED_OFFER_EVIDENCE {}",
+            json!({"case":case,"phase":phase,"facts":facts})
+        );
+        std::io::stdout().flush()?;
+        Ok(())
+    }
+
+    fn reads<'a>(
+        states: impl Iterator<Item = ArchiveReadState<'a>>,
+    ) -> TestResult<Vec<serde_json::Value>> {
+        states.map(|state| match state {
+            ArchiveReadState::Prepared { file, target_identity, media, cleanup } => {
+                assert_eq!(cleanup, Some(Cleanup::Complete));
+                assert_eq!(*target_identity, media.identity());
+                assert_eq!(file.bytes, media.digest().size);
+                assert_eq!(file.sha256, media.digest().sha256);
+                Ok(json!({"kind":"prepared","file":{"repository":file.repository_id,
+                    "snapshot":file.snapshot_id,"path":file.archive_path,"name":file.name,
+                    "bytes":file.bytes,"sha256":file.sha256,"identity":target_identity},
+                    "owner_address":format!("{media:p}"),"digest":media.digest(),"cleanup":cleanup}))
+            }
+            _ => Err(invalid("actual prepared read required").into()),
+        }).collect()
+    }
+
+    #[test]
+    #[ignore = "requires the owning historical-package-adapted synthetic fixture"]
+    fn packaged_owned_offer_entry() -> TestResult {
+        let input: Input = serde_json::from_slice(&fs::read(
+            std::env::var_os("ARCHIVE_APPROVAL_PROBE_JSON")
+                .ok_or_else(|| invalid("explicit owning offer input required"))?,
+        )?)?;
+        assert!(matches!(
+            input.case.as_str(),
+            "owned_offer_complete" | "owned_offer_uncertain" | "owned_offer_cancelled"
+        ));
+        let root = Arc::new(JournalRoot::open(&input.journal)?);
+        let first = input
+            .marks
+            .first()
+            .ok_or_else(|| invalid("actual offered file missing"))?;
+        let mut fixture = parent_fixture_for(&input, &root, std::slice::from_ref(first))?;
+        fixture.register_bytes = serde_json::to_vec(&Register {
+            version: 2,
+            marks: BTreeMap::new(),
+        })?;
+        fs::write(
+            input.journal.join("health/retention-marks.json"),
+            &fixture.register_bytes,
+        )?;
+        let proof = fixture
+            .mark
+            .offload
+            .as_ref()
+            .ok_or_else(|| invalid("actual proof missing"))?
+            .proof
+            .clone();
+        let raw_before = parent_raw_observations(&fixture)?;
+        let ledger_before = fs::read(&fixture.ledger)?;
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(NativeClock);
+        let cancellation = ArchiveCancellation::new();
+        let operation = OwnedPreparedArchiveOperation::prepare(
+            root.clone(),
+            ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone())?,
+            clock.clone(),
+        )
+        .map_err(|e| invalid(&format!("actual original preparation: {:?}", e.reason())))?;
+        let today =
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 11).ok_or_else(|| invalid("date missing"))?;
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 11, 12, 0, 0)
+            .single()
+            .ok_or_else(|| invalid("time missing"))?;
+        let observed = capture_offload_offers(
+            operation.as_prepared(),
+            &[OffloadOfferSelection {
+                target: proof.target.clone(),
+                layout: proof.layout,
+                names: fixture.mark.proposal.names.clone(),
+            }],
+            today,
+            now,
+        )
+        .map_err(|e| invalid(&format!("actual capture: {e:?}")))?;
+        assert_eq!(observed.groups().len(), 1);
+        let observed_address = format!("{:p}", observed.groups().as_ptr());
+        let installed = admit_prepared_archive_owned_read_installed(
+            operation,
+            input.repository_id.clone(),
+            &input.expected_restic_path,
+            env!("CARGO_PKG_VERSION"),
+            &solstone_core_backup_runtime::UreqHttpTransport,
+        )
+        .map_err(|e| invalid(&format!("actual installed admission: {:?}", e.error())))?;
+        let (read, outside) = installed.into_parts();
+        assert!(Arc::ptr_eq(read.carrier(), outside.carrier()));
+        assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+        emit(
+            &input.case,
+            "admitted",
+            json!({"marks":[fixture.mark.clone()],
+            "carrier":read.carrier().diagnostic_path(),"package_admission_version":env!("CARGO_PKG_VERSION"),
+            "seeded_archive_history":"synthetic fixture data; no durable-writer qualification"}),
+        )?;
+        parent_observer_cut(&input, b"admitted")?;
+        let verified = verify_owned_offload_offers(read, observed, vec![proof.clone()], today, now)
+            .map_err(|e| invalid(&format!("actual owning verification: {:?}", e.reason())))?;
+        assert_eq!(
+            format!("{:p}", verified.observed().groups().as_ptr()),
+            observed_address
+        );
+        let marks = verified.marks().to_vec();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(
+            marks.first().map(|mark| mark.state.clone()),
+            Some(MarkState::Marked)
+        );
+        assert_ne!(marks.first(), Some(&fixture.mark));
+        let prepared_reads = reads(verified.archive_reads())?;
+        assert_eq!(prepared_reads.len(), 1);
+        let uncertain = input.case == "owned_offer_uncertain";
+        let outcome = if uncertain {
+            let (outcome, consumed) = run_with_bound_publication_fault(
+                BoundPublicationPrimitive::ParentSync,
+                1,
+                5,
+                || publish_owned_offload_offers(verified, today, now),
+            );
+            assert!(consumed);
+            assert!(
+                matches!(outcome.publication(), Ok(BoundMutationOutcome::PublishedUncertain { uncertainty, .. })
+                if uncertainty.durability.as_ref().and_then(|error|error.raw_os_error())==Some(5))
+            );
+            outcome
+        } else {
+            let outcome = publish_owned_offload_offers(verified, today, now);
+            assert!(matches!(
+                outcome.publication(),
+                Ok(BoundMutationOutcome::Published(_))
+            ));
+            outcome
+        };
+        assert_eq!(reads(outcome.verified().archive_reads())?, prepared_reads);
+        assert_eq!(parent_raw_observations(&fixture)?, raw_before);
+        assert_eq!(fs::read(&fixture.ledger)?, ledger_before);
+        for (sidecar, complete, _) in &fixture.sidecars {
+            assert_eq!(fs::read(sidecar)?, *complete);
+        }
+        assert_ne!(
+            fs::read(input.journal.join("health/retention-marks.json"))?,
+            fixture.register_bytes
+        );
+        let publication = format!("{:?}", outcome.publication());
+        emit(
+            &input.case,
+            "returned",
+            json!({"reads":prepared_reads,"marks":marks,
+            "publication":publication,"uncertainty_fault_consumed":uncertain,"raw_unchanged":true,"ledger_unchanged":true}),
+        )?;
+        parent_observer_cut(&input, b"returned")?;
+        if input.case == "owned_offer_cancelled" {
+            cancellation.cancel();
+        }
+        match outcome.settle() {
+            Ok(settled) => {
+                assert_eq!(input.case, "owned_offer_complete");
+                assert_eq!(
+                    format!("{:p}", settled.observed().groups().as_ptr()),
+                    observed_address
+                );
+                assert_eq!(format!("{:?}", settled.report().publication()), publication);
+                assert_eq!(settled.report().marks(), marks);
+                assert_eq!(settled.report().archive_reads().len(), 1);
+                let (read, observed, report) = settled.into_parts();
+                assert!(Arc::ptr_eq(read.carrier(), outside.carrier()));
+                assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+                drop(observed);
+                let completed = outside.finish_owned(read);
+                assert_eq!(completed.state(), DirectReadFinishState::Completed);
+                assert!(completed.reason().is_none());
+                assert!(stages(&input.journal)?.is_empty());
+                assert_eq!(format!("{:?}", report.publication()), publication);
+                emit(
+                    &input.case,
+                    "finished",
+                    json!({"finish":"Completed","publication":publication,
+                    "read_report_count":report.archive_reads().len(),"stages":stages(&input.journal)?}),
+                )?;
+                parent_observer_cut(&input, b"finished")?;
+                drop(completed);
+                drop(ActivityLease::try_acquire(root.clone())?);
+                drop(TeardownLease::try_acquire(root.clone())?);
+                emit(
+                    &input.case,
+                    "released",
+                    json!({"next_activity":true,"next_teardown":true}),
+                )?;
+            }
+            Err(held) => {
+                assert_ne!(input.case, "owned_offer_complete");
+                assert!(Arc::ptr_eq(held.carrier(), outside.carrier()));
+                assert_eq!(
+                    format!("{:p}", held.observed().groups().as_ptr()),
+                    observed_address
+                );
+                assert_eq!(
+                    held.publication().map(|result| format!("{result:?}")),
+                    Some(publication.clone())
+                );
+                assert_eq!(held.marks(), marks);
+                assert_eq!(reads(held.archive_reads())?, prepared_reads);
+                if uncertain {
+                    assert!(held.readback_error().is_none());
+                } else {
+                    assert_eq!(
+                        held.readback_error(),
+                        Some(ReadbackError::Admission(AdmissionError::Cancelled))
+                    );
+                }
+                assert!(held.reason().is_none());
+                assert!(matches!(
+                    ActivityLease::try_acquire(root.clone()),
+                    Err(ActivityAdmissionError::Busy)
+                ));
+                assert!(matches!(
+                    TeardownLease::try_acquire(root.clone()),
+                    Err(ActivityAdmissionError::Busy)
+                ));
+                emit(
+                    &input.case,
+                    "finished",
+                    json!({"finish":"Held","publication":publication,
+                    "readback_error":format!("{:?}",held.readback_error()),"reads":reads(held.archive_reads())?,
+                    "same_observations":true,"exclusion_busy":true,"stages":stages(&input.journal)?}),
+                )?;
+                parent_observer_cut(&input, b"finished")?;
+                drop((held, outside));
+            }
+        }
+        assert_eq!(parent_raw_observations(&fixture)?, raw_before);
+        assert_eq!(fs::read(&fixture.ledger)?, ledger_before);
+        Ok(())
+    }
+}

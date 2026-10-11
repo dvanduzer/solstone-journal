@@ -22,7 +22,13 @@ use crate::marks::Mark;
 use crate::marks::{MarkId, RemovalClass};
 use crate::receipt::Target;
 
+mod owned;
 pub(crate) mod reconciliation;
+pub use owned::{
+    OwnedOffloadOfferFailure, OwnedOffloadOfferOutcome, OwnedOffloadOffersHold,
+    OwnedSettledOffloadOffers, OwnedVerifiedOffloadOffers, SettledOffloadOfferReport,
+    publish_owned_offload_offers, verify_owned_offload_offers,
+};
 pub use reconciliation::{
     OffloadReconciliation, OffloadReconciliationDisposition, OffloadReconciliationFailure,
     OffloadReconciliationGroup, OffloadReconciliationStop, reconcile_offload_empty,
@@ -919,8 +925,11 @@ pub fn verify_offload_offers<'clock>(
 }
 
 #[cfg(unix)]
-fn check_active_witnesses(verified: &VerifiedOffloadOffers<'_>) -> Result<(), OffloadOfferRefusal> {
-    let catalog = crate::archive_catalog::read_complete_catalog(verified.journal_root())
+fn check_active_witnesses(
+    root: &Arc<JournalRoot>,
+    marks: &[Mark],
+) -> Result<(), OffloadOfferRefusal> {
+    let catalog = crate::archive_catalog::read_complete_catalog(root)
         .map_err(OffloadOfferRefusal::Catalog)?;
     let segments = || catalog.days.iter().flat_map(|day| &day.segments);
     if catalog.degraded()
@@ -929,7 +938,7 @@ fn check_active_witnesses(verified: &VerifiedOffloadOffers<'_>) -> Result<(), Of
     {
         return Err(OffloadOfferRefusal::Changed);
     }
-    for mark in verified.marks() {
+    for mark in marks {
         let proof = &mark
             .offload
             .as_ref()
@@ -960,30 +969,27 @@ fn check_active_witnesses(verified: &VerifiedOffloadOffers<'_>) -> Result<(), Of
 }
 
 #[cfg(unix)]
-fn publish_verified(
-    verified: &VerifiedOffloadOffers<'_>,
+fn publish_with_approval(
+    observed: &ObservedOffloadOffers,
+    approval: crate::archive_approval::ArchiveApprovalRef<'_, '_>,
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> Result<crate::mark_mutation::BoundMutationOutcome, OffloadOfferRefusal> {
-    verified
-        .approval
-        .revalidate_admission()
-        .map_err(admission_refusal)?;
-    if !Arc::ptr_eq(verified.journal_root(), &verified.observed.root)
-        || !Arc::ptr_eq(verified.activity(), &verified.observed.activity)
+    approval.revalidate_admission().map_err(admission_refusal)?;
+    if !Arc::ptr_eq(approval.journal_root(), &observed.root)
+        || !Arc::ptr_eq(approval.activity(), &observed.activity)
     {
         return Err(OffloadOfferRefusal::Changed);
     }
-    let selections = verified
-        .observed
+    let selections = observed
         .groups
         .iter()
         .map(|group| group.selection.clone())
         .collect::<Vec<_>>();
-    let claimed = acquire_claims(&verified.observed.root, &selections)?;
+    let claimed = acquire_claims(&observed.root, &selections)?;
     let mut commits = Vec::new();
     for segment in &claimed {
-        let absolute = verified
+        let absolute = approval
             .journal_root()
             .canonical_path()
             .join(&segment.relative);
@@ -997,8 +1003,7 @@ fn publish_verified(
                 .flat_map(|selection| &selection.names)
                 .map(|name| absolute.join(name).with_extension("jsonl")),
         )?;
-        if verified
-            .observed
+        if observed
             .groups
             .iter()
             .filter(|group| selection_path(&group.selection) == segment.relative)
@@ -1010,28 +1015,24 @@ fn publish_verified(
     }
     // Governing claims precede every current catalog read and remain held until
     // final register publication, including the fresh read after register lock.
-    let policy = crate::remove_marked::ReviewedPolicy::capture(verified.journal_root())
+    let policy = crate::remove_marked::ReviewedPolicy::capture(approval.journal_root())
         .map_err(|error| OffloadOfferRefusal::Policy(Box::new(error)))?;
-    check_current_metadata(&verified.observed, &policy, today, now)?;
-    check_active_witnesses(verified)?;
-    let selected = verified
-        .observed
+    check_current_metadata(observed, &policy, today, now)?;
+    check_active_witnesses(approval.journal_root(), approval.expected_marks())?;
+    let selected = observed
         .groups
         .iter()
-        .zip(verified.marks())
+        .zip(approval.expected_marks())
         .map(|(group, mark)| (group.expected.as_ref(), mark))
         .collect::<Vec<_>>();
-    let guard = crate::mark_mutation::OfferMarkGuard::begin(verified.journal_root(), &selected)
+    let guard = crate::mark_mutation::OfferMarkGuard::begin(approval.journal_root(), &selected)
         .map_err(|error| OffloadOfferRefusal::Register(Box::new(error)))?;
-    check_current_inputs(&verified.observed, &policy, today, now)?;
-    check_active_witnesses(verified)?;
+    check_current_inputs(observed, &policy, today, now)?;
+    check_active_witnesses(approval.journal_root(), approval.expected_marks())?;
     for commit in &commits {
         commit.revalidate()?;
     }
-    verified
-        .approval
-        .revalidate_admission()
-        .map_err(admission_refusal)?;
+    approval.revalidate_admission().map_err(admission_refusal)?;
     guard
         .publish()
         .map_err(|error| OffloadOfferRefusal::Register(Box::new(error)))
@@ -1047,7 +1048,8 @@ pub fn publish_offload_offers<'clock>(
     now: DateTime<Utc>,
 ) -> OffloadOfferOutcome<'clock> {
     #[cfg(unix)]
-    let publication = publish_verified(&verified, today, now);
+    let publication =
+        publish_with_approval(&verified.observed, verified.approval.view(), today, now);
     #[cfg(not(unix))]
     let publication = {
         let _parameters = (today, now);
