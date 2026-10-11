@@ -688,7 +688,9 @@ pub struct BoundParentLock {
 
 #[cfg(unix)]
 impl BoundParentLock {
-    pub(crate) fn revalidate_bound(
+    /// Recheck the held persistent lock against its exact name in the retained
+    /// parent. The caller separately validates that parent's journal binding.
+    pub fn revalidate_bound(
         &self,
         parent: &impl AsFd,
         name: &OsStr,
