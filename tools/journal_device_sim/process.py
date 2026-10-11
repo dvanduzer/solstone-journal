@@ -22,7 +22,7 @@ from collections import deque
 from pathlib import Path
 
 _STARTUP_RE = re.compile(
-    r"forwarding 127\.0\.0\.1:([0-9]+) -> home .+ "
+    r"forwarding 127\.0\.0\.1:([0-9]+) -> .+ "
     r"(via direct connection|via direct or relay|via relay only)"
 )
 _BUNDLE_FILES = (
@@ -38,7 +38,7 @@ _MAX_VERSION_OUTPUT = 512
 _MAX_PEER_JSON_BYTES = 64 * 1024
 _MAX_HELP_OUTPUT_BYTES = 64 * 1024
 _HELP_PREFLIGHT_TIMEOUT_S = 5.0
-_NATIVE_ROOT_HEADER = b"solstone - journal access CLI"
+_NATIVE_ROOT_HEADER = b"solstone - your journal, from the command line"
 _CERTIFICATE_BEGIN = b"-----BEGIN CERTIFICATE-----"
 _CERTIFICATE_END = b"-----END CERTIFICATE-----"
 _CERTIFICATE_BODY_RE = re.compile(rb"[A-Za-z0-9+/]+={0,2}")
