@@ -259,6 +259,130 @@ pub fn bump_stream_marker(journal: &Path, day: &str) -> Result<u64, AtomicWriteE
     Ok(next)
 }
 
+/// A publication under an admitted day-health directory; canonical ancestry is caller-owned.
+#[cfg(unix)]
+#[must_use]
+#[derive(Debug)]
+pub struct BoundStreamMarkerPublication {
+    generation: u64,
+    publication: crate::BoundAtomicOutcome,
+    binding_error: Option<crate::errors::FlatDirectoryError>,
+    lock_error: Option<crate::ExistingParentLockError>,
+}
+
+#[cfg(unix)]
+impl BoundStreamMarkerPublication {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn publication(&self) -> &crate::BoundAtomicOutcome {
+        &self.publication
+    }
+    pub fn binding_error(&self) -> Option<&crate::errors::FlatDirectoryError> {
+        self.binding_error.as_ref()
+    }
+    pub fn lock_error(&self) -> Option<&crate::ExistingParentLockError> {
+        self.lock_error.as_ref()
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum BoundStreamMarkerError {
+    Parent(crate::errors::FlatDirectoryError),
+    Lock(crate::ExistingParentLockError),
+    Read(crate::errors::FlatDirectoryError),
+    Malformed,
+    Overflow,
+    Serialize(serde_json::Error),
+    Publish(crate::atomic::DetailedAtomicError),
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkerPoint {
+    BeforePublication,
+    AfterPublication,
+}
+
+/// Advance the existing stream marker protocol beneath this retained parent.
+/// The caller retains canonical ancestry and its owning operation exclusion.
+#[cfg(unix)]
+pub fn bump_stream_marker_bound(
+    day_health: &crate::FlatDirectory,
+    options: LockOptions,
+) -> Result<BoundStreamMarkerPublication, BoundStreamMarkerError> {
+    bump_bound_with_checkpoint(day_health, options, |_| {})
+}
+
+#[cfg(unix)]
+fn bump_bound_with_checkpoint(
+    day_health: &crate::FlatDirectory,
+    options: LockOptions,
+    mut checkpoint: impl FnMut(MarkerPoint),
+) -> Result<BoundStreamMarkerPublication, BoundStreamMarkerError> {
+    use BoundStreamMarkerError as Error;
+    use std::ffi::OsStr;
+    const LOCK_NAME: &str = "stream.updated.lock";
+    day_health.revalidate().map_err(Error::Parent)?;
+    let lock = crate::open_existing_parent_lock_bound(
+        day_health,
+        OsStr::new(LOCK_NAME),
+        options.timeout,
+        options.poll_interval,
+    )
+    .map_err(Error::Lock)?;
+    let lock = match lock {
+        Some(lock) => lock,
+        None => crate::acquire_existing_parent_lock_bound(
+            day_health,
+            OsStr::new(LOCK_NAME),
+            options.timeout,
+            options.poll_interval,
+        )
+        .map_err(Error::Lock)?,
+    };
+    day_health.revalidate().map_err(Error::Parent)?;
+    lock.revalidate_bound(day_health, OsStr::new(LOCK_NAME))
+        .map_err(Error::Lock)?;
+    let observed =
+        crate::read_observed_file_bounded(day_health, OsStr::new("stream.updated"), 1024 * 1024)
+            .map_err(Error::Read)?;
+    let (generation, fingerprint) = match observed {
+        None => (0, None),
+        Some(observed) if observed.bytes.is_empty() => (0, None),
+        Some(observed) => {
+            let marker = decode_versioned_marker(&observed.bytes).ok_or(Error::Malformed)?;
+            (marker.generation, marker.fingerprint)
+        }
+    };
+    let generation = generation.checked_add(1).ok_or(Error::Overflow)?;
+    let marker = HealthMarker {
+        version: MARKER_VERSION,
+        generation,
+        fingerprint,
+    };
+    let contents = serde_json::to_vec(&marker).map_err(Error::Serialize)?;
+    checkpoint(MarkerPoint::BeforePublication);
+    day_health.revalidate().map_err(Error::Parent)?;
+    lock.revalidate_bound(day_health, OsStr::new(LOCK_NAME))
+        .map_err(Error::Lock)?;
+    let publication =
+        crate::atomic_replace_bound(day_health, OsStr::new("stream.updated"), &contents, 0o600)
+            .map_err(Error::Publish)?;
+    checkpoint(MarkerPoint::AfterPublication);
+    let binding_error = day_health.revalidate().err();
+    let lock_error = lock
+        .revalidate_bound(day_health, OsStr::new(LOCK_NAME))
+        .err();
+    Ok(BoundStreamMarkerPublication {
+        generation,
+        publication,
+        binding_error,
+        lock_error,
+    })
+}
+
 /// Publish the daily marker only when the observed stream generation is current.
 pub fn publish_daily_marker_if_current(
     journal: &Path,
@@ -414,15 +538,19 @@ fn read_health_marker_path(path: &Path) -> Result<HealthMarkerState, HealthMarke
     if bytes.is_empty() {
         return Ok(HealthMarkerState::LegacyEmpty { modified });
     }
-    match serde_json::from_slice::<HealthMarker>(&bytes) {
-        Ok(marker) if marker.version == MARKER_VERSION => {
-            Ok(HealthMarkerState::Versioned { marker, modified })
-        }
-        Ok(_) | Err(_) => {
+    match decode_versioned_marker(&bytes) {
+        Some(marker) => Ok(HealthMarkerState::Versioned { marker, modified }),
+        None => {
             let _ = crate::durability::copy_aside(path);
             Ok(HealthMarkerState::MalformedNonEmpty { modified })
         }
     }
+}
+
+fn decode_versioned_marker(bytes: &[u8]) -> Option<HealthMarker> {
+    serde_json::from_slice::<HealthMarker>(bytes)
+        .ok()
+        .filter(|marker| marker.version == MARKER_VERSION)
 }
 
 fn write_marker(path: &Path, marker: &HealthMarker) -> Result<(), AtomicWriteError> {
@@ -1026,3 +1154,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+#[path = "../tests/support/health_marker_bound.rs"]
+mod bound_tests;
