@@ -888,3 +888,7 @@ mod unix {
 
 #[cfg(all(test, feature = "full-tests"))]
 mod tests;
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+#[path = "../run/offer_packaged.rs"]
+mod offer_packaged;
