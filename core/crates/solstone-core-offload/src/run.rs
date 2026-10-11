@@ -3271,13 +3271,26 @@ mod tests {
                 &services,
             )
             .unwrap();
-            inspect_current_offload(
+            let carrier = std::sync::Arc::clone(operation.carrier());
+            let decision = inspect_current_offload(
                 &mut operation,
                 expected,
                 DateTime::from_timestamp(CURRENT_NOW, 0)
                     .unwrap()
                     .fixed_offset(),
-            )
+            );
+            // Each inspection is its own admission; retire its root activity
+            // carrier so the next admission's census starts clean.
+            drop(operation);
+            let retirement = std::sync::Arc::try_unwrap(carrier)
+                .unwrap_or_else(|_| panic!("inspection must release its activity carrier"))
+                .retire_after_settlement();
+            assert_eq!(
+                retirement.receipt.effect(),
+                solstone_core_journal_io::media::ActivityCarrierRetirementEffect::Removed
+            );
+            assert!(retirement.receipt.failures().is_empty());
+            decision
         }
         fn project(
             &self,
