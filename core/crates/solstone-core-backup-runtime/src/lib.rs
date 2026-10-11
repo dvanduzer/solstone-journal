@@ -54,8 +54,8 @@ pub use engine::{
     ArchiveRemoteEffects, ArchiveSnapshot, BACKUP_EXCLUDES, BackupResult, BackupServices, Clock,
     ClosedToolError, JournalMaintenance, JournalMaintenanceError, NativeJournalMaintenance,
     NativeRestoreRecorder, PruneResult, RestoreRecorder, UnreadableSources, VerificationResult,
-    admit_archive, admit_archive_with_budget, admit_prepared_archive, check_archive_snapshot_files,
-    prepare, run_archive_backup, run_prune, run_verification,
+    admit_archive, admit_archive_with_budget, admit_prepared_archive, admit_prepared_archive_read,
+    check_archive_snapshot_files, prepare, run_archive_backup, run_prune, run_verification,
 };
 
 // The legacy direct entry points: production goes through admission, so only

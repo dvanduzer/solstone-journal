@@ -1273,3 +1273,153 @@ fn packaged_controlled_http_entry() {
         serde_json::json!({"elapsed_ms":started.elapsed().as_millis(),"cancelled":cancellation.is_cancelled(),"result":result})
     );
 }
+
+#[cfg(all(target_os = "linux", feature = "full-tests"))]
+#[test]
+#[ignore = "requires an admitted copied package and synthetic direct-read broker fixture"]
+fn packaged_direct_archive_read_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
+    use solstone_core_backup::archive_admission::{
+        ARCHIVE_BACKUP_TIMEOUT_SECONDS, ArchiveBudget, ArchiveCancellation,
+    };
+    use solstone_core_backup_runtime::{UreqHttpTransport, admit_prepared_archive_read};
+    use solstone_core_journal_io::JournalRoot;
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    struct OriginalClock {
+        base: AtomicI64,
+        started: Instant,
+    }
+    impl Clock for OriginalClock {
+        fn now_unix(&self) -> i64 {
+            self.base.load(Ordering::SeqCst) + self.started.elapsed().as_secs() as i64
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    struct NoGenericRunner;
+    impl ToolRunner for NoGenericRunner {
+        fn run(&self, _: &ToolRequest<'_>) -> std::io::Result<ToolOutput> {
+            panic!("direct installed read must not call the generic runner")
+        }
+    }
+    let input_path = std::env::var_os("DIRECT_READ_PROBE_JSON").expect("explicit fixture required");
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let expected_path = Path::new(input["restic_path"].as_str().unwrap());
+    let original = OriginalClock {
+        base: AtomicI64::new(10_000),
+        started: Instant::now(),
+    };
+    let replacement = OriginalClock {
+        base: AtomicI64::new(1_999_999_999),
+        started: Instant::now(),
+    };
+    let cancellation = ArchiveCancellation::new();
+    let budget = ArchiveBudget::new_cancellable(&original, cancellation.clone()).unwrap();
+    let remaining = input["remaining_seconds"].as_i64().unwrap_or(8);
+    original.base.store(
+        10_000 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - remaining,
+        Ordering::SeqCst,
+    );
+    let operation = PreparedArchiveOperation::prepare(root.clone(), budget, &original).unwrap();
+    let carrier = operation.carrier().clone();
+    let identity = fs::metadata(carrier.diagnostic_path()).unwrap();
+    let physical = (identity.dev(), identity.ino());
+    let started = Instant::now();
+    let observed = thread::scope(|scope| {
+        let publisher = input["control_fd"].as_i64().map(|raw| {
+            // SAFETY: this isolated probe owns this explicitly inherited socket.
+            #[allow(unsafe_code)]
+            let mut control =
+                unsafe { std::os::unix::net::UnixStream::from_raw_fd(i32::try_from(raw).unwrap()) };
+            control
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let original = &original;
+            let cancellation = &cancellation;
+            let root = &root;
+            scope.spawn(move || {
+                let mut byte = [0];
+                control.read_exact(&mut byte).unwrap();
+                match byte[0] {
+                    b'c' => cancellation.cancel(),
+                    b'e' => original.base.store(
+                        10_000 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64,
+                        Ordering::SeqCst,
+                    ),
+                    b'f' => {
+                        solstone_core_backup::set_enabled(root.canonical_path(), false).unwrap();
+                    }
+                    b'r' => {}
+                    _ => panic!("unknown fixture control"),
+                }
+                control.write_all(b"a").unwrap();
+            })
+        });
+        let services = BackupServices {
+            runner: &NoGenericRunner,
+            http: &UreqHttpTransport,
+            clock: &replacement,
+            restic_path: Some(expected_path),
+            rclone_path: None,
+            version: "2.0.40",
+            journal_maintenance: &Maintenance,
+        };
+        let result = admit_prepared_archive_read(
+            operation,
+            input["repository_id"].as_str().unwrap().into(),
+            &services,
+        );
+        let observed = match result {
+            Ok(read) => {
+                assert!(Arc::ptr_eq(read.carrier(), &carrier));
+                assert!(Arc::ptr_eq(read.journal_root(), &root));
+                let revalidation = read.revalidate_admission();
+                if input["expire_after_admission"].as_bool().unwrap_or(false) {
+                    original.base.store(
+                        input["credential_expiry"].as_i64().unwrap(),
+                        Ordering::SeqCst,
+                    );
+                }
+                serde_json::json!({"repository_id":read.repository_id(),
+                    "same_original_carrier":true,"same_original_root":true,
+                    "revalidation":format!("{revalidation:?}"),
+                    "after_cap":format!("{:?}",read.revalidate_admission())})
+            }
+            Err(failure) => {
+                assert!(Arc::ptr_eq(failure.carrier().unwrap(), &carrier));
+                assert!(Arc::ptr_eq(failure.journal_root(), &root));
+                if let Some(readback) = failure.readback() {
+                    assert!(Arc::ptr_eq(readback.carrier(), &carrier));
+                }
+                serde_json::json!({"error":format!("{:?}",failure.error()),
+                    "same_original_carrier":true,"same_original_root":true,
+                    "readback":failure.readback().map(|error|format!("{:?}",error.reason())),
+                    "effects":{"broker":failure.effects().broker_requested,
+                        "write":failure.effects().write_repository_requested,
+                        "read":failure.effects().read_repository_requested}})
+            }
+        };
+        if let Some(publisher) = publisher {
+            publisher.join().unwrap();
+        }
+        observed
+    });
+    let identity = fs::metadata(carrier.diagnostic_path()).unwrap();
+    assert_eq!((identity.dev(), identity.ino()), physical);
+    carrier.revalidate().unwrap();
+    println!(
+        "DIRECT_READ_RESULT {}",
+        serde_json::json!({"result":observed,"elapsed_ms":started.elapsed().as_millis(),
+            "same_physical_carrier":true,"carrier_device":physical.0,"carrier_inode":physical.1,
+            "cancelled":cancellation.is_cancelled(),"original_now":original.now_unix(),
+            "services_now":replacement.now_unix(),"rclone":null,
+            "limit":"admission only; no native retirement or next-admission claim"})
+    );
+}
