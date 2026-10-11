@@ -11,6 +11,7 @@ use solstone_core_journal_io::media::{Durability, MediaRead};
 
 use crate::restore_intent::{RepairHold, RestoreIntent};
 
+mod adoption;
 pub(crate) mod transaction;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,6 +115,23 @@ impl RestoreIntentStore {
         }
     }
 
+    fn open_existing(activity: Arc<ActivityLease>) -> Result<Self, StoreAdmissionFailure> {
+        let owner = Self::unprepared(activity);
+        #[cfg(unix)]
+        let mut owner = owner;
+        #[cfg(unix)]
+        let result = owner.prepare_existing(&mut unix::NativeHooks);
+        #[cfg(not(unix))]
+        let result = Err(StoreProblem::Unsupported);
+        match result {
+            Ok(()) => Ok(owner),
+            Err(problem) => Err(StoreAdmissionFailure {
+                owner: Box::new(owner),
+                problem,
+            }),
+        }
+    }
+
     fn read(&self, operation: &str) -> Result<Option<ObservedIntent>, StoreProblem> {
         #[cfg(unix)]
         {
@@ -169,9 +187,11 @@ mod unix {
     };
     use solstone_core_journal_io::errors::ExistingParentLockError;
     use solstone_core_journal_io::flat_directory::{
-        FlatDirectory, create_or_open_flat_directory_bound,
+        FlatDirectory, create_or_open_flat_directory_bound, open_flat_directory_bound,
     };
-    use solstone_core_journal_io::locking::acquire_existing_parent_lock_bound;
+    use solstone_core_journal_io::locking::{
+        acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
+    };
     use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity};
     use solstone_core_journal_io::observation::FileObservation;
 
@@ -235,8 +255,46 @@ mod unix {
         intent_filename(operation).ok_or(StoreProblem::Invalid(RepairHold::InvalidIntent))
     }
 
+    #[derive(Clone, Copy)]
+    enum StoreMode {
+        Create,
+        Existing,
+    }
+
+    fn open_parent(
+        parent: &impl AsFd,
+        leaf: &OsStr,
+        diagnostic: &Path,
+        mode: StoreMode,
+    ) -> Result<FlatDirectory, StoreProblem> {
+        match mode {
+            StoreMode::Create => {
+                create_or_open_flat_directory_bound(parent, leaf, 0o700, diagnostic)
+                    .map_err(io_problem)
+            }
+            StoreMode::Existing => open_flat_directory_bound(parent, leaf, diagnostic)
+                .map_err(io_problem)?
+                .ok_or(StoreProblem::Changed),
+        }
+    }
+
     impl RestoreIntentStore {
         pub(super) fn prepare(&mut self, hooks: &mut impl Hooks) -> Result<(), StoreProblem> {
+            self.prepare_mode(hooks, StoreMode::Create)
+        }
+
+        pub(super) fn prepare_existing(
+            &mut self,
+            hooks: &mut impl Hooks,
+        ) -> Result<(), StoreProblem> {
+            self.prepare_mode(hooks, StoreMode::Existing)
+        }
+
+        fn prepare_mode(
+            &mut self,
+            hooks: &mut impl Hooks,
+            mode: StoreMode,
+        ) -> Result<(), StoreProblem> {
             self.activity.revalidate().map_err(io_problem)?;
             for (index, relative) in PARENTS.into_iter().enumerate() {
                 self.activity.revalidate().map_err(io_problem)?;
@@ -255,21 +313,15 @@ mod unix {
                 let parent = Path::new(relative).parent().ok_or(StoreProblem::Changed)?;
                 let diagnostic = self.activity.journal_root().canonical_path().join(parent);
                 let flat = if index == 0 {
-                    create_or_open_flat_directory_bound(
+                    open_parent(
                         self.activity.journal_root().as_ref(),
                         leaf,
-                        0o700,
                         &diagnostic,
+                        mode,
                     )
                 } else {
-                    create_or_open_flat_directory_bound(
-                        &self.chain[index - 1].flat,
-                        leaf,
-                        0o700,
-                        &diagnostic,
-                    )
-                }
-                .map_err(io_problem)?;
+                    open_parent(&self.chain[index - 1].flat, leaf, &diagnostic, mode)
+                }?;
                 // Preserve the just-opened parent even if its independent named
                 // admission fails; the preparation result owns all prior effects.
                 let media = match MediaDirectory::open(
@@ -292,12 +344,30 @@ mod unix {
                     return Err(StoreProblem::Changed);
                 }
             }
-            let lock = acquire_existing_parent_lock_bound(
-                &self.chain[1].flat,
-                OsStr::new(LOCK),
-                Duration::ZERO,
-                Duration::ZERO,
-            )
+            let lock = match mode {
+                StoreMode::Create => acquire_existing_parent_lock_bound(
+                    &self.chain[1].flat,
+                    OsStr::new(LOCK),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                ),
+                StoreMode::Existing => open_existing_parent_lock_bound(
+                    &self.chain[1].flat,
+                    OsStr::new(LOCK),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .and_then(|lock| {
+                    lock.ok_or_else(|| ExistingParentLockError::NamespaceChanged {
+                        path: self
+                            .activity
+                            .journal_root()
+                            .canonical_path()
+                            .join("health/offload")
+                            .join(LOCK),
+                    })
+                }),
+            }
             .map_err(|error| match error {
                 ExistingParentLockError::Timeout(_) => StoreProblem::Busy,
                 other => io_problem(other),
