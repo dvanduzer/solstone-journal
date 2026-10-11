@@ -194,6 +194,7 @@ solstone-core-segment.workspace = true
 solstone-core-push.workspace = true
 solstone-core-support-web.workspace = true
 solstone-core-transcripts-web.workspace = true
+solstone-core-map-web.workspace = true
 solstone-core-health-web.workspace = true
 solstone-core-profile-web.workspace = true
 solstone-core-stats-web.workspace = true

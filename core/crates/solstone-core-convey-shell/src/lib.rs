@@ -569,6 +569,9 @@ fn run_convey_bound(
     );
     let loopback_router =
         router_with_hosted_parent(journal_root.clone(), hosted_parent.clone(), agents_routes);
+    // Location search documents follow the segments they come from; see
+    // `solstone-core-location::projection`.
+    solstone_core_map_web::start_maintenance(journal_root.clone());
     #[cfg(windows)]
     let loopback_router = loopback_router.layer(Extension(DiscoveryGenerationContext(
         discovery_generation.clone(),
@@ -1074,6 +1077,9 @@ fn router_with_hosted_parent(
             solstone_core_transcripts_web::Clock::system(),
             || asset_response("/static/shell.html"),
         ))
+        .merge(solstone_core_map_web::router(journal_root.clone(), || {
+            asset_response("/static/shell.html")
+        }))
         .route(
             "/app/{app}",
             get(move |app: Path<String>| app_bare(app, include_agents)),

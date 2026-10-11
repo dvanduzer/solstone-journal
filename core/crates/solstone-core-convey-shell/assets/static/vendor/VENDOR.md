@@ -78,6 +78,19 @@ const clean = DOMPurify.sanitize(marked.parse(dirty));
 **Currently Used By**:
 - All apps (shell-level include via `solstone/convey/templates/app.html`)
 
+### Leaflet (v1.9.4)
+
+**Purpose**: The map app's renderer: pan, zoom, scale, and vector layers for borders, towns and location records. No tile layer is ever added, so nothing is fetched off the journal.
+
+**License**: BSD-2-Clause (`vendor/leaflet/LICENSE`)
+
+**Source**: https://registry.npmjs.org/leaflet/-/leaflet-1.9.4.tgz (`dist/leaflet.js`, `dist/leaflet.css`, `LICENSE`, unmodified; tarball SHA-256 `84c65a256e50657896f54c33bd857b6849ebe94c817803be818bf32a3dde0b77`)
+
+**Usage**: the map workspace loads `/static/vendor/leaflet/leaflet.css` and `/static/vendor/leaflet/leaflet.js`. Use only vector layers (`L.polyline`, `L.circle`, `L.circleMarker`); a marker's default icon and the layers control would request images Leaflet expects beside its CSS, which are not shipped.
+
+**Currently Used By**:
+- `core/crates/solstone-core-map-web/assets/workspace.html`
+
 ## Adding New Libraries
 
 When adding a new third-party library:

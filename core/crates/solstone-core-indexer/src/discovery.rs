@@ -275,6 +275,8 @@ mod tests {
             "chronicle/20240101/default/123456_300/talents/morning_briefing.json",
         );
         write(&root, "chronicle/20240101/talents/morning_briefing.json");
+        write(&root, "chronicle/20240101/location.md");
+        write(&root, "chronicle/20240101/phone/123456_300/location.jsonl");
         write(
             &root,
             "chronicle/20260101/import.ics/090000_300/event_transcript.md",
@@ -316,6 +318,7 @@ mod tests {
                 "20240101/default/123456_300/talents/documents.json",
                 "20240101/default/123456_300/talents/screen.json",
                 "20240101/default/123456_300/talents/sense.json",
+                "20240101/location.md",
                 "20240101/talents/flow.md",
                 "20240101/talents/morning_briefing.json",
                 "20260101/import.ics/090000_300/event_transcript.md",
@@ -336,6 +339,7 @@ mod tests {
             "20240101/default/123456_300/left_transcript.jsonl",
             "20240101/default/123456_300/screen.jsonl",
             "20240101/default/123456_300/left_screen.jsonl",
+            "20240101/phone/123456_300/location.jsonl",
             "entities/alice/entity.json",
         ] {
             assert!(

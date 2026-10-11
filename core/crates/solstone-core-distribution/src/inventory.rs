@@ -710,6 +710,8 @@ pub fn entry_component_id(entry: &Entry) -> Option<&'static str> {
                 Some("rfdetr-model")
             } else if source.contains("rfdetr-") {
                 Some("rfdetr-engine")
+            } else if source.contains("geo/area-tier") {
+                Some("area-tier")
             } else {
                 None
             }
@@ -2843,7 +2845,7 @@ zig_gnu = "x86_64-linux-gnu.2.28"
             .unwrap();
         let path = repo.join("core/distribution/inventory.toml");
         let inv = super::load_inventory(&path).expect("real inventory validates");
-        assert_eq!(inv.entry.len(), 169);
+        assert_eq!(inv.entry.len(), 170);
         for entry in &inv.entry {
             assert!(entry.class().is_some());
         }
@@ -3117,6 +3119,7 @@ zig_gnu = "x86_64-linux-gnu.2.28"
             "wespeaker-model",
             "pyannote-model",
             "silero-vad-model",
+            "area-tier",
             "vulkan-loader",
             "msvc-runtime",
         ]
