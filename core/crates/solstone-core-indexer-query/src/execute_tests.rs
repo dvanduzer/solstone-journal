@@ -1754,12 +1754,33 @@ fn a_day_bounded_connection_listing_needs_no_words_and_keeps_its_scope() {
     const B: &str = "b1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     let (root, connection) = seeded_root("connection-day-listing");
     for (content, path, day, facet) in [
-        ("in scope that day", "20260107/default/090000_300/talents/a.md", "20260107", A),
-        ("out of scope that day", "20260107/default/100000_300/talents/b.md", "20260107", B),
-        ("in scope another day", "20260106/default/090000_300/talents/a.md", "20260106", A),
+        (
+            "in scope that day",
+            "20260107/default/090000_300/talents/a.md",
+            "20260107",
+            A,
+        ),
+        (
+            "out of scope that day",
+            "20260107/default/100000_300/talents/b.md",
+            "20260107",
+            B,
+        ),
+        (
+            "in scope another day",
+            "20260106/default/090000_300/talents/a.md",
+            "20260106",
+            A,
+        ),
     ] {
         insert(&connection, content, path, day, "", "fixture", "default", 0);
-        seed_classification(&connection, path, "transcripts", "segment_assigned", &[facet]);
+        seed_classification(
+            &connection,
+            path,
+            "transcripts",
+            "segment_assigned",
+            &[facet],
+        );
     }
     finish_classification(&connection);
     drop(connection);
@@ -1799,7 +1820,10 @@ fn a_day_bounded_connection_listing_needs_no_words_and_keeps_its_scope() {
         whole_day.sort();
         assert_eq!(
             whole_day,
-            vec!["in scope that day".to_string(), "out of scope that day".to_string()],
+            vec![
+                "in scope that day".to_string(),
+                "out of scope that day".to_string()
+            ],
             "{query:?}"
         );
     }
