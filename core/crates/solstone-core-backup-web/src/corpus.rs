@@ -1144,37 +1144,11 @@ async fn engine_routes_return_running_while_restic_is_held() {
             disable: false,
             outputs: rotate_outputs(),
         },
-        Case {
-            path: "/app/backup/offload/restore",
-            body: Some(json!({"all": true})),
-            kind: "offload_restore",
-            phase: "restoring",
-            disable: false,
-            outputs: vec![output(0, "")],
-        },
     ];
     for case in cases {
         let root = crate::test_support::root("healthy");
         if case.disable {
             disable_backup(root.path());
-        }
-        if case.kind == "offload_restore" {
-            let segment = root.path().join("chronicle/20260101/010000_001");
-            fs::create_dir_all(&segment).unwrap();
-            solstone_core_offload::append_offload_event(
-                root.path(),
-                "20260101",
-                "_default",
-                "010000_001",
-                "snapshot",
-                &[solstone_core_offload::OffloadFile {
-                    name: "new.webm".into(),
-                    bytes: 8,
-                    sha256: "d".repeat(64),
-                }],
-                1,
-            )
-            .unwrap();
         }
         let hold = Hold::new();
         let runner = ScriptRunner::with_hold(case.outputs, hold.clone());
@@ -2069,65 +2043,160 @@ async fn offload_status_preserves_checked_coverage_across_distinct_ledgers() {
     }
 }
 
-#[tokio::test]
-async fn offload_restore_digest_mismatch_is_verification_failed() {
-    let root = crate::test_support::root("healthy");
-    let segment = root.path().join("chronicle/20260101/010000_001");
-    fs::create_dir_all(&segment).unwrap();
-    solstone_core_offload::append_offload_event(
-        root.path(),
-        "20260101",
-        "_default",
-        "010000_001",
-        "snapshot",
-        &[solstone_core_offload::OffloadFile {
-            name: "new.webm".into(),
-            bytes: 8,
-            sha256: "d".repeat(64),
-        }],
-        1,
-    )
-    .unwrap();
-    let runner = RestoreMismatchRunner::default();
-    let (deps, _restic) = prepared(root.path().to_path_buf(), Arc::new(runner));
-    let (status, body) = post_json(
-        &deps,
-        "/app/backup/offload/restore",
-        Some(json!({"all": true})),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body["operation"]["kind"], "offload_restore");
-    let done = wait_terminal(&deps).await;
-    assert!(done["operation"]["phase"] == "error" || done["operation"]["phase"] == "degraded");
-    assert_eq!(done["operation"]["reason_code"], "verification_failed");
-}
+#[cfg(all(test, feature = "full-tests"))]
+mod held_restore_tests {
+    use super::*;
+    use std::collections::BTreeMap;
 
-#[derive(Default)]
-struct RestoreMismatchRunner {
-    calls: Mutex<Vec<Vec<String>>>,
-}
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn walk(root: &Path, relative: &Path, state: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(root.join(relative)).unwrap() {
+                let entry = entry.unwrap();
+                let path = relative.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    state.insert(path.clone(), None);
+                    walk(root, &path, state);
+                } else {
+                    state.insert(path, Some(fs::read(entry.path()).unwrap()));
+                }
+            }
+        }
+        let mut state = BTreeMap::new();
+        walk(root, Path::new(""), &mut state);
+        state
+    }
 
-impl ToolRunner for RestoreMismatchRunner {
-    fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-        let argv = request
-            .argv
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        self.calls.lock().unwrap().push(argv.clone());
-        if argv.first().map(String::as_str) == Some("version") {
-            return Ok(version_output());
+    fn archive(root: &Path, bound: bool) {
+        let directory = if bound {
+            "010000_001_full"
+        } else {
+            "010000_001"
+        };
+        let segment = root.join("chronicle/20260101").join(directory);
+        fs::create_dir_all(&segment).unwrap();
+        fs::write(segment.join("owner.webm"), b"existing owner media").unwrap();
+        if bound {
+            let event = json!({
+                "event_kind":"offload_archive_v2", "schema_version":2, "time":2,
+                "day":"20260101", "stream":"_default", "segment":"010000_001",
+                "segment_dir":directory, "layout":"direct",
+                "journal_id":"native-root-v1:unix:0000000000000001:0000000000000002",
+                "repository_id":"c".repeat(64), "snapshot_id":"b".repeat(64),
+                "manifest_id":"manifest", "files":[{
+                    "witness_id":"witness", "name":"new.webm", "bytes":8,
+                    "sha256":"a".repeat(64), "archive_path":"/stage/new.webm",
+                    "processing":{"record":null,"has_analysis_row":true}
+                }]
+            });
+            let ledger = solstone_core_offload::ledger_path_for_day(root, "20260101").unwrap();
+            fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            fs::write(ledger, format!("{event}\n")).unwrap();
+        } else {
+            solstone_core_offload::append_offload_event(
+                root,
+                "20260101",
+                "_default",
+                directory,
+                "legacy-snapshot",
+                &[solstone_core_offload::OffloadFile {
+                    name: "new.webm".into(),
+                    bytes: 8,
+                    sha256: "a".repeat(64),
+                }],
+                1,
+            )
+            .unwrap();
         }
-        if argv.first().map(String::as_str) == Some("restore") {
-            let target = argv
-                .windows(2)
-                .find(|pair| pair[0] == "--target")
-                .map(|pair| PathBuf::from(&pair[1]))
-                .expect("target");
-            fs::write(target.join("new.webm"), b"corrupt").unwrap();
+        let catalog = solstone_core_offload::ledger::catalog_journal(root);
+        assert!(!catalog.degraded(), "valid held selection fixture");
+        let witnesses = &catalog.days[0].segments[0].active;
+        assert_eq!(witnesses.len(), 1);
+        assert_eq!(witnesses[0].repository_id.is_some(), bound);
+    }
+
+    fn missing_tool_deps(
+        root: &Path,
+    ) -> (crate::BackupWebDeps, Arc<ScriptRunner>, Arc<HttpScript>) {
+        let runner = Arc::new(ScriptRunner::with_outputs(vec![]));
+        let http = Arc::new(HttpScript::default());
+        let deps = engine_deps(
+            root.to_path_buf(),
+            runner.clone(),
+            http.clone(),
+            Some(root.join("missing-package/bin/solstone")),
+        );
+        assert_eq!(
+            crate::resolve_tools(&deps).unwrap_err().to_string(),
+            "restic_unavailable"
+        );
+        (deps, runner, http)
+    }
+
+    #[tokio::test]
+    async fn day_and_all_preserve_owning_held_reasons_without_tools_or_effects() {
+        for (bound, reason) in [(false, "archive_unbound"), (true, "restore_held")] {
+            for request in [json!({"day":"20260101"}), json!({"all":true})] {
+                let root = crate::test_support::root("healthy");
+                archive(root.path(), bound);
+                let (deps, runner, http) = missing_tool_deps(root.path());
+                let before = snapshot(root.path());
+                let (status, _) =
+                    post_json(&deps, "/app/backup/offload/restore", Some(request)).await;
+                assert_eq!(status, 200);
+                let terminal = wait_terminal(&deps).await;
+                assert_eq!(terminal["operation"]["kind"], "offload_restore");
+                assert_eq!(terminal["operation"]["phase"], "refused");
+                assert_eq!(terminal["operation"]["reason_code"], reason);
+                assert!(runner.calls.lock().unwrap().is_empty());
+                assert!(http.requests.lock().unwrap().is_empty());
+                assert_eq!(snapshot(root.path()), before);
+            }
         }
-        Ok(output(0, ""))
+    }
+
+    #[tokio::test]
+    async fn empty_and_malformed_catalogs_preserve_owning_outcomes_without_tools() {
+        for (malformed, phase, reason) in [
+            (false, "done", "nothing_to_restore"),
+            (true, "error", "ledger_degraded"),
+        ] {
+            for request in [json!({"day":"20260101"}), json!({"all":true})] {
+                let root = crate::test_support::root("healthy");
+                if malformed {
+                    archive(root.path(), false);
+                    let ledger =
+                        solstone_core_offload::ledger_path_for_day(root.path(), "20260101")
+                            .unwrap();
+                    fs::write(ledger, b"not json\n").unwrap();
+                    assert!(solstone_core_offload::ledger::catalog_journal(root.path()).degraded());
+                }
+                let (deps, runner, http) = missing_tool_deps(root.path());
+                let before = snapshot(root.path());
+                let (status, _) =
+                    post_json(&deps, "/app/backup/offload/restore", Some(request)).await;
+                assert_eq!(status, 200);
+                let terminal = wait_terminal(&deps).await;
+                assert_eq!(terminal["operation"]["phase"], phase);
+                assert_eq!(terminal["operation"]["reason_code"], reason);
+                assert!(runner.calls.lock().unwrap().is_empty());
+                assert!(http.requests.lock().unwrap().is_empty());
+                assert_eq!(snapshot(root.path()), before);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_restore_still_requires_installed_tools() {
+        let root = crate::test_support::root("healthy");
+        let (deps, runner, http) = missing_tool_deps(root.path());
+        let (status, _) = post_json(&deps, "/app/backup/restore", Some(restore_body())).await;
+        assert_eq!(status, 200);
+        let terminal = wait_terminal(&deps).await;
+        assert_eq!(terminal["operation"]["kind"], "restore");
+        assert_eq!(terminal["operation"]["phase"], "error");
+        assert_eq!(terminal["operation"]["reason_code"], "restic_unavailable");
+        assert!(runner.calls.lock().unwrap().is_empty());
+        assert!(http.requests.lock().unwrap().is_empty());
     }
 }
 
@@ -2184,40 +2253,6 @@ async fn enable_success_response_shape_has_operation_without_secrets() {
     assert!(body.get("daily_key").is_none());
     assert!(body.get("broker_token").is_none());
     let _ = wait_terminal(&deps).await;
-}
-
-#[tokio::test]
-async fn offload_restore_day_digest_mismatch_is_verification_failed() {
-    let root = crate::test_support::root("healthy");
-    let segment = root.path().join("chronicle/20260101/010000_001");
-    fs::create_dir_all(&segment).unwrap();
-    solstone_core_offload::append_offload_event(
-        root.path(),
-        "20260101",
-        "_default",
-        "010000_001",
-        "snapshot",
-        &[solstone_core_offload::OffloadFile {
-            name: "new.webm".into(),
-            bytes: 8,
-            sha256: "d".repeat(64),
-        }],
-        1,
-    )
-    .unwrap();
-    let runner = RestoreMismatchRunner::default();
-    let (deps, _restic) = prepared(root.path().to_path_buf(), Arc::new(runner));
-    let (status, body) = post_json(
-        &deps,
-        "/app/backup/offload/restore",
-        Some(json!({"day": "20260101"})),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body["operation"]["kind"], "offload_restore");
-    let done = wait_terminal(&deps).await;
-    assert!(done["operation"]["phase"] == "error" || done["operation"]["phase"] == "degraded");
-    assert_eq!(done["operation"]["reason_code"], "verification_failed");
 }
 
 #[tokio::test]
