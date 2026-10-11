@@ -5883,6 +5883,7 @@ dependencies = [
  "chrono",
  "log",
  "serde_json",
+ "solstone-core-entity",
  "solstone-core-format",
  "solstone-core-journal-io",
  "solstone-core-memory-original",
