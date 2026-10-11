@@ -174,6 +174,70 @@ pub struct RootActivityCarrier {
 }
 
 impl RootActivityCarrier {
+    /// Observes this actual empty reservation and persistent lock. The result is
+    /// immutable data; it never certifies recovery, cooperation or settlement.
+    pub fn observe_recovery_binding(
+        &self,
+        origin: &crate::archive_origin::LocalArchiveOrigin,
+        repository_id: &str,
+    ) -> Result<
+        crate::archive_recovery::ArchiveRecoveryBinding,
+        crate::archive_recovery::RecoveryBindingObservationError,
+    > {
+        use crate::archive_recovery::RecoveryBindingObservationError as E;
+        #[cfg(target_os = "linux")]
+        {
+            if !Arc::ptr_eq(origin.root(), self.journal_root()) {
+                return Err(E::Native(invalid(
+                    "origin belongs to another original root",
+                )));
+            }
+            origin.revalidate().map_err(E::Origin)?;
+            self.activity().revalidate().map_err(E::Activity)?;
+            let matched = self
+                .observation()
+                .validate(self.journal_root())
+                .map_err(E::Native)?;
+            let lock = self
+                .activity()
+                .recovery_lock_observation()
+                .map_err(E::Activity)?;
+            let name = matched
+                .name
+                .to_str()
+                .ok_or_else(|| E::Native(invalid("invalid reservation name")))?;
+            let binding = crate::archive_recovery::ArchiveRecoveryBinding::observed(
+                origin.evidence().clone(),
+                name.into(),
+                matched.identity,
+                lock.clone(),
+                repository_id,
+            )
+            .map_err(E::Native)?;
+            origin.revalidate().map_err(E::Origin)?;
+            if self
+                .observation()
+                .validate(self.journal_root())
+                .map_err(E::Native)?
+                != matched
+                || self
+                    .activity()
+                    .recovery_lock_observation()
+                    .map_err(E::Activity)?
+                    != lock
+            {
+                return Err(E::Native(changed()));
+            }
+            self.activity().revalidate().map_err(E::Activity)?;
+            Ok(binding)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (origin, repository_id);
+            Err(E::Unsupported)
+        }
+    }
+
     /// Caller must freshly refuse existing unresolved obligations under this
     /// original activity lease before preparing a new operation. This native
     /// leaf cannot certify the owning catalog/intent/config admission.

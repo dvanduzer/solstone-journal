@@ -26,6 +26,35 @@ use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::media::MediaDigest;
 use solstone_core_journal_io::media::{ArchiveSource, Cleanup, OwnedMediaTarget, PreparedMedia};
 
+pub enum ArchiveRecoveryReadRefusal {
+    Qualification(ReadbackError),
+    CapturedOriginUnavailable,
+    Observation(solstone_core_journal_io::archive_recovery::RecoveryBindingObservationError),
+}
+impl fmt::Debug for ArchiveRecoveryReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+impl fmt::Display for ArchiveRecoveryReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Qualification(_) => "archive read qualification refused recovery observation",
+            Self::CapturedOriginUnavailable => "original archive origin unavailable",
+            Self::Observation(_) => "original archive recovery observation failed",
+        })
+    }
+}
+impl std::error::Error for ArchiveRecoveryReadRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation(error) => Some(error),
+            Self::Qualification(error) => Some(error),
+            Self::CapturedOriginUnavailable => None,
+        }
+    }
+}
+
 use crate::Destination;
 use crate::archive_activity::{
     ArchiveOperationClock, OwnedPreparedArchiveHold, OwnedPreparedArchiveOperation,
@@ -225,6 +254,16 @@ enum DirectInvocation {
     Dump,
 }
 impl DirectExecution {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn qualify_read_state(&self) -> Result<(), ReadbackError> {
+        if let Some(reason) = self.failure {
+            return Err(reason);
+        }
+        if self.pending != 0 || self.completed[0] == 0 || self.completed[1] == 0 {
+            return Err(ReadbackError::ToolFailed);
+        }
+        Ok(())
+    }
     fn fail(&mut self, reason: ReadbackError) {
         self.failure.get_or_insert(reason);
     }
@@ -362,6 +401,7 @@ impl OwnedDirectReadHold {
     pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
         self.operation.carrier()
     }
+
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
         self.operation.journal_root()
     }
@@ -551,6 +591,20 @@ impl OwnedReadOperation {
     pub fn as_read(&self) -> &ReadOperation<'static> {
         &self.read
     }
+    pub fn observe_recovery_binding(
+        &self,
+    ) -> Result<
+        solstone_core_journal_io::archive_recovery::ArchiveRecoveryBinding,
+        ArchiveRecoveryReadRefusal,
+    > {
+        self.read.observe_recovery_binding()
+    }
+    pub fn archive_origin_failure(
+        &self,
+    ) -> Option<&solstone_core_journal_io::archive_origin::OriginObservationFailure> {
+        self.read.archive_origin_failure()
+    }
+
     pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
         self.read.carrier()
     }
@@ -972,40 +1026,33 @@ impl<'a> ReadOperation<'a> {
             _execution: execution.into_inner(),
         })
     }
+    fn qualify_direct(&self) -> Result<(), ReadbackError> {
+        self.revalidate_admission()?;
+        if self.operation.owned_clock().is_none() {
+            return Err(ReadbackError::Unsupported);
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            if self.member.bytes() != 30_924_962
+                || self.member.sha256()
+                    != "ae7fe58ab3511f830fd31d157158620b209522ff1332b119199d2e938d72338c"
+            {
+                return Err(ReadbackError::UnsupportedToolVersion);
+            }
+            let execution = self.execution.borrow();
+            if let Some(predecessor) = &execution.predecessor {
+                predecessor.qualify_settlement()?;
+            }
+            execution.qualify_read_state()
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            Err(ReadbackError::Unsupported)
+        }
+    }
+
     pub fn settle_direct(self) -> Result<SettledDirectRead<'a>, Box<HeldDirectRead<'a>>> {
-        let qualify = (|| {
-            self.revalidate_admission()?;
-            if self.operation.owned_clock().is_none() {
-                return Err(ReadbackError::Unsupported);
-            }
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            {
-                if self.member.bytes() != 30_924_962
-                    || self.member.sha256()
-                        != "ae7fe58ab3511f830fd31d157158620b209522ff1332b119199d2e938d72338c"
-                {
-                    return Err(ReadbackError::UnsupportedToolVersion);
-                }
-                let execution = self.execution.borrow();
-                if let Some(predecessor) = &execution.predecessor {
-                    predecessor.qualify_settlement()?;
-                }
-                if let Some(reason) = execution.failure {
-                    return Err(reason);
-                }
-                if execution.pending != 0
-                    || execution.completed[0] == 0
-                    || execution.completed[1] == 0
-                {
-                    return Err(ReadbackError::ToolFailed);
-                }
-                Ok(())
-            }
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            {
-                Err(ReadbackError::Unsupported)
-            }
-        })();
+        let qualify = self.qualify_direct();
         match qualify {
             Ok(()) => Ok(SettledDirectRead { read: self }),
             Err(reason) => Err(Box::new(HeldDirectRead { reason, read: self })),
@@ -1112,6 +1159,34 @@ impl<'a> ReadOperation<'a> {
     pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
         self.operation.carrier()
     }
+    /// Forward DATA from this read's original owners. No work is settled or released.
+    pub fn observe_recovery_binding(
+        &self,
+    ) -> Result<
+        solstone_core_journal_io::archive_recovery::ArchiveRecoveryBinding,
+        ArchiveRecoveryReadRefusal,
+    > {
+        self.qualify_direct()
+            .map_err(ArchiveRecoveryReadRefusal::Qualification)?;
+        let origin = self
+            .operation
+            .activity
+            .origin()
+            .map_err(|_| ArchiveRecoveryReadRefusal::CapturedOriginUnavailable)?;
+        let binding = self
+            .carrier()
+            .observe_recovery_binding(origin, self.repository_id())
+            .map_err(ArchiveRecoveryReadRefusal::Observation)?;
+        self.qualify_direct()
+            .map_err(ArchiveRecoveryReadRefusal::Qualification)?;
+        Ok(binding)
+    }
+    pub fn archive_origin_failure(
+        &self,
+    ) -> Option<&solstone_core_journal_io::archive_origin::OriginObservationFailure> {
+        self.operation.activity.origin().err()
+    }
+
     pub fn activity(&self) -> &Arc<ActivityLease> {
         self.operation.activity()
     }
@@ -1667,6 +1742,26 @@ fn exact_regular_node(bytes: &[u8], file: &ExactArchiveFile) -> Result<(), Readb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn direct_read_state_requires_metadata_and_preserves_first_failure() {
+        let mut state = DirectExecution::default();
+        assert_eq!(state.qualify_read_state(), Err(ReadbackError::ToolFailed));
+        state.completed[DirectInvocation::Version as usize] = 1;
+        assert!(state.qualify_read_state().is_err());
+        state.completed[DirectInvocation::Config as usize] = 1;
+        assert_eq!(state.qualify_read_state(), Ok(()));
+        state.pending = 1;
+        assert!(state.qualify_read_state().is_err());
+        state.pending = 0;
+        state.fail(ReadbackError::Admission(AdmissionError::Cancelled));
+        state.fail(ReadbackError::ToolFailed);
+        assert_eq!(
+            state.qualify_read_state(),
+            Err(ReadbackError::Admission(AdmissionError::Cancelled))
+        );
+    }
 
     // Reduced output captured from restic 0.19.0 with a two-file local
     // repository. Parser fields are verbatim; unrelated host metadata is omitted.

@@ -128,6 +128,22 @@ pub struct ActivityLease {
 }
 
 impl ActivityLease {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recovery_lock_observation(
+        &self,
+    ) -> Result<crate::archive_recovery::RecoveryLockObservation, ActivityAdmissionError> {
+        self.revalidate()?;
+        let observation = self
+            .inner
+            .guard
+            .lock()
+            .map_err(|_| ActivityAdmissionError::Unavailable(ActivityUnavailable::Poisoned))?
+            .recovery_observation(self.inner.root.as_ref(), OsStr::new(ENTRY))
+            .map_err(entry_error)?;
+        self.revalidate()?;
+        Ok(observation)
+    }
+
     pub fn try_acquire(root: Arc<JournalRoot>) -> Result<Arc<Self>, ActivityAdmissionError> {
         Ok(Arc::new(Self {
             inner: Admission::acquire(root)?,

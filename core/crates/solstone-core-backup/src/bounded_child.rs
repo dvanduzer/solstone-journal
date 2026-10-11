@@ -485,7 +485,7 @@ fn execute_request(
     cancellation: Option<&ArchiveCancellation>,
     setup: ChildSetup,
 ) -> io::Result<CompletedChild> {
-    let dns_deadline = match setup {
+    let dns_deadline: Option<Instant> = match setup {
         #[cfg(target_os = "linux")]
         ChildSetup::Dns(deadline) => Some(deadline),
         _ => None,

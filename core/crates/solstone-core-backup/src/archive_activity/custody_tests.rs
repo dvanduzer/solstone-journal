@@ -37,6 +37,47 @@ fn fixture() -> (
     (temp, root, Arc::new(FixedClock))
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn unsupported_origin_keeps_original_closed_preparation() {
+    let temp = tempfile::Builder::new()
+        .prefix("archive-origin-unavailable-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    fs::write(
+        temp.path().join("config/journal.json"),
+        br#"{"backup":{"enabled":true,"mode":"byo"}}"#,
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+    let prepared = OwnedPreparedArchiveOperation::prepare(
+        Arc::clone(&root),
+        ArchiveBudget::new(clock.as_ref()).unwrap(),
+        Arc::clone(&clock),
+    )
+    .unwrap_or_else(|e| panic!("ordinary preparation refused: {}", e.reason()));
+    let origin = prepared.as_prepared().activity.origin().unwrap_err();
+    assert!(matches!(
+        origin.error(),
+        solstone_core_journal_io::archive_origin::OriginError::Unsupported(_)
+    ));
+    assert!(Arc::ptr_eq(origin.root(), &root));
+    let hold = prepared.into_owned_hold();
+    let hold = std::thread::spawn(move || {
+        let origin = hold.activity.origin().unwrap_err();
+        assert!(Arc::ptr_eq(origin.root(), hold.journal_root()));
+        busy(hold.journal_root());
+        hold
+    })
+    .join()
+    .unwrap();
+    assert!(Arc::ptr_eq(hold.journal_root(), &root));
+    busy(&root);
+    drop(hold);
+}
+
 fn busy(root: &Arc<JournalRoot>) {
     assert!(matches!(
         ActivityLease::try_acquire(Arc::clone(root)),
@@ -88,7 +129,8 @@ fn custody_keeps_original_lease_without_blocking_carrier_unwrap_and_retirement()
         owned_clock,
     ) = prepared.into_parts();
     drop((configuration, budget, original_clock, owned_clock));
-    let ArchiveActivity { carrier } = activity;
+    let ArchiveActivity { carrier, origin } = activity;
+    drop(origin);
     let carrier = match Arc::try_unwrap(carrier) {
         Ok(carrier) => carrier,
         Err(_) => panic!("outside custody must not retain a carrier share"),

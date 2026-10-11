@@ -690,6 +690,37 @@ pub struct BoundParentLock {
 
 #[cfg(unix)]
 impl BoundParentLock {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recovery_observation(
+        &self,
+        parent: &impl AsFd,
+        name: &OsStr,
+    ) -> Result<crate::archive_recovery::RecoveryLockObservation, ExistingParentLockError> {
+        use std::os::unix::fs::MetadataExt;
+        self.revalidate_bound(parent, name)?;
+        let metadata = self
+            ._guard
+            .metadata()
+            .map_err(|source| ExistingParentLockError::Io {
+                operation: "observe retained activity lock",
+                path: PathBuf::from(name),
+                source,
+            })?;
+        let observation = crate::archive_recovery::RecoveryLockObservation {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+        };
+        self.revalidate_bound(parent, name)?;
+        Ok(observation)
+    }
+
     /// Recheck the held persistent lock against its exact name in the retained
     /// parent. The caller separately validates that parent's journal binding.
     pub fn revalidate_bound(
