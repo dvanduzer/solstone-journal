@@ -30,6 +30,7 @@ pub mod runner;
 pub mod s3_wipe;
 pub mod schedule;
 pub mod teardown;
+pub mod teardown_admission;
 pub use engine::backup_enabled;
 pub use schedule::effective_backup_schedule;
 #[cfg(windows)]
@@ -86,6 +87,9 @@ pub use runner::{
 };
 pub use s3_wipe::{DELETE_OBJECT_BATCH_SIZE, S3Credentials, WipeResult, wipe_prefix};
 pub use teardown::{TeardownResult, teardown_backup};
+pub use teardown_admission::{
+    TeardownAdmission, TeardownAdmissionRefusal, TeardownReaderRefusal, admit_teardown,
+};
 
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

@@ -25,7 +25,11 @@ fn hosted_binding_read_path(journal: &Path) -> PathBuf {
 
 pub fn load_hosted_binding(journal: &Path) -> Option<HostedBinding> {
     let bytes = read_binding_bytes(&hosted_binding_read_path(journal)).ok()?;
-    let raw = serde_json::from_slice::<Value>(&bytes).ok()?;
+    decode_hosted_binding(&bytes)
+}
+
+pub(crate) fn decode_hosted_binding(bytes: &[u8]) -> Option<HostedBinding> {
+    let raw = serde_json::from_slice::<Value>(bytes).ok()?;
     let raw = raw.as_object()?;
     Some(HostedBinding {
         broker_endpoint: non_blank(raw, "broker_endpoint")?,
