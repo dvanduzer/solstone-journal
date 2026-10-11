@@ -6,6 +6,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.0.41] - 2026-10-11
+
 ### Added
 
 - `solstone link serve` now warns at startup that it is for development on trusted systems, because local callers can use the paired owner's full journal API authority.
@@ -15,10 +17,11 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- older solstone apps must update to keep syncing with your journal. minimum versions: tmux 2.0.6, linux 2.0.7, macos 2.0.15, windows 2.0.10, android 2.1.9, and ios 2.0.5 (build 107).
+- your journal no longer makes separate lists of decisions or commitments, counts them in profiles, or lets you mark them complete. your morning briefing no longer tells you what you owe or what you're waiting on. activities still describe what happened and who did it, and your weekly page still includes quotations from audio in which your voice is recognized. existing records stay as written.
+- for now, you can't bring back media your journal moved into your backup, or approve or decline the files it proposes to remove. while these are paused, your journal removes no media on its own, and files proposed for removal stay on your journal's computer. if your backup holds media that's no longer on that computer, keep your backup: turning it off and deleting it, or letting encrypted backup run by sol pbc end, deletes the only copy.
 - a connected agent can now list what a day or a range of days holds without searching for a word, and its list of transcripts shows each one's time, can be narrowed to part of a day, and continues past its first page.
 - when you ask a connected agent to remember something, it's now told to save it in your journal.
-- your journal no longer makes separate lists of decisions or commitments, counts them in profiles, or lets you mark them complete. your morning briefing no longer tells you what you owe or what you're waiting on. activities still describe what happened and who did it, and your weekly page still includes quotations from audio in which your voice is recognized. existing records stay as written.
-- older solstone apps must update to keep syncing with your journal. minimum versions: tmux 2.0.6, linux 2.0.7, macos 2.0.15, windows 2.0.10, android 2.1.9, and ios 2.0.5 (build 107).
 - when you import a text or markdown transcript and the journal can't find turn times in it, the import now says so, both in the command's output and on the import's page, with a link to ask us to support how your transcript marks times. the file still lands as one segment at the import's start time, each line as written.
 - after midnight, your journal now waits at least ten minutes, and up to an hour, for what's still coming in from the day that just ended before it makes that day's daily results and your morning briefing. when something was still coming in at midnight, it used to start on the day straight away and make part of it again ten to fifteen minutes later.
 - your morning briefing now stays as it was from noon on the morning it's for. until noon, something that arrives late for the day before, such as audio from your watch, can still change it. before, that could happen until midnight. to have it written again, run `solstone journal reprocess DAY --from-scratch` for the day before that morning. it redoes that whole day.
@@ -26,29 +29,25 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- security fix: agents on your network now stay disconnected while your journal's settings file is missing, unreadable or malformed. before, a file that couldn't be read could turn network access on even when you had turned it off. access resumes when the file is readable and network access is on.
+- copying older media to your backup now waits when your backup hasn't passed a check yet, or its last check can't be read. before, it went ahead.
 - deferred processing now starts during your chosen time window, or when all connected displays have been asleep for two minutes on mac or linux and that option is enabled. new material keeps reaching your journal while processing waits. work already running can finish after the window closes or a display wakes.
 - when a screen summary runs out of room, your journal now retries it more concisely while keeping the same source material.
 - your agents can now see speaker names in transcripts when the speaker is named for those sentences in your journal.
-
 - when a connected agent searches for a person's or project's full name, the results can now include a short description and notes from the facets you shared with it. for names such as "Project Juniper", the search also finds entries that call the project "Juniper".
 - starting the same connected agent repeatedly for short tasks no longer stops it with "MCP bearer session limit reached". your journal makes room by closing that connection's least recently used session. a quiet agent whose session was closed may have to reconnect.
-- security fix: agents on your network now stay disconnected while your journal's settings file is missing, unreadable or malformed. before, a file that couldn't be read could turn network access on even when you had turned it off. access resumes when the file is readable and network access is on.
 - on mac, installing local thinking or transcription now also clears quarantine, macos's marker for downloaded files, inside the downloaded folder.
-
 - a connected agent can now read transcripts of imported audio, and reads imported AI conversations and imported text transcripts as plain text with their times. before, imported audio couldn't be opened, and the others came back as raw data.
 - a transcript your journal can't read no longer stops a connected agent from listing that day's other transcripts.
 - if the model returns no text for an activity's story, your journal can now try once more through the same thinking provider.
 - home now names devices with rejected uploads, even when another source is still arriving, and shows queued work held for a safety check. both link to their details in health. when status is unavailable, the last known issues stay labeled as such.
-
 - health shows queued work held for a safety check, with the affected work, technical details and a way to get help. if live status becomes unavailable, the last check stays visible.
 - the backup page and the backup offload status command now count all original media on this device, including files proposed for removal. when a media total can't be checked completely, they show the amount counted so far separately.
 - when a backup action fails, the backup page now shows any guidance the tool gave on what to do next.
 - your journal no longer saves a transcript or description after the media has changed or its segment has been deleted.
 - the health page now shows which source on a device had uploads turned away, even when another source is still adding material. after a successful check, if device status can't be checked again, it keeps that last result and shows when it was checked.
 - backup commands now report when media offload couldn't finish, even if some files were marked for removal first. the backup page shows the latest offload and verification results separately from the last completed run.
-
 - moving a segment now stops if another operation is changing either its current directory or the directory it would move to. try the move again once that operation finishes.
-
 - a week your journal makes after you've deleted every segment of a conversation now leaves that conversation's words out of "said by you". before, they could still appear there.
 - `solstone call health pipeline --day DAY` now says when it couldn't read a day's processing record, as `scan_failed` with a reason. before, on a day with a very large record, it said the day's recordings hadn't been processed.
 - on the entities page, when your journal refuses something you asked for, such as a merge or a restore, it now says why, for example that one side of a merge is blocked. before, it often said only "Entity request refused".
