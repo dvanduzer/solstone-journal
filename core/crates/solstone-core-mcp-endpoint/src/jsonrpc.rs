@@ -3,6 +3,8 @@
 
 //! Minimal JSON-RPC 2.0 envelopes for the MCP surface.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -31,7 +33,7 @@ pub(crate) struct JsonRpcResponse {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct JsonRpcErrorObject {
     code: i32,
-    message: &'static str,
+    message: Cow<'static, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Value>,
 }
@@ -92,12 +94,28 @@ impl JsonRpcResponse {
         Self::error(id, -32602, "invalid params")
     }
 
+    /// A tool call whose arguments the tool refused, saying what to correct.
+    pub(crate) fn invalid_arguments(id: Option<&Value>, message: String) -> Self {
+        Self::error(id, -32602, message)
+    }
+
     pub(crate) fn internal_error(id: Option<&Value>, message: &'static str) -> Self {
         Self::error(id, -32603, message)
     }
 
     pub(crate) fn tool_not_found(id: Option<&Value>) -> Self {
         Self::error(id, -32601, "tool not found")
+    }
+
+    /// A tool that could not run, with its reason code and a plain sentence an
+    /// agent can act on.
+    pub(crate) fn tool_failed(id: Option<&Value>, error: crate::tools::ToolError) -> Self {
+        Self::error_with_data(
+            id,
+            -32000,
+            format!("tool execution failed: {}", error.agent_message()),
+            json!({ "reason": error.reason() }),
+        )
     }
 
     pub(crate) fn tool_error(id: Option<&Value>, reason: &'static str) -> Self {
@@ -113,18 +131,23 @@ impl JsonRpcResponse {
         Self::error_with_data(id, -32001, "Access denied", json!({ "reason": reason }))
     }
 
-    fn error(id: Option<&Value>, code: i32, message: &'static str) -> Self {
+    fn error(id: Option<&Value>, code: i32, message: impl Into<Cow<'static, str>>) -> Self {
         Self::error_with_optional_data(id, code, message, None)
     }
 
-    fn error_with_data(id: Option<&Value>, code: i32, message: &'static str, data: Value) -> Self {
+    fn error_with_data(
+        id: Option<&Value>,
+        code: i32,
+        message: impl Into<Cow<'static, str>>,
+        data: Value,
+    ) -> Self {
         Self::error_with_optional_data(id, code, message, Some(data))
     }
 
     fn error_with_optional_data(
         id: Option<&Value>,
         code: i32,
-        message: &'static str,
+        message: impl Into<Cow<'static, str>>,
         data: Option<Value>,
     ) -> Self {
         Self {
@@ -133,7 +156,7 @@ impl JsonRpcResponse {
             result: None,
             error: Some(JsonRpcErrorObject {
                 code,
-                message,
+                message: message.into(),
                 data,
             }),
         }
@@ -198,7 +221,7 @@ pub(crate) fn classify_method(request: &JsonRpcRequest) -> Result<McpMethod, Jso
 
 /// How to work from a journal, for an agent that brings no skills of its own.
 /// Each tool's description carries the detail; this is the overview.
-pub(crate) const SERVER_INSTRUCTIONS: &str = "This is the owner's journal: their record of their days, conversations, and the people and projects in them. You can read what the owner allowed this connection to see.\n\n- search takes a few keywords, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. It does not read conversations word for word.\n- To answer what someone said, promised or decided, search the names or the topic over a range of days, then read the transcript segments the results list with get_transcript. Answer from what was actually said. Tell a proposal apart from something done, and tell who was speaking apart from the owner. A transcript may number its speakers instead of naming them; when it does not say who spoke, say so.\n- For a day, search with `day` set, or call list_transcripts for that day, narrowed to a time range when you know one.\n- For a person or project, call list_entities, then get_entity, and search the name.\n- When the owner says \"remember that\" or asks you to remember something, call save_memory to save it in their journal. recall_memory returns only what this connection saved; search can include notes saved by other agents, so keep their origin attribution.\n- When a tool reports that nothing matched, tell the owner that. An empty search means nothing searchable matched, not that it never happened. Never fill a gap with a guess.";
+pub(crate) const SERVER_INSTRUCTIONS: &str = "This is the owner's journal: their record of their days, conversations, and the people and projects in them. You can read what the owner allowed this connection to see.\n\n- search takes a few keywords, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. It does not read conversations word for word.\n- To answer what someone said, promised or decided, search the names or the topic over a range of days, then read the transcript segments the results list with get_transcript. Answer from what was actually said. Tell a proposal apart from something done, and tell who was speaking apart from the owner. A transcript may number its speakers instead of naming them; when it does not say who spoke, say so.\n- For a day, search with `day` set, or call list_transcripts for that day, narrowed to a time range when you know one.\n- For a person or project, call list_entities, then get_entity, and search the name.\n- save_memory saves a note in the owner's journal when they say \"remember that\" or ask you to remember something. recall_memory returns only what this connection saved; search can include notes saved by other agents, so keep their origin attribution.\n- When a tool reports that nothing matched, tell the owner that. An empty search means nothing searchable matched, not that it never happened. Never fill a gap with a guess.";
 
 pub(crate) fn initialize_result() -> Value {
     json!({

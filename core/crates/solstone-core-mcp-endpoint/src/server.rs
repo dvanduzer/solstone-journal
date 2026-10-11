@@ -773,16 +773,25 @@ fn execute_tool_call(
             request.id.as_ref(),
             tool_result(output.value, output.empty_note.as_deref()),
         ),
-        Err(DispatchError::InvalidInput) => JsonRpcResponse::invalid_params(request.id.as_ref()),
+        Err(DispatchError::InvalidInput) => JsonRpcResponse::invalid_arguments(
+            request.id.as_ref(),
+            crate::registry::invalid_arguments_message(
+                journal_root,
+                &permissions::evaluate_connection_read(journal_root, &verified.id),
+                tool_name,
+                tool_arguments(request),
+            ),
+        ),
         Err(DispatchError::PermissionDenied(reason)) => {
             JsonRpcResponse::permission_denied(request.id.as_ref(), reason)
         }
         Err(DispatchError::Tool(crate::tools::ToolError::AuditUnavailable)) => {
-            JsonRpcResponse::internal_error(request.id.as_ref(), "MCP audit publication failed")
+            JsonRpcResponse::internal_error(
+                request.id.as_ref(),
+                crate::tools::ToolError::AuditUnavailable.agent_message(),
+            )
         }
-        Err(DispatchError::Tool(error)) => {
-            JsonRpcResponse::tool_error(request.id.as_ref(), error.reason())
-        }
+        Err(DispatchError::Tool(error)) => JsonRpcResponse::tool_failed(request.id.as_ref(), error),
     };
     json_rpc_response(if tools_list_changed {
         response.with_tools_list_changed()
