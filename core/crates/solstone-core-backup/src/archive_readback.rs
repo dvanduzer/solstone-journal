@@ -12,9 +12,9 @@ use std::time::Duration;
 #[cfg(any(unix, test))]
 use serde_json::Value;
 use solstone_core_journal_io::JournalRoot;
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use solstone_core_journal_io::media::MediaDigest;
-use solstone_core_journal_io::media::{Cleanup, OwnedMediaTarget, PreparedMedia};
+use solstone_core_journal_io::media::{ArchiveSource, Cleanup, OwnedMediaTarget, PreparedMedia};
 
 use crate::Destination;
 #[cfg(unix)]
@@ -111,6 +111,8 @@ pub type ReadbackAdmissionError = ReadbackError;
 
 pub struct ReadOperation<'a> {
     root: Arc<JournalRoot>,
+    #[cfg(all(unix, feature = "full-tests"))]
+    source_observations: std::cell::Cell<(usize, usize)>,
     #[cfg(unix)]
     configuration: ArchiveConfiguration,
     #[cfg(unix)]
@@ -164,6 +166,24 @@ impl std::error::Error for ReadbackFailure {}
 impl ReadbackFailure {
     pub fn reason(&self) -> ReadbackError {
         self.reason
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[doc(hidden)]
+    pub fn prepared_digest_for_test(&self) -> Option<&MediaDigest> {
+        match self.owned.as_ref() {
+            OwnedReadback::Prepared(prepared) => Some(prepared.digest()),
+            OwnedReadback::Target(_) => None,
+        }
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[doc(hidden)]
+    pub fn target_transport_issued_for_test(&self) -> Option<bool> {
+        match self.owned.as_ref() {
+            OwnedReadback::Target(target) => Some(target.helper_transport_issued()),
+            OwnedReadback::Prepared(_) => None,
+        }
     }
 
     /// Unknown writer lifetime never grants cleanup, including on Drop.
@@ -340,6 +360,8 @@ impl<'a> ReadOperation<'a> {
             }
             let admitted = Self {
                 root: input.root,
+                #[cfg(feature = "full-tests")]
+                source_observations: std::cell::Cell::new((0, 0)),
                 configuration: input.configuration,
                 budget: input.budget,
                 clock: input.clock,
@@ -364,6 +386,12 @@ impl<'a> ReadOperation<'a> {
     }
     pub fn repository_id(&self) -> &str {
         &self.repository_id
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[doc(hidden)]
+    pub fn source_observations_for_test(&self) -> (usize, usize) {
+        self.source_observations.get()
     }
 
     #[cfg(unix)]
@@ -440,6 +468,96 @@ impl<'a> ReadOperation<'a> {
             "--no-cache".into(),
         ])?;
         exact_regular_node(&output.output().stdout, file)
+    }
+
+    #[cfg(unix)]
+    fn revalidate_source(&self, source: &ArchiveSource<'_>) -> Result<(), ReadbackError> {
+        self.revalidate_local()?;
+        let result = source.revalidate();
+        #[cfg(feature = "full-tests")]
+        {
+            let (observed, failed) = self.source_observations.get();
+            self.source_observations
+                .set((observed + 1, failed + usize::from(result.is_err())));
+        }
+        self.revalidate_local()?;
+        result.map_err(|_| ReadbackError::NativeFailure)
+    }
+
+    /// Discover one retained source's exact snapshot path and independently read
+    /// its bytes. Other group members must have distinct original basenames.
+    pub fn read_owned_snapshot(
+        &mut self,
+        snapshot_id: &str,
+        source: &ArchiveSource<'_>,
+        target: OwnedMediaTarget,
+    ) -> Result<(ExactArchiveFile, PreparedMedia), ReadbackFailure> {
+        #[cfg(not(unix))]
+        {
+            let _ = (snapshot_id, source);
+            Err(ReadbackFailure::target(
+                ReadbackError::Unsupported,
+                WriterState::NotLaunched,
+                target,
+            ))
+        }
+        #[cfg(unix)]
+        {
+            if target.helper_transport_issued() {
+                return Err(ReadbackFailure::target(
+                    ReadbackError::NativeFailure,
+                    WriterState::Unknown,
+                    target,
+                ));
+            }
+            let discovery = (|| {
+                self.revalidate_source(source)?;
+                let name = source
+                    .name()
+                    .to_str()
+                    .filter(|name| plain_name(name))
+                    .ok_or(ReadbackError::InvalidSelection)?;
+                if !full_hex_identity(snapshot_id) || !full_hex_identity(&source.digest().sha256) {
+                    return Err(ReadbackError::InvalidSelection);
+                }
+                self.check_repository()?;
+                self.revalidate_source(source)?;
+                let output = self.query(vec![
+                    "ls".into(),
+                    "--json".into(),
+                    snapshot_id.into(),
+                    "--no-cache".into(),
+                ])?;
+                let file = owned_snapshot_file(
+                    &output.output().stdout,
+                    &self.repository_id,
+                    snapshot_id,
+                    name,
+                    source.digest(),
+                )?;
+                self.revalidate_source(source)?;
+                Ok(file)
+            })();
+            let file = match discovery {
+                Ok(file) => file,
+                Err(reason) => {
+                    return Err(ReadbackFailure::target(
+                        reason,
+                        WriterState::NotLaunched,
+                        target,
+                    ));
+                }
+            };
+            let prepared = self.read_exact(&file, target)?;
+            if let Err(reason) = self.revalidate_source(source) {
+                return Err(ReadbackFailure {
+                    reason,
+                    writer: WriterState::QualifiedCompletion,
+                    owned: Box::new(OwnedReadback::Prepared(prepared)),
+                });
+            }
+            Ok((file, prepared))
+        }
     }
 
     pub fn read_exact(
@@ -555,6 +673,65 @@ impl<'a> ReadOperation<'a> {
 }
 
 #[cfg(any(unix, test))]
+fn owned_snapshot_file(
+    bytes: &[u8],
+    repository_id: &str,
+    snapshot_id: &str,
+    name: &str,
+    digest: &MediaDigest,
+) -> Result<ExactArchiveFile, ReadbackError> {
+    let unavailable = ReadbackError::SnapshotNodeUnavailable;
+    let mut snapshots = 0usize;
+    let mut selected = None;
+    for value in serde_json::Deserializer::from_slice(bytes).into_iter::<Value>() {
+        let value = value.map_err(|_| unavailable)?;
+        match value.get("message_type").and_then(Value::as_str) {
+            Some("snapshot") => {
+                snapshots += 1;
+                if value.get("id").and_then(Value::as_str) != Some(snapshot_id) {
+                    return Err(unavailable);
+                }
+            }
+            Some("node") => {
+                // Every node must disclose a name so it cannot hide ambiguity.
+                let node_name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or(unavailable)?;
+                if node_name != name {
+                    continue;
+                }
+                if selected.is_some()
+                    || value.get("type").and_then(Value::as_str) != Some("file")
+                    || value.get("size").and_then(Value::as_u64) != Some(digest.size)
+                {
+                    return Err(unavailable);
+                }
+                let path = value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or(unavailable)?;
+                let file = ExactArchiveFile {
+                    repository_id: repository_id.to_owned(),
+                    snapshot_id: snapshot_id.to_owned(),
+                    name: name.to_owned(),
+                    archive_path: path.to_owned(),
+                    bytes: digest.size,
+                    sha256: digest.sha256.clone(),
+                };
+                file.validate().map_err(|_| unavailable)?;
+                selected = Some(file);
+            }
+            _ => return Err(unavailable),
+        }
+    }
+    if snapshots != 1 {
+        return Err(unavailable);
+    }
+    selected.ok_or(unavailable)
+}
+
+#[cfg(any(unix, test))]
 fn exact_regular_node(bytes: &[u8], file: &ExactArchiveFile) -> Result<(), ReadbackError> {
     let mut snapshots = 0usize;
     let mut nodes = 0usize;
@@ -591,6 +768,194 @@ fn exact_regular_node(bytes: &[u8], file: &ExactArchiveFile) -> Result<(), Readb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Reduced output captured from restic 0.19.0 with a two-file local
+    // repository. Parser fields are verbatim; unrelated host metadata is omitted.
+    const FULL_LS: &[u8] =
+        include_bytes!("../tests/fixtures/archive_readback/restic-0.19.0-full-ls.jsonl");
+    const EXACT_LS: &[u8] =
+        include_bytes!("../tests/fixtures/archive_readback/restic-0.19.0-exact-ls.jsonl");
+    const CAPTURED_SNAPSHOT: &str =
+        "61cc73a4bf7d520b6c28f68ab7f5402df357899c4613a4a6ea6dd9ea00b1804c";
+
+    fn captured_values() -> Vec<Value> {
+        serde_json::Deserializer::from_slice(FULL_LS)
+            .into_iter::<Value>()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn encode_values(values: &[Value]) -> Vec<u8> {
+        values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes()
+    }
+
+    fn captured_source() -> MediaDigest {
+        solstone_core_journal_io::media::digest_reader(
+            &mut b"actual owned discovery audio\n".as_slice(),
+        )
+        .unwrap()
+    }
+
+    fn discover(bytes: &[u8]) -> Result<ExactArchiveFile, ReadbackError> {
+        owned_snapshot_file(
+            bytes,
+            &"a".repeat(64),
+            CAPTURED_SNAPSHOT,
+            "audio.flac",
+            &captured_source(),
+        )
+    }
+
+    #[test]
+    fn captured_full_and_exact_lists_support_both_readback_parsers() {
+        let file = discover(FULL_LS).unwrap();
+        let values = captured_values();
+        let node = values
+            .iter()
+            .find(|value| value["name"] == "audio.flac")
+            .unwrap();
+        assert_eq!(file.archive_path, node["path"].as_str().unwrap());
+        assert_eq!(file.bytes, captured_source().size);
+        assert_eq!(file.sha256, captured_source().sha256);
+        exact_regular_node(FULL_LS, &file).unwrap();
+        exact_regular_node(EXACT_LS, &file).unwrap();
+
+        let screen = solstone_core_journal_io::media::digest_reader(
+            &mut b"actual owned discovery screen\n".as_slice(),
+        )
+        .unwrap();
+        let file = owned_snapshot_file(
+            FULL_LS,
+            &"a".repeat(64),
+            CAPTURED_SNAPSHOT,
+            "screen.mp4",
+            &screen,
+        )
+        .unwrap();
+        assert_eq!(file.name, "screen.mp4");
+        assert_eq!(file.bytes, screen.size);
+    }
+
+    #[test]
+    fn full_list_discovery_refuses_ambiguous_or_undisclosed_names() {
+        let values = captured_values();
+        let source = values
+            .iter()
+            .find(|value| value["name"] == "audio.flac")
+            .unwrap();
+        for replacement in [
+            serde_json::json!(29),
+            serde_json::json!(30),
+            serde_json::json!(null),
+        ] {
+            let mut duplicate = source.clone();
+            duplicate["path"] = serde_json::json!("/another/audio.flac");
+            duplicate["size"] = replacement;
+            let mut changed = values.clone();
+            changed.push(duplicate);
+            assert_eq!(
+                discover(&encode_values(&changed)).err(),
+                Some(ReadbackError::SnapshotNodeUnavailable)
+            );
+        }
+        for kind in ["dir", "symlink"] {
+            let mut duplicate = source.clone();
+            duplicate["path"] = serde_json::json!("/another/audio.flac");
+            duplicate["type"] = serde_json::json!(kind);
+            let mut changed = values.clone();
+            changed.push(duplicate);
+            assert_eq!(
+                discover(&encode_values(&changed)).err(),
+                Some(ReadbackError::SnapshotNodeUnavailable)
+            );
+        }
+        // An unrelated node with no usable name could hide a duplicate.
+        for name in [Value::Null, serde_json::json!(7), serde_json::json!([])] {
+            let mut changed = values.clone();
+            changed[1]["name"] = name;
+            assert_eq!(
+                discover(&encode_values(&changed)).err(),
+                Some(ReadbackError::SnapshotNodeUnavailable)
+            );
+        }
+        let mut changed = values;
+        changed[1].as_object_mut().unwrap().remove("name");
+        assert_eq!(
+            discover(&encode_values(&changed)).err(),
+            Some(ReadbackError::SnapshotNodeUnavailable)
+        );
+    }
+
+    #[test]
+    fn full_list_discovery_requires_one_snapshot_and_exact_regular_candidate() {
+        let values = captured_values();
+        let candidate = values
+            .iter()
+            .position(|value| value["name"] == "audio.flac")
+            .unwrap();
+        for (key, replacement) in [
+            ("type", serde_json::json!("dir")),
+            ("name", serde_json::json!("other.flac")),
+            ("size", serde_json::json!(30)),
+            ("size", serde_json::json!(-1)),
+            ("path", serde_json::json!("/a/../audio.flac")),
+            ("path", serde_json::json!("/a/other.flac")),
+            ("message_type", serde_json::json!("other")),
+        ] {
+            let mut changed = values.clone();
+            changed[candidate][key] = replacement;
+            assert_eq!(
+                discover(&encode_values(&changed)).err(),
+                Some(ReadbackError::SnapshotNodeUnavailable)
+            );
+        }
+        for key in ["type", "size", "path"] {
+            let mut changed = values.clone();
+            changed[candidate].as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                discover(&encode_values(&changed)).err(),
+                Some(ReadbackError::SnapshotNodeUnavailable)
+            );
+        }
+        let mut wrong = values.clone();
+        wrong[0]["id"] = serde_json::json!("b".repeat(64));
+        let mut duplicate = values.clone();
+        duplicate.push(values[0].clone());
+        let missing = values[1..].to_vec();
+        for changed in [wrong, duplicate, missing] {
+            assert_eq!(
+                discover(&encode_values(&changed)).err(),
+                Some(ReadbackError::SnapshotNodeUnavailable)
+            );
+        }
+        let mut truncated = FULL_LS.to_vec();
+        truncated.push(b'{');
+        assert_eq!(
+            discover(&truncated).err(),
+            Some(ReadbackError::SnapshotNodeUnavailable)
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_literal_snapshot_volume_path() {
+        let mut values = captured_values();
+        let candidate = values
+            .iter_mut()
+            .find(|value| value["name"] == "audio.flac")
+            .unwrap();
+        let literal = r"/\\?\Volume{08fa948d-3336-40fd-b369-dd44a1c89601}/stage/audio.flac";
+        candidate["path"] = serde_json::json!(literal);
+        let encoded = encode_values(&values);
+        let file = discover(&encoded).unwrap();
+        assert_eq!(file.archive_path, literal);
+        exact_regular_node(&encoded, &file).unwrap();
+    }
+
     fn selected() -> ExactArchiveFile {
         ExactArchiveFile {
             repository_id: "a".repeat(64),

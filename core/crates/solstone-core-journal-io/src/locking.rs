@@ -686,8 +686,53 @@ pub struct BoundParentLock {
     parent_identity: WindowsFileIdentity,
 }
 
+#[cfg(unix)]
+impl BoundParentLock {
+    pub(crate) fn revalidate_bound(
+        &self,
+        parent: &impl AsFd,
+        name: &OsStr,
+    ) -> Result<(), ExistingParentLockError> {
+        let name = NormalLockName::parse(name).ok_or_else(|| {
+            ExistingParentLockError::InvalidLockPath {
+                name: name.to_owned(),
+            }
+        })?;
+        verify_final_lock_entry(
+            parent,
+            &name,
+            &self._guard,
+            None,
+            &PathBuf::from(name.as_os_str()),
+            true,
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 impl BoundParentLock {
+    pub(crate) fn revalidate_bound(
+        &self,
+        parent: &impl AsHandle,
+        name: &OsStr,
+    ) -> Result<(), ExistingParentLockError> {
+        let name = NormalLockName::parse(name).ok_or_else(|| {
+            ExistingParentLockError::InvalidLockPath {
+                name: name.to_owned(),
+            }
+        })?;
+        let path = PathBuf::from(name.as_os_str());
+        validate_parent_handle_windows(parent, &path)?;
+        let current = file_identity(parent.as_handle().as_raw_handle())
+            .map_err(|source| existing_io("stat bound persistent lock parent", &path, source))?;
+        if current != self.parent_identity {
+            return Err(ExistingParentLockError::ParentChanged { parent: path });
+        }
+        validate_lock_entry_windows(self._guard.file(), &path)?;
+        verify_final_lock_entry_windows(parent, &name, self._guard.file(), &path)
+    }
+
     /// Full identity of the retained parent validated while acquiring this lock.
     pub(crate) const fn parent_identity(&self) -> WindowsFileIdentity {
         self.parent_identity

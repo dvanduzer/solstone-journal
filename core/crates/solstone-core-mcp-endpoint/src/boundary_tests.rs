@@ -1383,6 +1383,7 @@ fn setup_facets(journal: &Path) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plant_chunk(
     journal: &Path,
     path: &str,

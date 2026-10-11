@@ -15,7 +15,7 @@ publish = false
 unsafe_code = "deny"
 
 [features]
-full-tests = []
+full-tests = ["solstone-core-backup/full-tests"]
 default = []
 test-hooks = []
 test-support = []

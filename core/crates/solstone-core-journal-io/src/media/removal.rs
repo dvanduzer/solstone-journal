@@ -179,13 +179,15 @@ impl MediaRemoval {
     }
 
     fn validate_context(&self) -> io::Result<()> {
+        self.stage.revalidate_activity()?;
         self.source.revalidate()?;
         self.stage.parent.revalidate()?;
         let directory = self.stage.directory.as_ref().ok_or_else(changed)?;
         directory.revalidate()?;
         let source_root = self.source.inner.journal_root();
         let stage_root = self.stage.parent.inner.journal_root();
-        if source_root.identity() != stage_root.identity()
+        if !Arc::ptr_eq(source_root, self.stage.activity.journal_root())
+            || source_root.identity() != stage_root.identity()
             || source_root.canonical_path() != stage_root.canonical_path()
             || self.source.diagnostic_path().parent() != Some(self.stage.parent.diagnostic_path())
             || !self.source.identity().same_volume(directory.identity())
@@ -314,6 +316,7 @@ impl MediaRemoval {
             self.claim_file.as_mut().ok_or_else(changed)?,
             &self.expected,
         )?;
+        self.validate_context()?;
         self.receipt.effect = RemovalEffect::DeletionUncertain;
         platform::delete_claim(
             &directory.inner,
@@ -377,6 +380,7 @@ impl MediaRemoval {
             self.failure(RemovalPhase::Completion, error);
         }
         let stage_confirmation = (|| {
+            self.stage.revalidate_activity()?;
             self.stage.parent.revalidate()?;
             if self.stage.removed {
                 platform::ensure_absent(&self.stage.parent.inner, &self.stage.name)
@@ -398,6 +402,12 @@ impl MediaRemoval {
 
     /// Only known empty stages may be retired. Never retries a claim deletion.
     pub fn cleanup(&mut self) -> Cleanup {
+        if let Err(error) = self.stage.revalidate_activity() {
+            self.receipt.cleanup = Cleanup::Refused;
+            self.receipt.claim_confirmation = Confirmation::Unverified;
+            self.failure(RemovalPhase::Cleanup, error);
+            return Cleanup::Refused;
+        }
         if !matches!(
             self.receipt.effect,
             RemovalEffect::NotClaimed | RemovalEffect::Deleted

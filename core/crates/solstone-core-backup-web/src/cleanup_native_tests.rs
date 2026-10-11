@@ -35,7 +35,7 @@ const INNER_MARKERS: &[&str] = &[
     "BACKUP_CLEANUP_ORIGINAL_RESULT_RECOVERY_PASS",
     "BACKUP_CLEANUP_GLOBAL_RESULT_PRESERVED_PASS",
     "BACKUP_CLEANUP_WHOLE_RECORDING_GUARD_PASS",
-    "BACKUP_CLEANUP_SELECTIVE_RECORDING_GUARD_PASS",
+    "BACKUP_CLEANUP_SELECTIVE_RESTORE_HELD_PASS",
 ];
 
 fn run_owned_fixture() {
@@ -239,115 +239,180 @@ impl ToolRunner for RestoreWriterFault {
 }
 
 fn restore_engines_preserve_configuration_while_writer_cleanup_is_pending() {
-    for selective in [false, true] {
-        let fault = FaultGuard(HelperCleanupObservationFault::new());
-        let root = if selective {
-            crate::test_support::offload_inventory_root()
-        } else {
-            crate::test_support::root("fresh")
-        };
-        let partial = if selective {
-            root.path()
-                .join("chronicle")
-                .join("20260102")
-                .join("020000_001")
-                .join("backup.webm")
-        } else {
-            root.path().join("partial-restore.bin")
-        };
-        assert!(!partial.exists());
-        let (entered, waiting) = mpsc::channel();
-        let (publish, publication) = mpsc::channel();
-        publish.send(()).unwrap();
-        let runner = RestoreWriterFault {
-            writer: FaultRunner {
-                fault: fault.0.clone(),
-                entered,
-                publish: Mutex::new(publication),
-                calls: AtomicUsize::new(0),
-                partial_output: Some(partial.clone()),
-            },
-            expected_resources: if selective { 2 } else { 1 },
-        };
-        let deps = BackupWebDeps::production(
-            root.path().to_path_buf(),
-            crate::measurement::new(root.path()),
-        );
-        let config = root.path().join("config/journal.json");
-        let before = std::fs::read(&config).unwrap();
-        let executable = child_request(BoundedHelperResources::new()).executable;
-        let services = BackupServices {
-            runner: &runner,
-            http: deps.http.as_ref(),
-            clock: deps.clock.as_ref(),
-            restic_path: Some(&executable),
-            rclone_path: None,
-            version: deps.version,
-            journal_maintenance: deps.journal_maintenance.as_ref(),
-        };
-        let recorder = RestoreRecorderSpy::new();
-        if selective {
-            let result =
-                solstone_core_offload::restore_offload_day(root.path(), &services, "20260102");
-            assert_eq!(result.status, "error");
-            assert_eq!(result.reason.as_deref(), Some("failed"));
-        } else {
-            let destination = solstone_core_backup::Destination {
-                repository: "s3:s3.example.invalid/cleanup".into(),
-                backend: "s3".into(),
-                credentials: serde_json::json!({
-                    "access_key_id":"SYNTHETIC", "secret_access_key":"synthetic-secret"
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-            };
-            let result = restore_journal(
-                root.path(),
-                &services,
-                &recorder,
-                destination,
-                &solstone_core_backup::generate_recovery_key().unwrap(),
-            );
-            assert_eq!(result.status, "error");
-            assert_eq!(result.reason_code.as_deref(), Some("restore_io_failed"));
-            assert!(
-                recorder.calls().is_empty(),
-                "no recorder call while the writer retains cleanup"
-            );
-        }
-        let owner = waiting.recv_timeout(WAIT).unwrap();
-        assert_eq!(owner.observe(), HelperCleanupStatus::Pending);
-        assert_eq!(runner.writer.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(std::fs::read(&config).unwrap(), before);
-        let partial_bytes =
-            std::fs::read(&partial).expect("rollback must not remove a pending writer's file");
-        assert!(partial_bytes.starts_with(b"ready:"));
-        fault.0.release();
-        assert_eq!(
-            owner.retry_until(Instant::now() + WAIT),
-            HelperCleanupStatus::Quiescent
-        );
-        assert_eq!(
-            std::fs::read(&config).unwrap(),
-            before,
-            "cleanup must not replay bookkeeping"
-        );
-        assert!(recorder.calls().is_empty());
-        assert_eq!(
-            std::fs::read(&partial).unwrap(),
-            partial_bytes,
-            "recovery must not replay rollback"
-        );
-        println!(
-            "{}",
-            if selective {
-                "BACKUP_CLEANUP_SELECTIVE_RECORDING_GUARD_PASS"
-            } else {
-                "BACKUP_CLEANUP_WHOLE_RECORDING_GUARD_PASS"
-            }
-        );
+    let fault = FaultGuard(HelperCleanupObservationFault::new());
+    let root = crate::test_support::root("fresh");
+    let partial = root.path().join("partial-restore.bin");
+    assert!(!partial.exists());
+    let (entered, waiting) = mpsc::channel();
+    let (publish, publication) = mpsc::channel();
+    publish.send(()).unwrap();
+    let runner = RestoreWriterFault {
+        writer: FaultRunner {
+            fault: fault.0.clone(),
+            entered,
+            publish: Mutex::new(publication),
+            calls: AtomicUsize::new(0),
+            partial_output: Some(partial.clone()),
+        },
+        expected_resources: 1,
+    };
+    let deps = BackupWebDeps::production(
+        root.path().to_path_buf(),
+        crate::measurement::new(root.path()),
+    );
+    let config = root.path().join("config/journal.json");
+    let before = std::fs::read(&config).unwrap();
+    let executable = child_request(BoundedHelperResources::new()).executable;
+    let services = BackupServices {
+        runner: &runner,
+        http: deps.http.as_ref(),
+        clock: deps.clock.as_ref(),
+        restic_path: Some(&executable),
+        rclone_path: None,
+        version: deps.version,
+        journal_maintenance: deps.journal_maintenance.as_ref(),
+    };
+    let recorder = RestoreRecorderSpy::new();
+    let destination = solstone_core_backup::Destination {
+        repository: "s3:s3.example.invalid/cleanup".into(),
+        backend: "s3".into(),
+        credentials: serde_json::json!({
+            "access_key_id":"SYNTHETIC", "secret_access_key":"synthetic-secret"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    };
+    let result = restore_journal(
+        root.path(),
+        &services,
+        &recorder,
+        destination,
+        &solstone_core_backup::generate_recovery_key().unwrap(),
+    );
+    assert_eq!(result.status, "error");
+    assert_eq!(result.reason_code.as_deref(), Some("restore_io_failed"));
+    assert!(
+        recorder.calls().is_empty(),
+        "no recorder call while the writer retains cleanup"
+    );
+    let owner = waiting.recv_timeout(WAIT).unwrap();
+    assert_eq!(owner.observe(), HelperCleanupStatus::Pending);
+    assert_eq!(runner.writer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    let partial_bytes =
+        std::fs::read(&partial).expect("rollback must not remove a pending writer's file");
+    assert!(partial_bytes.starts_with(b"ready:"));
+    fault.0.release();
+    assert_eq!(
+        owner.retry_until(Instant::now() + WAIT),
+        HelperCleanupStatus::Quiescent
+    );
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        before,
+        "cleanup must not replay bookkeeping"
+    );
+    assert!(recorder.calls().is_empty());
+    assert_eq!(
+        std::fs::read(&partial).unwrap(),
+        partial_bytes,
+        "recovery must not replay rollback"
+    );
+    println!("BACKUP_CLEANUP_WHOLE_RECORDING_GUARD_PASS");
+    drop(fault);
+    held_selective_restore_keeps_owner_state_without_a_writer();
+}
+
+#[derive(Default)]
+struct HeldSelectiveRunner {
+    calls: AtomicUsize,
+}
+
+impl ToolRunner for HeldSelectiveRunner {
+    fn run(&self, _: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(io::Error::other(
+            "held selective restore must not issue a tool",
+        ))
     }
+}
+
+fn selective_fixture_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if kind.is_dir() {
+                snapshot.insert(relative, None);
+                visit(root, &path, snapshot);
+            } else {
+                assert!(kind.is_file(), "fixture entry must be a plain file");
+                snapshot.insert(relative, Some(std::fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+fn held_selective_restore_keeps_owner_state_without_a_writer() {
+    let root = crate::test_support::offload_inventory_root();
+    let expected_absent = root
+        .path()
+        .join("chronicle/20260102/020000_001/backup.webm");
+    assert!(!expected_absent.exists());
+    let before = selective_fixture_snapshot(root.path());
+    let runner = HeldSelectiveRunner::default();
+    let deps = BackupWebDeps::production(
+        root.path().to_path_buf(),
+        crate::measurement::new(root.path()),
+    );
+    let services = BackupServices {
+        runner: &runner,
+        http: deps.http.as_ref(),
+        clock: deps.clock.as_ref(),
+        restic_path: None,
+        rclone_path: None,
+        version: deps.version,
+        journal_maintenance: deps.journal_maintenance.as_ref(),
+    };
+    let result = solstone_core_offload::restore_offload_day(root.path(), &services, "20260102");
+    assert_eq!(result.status, "refused");
+    assert_eq!(result.reason.as_deref(), Some("archive_unbound"));
+    assert_eq!(
+        (
+            result.segments_selected,
+            result.files_expected,
+            result.bytes_expected
+        ),
+        (1, 1, 7)
+    );
+    assert_eq!(
+        (
+            result.segments_restored,
+            result.files_restored,
+            result.bytes_restored
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(result.details.len(), 1);
+    let detail = &result.details[0];
+    assert_eq!(detail.status, "refused");
+    assert_eq!(detail.reason.as_deref(), Some("archive_unbound"));
+    assert_eq!(detail.day, "20260102");
+    assert_eq!(detail.stream, "_default");
+    assert_eq!(detail.segment, "020000_001");
+    assert_eq!(detail.snapshot_id.as_deref(), Some("snapshot-b"));
+    assert_eq!((detail.files_expected, detail.bytes_expected), (1, 7));
+    assert_eq!((detail.files_restored, detail.bytes_restored), (0, 0));
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    assert!(!expected_absent.exists());
+    assert_eq!(selective_fixture_snapshot(root.path()), before);
+    println!("BACKUP_CLEANUP_SELECTIVE_RESTORE_HELD_PASS");
 }
 
 fn wait_for_phase(deps: &BackupWebDeps, phase: &str) {

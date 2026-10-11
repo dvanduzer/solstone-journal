@@ -314,6 +314,535 @@ impl JournalMaintenance for Maintenance {
     }
 }
 
+#[test]
+#[ignore = "requires an admitted copied package and synthetic direct S3 fixture"]
+fn packaged_owned_archive_entry() {
+    use solstone_core_backup::archive_admission::{
+        AdmissionError, ArchiveBudget, ArchiveCancellation,
+    };
+    use solstone_core_backup::archive_readback::ReadbackError;
+    use solstone_core_backup_runtime::admit_archive_with_budget;
+    use solstone_core_journal_io::{
+        JournalRoot,
+        media::{Cleanup, MediaDirectory, MediaStage, digest_reader},
+    };
+    use std::sync::Arc;
+
+    struct ProbeClock(Cell<i64>);
+    impl Clock for ProbeClock {
+        fn now_unix(&self) -> i64 {
+            self.0.get()
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    struct ProbeRunner;
+    impl ProbeRunner {
+        fn record(result: std::io::Result<ToolOutput>) -> std::io::Result<ToolOutput> {
+            if let Ok(output) = &result
+                && output.returncode != 0
+            {
+                eprintln!(
+                    "OWNED_ARCHIVE_TOOL_FAILURE {}",
+                    serde_json::json!({"returncode":output.returncode,
+                        "stdout":String::from_utf8_lossy(&output.stdout),
+                        "stderr":String::from_utf8_lossy(&output.stderr)})
+                );
+            }
+            result
+        }
+    }
+    impl ToolRunner for ProbeRunner {
+        fn run(&self, request: &ToolRequest<'_>) -> std::io::Result<ToolOutput> {
+            Self::record(SystemToolRunner.run(request))
+        }
+        fn run_cancellable(
+            &self,
+            request: &ToolRequest<'_>,
+            cancellation: &ArchiveCancellation,
+        ) -> std::io::Result<ToolOutput> {
+            Self::record(SystemToolRunner.run_cancellable(request, cancellation))
+        }
+    }
+    let input_path =
+        std::env::var_os("OWNED_ARCHIVE_PROBE_JSON").expect("explicit fixture required");
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let activity =
+        solstone_core_journal_io::activity::ActivityLease::try_acquire(root.clone()).unwrap();
+    let member =
+        solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
+            .unwrap();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let clock = ProbeClock(Cell::new(started));
+    let cancellation = ArchiveCancellation::new();
+    let http = RecordingHttp {
+        urls: RefCell::new(Vec::new()),
+    };
+    let services = BackupServices {
+        runner: &ProbeRunner,
+        http: &http,
+        clock: &clock,
+        restic_path: Some(member.path()),
+        rclone_path: None,
+        version: "2.0.40",
+        journal_maintenance: &Maintenance,
+    };
+    let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+    let mut archive = admit_archive_with_budget(root.clone(), &services, budget).unwrap();
+    assert_eq!(
+        archive.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
+    let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
+    let fresh = || {
+        MediaStage::create(parent.clone(), activity.clone())
+            .unwrap()
+            .create_target()
+            .unwrap()
+    };
+    let original_files = input["files"].as_array().unwrap();
+    let copy = |index: usize| {
+        let file = &original_files[index];
+        let name = std::ffi::OsStr::new(file["name"].as_str().unwrap());
+        let bytes = fs::read(root.canonical_path().join("media").join(name)).unwrap();
+        let digest = digest_reader(&mut bytes.as_slice()).unwrap();
+        assert_eq!(digest.sha256, file["sha256"].as_str().unwrap());
+        assert_eq!(digest.size, file["bytes"].as_u64().unwrap());
+        MediaStage::create(parent.clone(), activity.clone())
+            .unwrap()
+            .create_named_target(name)
+            .unwrap()
+            .copy_from(&parent, name, &digest)
+            .unwrap()
+    };
+    assert_eq!(original_files.len(), 2);
+    let mut prepared_sources = vec![copy(0), copy(1)];
+    let mut duplicate_one = copy(0);
+    let mut duplicate_two = copy(0);
+    let mut wrong_content = {
+        let name = std::ffi::OsStr::new(original_files[0]["name"].as_str().unwrap());
+        let path = root.canonical_path().join("media").join(name);
+        let original = fs::read(&path).unwrap();
+        let mut wrong = original.clone();
+        wrong[0] ^= 1;
+        fs::write(&path, &wrong).unwrap();
+        let digest = digest_reader(&mut wrong.as_slice()).unwrap();
+        let prepared = MediaStage::create(parent.clone(), activity.clone())
+            .unwrap()
+            .create_named_target(name)
+            .unwrap()
+            .copy_from(&parent, name, &digest)
+            .unwrap();
+        fs::write(&path, original).unwrap();
+        prepared
+    };
+    let sources = prepared_sources
+        .iter_mut()
+        .map(|p| p.archive_source().unwrap())
+        .collect::<Vec<_>>();
+    let duplicates = [
+        duplicate_one.archive_source().unwrap(),
+        duplicate_two.archive_source().unwrap(),
+    ];
+    let wrong_source = wrong_content.archive_source().unwrap();
+    let initial_fd_flags = sources
+        .iter()
+        .map(|source| {
+            source
+                .descriptor()
+                .map(|fd| nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap())
+        })
+        .collect::<Vec<_>>();
+    for flags in initial_fd_flags.iter().flatten() {
+        assert_ne!(flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
+    }
+    let snapshot = archive.archive_owned(&sources).unwrap();
+    let duplicate_snapshot = archive.archive_owned(&duplicates).unwrap();
+    let mut reader = archive.into_read_operation().unwrap();
+    let mut results = Vec::new();
+    for source in &sources {
+        let (exact, mut prepared) = reader
+            .read_owned_snapshot(&snapshot.snapshot_id, source, fresh())
+            .unwrap();
+        assert_eq!(prepared.digest(), source.digest());
+        assert_eq!(exact.name, source.name().to_str().unwrap());
+        assert_eq!(exact.sha256, source.digest().sha256);
+        assert_eq!(prepared.cleanup(), Cleanup::Complete);
+        results.push(
+            serde_json::json!({"name":exact.name, "archive_path":exact.archive_path,
+            "bytes":exact.bytes, "sha256":exact.sha256}),
+        );
+    }
+    let mut duplicate = reader
+        .read_owned_snapshot(&duplicate_snapshot.snapshot_id, &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(duplicate.reason(), ReadbackError::SnapshotNodeUnavailable);
+    assert_eq!(duplicate.cleanup(), Cleanup::Complete);
+    let mut wrong = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &wrong_source, fresh())
+        .err()
+        .unwrap();
+    assert_eq!(wrong.reason(), ReadbackError::NativeFailure);
+    assert_eq!(wrong.cleanup(), Cleanup::Complete);
+    let mut issued_target = fresh();
+    drop(issued_target.helper_transport().unwrap());
+    let mut issued = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &sources[0], issued_target)
+        .err()
+        .unwrap();
+    assert_eq!(issued.reason(), ReadbackError::NativeFailure);
+    assert_eq!(issued.cleanup(), Cleanup::Refused);
+    let mut invalid = reader
+        .read_owned_snapshot("latest", &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(invalid.reason(), ReadbackError::InvalidSelection);
+    assert_eq!(invalid.cleanup(), Cleanup::Complete);
+    let mut changed_bytes = fs::read(wrong_source.path()).unwrap();
+    changed_bytes[0] ^= 2;
+    fs::write(wrong_source.path(), changed_bytes).unwrap();
+    let mut changed = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &wrong_source, fresh())
+        .err()
+        .unwrap();
+    assert_eq!(changed.reason(), ReadbackError::NativeFailure);
+    assert_eq!(changed.cleanup(), Cleanup::Complete);
+    clock.0.set(
+        started + solstone_core_backup::archive_admission::ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64,
+    );
+    let mut exhausted = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(
+        exhausted.reason(),
+        ReadbackError::Admission(AdmissionError::DeadlineExceeded)
+    );
+    assert_eq!(exhausted.cleanup(), Cleanup::Complete);
+    cancellation.cancel();
+    let mut cancelled = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(
+        cancelled.reason(),
+        ReadbackError::Admission(AdmissionError::Cancelled)
+    );
+    assert_eq!(cancelled.cleanup(), Cleanup::Complete);
+    for (source, before) in sources.iter().zip(&initial_fd_flags) {
+        source.revalidate().unwrap();
+        assert_eq!(
+            source
+                .descriptor()
+                .map(|fd| nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap()),
+            *before
+        );
+    }
+    assert!(http.urls.borrow().is_empty());
+    println!(
+        "OWNED_ARCHIVE_RESULT {}",
+        serde_json::json!({"snapshot_id":snapshot.snapshot_id,
+        "duplicate_snapshot_id":duplicate_snapshot.snapshot_id, "repository_id":snapshot.repository_id,
+        "files":results, "original_budget_exhausted":true, "original_stop_observed":true,
+        "duplicate_and_wrong_bytes_refused":true, "issued_target_cleanup":"refused"})
+    );
+    drop(sources);
+    drop(duplicates);
+    drop(wrong_source);
+    for source in &mut prepared_sources {
+        assert_eq!(source.cleanup(), Cleanup::Complete);
+    }
+    assert_eq!(duplicate_one.cleanup(), Cleanup::Complete);
+    assert_eq!(duplicate_two.cleanup(), Cleanup::Complete);
+    // Deliberately mutated owned input remains subject to Native cleanup refusal.
+    let _ = wrong_content.cleanup();
+}
+
+#[test]
+#[cfg(feature = "full-tests")]
+#[ignore = "requires an admitted copied package and synthetic direct S3 race fixture"]
+fn packaged_owned_archive_race_entry() {
+    use solstone_core_backup::archive_admission::{
+        ARCHIVE_BACKUP_TIMEOUT_SECONDS, AdmissionError, ArchiveBudget, ArchiveCancellation,
+    };
+    use solstone_core_backup::archive_readback::ReadbackError;
+    use solstone_core_backup_runtime::admit_archive_with_budget;
+    use solstone_core_journal_io::{
+        JournalRoot,
+        activity::ActivityLease,
+        media::{Cleanup, MediaDigest, MediaDirectory, MediaStage, digest_reader},
+    };
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    enum Cut {
+        Discovery {
+            barrier: PathBuf,
+            source: PathBuf,
+            change: bool,
+        },
+        Dump {
+            target: PathBuf,
+            source: PathBuf,
+            expected: MediaDigest,
+        },
+        Cancel {
+            source: PathBuf,
+            cancellation: ArchiveCancellation,
+        },
+        Deadline {
+            source: PathBuf,
+            deadline: i64,
+        },
+    }
+    struct RaceClock {
+        now: Cell<i64>,
+        cut: RefCell<Option<Cut>>,
+        fired: Cell<bool>,
+        mutation: RefCell<Option<serde_json::Value>>,
+    }
+    impl RaceClock {
+        fn mutate(&self, source: &Path) {
+            let before = fs::metadata(source).unwrap();
+            let mut bytes = fs::read(source).unwrap();
+            bytes[0] ^= 1;
+            fs::write(source, bytes).unwrap();
+            let after = fs::metadata(source).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            *self.mutation.borrow_mut() = Some(serde_json::json!({
+                "device":before.dev().to_string(), "inode":before.ino().to_string(),
+                "same_native_identity":true
+            }));
+        }
+    }
+    impl Clock for RaceClock {
+        fn now_unix(&self) -> i64 {
+            let sampled = self.now.get();
+            let cut = self.cut.borrow_mut().take();
+            if let Some(cut) = cut {
+                let ready = match &cut {
+                    Cut::Discovery { barrier, .. } => barrier.is_file(),
+                    Cut::Dump {
+                        target, expected, ..
+                    } => fs::metadata(target).is_ok_and(|m| m.len() == expected.size),
+                    Cut::Cancel { .. } | Cut::Deadline { .. } => true,
+                };
+                if !ready {
+                    *self.cut.borrow_mut() = Some(cut);
+                } else {
+                    self.fired.set(true);
+                    match cut {
+                        Cut::Discovery { source, change, .. } => {
+                            if change {
+                                self.mutate(&source);
+                            }
+                        }
+                        Cut::Dump {
+                            target,
+                            source,
+                            expected,
+                        } => {
+                            let bytes = fs::read(target).unwrap();
+                            assert_eq!(digest_reader(&mut bytes.as_slice()).unwrap(), expected);
+                            self.mutate(&source);
+                        }
+                        Cut::Cancel {
+                            source,
+                            cancellation,
+                        } => {
+                            self.mutate(&source);
+                            cancellation.cancel();
+                        }
+                        Cut::Deadline { source, deadline } => {
+                            self.mutate(&source);
+                            self.now.set(deadline);
+                        }
+                    }
+                }
+            }
+            // Preserve this pre-observation sample; a deadline cut expires the
+            // next sample after the real Native observation has failed.
+            sampled
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+
+    let input_path = std::env::var_os("OWNED_ARCHIVE_PROBE_JSON").unwrap();
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let scenario = input["scenario"].as_str().unwrap();
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let clock = RaceClock {
+        now: Cell::new(started),
+        cut: RefCell::new(None),
+        fired: Cell::new(false),
+        mutation: RefCell::new(None),
+    };
+    let cancellation = ArchiveCancellation::new();
+    let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
+    let member =
+        solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
+            .unwrap();
+    let http = RecordingHttp {
+        urls: RefCell::new(Vec::new()),
+    };
+    let services = BackupServices {
+        runner: &SystemToolRunner,
+        http: &http,
+        clock: &clock,
+        restic_path: Some(member.path()),
+        rclone_path: None,
+        version: "2.0.40",
+        journal_maintenance: &Maintenance,
+    };
+    let mut archive = admit_archive_with_budget(root.clone(), &services, budget).unwrap();
+    assert_eq!(
+        archive.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
+    let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
+    let file = &input["files"][0];
+    let name = std::ffi::OsStr::new(file["name"].as_str().unwrap());
+    let original = fs::read(root.canonical_path().join("media").join(name)).unwrap();
+    let digest = digest_reader(&mut original.as_slice()).unwrap();
+    assert_eq!(digest.sha256, file["sha256"].as_str().unwrap());
+    assert_eq!(digest.size, file["bytes"].as_u64().unwrap());
+    let source_stage = MediaStage::create(parent.clone(), activity.clone()).unwrap();
+    let retained_source_path = source_stage.diagnostic_path().join(name);
+    let mut copied = source_stage
+        .create_named_target(name)
+        .unwrap()
+        .copy_from(&parent, name, &digest)
+        .unwrap();
+    let source = copied.archive_source().unwrap();
+    let snapshot = archive
+        .archive_owned(std::slice::from_ref(&source))
+        .unwrap();
+    let mut reader = archive.into_read_operation().unwrap();
+    let stage = MediaStage::create(parent, activity.clone()).unwrap();
+    let target_path = stage.diagnostic_path().join("payload");
+    let target = stage.create_target().unwrap();
+    assert!(!target.helper_transport_issued());
+    let source_path = source.path().to_owned();
+    let barrier = PathBuf::from(input["barrier"].as_str().unwrap());
+    let selected_snapshot = if scenario == "oversize" {
+        input["oversized_snapshot_id"].as_str().unwrap()
+    } else {
+        &snapshot.snapshot_id
+    };
+    *clock.cut.borrow_mut() = match scenario {
+        "discovery_positive" | "discovery_change" => {
+            assert!(!barrier.exists());
+            assert!(!Path::new(input["arm"].as_str().unwrap()).exists());
+            fs::write(
+                input["arm"].as_str().unwrap(),
+                serde_json::to_vec(&serde_json::json!({"snapshot_id":selected_snapshot})).unwrap(),
+            )
+            .unwrap();
+            Some(Cut::Discovery {
+                barrier: barrier.clone(),
+                source: source_path,
+                change: scenario == "discovery_change",
+            })
+        }
+        "dump_change" => Some(Cut::Dump {
+            target: target_path.clone(),
+            source: source_path,
+            expected: digest.clone(),
+        }),
+        "native_cancel" => Some(Cut::Cancel {
+            source: source_path,
+            cancellation: cancellation.clone(),
+        }),
+        "native_deadline" => Some(Cut::Deadline {
+            source: source_path,
+            deadline: started + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64,
+        }),
+        "oversize" => None,
+        _ => panic!("unknown explicit race scenario"),
+    };
+    let before_native = reader.source_observations_for_test();
+    let result = reader.read_owned_snapshot(selected_snapshot, &source, target);
+    let after_native = reader.source_observations_for_test();
+    if matches!(scenario, "native_cancel" | "native_deadline") {
+        assert_eq!(after_native, (before_native.0 + 1, before_native.1 + 1));
+    }
+    let observation = if scenario == "discovery_positive" {
+        let (exact, mut prepared) = result.unwrap();
+        assert_eq!(prepared.digest(), &digest);
+        assert!(clock.fired.get());
+        source.revalidate().unwrap();
+        assert_eq!(prepared.cleanup(), Cleanup::Complete);
+        serde_json::json!({"archive_path":exact.archive_path, "bytes":exact.bytes,
+            "sha256":exact.sha256, "target_cleanup":"complete", "source_valid":true})
+    } else {
+        let mut failure = result.err().unwrap();
+        let expected = match scenario {
+            "dump_change" | "discovery_change" => ReadbackError::NativeFailure,
+            "native_cancel" => ReadbackError::Admission(AdmissionError::Cancelled),
+            "native_deadline" => ReadbackError::Admission(AdmissionError::DeadlineExceeded),
+            "oversize" => ReadbackError::ToolFailed,
+            _ => unreachable!(),
+        };
+        assert_eq!(failure.reason(), expected);
+        assert_eq!(clock.fired.get(), scenario != "oversize");
+        let prepared = failure.prepared_digest_for_test().cloned();
+        let issued = failure.target_transport_issued_for_test();
+        if scenario == "dump_change" {
+            assert_eq!(prepared.as_ref(), Some(&digest));
+            assert_eq!(issued, None);
+            let bytes = fs::read(&target_path).unwrap();
+            assert_eq!(digest_reader(&mut bytes.as_slice()).unwrap(), digest);
+        } else {
+            assert_eq!(prepared, None);
+            assert_eq!(issued, Some(false));
+            assert_eq!(fs::metadata(&target_path).unwrap().len(), 0);
+        }
+        assert_eq!(source.revalidate().is_err(), scenario != "oversize");
+        assert_eq!(failure.cleanup(), Cleanup::Complete);
+        serde_json::json!({"reason":format!("{:?}",failure.reason()),
+            "prepared_digest":prepared, "target_transport_issued":issued,
+            "target_cleanup":"complete", "source_valid":scenario=="oversize"})
+    };
+    if scenario.starts_with("discovery_") {
+        let event: serde_json::Value = serde_json::from_slice(&fs::read(barrier).unwrap()).unwrap();
+        assert_eq!(event["snapshot_id"], selected_snapshot);
+    }
+    assert!(http.urls.borrow().is_empty());
+    drop(source);
+    let source_cleanup = if scenario == "discovery_positive" || scenario == "oversize" {
+        assert_eq!(copied.cleanup(), Cleanup::Complete);
+        "complete"
+    } else {
+        // Keep the intentionally mutated private copy as qualification evidence.
+        // Native exact-identity cleanup is not an immutability observation.
+        assert!(retained_source_path.is_file());
+        "not_requested"
+    };
+    println!(
+        "OWNED_ARCHIVE_RACE_RESULT {}",
+        serde_json::json!({"scenario":scenario, "snapshot_id":snapshot.snapshot_id,
+            "selected_snapshot_id":selected_snapshot, "repository_id":snapshot.repository_id,
+            "cut_fired":clock.fired.get(), "mutation":*clock.mutation.borrow(),
+            "observation":observation, "source_cleanup":source_cleanup,
+            "native_observations_before":before_native, "native_observations_after":after_native,
+            "retained_source_path":retained_source_path})
+    );
+}
+
 fn configure_byo(journal: &Path) {
     let destination = solstone_core_backup::Destination {
         repository: "s3:repo".into(),

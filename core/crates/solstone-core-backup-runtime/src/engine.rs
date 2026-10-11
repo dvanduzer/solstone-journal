@@ -2008,6 +2008,7 @@ impl<'a> AdmittedArchive<'a> {
         args.extend([
             "backup".into(),
             "--force".into(),
+            "--no-cache".into(),
             "--tag".into(),
             ARCHIVE_TAG.into(),
             "--retry-lock".into(),
@@ -2685,7 +2686,10 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .digest;
-                let stage = MediaStage::create(parent.clone()).unwrap();
+                let activity =
+                    solstone_core_journal_io::activity::ActivityLease::try_acquire(root.clone())
+                        .unwrap();
+                let stage = MediaStage::create(parent.clone(), activity).unwrap();
                 let path = stage.diagnostic_path();
                 let media = stage
                     .create_named_target(OsStr::new("audio.flac"))
@@ -2738,6 +2742,7 @@ mod tests {
                     if request.argv.iter().any(|arg| arg == "backup") {
                         assert!(request.argv.iter().any(|arg| arg == OsStr::new(&expected)));
                         assert!(request.argv.iter().any(|arg| arg == "--force"));
+                        assert!(request.argv.iter().any(|arg| arg == "--no-cache"));
                         assert_eq!(
                             request
                                 .pass_fds

@@ -19,6 +19,12 @@ use sha2::{Digest, Sha256};
 
 use crate::JournalRoot;
 
+mod activity_carrier;
+pub use activity_carrier::{
+    ActivityCarrierPreparationFailure, ActivityCarrierPreparationReceipt,
+    ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,
+    RootActivityCarrier,
+};
 mod observation;
 pub use observation::{MediaEntry, MediaRead};
 mod removal;
@@ -41,6 +47,13 @@ const BUFFER_BYTES: usize = 64 * 1024;
 /// Narrow mutation/observation barriers for native fault evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaPrimitive {
+    StageCreated,
+    CarrierStageSync,
+    CarrierRootSync,
+    CarrierConfirmation,
+    CarrierRetirementRootSync,
+    CarrierRetirementConfirmation,
+    NativeDirectoryRemoveCut,
     CapacityQuery,
     PreparationRead,
     PreparationWrite,
@@ -296,6 +309,7 @@ struct Leaf {
 /// Exactly one private sibling stage. Drop only closes handles, never unlinks.
 pub struct MediaStage {
     parent: Arc<MediaDirectory>,
+    activity: Arc<crate::activity::ActivityLease>,
     name: OsString,
     directory: Option<Arc<MediaDirectory>>,
     leaf: Option<Box<Leaf>>,
@@ -311,8 +325,21 @@ pub struct MediaStage {
 impl MediaStage {
     /// Create a unique `.tmp-offload-` sibling. Failures after creation retain
     /// the reservation, even when its identity could not be established.
-    pub fn create(parent: Arc<MediaDirectory>) -> Result<Self, OwnedMediaFailure<Option<Self>>> {
-        if let Err(error) = platform::supported_mutation().and_then(|()| parent.revalidate()) {
+    pub fn create(
+        parent: Arc<MediaDirectory>,
+        activity: Arc<crate::activity::ActivityLease>,
+    ) -> Result<Self, OwnedMediaFailure<Option<Self>>> {
+        let preflight = (|| {
+            platform::supported_mutation()?;
+            if !Arc::ptr_eq(parent.inner.journal_root(), activity.journal_root()) {
+                return Err(invalid("stage belongs to another activity root"));
+            }
+            activity
+                .revalidate()
+                .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+            parent.revalidate()
+        })();
+        if let Err(error) = preflight {
             return Err(OwnedMediaFailure { error, owned: None });
         }
         let mut random = [0u8; 16];
@@ -325,6 +352,7 @@ impl MediaStage {
         let name = OsString::from(format!(".tmp-offload-{:032x}", u128::from_le_bytes(random)));
         let mut stage = Self {
             parent,
+            activity,
             name,
             directory: None,
             leaf: None,
@@ -336,15 +364,22 @@ impl MediaStage {
             #[cfg(windows)]
             directory_delete_pending: false,
         };
-        match platform::create_directory(&stage.parent.inner, &stage.name) {
+        match stage
+            .revalidate_activity()
+            .and_then(|()| platform::create_directory(&stage.parent.inner, &stage.name))
+        {
             Ok(inner) => {
                 stage.directory = Some(Arc::new(MediaDirectory { inner }));
-                match stage
-                    .directory
-                    .as_ref()
-                    .expect("retained stage")
-                    .revalidate()
-                {
+                let result = (|| {
+                    step(MediaPrimitive::StageCreated)?;
+                    stage
+                        .directory
+                        .as_ref()
+                        .expect("retained stage")
+                        .revalidate()?;
+                    stage.revalidate_activity()
+                })();
+                match result {
                     Ok(()) => Ok(stage),
                     Err(error) => Err(OwnedMediaFailure {
                         error,
@@ -361,6 +396,12 @@ impl MediaStage {
 
     pub fn diagnostic_path(&self) -> PathBuf {
         self.parent.diagnostic_path().join(&self.name)
+    }
+
+    fn revalidate_activity(&self) -> io::Result<()> {
+        self.activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)
     }
 
     pub fn available_bytes(&self) -> io::Result<u64> {
@@ -382,6 +423,7 @@ impl MediaStage {
     ) -> Result<OwnedMediaTarget, OwnedMediaFailure<Self>> {
         let result = (|| {
             plain_name(name)?;
+            self.revalidate_activity()?;
             let directory = self.directory.as_ref().ok_or_else(changed)?;
             directory.revalidate()?;
             let file = platform::create_file(&directory.inner, name)?;
@@ -427,6 +469,7 @@ impl MediaStage {
 
     #[cfg(unix)]
     fn cleanup_exact(&mut self) -> io::Result<()> {
+        self.revalidate_activity()?;
         if self.removed {
             return Ok(());
         }
@@ -437,11 +480,13 @@ impl MediaStage {
             let identity = leaf.identity.ok_or_else(changed)?;
             platform::check_leaf(&directory.inner, &leaf.name, identity)?;
             step(MediaPrimitive::StageUnlink)?;
+            self.revalidate_activity()?;
             platform::check_leaf(&directory.inner, &leaf.name, identity)?;
             platform::remove_leaf(&directory.inner, &leaf.name, &leaf.file)?;
             self.leaf = None;
         }
         step(MediaPrimitive::StageRemove)?;
+        self.revalidate_activity()?;
         directory.revalidate()?;
         platform::remove_directory(&self.parent.inner, &self.name, &directory.inner)?;
         self.removed = true;
@@ -450,6 +495,7 @@ impl MediaStage {
 
     #[cfg(windows)]
     fn cleanup_exact(&mut self) -> io::Result<()> {
+        self.revalidate_activity()?;
         if self.removed {
             return Ok(());
         }
@@ -472,6 +518,10 @@ impl MediaStage {
                 }
                 platform::check_leaf(&directory.inner, &leaf.name, identity)?;
                 step(MediaPrimitive::StageUnlink)?;
+                // The mutable leaf borrow is used only after lease validation.
+                self.activity
+                    .revalidate()
+                    .map_err(crate::activity::ActivityAdmissionError::into_io)?;
                 platform::check_leaf(&directory.inner, &leaf.name, identity)?;
                 platform::mark_delete(&leaf.file)?;
                 self.payload_delete_pending = Some(leaf.name.clone());
@@ -483,6 +533,7 @@ impl MediaStage {
             }
         }
         step(MediaPrimitive::StageRemove)?;
+        self.revalidate_activity()?;
         directory.revalidate()?;
         platform::mark_delete(directory.inner.file())?;
         self.directory_delete_pending = true;
@@ -611,6 +662,7 @@ impl OwnedMediaTarget {
     }
 
     fn revalidate(&self) -> io::Result<()> {
+        self.stage.revalidate_activity()?;
         let directory = self.stage.directory.as_ref().ok_or_else(changed)?;
         directory.revalidate()?;
         let leaf = self.stage.leaf.as_ref().ok_or_else(changed)?;
@@ -837,6 +889,13 @@ impl PreparedMedia {
         let result = (|| {
             plain_name(name)?;
             platform::supported_mutation()?;
+            if !Arc::ptr_eq(
+                destination.inner.journal_root(),
+                self.target.stage.activity.journal_root(),
+            ) {
+                return Err(invalid("publication belongs to another activity root"));
+            }
+            self.target.stage.revalidate_activity()?;
             #[cfg(windows)]
             {
                 let leaf = self.target.stage.leaf.as_mut().ok_or_else(changed)?;
@@ -921,6 +980,7 @@ impl PreparedMedia {
                 Err(error) => return Err(error),
             }
             step(MediaPrimitive::AfterPublish)?;
+            self.target.stage.revalidate_activity()?;
             // Final-name confirmation includes content and retained chain checks.
             let observation = destination.observe_file(name)?.ok_or_else(changed)?;
             if Some(observation.identity) != receipt.identity || observation.digest != self.digest {
@@ -937,6 +997,7 @@ impl PreparedMedia {
             receipt.cleanup = self.cleanup();
             // Cleanup/sync are separate effects; confirm again at completion.
             step(MediaPrimitive::Completion)?;
+            self.target.stage.revalidate_activity()?;
             let completion = destination.observe_file(name)?.ok_or_else(changed)?;
             if Some(completion.identity) != receipt.identity || completion.digest != self.digest {
                 return Err(changed());

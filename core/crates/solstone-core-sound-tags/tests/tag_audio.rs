@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use solstone_core_installed_payload::{
-    COMPILED_VERSION, PRODUCT, TARGET_LINUX_X86_64, code, guidance, render_installed_payload,
+    COMPILED_VERSION, PRODUCT, code, compiled_target, guidance, render_installed_payload,
 };
 use solstone_core_local::install::capability_status::CapabilityStatus;
 use solstone_core_local::install::ced_readiness::{
-    CedVerdict, LINUX_CED_LIBRARY, POSIX_CED_MODEL, evaluate_ced_readiness_in_package_with_probe,
-    fresh_model_check_in_package,
+    CedVerdict, POSIX_CED_MODEL, ced_target_and_library,
+    evaluate_ced_readiness_in_package_with_probe, fresh_model_check_in_package,
 };
 use solstone_core_local::install::ced_runtime::CedAnalyzeProgram;
 use solstone_core_sound_tags::{
@@ -29,6 +29,27 @@ fn enough_audio() -> Vec<f32> {
 
 fn one_second() -> Vec<f32> {
     vec![0.0; 16_000]
+}
+
+fn fixture_platform() -> (&'static str, &'static str, &'static str, &'static str) {
+    if matches!(std::env::consts::OS, "linux" | "macos") {
+        let (_, library) = ced_target_and_library(std::env::consts::OS, std::env::consts::ARCH)
+            .expect("supported CED fixture platform");
+        (
+            compiled_target(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            library,
+        )
+    } else {
+        // Keep the original POSIX-script fixture coordinates on other targets.
+        (
+            solstone_core_installed_payload::TARGET_LINUX_X86_64,
+            "linux",
+            "x86_64",
+            solstone_core_local::install::ced_readiness::LINUX_CED_LIBRARY,
+        )
+    }
 }
 
 fn write_rendered_manifest(root: &Path, target: &str) {
@@ -68,14 +89,15 @@ fn audio_too_short_yields_neither_tags_nor_status() {
 #[test]
 fn missing_member_in_package_yields_absent_status() {
     let root = tempfile::tempdir().unwrap();
-    let lib_path = root.path().join(LINUX_CED_LIBRARY);
+    let (target, _, _, library) = fixture_platform();
+    let lib_path = root.path().join(library);
     let model_path = root.path().join(POSIX_CED_MODEL);
     fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
     fs::create_dir_all(model_path.parent().unwrap()).unwrap();
     fs::write(&lib_path, b"lib_bytes").unwrap();
     fs::write(&model_path, b"model_bytes").unwrap();
 
-    write_rendered_manifest(root.path(), TARGET_LINUX_X86_64);
+    write_rendered_manifest(root.path(), target);
 
     fs::remove_file(&model_path).unwrap();
 
@@ -98,7 +120,8 @@ fn missing_member_in_package_yields_absent_status() {
 #[test]
 fn model_changed_after_admission_yields_integrity_invalid_and_does_not_invoke_worker() {
     let root = tempfile::tempdir().unwrap();
-    let lib_path = root.path().join(LINUX_CED_LIBRARY);
+    let (target, os, arch, library) = fixture_platform();
+    let lib_path = root.path().join(library);
     let model_path = root.path().join(POSIX_CED_MODEL);
     fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
     fs::create_dir_all(model_path.parent().unwrap()).unwrap();
@@ -106,18 +129,18 @@ fn model_changed_after_admission_yields_integrity_invalid_and_does_not_invoke_wo
     fs::write(&model_path, b"initial_model_bytes").unwrap();
 
     // 1. Render the package with the model bytes that admission will accept.
-    write_rendered_manifest(root.path(), TARGET_LINUX_X86_64);
+    write_rendered_manifest(root.path(), target);
 
     // 2. evaluate_ced_readiness_in_package_with_probe(..., |_, _| Ok(())) and assert Ready.
     let readiness =
-        evaluate_ced_readiness_in_package_with_probe(root.path(), "linux", "x86_64", |_, _| Ok(()));
+        evaluate_ced_readiness_in_package_with_probe(root.path(), os, arch, |_, _| Ok(()));
     assert!(matches!(readiness, CedVerdict::Ready { .. }));
 
     // 3. Overwrite the model file.
     fs::write(&model_path, b"altered_model_bytes").unwrap();
 
     // 4. fresh_model_check_in_package returns IntegrityInvalid whose detail contains code::MEMBER_CHANGED and guidance::PACKAGE_MISMATCH, and does not contain tamper.
-    let check = fresh_model_check_in_package(root.path(), "linux", "x86_64");
+    let check = fresh_model_check_in_package(root.path(), os, arch);
     match check {
         Err(CapabilityStatus::IntegrityInvalid { detail, .. }) => {
             assert!(
@@ -159,14 +182,15 @@ fn model_changed_after_admission_yields_integrity_invalid_and_does_not_invoke_wo
 #[test]
 fn successful_package_classification_returns_tags_and_no_status() {
     let root = tempfile::tempdir().unwrap();
-    let lib_path = root.path().join(LINUX_CED_LIBRARY);
+    let (target, _, _, library) = fixture_platform();
+    let lib_path = root.path().join(library);
     let model_path = root.path().join(POSIX_CED_MODEL);
     fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
     fs::create_dir_all(model_path.parent().unwrap()).unwrap();
     fs::write(&lib_path, b"lib_bytes").unwrap();
     fs::write(&model_path, b"model_bytes").unwrap();
 
-    write_rendered_manifest(root.path(), TARGET_LINUX_X86_64);
+    write_rendered_manifest(root.path(), target);
 
     let (_stub_dir, program) = stub_program(
         "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *solstone-ced-probe-request-v1*)\n    printf '%s\\n' '{\"schema\":\"solstone-ced-probe-response-v1\",\"ok\":true}'\n    ;;\n  *)\n    printf '%s\\n' '{\"schema\":\"solstone-ced-response-v1\",\"windows\":[{\"ok\":true,\"tags\":{\"Music\":0.9,\"Above\":0.11}}]}'\n    ;;\nesac\n",
