@@ -77,6 +77,14 @@ pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) 
         )
         .route("/app/home/api/removals", get(removals::list))
         .route("/app/home/api/approve", post(removals::approve))
+        .route(
+            "/app/home/api/approve/{generation}",
+            get(removals::approval_status),
+        )
+        .route(
+            "/app/home/api/approve/{generation}/cancel",
+            post(removals::cancel_approval).layer(axum::extract::DefaultBodyLimit::max(1024)),
+        )
         .route("/app/home/api/decline", post(removals::decline))
         .route("/app/home/api/recover", post(removals::recover))
         .route(

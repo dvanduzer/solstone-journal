@@ -6,7 +6,18 @@
     "card.heading": "originals waiting on you",
     "card.subhead": "original audio and video marked for deletion, plus anything a deletion left unfinished. nothing marked here is deleted until you say so.",
     "card.empty": "nothing is waiting on you.",
-    "card.unavailable": "the list couldn't be loaded. nothing has been deleted.",
+    "card.unavailable": "the list couldn't be loaded.",
+    "operation.submitting": "sending your deletion request.",
+    "operation.running": "deletion is in progress.",
+    "operation.stop_pending": "requesting a stop.",
+    "operation.stopping": "stop requested. waiting for the work to finish.",
+    "operation.stop": "stop deleting",
+    "operation.held": "deleting hasn't fully finished.",
+    "operation.completed": "deletion finished.",
+    "operation.refused": "deletion didn't start.",
+    "operation.unknown": "it's unclear what was deleted and what wasn't.",
+    "operation.unavailable": "the current result couldn't be checked.",
+    "operation.record_unavailable": "the deletion record isn't available.",
     "card.total_one": "in all: 1 original · {size}",
     "card.total_many": "in all: {n} originals · {size}",
     "row.identity": "{date} · {stream}",
@@ -76,6 +87,11 @@
   const DECLINE_URL = '/app/home/api/decline';
   const RECOVER_URL = '/app/home/api/recover';
   const MAX_SELECTED_MARKS = 32;
+  const POLL_INTERVAL_MS = 2000;
+  if (typeof window.__homeRemovalsCleanup === 'function') window.__homeRemovalsCleanup();
+  let retired = false;
+  let mountEpoch = 0;
+  let activeAction = null;
 
   let card = null;
   let mountedRoot = null;
@@ -338,13 +354,13 @@
   }
 
   function render() {
-    if (!card) return;
+    if (!card || retired || mountedRoot !== document.querySelector('[data-home-root]')) return;
     renderGeneration += 1;
     pageIndex = Math.min(pageIndex, Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1));
     const heading = '<h2 class="pulse-section-header">' + copy("card.heading") + '</h2><p>' + copy("card.subhead") + '</p>';
     if (listState === 'list.empty') {
       card.innerHTML = '<section class="removals-card">' + heading
-        + '<p>' + copy("card.empty") + '</p>' + outcomeHtml + '</section>';
+        + '<p>' + copy("card.empty") + '</p>' + outcomeHtml + operationHtml() + '</section>';
     } else if (listState === 'list.ready') {
       const totals = total();
       card.innerHTML = '<section class="removals-card">' + heading
@@ -353,10 +369,10 @@
         + '</p><details class="removals-review"' + (expanded ? ' open' : '') + '><summary>review originals' + (rows.some(row => row.state === 'failed') ? ' · unfinished deletions need review' : '') + '</summary>'
         + listNoteHtml() + toolbarHtml() + '<p class="removals-card-scope">selection applies across every page.</p>' + cardRows()
         + '<nav class="removals-card-pages" aria-label="originals pages"><button type="button" data-removal-action="previous"' + (pageIndex === 0 ? ' disabled' : '') + '>previous</button><span>page ' + (pageIndex + 1) + ' of ' + Math.max(1, Math.ceil(rows.length / PAGE_SIZE)) + '</span><button type="button" data-removal-action="next"' + ((pageIndex + 1) * PAGE_SIZE >= rows.length ? ' disabled' : '') + '>next</button></nav>'
-        + finishHtml() + '</details>' + confirmationHtml() + outcomeHtml + '</section>';
+        + finishHtml() + '</details>' + confirmationHtml() + outcomeHtml + operationHtml() + '</section>';
     } else {
       card.innerHTML = '<section class="removals-card">' + heading
-        + '<p>' + copy("card.unavailable") + '</p>' + outcomeHtml + '</section>';
+        + '<p data-removals-list-unavailable>' + copy("card.unavailable") + '</p>' + outcomeHtml + operationHtml() + '</section>';
     }
     wire();
     const focus = card.querySelector('.removals-card-confirm');
@@ -490,13 +506,16 @@
 
   async function refresh() {
     const generation = ++refreshGeneration;
+    const epoch = mountEpoch;
+    const root = mountedRoot;
     let response;
     try {
       response = await request(LIST_URL);
     } catch (_) {
       response = { state: 'list.register_unavailable' };
     }
-    if (generation !== refreshGeneration) return false;
+    if (retired || epoch !== mountEpoch || root !== document.querySelector('[data-home-root]')
+        || generation !== refreshGeneration) return false;
     const trustworthy = (response?.state === 'list.ready' || response?.state === 'list.empty')
       && Array.isArray(response.removals)
       && typeof response.review_context === 'string' && response.review_context.length > 0;
@@ -514,29 +533,183 @@
     return trustworthy;
   }
 
+  function currentAction(action) {
+    return !!action && !retired && activeAction === action && action.mountEpoch === mountEpoch
+      && mountedRoot === document.querySelector('[data-home-root]');
+  }
+
+  function canonicalGeneration(value) {
+    // This is transport, including values beyond JavaScript's exact integers.
+    return typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)
+      && value.length <= 20
+      && (value.length < 20 || value <= '18446744073709551615');
+  }
+
+  function operationHtml() {
+    const action = activeAction;
+    if (!action || action.kind !== 'approve') return '';
+    let key = 'operation.' + action.phase;
+    if (!action.settled && action.cancellationRequested) key = 'operation.stopping';
+    else if (!action.settled && action.stopInFlight) key = 'operation.stop_pending';
+    let html = '<section class="removals-card-outcome" data-removal-operation><p>' + copy(key) + '</p>';
+    if (action.observationUnavailable) html += '<p>' + copy('operation.unavailable') + '</p>';
+    const targets = action.report?.outcome?.targets;
+    if (Array.isArray(targets) && targets.every(target => Array.isArray(target.removed) && Array.isArray(target.not_removed))) {
+      const removed = targets.flatMap(target => target.removed);
+      if (removed.length) {
+        html += '<p>' + copyForCount('done.clause_deleted', removed.length, { n: removed.length }) + '</p>';
+        html += '<ul>' + removed.map(name => '<li>' + escapeHtml(name) + '</li>').join('') + '</ul>';
+      }
+      const refusals = targets.flatMap(target => target.not_removed);
+      if (refusals.length) {
+        html += '<p>' + copyForCount('done.clause_not_removed', refusals.length, { m: refusals.length }) + '</p>';
+        html += '<ul>' + refusals.map(item => '<li>' + copy('done.refused_item', { name: item.entry, reason: item.reason }) + '</li>').join('') + '</ul>';
+      }
+    } else {
+      html += '<p>' + copy('operation.record_unavailable') + '</p>';
+    }
+    if (action.generation && !action.settled) {
+      html += '<button type="button" data-removal-action="stop"'
+        + (action.stopInFlight || action.cancellationRequested ? ' disabled' : '') + '>' + copy('operation.stop') + '</button>';
+    }
+    return html + '</section>';
+  }
+
+  function schedulePoll(action) {
+    if (!currentAction(action) || action.settled || action.timer !== null) return;
+    action.timer = window.setTimeout(function () {
+      action.timer = null;
+      poll(action);
+    }, POLL_INTERVAL_MS);
+  }
+
+  async function poll(action) {
+    if (!currentAction(action) || action.settled || action.pollInFlight) return;
+    action.pollInFlight = true;
+    try {
+      const response = await request(APPROVE_URL + '/' + action.generation, { cache: 'no-store' });
+      if (!currentAction(action)) return;
+      if (response?.generation !== action.generation
+          || !['running', 'refused', 'held', 'unknown', 'completed'].includes(response.state)
+          || typeof response.worker_settled !== 'boolean'
+          || typeof response.cancellation_requested !== 'boolean') {
+        action.observationUnavailable = true;
+      } else {
+        action.observationUnavailable = false;
+        action.cancellationRequested ||= response.cancellation_requested;
+        // A missing later report cannot erase earlier recorded effects.
+        if (Array.isArray(response.report?.outcome?.targets)
+            && response.report.outcome.targets.every(target => Array.isArray(target.removed)
+              && target.removed.every(name => typeof name === 'string')
+              && Array.isArray(target.not_removed)
+              && target.not_removed.every(item => typeof item?.entry === 'string' && typeof item.reason === 'string'))) {
+          action.report = response.report;
+        }
+        action.phase = response.state === 'completed' && !response.worker_settled ? 'running' : response.state;
+        action.settled = response.worker_settled && response.state !== 'running';
+        action.locked = !action.settled || !['completed', 'refused'].includes(response.state);
+        if (action.settled) {
+          render();
+          await refresh();
+          if (!currentAction(action)) return;
+        }
+      }
+    } catch (_) {
+      if (!currentAction(action)) return;
+      action.observationUnavailable = true;
+    } finally {
+      if (currentAction(action)) {
+        action.pollInFlight = false;
+        render();
+        schedulePoll(action);
+      }
+    }
+  }
+
+  async function stop(action) {
+    if (!currentAction(action) || !action.generation || action.settled
+        || action.stopInFlight || action.cancellationRequested) return;
+    action.stopInFlight = true;
+    render();
+    try {
+      const response = await request(APPROVE_URL + '/' + action.generation + '/cancel', {
+        method: 'POST', cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' }, body: '{}'
+      });
+      if (!currentAction(action) || action.settled) return;
+      // Stop replies only acknowledge the original sticky negative flag.
+      // They never replace a newer poll's settlement or effect report.
+      if (response?.generation === action.generation && response.cancellation_requested === true) {
+        action.cancellationRequested = true;
+      }
+    } catch (_) {
+      // A failed request does not acknowledge cancellation or erase effects.
+    } finally {
+      if (currentAction(action)) {
+        action.stopInFlight = false;
+        render();
+      }
+    }
+  }
+
   async function submit(action, selectionRows, context) {
-    if (typeof context !== 'string' || !context || context !== reviewContext) return;
+    if (activeAction?.locked || typeof context !== 'string' || !context || context !== reviewContext) return;
     const endpoint = action === 'approve' ? APPROVE_URL : DECLINE_URL;
+    const tracking = {
+      kind: action, rows: selectionRows.slice(), reviewContext: context, mountEpoch: mountEpoch,
+      generation: null, phase: 'submitting', settled: false, locked: true,
+      pollInFlight: false, stopInFlight: false, cancellationRequested: false,
+      observationUnavailable: false, report: null, timer: null
+    };
+    activeAction = tracking;
     confirmation = null;
     selected = new Set();
+    setOutcome('');
+    render();
     try {
       const response = await request(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ review_context: context, mark_ids: selectionRows.map(function (row) { return row.id; }) })
+        body: JSON.stringify({ review_context: context, mark_ids: tracking.rows.map(function (row) { return row.id; }) })
       });
+      if (!currentAction(tracking)) return;
+      if (action === 'approve' && response?.state === 'approve.started') {
+        if (!canonicalGeneration(response.generation)) {
+          tracking.phase = 'unknown'; render(); return;
+        }
+        tracking.generation = response.generation;
+        tracking.phase = 'running';
+        render();
+        await poll(tracking);
+        return;
+      }
       await refresh();
-      showOutcome(response, { action: action, rows: selectionRows });
+      if (!currentAction(tracking)) return;
+      if (action === 'approve' && ![
+        'approve.refused_before_start', 'approve.refused_after_start', 'approve.deleted',
+        'approve.partial', 'approve.halted', 'tool.unavailable', 'approve.policy_keeps',
+        'request.too_large', 'request.invalid'
+      ].includes(response?.state)) {
+        tracking.phase = 'unknown'; render(); return;
+      }
+      activeAction = null;
+      showOutcome(response, { action: action, rows: tracking.rows });
     } catch (_) {
-      await refresh();
-      showOutcome(
-        { state: action === 'decline' ? 'declined.unknown' : 'outcome.unknown' },
-        { action: action, rows: selectionRows }
-      );
+      if (!currentAction(tracking)) return;
+      if (action === 'approve') {
+        tracking.phase = 'unknown';
+        render();
+      } else {
+        await refresh();
+        if (!currentAction(tracking)) return;
+        activeAction = null;
+        showOutcome({ state: 'declined.unknown' }, { action: action, rows: tracking.rows });
+      }
     }
   }
 
   async function submitRecover() {
+    if (activeAction?.locked) return;
     confirmation = null;
     selected = new Set();
     let response;
@@ -555,7 +728,7 @@
 
   function openDeleteConfirmation(rows) {
     expanded = true;
-    if (!reviewContext) return;
+    if (activeAction?.locked || !reviewContext) return;
     confirmation = { kind: 'delete', rows: rows, reviewContext: reviewContext };
     render();
   }
@@ -572,9 +745,12 @@
     const renderedRows = rows;
     card.querySelector('.removals-review')?.addEventListener('toggle', event => { expanded = event.currentTarget.open; });
     card.querySelectorAll('[data-removal-action]').forEach(function (control) {
+      if (activeAction?.locked && !['stop', 'previous', 'next'].includes(control.dataset.removalAction)) control.disabled = true;
       control.addEventListener('click', function () {
         if (generation !== renderGeneration || context !== reviewContext) return;
         const action = control.dataset.removalAction;
+        if (action === 'stop') { stop(activeAction); return; }
+        if (activeAction?.locked && action !== 'previous' && action !== 'next') return;
         const row = renderedRows.find(function (candidate) {
           return candidate.id === control.dataset.markId;
         });
@@ -624,8 +800,9 @@
       });
     });
     card.querySelectorAll('[data-removal-select]').forEach(function (control) {
+      control.disabled = !!activeAction?.locked;
       control.addEventListener('click', function () {
-        if (generation !== renderGeneration || context !== reviewContext || !context) return;
+        if (activeAction?.locked || generation !== renderGeneration || context !== reviewContext || !context) return;
         const id = control.dataset.markId;
         if (!id) return;
         if (selected.has(id)) selected.delete(id);
@@ -635,16 +812,26 @@
     });
   }
 
+  function detach() {
+    mountEpoch += 1;
+    refreshGeneration += 1;
+    renderGeneration += 1;
+    if (activeAction?.timer !== null && activeAction?.timer !== undefined) window.clearTimeout(activeAction.timer);
+    activeAction = null;
+    card = null;
+    mountedRoot = null;
+  }
+
   function mount() {
     const pathname = window.location.pathname || '';
-    if (pathname.startsWith('/app/home/week/')) return;
     const root = document.querySelector('[data-home-root]');
-    if (!root) return;
+    if (pathname.startsWith('/app/home/week/') || !root) { detach(); return; }
     if (root === mountedRoot && card) { refresh(); return; }
-    refreshGeneration += 1;
+    detach();
     reviewContext = null;
     selected = new Set();
     confirmation = null;
+    outcomeHtml = '';
     mountedRoot = root;
     card = document.createElement('div');
     card.setAttribute('data-removals-card', '');
@@ -652,8 +839,17 @@
     refresh();
   }
 
-  document.addEventListener('workspace:mounted', function (event) {
-    if (event?.detail?.appName !== 'home') return;
+  function workspaceMounted(event) {
+    if (event?.detail?.appName !== 'home') { detach(); return; }
     mount();
-  });
+  }
+
+  function cleanup() {
+    retired = true;
+    detach();
+    document.removeEventListener('workspace:mounted', workspaceMounted);
+    if (window.__homeRemovalsCleanup === cleanup) delete window.__homeRemovalsCleanup;
+  }
+  window.__homeRemovalsCleanup = cleanup;
+  document.addEventListener('workspace:mounted', workspaceMounted);
 })();

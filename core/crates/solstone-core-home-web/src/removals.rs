@@ -7,8 +7,8 @@ use std::sync::Arc;
 use axum::{
     Extension, Json,
     body::Bytes,
-    extract::State,
-    http::StatusCode,
+    extract::{Path as RoutePath, State, rejection::PathRejection},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::SecondsFormat;
@@ -111,6 +111,81 @@ pub async fn approve(body: Result<Bytes, axum::extract::rejection::BytesRejectio
         Ok(context) => write_response(context.marks().len(), refused_before_start()),
         Err((status, state)) => request_response(status, state),
     }
+}
+
+fn uncached(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn approval_unavailable(state: &'static str, status: StatusCode) -> Response {
+    uncached((status, Json(json!({"state": state}))).into_response())
+}
+
+async fn approval_receiving(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    id: Result<RoutePath<String>, PathRejection>,
+    cancel: bool,
+) -> Response {
+    let Ok(RoutePath(id)) = id else {
+        return approval_unavailable(REQUEST_INVALID, StatusCode::BAD_REQUEST);
+    };
+    let Some(Extension(deps)) = deps else {
+        return approval_unavailable("approve.unavailable", StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        use solstone_core_backup_web::archive_worker::removal;
+        if cancel {
+            removal::cancel_response(&deps.operations, &id)
+        } else {
+            removal::response(&deps.operations, &id)
+        }
+    })
+    .await;
+    use solstone_core_backup_web::archive_worker::removal::ApprovalStatusRefusal;
+    match result {
+        Ok(Ok(response)) => uncached(response),
+        Ok(Err(ApprovalStatusRefusal::Stale)) => {
+            approval_unavailable("approve.stale", StatusCode::CONFLICT)
+        }
+        Ok(Err(ApprovalStatusRefusal::Unavailable)) | Err(_) => {
+            approval_unavailable("approve.unavailable", StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
+pub async fn approval_status(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    id: Result<RoutePath<String>, PathRejection>,
+) -> Response {
+    approval_receiving(deps, id, false).await
+}
+
+pub async fn cancel_approval(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    id: Result<RoutePath<String>, PathRejection>,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let body = match body {
+        Ok(body) if body.len() <= 1024 => body,
+        Ok(_) => return approval_unavailable(REQUEST_TOO_LARGE, StatusCode::PAYLOAD_TOO_LARGE),
+        Err(error) => {
+            return if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                approval_unavailable(REQUEST_TOO_LARGE, StatusCode::PAYLOAD_TOO_LARGE)
+            } else {
+                approval_unavailable(REQUEST_INVALID, StatusCode::BAD_REQUEST)
+            };
+        }
+    };
+    if !serde_json::from_slice::<serde_json::Map<String, Value>>(&body)
+        .is_ok_and(|object| object.is_empty())
+    {
+        return approval_unavailable(REQUEST_INVALID, StatusCode::BAD_REQUEST);
+    }
+    approval_receiving(deps, id, true).await
 }
 
 // Classified consumer join only. Public dispatch remains held until the

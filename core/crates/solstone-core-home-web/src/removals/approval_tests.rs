@@ -252,3 +252,140 @@ fn packaged_home_approval_join() {
         json!({"mode":input.mode,"status":observed,"typed_removed":true,"policy_preserved":true})
     );
 }
+
+#[tokio::test]
+#[ignore = "uses the existing copied installed package; lease refusal precedes helper or WAN work"]
+async fn packaged_home_approval_receiving_retains_preparation_refusal_and_sticky_flag() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use solstone_core_backup_web::{BackupWebDeps, archive_operation};
+    use solstone_core_journal_io::activity::ActivityLease;
+    use tower::ServiceExt;
+    let journal = tempfile::tempdir().unwrap();
+    fs::create_dir_all(journal.path().join("config")).unwrap();
+    fs::write(
+        journal.path().join("config/journal.json"),
+        br#"{"setup":{"completed_at":1700000000000}}"#,
+    )
+    .unwrap();
+    let source = journal.path().join("audio.flac");
+    fs::write(&source, b"synthetic local original").unwrap();
+    let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+    let source_observation =
+        solstone_core_journal_io::media::MediaDirectory::open(Arc::clone(&root), Path::new(""))
+            .unwrap()
+            .observe_file(std::ffi::OsStr::new("audio.flac"))
+            .unwrap()
+            .unwrap();
+    let input = Input {
+        mode: "receiving".into(),
+        journal: journal.path().to_path_buf(),
+        restic_path: PathBuf::new(),
+        repository_id: "a".repeat(64),
+        snapshot_id: "b".repeat(64),
+        archive_path: source.to_string_lossy().into_owned(),
+        bytes: source_observation.digest.size,
+        sha256: source_observation.digest.sha256,
+    };
+    let (rows, paths) = seed(&input, &root);
+    let context = read_review_context(
+        &root,
+        &rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let body = json!({"review_context": serde_json::to_string(&context).unwrap(), "mark_ids": rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()});
+    let external_lease = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+    let mut deps = BackupWebDeps::new(journal.path().to_path_buf());
+    deps.executable = PathBuf::from(
+        std::env::var_os("HOME_APPROVAL_RECEIVING_PACKAGE")
+            .expect("existing copied package member"),
+    );
+    let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
+    let started = dispatch_approval(
+        Some(Extension(deps.clone())),
+        Ok(Bytes::from(body.to_string())),
+        now,
+    )
+    .unwrap();
+    // The proposed transport envelope carries only the actual returned string.
+    let envelope = json!({"state":"approve.started", "generation":started.generation()});
+    assert_eq!(envelope["generation"], started.generation());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let observed = loop {
+        let observed = status(&deps.operations, started.generation()).unwrap();
+        if observed.worker_settled {
+            break observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "real preparation refusal did not settle"
+        );
+        std::thread::park_timeout(Duration::from_millis(10));
+    };
+    assert_eq!(observed.state, ApprovalState::Held);
+    assert_eq!(
+        observed.report.as_ref().unwrap()["preparation"]["state"],
+        "refused"
+    );
+    assert!(matches!(
+        deps.operations
+            .lock()
+            .unwrap()
+            .archive_returns()
+            .next()
+            .unwrap()
+            .payload(),
+        solstone_core_backup_web::archive_worker::ArchivePayload::PreparationFailure(_)
+    ));
+    drop(external_lease);
+    let router = crate::routes_with_backup_deps(deps.clone(), crate::Clock::fixed(now), |_| false);
+    let mut observations = Vec::new();
+    for (method, tail, expected) in [
+        ("GET", "", false),
+        ("POST", "/cancel", true),
+        ("POST", "/cancel", true),
+        ("GET", "", true),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(format!(
+                        "/app/home/api/approve/{}{tail}",
+                        started.generation()
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(if method == "POST" { "{}" } else { "" }))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(value["generation"], started.generation());
+        assert_eq!(value["state"], "held");
+        assert_eq!(value["cancellation_requested"], expected);
+        assert_eq!(value["report"], observed.report.as_ref().unwrap().clone());
+        assert!(archive_operation::begin(&deps.operations, "backup", deps.clock.as_ref()).is_err());
+        observations.push(value);
+    }
+    for path in paths {
+        assert_eq!(fs::read(path).unwrap(), b"synthetic local original");
+    }
+    assert!(paths_unchanged(&root, &rows));
+    println!(
+        "HOME_APPROVAL_RECEIVING {}",
+        json!({"started":envelope, "observations":observations, "busy":true, "helper_wan":"not admitted; actual activity capture refused"})
+    );
+}
+
+fn paths_unchanged(root: &Arc<JournalRoot>, rows: &[Mark]) -> bool {
+    let register = load_at_root(root).unwrap();
+    rows.iter()
+        .all(|row| register.marks.get(&row.id) == Some(row))
+}
