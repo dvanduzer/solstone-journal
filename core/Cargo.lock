@@ -3617,8 +3617,11 @@ name = "solstone-core-backup"
 version = "2.0.40"
 dependencies = [
  "getrandom 0.3.4",
+ "nix",
+ "rustix",
  "serde",
  "serde_json",
+ "solstone-core-installed-payload",
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
@@ -4420,6 +4423,7 @@ dependencies = [
  "solstone-core-home",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
+ "solstone-core-retention",
  "solstone-core-retention-client",
  "temp-env",
  "tempfile",
@@ -4956,6 +4960,7 @@ name = "solstone-core-offload"
 version = "2.0.40"
 dependencies = [
  "chrono",
+ "getrandom 0.3.4",
  "minisign",
  "nix",
  "serde",
@@ -4969,6 +4974,7 @@ dependencies = [
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-retention",
+ "solstone-core-segment",
  "solstone-core-system",
  "tempfile",
 ]
@@ -5137,6 +5143,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solstone-core-backup",
  "solstone-core-callosum",
  "solstone-core-depict",
  "solstone-core-generate",

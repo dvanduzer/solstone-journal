@@ -10,20 +10,21 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use solstone_core_journal_io::errors::FlatDirectoryError;
 use solstone_core_journal_io::journal_root::is_canonical_identity_observation;
-use solstone_core_journal_io::{JournalRoot, JournalRootError};
 #[cfg(unix)]
 use solstone_core_journal_io::{
-    open_flat_directory_bound as open_health, read_observed_file_bounded as read_register,
+    FlatDirectory as HealthDirectory, open_flat_directory_bound as open_health,
+    read_observed_file_bounded as read_register,
 };
+use solstone_core_journal_io::{JournalRoot, JournalRootError};
 #[cfg(windows)]
 use solstone_core_journal_io::{
-    open_windows_flat_directory_bound as open_health,
+    WindowsFlatDirectory as HealthDirectory, open_windows_flat_directory_bound as open_health,
     read_windows_observed_file_bounded as read_register,
 };
 
 use crate::marks::{Approval, Mark, MarkId, MarkState, Register, StoreError, validate};
 
-const MAX_REGISTER_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_REGISTER_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ReviewRefusal {
@@ -88,6 +89,7 @@ impl ReviewContext {
 /// processing, input, consent and archive evidence at its destructive boundary.
 pub struct CheckedReviewContext {
     root: Arc<JournalRoot>,
+    health: HealthDirectory,
     marks: Vec<Mark>,
 }
 
@@ -98,34 +100,67 @@ impl CheckedReviewContext {
     pub fn marks(&self) -> &[Mark] {
         &self.marks
     }
+    pub(crate) fn health(&self) -> &HealthDirectory {
+        &self.health
+    }
 }
 
-pub(crate) fn load_at_root(root: &JournalRoot) -> Result<Register, ReviewRefusal> {
+pub(crate) fn revalidate_health(
+    root: &JournalRoot,
+    health: &HealthDirectory,
+) -> Result<(), ReviewRefusal> {
     root.revalidate_canonical_binding()
         .map_err(ReviewRefusal::Root)?;
-    let health = open_health(root, OsStr::new("health"), root.canonical_path())
+    let current = open_health(root, OsStr::new("health"), root.canonical_path())
         .map_err(ReviewRefusal::Read)?;
-    let observed = match health {
-        Some(health) => read_register(
-            &health,
-            OsStr::new("retention-marks.json"),
-            MAX_REGISTER_BYTES,
-        )
-        .map_err(ReviewRefusal::Read)?,
-        None => None,
-    };
-    let register = match observed {
+    if current.is_none_or(|current| current.identity() != health.identity()) {
+        return Err(ReviewRefusal::RootChanged);
+    }
+    root.revalidate_canonical_binding()
+        .map_err(ReviewRefusal::Root)
+}
+
+pub(crate) fn read_at_health(health: &HealthDirectory) -> Result<Option<Register>, ReviewRefusal> {
+    let observed = read_register(
+        health,
+        OsStr::new("retention-marks.json"),
+        MAX_REGISTER_BYTES,
+    )
+    .map_err(ReviewRefusal::Read)?;
+    match observed {
         Some(observed) => {
             let register = serde_json::from_slice(&observed.bytes)
                 .map_err(|error| ReviewRefusal::Register(StoreError::Malformed(error)))?;
             validate(&register).map_err(ReviewRefusal::Register)?;
+            Ok(Some(register))
+        }
+        None => Ok(None),
+    }
+}
+
+fn load_bound_at_root(
+    root: &JournalRoot,
+) -> Result<(Register, Option<HealthDirectory>), ReviewRefusal> {
+    root.revalidate_canonical_binding()
+        .map_err(ReviewRefusal::Root)?;
+    let health = open_health(root, OsStr::new("health"), root.canonical_path())
+        .map_err(ReviewRefusal::Read)?;
+    let register = match &health {
+        Some(health) => {
+            let register = read_at_health(health)?.unwrap_or_else(Register::empty);
+            revalidate_health(root, health)?;
             register
         }
         None => Register::empty(),
     };
     root.revalidate_canonical_binding()
         .map_err(ReviewRefusal::Root)?;
-    Ok(register)
+    Ok((register, health))
+}
+
+/// Strict retained-root register observation, without current release authority.
+pub fn load_at_root(root: &JournalRoot) -> Result<Register, ReviewRefusal> {
+    load_bound_at_root(root).map(|(register, _health)| register)
 }
 
 fn check_source_root(mark: &Mark, root_observation: &str) -> Result<(), ReviewRefusal> {
@@ -180,9 +215,27 @@ pub fn check_review_context(
     {
         return Err(ReviewRefusal::RootChanged);
     }
-    let register = load_at_root(&root)?;
+    let (register, health) = load_bound_at_root(&root)?;
+    check_marks(&register, &context.marks, &context.root_observation)?;
+    let health = health.ok_or(ReviewRefusal::RootChanged)?;
+    revalidate_health(&root, &health)?;
+    Ok(CheckedReviewContext {
+        root,
+        health,
+        marks: context.marks.clone(),
+    })
+}
+
+pub(crate) fn check_marks(
+    register: &Register,
+    marks: &[Mark],
+    root_observation: &str,
+) -> Result<(), ReviewRefusal> {
+    if marks.is_empty() {
+        return Err(ReviewRefusal::Empty);
+    }
     let mut unique = BTreeSet::new();
-    for expected in &context.marks {
+    for expected in marks {
         if !unique.insert(&expected.id) {
             return Err(ReviewRefusal::Duplicate);
         }
@@ -207,12 +260,7 @@ pub fn check_review_context(
                 id: expected.id.clone(),
             });
         }
-        check_source_root(current, &context.root_observation)?;
+        check_source_root(current, root_observation)?;
     }
-    root.revalidate_canonical_binding()
-        .map_err(ReviewRefusal::Root)?;
-    Ok(CheckedReviewContext {
-        root,
-        marks: context.marks.clone(),
-    })
+    Ok(())
 }

@@ -30,6 +30,28 @@ use support::TempTree;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
+fn only_segment_directory(stream: &Path) -> PathBuf {
+    let entries = fs::read_dir(stream)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .collect::<Vec<_>>();
+    let segments = entries
+        .iter()
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(segments.len(), 1, "one partial segment in {stream:?}");
+    let segment = segments[0].path();
+    let mut lock_name = segment.file_name().unwrap().to_os_string();
+    lock_name.push(".lock");
+    for entry in entries {
+        if entry.path() != segment {
+            assert!(entry.file_type().unwrap().is_file());
+            assert_eq!(entry.file_name(), lock_name);
+        }
+    }
+    segment
+}
+
 struct SuccessWire;
 
 impl WireClient for SuccessWire {
@@ -271,13 +293,12 @@ fn image_original_is_dirtied_before_a_later_transcript_failure() {
         matches!(error, ImageImportError::JournalIo { path, .. } if path.ends_with("image_transcript.md"))
     );
     let stream_dir = journal.join("chronicle").join(&day).join("import.image");
-    let segment_dir = fs::read_dir(stream_dir)
-        .unwrap()
-        .next()
-        .expect("partial image segment")
-        .unwrap()
-        .path();
+    let segment_dir = only_segment_directory(&stream_dir);
     assert!(segment_dir.join("original.png").is_file());
+    assert_eq!(
+        fs::read(segment_dir.join("original.png")).unwrap(),
+        fs::read(&source).unwrap()
+    );
     assert!(matches!(
         read_health_marker(&journal, &day, HealthMarkerKind::Stream).unwrap(),
         HealthMarkerState::Versioned { marker, .. } if marker.generation == 1
@@ -324,13 +345,12 @@ fn image_install_marker_failure_is_typed_and_retains_original() {
     ));
     assert!(error.to_string().contains("remains installed"));
     let stream_dir = journal.join("chronicle").join(&day).join("import.image");
-    let segment_dir = fs::read_dir(stream_dir)
-        .unwrap()
-        .next()
-        .expect("partial image segment")
-        .unwrap()
-        .path();
+    let segment_dir = only_segment_directory(&stream_dir);
     assert!(segment_dir.join("original.png").is_file());
+    assert_eq!(
+        fs::read(segment_dir.join("original.png")).unwrap(),
+        fs::read(&source).unwrap()
+    );
     assert!(!segment_dir.join("image_transcript.md").exists());
 }
 
@@ -389,12 +409,7 @@ impl PublicationOperations for ImagePublication {
                     day,
                 )?;
                 let stream_dir = journal.join("chronicle").join(day).join("import.image");
-                let segment_dir = fs::read_dir(stream_dir)
-                    .map_err(|error| error.to_string())?
-                    .next()
-                    .ok_or_else(|| "missing image segment".to_owned())?
-                    .map_err(|error| error.to_string())?
-                    .path();
+                let segment_dir = only_segment_directory(&stream_dir);
                 fs::create_dir(segment_dir.join("image_transcript.md"))
                     .map_err(|error| error.to_string())
             }

@@ -12,6 +12,11 @@ use solstone_core_journal_io::{JournalRoot, errors::FlatDirectoryError};
 use solstone_core_retention::archive_proof::{
     AcceptedProcessingObservation, ArchiveFileProof, OffloadOffer, OffloadProof,
 };
+#[cfg(unix)]
+use solstone_core_retention::mark_mutation::{BoundMutationOutcome, MutationStatus};
+use solstone_core_retention::mark_mutation::{
+    BoundMutationRefusal, PlannedMarkMutation, conditional_mutate_at_root, decline_reviewed,
+};
 use solstone_core_retention::marks::{Failure, Proposal, RemovalClass};
 use solstone_core_retention::marks::{Mark, MarkId, MarkState, Register};
 use solstone_core_retention::receipt::Target;
@@ -171,6 +176,283 @@ fn rendered_selection_keeps_full_rows_and_excludes_unselected_failures() {
         ambiguous.select(std::slice::from_ref(&rendered.marks()[0].id)),
         Err(ReviewRefusal::Duplicate)
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewed_decline_checks_all_rows_before_publication() {
+    let journal = tempfile::tempdir().unwrap();
+    let root = root(journal.path());
+    let first = mark(&root, "a.flac", false);
+    let second = mark(&root, "b.flac", false);
+    let mut failed = mark(&root, "failed.flac", false);
+    failed.state = MarkState::Failed(Failure {
+        at: "now".into(),
+        reason: "failed".into(),
+        staged: None,
+    });
+    save(&root, &[first.clone(), second.clone(), failed.clone()]);
+    let ids = [first.id.clone(), second.id.clone()];
+    let rendered = read_review_context(&root, &ids).unwrap();
+    let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+    let mut changed = second.clone();
+    changed.marked_at = "2026-10-10T00:00:01Z".into();
+    save(&root, &[first.clone(), changed, failed.clone()]);
+    let path = journal.path().join("health/retention-marks.json");
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        decline_reviewed(checked),
+        Err(BoundMutationRefusal::Review(ReviewRefusal::Stale { .. }))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    save(&root, &[first, second, failed.clone()]);
+    let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+    let BoundMutationOutcome::Published(result) = decline_reviewed(checked).unwrap() else {
+        panic!("decline was not confirmed")
+    };
+    assert_eq!(result.status, MutationStatus::Applied);
+    assert_eq!(
+        result.register.marks.values().collect::<Vec<_>>(),
+        vec![&failed]
+    );
+    assert_eq!(load_at_root(&root).unwrap(), result.register);
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_decline_retains_preflight_health_and_root() {
+    for replace_root in [false, true] {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("journal");
+        std::fs::create_dir(&path).unwrap();
+        let root = root(&path);
+        let mark = mark(&root, "a.flac", false);
+        save(&root, std::slice::from_ref(&mark));
+        let rendered = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
+        let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+        let bytes = std::fs::read(path.join("health/retention-marks.json")).unwrap();
+        let old_register = if replace_root {
+            std::fs::rename(&path, parent.path().join("old-root")).unwrap();
+            std::fs::create_dir_all(path.join("health")).unwrap();
+            parent.path().join("old-root/health/retention-marks.json")
+        } else {
+            std::fs::rename(path.join("health"), path.join("old-health")).unwrap();
+            std::fs::create_dir(path.join("health")).unwrap();
+            path.join("old-health/retention-marks.json")
+        };
+        std::fs::write(path.join("health/retention-marks.json"), &bytes).unwrap();
+        assert!(decline_reviewed(checked).is_err());
+        assert_eq!(std::fs::read(old_register).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(path.join("health/retention-marks.json")).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_cas_preserves_newer_full_rows_and_exact_idempotence() {
+    let journal = tempfile::tempdir().unwrap();
+    let root = root(journal.path());
+    let expected = mark(&root, "a.flac", false);
+    let mut current = expected.clone();
+    current.marked_at = "2026-10-10T00:00:01Z".into();
+    save(&root, std::slice::from_ref(&current));
+    let path = journal.path().join("health/retention-marks.json");
+    let before = std::fs::read(&path).unwrap();
+    let plan = PlannedMarkMutation::resolve(&expected).unwrap();
+    let BoundMutationOutcome::Unchanged(result) = conditional_mutate_at_root(&root, &plan).unwrap()
+    else {
+        panic!("stale row was changed")
+    };
+    assert_eq!(result.status, MutationStatus::Stale);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let plan = PlannedMarkMutation::failure(
+        &current,
+        Failure {
+            at: "now".into(),
+            reason: "failed".into(),
+            staged: None,
+        },
+    )
+    .unwrap();
+    let BoundMutationOutcome::Published(result) = conditional_mutate_at_root(&root, &plan).unwrap()
+    else {
+        panic!("exact row was not changed")
+    };
+    assert_eq!(result.status, MutationStatus::Applied);
+    let BoundMutationOutcome::Unchanged(result) = conditional_mutate_at_root(&root, &plan).unwrap()
+    else {
+        panic!("exact replacement was rewritten")
+    };
+    assert_eq!(result.status, MutationStatus::AlreadyApplied);
+    std::fs::remove_file(&path).unwrap();
+    assert!(conditional_mutate_at_root(&root, &plan).is_err());
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_typed_writers_remain_held_without_rewriting() {
+    let journal = tempfile::tempdir().unwrap();
+    let root = root(journal.path());
+    let mark = mark(&root, "a.flac", true);
+    save(&root, std::slice::from_ref(&mark));
+    let rendered = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
+    let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+    let path = journal.path().join("health/retention-marks.json");
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        decline_reviewed(checked),
+        Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+            solstone_core_retention::marks::StoreError::WriterHeld
+        )))
+    ));
+    let plan = PlannedMarkMutation::resolve(&mark).unwrap();
+    assert!(matches!(
+        conditional_mutate_at_root(&root, &plan),
+        Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+            solstone_core_retention::marks::StoreError::WriterHeld
+        )))
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn checked_windows_register_writes_refuse_until_native_qualification() {
+    let journal = tempfile::tempdir().unwrap();
+    let root = root(journal.path());
+    let mark = mark(&root, "a.flac", false);
+    save(&root, std::slice::from_ref(&mark));
+    let rendered = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
+    let checked = check_review_context(Arc::clone(&root), &rendered).unwrap();
+    let plan = PlannedMarkMutation::resolve(&mark).unwrap();
+    let path = journal.path().join("health/retention-marks.json");
+    let before = std::fs::read(&path).unwrap();
+    assert!(matches!(
+        decline_reviewed(checked),
+        Err(BoundMutationRefusal::Unsupported)
+    ));
+    assert!(matches!(
+        conditional_mutate_at_root(&root, &plan),
+        Err(BoundMutationRefusal::Unsupported)
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!path.with_file_name("retention-marks.json.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_and_legacy_register_writers_use_the_same_sidecar() {
+    use solstone_core_journal_io::{
+        FlatDirectory, LockOptions, acquire_existing_parent_lock_bound, hold_lock,
+    };
+    use std::ffi::OsStr;
+    use std::time::Duration;
+    let journal = tempfile::tempdir().unwrap();
+    let root = root(journal.path());
+    save(&root, &[mark(&root, "a.flac", false)]);
+    let health = FlatDirectory::open(&root, std::path::Path::new("health")).unwrap();
+    let bound = acquire_existing_parent_lock_bound(
+        &health,
+        OsStr::new("retention-marks.json.lock"),
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .unwrap();
+    let options = LockOptions {
+        timeout: Duration::ZERO,
+        ..LockOptions::default()
+    };
+    let path = journal.path().join("health/retention-marks.json");
+    assert!(hold_lock(&path, options).is_err());
+    drop(bound);
+    let _legacy = hold_lock(&path, options).unwrap();
+    assert!(
+        acquire_existing_parent_lock_bound(
+            &health,
+            OsStr::new("retention-marks.json.lock"),
+            Duration::ZERO,
+            Duration::ZERO
+        )
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_publication_keeps_effect_and_uncertainty_distinct() {
+    use solstone_core_journal_io::{
+        BoundPublicationPrimitive, run_with_bound_publication_barrier,
+        run_with_bound_publication_fault,
+    };
+    for primitive in [
+        BoundPublicationPrimitive::Rename,
+        BoundPublicationPrimitive::ParentSync,
+    ] {
+        let journal = tempfile::tempdir().unwrap();
+        let root = root(journal.path());
+        let mark = mark(&root, "a.flac", false);
+        save(&root, std::slice::from_ref(&mark));
+        let path = journal.path().join("health/retention-marks.json");
+        let before = std::fs::read(&path).unwrap();
+        let plan = PlannedMarkMutation::resolve(&mark).unwrap();
+        let (outcome, consumed) = run_with_bound_publication_fault(primitive, 1, 5, || {
+            conditional_mutate_at_root(&root, &plan)
+        });
+        assert!(consumed);
+        if primitive == BoundPublicationPrimitive::Rename {
+            assert!(matches!(outcome, Err(BoundMutationRefusal::Write(_))));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        } else {
+            let BoundMutationOutcome::PublishedUncertain {
+                candidate,
+                uncertainty,
+            } = outcome.unwrap()
+            else {
+                panic!("published effect was lost")
+            };
+            assert!(candidate.register.marks.is_empty());
+            assert!(uncertainty.durability.is_some());
+            assert!(load_at_root(&root).unwrap().marks.is_empty());
+        }
+    }
+    let journal = tempfile::tempdir().unwrap();
+    let root = root(journal.path());
+    let mark = mark(&root, "a.flac", false);
+    save(&root, std::slice::from_ref(&mark));
+    let plan = PlannedMarkMutation::resolve(&mark).unwrap();
+    let path = journal.path().to_path_buf();
+    let (outcome, consumed) = run_with_bound_publication_barrier(
+        BoundPublicationPrimitive::ParentSync,
+        1,
+        move || {
+            std::fs::rename(path.join("health"), path.join("old-health")).unwrap();
+            std::fs::create_dir(path.join("health")).unwrap();
+        },
+        || conditional_mutate_at_root(&root, &plan),
+    );
+    assert!(consumed);
+    let BoundMutationOutcome::PublishedUncertain {
+        candidate,
+        uncertainty,
+    } = outcome.unwrap()
+    else {
+        panic!("retired-parent publication was claimed current")
+    };
+    assert!(candidate.register.marks.is_empty());
+    assert!(!uncertainty.bindings.is_empty());
+    assert!(!journal.path().join("health/retention-marks.json").exists());
+    assert!(
+        serde_json::from_slice::<Register>(
+            &std::fs::read(journal.path().join("old-health/retention-marks.json")).unwrap()
+        )
+        .unwrap()
+        .marks
+        .is_empty()
+    );
 }
 
 #[test]

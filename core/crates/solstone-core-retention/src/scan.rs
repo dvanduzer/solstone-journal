@@ -30,11 +30,15 @@
 //! ⚠ A truncated final line cannot parse, so exceeding the bound can only lose
 //! evidence, never manufacture it.
 
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
 use serde_json::Value;
+use solstone_core_journal_io::journal_root::JournalEntryKind;
+use solstone_core_journal_io::media::{MediaDirectory, MediaEntry};
 use solstone_core_journal_io::paths::{DirEntryKind, list_dir_entries};
 use solstone_core_processing_record::{analysis_row_key, vocab};
 
@@ -172,11 +176,18 @@ pub fn scan_segment(
 /// Callers needing a stable decision must also hold writer and segment exclusion.
 pub struct CheckedSegment {
     pub(crate) found: Vec<FoundContent>,
+    pub(crate) bound_entries: BTreeMap<ContentName, MediaEntry>,
 }
 
 impl CheckedSegment {
     pub fn files(&self) -> &[FoundContent] {
         &self.found
+    }
+
+    /// The exact bound raw entry, including its native change stamp. Path scans
+    /// return None. This is read evidence, without hash or release authority.
+    pub fn bound_entry(&self, name: &ContentName) -> Option<&MediaEntry> {
+        self.bound_entries.get(name)
     }
 }
 
@@ -204,7 +215,11 @@ fn checked_sidecar(path: &Path, marker: Option<&str>) -> io::Result<SidecarFacts
     }
     let mut buffer = Vec::new();
     file.by_ref().take(READ_BOUND).read_to_end(&mut buffer)?;
-    let text = std::str::from_utf8(&buffer).map_err(|_| invalid_observation())?;
+    checked_sidecar_facts(&buffer, marker)
+}
+
+fn checked_sidecar_facts(buffer: &[u8], marker: Option<&str>) -> io::Result<SidecarFacts> {
+    let text = std::str::from_utf8(buffer).map_err(|_| invalid_observation())?;
     let rows = text
         .split('\n')
         .filter(|line| !line.trim().is_empty())
@@ -251,5 +266,91 @@ pub fn scan_segment_checked(
         });
     }
     found.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-    Ok(CheckedSegment { found })
+    Ok(CheckedSegment {
+        found,
+        bound_entries: BTreeMap::new(),
+    })
+}
+
+/// Read every owner-media sibling through an already admitted native directory.
+///
+/// The caller supplies the complete-listing limit and holds any required writer
+/// and segment exclusion. Overflow, source changes and binding uncertainty
+/// refuse the whole observation. Long sidecars need only a stable READ_BOUND
+/// prefix; raw files are opened with a zero-byte prefix and are never hashed.
+///
+/// This point-in-time evidence does not grant P or release authority. A caller
+/// joining a separate raw digest must compare fresh zero-prefix entries before
+/// and after hashing with `bound_entry`, including the private native stamp.
+pub fn scan_segment_bound(
+    segment: &MediaDirectory,
+    registry: &dyn HandlerRegistry,
+    classifier: &dyn MediaClassifier,
+    maximum_entries: usize,
+) -> io::Result<CheckedSegment> {
+    let entries = segment
+        .entries(maximum_entries)?
+        .ok_or_else(invalid_observation)?;
+    let by_name = entries
+        .iter()
+        .map(|entry| (entry.name.as_os_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut found = Vec::new();
+    let mut bound_entries = BTreeMap::new();
+    for entry in &entries {
+        let name = entry.name.to_str().ok_or_else(invalid_observation)?;
+        let name = ContentName::new(name).ok_or_else(invalid_observation)?;
+        if !classifier.is_owner_media(&name) {
+            continue;
+        }
+        if entry.kind != JournalEntryKind::RegularFile {
+            return Err(invalid_observation());
+        }
+        let raw = segment
+            .read_prefix(&entry.name, 0)?
+            .ok_or_else(invalid_observation)?;
+        if raw.entry != *entry {
+            return Err(invalid_observation());
+        }
+        let marker = registry.expected_handler(&name).and_then(analysis_row_key);
+        let sidecar = match sidecar_name(&name) {
+            Some(sidecar) => match by_name.get(OsStr::new(&sidecar)) {
+                Some(listed) => {
+                    if listed.kind != JournalEntryKind::RegularFile {
+                        return Err(invalid_observation());
+                    }
+                    let prefix = segment
+                        .read_prefix(
+                            OsStr::new(&sidecar),
+                            usize::try_from(READ_BOUND).map_err(|_| invalid_observation())?,
+                        )?
+                        .ok_or_else(invalid_observation)?;
+                    if prefix.entry != **listed {
+                        return Err(invalid_observation());
+                    }
+                    checked_sidecar_facts(&prefix.bytes, marker)?
+                }
+                None => SidecarFacts::default(),
+            },
+            None => SidecarFacts::default(),
+        };
+        bound_entries.insert(name.clone(), raw.entry);
+        found.push(FoundContent {
+            name,
+            size: entry.size,
+            sidecar,
+        });
+    }
+    let final_entries = segment
+        .entries(maximum_entries)?
+        .ok_or_else(invalid_observation)?;
+    if final_entries != entries {
+        return Err(invalid_observation());
+    }
+    segment.revalidate()?;
+    found.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    Ok(CheckedSegment {
+        found,
+        bound_entries,
+    })
 }

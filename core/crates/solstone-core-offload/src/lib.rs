@@ -8,6 +8,11 @@ pub mod marks;
 pub mod measurement;
 pub mod pruning_audit;
 pub mod restore;
+// Private, uncalled coordination while durable intent publication is held.
+#[allow(dead_code)]
+mod restore_intent;
+#[allow(dead_code)]
+mod restore_prepared;
 pub mod run;
 pub mod status;
 
@@ -16,7 +21,7 @@ pub use ledger::{
     summarize_journal, summarize_segment,
 };
 pub use marks::OffloadMarkIndex;
-pub use measurement::{measure_raw_media_usage, suggest_offload_defaults};
+pub use measurement::suggest_offload_defaults;
 pub use restore::{RestoreResult, restore_all_offload, restore_offload_day};
 pub use run::{OffloadResult, format_offload_result, run_offload};
 pub use status::OffloadStatus;

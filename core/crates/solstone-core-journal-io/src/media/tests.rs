@@ -58,6 +58,321 @@ fn full_identity_is_lossless_and_strict() {
     );
     assert_eq!(checked_length(u64::MAX - 1, 1).unwrap(), u64::MAX);
     assert!(checked_length(u64::MAX, 1).is_err());
+    let original = MediaEntry {
+        name: "record".into(),
+        kind: crate::journal_root::JournalEntryKind::RegularFile,
+        identity: a,
+        size: 0,
+        stamp: Default::default(),
+    };
+    let mut replaced = original.clone();
+    replaced.identity = b;
+    assert_ne!(original, replaced);
+}
+
+#[cfg(unix)]
+#[test]
+fn portable_name_validation_refuses_non_utf8() {
+    use std::os::unix::ffi::OsStringExt;
+    let name = OsString::from_vec(vec![b'b', 0xff]);
+    assert_eq!(
+        plain_name(&name).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod observations {
+    use super::*;
+    use crate::journal_root::JournalEntryKind;
+    use std::fs;
+
+    fn fixture() -> (tempfile::TempDir, Arc<MediaDirectory>) {
+        let temp = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::create_dir(temp.path().join("parent")).unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let parent = MediaDirectory::open(root, Path::new("parent")).unwrap();
+        (temp, parent)
+    }
+
+    #[test]
+    fn complete_listing_and_full_read_are_lossless_prefix_allows_long_files() {
+        let (temp, parent) = fixture();
+        let dir = temp.path().join("parent");
+        assert_eq!(parent.entries(0).unwrap(), Some(vec![]));
+        assert!(parent.open_child(OsStr::new("missing")).unwrap().is_none());
+        assert!(!dir.join("missing").exists());
+        fs::write(dir.join("record.jsonl"), b"abcdefghijk").unwrap();
+        fs::write(dir.join(".hidden.flac"), b"hidden").unwrap();
+        fs::create_dir(dir.join("child")).unwrap();
+        fs::create_dir(dir.join(".tmp-offload-unknown")).unwrap();
+        let entries = parent.entries(4).unwrap().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                ".hidden.flac",
+                ".tmp-offload-unknown",
+                "child",
+                "record.jsonl"
+            ]
+        );
+        assert_eq!(entries[1].kind, JournalEntryKind::Directory);
+        assert!(parent.entries(3).unwrap().is_none());
+        assert!(parent.entries(0).unwrap().is_none());
+        let child = parent.open_child(OsStr::new("child")).unwrap().unwrap();
+        assert!(child.entries(0).unwrap().unwrap().is_empty());
+        assert!(parent.open_child(OsStr::new("record.jsonl")).is_err());
+        assert!(
+            parent
+                .read_file_bounded(OsStr::new("record.jsonl"), 10)
+                .is_err()
+        );
+        let complete = parent
+            .read_file_bounded(OsStr::new("record.jsonl"), 11)
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.entry, entries[3]);
+        assert!(complete.complete);
+        assert_eq!(complete.bytes, b"abcdefghijk");
+        let prefix = parent
+            .read_prefix(OsStr::new("record.jsonl"), 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.entry, entries[3]);
+        assert_eq!(prefix.bytes, b"abc");
+        assert!(!prefix.complete);
+        let zero = parent
+            .read_prefix(OsStr::new("record.jsonl"), 0)
+            .unwrap()
+            .unwrap();
+        assert!(zero.bytes.is_empty() && !zero.complete);
+        assert!(
+            parent
+                .read_file_bounded(OsStr::new("absent"), 10)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parent.read_prefix(OsStr::new("child"), 10).is_err());
+        #[cfg(windows)]
+        if std::env::var("SOLSTONE_MEDIA_TEST_ROOT")
+            .unwrap_or_default()
+            .starts_with("R:")
+        {
+            let MediaIdentity::Windows { file_id, .. } = complete.entry.identity else {
+                panic!("native Windows identity")
+            };
+            assert!(file_id[8..].iter().any(|byte| *byte != 0));
+        }
+    }
+
+    #[test]
+    fn membership_changes_between_walks_refuse_without_parent_replacement() {
+        for mutation in ["add", "remove", "replace"] {
+            let (temp, parent) = fixture();
+            let dir = temp.path().join("parent");
+            fs::write(dir.join("record"), b"old").unwrap();
+            let identity = parent.identity();
+            let (result, fired) = run_with_media_hook(
+                MediaPrimitive::AfterFirstEnumeration,
+                move || {
+                    match mutation {
+                        "add" => fs::write(dir.join("before-record"), b"new")?,
+                        "remove" => fs::remove_file(dir.join("record"))?,
+                        _ => {
+                            fs::rename(dir.join("record"), dir.join("moved"))?;
+                            fs::write(dir.join("record"), b"old")?;
+                        }
+                    }
+                    Ok(())
+                },
+                || parent.entries(10),
+            );
+            assert!(fired && result.is_err(), "{mutation}");
+            assert_eq!(parent.identity(), identity);
+        }
+    }
+
+    #[test]
+    fn late_child_observation_errors_never_become_known_absence() {
+        for barrier in [
+            MediaPrimitive::AfterChildOpen,
+            MediaPrimitive::AfterChildObservation,
+        ] {
+            let (temp, parent) = fixture();
+            fs::create_dir(temp.path().join("parent/child")).unwrap();
+            let (result, fired) = run_with_media_hook(
+                barrier,
+                || Err(io::ErrorKind::NotFound.into()),
+                || parent.open_child(OsStr::new("child")),
+            );
+            assert!(fired);
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::NotFound);
+            parent.revalidate().unwrap();
+            assert!(parent.open_child(OsStr::new("child")).unwrap().is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_child_disappearance_is_uncertain_with_unchanged_parent() {
+        for barrier in [
+            MediaPrimitive::AfterChildOpen,
+            MediaPrimitive::AfterChildObservation,
+        ] {
+            let (temp, parent) = fixture();
+            let child = temp.path().join("parent/child");
+            fs::create_dir(&child).unwrap();
+            let identity = parent.identity();
+            let (result, fired) = run_with_media_hook(
+                barrier,
+                move || fs::remove_dir(child),
+                || parent.open_child(OsStr::new("child")),
+            );
+            assert!(fired && result.is_err(), "{barrier:?}");
+            parent.revalidate().unwrap();
+            assert_eq!(parent.identity(), identity);
+            assert!(parent.open_child(OsStr::new("child")).unwrap().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_enumerated_names_refuse_complete_coverage() {
+        for name in ["bad:name", "bad\\name"] {
+            let (temp, parent) = fixture();
+            fs::write(temp.path().join("parent").join(name), b"untouched").unwrap();
+            assert!(parent.entries(10).is_err());
+            parent.revalidate().unwrap();
+        }
+    }
+
+    #[test]
+    fn replacement_between_directory_record_and_leaf_observation_refuses() {
+        let (temp, parent) = fixture();
+        let dir = temp.path().join("parent");
+        fs::write(dir.join("record"), b"abc").unwrap();
+        let (result, fired) = run_with_media_hook(
+            MediaPrimitive::BeforeEntryObservation,
+            move || {
+                fs::rename(dir.join("record"), dir.join("old"))?;
+                fs::write(dir.join("record"), b"abc")
+            },
+            || parent.entries(10),
+        );
+        assert!(fired && result.is_err());
+    }
+
+    #[test]
+    fn concurrent_walks_have_independent_cursors() {
+        let (temp, parent) = fixture();
+        for number in 0..700 {
+            fs::write(temp.path().join(format!("parent/file-{number:04}")), []).unwrap();
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let parent = parent.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    parent.entries(700).unwrap().unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let mut results = threads.into_iter().map(|thread| thread.join().unwrap());
+        let first = results.next().unwrap();
+        assert_eq!(first.len(), 700);
+        assert_eq!(results.next().unwrap(), first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonfiles_are_listed_without_following_or_opening_content() {
+        use std::os::unix::fs::symlink;
+        let (temp, parent) = fixture();
+        let dir = temp.path().join("parent");
+        symlink("absent", dir.join("link")).unwrap();
+        nix::unistd::mkfifo(&dir.join("pipe"), nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let entries = parent.entries(2).unwrap().unwrap();
+        assert_eq!(entries[0].kind, JournalEntryKind::Symlink);
+        assert_eq!(entries[1].kind, JournalEntryKind::Fifo);
+        assert!(parent.read_prefix(OsStr::new("link"), 1).is_err());
+        assert!(parent.read_prefix(OsStr::new("pipe"), 1).is_err());
+        assert!(parent.open_child(OsStr::new("link")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_read_after_observation_refuses() {
+        let (temp, parent) = fixture();
+        let path = temp.path().join("parent/record");
+        fs::write(&path, b"abc").unwrap();
+        let (result, fired) = run_with_media_hook(
+            MediaPrimitive::BeforePrefixRead,
+            move || fs::write(path, b"a"),
+            || parent.read_prefix(OsStr::new("record"), 3),
+        );
+        assert!(fired && result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_file_and_rebound_parent_after_read_refuse() {
+        for mutation in ["content", "leaf", "parent"] {
+            let (temp, parent) = fixture();
+            let dir = temp.path().join("parent");
+            fs::write(dir.join("record"), b"abc").unwrap();
+            let moved = dir.with_extension("moved");
+            let (result, fired) = run_with_media_hook(
+                MediaPrimitive::AfterPrefixRead,
+                move || {
+                    match mutation {
+                        "content" => fs::write(dir.join("record"), b"xyz")?,
+                        "leaf" => {
+                            fs::rename(dir.join("record"), dir.join("old"))?;
+                            fs::write(dir.join("record"), b"abc")?;
+                        }
+                        _ => {
+                            fs::rename(&dir, moved)?;
+                            fs::create_dir(&dir)?;
+                            fs::write(dir.join("record"), b"abc")?;
+                        }
+                    }
+                    Ok(())
+                },
+                || parent.read_prefix(OsStr::new("record"), 3),
+            );
+            assert!(fired && result.is_err(), "{mutation}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn observed_read_excludes_mutation_then_releases_it() {
+        let (temp, parent) = fixture();
+        let path = temp.path().join("parent/record");
+        fs::write(&path, b"abc").unwrap();
+        let current = path.clone();
+        let (result, fired) = run_with_media_hook(
+            MediaPrimitive::AfterPrefixRead,
+            move || {
+                assert!(fs::write(&current, b"xyz").is_err());
+                assert!(fs::rename(&current, current.with_extension("moved")).is_err());
+                Ok(())
+            },
+            || parent.read_prefix(OsStr::new("record"), 3),
+        );
+        assert!(fired && result.unwrap().unwrap().complete);
+        fs::write(&path, b"xyz").unwrap();
+        fs::rename(&path, path.with_extension("moved")).unwrap();
+    }
 }
 
 #[cfg(unix)]

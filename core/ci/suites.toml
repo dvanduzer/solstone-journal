@@ -308,6 +308,7 @@ areas = ["backup"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
+serial_group = "host-contention"
 default_full = true
 runtime = "none"
 features = ["full-tests"]
@@ -789,12 +790,13 @@ runtime = "none"
 [[package_suites]]
 id = "package::solstone-core-home-web"
 package = "solstone-core-home-web"
+features = ["full-tests"]
 set = "component"
 areas = ["home"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
 
 [[package_suites]]
@@ -2228,6 +2230,20 @@ required_features = []
 runtime = "none"
 
 [[suites]]
+id = "solstone-core-backup::bounded_child_process"
+package = "solstone-core-backup"
+target = "bounded_child_process"
+set = "component"
+areas = ["backup"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+serial_group = "host-contention"
+default_full = true
+required_features = ["full-tests"]
+runtime = "none"
+
+[[suites]]
 id = "solstone-core-backup-runtime::backup_runtime_process"
 package = "solstone-core-backup-runtime"
 target = "backup_runtime_process"
@@ -3030,6 +3046,19 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-home-web::review_transport"
+package = "solstone-core-home-web"
+target = "review_transport"
+set = "component"
+areas = ["home"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]

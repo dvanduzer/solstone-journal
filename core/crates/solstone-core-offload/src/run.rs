@@ -29,7 +29,7 @@ use solstone_core_retention::{
 
 use crate::ledger::{OffloadFile, append_offload_event};
 use crate::marks::OffloadMarkIndex;
-use crate::measurement::measure_raw_media_usage;
+use crate::measurement::measure_local_media;
 use crate::pruning_audit::{PruneAuditWriter, open_prune_audit, write_prune_audit};
 
 pub const OFFLOAD_STALL_BACKUP_NOT_READY: &str = "backup_not_ready";
@@ -290,6 +290,22 @@ fn local_instant(now_unix: i64) -> Option<DateTime<FixedOffset>> {
         .single()
         .map(|time| time.fixed_offset())
 }
+fn offload_days(journal: &Path) -> Result<Vec<String>, String> {
+    let mut days = day_dirs(journal)
+        .unwrap_or_default()
+        .into_keys()
+        .collect::<Vec<_>>();
+    days.sort();
+    // A segment key is a time of day, so `(stream, key)` is unique only within
+    // one day; every day is still checked before the first release.
+    for day in &days {
+        let listed = iter_segments(journal, PathOrDay::Day(day)).unwrap_or_default();
+        if let Err(error) = check_record_identities(&listed) {
+            return Err(format!("day {day}: {error}"));
+        }
+    }
+    Ok(days)
+}
 fn precondition(config: &serde_json::Map<String, Value>, now: i64) -> Option<&'static str> {
     if config.get("enabled") != Some(&Value::Bool(true)) {
         return Some(OFFLOAD_STALL_BACKUP_NOT_READY);
@@ -490,7 +506,25 @@ fn run_offload_body(
         .map(|mark| mark.names.len() as u64)
         .sum();
     let bytes_already_marked = mark_index.entries.iter().map(|mark| mark.bytes).sum();
-    let start_raw_bytes = measure_raw_media_usage(journal).total_bytes;
+    let start_raw_bytes = match measure_local_media(journal).usage() {
+        Ok(usage) => usage.total_bytes,
+        Err(_) => {
+            let mut failure = stall(
+                OFFLOAD_STALL_UNEXPECTED_ERROR,
+                dry_run,
+                vec![],
+                0,
+                0,
+                files_already_marked,
+                bytes_already_marked,
+            );
+            if let Err(detail) = offload_days(journal) {
+                failure.reason = Some(OFFLOAD_STALL_SEGMENT_IDENTITY.into());
+                failure.reason_detail = Some(detail);
+            }
+            return failure;
+        }
+    };
     let budget = config
         .get("offload")
         .and_then(|value| value.get("budget_bytes"))
@@ -513,16 +547,9 @@ fn run_offload_body(
             recording_failure: None,
         };
     }
-    let mut days = day_dirs(journal)
-        .unwrap_or_default()
-        .into_keys()
-        .collect::<Vec<_>>();
-    days.sort();
-    // A segment key is a time of day, so `(stream, key)` is unique only within
-    // one day; every day is still checked before the first release.
-    for day in &days {
-        let listed = iter_segments(journal, PathOrDay::Day(day)).unwrap_or_default();
-        if let Err(error) = check_record_identities(&listed) {
+    let days = match offload_days(journal) {
+        Ok(days) => days,
+        Err(detail) => {
             return stall(
                 OFFLOAD_STALL_SEGMENT_IDENTITY,
                 dry_run,
@@ -532,9 +559,9 @@ fn run_offload_body(
                 files_already_marked,
                 bytes_already_marked,
             )
-            .with_reason_detail(format!("day {day}: {error}"));
+            .with_reason_detail(detail);
         }
-    }
+    };
     let (mut audit, mut audit_recording_failure): (Option<PruneAuditWriter>, Option<String>) =
         if dry_run {
             (None, None)
@@ -1586,6 +1613,75 @@ mod tests {
         assert_eq!(last["status"], "skipped");
         assert_eq!(last["time"], 100);
         assert!(last["reason"].is_null());
+    }
+
+    #[test]
+    fn budget_uses_checked_local_media_and_refuses_incomplete_coverage() {
+        fn checked_run(journal: &Path) -> OffloadResult {
+            let runner = Script {
+                outputs: RefCell::new(VecDeque::new()),
+                calls: RefCell::new(vec![]),
+            };
+            let result = run_offload(
+                journal,
+                &services(&runner, &Http, &TestClock { now: 100 }, &Maintenance),
+                false,
+            );
+            assert!(runner.calls.borrow().is_empty());
+            result
+        }
+        for populated in [false, true] {
+            let journal = tempfile::tempdir().unwrap();
+            configure_offload(journal.path(), 100, Some(3));
+            let raw = journal
+                .path()
+                .join("chronicle/20260101/work/120000_60/raw.webm");
+            if populated {
+                fs::create_dir_all(raw.parent().unwrap()).unwrap();
+                fs::write(&raw, b"raw").unwrap();
+                fs::write(
+                    raw.with_file_name("notes.txt"),
+                    b"not owner media; larger than budget",
+                )
+                .unwrap();
+            }
+            let result = checked_run(journal.path());
+            assert_eq!(result.status, "ok");
+            assert_eq!(
+                result.reason.as_deref(),
+                Some(OFFLOAD_OK_BUDGET_ALREADY_SATISFIED)
+            );
+            assert_eq!(result.files_marked, 0);
+            assert!(!marks_path(journal.path()).exists());
+            if populated {
+                assert_eq!(fs::read(&raw).unwrap(), b"raw");
+                let duplicate = raw.parent().unwrap().with_file_name("120000_60_duplicate");
+                fs::create_dir(&duplicate).unwrap();
+                fs::write(duplicate.join("raw.webm"), b"raw").unwrap();
+                configure_offload(journal.path(), 100, Some(6));
+                let result = checked_run(journal.path());
+                assert_eq!(
+                    result.reason.as_deref(),
+                    Some(OFFLOAD_OK_BUDGET_ALREADY_SATISFIED)
+                );
+                assert!(!marks_path(journal.path()).exists());
+            }
+        }
+        for budget in [None, Some(i64::MAX as u64)] {
+            let journal = tempfile::tempdir().unwrap();
+            configure_offload(journal.path(), 100, budget);
+            let chronicle = journal.path().join("chronicle");
+            fs::write(&chronicle, b"unchanged non-directory").unwrap();
+            let result = checked_run(journal.path());
+            assert_eq!(result.status, "stalled");
+            assert_eq!(
+                result.reason.as_deref(),
+                Some(OFFLOAD_STALL_UNEXPECTED_ERROR)
+            );
+            assert_eq!(result.files_marked, 0);
+            assert!(!marks_path(journal.path()).exists());
+            assert_eq!(fs::read(chronicle).unwrap(), b"unchanged non-directory");
+        }
     }
 
     #[test]

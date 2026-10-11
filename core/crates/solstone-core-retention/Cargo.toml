@@ -17,6 +17,7 @@ publish = false
 workspace = true
 
 [dependencies]
+solstone-core-backup.workspace = true
 getrandom.workspace = true
 chrono = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -30,6 +31,7 @@ solstone-core-processing-record = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+solstone-core-journal-io = { workspace = true, features = ["test-hooks"] }
 # The index-ordering test drives a real SQLite index through the notification
 # boundary. ⛔ Dev-only: the executor depends on the trait, never on a database,
 # so the contract can move without touching it.

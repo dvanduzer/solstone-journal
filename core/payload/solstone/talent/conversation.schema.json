@@ -10,6 +10,7 @@
   "properties": {
     "body": {
       "type": "string",
+      "minLength": 1,
       "maxLength": 4000
     },
     "topics": {
