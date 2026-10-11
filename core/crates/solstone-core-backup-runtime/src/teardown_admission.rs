@@ -23,6 +23,9 @@ pub enum TeardownReaderRefusal {
     CatalogUnavailable,
     RecoveryUnavailable,
     RecoveryHeld,
+    /// Some cataloged media is not verifiably present locally, so the backup may
+    /// hold the only copy.
+    BackupOnlyHeld,
 }
 
 pub type TeardownReader<'a> = dyn for<'carrier> FnMut(

@@ -6,6 +6,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use solstone_core_backup::archive_admission::ArchiveCancellation;
+use solstone_core_backup_runtime::teardown_admission::{
+    TeardownAdmissionRefusal, TeardownCarrierRefusal, TeardownReaderRefusal,
+};
 use solstone_core_offload::teardown::{
     OwnedTeardownOutcome, TeardownRunRefusal, run_owned_teardown,
 };
@@ -14,6 +17,9 @@ use super::{CliRun, ProductionClock};
 
 pub(super) const PRELAUNCH_HELD: &str =
     "backup teardown is temporarily unavailable. no backup changes were made.";
+pub(super) const BACKUP_ONLY_HELD: &str = "your backup holds the only copy of some of your media. no backup changes were made. restore it with `solstone journal backup offload restore --all`, then try again.";
+pub(super) const DESTINATION_UNSUPPORTED: &str = "turning off backup here only works for encrypted backup from sol pbc. no backup changes were made.";
+pub(super) const NOT_STARTED: &str = "backup teardown couldn't start. no backup changes were made.";
 
 /// The complete native outcome remains alive while output is borrowed.
 #[must_use = "Retain the whole teardown result through printing and exit"]
@@ -59,9 +65,20 @@ pub(super) fn run(journal: &Path) -> OwnedTeardownCliRun {
     ))
 }
 
-fn reason(refusal: Option<&TeardownRunRefusal>) -> &'static str {
-    match refusal {
-        Some(TeardownRunRefusal::NamespaceCooperationHeld) => "namespace_cooperation_held",
+fn backup_only_held(outcome: &OwnedTeardownOutcome) -> bool {
+    outcome.preparation_failure().is_some_and(|failure| {
+        failure.refusal()
+            == TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(
+                TeardownReaderRefusal::BackupOnlyHeld,
+            ))
+    })
+}
+
+fn reason(outcome: &OwnedTeardownOutcome) -> &'static str {
+    if backup_only_held(outcome) {
+        return "backup_only_held";
+    }
+    match outcome.refusal() {
         Some(TeardownRunRefusal::UnsupportedPlatform) => "platform_unavailable",
         Some(TeardownRunRefusal::UnsupportedDestination) => "destination_unavailable",
         Some(TeardownRunRefusal::Root(_)) => "journal_unavailable",
@@ -85,10 +102,7 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
         OwnedTeardownOutcome::Held(_) => ("held", 1),
         OwnedTeardownOutcome::Unknown(_) => ("unknown", 1),
     };
-    let mut stdout = format!(
-        "teardown_status={status} reason={}\n",
-        reason(outcome.refusal())
-    );
+    let mut stdout = format!("teardown_status={status} reason={}\n", reason(outcome));
     if let Some(remote) = outcome.remote() {
         writeln!(stdout, "delete_attempts={} delete_confirmations={} abort_attempts={} abort_confirmations={} objects_empty={} uploads_empty={}",
             remote.delete_attempts(), remote.delete_confirmations(), remote.abort_attempts(),
@@ -128,6 +142,18 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
         String::new()
     } else if outcome.phase() == solstone_core_offload::teardown::TeardownRunPhase::Prelaunch {
         format!("{PRELAUNCH_HELD}\n")
+    } else if outcome.refused_before_effects() {
+        let message = if backup_only_held(outcome) {
+            BACKUP_ONLY_HELD
+        } else if matches!(
+            outcome.refusal(),
+            Some(TeardownRunRefusal::UnsupportedDestination)
+        ) {
+            DESTINATION_UNSUPPORTED
+        } else {
+            NOT_STARTED
+        };
+        format!("{message}\n")
     } else {
         "backup teardown did not finish. keep recovery files and review the recorded effects before retrying.\n".into()
     };
@@ -145,7 +171,7 @@ mod tests {
     use solstone_core_offload::teardown::TeardownRunPhase;
 
     #[test]
-    fn off_yes_retains_whole_prelaunch_result_without_root_or_tools() {
+    fn off_yes_retains_whole_unstarted_result_without_root_or_tools() {
         for args in [
             vec!["off".into(), "--yes".into()],
             vec![
@@ -162,25 +188,100 @@ mod tests {
                 panic!("whole teardown outcome required")
             };
             let native = owned.outcome();
-            assert_eq!(native.phase(), TeardownRunPhase::Prelaunch);
-            assert!(matches!(
-                native.refusal(),
-                Some(
-                    TeardownRunRefusal::NamespaceCooperationHeld
-                        | TeardownRunRefusal::UnsupportedPlatform
-                )
-            ));
+            if cfg!(target_os = "linux") {
+                assert_eq!(native.phase(), TeardownRunPhase::Admission);
+                assert!(matches!(
+                    native.refusal(),
+                    Some(TeardownRunRefusal::Root(_))
+                ));
+                assert!(!native.remote().unwrap().broker_attempted());
+                assert!(run.output().0.contains("reason=journal_unavailable"));
+                assert!(run.output().1.contains(NOT_STARTED));
+            } else {
+                assert_eq!(native.phase(), TeardownRunPhase::Prelaunch);
+                assert!(matches!(
+                    native.refusal(),
+                    Some(TeardownRunRefusal::UnsupportedPlatform)
+                ));
+                assert!(native.remote().is_none());
+                assert!(run.output().1.contains(PRELAUNCH_HELD));
+            }
+            assert!(native.refused_before_effects());
             assert!(native.journal_root().is_none());
             assert!(native.teardown_lease().is_none());
-            assert!(native.remote().is_none());
             assert!(native.publication().is_none());
             assert!(native.retirement().is_none());
             assert!(!native.attempts().clear());
             assert!(!native.attempts().binding());
             assert!(!native.attempts().retirement());
             assert_ne!(run.output().2, 0);
-            assert!(run.output().1.contains(PRELAUNCH_HELD));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_yes_names_backup_only_media_and_unsupported_destinations() {
+        use solstone_core_backup::{HostedBinding, save_hosted_binding};
+        use solstone_core_retention::archive_catalog::OffloadFile;
+        let journal = tempfile::tempdir().unwrap();
+        std::fs::create_dir(journal.path().join("config")).unwrap();
+        let config = journal.path().join("config/journal.json");
+        std::fs::write(&config, br#"{"backup":{"enabled":true,"mode":"operated"}}"#).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        save_hosted_binding(
+            journal.path(),
+            &HostedBinding {
+                broker_endpoint: format!("http://{}", listener.local_addr().unwrap()),
+                account_id: "account".into(),
+                instance_id: "instance".into(),
+                bucket: "bucket".into(),
+                prefix: "owner/".into(),
+                broker_token: "fixture-token".into(),
+            },
+        )
+        .unwrap();
+        solstone_core_offload::ledger::append_offload_event(
+            journal.path(),
+            "20260101",
+            "_default",
+            "010000_001",
+            "legacy-snapshot",
+            &[OffloadFile {
+                name: "clip.webm".into(),
+                bytes: 3,
+                sha256: "a".repeat(64),
+            }],
+            1,
+        )
+        .unwrap();
+        let before = std::fs::read(&config).unwrap();
+        let args = vec!["off".into(), "--yes".into()];
+        let run = run_cli(&args, journal.path());
+        let (stdout, stderr, code) = run.output();
+        assert_eq!(code, 1);
+        assert!(stdout.contains("reason=backup_only_held"), "{stdout}");
+        assert_eq!(stderr, format!("{BACKUP_ONLY_HELD}\n"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        drop(run);
+
+        std::fs::write(
+            &config,
+            br#"{"backup":{"enabled":true,"destination":{"repository":"s3:bucket/prefix","backend":"s3"}}}"#,
+        )
+        .unwrap();
+        let run = run_cli(&args, journal.path());
+        let (stdout, stderr, code) = run.output();
+        assert_eq!(code, 1);
+        assert!(
+            stdout.contains("reason=destination_unavailable"),
+            "{stdout}"
+        );
+        assert_eq!(stderr, format!("{DESTINATION_UNSUPPORTED}\n"));
     }
 
     #[test]

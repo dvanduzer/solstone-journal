@@ -329,6 +329,7 @@ mod unix {
             TeardownReaderRefusal::CatalogUnavailable,
             TeardownReaderRefusal::RecoveryUnavailable,
             TeardownReaderRefusal::RecoveryHeld,
+            TeardownReaderRefusal::BackupOnlyHeld,
         ] {
             assert_eq!(
                 phase.check(&mut |_, _, _| Err(refusal)),

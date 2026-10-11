@@ -75,39 +75,225 @@ fn closed(peer: &mut TcpStream) {
 }
 
 #[test]
-fn production_hold_is_prelaunch_and_closed_custody_is_send() {
-    struct UntouchedClock;
-    impl Clock for UntouchedClock {
-        fn now_unix(&self) -> i64 {
-            panic!("production hold must not prepare a budget")
-        }
-        fn iso_week(&self) -> u8 {
-            panic!("production hold must not read time")
-        }
-    }
+fn production_reaches_root_admission_and_closed_custody_is_send() {
     let cancellation = ArchiveCancellation::new();
     let result = run_owned_teardown(
         Path::new("/no-journal-open"),
-        Arc::new(UntouchedClock),
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
         cancellation.clone(),
         "fixture",
     );
     assert!(matches!(
         result.refusal(),
-        Some(TeardownRunRefusal::NamespaceCooperationHeld)
+        Some(TeardownRunRefusal::Root(_))
     ));
-    assert_eq!(result.phase(), TeardownRunPhase::Prelaunch);
-    assert!(result.remote().is_none() && result.journal_root().is_none());
-    assert!(result.teardown_lease().is_none() && result.carrier().is_none());
+    assert_eq!(result.phase(), TeardownRunPhase::Admission);
+    assert!(result.journal_root().is_none() && result.teardown_lease().is_none());
+    assert!(result.carrier().is_none());
+    assert!(!result.remote().unwrap().broker_attempted());
     assert!(
         !result.attempts().clear()
             && !result.attempts().binding()
             && !result.attempts().retirement()
     );
+    assert!(result.refused_before_effects());
     assert!(result.cancellation().is_some());
     fn send_static<T: Send + 'static>() {}
     send_static::<OwnedTeardownOutcome>();
     send_static::<SettledTeardownReport>();
+}
+
+/// An operated journal whose hosted binding points at a local listener.
+struct OperatedJournal {
+    temp: tempfile::TempDir,
+    listener: Option<TcpListener>,
+}
+
+impl OperatedJournal {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("config")).unwrap();
+        fs::write(
+            temp.path().join("config/journal.json"),
+            br#"{"backup":{"enabled":true,"mode":"operated"},"other":7}"#,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let binding = HostedBinding {
+            broker_endpoint: format!("http://{}", listener.local_addr().unwrap()),
+            account_id: "account".into(),
+            instance_id: "instance".into(),
+            bucket: "bucket".into(),
+            prefix: "owner/".into(),
+            broker_token: "fixture-token".into(),
+        };
+        save_hosted_binding(temp.path(), &binding).unwrap();
+        Self {
+            temp,
+            listener: Some(listener),
+        }
+    }
+
+    /// Record one bound archived file and return its local path.
+    fn archive(&self, bound: bool) -> std::path::PathBuf {
+        let directory = if bound {
+            "010000_001_full"
+        } else {
+            "010000_001"
+        };
+        let segment = self.temp.path().join("chronicle/20260101").join(directory);
+        fs::create_dir_all(&segment).unwrap();
+        if bound {
+            let event = json!({
+                "event_kind":"offload_archive_v2", "schema_version":2, "time":2,
+                "day":"20260101", "stream":"_default", "segment":"010000_001",
+                "segment_dir":directory, "layout":"direct",
+                "journal_id":"native-root-v1:unix:0000000000000001:0000000000000002",
+                "repository_id":"c".repeat(64), "snapshot_id":"b".repeat(64),
+                "manifest_id":"manifest", "files":[{
+                    "witness_id":"witness", "name":"clip.webm", "bytes":3,
+                    "sha256":"a".repeat(64), "archive_path":"/stage/clip.webm",
+                    "processing":{"record":null,"has_analysis_row":true}
+                }]
+            });
+            let ledger = crate::ledger::ledger_path_for_day(self.temp.path(), "20260101").unwrap();
+            fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            fs::write(ledger, format!("{event}\n")).unwrap();
+        } else {
+            crate::ledger::append_offload_event(
+                self.temp.path(),
+                "20260101",
+                "_default",
+                directory,
+                "legacy-snapshot",
+                &[solstone_core_retention::archive_catalog::OffloadFile {
+                    name: "clip.webm".into(),
+                    bytes: 3,
+                    sha256: "a".repeat(64),
+                }],
+                1,
+            )
+            .unwrap();
+        }
+        segment.join("clip.webm")
+    }
+
+    fn run(&self) -> OwnedTeardownOutcome {
+        run_owned_teardown(
+            self.temp.path(),
+            Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+            ArchiveCancellation::new(),
+            "fixture",
+        )
+    }
+
+    fn effects(&self) -> [Vec<u8>; 2] {
+        [
+            fs::read(self.temp.path().join("config/journal.json")).unwrap(),
+            fs::read(self.temp.path().join("backup/hosted/binding.json")).unwrap(),
+        ]
+    }
+
+    fn no_request(&self) {
+        assert!(matches!(
+            self.listener.as_ref().unwrap().accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+}
+
+#[test]
+fn backup_only_media_refuses_before_any_remote_or_config_effect() {
+    use solstone_core_backup_runtime::TeardownReaderRefusal;
+    use solstone_core_backup_runtime::teardown_admission::{
+        TeardownAdmissionRefusal, TeardownCarrierRefusal,
+    };
+    for case in ["absent", "unbound", "resized"] {
+        let journal = OperatedJournal::new();
+        let local = journal.archive(case != "unbound");
+        match case {
+            "unbound" => fs::write(&local, b"abc").unwrap(),
+            "resized" => fs::write(&local, b"different local bytes").unwrap(),
+            _ => {}
+        }
+        let before = journal.effects();
+        let local_before = fs::read(&local).ok();
+        let result = journal.run();
+        assert_eq!(result.phase(), TeardownRunPhase::Preparation, "{case}");
+        assert!(
+            matches!(
+                result.refusal(),
+                Some(TeardownRunRefusal::CarrierPreparation)
+            ),
+            "{case}"
+        );
+        assert_eq!(
+            result.preparation_failure().unwrap().refusal(),
+            TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(
+                TeardownReaderRefusal::BackupOnlyHeld
+            )),
+            "{case}"
+        );
+        assert!(result.refused_before_effects(), "{case}");
+        assert!(!result.remote().unwrap().broker_attempted(), "{case}");
+        journal.no_request();
+        assert_eq!(journal.effects(), before, "{case}");
+        assert_eq!(fs::read(&local).ok(), local_before, "{case}");
+        let root = result.journal_root().unwrap().clone();
+        drop(result);
+        assert!(
+            observe_obligations(&root).unwrap().entries().is_empty(),
+            "{case}"
+        );
+        drop(ActivityLease::try_acquire(root).unwrap());
+    }
+}
+
+#[test]
+fn fully_local_catalog_passes_coverage_to_the_remote_phase() {
+    let mut journal = OperatedJournal::new();
+    let local = journal.archive(true);
+    fs::write(&local, b"abc").unwrap();
+    let before = journal.effects();
+    // Close the bound port so the remote phase ends locally, without any server.
+    let closed = journal.listener.take().unwrap().local_addr().unwrap();
+    let result = journal.run();
+    assert!(TcpStream::connect(closed).is_err());
+    assert_eq!(result.phase(), TeardownRunPhase::Remote);
+    assert!(matches!(
+        result.refusal(),
+        Some(TeardownRunRefusal::Remote(_))
+    ));
+    assert!(!result.refused_before_effects());
+    assert!(result.carrier().is_some());
+    assert!(!result.attempts().clear());
+    assert_eq!(journal.effects(), before);
+    assert_eq!(fs::read(local).unwrap(), b"abc");
+}
+
+#[test]
+fn owner_configured_destination_is_refused_after_admission_without_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = br#"{"backup":{"enabled":true,"destination":{"repository":"s3:bucket/prefix","backend":"s3"}}}"#;
+    fs::write(temp.path().join("config/journal.json"), config).unwrap();
+    let result = run_owned_teardown(
+        temp.path(),
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+    assert_eq!(result.phase(), TeardownRunPhase::Admission);
+    assert!(matches!(
+        result.refusal(),
+        Some(TeardownRunRefusal::UnsupportedDestination)
+    ));
+    assert!(result.refused_before_effects());
+    assert_eq!(
+        fs::read(temp.path().join("config/journal.json")).unwrap(),
+        config
+    );
 }
 
 #[test]
@@ -260,8 +446,8 @@ fn packaged_owned_teardown_boundaries() {
         _ => None,
     };
     PANIC_AT.with(|slot| slot.set(cut));
-    // Only this private installed fixture executes the same coordinator while
-    // production cooperation remains held. Its writers use the actual protocols.
+    // This installed fixture drives the coordinator directly with the actual owned
+    // DNS member. Its writers use the actual protocols.
     let result = execute(temp.path(), Outside::new(clock, cancellation), "fixture");
     assert_eq!(server.join().unwrap(), expected);
     let remote = result.remote().unwrap();

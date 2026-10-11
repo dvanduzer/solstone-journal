@@ -2291,6 +2291,21 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
             assert_eq!(done["mode"], "operated");
             assert_eq!(done["enabled"], true);
 
+            // Media recorded only in this backup must stop teardown before any request.
+            solstone_core_offload::append_offload_event(
+                journal_path.as_path(),
+                "20260101",
+                "_default",
+                "010000_001",
+                "snapshot-a",
+                &[solstone_core_retention::archive_catalog::OffloadFile {
+                    name: "clip.webm".into(),
+                    bytes: 3,
+                    sha256: "a".repeat(64),
+                }],
+                1,
+            )
+            .unwrap();
             let config_before = std::fs::read(journal_path.join("config/journal.json")).unwrap();
             let binding_before = solstone_core_backup::load_hosted_binding(journal_path.as_path());
             deps.http = teardown_http.clone();
@@ -2298,18 +2313,28 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
             assert_eq!(status, 200);
             assert_eq!(teardown["operation"]["kind"], "teardown");
             let refused = wait_terminal(&deps).await;
-            assert_eq!(refused["operation"]["phase"], "refused");
-            assert_eq!(refused["operation"]["report"]["phase"], "prelaunch");
             #[cfg(target_os = "linux")]
-            assert_eq!(
-                refused["operation"]["report"]["refusal"]["kind"],
-                "namespace_cooperation_held"
-            );
+            {
+                assert_eq!(refused["operation"]["phase"], "error");
+                assert_eq!(refused["operation"]["reason_code"], "backup_only_held");
+                let report = &refused["operation"]["report"];
+                assert_eq!(report["phase"], "preparation");
+                assert_eq!(report["refusal"]["kind"], "carrier_preparation");
+                assert_eq!(
+                    report["preparation_failure"]["refusal"],
+                    serde_json::json!({"kind":"reader","reason":"backup_only_held"})
+                );
+                assert_eq!(report["remote"]["broker_attempted"], false);
+            }
             #[cfg(not(target_os = "linux"))]
-            assert_eq!(
-                refused["operation"]["report"]["refusal"]["kind"],
-                "unsupported_platform"
-            );
+            {
+                assert_eq!(refused["operation"]["phase"], "refused");
+                assert_eq!(refused["operation"]["report"]["phase"], "prelaunch");
+                assert_eq!(
+                    refused["operation"]["report"]["refusal"]["kind"],
+                    "unsupported_platform"
+                );
+            }
             assert!(teardown_http.requests.lock().unwrap().is_empty());
             assert_eq!(
                 std::fs::read(journal_path.join("config/journal.json")).unwrap(),

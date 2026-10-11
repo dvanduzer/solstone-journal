@@ -117,50 +117,40 @@ mod unix {
     }
 
     #[test]
-    fn live_own_carrier_preserves_known_archive_policy_before_and_after_clear() {
-        for bound in [false, true] {
-            for present in [false, true] {
-                let f = Fixture::new();
-                let media = f.archive(bound);
-                if present {
-                    fs::write(&media, b"different local bytes").unwrap();
-                }
-                let prepared = f
-                    .admit()
-                    .prepare_carrier(&mut read_teardown_coverage)
-                    .unwrap_or_else(|failure| panic!("{failure:?}"));
-                assert_eq!(
-                    solstone_core_journal_io::activity_obligations::observe_obligations(&f.root)
-                        .unwrap()
-                        .entries()
-                        .len(),
-                    1
-                );
-                assert_eq!(prepared.check(&mut read_teardown_coverage), Ok(()));
-                let cleared = prepared
-                    .clear_configuration(&mut read_teardown_coverage)
-                    .unwrap_or_else(|failure| panic!("{failure:?}"));
-                assert_eq!(cleared.check(&mut read_teardown_coverage), Ok(()));
-                if present {
-                    assert_eq!(fs::read(media).unwrap(), b"different local bytes");
-                } else {
-                    assert!(!media.exists());
-                }
-                drop(cleared);
-                assert_eq!(
-                    check(&f.admit()),
-                    Err(TeardownAdmissionRefusal::Reader(
-                        TeardownReaderRefusal::RecoveryHeld
-                    ))
-                );
-            }
-        }
+    fn live_own_carrier_preserves_fully_local_archive_before_and_after_clear() {
+        let f = Fixture::new();
+        let media = f.archive(true);
+        fs::write(&media, b"abc").unwrap();
+        let prepared = f
+            .admit()
+            .prepare_carrier(&mut read_teardown_coverage)
+            .unwrap_or_else(|failure| panic!("{failure:?}"));
+        assert_eq!(
+            solstone_core_journal_io::activity_obligations::observe_obligations(&f.root)
+                .unwrap()
+                .entries()
+                .len(),
+            1
+        );
+        assert_eq!(prepared.check(&mut read_teardown_coverage), Ok(()));
+        let cleared = prepared
+            .clear_configuration(&mut read_teardown_coverage)
+            .unwrap_or_else(|failure| panic!("{failure:?}"));
+        assert_eq!(cleared.check(&mut read_teardown_coverage), Ok(()));
+        assert_eq!(fs::read(media).unwrap(), b"abc");
+        drop(cleared);
+        assert_eq!(
+            check(&f.admit()),
+            Err(TeardownAdmissionRefusal::Reader(
+                TeardownReaderRefusal::RecoveryHeld
+            ))
+        );
     }
 
     #[test]
     fn live_carrier_checks_retain_every_other_raw_hold_and_catalog_uncertainty() {
         let f = Fixture::new();
-        f.archive(false);
+        fs::write(f.archive(true), b"abc").unwrap();
         let prepared = f
             .admit()
             .prepare_carrier(&mut read_teardown_coverage)
@@ -216,21 +206,78 @@ mod unix {
         assert_eq!(f.snapshot(), before);
     }
 
+    fn backup_only() -> Result<(), TeardownAdmissionRefusal> {
+        Err(TeardownAdmissionRefusal::Reader(
+            TeardownReaderRefusal::BackupOnlyHeld,
+        ))
+    }
+
     #[test]
-    fn known_bound_and_legacy_absence_or_changed_same_name_bytes_keep_policy() {
+    fn absent_unbound_or_resized_local_media_holds_backup_only_copies() {
         for bound in [false, true] {
             let f = Fixture::new();
             let local = f.archive(bound);
             assert!(!local.exists());
             let admission = f.admit();
             let before = f.snapshot();
-            assert_eq!(check(&admission), Ok(()));
+            assert_eq!(check(&admission), backup_only());
             assert_eq!(f.snapshot(), before);
+            // Only a bound witness can be matched to a local file at all.
             fs::write(&local, b"abc").unwrap();
             let before = f.snapshot();
-            assert_eq!(check(&admission), Ok(()));
+            let expected = if bound { Ok(()) } else { backup_only() };
+            assert_eq!(check(&admission), expected);
+            assert_eq!(f.snapshot(), before);
+            fs::write(&local, b"different local bytes").unwrap();
+            let before = f.snapshot();
+            assert_eq!(check(&admission), backup_only());
             assert_eq!(f.snapshot(), before);
         }
+    }
+
+    #[test]
+    fn unknown_local_presence_never_counts_as_covered() {
+        let f = Fixture::new();
+        let local = f.archive(true);
+        fs::write(&local, b"abc").unwrap();
+        let catalog = read_complete_catalog(&f.root).unwrap();
+        let segment = &catalog.days[0].segments[0];
+        let mut observed = CatalogMediaObservation {
+            day: segment.day.clone(),
+            stream: segment.stream.clone(),
+            segment: segment.segment.clone(),
+            witness: segment.active[0].clone(),
+            presence: CatalogLocalPresence::Present { local_bytes: 3 },
+        };
+        assert!(locally_covered(&f.root, &observed));
+        // An incomplete local scan reports Unknown even when the same-size file is seen.
+        observed.presence = CatalogLocalPresence::Unknown {
+            known_local_bytes: Some(3),
+        };
+        assert!(!locally_covered(&f.root, &observed));
+    }
+
+    #[test]
+    fn owner_deleted_segment_releases_only_its_recorded_absence() {
+        let f = Fixture::new();
+        let local = f.archive(true);
+        let segment = local.parent().unwrap().to_path_buf();
+        let admission = f.admit();
+        assert_eq!(check(&admission), backup_only());
+        // An occupied marker is not a recorded owner deletion.
+        std::os::unix::fs::symlink("elsewhere", segment.join("tombstone.json")).unwrap();
+        assert_eq!(check(&admission), backup_only());
+        fs::remove_file(segment.join("tombstone.json")).unwrap();
+        fs::write(segment.join("tombstone.json"), b"{}").unwrap();
+        let before = f.snapshot();
+        assert_eq!(check(&admission), Ok(()));
+        assert_eq!(f.snapshot(), before);
+
+        // A legacy witness names no segment directory, so deletion cannot be proven.
+        let f = Fixture::new();
+        let local = f.archive(false);
+        fs::write(local.parent().unwrap().join("tombstone.json"), b"{}").unwrap();
+        assert_eq!(check(&f.admit()), backup_only());
     }
 
     #[test]
@@ -240,7 +287,7 @@ mod unix {
             br#"{"event_kind":"future","schema_version":999}"#.as_slice(),
         ] {
             let f = Fixture::new();
-            f.archive(false);
+            fs::write(f.archive(true), b"abc").unwrap();
             let admission = f.admit();
             check(&admission).unwrap();
             let ledger = ledger_path_for_day(f.temp.path(), "20260101").unwrap();
