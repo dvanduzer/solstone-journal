@@ -33,6 +33,12 @@ use crate::review_context::{
     CheckedReviewContext, ReviewRefusal, check_marks, read_at_health, revalidate_health,
 };
 
+mod recovered;
+pub use recovered::{
+    RecoveredRestoredMarkMutation, RecoveredRestoredMarkRefusal,
+    conditional_retire_recovered_restored,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MutationStatus {
@@ -609,6 +615,8 @@ pub enum RestoredMarkRefusal {
     Io(io::Error),
     Segment(solstone_core_segment::SegmentError),
     Bound(Box<BoundMutationRefusal>),
+    Intent(crate::restore_intent::RepairHold),
+    Recovery(Box<solstone_core_journal_io::archive_recovery::RecoveryPopulationFailure>),
 }
 
 impl From<io::Error> for RestoredMarkRefusal {
@@ -620,6 +628,93 @@ impl From<BoundMutationRefusal> for RestoredMarkRefusal {
     fn from(error: BoundMutationRefusal) -> Self {
         Self::Bound(Box::new(error))
     }
+}
+
+#[cfg(unix)]
+enum RestoredAdmission<'a, 'clock> {
+    Live(&'a solstone_core_backup::archive_readback::ReadOperation<'clock>),
+    #[cfg(target_os = "linux")]
+    Recovered {
+        reservation: &'a solstone_core_journal_io::archive_recovery::RecoveredArchiveReservation,
+        destination: &'a crate::restore_intent::DestinationObservation,
+    },
+}
+
+#[cfg(unix)]
+impl RestoredAdmission<'_, '_> {
+    fn root(&self) -> &std::sync::Arc<JournalRoot> {
+        match self {
+            Self::Live(read) => read.journal_root(),
+            #[cfg(target_os = "linux")]
+            Self::Recovered { reservation, .. } => reservation.root(),
+        }
+    }
+
+    fn repository_id(&self) -> &str {
+        match self {
+            Self::Live(read) => read.repository_id(),
+            #[cfg(target_os = "linux")]
+            Self::Recovered { reservation, .. } => reservation.binding().repository_id(),
+        }
+    }
+
+    fn revalidate(&self) -> Result<(), RestoredMarkRefusal> {
+        match self {
+            Self::Live(read) => read
+                .revalidate_admission()
+                .map_err(RestoredMarkRefusal::Readback),
+            #[cfg(target_os = "linux")]
+            Self::Recovered { reservation, .. } => reservation
+                .revalidate_current_population()
+                .map(|_census| ())
+                .map_err(RestoredMarkRefusal::Recovery),
+        }
+    }
+
+    fn check_destination(
+        &self,
+        parent: &solstone_core_journal_io::media::MediaDirectory,
+        directory: &solstone_core_journal_io::media::MediaDirectory,
+    ) -> Result<(), RestoredMarkRefusal> {
+        #[cfg(not(target_os = "linux"))]
+        let _directories = (parent, directory);
+        match self {
+            Self::Live(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::Recovered {
+                reservation,
+                destination,
+            } => {
+                if destination.root != reservation.root().identity().observation_id()
+                    || destination.parent != parent.identity()
+                    || destination.segment != directory.identity()
+                {
+                    return Err(RestoredMarkRefusal::Changed);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct RestoredFacts<'a, 'clock> {
+    admission: RestoredAdmission<'a, 'clock>,
+    operation: &'a crate::archive_catalog::RestoreOperation,
+    confirmed: &'a solstone_core_journal_io::media::MediaObservation,
+    plan: &'a PlannedMarkMutation,
+    claims: &'a solstone_core_segment::output_attempt::OutputClaims,
+    commit: &'a solstone_core_segment::output_attempt::SegmentCommit<'a>,
+}
+
+// Keep the actual exclusion and descendant handles through a recovered postcheck.
+#[cfg(unix)]
+struct RestoredMutationGuard {
+    _directory: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
+    _parent: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
+    _owner: solstone_core_segment::RetainedOwnerDeletion,
+    _health: HealthDirectory,
+    _lock: BoundParentLock,
 }
 
 /// Retire only the deterministic remainder after exact durable restore evidence.
@@ -634,110 +729,135 @@ pub fn conditional_retire_restored(
     }
     #[cfg(unix)]
     {
-        use solstone_core_journal_io::media::MediaDirectory;
-        use solstone_core_segment::RetainedOwnerDeletion;
-        use std::sync::Arc;
-
-        input
-            .plan
-            .validate()
-            .map_err(|_| RestoredMarkRefusal::InvalidPlan)?;
-        let expected = input.plan.expected();
-        let offer = expected
-            .offload
-            .as_ref()
-            .filter(|_| expected.class == crate::marks::RemovalClass::OffloadRawRelease)
-            .ok_or(RestoredMarkRefusal::InvalidPlan)?;
-        let restored = match input.operation.files.as_slice() {
-            [file]
-                if matches!(
-                    file.disposition,
-                    crate::archive_catalog::RestoreDisposition::Published
-                        | crate::archive_catalog::RestoreDisposition::AlreadyPresent
-                ) =>
-            {
-                file
-            }
-            _ => return Err(RestoredMarkRefusal::InvalidPlan),
+        let facts = RestoredFacts {
+            admission: RestoredAdmission::Live(input.read),
+            operation: input.operation,
+            confirmed: input.confirmed,
+            plan: input.plan,
+            claims: input.claims,
+            commit: input.commit,
         };
-        let file = offer
-            .proof
-            .files
-            .iter()
-            .find(|file| file.name == restored.name && file.witness_id == restored.witness_id)
-            .ok_or(RestoredMarkRefusal::InvalidPlan)?;
-        let remaining = expected
-            .proposal
-            .names
-            .iter()
-            .filter(|name| **name != restored.name)
-            .cloned()
-            .collect::<Vec<_>>();
-        if input.operation.operation_id.is_empty()
-            || input.read.repository_id() != offer.proof.repository_id
-            || PlannedMarkMutation::remainder(expected, &remaining)
-                .map_err(|_| RestoredMarkRefusal::InvalidPlan)?
-                != *input.plan
-        {
-            return Err(RestoredMarkRefusal::InvalidPlan);
-        }
-        let root = input.read.journal_root();
-        input
-            .read
-            .revalidate_admission()
-            .map_err(RestoredMarkRefusal::Readback)?;
-        let target = &offer.proof.target;
-        let relative = crate::layout::segment_rel_with_layout(
-            &target.day,
-            &target.stream,
-            &target.dir,
-            offer.proof.layout,
-        );
-        let segment = root.canonical_path().join(&relative);
-        let directory = MediaDirectory::open(Arc::clone(root), Path::new(&relative))?;
-        let parent = MediaDirectory::open(
-            Arc::clone(root),
-            Path::new(&crate::layout::stream_rel_with_layout(
-                &target.day,
-                &target.stream,
-                offer.proof.layout,
-            )),
-        )?;
-        let owner =
-            RetainedOwnerDeletion::open(parent, OsStr::new(&target.dir), Some(&directory), 65_536)
-                .map_err(RestoredMarkRefusal::Segment)?;
-        revalidate_restored(&input, file, &directory, &owner, &segment)?;
-        let health = open_health(root, OsStr::new("health"), root.canonical_path())
-            .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Read(error)))?
-            .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
-        let (lock, mut register) = begin_bound_read(root, &health)?;
-        let status = apply(&mut register, input.plan)
-            .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
-        let result = ConditionalResult { status, register };
-        revalidate_restored(&input, file, &directory, &owner, &segment)?;
-        if status == MutationStatus::Applied {
-            publish_bound(root, &health, &lock, result).map_err(RestoredMarkRefusal::from)
-        } else {
-            revalidate_health(root, &health).map_err(BoundMutationRefusal::from)?;
-            lock.revalidate_bound(&health, OsStr::new("retention-marks.json.lock"))
-                .map_err(BoundMutationRefusal::Lock)?;
-            Ok(BoundMutationOutcome::Unchanged(result))
-        }
+        mutate_restored(&facts).map(|(outcome, _guard)| outcome)
     }
 }
 
 #[cfg(unix)]
+fn mutate_restored(
+    input: &RestoredFacts<'_, '_>,
+) -> Result<(BoundMutationOutcome, RestoredMutationGuard), RestoredMarkRefusal> {
+    use solstone_core_journal_io::media::MediaDirectory;
+    use solstone_core_segment::RetainedOwnerDeletion;
+    use std::sync::Arc;
+
+    input
+        .plan
+        .validate()
+        .map_err(|_| RestoredMarkRefusal::InvalidPlan)?;
+    let expected = input.plan.expected();
+    let offer = expected
+        .offload
+        .as_ref()
+        .filter(|_| expected.class == crate::marks::RemovalClass::OffloadRawRelease)
+        .ok_or(RestoredMarkRefusal::InvalidPlan)?;
+    let restored = match input.operation.files.as_slice() {
+        [file]
+            if matches!(
+                file.disposition,
+                crate::archive_catalog::RestoreDisposition::Published
+                    | crate::archive_catalog::RestoreDisposition::AlreadyPresent
+            ) =>
+        {
+            file
+        }
+        _ => return Err(RestoredMarkRefusal::InvalidPlan),
+    };
+    let file = offer
+        .proof
+        .files
+        .iter()
+        .find(|file| file.name == restored.name && file.witness_id == restored.witness_id)
+        .ok_or(RestoredMarkRefusal::InvalidPlan)?;
+    let remaining = expected
+        .proposal
+        .names
+        .iter()
+        .filter(|name| **name != restored.name)
+        .cloned()
+        .collect::<Vec<_>>();
+    if input.operation.operation_id.is_empty()
+        || input.admission.repository_id() != offer.proof.repository_id
+        || PlannedMarkMutation::remainder(expected, &remaining)
+            .map_err(|_| RestoredMarkRefusal::InvalidPlan)?
+            != *input.plan
+    {
+        return Err(RestoredMarkRefusal::InvalidPlan);
+    }
+    let root = input.admission.root();
+    input.admission.revalidate()?;
+    let target = &offer.proof.target;
+    let relative = crate::layout::segment_rel_with_layout(
+        &target.day,
+        &target.stream,
+        &target.dir,
+        offer.proof.layout,
+    );
+    let segment = root.canonical_path().join(&relative);
+    let directory = MediaDirectory::open(Arc::clone(root), Path::new(&relative))?;
+    let parent = MediaDirectory::open(
+        Arc::clone(root),
+        Path::new(&crate::layout::stream_rel_with_layout(
+            &target.day,
+            &target.stream,
+            offer.proof.layout,
+        )),
+    )?;
+    let owner = RetainedOwnerDeletion::open(
+        Arc::clone(&parent),
+        OsStr::new(&target.dir),
+        Some(&directory),
+        65_536,
+    )
+    .map_err(RestoredMarkRefusal::Segment)?;
+    revalidate_restored(input, file, &directory, &parent, &owner, &segment)?;
+    let health = open_health(root, OsStr::new("health"), root.canonical_path())
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Read(error)))?
+        .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
+    let (lock, mut register) = begin_bound_read(root, &health)?;
+    let status = apply(&mut register, input.plan)
+        .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+    let result = ConditionalResult { status, register };
+    revalidate_restored(input, file, &directory, &parent, &owner, &segment)?;
+    let outcome = if status == MutationStatus::Applied {
+        publish_bound(root, &health, &lock, result).map_err(RestoredMarkRefusal::from)?
+    } else {
+        revalidate_health(root, &health).map_err(BoundMutationRefusal::from)?;
+        lock.revalidate_bound(&health, OsStr::new("retention-marks.json.lock"))
+            .map_err(BoundMutationRefusal::Lock)?;
+        BoundMutationOutcome::Unchanged(result)
+    };
+    Ok((
+        outcome,
+        RestoredMutationGuard {
+            _directory: directory,
+            _parent: parent,
+            _owner: owner,
+            _health: health,
+            _lock: lock,
+        },
+    ))
+}
+
+#[cfg(unix)]
 fn revalidate_restored(
-    input: &RestoredMarkMutation<'_, '_>,
+    input: &RestoredFacts<'_, '_>,
     file: &crate::archive_proof::ArchiveFileProof,
     directory: &solstone_core_journal_io::media::MediaDirectory,
+    parent: &solstone_core_journal_io::media::MediaDirectory,
     owner: &solstone_core_segment::RetainedOwnerDeletion,
     segment: &Path,
 ) -> Result<(), RestoredMarkRefusal> {
-    input
-        .read
-        .revalidate_admission()
-        .map_err(RestoredMarkRefusal::Readback)?;
+    input.admission.revalidate()?;
+    input.admission.check_destination(parent, directory)?;
     directory.revalidate()?;
     if input.claims.segment_identity(segment)? != directory.object_identity()
         || owner.state().map_err(RestoredMarkRefusal::Segment)?
@@ -769,7 +889,7 @@ fn revalidate_restored(
         .as_ref()
         .ok_or(RestoredMarkRefusal::InvalidPlan)?
         .proof;
-    let catalog = crate::archive_catalog::read_complete_catalog(input.read.journal_root())
+    let catalog = crate::archive_catalog::read_complete_catalog(input.admission.root())
         .map_err(RestoredMarkRefusal::Catalog)?;
     check_restored_catalog(&catalog, proof, file, input.operation)?;
     directory.revalidate()?;
@@ -778,10 +898,8 @@ fn revalidate_restored(
     {
         return Err(RestoredMarkRefusal::Changed);
     }
-    input
-        .read
-        .revalidate_admission()
-        .map_err(RestoredMarkRefusal::Readback)
+    input.admission.check_destination(parent, directory)?;
+    input.admission.revalidate()
 }
 
 #[cfg(unix)]
