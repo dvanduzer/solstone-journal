@@ -744,3 +744,39 @@ fn absent_recovery_is_none_but_uncertain_parent_is_a_refusal_without_phantom_day
     assert!(!row.not_removed.is_empty());
     assert!(row.removed.is_empty());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn owner_deletion_retires_an_ended_empty_reservation_but_never_an_occupied_one() {
+    let fixture = Fixture::new();
+    let target = Fixture::target("field.audio", "070000_17");
+    let path = fixture.populate(&target);
+    let carrier = RootActivityCarrier::prepare(fixture.activity())
+        .unwrap_or_else(|_| panic!("carrier preparation failed"));
+    let ended = carrier.diagnostic_path();
+    // The owner ends without retiring its reservation, as on a crash.
+    drop(carrier);
+    let removed = remove_at(&fixture, &target);
+    assert!(removed.targets[0].not_removed.is_empty(), "{removed:?}");
+    assert_eq!(removed.targets[0].removed.len(), 2);
+    assert!(path.join(TOMBSTONE_NAME).exists());
+    assert!(!ended.exists());
+
+    let second = Fixture::target("field.audio", "080000_17");
+    let second_path = fixture.populate(&second);
+    let carrier = RootActivityCarrier::prepare(fixture.activity())
+        .unwrap_or_else(|_| panic!("carrier preparation failed"));
+    let occupied = carrier.diagnostic_path();
+    drop(carrier);
+    fs::write(occupied.join("payload"), b"unpublished copy").unwrap();
+    let held = remove_at(&fixture, &second);
+    assert!(held.targets[0].removed.is_empty());
+    assert_eq!(
+        fs::read(second_path.join("audio.flac")).unwrap(),
+        b"sole raw bytes"
+    );
+    assert_eq!(
+        fs::read(occupied.join("payload")).unwrap(),
+        b"unpublished copy"
+    );
+}

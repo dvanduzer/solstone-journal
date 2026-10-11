@@ -10,7 +10,9 @@ use std::sync::Arc;
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::activity_obligations::observe_obligations;
-use solstone_core_journal_io::media::{ActivityCarrierPreparationFailure, RootActivityCarrier};
+use solstone_core_journal_io::media::{
+    ActivityCarrierPreparationFailure, RootActivityCarrier, retire_orphan_root_carriers,
+};
 
 use crate::archive_admission::{AdmissionError, ArchiveBudget, ArchiveConfiguration, Clock};
 
@@ -106,6 +108,9 @@ impl ArchiveActivity {
                 inner: Box::new(failure),
             });
         }
+        // Reservations an ended owner left behind would otherwise hold every
+        // later operation. The fresh census below still decides admission.
+        retire_orphan_root_carriers(&lease);
         let census = match observe_obligations(&root) {
             Ok(census) => census,
             Err(error) => {

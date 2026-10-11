@@ -592,6 +592,92 @@ pub(crate) fn retire_recovered(
     receipt
 }
 
+/// Retire empty root reservations left by owners that no longer exist, such as
+/// after a crash or restart. Call only with a freshly acquired lease, before
+/// creating anything: holding it excludes every cooperating owner, but only on
+/// local storage, so other filesystems retire nothing. Any restore intent holds
+/// every reservation, since an interrupted restore may name one. Removal is
+/// rmdir, so a reservation holding anything stays an unresolved obligation.
+pub fn retire_orphan_root_carriers(activity: &Arc<ActivityLease>) -> usize {
+    let mut retired = 0;
+    // A refusal or error retires nothing further; the caller's census decides.
+    #[cfg(target_os = "linux")]
+    retire_orphans(activity, &mut retired).unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let _ = activity;
+    retired
+}
+
+#[cfg(target_os = "linux")]
+fn retire_orphans(activity: &Arc<ActivityLease>, retired: &mut usize) -> io::Result<()> {
+    use crate::activity_obligations::{NativeObligation, observe_obligations};
+    use crate::journal_root::JournalEntryKind;
+
+    activity
+        .revalidate()
+        .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+    let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
+    if !local_storage(nix::sys::statfs::fstatfs(&root.inner)?.filesystem_type()) {
+        return Ok(());
+    }
+    let census = observe_obligations(activity.journal_root()).map_err(io::Error::other)?;
+    let entries = census.entries();
+    if entries
+        .iter()
+        .any(|entry| matches!(entry, NativeObligation::Intent { .. }))
+    {
+        return Ok(());
+    }
+    for obligation in entries {
+        let NativeObligation::Stage { relative, entry } = obligation else {
+            continue;
+        };
+        if relative != Path::new(&entry.name) || entry.kind != JournalEntryKind::Directory {
+            continue;
+        }
+        activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        let removed = root
+            .inner
+            .open_child(&entry.name)
+            .and_then(|child| match child {
+                Some(child) if child.identity() == entry.identity => {
+                    platform::remove_directory(&root.inner, &entry.name, &child).map(|()| true)
+                }
+                _ => Ok(false),
+            });
+        if matches!(removed, Ok(true)) {
+            *retired += 1;
+        }
+    }
+    if *retired > 0 {
+        root.sync()?;
+    }
+    Ok(())
+}
+
+/// Filesystems where this host's lock excludes every writer. Anything else,
+/// including network, FUSE and virtual-machine shares, is refused.
+#[cfg(target_os = "linux")]
+fn local_storage(kind: nix::sys::statfs::FsType) -> bool {
+    use nix::sys::statfs::{
+        BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, F2FS_SUPER_MAGIC, FsType, OVERLAYFS_SUPER_MAGIC,
+        TMPFS_MAGIC, XFS_SUPER_MAGIC,
+    };
+    const ZFS_SUPER_MAGIC: FsType = FsType(0x2fc1_2fc1);
+    [
+        EXT4_SUPER_MAGIC,
+        XFS_SUPER_MAGIC,
+        BTRFS_SUPER_MAGIC,
+        F2FS_SUPER_MAGIC,
+        ZFS_SUPER_MAGIC,
+        TMPFS_MAGIC,
+        OVERLAYFS_SUPER_MAGIC,
+    ]
+    .contains(&kind)
+}
+
 /// Keeps the original capability and lease even after a known removal.
 #[must_use = "Handle retirement facts and retained ownership independently"]
 pub struct ActivityCarrierRetirement<T> {
@@ -601,3 +687,31 @@ pub struct ActivityCarrierRetirement<T> {
 
 #[cfg(all(test, feature = "full-tests"))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod storage_tests {
+    use nix::sys::statfs::{
+        EXT4_SUPER_MAGIC, FUSE_SUPER_MAGIC, FsType, NFS_SUPER_MAGIC, SMB_SUPER_MAGIC, TMPFS_MAGIC,
+        XFS_SUPER_MAGIC,
+    };
+
+    #[test]
+    fn shared_and_network_filesystems_refuse_orphan_retirement() {
+        for local in [EXT4_SUPER_MAGIC, XFS_SUPER_MAGIC, TMPFS_MAGIC] {
+            assert!(super::local_storage(local));
+        }
+        // CIFS, SMB2, 9p, Ceph and an unknown type; virtiofs reports FUSE.
+        for shared in [
+            NFS_SUPER_MAGIC,
+            SMB_SUPER_MAGIC,
+            FUSE_SUPER_MAGIC,
+            FsType(0xff53_4d42),
+            FsType(0xfe53_4d42),
+            FsType(0x0102_1997),
+            FsType(0x00c3_6400),
+            FsType(0x1234_5678),
+        ] {
+            assert!(!super::local_storage(shared));
+        }
+    }
+}
