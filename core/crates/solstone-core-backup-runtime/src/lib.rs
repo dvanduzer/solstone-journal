@@ -50,8 +50,9 @@ pub use engine::{
     ArchiveFailure, ArchiveFileVerdict, ArchiveReadSession, ArchiveRemoteEffects, ArchiveSnapshot,
     BACKUP_EXCLUDES, BackupResult, BackupServices, Clock, ClosedToolError, JournalMaintenance,
     JournalMaintenanceError, NativeJournalMaintenance, NativeRestoreRecorder, PruneResult,
-    RestoreRecorder, UnreadableSources, VerificationResult, admit_archive, archive_read_session,
-    check_archive_snapshot_files, prepare, run_archive_backup, run_prune, run_verification,
+    RestoreRecorder, UnreadableSources, VerificationResult, admit_archive,
+    admit_archive_with_budget, archive_read_session, check_archive_snapshot_files, prepare,
+    run_archive_backup, run_prune, run_verification,
 };
 // The legacy direct entry points: production goes through admission, so only
 // test builds can reach these.
