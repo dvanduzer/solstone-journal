@@ -584,7 +584,11 @@ mod composed_tests {
             ("backup:run", "backup: skipped", 0),
             ("backup:prune", "backup prune:", 0),
             ("backup:verify", "backup verify:", 0),
-            ("backup:offload", "backup offload:", 0),
+            (
+                "backup:offload",
+                "offload_status=held reason=dry_run_unavailable",
+                1,
+            ),
             ("health:mark-raw", "new items: 0", 0),
             ("health:prune-logs", "prune-logs: disabled", 0),
         ] {
