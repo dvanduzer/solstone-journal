@@ -1,0 +1,616 @@
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+<style>
+.map-shell {
+  max-width: 1200px;
+}
+
+.map-shell[data-map-empty] [data-date-nav] {
+  display: none;
+}
+
+.map-title {
+  margin: 0 0 var(--space-4);
+  font-family: var(--font-display);
+  font-weight: var(--weight-display);
+  font-size: clamp(1.8rem, 3vw, 2.35rem);
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.map-card {
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.map-card h2 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-body);
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.map-muted {
+  margin: var(--space-1) 0 0;
+  color: var(--ink-soft);
+  font-size: var(--text-small, 0.9rem);
+  line-height: 1.45;
+}
+
+.map-device-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+
+.map-device-head strong {
+  font-size: var(--text-body);
+  color: var(--ink);
+}
+
+.map-device-count {
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.map-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+@media (min-width: 900px) {
+  .map-columns {
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  }
+  .map-figure-card {
+    position: sticky;
+    top: var(--space-4);
+  }
+}
+
+.map-list-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.map-list {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+}
+
+.map-row {
+  display: grid;
+  grid-template-columns: 6.6rem 1.2rem minmax(0, 1fr);
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-2);
+  border-top: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+}
+
+.map-row:first-child {
+  border-top: 0;
+}
+
+.map-row[data-active] {
+  background: var(--cream-bright);
+}
+
+.map-row-time {
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+
+.map-row-mark {
+  width: 0.9rem;
+  height: 0.9rem;
+  margin-top: 0.25rem;
+  border-radius: 50%;
+}
+
+.map-row-mark-readings {
+  background: var(--orange);
+}
+
+.map-row-mark-approximate {
+  background: transparent;
+  border: 2px dashed var(--orange);
+}
+
+.map-row-mark-visit {
+  background: transparent;
+  border: 2px solid var(--orange);
+}
+
+.map-row-mark-unreadable {
+  background: transparent;
+  border: 2px dotted var(--ink-soft);
+}
+
+.map-row-title {
+  margin: 0;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.map-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  margin-top: var(--space-1);
+}
+
+.map-link,
+.map-row-actions button {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--touch-min);
+  margin: calc((var(--touch-min) - 1.4em) / -2) 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--orange-text-aa);
+  font: inherit;
+  font-size: 0.9rem;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.map-pieces {
+  margin-top: var(--space-1);
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.map-pieces summary {
+  cursor: pointer;
+}
+
+.map-pieces ul {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+}
+
+.map-canvas {
+  height: 420px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--hairline);
+  background: var(--panel);
+}
+
+.map-canvas .leaflet-container,
+.map-canvas.leaflet-container {
+  background: var(--panel);
+  font: inherit;
+}
+
+.map-town-label {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  padding: 0 0 0 2px;
+  color: var(--ink);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-shadow: 0 0 3px var(--paper), 0 0 3px var(--paper);
+}
+
+.map-town-label::before {
+  display: none;
+}
+
+.map-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.map-empty-actions a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--touch-min);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.map-details summary {
+  cursor: pointer;
+  font-weight: 700;
+  min-height: var(--touch-min);
+  display: flex;
+  align-items: center;
+}
+
+.map-details p {
+  margin: var(--space-2) 0 0;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+</style>
+
+<div class="workspace-content map-shell" id="map-shell">
+  <div data-date-nav></div>
+  <h1 class="map-title" data-date-nav-heading></h1>
+  <div id="map-state-gate"></div>
+  <div id="map-view-root" hidden></div>
+</div>
+
+<script src="/static/vendor/leaflet/leaflet.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  const DAY_RE = /^\d{8}$/;
+  const escapeHtml = (value) => window.AppServices.escapeHtml(String(value ?? ""));
+  const shell = document.getElementById("map-shell");
+  const root = document.getElementById("map-view-root");
+  const gate = document.getElementById("map-state-gate");
+  const MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December"];
+  const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const TIER_NAMES = {
+    light: "places only",
+    balanced: "places + comings and goings",
+    full: "the complete picture",
+  };
+  let mapState = null;
+
+  function asArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function dayDate(day) {
+    if (!DAY_RE.test(String(day || ""))) return null;
+    return new Date(Number(day.slice(0, 4)), Number(day.slice(4, 6)) - 1, Number(day.slice(6, 8)));
+  }
+
+  function longDay(day) {
+    const date = dayDate(day);
+    return date ? `${WEEKDAYS[date.getDay()]}, ${MONTHS[date.getMonth()]} ${date.getDate()}` : "";
+  }
+
+  function shortDay(day) {
+    const date = dayDate(day);
+    return date ? `${MONTHS[date.getMonth()].slice(0, 3)} ${date.getDate()}` : "";
+  }
+
+  function plural(count, one, many) {
+    return `${count} ${count === 1 ? one : many}`;
+  }
+
+  // A time on the day being shown reads as its clock; one on another day
+  // carries that day, so a visit begun the evening before says so.
+  function moment(time, day) {
+    if (!time) return "";
+    return time.day === day ? time.clock : `${shortDay(time.day)} ${time.clock}`;
+  }
+
+  function pieceTime(segment) {
+    const match = /^(\d{2})(\d{2})\d{2}_/.exec(String(segment || ""));
+    return match ? `${match[1]}:${match[2]}` : String(segment || "");
+  }
+
+  function setGate(markup) {
+    root.hidden = true;
+    gate.hidden = false;
+    gate.innerHTML = markup;
+  }
+
+  function reveal(markup) {
+    gate.hidden = true;
+    gate.innerHTML = "";
+    root.innerHTML = markup;
+    root.hidden = false;
+  }
+
+  function showError(err, retry) {
+    if (window.logError) window.logError(err, { context: "map:day" });
+    setGate(window.SurfaceState.error({
+      heading: "couldn't open this day's location.",
+      desc: window.CONVEY_COPY?.RELOAD_HINT,
+      serverMessage: err?.serverMessage,
+      detail: err,
+      retry: true,
+    }));
+    gate.querySelector(".surface-state-retry")?.addEventListener("click", retry, { once: true });
+  }
+
+  function renderJournalEmpty() {
+    shell.setAttribute("data-map-empty", "");
+    setGate(window.SurfaceState.empty({
+      icon: window.ConveyIcons?.svg("map-pin"),
+      heading: "no location in your journal yet",
+      desc: "location comes from the solstone app on your phone, once you turn it on there. whatever it takes in goes into your journal and shows up here, day by day.",
+    }));
+  }
+
+  function renderDayEmpty(data, day) {
+    const nearby = data.nearby || {};
+    const links = [nearby.previous, nearby.next]
+      .filter((value) => DAY_RE.test(String(value || "")))
+      .map((value) => `<a href="/app/map/${escapeHtml(value)}">go to ${escapeHtml(longDay(value))}</a>`)
+      .join("");
+    setGate(window.SurfaceState.empty({
+      icon: window.ConveyIcons?.svg("map-pin"),
+      heading: "no location kept for this day",
+      desc: `your journal has no location from ${longDay(day)}. location may have been paused or off, or the phone may not have reached your journal. your journal can't tell which.`,
+    }));
+    if (links) {
+      const actions = document.createElement("div");
+      actions.className = "map-empty-actions";
+      actions.innerHTML = links;
+      gate.firstElementChild?.appendChild(actions);
+    }
+  }
+
+  function deviceNotes(device) {
+    const notes = [];
+    const word = device.word;
+    const tier = TIER_NAMES[device.tier];
+    if (device.platform === "android") {
+      notes.push("approximate location: each reading is only good to within a few kilometres, which is enough to name the town, not the building.");
+    } else if (device.platform === "watchos") {
+      notes.push("your watch gives only approximate location, so its readings name the town, not the building.");
+    } else if (tier) {
+      notes.push(`detail level in the solstone app: <strong>${escapeHtml(tier)}</strong>.`);
+    }
+    if (device.precision_reduced) {
+      notes.push(`precise location is off for solstone on your ${escapeHtml(word)}, so its readings name the town, not the building.`);
+    }
+    if (device.interrupted_segments > 0) {
+      notes.push(`your ${escapeHtml(word)} said location was interrupted ${device.interrupted_segments === 1 ? "once" : `${device.interrupted_segments} times`} this day.`);
+    }
+    return notes;
+  }
+
+  function renderDevice(device, day) {
+    const counts = [];
+    if (device.readings) counts.push(plural(device.readings, "reading", "readings"));
+    if (device.visits) counts.push(plural(device.visits, "visit", "visits"));
+    if (device.first && device.last && device.readings > 1) {
+      counts.push(`${moment(device.first, day)} to ${moment(device.last, day)}`);
+    }
+    const notes = deviceNotes(device).map((note) => `<p class="map-muted">${note}</p>`).join("");
+    return `<section class="map-card" aria-label="from ${escapeHtml(device.phrase)}">
+      <div class="map-device-head"><strong>from ${escapeHtml(device.phrase)}</strong>
+      <span class="map-device-count">${escapeHtml(counts.join(" · "))}</span></div>${notes}</section>`;
+  }
+
+  function entryTitle(entry) {
+    if (entry.kind === "unreadable") {
+      return entry.whole_file
+        ? "a segment your journal couldn't read"
+        : `${plural(entry.lines, "line", "lines")} your journal couldn't read`;
+    }
+    return entry.area?.label || "no named town nearby";
+  }
+
+  function entryTime(entry, day) {
+    if (entry.kind === "readings") {
+      return entry.count === 1
+        ? moment(entry.first, day)
+        : `${moment(entry.first, day)}–\u200b${moment(entry.last, day)}`;
+    }
+    if (entry.kind === "visit") {
+      return `${entry.arrival ? moment(entry.arrival, day) : "…"}–\u200b${entry.departure ? moment(entry.departure, day) : "…"}`;
+    }
+    return entry.at ? moment(entry.at, day) : "";
+  }
+
+  function entryMeta(entry, data) {
+    const device = asArray(data.devices)[entry.device] || {};
+    const many = asArray(data.devices).length > 1;
+    const parts = [];
+    if (entry.kind === "readings") {
+      parts.push(plural(entry.count, "reading", "readings"));
+      if (entry.precision === "approximate" || entry.precision === "reduced") parts.push("approximate");
+      if (many) parts.push(`from ${device.phrase}`);
+    } else if (entry.kind === "visit") {
+      parts.push(`a visit ${device.phrase} reported`);
+      parts.push(entry.arrival ? `arrived ${moment(entry.arrival, data.day)}` : "arrival not known");
+      parts.push(entry.departure ? `left ${moment(entry.departure, data.day)}` : "no departure reported");
+    } else {
+      parts.push(`from ${device.phrase}`);
+      parts.push("open it in transcripts to see or delete it");
+    }
+    return parts.join(" · ");
+  }
+
+  function entryActions(entry, index) {
+    const segments = asArray(entry.segments);
+    const actions = [];
+    if (entry.kind !== "unreadable") {
+      actions.push(`<button type="button" data-map-show="${index}">show on the map</button>`);
+    }
+    if (segments.length === 1) {
+      actions.push(`<a class="map-link" href="${escapeHtml(segments[0].url)}">open in transcripts</a>`);
+    }
+    let pieces = "";
+    if (segments.length > 1) {
+      const items = segments
+        .map((segment) => `<li><a class="map-link" href="${escapeHtml(segment.url)}">${escapeHtml(pieceTime(segment.segment))}</a></li>`)
+        .join("");
+      pieces = `<details class="map-pieces"><summary>open in transcripts: ${segments.length} segments</summary><ul>${items}</ul></details>`;
+    }
+    return `<div class="map-row-actions">${actions.join("")}</div>${pieces}`;
+  }
+
+  function markClass(entry) {
+    if (entry.kind === "readings") {
+      return entry.precision === "precise" ? "map-row-mark-readings" : "map-row-mark-approximate";
+    }
+    return `map-row-mark-${entry.kind}`;
+  }
+
+  function renderEntry(entry, index, data) {
+    return `<li class="map-row" data-map-entry="${index}">
+      <span class="map-row-time">${escapeHtml(entryTime(entry, data.day))}</span>
+      <span class="map-row-mark ${markClass(entry)}" aria-hidden="true"></span>
+      <div><p class="map-row-title">${escapeHtml(entryTitle(entry))}</p>
+      <p class="map-muted">${escapeHtml(entryMeta(entry, data))}</p>${entryActions(entry, index)}</div></li>`;
+  }
+
+  function renderDay(data) {
+    const entries = asArray(data.entries);
+    const devices = asArray(data.devices);
+    const list = entries.map((entry, index) => renderEntry(entry, index, data)).join("");
+    const mapCard = data.map
+      ? `<section class="map-card map-figure-card" aria-label="map">
+          <div class="map-canvas" id="map-canvas" role="region" aria-label="map of the records listed here, with towns and borders"></div>
+          <p class="map-muted">named features only; streets not shown.</p>
+          <p class="map-muted">towns from <a class="map-link" href="https://www.geonames.org/" rel="noopener noreferrer">GeoNames</a> (<a class="map-link" href="https://creativecommons.org/licenses/by/4.0/" rel="noopener noreferrer">CC BY 4.0</a>) · borders from Natural Earth</p>
+        </section>`
+      : "";
+    reveal(`${devices.map((device) => renderDevice(device, data.day)).join("")}
+      <div class="map-columns">
+        <section class="map-card" aria-label="the day, in order">
+          <div class="map-list-head"><h2>the day, in order</h2>
+          <span class="map-muted">${escapeHtml(plural(entries.length, "record", "records"))}</span></div>
+          <ol class="map-list">${list}</ol>
+        </section>
+        ${mapCard}
+      </div>
+      <section class="map-card"><details class="map-details"><summary>how this is drawn</summary>
+        <p>your journal draws this from the readings your phone sent it, and the town and border names that came with your journal. no map service is asked for anything.</p>
+        <p>there's no street map. a street map is loaded piece by piece from a map service, and asking for the right piece tells that service where you were.</p>
+        <p>each reading is named after the town that best stands for its area, which isn't always the town you were in. that's why it says "near".</p>
+        <p>for readings, the times are the first and last reading in the row. they don't say how long you were anywhere.</p>
+      </details></section>
+      <section class="map-card"><h2>deleting any of this</h2>
+        <p class="map-muted">every record above opens in transcripts, where you delete its segments the same way as any other. a deleted segment leaves this view and search.</p>
+      </section>`);
+    root.querySelectorAll("[data-map-show]").forEach((button) => {
+      button.addEventListener("click", () => focusEntry(Number(button.getAttribute("data-map-show")), true));
+    });
+    drawMap(data);
+  }
+
+  function cssColor(name, fallback) {
+    const value = window.getComputedStyle?.(document.documentElement)?.getPropertyValue(name);
+    return (value && value.trim()) || fallback;
+  }
+
+  function tooltipNode(text) {
+    const span = document.createElement("span");
+    span.textContent = text;
+    return span;
+  }
+
+  function drawMap(data) {
+    const L = window.L;
+    const element = document.getElementById("map-canvas");
+    if (!L || !element || !data.map) return;
+    const ink = cssColor("--ink-soft", "#6b5f55");
+    const orange = cssColor("--orange", "#e8913a");
+    const map = L.map(element, { attributionControl: false, zoomSnap: 0.5, worldCopyJump: false });
+    const [west, south, east, north] = data.map.bounds;
+    map.fitBounds([[south, west], [north, east]], { padding: [28, 28], maxZoom: 14 });
+    L.control.scale({ imperial: false }).addTo(map);
+    const line = (lines, style) => asArray(lines).forEach((points) => L.polyline(points, style).addTo(map));
+    asArray(data.map.countries).forEach((country) => line(country.lines, { color: ink, weight: 1.6, opacity: 0.8, interactive: false }));
+    asArray(data.map.regions).forEach((region) => line(region.lines, { color: ink, weight: 1, opacity: 0.6, dashArray: "4 4", interactive: false }));
+    // Only towns that carry a name are drawn: an unnamed dot says nothing.
+    asArray(data.map.towns).slice(0, 15).forEach((town) => {
+      const dot = L.circleMarker([town.lat, town.lon], { radius: 2.5, color: ink, weight: 1, fillColor: ink, fillOpacity: 0.9, interactive: false }).addTo(map);
+      dot.bindTooltip(tooltipNode(town.name), { permanent: true, direction: "right", className: "map-town-label", offset: [4, 0] });
+    });
+    const layers = [];
+    asArray(data.entries).forEach((entry, index) => {
+      const group = L.featureGroup();
+      const points = entry.kind === "readings" ? asArray(entry.points) : entry.kind === "visit" ? [entry.point] : [];
+      points.forEach((point) => {
+        const [lat, lon, accuracy] = point;
+        if (Number.isFinite(accuracy) && accuracy > 25) {
+          L.circle([lat, lon], { radius: accuracy, stroke: false, fillColor: orange, fillOpacity: accuracy > 500 ? 0.025 : 0.07, interactive: false }).addTo(group);
+        }
+        const marker = entry.kind === "visit"
+          ? L.circleMarker([lat, lon], { radius: 8, color: orange, weight: 2.5, fill: false })
+          : L.circleMarker([lat, lon], { radius: 3.5, color: orange, weight: 1, fillColor: orange, fillOpacity: entry.precision === "precise" ? 0.9 : 0.35 });
+        marker.on("click", () => focusEntry(index, false));
+        marker.addTo(group);
+      });
+      if (points.length) group.addTo(map);
+      layers[index] = points.length ? group : null;
+    });
+    mapState = { map, layers };
+  }
+
+  function focusEntry(index, onMap) {
+    root.querySelectorAll("[data-map-entry]").forEach((row) => {
+      if (Number(row.getAttribute("data-map-entry")) === index) row.setAttribute("data-active", "");
+      else row.removeAttribute("data-active");
+    });
+    const row = root.querySelector(`[data-map-entry="${index}"]`);
+    if (!onMap) {
+      row?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+      return;
+    }
+    const layer = mapState?.layers?.[index];
+    if (layer && mapState.map) {
+      mapState.map.fitBounds(layer.getBounds(), { padding: [40, 40], maxZoom: 15 });
+      document.getElementById("map-canvas")?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+    }
+  }
+
+  async function loadDay(day) {
+    setGate(window.SurfaceState.loading({ text: "loading this day's location…" }));
+    try {
+      const data = await window.apiJson(`/app/map/api/day/${encodeURIComponent(day)}`);
+      if (!root.isConnected) return;
+      if (!asArray(data.entries).length && !asArray(data.devices).length) {
+        if (data.journal_has_location) renderDayEmpty(data, day);
+        else renderJournalEmpty();
+        return;
+      }
+      renderDay(data);
+    } catch (err) {
+      showError(err, () => loadDay(day));
+    }
+  }
+
+  async function start() {
+    const { day } = window.solPathContext ? window.solPathContext() : {};
+    if (DAY_RE.test(String(day || ""))) {
+      await loadDay(day);
+      return;
+    }
+    setGate(window.SurfaceState.loading({ text: "loading your journal's location…" }));
+    try {
+      const index = await window.apiJson("/app/map/api/index");
+      const end = index?.coverage?.end;
+      if (DAY_RE.test(String(end || ""))) {
+        window.location.replace(`/app/map/${end}`);
+        return;
+      }
+      renderJournalEmpty();
+    } catch (err) {
+      showError(err, start);
+    }
+  }
+
+  window.__mapWorkspace = { start, renderDay, entryTitle, entryTime, entryMeta, moment };
+  start();
+})();
+</script>

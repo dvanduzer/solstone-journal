@@ -14,3 +14,6 @@ core/crates/solstone-core-distribution/fixtures/nvattest-windows-build/*.lock -t
 
 # Unified patches use a single space to mark an empty context line.
 core/distribution/mobile/*.patch whitespace=-blank-at-eol
+
+# Vendored Leaflet keeps its exact upstream bytes.
+core/crates/solstone-core-convey-shell/assets/static/vendor/leaflet/* -text -whitespace

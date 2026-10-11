@@ -6,6 +6,11 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- searching your journal now finds a day by the towns your phone's location was near, and your journal's own thinking, and an agent that may see transcripts across your whole journal, can read those town names, never the coordinates.
+- a new map app shows the location your phone sends, a day at a time. each record is named after the town it was near, like "near Golden, Colorado". visits your iphone reported show when you arrived and left. a small map draws the towns and borders around them. the town and border names come with your journal, so no map service is asked for anything, and streets aren't shown. every record opens in transcripts, where you can delete the segments it came from.
+
 ### Changed
 
 - each tool your journal offers a connected agent now has a short name. saving a note, the one tool that doesn't only read, now says it adds without changing anything already in your journal. when an agent's call has arguments your journal can't use, it's told what to fix.

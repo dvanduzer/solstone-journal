@@ -239,6 +239,25 @@ fn owner_read_role_classification_table_exhaustiveness() {
             "/app/transcripts/api/serve_file/{day}/{*rel_path}",
             RouteClassification::Moved(OwnerReadRole::TranscriptsServeFile),
         ),
+        // Map (6 live GET paths in map-web lib.rs)
+        (
+            "/app/map/",
+            RouteClassification::Moved(OwnerReadRole::MapRoot),
+        ),
+        ("/app/map/workspace", RouteClassification::NoQualifyingWork),
+        ("/app/map/{day}", RouteClassification::NoQualifyingWork),
+        (
+            "/app/map/api/index",
+            RouteClassification::Moved(OwnerReadRole::MapIndex),
+        ),
+        (
+            "/app/map/api/stats/{month}",
+            RouteClassification::Moved(OwnerReadRole::MapMonthStats),
+        ),
+        (
+            "/app/map/api/day/{day}",
+            RouteClassification::Moved(OwnerReadRole::MapDay),
+        ),
         // Stats (8 live GET paths in stats-web lib.rs:24-43)
         ("/app/stats/", RouteClassification::NoQualifyingWork),
         (
@@ -368,7 +387,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         ),
     ];
 
-    assert_eq!(table.len(), 75, "Must classify all 75 live GET routes");
+    assert_eq!(table.len(), 81, "Must classify all 81 live GET routes");
 
     let mut distinct_paths = BTreeSet::new();
     for (path, _) in table {
@@ -391,7 +410,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         moved_roles, all_roles,
         "Moved roles must equal OwnerReadRole::ALL exactly"
     );
-    assert_eq!(moved_roles.len(), 48);
+    assert_eq!(moved_roles.len(), 52);
 
     let ten_measured = [
         OwnerReadRole::SpeakersKnown,
@@ -434,8 +453,8 @@ fn owner_read_role_classification_table_exhaustiveness() {
         .collect();
     assert_eq!(
         no_qualifying.len(),
-        24,
-        "NoQualifyingWork must have exactly 24 routes"
+        26,
+        "NoQualifyingWork must have exactly 26 routes"
     );
 }
 

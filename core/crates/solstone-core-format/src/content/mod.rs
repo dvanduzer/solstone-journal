@@ -193,6 +193,17 @@ pub(crate) const INDEX_FAMILY_PATTERNS: &[FamilyPattern] = &[
             basis: ScopeBasis::JournalWide,
         },
     },
+    // A day's location in words (`solstone-core-location` writes it): area
+    // names and times, never coordinates.
+    FamilyPattern {
+        pattern: "*/location.md",
+        family: Family::Markdown,
+        root: PatternRoot::DayRooted,
+        disposition: IndexDisposition::Admitted {
+            category: AdmittedCategory::Transcripts,
+            basis: ScopeBasis::JournalWide,
+        },
+    },
     FamilyPattern {
         pattern: "*/*/*/talents/sense.json",
         family: Family::Sense,

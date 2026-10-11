@@ -1,8 +1,8 @@
 # third-party notices
 
 this file records third-party materials used by solstone, including model
-weights bundled with solstone, the restic, rclone, nvattest and CED components
-bundled in every package, provider artifacts downloaded at runtime into the
+weights and place names bundled with solstone, the map app's renderer, the
+restic, rclone, nvattest and CED components bundled in every package, provider artifacts downloaded at runtime into the
 journal provider cache, and test fixtures derived from permissively licensed
 sources.
 
@@ -39,6 +39,57 @@ License notice: BSD 3-Clause License (BSD-3-Clause).
 | `lib/solstone_journal_models/assets/wespeaker-resnet34-256.onnx` | WeSpeaker ResNet34 speaker embedding model trained on VoxCeleb | `wespeaker_en_voxceleb_resnet34.onnx` from the k2-fsa/sherpa-onnx `speaker-recongition-models` release | CC-BY-4.0 | `5ef208a9da1453335308a6b6f4e6dfbd7e183a38b604de0a57664f45d257fe94` |
 | `lib/solstone_journal_models/assets/pyannote-segmentation-3.0.onnx` | `pyannote/segmentation-3.0` speaker segmentation model | `onnx/model.onnx` from `onnx-community/pyannote-segmentation-3.0` | MIT | `057ee564753071c0b09b5b611648b50ac188d50846bff5f01e9f7bbf1591ea25` |
 | `lib/solstone_journal_models/assets/silero_vad_v6.onnx` | Silero VAD voice activity detection model | ONNX model from `snakers4/silero-vad` | MIT | `4cbf549b8326f60f80f2536d9eefeb450a9abe83365a098031c89719f1be17d2` |
+
+## bundled place names (area tier)
+
+`lib/solstone_journal_models/assets/geo/area-tier.bin` (SHA-256
+`a803dc5d4557b8b969c607834a3096d77803875e92c9acda7a5f9a1fd7c7aa21`) names a
+location reading after a nearby town, and gives the map app its country and
+state borders. The journal reads it on the owner's own computer; nothing is
+looked up anywhere. It is built by `scripts/build_location_area_tier.py` from
+the two sources below.
+
+### GeoNames
+
+Attribution: GeoNames, https://www.geonames.org/
+
+Source: `cities500.zip`, `admin1CodesASCII.txt` and `countryInfo.txt` from
+https://download.geonames.org/export/dump/
+
+License notice: Creative Commons Attribution 4.0 International (CC-BY-4.0).
+License text: https://creativecommons.org/licenses/by/4.0/legalcode.txt
+
+Changes: sections of populated places and historical, abandoned or destroyed
+places are left out; each place keeps only its name, ASCII name, position
+rounded to 1e-5 degrees, population, country and first-level division name;
+the rows are re-encoded into the file's compact binary form. The map app
+credits GeoNames, with a link, wherever it draws the map.
+
+### Natural Earth
+
+Attribution: Natural Earth, https://www.naturalearthdata.com/
+
+Source: `ne_10m_admin_0_countries` and `ne_10m_admin_1_states_provinces`
+(GeoJSON) from https://github.com/nvkelso/natural-earth-vector at commit
+`ca96624a56bd078437bca8184e78163e5039ad19`.
+
+License notice: public domain. Natural Earth's terms of use:
+https://www.naturalearthdata.com/about/terms-of-use/
+
+Changes: outlines simplified (state and province borders to 0.01 degrees,
+country borders to 0.02 degrees) and keyed by name and ISO country code.
+
+## map renderer (Leaflet)
+
+The map app draws with Leaflet 1.9.4, served from the journal at
+`/static/vendor/leaflet/`, with no tile layer and no request off the journal.
+
+Source: https://registry.npmjs.org/leaflet/-/leaflet-1.9.4.tgz (SHA-256
+`84c65a256e50657896f54c33bd857b6849ebe94c817803be818bf32a3dde0b77`);
+project https://leafletjs.com
+
+License notice: BSD 2-Clause License (BSD-2-Clause). The licence text ships
+beside the library as `vendor/leaflet/LICENSE`.
 
 ## bundled test fixtures
 
