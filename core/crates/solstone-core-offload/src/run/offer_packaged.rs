@@ -965,4 +965,391 @@ mod caller_qualification {
         carrier.revalidate()?;
         Ok(())
     }
+
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    mod planner_qualification {
+        use super::*;
+        use crate::run::{
+            CurrentOffloadAvailability, OffloadPlanningPhase, create_planned_offload_offers,
+            with_payload_capacity_fault,
+        };
+
+        #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum PlannerCase {
+            PlannerPositive,
+            PlannerPayloadCapacityRefused,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PlannerInput {
+            case: PlannerCase,
+            journal: PathBuf,
+            repository_id: String,
+            snapshot_id: String,
+            archive_paths: Vec<String>,
+            expected_restic_path: PathBuf,
+            control: PathBuf,
+        }
+
+        #[test]
+        #[ignore = "requires copied package and owning actual planner/S3/child fixture"]
+        fn packaged_offer_planner_entry() -> TestResult {
+            let input: PlannerInput = serde_json::from_slice(&fs::read(
+                std::env::var_os("OFFLOAD_OFFER_PLANNER_PROBE_JSON")
+                    .ok_or_else(|| invalid("explicit planner input required"))?,
+            )?)?;
+            assert_eq!(input.archive_paths.len(), 2);
+            let root = Arc::new(JournalRoot::open(&input.journal)?);
+            let register_path = input.journal.join("health/retention-marks.json");
+            let ledger_path = input.journal.join("health/offload/20261009.jsonl");
+            assert!(!register_path.try_exists()?);
+            assert!(!ledger_path.try_exists()?);
+            assert!(stages(&input.journal)?.is_empty());
+            let selection = OffloadOfferSelection {
+                target: Target {
+                    day: "20261009".into(),
+                    stream: "_default".into(),
+                    dir: "120000_60_fixture".into(),
+                },
+                layout: SegmentLayout::Direct,
+                names: vec!["file1.flac".into(), "file2.flac".into()],
+            };
+            let raw_dir = input
+                .journal
+                .join(solstone_core_retention::layout::segment_rel(
+                    &selection.target.day,
+                    &selection.target.stream,
+                    &selection.target.dir,
+                ));
+            let raw = selection
+                .names
+                .iter()
+                .map(|name| file_fact(&raw_dir.join(name)))
+                .collect::<TestResult<Vec<_>>>()?;
+            let headers = selection
+                .names
+                .iter()
+                .map(|name| fs::read(raw_dir.join(name).with_extension("jsonl")))
+                .collect::<io::Result<Vec<_>>>()?;
+            let configuration = fs::read(input.journal.join("config/journal.json"))?;
+            let clock = NativeClock;
+            let at = Utc::now().fixed_offset();
+            let budget = ArchiveBudget::new_cancellable(&clock, ArchiveCancellation::new())?;
+            let budget_seconds = budget.remaining(&clock)?.as_secs();
+            let operation = PreparedArchiveOperation::prepare(Arc::clone(&root), budget, &clock)
+                .map_err(|error| invalid(format!("actual planner preparation: {error:?}")))?;
+            assert!(operation.configuration().offload_enabled());
+            assert_eq!(operation.configuration().offload_budget_bytes()?, Some(0));
+            let activity = Arc::clone(operation.activity());
+            let carrier = Arc::clone(operation.carrier());
+            let runner = ObservedRunner(RefCell::new(Vec::new()));
+            let http = UreqHttpTransport;
+            let maintenance = NativeJournalMaintenance;
+            let services = BackupServices {
+                runner: &runner,
+                http: &http,
+                clock: &clock,
+                restic_path: Some(&input.expected_restic_path),
+                rclone_path: None,
+                version: "actual-planner-fixture",
+                journal_maintenance: &maintenance,
+            };
+            let mut control = UnixStream::connect(&input.control)?;
+            cut(&mut control, b"prepared")?;
+            let (creation, consumed) = if input.case == PlannerCase::PlannerPayloadCapacityRefused {
+                with_payload_capacity_fault(|| {
+                    create_planned_offload_offers(operation, &services, at)
+                })
+            } else {
+                (
+                    create_planned_offload_offers(operation, &services, at),
+                    false,
+                )
+            };
+            println!(
+                "PLANNER_RETURN_FACTS {}",
+                json!({"case":input.case,
+                "reason":format!("{:?}",creation.reason()),"fault_consumed":consumed,
+                "requests":runner.0.borrow().clone()})
+            );
+            let planning = creation
+                .planning()
+                .ok_or_else(|| invalid("actual planning report missing"))?;
+            let reconciliation = planning
+                .reconciliation()
+                .ok_or_else(|| invalid("reconciliation missing"))?
+                .as_ref()
+                .map_err(|failure| {
+                    invalid(format!("actual reconciliation: {:?}", failure.reason()))
+                })?;
+            assert!(Arc::ptr_eq(reconciliation.journal_root(), &root));
+            assert!(reconciliation.register().marks.is_empty());
+            assert!(reconciliation.groups().is_empty());
+            assert_eq!(planning.budget_bytes(), Some(0));
+            let local = planning
+                .local()
+                .ok_or_else(|| invalid("actual local population missing"))?;
+            let usage = local.usage().map_err(invalid)?;
+            assert_eq!((usage.total_bytes, usage.total_files), (4_194_324, 2));
+            assert_eq!(local.files.len(), 2);
+            for file in &local.files {
+                assert_eq!(file.key.day, selection.target.day);
+                assert_eq!(file.key.stream, selection.target.stream);
+                assert_eq!(file.key.segment_dir, selection.target.dir);
+                assert_eq!(file.key.layout, selection.layout);
+                assert!(selection.names.contains(&file.key.name));
+                assert_eq!(file.bytes, 2_097_162);
+            }
+            let decision = planning
+                .decision()
+                .ok_or_else(|| invalid("actual current inspection missing"))?;
+            assert_eq!(
+                decision.availability(),
+                CurrentOffloadAvailability::Available
+            );
+            assert!(decision.refusals().is_empty());
+            assert_eq!(decision.eligible().count(), 0);
+            assert_eq!(
+                decision.root_observation(),
+                root.identity().observation_id()
+            );
+            let projection = planning
+                .initial_projection()
+                .ok_or_else(|| invalid("actual projection unavailable"))?;
+            assert_eq!(
+                (
+                    projection.local.total_bytes,
+                    projection.local.total_files,
+                    projection.eligible_bytes,
+                    projection.eligible_files,
+                    projection.projected_local_bytes
+                ),
+                (4_194_324, 2, 0, 0, 4_194_324)
+            );
+            let observed = creation
+                .observed()
+                .ok_or_else(|| invalid("real planner capture missing"))?;
+            assert!(Arc::ptr_eq(observed.journal_root(), &root));
+            assert!(Arc::ptr_eq(observed.activity(), &activity));
+            assert_eq!(observed.groups().len(), 1);
+            let group = &observed.groups()[0];
+            assert_eq!(group.selection(), &selection);
+            assert!(group.expected_mark().is_none());
+            assert_eq!(group.files().len(), 2);
+            for (file, fact) in group.files().iter().zip(&raw) {
+                assert_eq!(
+                    file.observation().digest.size,
+                    fact["bytes"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    file.observation().digest.sha256,
+                    fact["sha256"].as_str().unwrap()
+                );
+            }
+            assert!(creation.partial_copy().is_none());
+            assert!(creation.native_error().is_none());
+            let requests = runner.0.borrow();
+            assert!(!requests.is_empty());
+            let mut source_facts = Vec::new();
+            let mut reads = Vec::new();
+            let mut marks = Vec::new();
+            let mut receipt = None;
+            let mut capacity_error_os = None;
+            let publication;
+            match input.case {
+                PlannerCase::PlannerPayloadCapacityRefused => {
+                    assert!(consumed);
+                    assert_eq!(planning.phase(), OffloadPlanningPhase::Held);
+                    let OffloadCreationOwner::Admitted(original) = creation.owner() else {
+                        return Err(invalid("post-P refusal lost the actual admitted owner").into());
+                    };
+                    assert!(Arc::ptr_eq(original.journal_root(), &root));
+                    assert!(Arc::ptr_eq(original.activity(), &activity));
+                    assert!(Arc::ptr_eq(original.carrier(), &carrier));
+                    assert_eq!(original.repository_id(), input.repository_id);
+                    original.prepared_operation().revalidate()?;
+                    let Some(OffloadCreationRefusal::Inputs(OffloadOfferRefusal::Io(error))) =
+                        creation.reason()
+                    else {
+                        return Err(invalid("retained native capacity error missing").into());
+                    };
+                    assert_eq!(error.raw_os_error(), Some(13));
+                    capacity_error_os = error.raw_os_error();
+                    assert_eq!(creation.source_copies().count(), 0);
+                    assert!(creation.archives().is_empty());
+                    assert_eq!(creation.ledger_writes().count(), 0);
+                    assert!(!register_path.try_exists()?);
+                    assert!(!ledger_path.try_exists()?);
+                    assert!(
+                        requests.iter().all(|request| request["argv"][0] != "backup"
+                            && request["argv"][0] != "dump")
+                    );
+                    check_carrier(&carrier)?;
+                    publication = "held_capacity_os13";
+                }
+                PlannerCase::PlannerPositive => {
+                    assert!(!consumed);
+                    assert_eq!(planning.phase(), OffloadPlanningPhase::OffersPublished);
+                    assert!(creation.reason().is_none());
+                    let OffloadCreationOwner::Published(outcome) = creation.owner() else {
+                        return Err(
+                            invalid("actual planner did not retain genuine publication").into()
+                        );
+                    };
+                    let Ok(BoundMutationOutcome::Published(published)) = outcome.publication()
+                    else {
+                        return Err(invalid(format!(
+                            "actual planner publication: {:?}",
+                            outcome.publication()
+                        ))
+                        .into());
+                    };
+                    assert!(matches!(published.status, MutationStatus::Applied));
+                    let verified = outcome.verified();
+                    assert!(Arc::ptr_eq(verified.journal_root(), &root));
+                    assert!(Arc::ptr_eq(verified.activity(), &activity));
+                    let current = marks::load(&input.journal)?;
+                    assert_eq!(current.version, 2);
+                    assert_eq!(current, published.register);
+                    assert_eq!(
+                        current.marks.values().cloned().collect::<Vec<_>>(),
+                        verified.marks()
+                    );
+                    marks = verified.marks().to_vec();
+                    reads = read_facts(verified)?;
+                    let copies = creation.source_copies().collect::<Vec<_>>();
+                    assert_eq!(copies.len(), 2);
+                    for ((copy, name), fact) in copies.iter().zip(&selection.names).zip(&raw) {
+                        assert_eq!(copy.digest().size, fact["bytes"].as_u64().unwrap());
+                        assert_eq!(copy.digest().sha256, fact["sha256"].as_str().unwrap());
+                        source_facts.push(
+                            json!({"name":name,"identity":copy.identity(),"digest":copy.digest()}),
+                        );
+                    }
+                    assert_ne!(copies[0].identity(), copies[1].identity());
+                    let backups = requests
+                        .iter()
+                        .filter(|request| request["argv"][0] == "backup")
+                        .collect::<Vec<_>>();
+                    assert_eq!(backups.len(), 1);
+                    for option in ["--force", "--no-cache", "solstone-archive"] {
+                        assert!(
+                            backups[0]["argv"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&json!(option))
+                        );
+                    }
+                    assert_eq!(backups[0]["sources"].as_array().unwrap().len(), 2);
+                    assert_eq!(backups[0]["descriptors"].as_array().unwrap().len(), 2);
+                    assert_eq!(backups[0]["outcome"]["returncode"], 0);
+                    assert_eq!(creation.archives().len(), 1);
+                    let archive = creation.archives()[0]
+                        .as_ref()
+                        .map_err(|error| invalid(format!("actual archive: {error:?}")))?;
+                    let proof = &marks[0]
+                        .offload
+                        .as_ref()
+                        .ok_or_else(|| invalid("real offer missing"))?
+                        .proof;
+                    assert_eq!(archive.repository_id, input.repository_id);
+                    assert_ne!(archive.snapshot_id, input.snapshot_id);
+                    assert_eq!(archive.snapshot_id, proof.snapshot_id);
+                    let writes = creation.ledger_writes().collect::<Vec<_>>();
+                    assert_eq!(writes.len(), 1);
+                    let OffloadLedgerWrite::Recorded {
+                        effect,
+                        durability,
+                        confirmation,
+                        failures,
+                    } = writes[0]
+                    else {
+                        return Err(invalid("actual owning ledger receipt missing").into());
+                    };
+                    assert!(matches!(effect,OffloadLedgerEffect::Appended {bytes} if bytes>0));
+                    assert_eq!(durability, [OffloadLedgerSync::Confirmed; 4]);
+                    assert_eq!(confirmation, OffloadLedgerSync::Confirmed);
+                    assert!(failures.is_empty());
+                    receipt = Some(
+                        json!({"effect":format!("{effect:?}"),"durability":durability.map(|fact|format!("{fact:?}")),
+                        "confirmation":format!("{confirmation:?}"),"failures":failures}),
+                    );
+                    let catalog = read_complete_catalog(&root).map_err(invalid)?;
+                    assert_eq!(catalog.days.len(), 1);
+                    assert_eq!(catalog.days[0].segments.len(), 1);
+                    assert_eq!(catalog.days[0].segments[0].history.len(), 1);
+                    for file in &proof.files {
+                        assert!(catalog.active_witness(proof, file).is_some());
+                    }
+                    assert_eq!(stages(&input.journal)?.len(), 3);
+                    publication = "published_applied";
+                }
+            }
+            for (index, name) in selection.names.iter().enumerate() {
+                assert_eq!(file_fact(&raw_dir.join(name))?, raw[index]);
+                assert_eq!(
+                    fs::read(raw_dir.join(name).with_extension("jsonl"))?,
+                    headers[index]
+                );
+            }
+            assert_eq!(
+                fs::read(input.journal.join("config/journal.json"))?,
+                configuration
+            );
+            carrier.revalidate()?;
+            assert_eq!(fs::read_dir(carrier.diagnostic_path())?.count(), 0);
+            let catalog = read_complete_catalog(&root).map_err(invalid)?;
+            let ledger = if ledger_path.try_exists()? {
+                Some(fs::read(&ledger_path)?)
+            } else {
+                None
+            };
+            println!(
+                "OFFER_PLANNER_EVIDENCE {}",
+                json!({"case":input.case,"publication":publication,
+                "carrier":carrier.diagnostic_path(),"budget_seconds_before_prepare":budget_seconds,"at":at,
+                "phase":format!("{:?}",planning.phase()),"projection":{"local_bytes":projection.local.total_bytes,
+                    "local_files":projection.local.total_files,"eligible_bytes":projection.eligible_bytes,
+                    "eligible_files":projection.eligible_files,"projected_local_bytes":projection.projected_local_bytes},
+                "source_copies":source_facts,"reads":reads,"marks":marks,"raw":raw,"receipt":receipt,
+                "ledger_sha256":ledger.as_ref().map(|bytes|format!("{:x}",Sha256::digest(bytes))),
+                "requests":*requests,"fault_consumed":consumed,"capacity_error_os":capacity_error_os,
+                "owners_retained":true})
+            );
+            io::stdout().flush()?;
+            cut(&mut control, b"returned")?;
+            assert_eq!(read_complete_catalog(&root).map_err(invalid)?, catalog);
+            assert_eq!(
+                if ledger_path.try_exists()? {
+                    Some(fs::read(&ledger_path)?)
+                } else {
+                    None
+                },
+                ledger
+            );
+            carrier.revalidate()?;
+            if input.case == PlannerCase::PlannerPayloadCapacityRefused {
+                let OffloadCreationOwner::Admitted(original) = creation.owner() else {
+                    unreachable!()
+                };
+                assert!(Arc::ptr_eq(original.carrier(), &carrier));
+                original.prepared_operation().revalidate()?;
+                let Some(OffloadCreationRefusal::Inputs(OffloadOfferRefusal::Io(error))) =
+                    creation.reason()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(error.raw_os_error(), Some(13));
+                check_carrier(&carrier)?;
+            } else {
+                let OffloadCreationOwner::Published(outcome) = creation.owner() else {
+                    unreachable!()
+                };
+                assert_eq!(read_facts(outcome.verified())?, reads);
+            }
+            Ok(())
+        }
+    }
 }

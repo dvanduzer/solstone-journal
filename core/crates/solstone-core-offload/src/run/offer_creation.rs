@@ -20,6 +20,13 @@ use solstone_core_retention::archive_offer::{
     OffloadOfferSelection, VerifiedOffloadOffers,
 };
 
+mod planner;
+#[cfg(all(test, unix, feature = "full-tests"))]
+pub(super) use planner::with_payload_capacity_fault;
+pub use planner::{
+    OffloadPlanning, OffloadPlanningPhase, OffloadPlanningRefusal, create_planned_offload_offers,
+};
+
 use crate::ledger::writer::{
     LedgerConfirmation, LedgerSync, LedgerWriteEffect, LedgerWriteReceipt, LedgerWriteRefusal,
 };
@@ -35,6 +42,7 @@ pub enum OffloadCreationRefusal {
     Ledger,
     Verification,
     Publication,
+    Planning(OffloadPlanningRefusal),
 }
 
 /// Borrowed original operation phase, never an extractable completion token.
@@ -102,6 +110,7 @@ pub enum OffloadLedgerWrite<'a> {
 
 #[derive(Default)]
 struct Resources {
+    planning: Option<OffloadPlanning>,
     observed: Option<ObservedOffloadOffers>,
     copies: Vec<Vec<PreparedMedia>>,
     partial: Option<PartialCopy>,
@@ -118,6 +127,10 @@ pub struct OffloadCreation<'clock> {
 }
 
 impl<'clock> OffloadCreation<'clock> {
+    pub fn planning(&self) -> Option<&OffloadPlanning> {
+        self.resources.planning.as_ref()
+    }
+
     pub fn owner(&self) -> OffloadCreationOwner<'_, 'clock> {
         match &self.owner {
             Owner::Prepared(owner) => OffloadCreationOwner::Prepared(owner),
@@ -274,16 +287,19 @@ mod unix {
         reused: bool,
     }
 
-    fn fail<'clock>(
+    pub(super) fn fail<'clock>(
         owner: Owner<'clock>,
         mut resources: Resources,
         reason: OffloadCreationRefusal,
     ) -> OffloadCreation<'clock> {
         resources.reason = Some(reason);
+        if let Some(planning) = &mut resources.planning {
+            planning.phase = OffloadPlanningPhase::Held;
+        }
         OffloadCreation { owner, resources }
     }
 
-    fn inputs(error: OffloadOfferRefusal) -> OffloadCreationRefusal {
+    pub(super) fn inputs(error: OffloadOfferRefusal) -> OffloadCreationRefusal {
         OffloadCreationRefusal::Inputs(error)
     }
 
@@ -328,7 +344,7 @@ mod unix {
 
     // Partition historical coordinates only. Capture owns all eligibility and
     // expected-row observations after this planning read.
-    fn partition(
+    pub(super) fn partition(
         catalog: &JournalCatalog,
         register: &Register,
         selections: &[OffloadOfferSelection],
@@ -401,7 +417,7 @@ mod unix {
         Ok(result)
     }
 
-    fn capacity(
+    pub(super) fn capacity(
         operation: &PreparedArchiveOperation<'_>,
         observed: &ObservedOffloadOffers,
     ) -> Result<Arc<MediaDirectory>, OffloadCreationRefusal> {
@@ -416,6 +432,13 @@ mod unix {
         let payload = total
             .checked_add(maximum)
             .ok_or(OffloadCreationRefusal::Metadata)?;
+        capacity_for_payload(operation, payload)
+    }
+
+    pub(super) fn capacity_for_payload(
+        operation: &PreparedArchiveOperation<'_>,
+        payload: u64,
+    ) -> Result<Arc<MediaDirectory>, OffloadCreationRefusal> {
         let metadata = u64::try_from(MAX_REGISTER_BYTES)
             .ok()
             .and_then(|bound| bound.checked_mul(2))
@@ -445,7 +468,7 @@ mod unix {
         Ok(parent)
     }
 
-    fn copy_inputs(
+    pub(super) fn copy_inputs(
         operation: &PreparedArchiveOperation<'_>,
         parent: Arc<MediaDirectory>,
         resources: &mut Resources,
@@ -728,7 +751,7 @@ mod unix {
             Ok(catalog) => catalog,
             Err(reason) => return fail(Owner::Prepared(Box::new(operation)), resources, reason),
         };
-        let mut admitted =
+        let admitted =
             match solstone_core_backup_runtime::admit_prepared_archive(operation, services) {
                 Ok(admitted) => admitted,
                 Err(failure) => {
@@ -740,6 +763,16 @@ mod unix {
                     );
                 }
             };
+        continue_creation(admitted, resources, catalog, today, now)
+    }
+
+    pub(super) fn continue_creation<'clock>(
+        mut admitted: AdmittedArchive<'clock>,
+        mut resources: Resources,
+        catalog: JournalCatalog,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> OffloadCreation<'clock> {
         let mut proofs = Vec::new();
         let mut writes = Vec::new();
         let mut snapshots = Vec::new();
@@ -936,6 +969,11 @@ mod unix {
         }
         let outcome = publish_offload_offers(verified, today, now);
         record_publication(&mut resources, outcome.publication());
+        if resources.reason.is_none()
+            && let Some(planning) = &mut resources.planning
+        {
+            planning.phase = OffloadPlanningPhase::OffersPublished;
+        }
         OffloadCreation {
             owner: Owner::Published(Box::new(outcome)),
             resources,

@@ -41,8 +41,15 @@ pub use current::{
 mod offer_creation;
 pub use offer_creation::{
     OffloadCreation, OffloadCreationNative, OffloadCreationOwner, OffloadCreationRefusal,
-    OffloadLedgerEffect, OffloadLedgerSync, OffloadLedgerWrite, create_offload_offers,
+    OffloadLedgerEffect, OffloadLedgerSync, OffloadLedgerWrite, OffloadPlanning,
+    OffloadPlanningPhase, OffloadPlanningRefusal, create_offload_offers,
+    create_planned_offload_offers,
 };
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+pub(crate) fn with_payload_capacity_fault<T>(run: impl FnOnce() -> T) -> (T, bool) {
+    offer_creation::with_payload_capacity_fault(run)
+}
 
 pub const OFFLOAD_STALL_BACKUP_NOT_READY: &str = "backup_not_ready";
 pub const OFFLOAD_STALL_BACKUP_FAILING: &str = "backup_failing";
@@ -864,7 +871,7 @@ mod current {
 
     use solstone_core_retention::archive_catalog::read_complete_catalog;
 
-    const MAX_CURRENT_ENTRIES: usize = 100_000;
+    pub(super) const MAX_CURRENT_ENTRIES: usize = 100_000;
     const MAX_CURRENT_CONFIG_BYTES: usize = 1024 * 1024;
 
     #[cfg(test)]
@@ -1028,7 +1035,7 @@ mod current {
     }
 
     #[derive(PartialEq)]
-    struct CurrentPolicyObservation {
+    pub(super) struct CurrentPolicyObservation {
         prerequisites: Map<String, Value>,
         retention: Option<Value>,
         preserve_all: Option<Value>,
@@ -1059,7 +1066,10 @@ mod current {
     }
 
     impl CurrentPolicyObservation {
-        fn capture(root: &Arc<JournalRoot>, now: i64) -> Result<Self, CurrentOffloadRefusalReason> {
+        pub(super) fn capture(
+            root: &Arc<JournalRoot>,
+            now: i64,
+        ) -> Result<Self, CurrentOffloadRefusalReason> {
             let directory = MediaDirectory::open(Arc::clone(root), Path::new("config"))
                 .map_err(|_| CurrentOffloadRefusalReason::Incomplete)?;
             let read = directory
@@ -1117,7 +1127,7 @@ mod current {
             })
         }
 
-        fn policy(&self) -> Policy {
+        pub(super) fn policy(&self) -> Policy {
             let mut config = Map::new();
             if let Some(retention) = &self.retention {
                 config.insert("retention".into(), retention.clone());
@@ -1131,7 +1141,7 @@ mod current {
             policy_from_journal_config(&config)
         }
 
-        fn revalidate(
+        pub(super) fn revalidate(
             &self,
             operation: &AdmittedArchive<'_>,
         ) -> Result<(), CurrentOffloadRefusalReason> {
@@ -1649,6 +1659,9 @@ mod tests {
         operational_log::{OplogFormat, catalog_oplogs},
         readers::read_jsonl_with_report,
     };
+
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    mod planner;
 
     #[test]
     fn prerequisites_refuse_missing_malformed_future_and_expired_observations() {
