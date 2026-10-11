@@ -21,6 +21,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- on mac, installing local thinking or transcription now also clears quarantine, macos's marker for downloaded files, inside the downloaded folder.
+
 - if the model returns no text for an activity's story, your journal can now try once more through the same thinking provider.
 - home now names devices with rejected uploads, even when another source is still arriving, and shows queued work held for a safety check. both link to their details in health. when status is unavailable, the last known issues stay labeled as such.
 
