@@ -263,6 +263,23 @@ fn corpus() -> Value {
                 case["body_sha256_basis"] = json!("normalized-json");
                 projected = true;
             }
+            // Local installs now carry an admission warning (null when none) and
+            // the model label dropped its memory figure. Both changed on purpose.
+            if project_install_admission_warning(&mut case["json"]) {
+                case["body_sha256_basis"] = json!("normalized-json");
+                projected = true;
+            }
+            if case["path"] == "/app/thinking/api/local/models"
+                && let Some(models) = case["json"].as_array_mut()
+            {
+                for model in models {
+                    if model["label"] == "qwen 3.5 4B VLM \u{2014} 8 GB" {
+                        model["label"] = json!("qwen 3.5 4B VLM");
+                    }
+                }
+                case["body_sha256_basis"] = json!("normalized-json");
+                projected = true;
+            }
             if project_install_provider_command(&mut case["json"]) {
                 case["body_sha256_basis"] = json!("normalized-json");
                 projected = true;
@@ -274,6 +291,26 @@ fn corpus() -> Value {
         }
     }
     corpus
+}
+
+fn project_install_admission_warning(value: &mut Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            let mut projected = false;
+            if fields.contains_key("install_state") && !fields.contains_key("admission_warning") {
+                fields.insert("admission_warning".into(), Value::Null);
+                projected = true;
+            }
+            for child in fields.values_mut() {
+                projected |= project_install_admission_warning(child);
+            }
+            projected
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |projected, item| {
+            project_install_admission_warning(item) | projected
+        }),
+        _ => false,
+    }
 }
 
 fn project_install_provider_command(value: &mut Value) -> bool {
