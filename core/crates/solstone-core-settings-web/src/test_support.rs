@@ -21,6 +21,9 @@ pub fn corpus() -> Value {
     crate::settings_corpus_divergence::apply_permanent_journal_name_settings_divergence(
         &mut corpus,
     );
+    crate::settings_corpus_divergence::apply_permanent_processing_default_gate_divergence(
+        &mut corpus,
+    );
     corpus
 }
 

@@ -73,6 +73,41 @@ pub fn apply_permanent_journal_name_settings_divergence(expected: &mut Value) {
     recompute_case_digests(expected);
 }
 
+/// Permanent narrow divergence introduced by the 2026-10-10 deferred-processing
+/// gate restore. The frozen corpus captured "POST processing.valid" writing the
+/// default gate (02:00-06:00 window on, display sleep off) beside the mode. The
+/// handler now writes only the supplied fields, and the reader supplies those
+/// same defaults for an absent gate, so the effective settings are unchanged.
+/// Remove only that exact default gate from that named probe's normalized
+/// response and saved config; never generalize this rule.
+pub fn apply_permanent_processing_default_gate_divergence(expected: &mut Value) {
+    const PROBE: &str = "POST processing.valid";
+    let default_gate = serde_json::json!({
+        "display_powersave": {"enabled": false},
+        "time_window": {"enabled": true, "end": "06:00", "start": "02:00"}
+    });
+    assert_eq!(
+        count_keys(expected, PROBE),
+        2,
+        "frozen settings corpus contains exactly two processing.valid mutation probes"
+    );
+    for collection in ["mutations", "mutations_malformed"] {
+        let probe = &mut expected[collection][PROBE];
+        for pointer in ["/normalized/config/processing", "/config_after/processing"] {
+            let processing = probe
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .expect("captured processing section");
+            assert_eq!(
+                processing.remove("gate"),
+                Some(default_gate.clone()),
+                "{collection} {PROBE} {pointer} captured the default gate"
+            );
+        }
+    }
+    recompute_case_digests(expected);
+}
+
 fn update_empty_journal_name_probes(value: &mut Value) {
     match value {
         Value::Object(map) => {
