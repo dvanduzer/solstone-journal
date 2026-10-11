@@ -611,6 +611,8 @@ pub use archive_finish::{
     ReviewedArchiveReadReport, ReviewedArchiveReport, ReviewedRemovalFileReport,
     SettledReviewedArchiveRemoval, remove_reviewed_with_owned_archive,
 };
+mod interrupted;
+pub use interrupted::{InterruptedRemoval, recover_interrupted_removals};
 mod ordinary_finish;
 pub use ordinary_finish::{
     OwnedReviewedRemoval, ReviewedRemovalFinish, ReviewedRemovalFinishRefusal,
@@ -1543,6 +1545,7 @@ fn execute_reviewed_mode(
             .map_err(ReviewedRemovalRefusal::Activity)?;
         // As at archive admission: first recover what an ended owner left
         // behind, then let the fresh census decide.
+        recover_interrupted_removals(&activity);
         crate::restore_intent::recover_abandoned_restores(&activity);
         solstone_core_journal_io::media::retire_orphan_root_carriers(&activity);
         let obligations =

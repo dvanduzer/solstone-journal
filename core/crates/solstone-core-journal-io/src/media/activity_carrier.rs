@@ -768,7 +768,7 @@ fn retire_stage(
     }
 }
 
-fn shared_storage() -> io::Error {
+pub(super) fn shared_storage() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
         "the activity lease does not exclude every writer here",

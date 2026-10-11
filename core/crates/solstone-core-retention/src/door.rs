@@ -711,9 +711,10 @@ fn admit_whole_segment_activity(journal: &Path) -> Result<Arc<ActivityLease>, St
         ActivityAdmissionError::Busy => WHOLE_ACTIVITY_HOLD.to_owned(),
         ActivityAdmissionError::Unavailable(_) => WHOLE_BINDING_HOLD.to_owned(),
     })?;
-    // An owner deletion must not wait on what an ended owner left behind: a
-    // restore that never published, then empty reservations. Each phase's
-    // fresh census still decides.
+    // An owner deletion must not wait on what an ended owner left behind: an
+    // interrupted removal, a restore that never published, then empty
+    // reservations. Each phase's fresh census still decides.
+    crate::remove_marked::recover_interrupted_removals(&activity);
     crate::restore_intent::recover_abandoned_restores(&activity);
     retire_orphan_root_carriers(&activity);
     Ok(activity)

@@ -31,6 +31,7 @@ use solstone_core_backup_runtime::{
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_offload::restore::owned::{OwnedRestoreFinishHold, SettledRestoreReport};
+use solstone_core_retention::remove_marked::recover_interrupted_removals;
 use solstone_core_retention::remove_marked::{
     OwnedReviewedArchiveRemoval, OwnedReviewedRemoval, ReviewedArchiveReport, ReviewedRemovalReport,
 };
@@ -727,8 +728,9 @@ pub(crate) fn prepare_read_in(
         return None;
     }
     let (ticket, root, budget, clock) = begin.into_parts();
-    // A restore interrupted before it published would refuse this admission.
+    // A removal or restore interrupted by a crash would refuse this admission.
     if let Ok(activity) = ActivityLease::try_acquire(Arc::clone(&root)) {
+        recover_interrupted_removals(&activity);
         recover_abandoned_restores(&activity);
     }
     let (input, custody) = match OwnedArchivePreparationInput::capture(root, budget, clock) {

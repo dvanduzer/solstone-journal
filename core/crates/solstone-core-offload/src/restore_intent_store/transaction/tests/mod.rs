@@ -1102,7 +1102,7 @@ fn retirement_interrupted_claim_preserves_exact_record_in_census_visible_stage()
                 .path()
                 .join("health/offload")
                 .join(&stage.directory_name)
-                .join(&facts.observed.entry.name)
+                .join(solstone_core_journal_io::media::REMOVAL_ORIGINAL_LEAF)
         )
         .unwrap(),
         bytes

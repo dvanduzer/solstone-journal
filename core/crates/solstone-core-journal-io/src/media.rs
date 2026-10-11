@@ -33,8 +33,9 @@ mod observation;
 pub use observation::{MediaEntry, MediaRead};
 mod removal;
 pub use removal::{
-    MediaRemoval, OriginalName, RemovalEffect, RemovalFailure, RemovalPhase, RemovalReceipt,
-    StageObservation,
+    InterruptedRemovalRecord, InterruptedRemovalResolution, MediaRemoval, OriginalName,
+    REMOVAL_ORIGINAL_LEAF, REMOVAL_RECORD_LEAF, RemovalEffect, RemovalFailure, RemovalPhase,
+    RemovalReceipt, StageObservation, resolve_interrupted_removal,
 };
 
 #[cfg(unix)]

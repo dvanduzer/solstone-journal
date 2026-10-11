@@ -1060,3 +1060,59 @@ fn known_unremoved_files_settle_and_an_uncertain_remnant_holds() {
         Err(solstone_core_journal_io::activity::ActivityAdmissionError::Busy)
     ));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn policy_approval_resolves_a_removal_interrupted_mid_move() {
+    use solstone_core_journal_io::media::{MediaDirectory, MediaStage, REMOVAL_ORIGINAL_LEAF};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+    // An earlier approval ended abruptly after moving the original aside.
+    let stage = {
+        let activity = ActivityLease::try_acquire(Arc::clone(&f.root)).unwrap();
+        let segment = raw.parent().unwrap();
+        let parent = MediaDirectory::open(
+            Arc::clone(&f.root),
+            segment
+                .parent()
+                .unwrap()
+                .strip_prefix(f.temp.path())
+                .unwrap(),
+        )
+        .unwrap();
+        let source = parent
+            .open_child(segment.file_name().unwrap())
+            .unwrap()
+            .unwrap();
+        let expected = source
+            .observe_file(OsStr::new("audio.flac"))
+            .unwrap()
+            .unwrap();
+        let stage = MediaStage::create(Arc::clone(&parent), activity).unwrap();
+        let path = stage.diagnostic_path();
+        let ended = catch_unwind(AssertUnwindSafe(|| {
+            run_with_media_hook(
+                MediaPrimitive::BeforeClaimDelete,
+                || -> std::io::Result<()> { panic!("the process ended here") },
+                || source.remove_observed(OsStr::new("audio.flac"), &expected, stage),
+            )
+        }));
+        assert!(ended.is_err());
+        path
+    };
+    assert!(!raw.exists());
+    assert!(stage.join(REMOVAL_ORIGINAL_LEAF).is_file());
+    // The next approval puts it back first, then removes it as approved.
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    assert!(result.refusal().is_none(), "{:?}", result.refusal());
+    let ReviewedRemovalFinish::Settled(report) = result.finish() else {
+        panic!("the resumed approval must settle");
+    };
+    assert_eq!(report.outcome().removed_paths().count(), 1);
+    assert!(!raw.exists());
+    assert!(!stage.exists());
+    assert!(load_at_root(&f.root).unwrap().marks.is_empty());
+}
