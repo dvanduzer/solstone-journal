@@ -201,6 +201,6 @@ mod tests;
 
 mod recovered;
 pub use recovered::{
-    ArchiveRecoveryAdmissionFailure, RecoveredArchiveReservation, RecoveryAdmissionError,
-    RecoveryPopulationFailure,
+    ArchiveRecoveryAdmissionFailure, RecoveredArchiveReservation, RecoveredArchiveRetirement,
+    RecoveryAdmissionError, RecoveryPopulationFailure,
 };

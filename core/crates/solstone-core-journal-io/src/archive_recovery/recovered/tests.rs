@@ -7,6 +7,11 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 const OPERATION: &str = "0123456789abcdef0123456789abcdef";
 
+use super::retirement::RetirementCheckpoint;
+use crate::media::{
+    ActivityCarrierRetirementEffect, Confirmation, Durability, MediaPrimitive, run_with_media_hook,
+};
+
 struct Fixture {
     temp: tempfile::TempDir,
     root: Arc<JournalRoot>,
@@ -101,6 +106,311 @@ impl Fixture {
         resources.finish_admission_with(|_| {}).unwrap();
         RecoveredArchiveReservation { resources }
     }
+}
+
+fn retirement_ready(f: &Fixture) -> RecoveredArchiveReservation {
+    let owner = f.structural_current_owner();
+    fs::remove_file(f.record_path()).unwrap();
+    owner
+}
+
+fn assert_removed_facts(result: &RecoveredArchiveRetirement) {
+    assert_eq!(
+        result.receipt().effect(),
+        ActivityCarrierRetirementEffect::Removed
+    );
+    assert_eq!(result.receipt().root_durability(), Durability::Synced);
+    assert_eq!(result.receipt().confirmation(), Confirmation::Confirmed);
+    assert_eq!(result.before_census().unwrap().entries().len(), 1);
+    assert_eq!(result.admission_census().entries().len(), 2);
+}
+
+#[test]
+fn retirement_actual_removal_keeps_original_lease_across_thread_until_drop() {
+    fn closed<T: Send + 'static>() {}
+    closed::<RecoveredArchiveRetirement>();
+    let f = Fixture::new();
+    let owner = retirement_ready(&f);
+    let activity = Arc::as_ptr(owner.activity());
+    let original = owner.record().clone();
+    let result = owner.retire_after_settlement();
+    assert!(result.is_complete());
+    assert_removed_facts(&result);
+    assert!(result.final_census().unwrap().entries().is_empty());
+    assert!(result.named_reads().is_empty());
+    assert_eq!(result.selected_absence(), Confirmation::Confirmed);
+    assert_eq!(result.record(), &original);
+    assert_eq!(Arc::as_ptr(result.activity()), activity);
+    assert!(!f.temp.path().join(f.binding.reservation_name()).exists());
+    assert!(!f.record_path().exists());
+    let result = std::thread::spawn(move || result).join().unwrap();
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    drop(result);
+    ActivityLease::try_acquire_existing(Arc::clone(&f.root))
+        .ok()
+        .unwrap();
+}
+
+#[test]
+fn retirement_occupied_original_and_same_byte_replacement_keep_observed_reads() {
+    for replace in [false, true] {
+        let f = Fixture::new();
+        let owner = f.structural_current_owner();
+        let original = owner.record().clone();
+        if replace {
+            fs::rename(f.record_path(), f.record_path().with_extension("original")).unwrap();
+            fs::write(f.record_path(), &original.bytes).unwrap();
+        }
+        let result = owner.retire_after_settlement();
+        assert!(!result.is_complete());
+        assert_eq!(
+            result.receipt().effect(),
+            ActivityCarrierRetirementEffect::NotAttempted
+        );
+        assert_eq!(result.record(), &original);
+        assert_eq!(result.named_reads().len(), 1);
+        assert_eq!(result.named_reads()[0].bytes, original.bytes);
+        assert_eq!(result.named_reads()[0] != original, replace);
+        assert!(f.temp.path().join(f.binding.reservation_name()).exists());
+        assert!(matches!(
+            ActivityLease::try_acquire(Arc::clone(&f.root)),
+            Err(ActivityAdmissionError::Busy)
+        ));
+    }
+}
+
+#[test]
+fn retirement_unknown_stage_or_intent_refuses_with_complete_population() {
+    for stage in [false, true] {
+        let f = Fixture::new();
+        let owner = retirement_ready(&f);
+        if stage {
+            fs::create_dir(f.temp.path().join(".tmp-offload-other")).unwrap();
+        } else {
+            fs::write(
+                f.record_path()
+                    .with_file_name("11111111111111111111111111111111.json"),
+                b"unresolved",
+            )
+            .unwrap();
+        }
+        let result = owner.retire_after_settlement();
+        assert_eq!(
+            result.receipt().effect(),
+            ActivityCarrierRetirementEffect::NotAttempted
+        );
+        assert_eq!(result.before_census().unwrap().entries().len(), 2);
+        assert!(result.final_census().is_none());
+        assert!(!result.refusals().is_empty());
+        assert!(f.temp.path().join(f.binding.reservation_name()).exists());
+    }
+}
+
+#[test]
+fn retirement_failed_first_walk_retains_prior_record_and_encountered_errno() {
+    let f = Fixture::new();
+    let owner = retirement_ready(&f);
+    let name = "11111111111111111111111111111111.json";
+    fs::write(f.record_path().with_file_name(name), b"unresolved").unwrap();
+    let (result, consumed) = run_with_media_hook(
+        MediaPrimitive::BeforePrefixRead,
+        || Err(io::Error::from_raw_os_error(13)),
+        || owner.retire_after_settlement(),
+    );
+    assert!(consumed);
+    assert_eq!(
+        result.receipt().effect(),
+        ActivityCarrierRetirementEffect::NotAttempted
+    );
+    assert_eq!(result.admission_census().entries().len(), 2);
+    let incomplete = result.before_incomplete().unwrap();
+    assert_eq!(incomplete.entries().len(), 1);
+    assert_eq!(
+        incomplete.encountered().unwrap().0,
+        Path::new("health/offload/restore-intents").join(name)
+    );
+    assert_eq!(
+        incomplete.error().source.as_ref().unwrap().raw_os_error(),
+        Some(13)
+    );
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+}
+
+#[test]
+fn retirement_replaced_or_nonempty_reservation_and_native_error_keep_owner() {
+    for replace in [false, true] {
+        let f = Fixture::new();
+        let owner = retirement_ready(&f);
+        let path = f.temp.path().join(f.binding.reservation_name());
+        if replace {
+            fs::rename(&path, f.temp.path().join("old-reservation")).unwrap();
+            fs::create_dir(&path).unwrap();
+        } else {
+            fs::write(path.join("unresolved"), b"held").unwrap();
+        }
+        let result = owner.retire_after_settlement();
+        assert_eq!(
+            result.receipt().effect(),
+            ActivityCarrierRetirementEffect::NotAttempted
+        );
+        assert!(!result.refusals().is_empty());
+        assert!(path.exists());
+    }
+    let f = Fixture::new();
+    let owner = retirement_ready(&f);
+    let (result, consumed) = run_with_media_hook(
+        MediaPrimitive::NativeDirectoryRemoveCut,
+        || Err(io::Error::from_raw_os_error(13)),
+        || owner.retire_after_settlement(),
+    );
+    assert!(consumed);
+    assert_eq!(
+        result.receipt().effect(),
+        ActivityCarrierRetirementEffect::Attempted
+    );
+    assert_eq!(result.receipt().failures()[0].raw_os_error(), Some(13));
+    assert!(f.temp.path().join(f.binding.reservation_name()).exists());
+    let result = std::thread::spawn(move || result).join().unwrap();
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    drop(result);
+}
+
+#[test]
+fn retirement_sync_fault_preserves_removed_and_independent_confirmation() {
+    let f = Fixture::new();
+    let owner = retirement_ready(&f);
+    let (result, consumed) = run_with_media_hook(
+        MediaPrimitive::CarrierRetirementRootSync,
+        || Err(io::Error::from_raw_os_error(13)),
+        || owner.retire_after_settlement(),
+    );
+    assert!(consumed);
+    assert_eq!(
+        result.receipt().effect(),
+        ActivityCarrierRetirementEffect::Removed
+    );
+    assert_eq!(result.receipt().root_durability(), Durability::Unproven);
+    assert_eq!(result.receipt().confirmation(), Confirmation::Confirmed);
+    assert_eq!(result.receipt().failures()[0].raw_os_error(), Some(13));
+    assert!(result.final_census().unwrap().entries().is_empty());
+    assert!(!result.is_complete());
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+}
+
+#[test]
+fn retirement_late_obligation_keeps_earlier_removed_synced_confirmed_facts() {
+    let f = Fixture::new();
+    let owner = retirement_ready(&f);
+    let result = owner.retire_with(|cut| {
+        if matches!(cut, RetirementCheckpoint::BeforeFinalWalk) {
+            fs::create_dir(f.temp.path().join(".tmp-offload-late")).unwrap();
+        }
+    });
+    assert_removed_facts(&result);
+    assert_eq!(result.final_census().unwrap().entries().len(), 1);
+    assert!(!result.refusals().is_empty());
+    assert!(!result.is_complete());
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+}
+
+#[test]
+fn retirement_guard_change_after_final_walk_keeps_empty_census_and_effects() {
+    for lock in [false, true] {
+        let f = Fixture::new();
+        let owner = retirement_ready(&f);
+        let result = owner.retire_with(|cut| {
+            if matches!(cut, RetirementCheckpoint::AfterFinalWalk) {
+                if lock {
+                    let path = f.temp.path().join("backup-activity.lock");
+                    fs::rename(&path, f.temp.path().join("original-lock")).unwrap();
+                    fs::write(&path, b"").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                } else {
+                    let parent = f.record_path().parent().unwrap().to_path_buf();
+                    fs::rename(&parent, parent.with_file_name("original-intents")).unwrap();
+                    fs::create_dir(&parent).unwrap();
+                }
+            }
+        });
+        assert_removed_facts(&result);
+        assert!(result.final_census().unwrap().entries().is_empty());
+        assert!(!result.refusals().is_empty());
+        assert!(!result.is_complete());
+        assert!(Arc::ptr_eq(result.root(), &f.root));
+        // Replaced Activity namespace can admit a different lock; do not claim
+        // native Busy for that replacement from the retained original guard.
+    }
+}
+
+#[test]
+fn retirement_failed_final_walk_retains_incomplete_evidence_after_actual_removal() {
+    let f = Fixture::new();
+    let owner = retirement_ready(&f);
+    let name = "11111111111111111111111111111111.json";
+    let (result, consumed) = run_with_media_hook(
+        MediaPrimitive::BeforePrefixRead,
+        || Err(io::Error::from_raw_os_error(13)),
+        || {
+            owner.retire_with(|cut| {
+                if matches!(cut, RetirementCheckpoint::BeforeFinalWalk) {
+                    fs::create_dir(f.temp.path().join(".tmp-offload-late")).unwrap();
+                    fs::write(f.record_path().with_file_name(name), b"late unresolved").unwrap();
+                }
+            })
+        },
+    );
+    assert!(consumed);
+    assert_removed_facts(&result);
+    assert!(result.final_census().is_none());
+    let incomplete = result.final_incomplete().unwrap();
+    assert_eq!(incomplete.entries().len(), 1);
+    assert_eq!(
+        incomplete.encountered().unwrap().0,
+        Path::new("health/offload/restore-intents").join(name)
+    );
+    assert_eq!(
+        incomplete.error().source.as_ref().unwrap().raw_os_error(),
+        Some(13)
+    );
+    assert!(!result.is_complete());
+    let result = std::thread::spawn(move || result).join().unwrap();
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    drop(result);
+}
+
+#[test]
+fn retirement_selected_name_appearing_after_zero_walk_is_retained_refusal() {
+    let f = Fixture::new();
+    let owner = retirement_ready(&f);
+    let result = owner.retire_with(|cut| {
+        if matches!(cut, RetirementCheckpoint::AfterFinalWalk) {
+            fs::write(f.record_path(), b"late named successor").unwrap();
+        }
+    });
+    assert_removed_facts(&result);
+    assert!(result.final_census().unwrap().entries().is_empty());
+    assert_eq!(result.named_reads().len(), 1);
+    assert_eq!(result.named_reads()[0].bytes, b"late named successor");
+    assert_eq!(result.selected_absence(), Confirmation::Unverified);
+    assert!(!result.is_complete());
 }
 
 #[test]

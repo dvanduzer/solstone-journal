@@ -312,7 +312,7 @@ fn observe_carrier_with<'a>(
     })
 }
 
-fn matching_carrier(
+pub(crate) fn matching_carrier(
     entries: &[NativeObligation],
     name: &OsStr,
     identity: crate::media::MediaIdentity,
