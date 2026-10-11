@@ -297,6 +297,7 @@ pub(crate) struct ArchiveCustody {
     retained: Vec<RejectedArchiveReturn>,
     teardown: teardown::Custody,
     approval: removal::ApprovalCustody,
+    restore: restore::Custody,
 }
 
 impl ArchiveCustody {
@@ -305,6 +306,7 @@ impl ArchiveCustody {
             || !self.retained.is_empty()
             || self.teardown.is_busy()
             || self.approval.is_busy()
+            || self.restore.is_busy()
     }
 
     pub(crate) fn retained(&self) -> impl Iterator<Item = &RejectedArchiveReturn> {

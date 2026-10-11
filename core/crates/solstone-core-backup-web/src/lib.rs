@@ -34,7 +34,6 @@ use solstone_core_backup_runtime::{
     reason_for_returncode, resolve_operational_tools, restore_journal, rotate_recovery_key,
     validate_destination,
 };
-use solstone_core_offload::{restore_all_offload, restore_offload_day};
 
 pub mod archive_operation;
 pub mod archive_worker;
@@ -273,6 +272,9 @@ pub fn routes_with_deps(deps: BackupWebDeps) -> Router {
 fn status_response(deps: &BackupWebDeps) -> axum::response::Response {
     restore_prepare::reconcile(&deps.restore_prepare, &deps.operations);
     if let Some(response) = archive_worker::teardown::response(deps) {
+        return response;
+    }
+    if let Some(response) = archive_worker::restore::response(deps, None) {
         return response;
     }
     status::status(&deps.journal_root, &deps.operations)
@@ -645,18 +647,6 @@ fn publish_restore_error(deps: &BackupWebDeps, reason_code: &str) -> Terminal {
             bytes_restored: None,
         },
     ))
-}
-
-fn map_offload_restore(result: solstone_core_offload::RestoreResult) -> Terminal {
-    let report = restore_report::summary(&result);
-    let mut terminal = match result.status.as_str() {
-        "ok" | "no_op" => Terminal::phase("done", result.reason),
-        "refused" => Terminal::phase("refused", result.reason),
-        "degraded" => Terminal::phase("degraded", result.reason),
-        _ => Terminal::phase("error", result.reason.or_else(|| Some("failed".into()))),
-    };
-    terminal.report = Some(report);
-    terminal
 }
 
 async fn enable_backup(deps: BackupWebDeps) -> axum::response::Response {
@@ -1136,38 +1126,32 @@ async fn offload_restore_route(deps: BackupWebDeps, body: Bytes) -> axum::respon
     if let Err(error) = validation::restore_day(&payload) {
         return error;
     }
-    let all = payload.get("all") == Some(&Value::Bool(true));
-    let day = payload
-        .get("day")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let started = match operation::begin(&deps.operations, "offload_restore", None, None, None) {
-        Ok(started) => started,
-        Err(error) => return error,
-    };
-    spawn_backup_worker(deps.clone(), started.generation, move |worker| {
-        // The owning restore path is held before any tool can run.
-        let restore_services = BackupServices {
-            runner: worker.runner.as_ref(),
-            http: worker.http.as_ref(),
-            clock: worker.clock.as_ref(),
-            restic_path: None,
-            rclone_path: None,
-            version: worker.version,
-            journal_maintenance: worker.journal_maintenance.as_ref(),
-        };
-        let result = if all {
-            restore_all_offload(&worker.journal_root, &restore_services)
-        } else {
-            restore_offload_day(
-                &worker.journal_root,
-                &restore_services,
-                day.as_deref().unwrap_or_default(),
-            )
-        };
-        map_offload_restore(result)
-    });
-    status_response(&deps)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = deps;
+        response::error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "that action isn't available in the current state.",
+            "restore_held",
+            "",
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let day = payload
+            .get("day")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        solstone_core_convey_http::owner_read::spawn_blocking_response(
+            solstone_core_convey_http::owner_read::OwnerReadRole::BackupOffloadStatus,
+            move || match archive_worker::restore::start(&deps, day) {
+                Ok(generation) => archive_worker::restore::response(&deps, Some(generation))
+                    .unwrap_or_else(internal_error),
+                Err(response) => response,
+            },
+        )
+        .await
+    }
 }
 
 async fn handoff_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
@@ -1417,7 +1401,7 @@ mod offload_report_tests {
     use solstone_core_offload::restore::{RestoreResult, RestoreSegmentResult};
 
     #[test]
-    fn terminal_mapping_keeps_partial_reports_and_exact_json_integers() {
+    fn summary_keeps_partial_reports_and_exact_json_integers() {
         let bytes = (1_u64 << 53) + 17;
         let first = RestoreSegmentResult {
             status: "ok".into(),
@@ -1437,14 +1421,7 @@ mod offload_report_tests {
         later.files_restored = 0;
         later.bytes_expected = 100;
         later.bytes_restored = 0;
-        for (status, phase) in [
-            ("ok", "done"),
-            ("no_op", "done"),
-            ("refused", "refused"),
-            ("degraded", "degraded"),
-            ("error", "error"),
-            ("unknown", "error"),
-        ] {
+        for status in ["ok", "no_op", "refused", "degraded", "error", "unknown"] {
             let result = RestoreResult {
                 status: status.into(),
                 reason: Some("verification_failed".into()),
@@ -1459,10 +1436,7 @@ mod offload_report_tests {
                 reason_detail: Some("segment identity changed".into()),
                 details: vec![first.clone(), later.clone()],
             };
-            let terminal = map_offload_restore(result);
-            assert_eq!(terminal.phase, phase);
-            assert_eq!(terminal.reason_code.as_deref(), Some("verification_failed"));
-            let encoded = serde_json::to_string(&terminal.report).unwrap();
+            let encoded = serde_json::to_string(&restore_report::summary(&result)).unwrap();
             let report: Value = serde_json::from_str(&encoded).unwrap();
             assert_eq!(report["status"], status);
             assert_eq!(report["scope"], "all");

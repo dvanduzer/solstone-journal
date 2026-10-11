@@ -17,6 +17,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+type PublicStartHook = Box<dyn FnOnce(&str) + Send>;
+thread_local! {
+    static PUBLIC_START: std::cell::RefCell<Option<PublicStartHook>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn take_public_start_hook() -> Option<PublicStartHook> {
+    PUBLIC_START.with(|hook| hook.borrow_mut().take())
+}
+
 #[derive(Deserialize)]
 struct Input {
     mode: String,
@@ -155,16 +164,25 @@ fn save(input: &Input, rows: &[Mark]) {
     .unwrap();
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires copied package and synthetic Home reviewed-removal fixture"]
-fn packaged_home_approval_join() {
+async fn packaged_home_approval_join() {
     let input: Input = serde_json::from_slice(
         &fs::read(std::env::var_os("OWNED_APPROVAL_JSON").unwrap()).unwrap(),
     )
     .unwrap();
-    assert!(matches!(input.mode.as_str(), "mixed" | "reoffer"));
+    assert!(matches!(input.mode.as_str(), "typed" | "mixed" | "reoffer"));
     let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
     let (mut rows, paths) = seed(&input, &root);
+    if input.mode == "typed" {
+        rows[1].state = MarkState::Failed(solstone_core_retention::marks::Failure {
+            at: "now".into(),
+            reason: "unselected".into(),
+            staged: None,
+        });
+        save(&input, &rows);
+        rows.truncate(1);
+    }
     let context = read_review_context(
         &root,
         &rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
@@ -191,9 +209,29 @@ fn packaged_home_approval_join() {
     let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
     // Missing Extension never constructs another slot or touches admission.
     assert!(dispatch_approval(None, Ok(Bytes::from(body.clone())), now).is_err());
-    let started = dispatch_approval(Some(Extension(deps.clone())), Ok(Bytes::from(body)), now);
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    let router = crate::routes_with_backup_deps(deps.clone(), crate::Clock::fixed(now), |_| false);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/home/api/approve")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let started: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
     if input.mode == "reoffer" {
-        assert!(started.is_err());
+        assert_eq!(started["state"], "approve.refused_before_start");
         assert_eq!(
             fs::read(input.journal.join("health/retention-marks.json")).unwrap(),
             before
@@ -208,10 +246,11 @@ fn packaged_home_approval_join() {
         );
         return;
     }
-    let started = started.unwrap();
+    assert_eq!(started["state"], "approve.started");
+    let generation = started["generation"].as_str().unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     let observed = loop {
-        let observed = status(&deps.operations, started.generation()).unwrap();
+        let observed = status(&deps.operations, generation).unwrap();
         if observed.worker_settled {
             break observed;
         }
@@ -221,32 +260,71 @@ fn packaged_home_approval_join() {
         );
         std::thread::park_timeout(Duration::from_millis(10));
     };
-    assert_eq!(observed.state, ApprovalState::Held);
+    assert_eq!(
+        observed.state,
+        if input.mode == "typed" {
+            ApprovalState::Completed
+        } else {
+            ApprovalState::Held
+        }
+    );
     assert!(!paths[0].exists());
     assert_eq!(fs::read(&paths[1]).unwrap(), originals[1]);
     let register = load_at_root(&root).unwrap();
     assert!(!register.marks.contains_key(&rows[0].id));
-    assert_eq!(register.marks.get(&rows[1].id), Some(&rows[1]));
+    if input.mode == "mixed" {
+        assert_eq!(register.marks.get(&rows[1].id), Some(&rows[1]));
+    }
     let report = observed.report.as_ref().unwrap();
-    let state = deps.operations.lock().unwrap();
-    let returned = state.archive_returns().next().unwrap();
-    let solstone_core_backup_web::archive_worker::ArchivePayload::ProofHeld { proof, .. } =
-        returned.payload()
-    else {
-        panic!("whole partial Proof owner");
-    };
-    assert_eq!(proof.selected_marks(), rows);
-    drop(state);
-    assert_eq!(report["outcome"]["targets"].as_array().unwrap().len(), 2);
-    assert_eq!(report["attempts"].as_array().unwrap().len(), 1);
-    // Shared backup admission remains Busy while the actual partial owner lives.
-    let refused = solstone_core_backup_web::archive_worker::removal::start(
-        &deps,
-        context,
-        now.date_naive(),
-        now,
+    assert_eq!(
+        report["outcome"]["targets"].as_array().unwrap().len(),
+        rows.len()
     );
-    assert!(refused.is_err());
+    assert_eq!(report["attempts"].as_array().unwrap().len(), 1);
+    let received = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/app/home/api/approve/{generation}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(received.status().is_success());
+    let received: Value =
+        serde_json::from_slice(&to_bytes(received.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(received["generation"], generation);
+    assert_eq!(received["report"], *report);
+    let state = deps.operations.lock().unwrap();
+    if input.mode == "mixed" {
+        let returned = state.archive_returns().next().unwrap();
+        let solstone_core_backup_web::archive_worker::ArchivePayload::ProofHeld { proof, .. } =
+            returned.payload()
+        else {
+            panic!("whole partial Proof owner");
+        };
+        assert_eq!(proof.selected_marks(), rows);
+        drop(state);
+        assert!(
+            solstone_core_backup_web::archive_operation::begin(
+                &deps.operations,
+                "backup",
+                deps.clock.as_ref()
+            )
+            .is_err()
+        );
+    } else {
+        assert!(state.archive_returns().next().is_none());
+        drop(state);
+        assert!(
+            solstone_core_backup_web::archive_operation::begin(
+                &deps.operations,
+                "backup",
+                deps.clock.as_ref()
+            )
+            .is_ok()
+        );
+    }
     println!(
         "OWNED_APPROVAL_RESULT {}",
         json!({"mode":input.mode,"status":observed,"typed_removed":true,"policy_preserved":true})
@@ -255,7 +333,7 @@ fn packaged_home_approval_join() {
 
 #[tokio::test]
 #[ignore = "uses the existing copied installed package; lease refusal precedes helper or WAN work"]
-async fn packaged_home_approval_receiving_retains_preparation_refusal_and_sticky_flag() {
+async fn packaged_public_approval_post_start_unknown_retains_original() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -303,18 +381,34 @@ async fn packaged_home_approval_receiving_retains_preparation_refusal_and_sticky
             .expect("existing copied package member"),
     );
     let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
-    let started = dispatch_approval(
-        Some(Extension(deps.clone())),
-        Ok(Bytes::from(body.to_string())),
-        now,
-    )
-    .unwrap();
-    // The proposed transport envelope carries only the actual returned string.
-    let envelope = json!({"state":"approve.started", "generation":started.generation()});
-    assert_eq!(envelope["generation"], started.generation());
+    let router = crate::routes_with_backup_deps(deps.clone(), crate::Clock::fixed(now), |_| false);
+    let (sent, received) = std::sync::mpsc::channel();
+    PUBLIC_START.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |generation| {
+            sent.send(generation.to_owned()).unwrap();
+            panic!("actual start received before initial HTTP reply");
+        }))
+    });
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/home/api/approve")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let envelope: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(envelope["state"], OUTCOME_UNKNOWN);
+    let generation = received.recv().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let observed = loop {
-        let observed = status(&deps.operations, started.generation()).unwrap();
+        let observed = status(&deps.operations, &generation).unwrap();
         if observed.worker_settled {
             break observed;
         }
@@ -340,7 +434,6 @@ async fn packaged_home_approval_receiving_retains_preparation_refusal_and_sticky
         solstone_core_backup_web::archive_worker::ArchivePayload::PreparationFailure(_)
     ));
     drop(external_lease);
-    let router = crate::routes_with_backup_deps(deps.clone(), crate::Clock::fixed(now), |_| false);
     let mut observations = Vec::new();
     for (method, tail, expected) in [
         ("GET", "", false),
@@ -353,10 +446,7 @@ async fn packaged_home_approval_receiving_retains_preparation_refusal_and_sticky
             .oneshot(
                 Request::builder()
                     .method(method)
-                    .uri(format!(
-                        "/app/home/api/approve/{}{tail}",
-                        started.generation()
-                    ))
+                    .uri(format!("/app/home/api/approve/{}{tail}", generation))
                     .header("content-type", "application/json")
                     .body(Body::from(if method == "POST" { "{}" } else { "" }))
                     .unwrap(),
@@ -367,7 +457,7 @@ async fn packaged_home_approval_receiving_retains_preparation_refusal_and_sticky
         assert_eq!(response.headers()["cache-control"], "no-store");
         let value: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(value["generation"], started.generation());
+        assert_eq!(value["generation"], generation);
         assert_eq!(value["state"], "held");
         assert_eq!(value["cancellation_requested"], expected);
         assert_eq!(value["report"], observed.report.as_ref().unwrap().clone());

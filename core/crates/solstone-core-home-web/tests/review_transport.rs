@@ -674,6 +674,14 @@ mod tests {
             (b"{".as_slice(), StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             let root = journal();
+            let row = mark(root.path(), "busy.flac", true);
+            save(root.path(), std::slice::from_ref(&row));
+            let context = solstone_core_retention::review_context::read_review_context(
+                &JournalRoot::open(root.path()).unwrap(),
+                std::slice::from_ref(&row.id),
+            )
+            .unwrap();
+            let start_body = json!({"review_context":serde_json::to_string(&context).unwrap(),"mark_ids":[row.id.as_str()]}).to_string();
             let deps = BackupWebDeps::new(root.path().to_path_buf());
             let (generation, budget) =
                 archive_operation::begin(&deps.operations, "other_archive", deps.clock.as_ref())
@@ -689,25 +697,145 @@ mod tests {
                 root.path().to_path_buf(),
             );
             fs::write(root.path().join("config/journal.json"), config).unwrap();
-            for (method, tail, body) in [("GET", "", ""), ("POST", "/cancel", "{}")] {
+            for (method, tail, body) in [
+                ("GET", "", ""),
+                ("POST", "/cancel", "{}"),
+                ("POST", "/start", start_body.as_str()),
+            ] {
                 let response = router
                     .clone()
                     .oneshot(
                         Request::builder()
                             .method(method)
-                            .uri(format!("/app/home/api/approve/{generation}{tail}"))
+                            .uri(if tail == "/start" {
+                                "/app/home/api/approve".into()
+                            } else {
+                                format!("/app/home/api/approve/{generation}{tail}")
+                            })
                             .header("content-type", "application/json")
-                            .body(Body::from(body))
+                            .body(Body::from(body.to_owned()))
                             .unwrap(),
                     )
                     .await
                     .unwrap();
-                assert_eq!(response.status(), expected);
+                let start_refused = tail == "/start" && expected == StatusCode::CONFLICT;
+                assert_eq!(
+                    response.status(),
+                    if start_refused {
+                        StatusCode::OK
+                    } else {
+                        expected
+                    }
+                );
+                if start_refused {
+                    let value: Value = serde_json::from_slice(
+                        &to_bytes(response.into_body(), 65536).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(value["state"], "approve.refused_before_start");
+                }
                 assert!(!budget.cancellation().unwrap().is_cancelled());
                 assert!(
                     archive_operation::begin(&deps.operations, "backup", deps.clock.as_ref())
                         .is_err()
                 );
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn public_approval_refuses_invalid_current_selection_before_admission() {
+        for cut in [
+            "ordinary",
+            "stale",
+            "reoffer",
+            "copied",
+            "failed",
+            "malformed",
+            "oversized",
+        ] {
+            let root = journal();
+            let mut row = mark(root.path(), "selected.flac", cut != "ordinary");
+            let original = save(root.path(), &[row.clone()]);
+            let listed = list(root.path()).await;
+            let context = listed["review_context"].as_str().unwrap().to_owned();
+            let mut body =
+                json!({"review_context":context,"mark_ids":[row.id.as_str()]}).to_string();
+            match cut {
+                "stale" => {
+                    row.proposal.reason = "changed".into();
+                    save(root.path(), &[row.clone()]);
+                }
+                "reoffer" => {
+                    row.offload = Some(
+                        OffloadOffer::new(row.offload.as_ref().unwrap().proof.clone()).unwrap(),
+                    );
+                    save(root.path(), &[row.clone()]);
+                }
+                "failed" => {
+                    row.state = MarkState::Failed(Failure {
+                        at: "now".into(),
+                        reason: "held".into(),
+                        staged: None,
+                    });
+                    save(root.path(), &[row.clone()]);
+                }
+                "malformed" => body = "{".into(),
+                "oversized" => body = " ".repeat(2 * 1024 * 1024 + 1),
+                _ => {}
+            }
+            let before = fs::read(root.path().join("health/retention-marks.json")).unwrap();
+            let copied = journal();
+            let executing = if cut == "copied" {
+                save(copied.path(), &[row.clone()]);
+                copied.path()
+            } else {
+                root.path()
+            };
+            let mut deps = solstone_core_backup_web::BackupWebDeps::new(executing.to_path_buf());
+            deps.executable = root.path().join("missing-package/bin/solstone");
+            let router = solstone_core_home_web::routes_with_backup_deps(
+                deps.clone(),
+                solstone_core_home_web::Clock::fixed(
+                    Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap(),
+                ),
+                |_| false,
+            );
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/app/home/api/approve")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_ne!(value["state"], "approve.started", "{cut}");
+            assert!(
+                solstone_core_backup_web::archive_operation::begin(
+                    &deps.operations,
+                    "probe",
+                    deps.clock.as_ref()
+                )
+                .is_ok()
+            );
+            assert!(!root.path().join("backup-activity.lock").exists());
+            assert_eq!(
+                fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+                before
+            );
+            assert_eq!(
+                fs::read(root.path().join("chronicle/raw.flac")).unwrap(),
+                b"original bytes"
+            );
+            if cut == "ordinary" {
+                assert_eq!(before, original);
             }
         }
     }

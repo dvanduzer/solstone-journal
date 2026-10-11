@@ -2579,29 +2579,36 @@ mod held_restore_tests {
     }
 
     #[tokio::test]
-    async fn day_and_all_preserve_owning_held_reasons_without_tools_or_effects() {
-        for (bound, reason) in [(false, "archive_unbound"), (true, "restore_held")] {
+    async fn day_and_all_preserve_preflight_and_owned_tool_refusal() {
+        for bound in [false, true] {
             for request in [json!({"day":"20260101"}), json!({"all":true})] {
                 let root = crate::test_support::root("healthy");
                 archive(root.path(), bound);
                 let (deps, runner, http) = missing_tool_deps(root.path());
                 let before = snapshot(root.path());
-                let (status, _) =
+                let (status, value) =
                     post_json(&deps, "/app/backup/offload/restore", Some(request)).await;
-                assert_eq!(status, 200);
-                let terminal = wait_terminal(&deps).await;
-                assert_eq!(terminal["operation"]["kind"], "offload_restore");
-                assert_eq!(terminal["operation"]["phase"], "refused");
-                assert_eq!(terminal["operation"]["reason_code"], reason);
-                assert_eq!(terminal["operation"]["report"]["status"], "refused");
-                assert_eq!(terminal["operation"]["report"]["reason"], reason);
-                assert_eq!(terminal["operation"]["report"]["files_expected"], 1);
-                assert_eq!(terminal["operation"]["report"]["files_restored"], 0);
-                assert_eq!(terminal["operation"]["report"]["bytes_restored"], 0);
-                assert_eq!(
-                    terminal["operation"]["report"]["details"][0]["reason"],
-                    reason
-                );
+                if bound && cfg!(target_os = "linux") {
+                    assert_eq!(status, 200);
+                    let terminal = wait_terminal(&deps).await;
+                    assert_eq!(terminal["operation"]["kind"], "offload_restore");
+                    assert_eq!(terminal["operation"]["phase"], "refused");
+                    assert_eq!(terminal["operation"]["reason_code"], "restic_unavailable");
+                    assert_eq!(terminal["operation"]["report"]["files_restored"], 0);
+                    assert_eq!(terminal["operation"]["report"]["bytes_restored"], 0);
+                    assert!(!crate::operation::is_busy(&deps.operations));
+                } else {
+                    assert_eq!(status, 400);
+                    assert_eq!(
+                        value["reason_code"],
+                        if cfg!(target_os = "linux") {
+                            "archive_unbound"
+                        } else {
+                            "restore_held"
+                        }
+                    );
+                    assert!(!crate::operation::is_busy(&deps.operations));
+                }
                 assert!(runner.calls.lock().unwrap().is_empty());
                 assert!(http.requests.lock().unwrap().is_empty());
                 assert_eq!(snapshot(root.path()), before);
@@ -2611,10 +2618,7 @@ mod held_restore_tests {
 
     #[tokio::test]
     async fn empty_and_malformed_catalogs_preserve_owning_outcomes_without_tools() {
-        for (malformed, phase, reason) in [
-            (false, "done", "nothing_to_restore"),
-            (true, "error", "ledger_degraded"),
-        ] {
+        for (malformed, reason) in [(false, "nothing_to_restore"), (true, "ledger_degraded")] {
             for request in [json!({"day":"20260101"}), json!({"all":true})] {
                 let root = crate::test_support::root("healthy");
                 if malformed {
@@ -2627,12 +2631,18 @@ mod held_restore_tests {
                 }
                 let (deps, runner, http) = missing_tool_deps(root.path());
                 let before = snapshot(root.path());
-                let (status, _) =
+                let (status, value) =
                     post_json(&deps, "/app/backup/offload/restore", Some(request)).await;
-                assert_eq!(status, 200);
-                let terminal = wait_terminal(&deps).await;
-                assert_eq!(terminal["operation"]["phase"], phase);
-                assert_eq!(terminal["operation"]["reason_code"], reason);
+                assert_eq!(status, 400);
+                assert_eq!(
+                    value["reason_code"],
+                    if cfg!(target_os = "linux") {
+                        reason
+                    } else {
+                        "restore_held"
+                    }
+                );
+                assert!(!crate::operation::is_busy(&deps.operations));
                 assert!(runner.calls.lock().unwrap().is_empty());
                 assert!(http.requests.lock().unwrap().is_empty());
                 assert_eq!(snapshot(root.path()), before);

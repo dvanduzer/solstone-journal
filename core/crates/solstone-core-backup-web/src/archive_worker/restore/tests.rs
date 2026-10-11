@@ -18,6 +18,52 @@ use solstone_core_retention::archive_proof::{
 use crate::archive_operation::ArchiveBeginRefusal;
 use crate::archive_worker::{begin_owned, prepare_read};
 
+#[derive(Default)]
+pub(super) struct DispatchControl {
+    pause: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    resolver_panic: bool,
+}
+thread_local! {
+    static DISPATCH: RefCell<DispatchControl> = RefCell::new(DispatchControl::default());
+    static RESPONSE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(super) fn take_dispatch() -> DispatchControl {
+    DISPATCH.with(|control| std::mem::take(&mut *control.borrow_mut()))
+}
+pub(super) fn install_dispatch(control: DispatchControl) {
+    DISPATCH.with(|current| *current.borrow_mut() = control);
+}
+pub(super) fn before_pending() {
+    let pause = DISPATCH.with(|control| control.borrow_mut().pause.take());
+    if let Some((entered, resume)) = pause {
+        entered.send(()).unwrap();
+        resume.recv().unwrap();
+    }
+}
+pub(super) fn before_resolver() {
+    if DISPATCH.with(|control| control.borrow().resolver_panic) {
+        panic!("restore resolver unwind with original input outside");
+    }
+}
+pub(super) fn before_response() {
+    if RESPONSE_PANIC.replace(false) {
+        panic!("restore response unwind with unused input retained");
+    }
+}
+
+fn join_pending(slot: &SharedOperationSlot) {
+    let worker = slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .archive
+        .restore
+        .worker
+        .take();
+    if let Some(worker) = worker {
+        worker.join().unwrap();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Cut {
@@ -389,4 +435,256 @@ fn packaged_owned_restore_worker() {
         );
     }
     println!("OWNED_RESTORE_WORKER_RESULT {}", result);
+}
+
+struct AdjustableClock(std::sync::atomic::AtomicI64);
+impl Clock for AdjustableClock {
+    fn now_unix(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn iso_week(&self) -> u8 {
+        1
+    }
+}
+
+fn local_restore() -> (
+    tempfile::TempDir,
+    crate::BackupWebDeps,
+    Arc<AdjustableClock>,
+    PathBuf,
+) {
+    let journal = crate::test_support::root("healthy");
+    let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+    let input = Input {
+        mode: Cut::Complete,
+        journal: journal.path().to_path_buf(),
+        restic_path: PathBuf::new(),
+        repository_id: "a".repeat(64),
+        snapshot_id: "b".repeat(64),
+        archive_path: "/synthetic/audio.flac".into(),
+        bytes: 7,
+        sha256: "c".repeat(64),
+    };
+    let segment = seed(&input, &root);
+    let clock = Arc::new(AdjustableClock(std::sync::atomic::AtomicI64::new(10_000)));
+    let mut deps = crate::BackupWebDeps::new(journal.path().to_path_buf());
+    deps.clock = clock.clone();
+    deps.executable = journal.path().join("missing-package/bin/solstone");
+    (journal, deps, clock, segment)
+}
+
+#[test]
+fn public_restore_preselection_uses_complete_unique_bound_catalog() {
+    let (journal, deps, _, _) = local_restore();
+    let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+    assert_eq!(repository(&root, Some("20261009")).unwrap(), "a".repeat(64));
+    assert_eq!(repository(&root, None).unwrap(), "a".repeat(64));
+    assert_eq!(
+        repository(&root, Some("20261008")),
+        Err("nothing_to_restore")
+    );
+    let ledger = journal.path().join("health/offload/20261009.jsonl");
+    let original = fs::read(&ledger).unwrap();
+    let mut extra: Value = serde_json::from_slice(&original).unwrap();
+    extra["repository_id"] = json!("d".repeat(64));
+    extra["manifest_id"] = json!("other-manifest");
+    extra["files"][0]["witness_id"] = json!("other-witness");
+    extra["segment_dir"] = json!("130000_60_fixture");
+    extra["segment"] = json!("130000_60");
+    let mut mixed = original.clone();
+    mixed.extend(serde_json::to_vec(&extra).unwrap());
+    mixed.push(b'\n');
+    fs::write(&ledger, mixed).unwrap();
+    assert_eq!(repository(&root, None), Err("repository_mismatch"));
+    assert!(start(&deps, None).is_err());
+    assert!(!operation::is_busy(&deps.operations));
+    assert!(!journal.path().join("backup-activity.lock").exists());
+    fs::write(&ledger, b"not-json\n").unwrap();
+    assert_eq!(repository(&root, None), Err("ledger_degraded"));
+    assert!(start(&deps, None).is_err());
+    assert!(!operation::is_busy(&deps.operations));
+}
+
+#[test]
+fn pending_restore_preserves_original_input_and_matching_response_authority() {
+    for cut in [
+        "spawn", "tools", "cancel", "deadline", "resolver", "start", "stale", "absent", "poison",
+        "response",
+    ] {
+        let (journal, deps, clock, _) = local_restore();
+        let config = fs::read(journal.path().join("config/journal.json")).unwrap();
+        let ledger = fs::read(journal.path().join("health/offload/20261009.jsonl")).unwrap();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (resume, continued) = std::sync::mpsc::channel();
+        DISPATCH.with(|control| {
+            *control.borrow_mut() = DispatchControl {
+                pause: (cut != "spawn").then_some((entered, continued)),
+                resolver_panic: cut == "resolver",
+            }
+        });
+        if cut == "spawn" {
+            operation::fail_next_worker_start();
+        }
+        let generation = start(&deps, None).unwrap();
+        if cut != "spawn" {
+            waiting.recv().unwrap();
+            {
+                let mut state = deps.operations.lock().unwrap();
+                let input = state.archive.restore.input.as_ref().unwrap();
+                assert_eq!(input.repository, "a".repeat(64));
+                assert!(input.day.is_none());
+                assert!(Arc::ptr_eq(&input.begin.ticket.0.clock, &deps.clock));
+                assert_eq!(input.begin.generation(), generation);
+                assert_eq!(
+                    input.begin.ticket.0.root.identity().observation_id(),
+                    JournalRoot::open(journal.path())
+                        .unwrap()
+                        .identity()
+                        .observation_id()
+                );
+                match cut {
+                    "cancel" => state
+                        .current
+                        .as_ref()
+                        .unwrap()
+                        .archive_cancellation
+                        .as_ref()
+                        .unwrap()
+                        .cancel(),
+                    "deadline" => clock.0.store(40_000, std::sync::atomic::Ordering::SeqCst),
+                    "start" => state.current.as_mut().unwrap().worker_active = true,
+                    "stale" => {
+                        let current = state.current.as_mut().unwrap();
+                        current.generation += 1;
+                        current.view.report = Some(json!({"successor":true}));
+                    }
+                    "absent" => state.current = None,
+                    _ => {}
+                }
+            }
+            if cut == "poison" {
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let _guard = deps.operations.lock().unwrap();
+                    panic!("poison admission");
+                }));
+            }
+            resume.send(()).unwrap();
+        }
+        join_pending(&deps.operations);
+        assert!(operation::is_busy(&deps.operations));
+        if cut == "response" {
+            RESPONSE_PANIC.set(true);
+        }
+        let response = response(&deps, Some(generation)).unwrap();
+        let refused_return = matches!(cut, "start" | "stale" | "absent" | "poison" | "response");
+        assert_eq!(response.status().is_success(), !refused_return, "{cut}");
+        assert_eq!(
+            operation::is_busy(&deps.operations),
+            refused_return,
+            "{cut}"
+        );
+        let state = deps
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            state.archive.restore.unused.len(),
+            usize::from(refused_return)
+        );
+        if cut == "stale" {
+            assert_eq!(
+                state
+                    .current
+                    .as_ref()
+                    .unwrap()
+                    .view
+                    .report
+                    .as_ref()
+                    .unwrap()["successor"],
+                true
+            );
+        }
+        if !refused_return {
+            assert_eq!(
+                state.current.as_ref().unwrap().view.reason_code.as_deref(),
+                Some(match cut {
+                    "spawn" => "worker_start_failed",
+                    "cancel" => "cancelled",
+                    "deadline" => "deadline_exceeded",
+                    "resolver" => "resolver_unknown",
+                    _ => "restic_unavailable",
+                })
+            );
+        }
+        drop(state);
+        assert_eq!(
+            fs::read(journal.path().join("config/journal.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read(journal.path().join("health/offload/20261009.jsonl")).unwrap(),
+            ledger
+        );
+        assert!(!journal.path().join("backup-activity.lock").exists());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the existing copied package and snapshot fixture; public caller only"]
+async fn packaged_public_bound_restore() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    let input: Input = serde_json::from_slice(
+        &fs::read(std::env::var_os("OWNED_RESTORE_WORKER_JSON").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
+    let segment = seed(&input, &root);
+    let mut deps = crate::BackupWebDeps::new(input.journal.clone());
+    deps.executable = std::env::current_exe().unwrap();
+    deps.clock = Arc::new(LiveClock(Instant::now()));
+    let router = crate::routes_with_deps(deps.clone());
+    let started = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/backup/offload/restore")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"day":"20261009"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(started.status().is_success());
+    join_pending(&deps.operations);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/app/backup/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let value: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1_048_576).await.unwrap()).unwrap();
+    assert_eq!(value["operation"]["phase"], "done");
+    assert_eq!(value["operation"]["report"]["bytes_restored"], input.bytes);
+    assert_eq!(
+        value["operation"]["report"]["runtime"]["state"],
+        "completed"
+    );
+    assert_eq!(
+        fs::read(segment.join("audio.flac")).unwrap(),
+        fs::read(input.archive_path).unwrap()
+    );
+    assert!(!operation::is_busy(&deps.operations));
+    assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+    assert!(operation::begin(&deps.operations, "backup", None, None, None).is_ok());
+    println!("PUBLIC_BOUND_RESTORE {}", value);
 }

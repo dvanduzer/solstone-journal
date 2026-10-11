@@ -106,10 +106,51 @@ fn rendered_review(journal_root: &Path) -> Result<(Vec<Value>, String), &'static
     Ok((removals, context))
 }
 
-pub async fn approve(body: Result<Bytes, axum::extract::rejection::BytesRejection>) -> Response {
-    match action_context(body) {
-        Ok(context) => write_response(context.marks().len(), refused_before_start()),
-        Err((status, state)) => request_response(status, state),
+pub async fn approve(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    Extension(clock): Extension<crate::Clock>,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let context = match action_context(body) {
+        Ok(context) => context,
+        Err((status, state)) => return uncached(request_response(status, state)),
+    };
+    let count = context.marks().len();
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (deps, clock);
+        uncached(write_response(count, refused_before_start()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(Extension(deps)) = deps else {
+            return uncached(write_response(count, refused_before_start()));
+        };
+        #[cfg(all(test, feature = "full-tests"))]
+        let after_start = approval_tests::take_public_start_hook();
+        let result = tokio::task::spawn_blocking(move || {
+            let now = clock.now();
+            let started = solstone_core_backup_web::archive_worker::removal::start(
+                &deps,
+                context,
+                now.date_naive(),
+                now,
+            );
+            #[cfg(all(test, feature = "full-tests"))]
+            if let (Ok(started), Some(after_start)) = (&started, after_start) {
+                after_start(started.generation());
+            }
+            started
+        })
+        .await;
+        match result {
+            Ok(Ok(started)) => uncached(
+                Json(json!({"state":"approve.started", "generation":started.generation()}))
+                    .into_response(),
+            ),
+            Ok(Err(_)) => uncached(write_response(count, refused_before_start())),
+            Err(_) => approval_unavailable(OUTCOME_UNKNOWN, StatusCode::SERVICE_UNAVAILABLE),
+        }
     }
 }
 
@@ -188,8 +229,7 @@ pub async fn cancel_approval(
     approval_receiving(deps, id, true).await
 }
 
-// Classified consumer join only. Public dispatch remains held until the
-// browser/current-result and namespace cooperation boundaries are qualified.
+// Direct fixture entry for the same retained worker used by the public handler.
 #[cfg(all(test, feature = "full-tests"))]
 #[cfg(target_os = "linux")]
 fn dispatch_approval(
