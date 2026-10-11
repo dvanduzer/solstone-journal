@@ -13,6 +13,8 @@ pub mod restore;
 #[allow(dead_code)]
 mod restore_intent;
 #[allow(dead_code)]
+mod restore_intent_store;
+#[allow(dead_code)]
 mod restore_prepared;
 pub mod run;
 pub mod status;

@@ -160,6 +160,336 @@ fn io_error(path: &Path, source: io::Error) -> AppendError {
     }
 }
 
+#[cfg(unix)]
+pub use bound_append::{
+    BoundAppendConfirmation, BoundAppendDurability, BoundAppendEffect, BoundAppendReceipt,
+    append_jsonl_bound,
+};
+
+#[cfg(unix)]
+mod bound_append {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    use nix::fcntl::{AtFlags, OFlag, openat};
+    use nix::sys::stat::{FileStat, Mode, fstat, fstatat};
+    use serde::Serialize;
+
+    use crate::flat_directory::entry_from_stat;
+    use crate::journal_root::JournalEntryKind;
+    use crate::observation::{FileObservation, same_entry_metadata};
+    use crate::{FlatDirectory, read_observed_file_bounded};
+
+    const INPUT_LIMIT: usize = 32 * 1024 * 1024;
+    const RECORD_LIMIT: usize = 1024 * 1024;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BoundAppendEffect {
+        NotAttempted,
+        /// The open may have created a leaf; a failed write may have changed bytes.
+        Attempted {
+            written: Option<usize>,
+        },
+        Appended {
+            bytes: usize,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BoundAppendDurability {
+        Unproven,
+        Synced,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum BoundAppendConfirmation {
+        Unverified,
+        Confirmed,
+    }
+
+    /// Physical facts beneath the retained parent, without canonical-root authority.
+    #[must_use]
+    #[derive(Debug)]
+    pub struct BoundAppendReceipt {
+        effect: BoundAppendEffect,
+        file_durability: BoundAppendDurability,
+        parent_durability: BoundAppendDurability,
+        confirmation: BoundAppendConfirmation,
+        failures: Vec<io::Error>,
+    }
+
+    impl BoundAppendReceipt {
+        pub fn effect(&self) -> BoundAppendEffect {
+            self.effect
+        }
+        pub fn file_durability(&self) -> BoundAppendDurability {
+            self.file_durability
+        }
+        pub fn parent_durability(&self) -> BoundAppendDurability {
+            self.parent_durability
+        }
+        pub fn confirmation(&self) -> BoundAppendConfirmation {
+            self.confirmation
+        }
+        pub fn failures(&self) -> &[io::Error] {
+            &self.failures
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Point {
+        BeforeOpen,
+        BeforeWrite,
+        AfterWrite,
+        FileSync,
+        ParentSync,
+        AfterConfirmationRead,
+    }
+
+    pub(super) trait Hooks {
+        fn checkpoint(&mut self, _point: Point) {}
+        fn write(&mut self, file: &mut File, contents: &[u8]) -> io::Result<usize> {
+            file.write(contents)
+        }
+        fn sync(&mut self, file: &impl std::os::fd::AsFd, _point: Point) -> io::Result<()> {
+            nix::unistd::fsync(file).map_err(io::Error::from)
+        }
+    }
+    struct NoHooks;
+    impl Hooks for NoHooks {}
+
+    fn invalid() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bound append observation changed",
+        )
+    }
+    fn observed_error(error: impl std::fmt::Display) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+    }
+
+    struct RecordWriter(Vec<u8>);
+    impl Write for RecordWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self
+                .0
+                .len()
+                .checked_add(bytes.len())
+                .is_none_or(|len| len >= RECORD_LIMIT)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bound append record exceeds limit",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn same_stat(left: &FileStat, right: &FileStat) -> bool {
+        left.st_dev == right.st_dev
+            && left.st_ino == right.st_ino
+            && left.st_mode == right.st_mode
+            && left.st_nlink == right.st_nlink
+            && left.st_size == right.st_size
+            && left.st_mtime == right.st_mtime
+            && left.st_mtime_nsec == right.st_mtime_nsec
+            && left.st_ctime == right.st_ctime
+            && left.st_ctime_nsec == right.st_ctime_nsec
+    }
+
+    fn named_stat(parent: &FlatDirectory, name: &OsStr) -> io::Result<FileStat> {
+        fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(io::Error::from)
+    }
+
+    fn opened_observation(
+        file: &mut File,
+        name: &OsStr,
+    ) -> io::Result<(FileObservation, FileStat)> {
+        let before = fstat(&*file).map_err(io::Error::from)?;
+        if before.st_nlink != 1 || before.st_size < 0 {
+            return Err(invalid());
+        }
+        let entry =
+            entry_from_stat(name.to_owned(), &before, Path::new(name)).map_err(observed_error)?;
+        if entry.kind != JournalEntryKind::RegularFile || entry.size > INPUT_LIMIT as u64 {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        Read::by_ref(file)
+            .take((INPUT_LIMIT as u64) + 1)
+            .read_to_end(&mut bytes)?;
+        let after = fstat(&*file).map_err(io::Error::from)?;
+        let final_entry =
+            entry_from_stat(name.to_owned(), &after, Path::new(name)).map_err(observed_error)?;
+        if after.st_nlink != 1
+            || !same_stat(&before, &after)
+            || !same_entry_metadata(&entry, &final_entry)
+            || u64::try_from(bytes.len()).ok() != Some(entry.size)
+        {
+            return Err(invalid());
+        }
+        Ok((FileObservation { entry, bytes }, after))
+    }
+
+    /// Append once through the retained parent and preserve independent effect facts.
+    /// The caller retains and revalidates canonical ancestry and its owning exclusions.
+    pub fn append_jsonl_bound<T: Serialize>(
+        parent: &FlatDirectory,
+        name: &OsStr,
+        record: &T,
+    ) -> BoundAppendReceipt {
+        append_with_hooks(parent, name, record, &mut NoHooks)
+    }
+
+    pub(super) fn append_with_hooks<T: Serialize>(
+        parent: &FlatDirectory,
+        name: &OsStr,
+        record: &T,
+        hooks: &mut impl Hooks,
+    ) -> BoundAppendReceipt {
+        let mut receipt = BoundAppendReceipt {
+            effect: BoundAppendEffect::NotAttempted,
+            file_durability: BoundAppendDurability::Unproven,
+            parent_durability: BoundAppendDurability::Unproven,
+            confirmation: BoundAppendConfirmation::Unverified,
+            failures: Vec::new(),
+        };
+        let preparation = (|| -> io::Result<(Vec<u8>, Option<FileObservation>)> {
+            let mut encoded = RecordWriter(Vec::new());
+            serde_json::to_writer(&mut encoded, record).map_err(observed_error)?;
+            encoded.0.push(b'\n');
+            parent.revalidate().map_err(observed_error)?;
+            let baseline =
+                read_observed_file_bounded(parent, name, INPUT_LIMIT).map_err(observed_error)?;
+            if baseline.as_ref().is_some_and(|observed| {
+                !observed.bytes.is_empty() && observed.bytes.last() != Some(&b'\n')
+            }) {
+                return Err(invalid());
+            }
+            Ok((encoded.0, baseline))
+        })();
+        let (contents, baseline) = match preparation {
+            Ok(value) => value,
+            Err(error) => {
+                receipt.failures.push(error);
+                return receipt;
+            }
+        };
+        let opened = (|| -> io::Result<(File, Vec<u8>)> {
+            hooks.checkpoint(Point::BeforeOpen);
+            parent.revalidate().map_err(observed_error)?;
+            receipt.effect = BoundAppendEffect::Attempted { written: None };
+            let fd = openat(
+                parent,
+                name,
+                OFlag::O_APPEND
+                    | OFlag::O_RDWR
+                    | OFlag::O_CREAT
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_NONBLOCK,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(io::Error::from)?;
+            let mut file = File::from(fd);
+            hooks.checkpoint(Point::BeforeWrite);
+            let (opened, opened_stat) = opened_observation(&mut file, name)?;
+            if baseline
+                .as_ref()
+                .is_some_and(|baseline| baseline != &opened)
+                || (baseline.is_none() && !opened.bytes.is_empty())
+                || !same_stat(&opened_stat, &named_stat(parent, name)?)
+            {
+                return Err(invalid());
+            }
+            let mut expected = opened.bytes;
+            expected
+                .len()
+                .checked_add(contents.len())
+                .ok_or_else(invalid)?;
+            expected.extend_from_slice(&contents);
+            parent.revalidate().map_err(observed_error)?;
+            if !same_stat(&opened_stat, &named_stat(parent, name)?) {
+                return Err(invalid());
+            }
+            Ok((file, expected))
+        })();
+        let (mut file, expected) = match opened {
+            Ok(value) => value,
+            Err(error) => {
+                receipt.failures.push(error);
+                return receipt;
+            }
+        };
+        match hooks.write(&mut file, &contents) {
+            Ok(written) if written == contents.len() => {
+                receipt.effect = BoundAppendEffect::Appended { bytes: written }
+            }
+            Ok(written) => {
+                receipt.effect = BoundAppendEffect::Attempted {
+                    written: Some(written),
+                };
+                receipt.failures.push(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "bound append record was only partially written",
+                ));
+            }
+            Err(error) => receipt.failures.push(error),
+        }
+        hooks.checkpoint(Point::AfterWrite);
+        match hooks.sync(&file, Point::FileSync) {
+            Ok(()) => receipt.file_durability = BoundAppendDurability::Synced,
+            Err(error) => receipt.failures.push(error),
+        }
+        match hooks.sync(parent, Point::ParentSync) {
+            Ok(()) => receipt.parent_durability = BoundAppendDurability::Synced,
+            Err(error) => receipt.failures.push(error),
+        }
+        let confirmation = (|| -> io::Result<()> {
+            let before = fstat(&file).map_err(io::Error::from)?;
+            let observed = read_observed_file_bounded(parent, name, expected.len())
+                .map_err(observed_error)?
+                .ok_or_else(invalid)?;
+            let retained = fstat(&file).map_err(io::Error::from)?;
+            let retained_entry = entry_from_stat(name.to_owned(), &retained, Path::new(name))
+                .map_err(observed_error)?;
+            if retained.st_nlink != 1
+                || !same_stat(&before, &retained)
+                || observed.bytes != expected
+                || !same_entry_metadata(&observed.entry, &retained_entry)
+            {
+                return Err(invalid());
+            }
+            hooks.checkpoint(Point::AfterConfirmationRead);
+            if !same_stat(&retained, &named_stat(parent, name)?) {
+                return Err(invalid());
+            }
+            parent.revalidate().map_err(observed_error)?;
+            Ok(())
+        })();
+        match confirmation {
+            Ok(()) if matches!(receipt.effect, BoundAppendEffect::Appended { .. }) => {
+                receipt.confirmation = BoundAppendConfirmation::Confirmed
+            }
+            Ok(()) => {}
+            Err(error) => receipt.failures.push(error),
+        }
+        receipt
+    }
+}
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+#[path = "../tests/support/append_bound.rs"]
+mod bound_tests;
+
 #[cfg(test)]
 mod tests {
     use std::fs;
