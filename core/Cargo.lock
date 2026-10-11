@@ -4420,6 +4420,7 @@ dependencies = [
  "solstone-core-home",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
+ "solstone-core-retention",
  "solstone-core-retention-client",
  "temp-env",
  "tempfile",
