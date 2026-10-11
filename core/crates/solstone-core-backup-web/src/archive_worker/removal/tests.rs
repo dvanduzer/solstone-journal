@@ -1108,3 +1108,188 @@ fn packaged_owned_removal_worker() {
     }
     println!("OWNED_REMOVAL_WORKER_RESULT {}", result);
 }
+
+/// A journal holding policy marks only, with a day rule old rows satisfy.
+fn policy_fixture(
+    names: &[&str],
+    legacy: bool,
+) -> (tempfile::TempDir, Arc<JournalRoot>, Vec<Mark>) {
+    let journal = tempfile::tempdir().unwrap();
+    fs::create_dir(journal.path().join("config")).unwrap();
+    fs::create_dir(journal.path().join("health")).unwrap();
+    fs::write(
+        journal.path().join("config/journal.json"),
+        br#"{"retention":{"raw_media":"days","raw_media_days":1}}"#,
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+    let target = solstone_core_retention::Target {
+        day: "20261009".into(),
+        stream: "_default".into(),
+        dir: "120000_60_policy".into(),
+    };
+    let segment = journal
+        .path()
+        .join(solstone_core_retention::layout::segment_rel(
+            &target.day,
+            &target.stream,
+            &target.dir,
+        ));
+    fs::create_dir_all(&segment).unwrap();
+    fs::create_dir_all(journal.path().join("chronicle/20261009/health")).unwrap();
+    fs::write(segment.join("audio.flac"), b"raw").unwrap();
+    fs::write(
+        segment.join("audio.jsonl"),
+        "{\"_solstone_processing\":{\"schema\":\"solstone.processing.v1\",\"state\":\"analyzed\",\"reason_code\":\"ok\",\"handler\":\"transcribe\",\"input_size\":3,\"attempted_at\":\"2026-10-09T12:00:00Z\"}}\n{\"start\":0,\"text\":\"x\"}\n",
+    )
+    .unwrap();
+    let mut marks = Vec::new();
+    let mut classes = vec![RemovalClass::PolicyRawRelease];
+    if legacy {
+        classes.push(RemovalClass::OffloadRawRelease);
+    }
+    for class in classes {
+        let names = names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        marks.push(Mark {
+            id: MarkId::derive(class, &target, &names),
+            class,
+            target: target.clone(),
+            marked_at: "2026-10-10T00:00:00Z".into(),
+            proposal: Proposal {
+                names,
+                bytes: 3,
+                reason: "synthetic policy".into(),
+            },
+            state: MarkState::Marked,
+            offload: None,
+        });
+    }
+    let mut register = Register::empty();
+    for mark in &marks {
+        register.marks.insert(mark.id.clone(), mark.clone());
+    }
+    fs::write(
+        journal.path().join("health/retention-marks.json"),
+        serde_json::to_vec(&register).unwrap(),
+    )
+    .unwrap();
+    (journal, root, marks)
+}
+
+fn policy_start(
+    journal: &tempfile::TempDir,
+    root: &Arc<JournalRoot>,
+    marks: &[Mark],
+) -> (
+    crate::BackupWebDeps,
+    Result<ApprovalStart, ApprovalStartRefusal>,
+) {
+    let ids = marks.iter().map(|mark| mark.id.clone()).collect::<Vec<_>>();
+    let context = read_review_context(root, &ids).unwrap();
+    let mut deps = crate::BackupWebDeps::new(journal.path().to_path_buf());
+    // A local policy release never resolves or runs the backup tools.
+    deps.executable = journal.path().join("missing/bin/solstone");
+    let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
+    let started = start(&deps, context, now.date_naive(), now);
+    join_pending(&deps.operations);
+    (deps, started)
+}
+
+#[test]
+fn policy_only_approval_settles_locally_and_frees_the_slot() {
+    let (journal, root, marks) = policy_fixture(&["audio.flac"], false);
+    let raw = journal
+        .path()
+        .join("chronicle/20261009/120000_60_policy/audio.flac");
+    let (deps, started) = policy_start(&journal, &root, &marks);
+    let started = started.unwrap();
+    let observed = status(&deps.operations, started.generation()).unwrap();
+    assert!(observed.worker_settled);
+    assert_eq!(observed.state, ApprovalState::Completed);
+    assert_eq!(observed.actor_phase.as_deref(), Some("done"));
+    let report = observed.report.as_ref().unwrap();
+    assert_eq!(report["settlement"]["state"], "settled");
+    assert_eq!(report["attempts"][0]["native"]["effect"], "deleted");
+    assert_eq!(report["mutation"]["publication"], "published");
+    assert!(!raw.exists());
+    assert!(load_at_root(&root).unwrap().marks.is_empty());
+    assert!(!operation::is_busy(&deps.operations));
+    assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+    assert!(
+        response(&deps.operations, started.generation())
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert!(operation::begin(&deps.operations, "enable", None, None, None).is_ok());
+}
+
+#[test]
+fn policy_only_hold_stays_in_the_slot_and_status_reports_it() {
+    // One selected original is already gone, so the selection cannot settle.
+    let (journal, root, marks) = policy_fixture(&["audio.flac", "gone.flac"], false);
+    let raw = journal
+        .path()
+        .join("chronicle/20261009/120000_60_policy/audio.flac");
+    let (deps, started) = policy_start(&journal, &root, &marks);
+    let started = started.unwrap();
+    let observed = status(&deps.operations, started.generation()).unwrap();
+    assert!(observed.worker_settled);
+    assert_eq!(observed.state, ApprovalState::Held);
+    assert_eq!(observed.actor_phase.as_deref(), Some("degraded"));
+    assert_eq!(observed.reason_code.as_deref(), Some("failed"));
+    assert_eq!(
+        observed.report.as_ref().unwrap()["settlement"]["state"],
+        "held"
+    );
+    assert!(!raw.exists());
+    {
+        let state = deps.operations.lock().unwrap();
+        let returned = state.archive_returns().next().unwrap();
+        let ArchivePayload::OrdinaryHeld(held) = returned.payload() else {
+            panic!("the whole local owner stays in the slot");
+        };
+        assert_eq!(held.removal().selected_marks(), marks.as_slice());
+        assert!(held.removal().carrier_preparation().is_some());
+    }
+    // Reading the status never releases the retained hold.
+    assert!(
+        response(&deps.operations, started.generation())
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert_eq!(
+        status(&deps.operations, started.generation())
+            .unwrap()
+            .state,
+        ApprovalState::Held
+    );
+    let clock = Arc::clone(&deps.clock);
+    blocked(&deps.operations, &root, &clock);
+}
+
+#[test]
+fn unbound_offload_row_refuses_before_start() {
+    let (journal, root, marks) = policy_fixture(&["audio.flac"], true);
+    let raw = journal
+        .path()
+        .join("chronicle/20261009/120000_60_policy/audio.flac");
+    let before = fs::read(journal.path().join("health/retention-marks.json")).unwrap();
+    for selected in [&marks[1..], &marks[..]] {
+        let (deps, started) = policy_start(&journal, &root, selected);
+        assert!(matches!(
+            started,
+            Err(ApprovalStartRefusal::UnsupportedSelection)
+        ));
+        assert!(!operation::is_busy(&deps.operations));
+    }
+    assert_eq!(fs::read(&raw).unwrap(), b"raw");
+    assert_eq!(
+        fs::read(journal.path().join("health/retention-marks.json")).unwrap(),
+        before
+    );
+}

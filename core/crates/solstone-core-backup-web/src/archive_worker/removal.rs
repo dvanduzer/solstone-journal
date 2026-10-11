@@ -22,8 +22,10 @@ use solstone_core_backup::archive_readback::{OwnedSettledDirectRead, RefusedDire
 use solstone_core_backup_runtime::{ClosedToolError, resolve::resolve_restic_member};
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_retention::Outcome;
+use solstone_core_retention::marks::RemovalClass;
 use solstone_core_retention::remove_marked::{
-    OwnedReviewedArchiveFinish, ReviewedArchiveReport, remove_reviewed_with_owned_archive,
+    OwnedReviewedArchiveFinish, ReviewedArchiveReport, ReviewedRemovalFinish, remove_reviewed,
+    remove_reviewed_with_owned_archive,
 };
 use solstone_core_retention::review_context::{
     CheckedReviewContext, ReviewContext, ReviewRefusal, check_review_context,
@@ -31,7 +33,7 @@ use solstone_core_retention::review_context::{
 
 use super::{
     ArchivePayload, ArchiveTicket, OwnedArchiveBegin, PreparedArchiveWorker, begin_owned_locked,
-    entry, prepare_read, return_owned, runtime_facts,
+    entry, entry_current, prepare_read, return_owned, runtime_facts, start_owned_worker,
 };
 use crate::operation::{self, OperationState, SharedOperationSlot, Terminal};
 use crate::removal_report;
@@ -42,7 +44,8 @@ const KIND: &str = "offload_approve";
 struct ApprovalInput {
     begin: OwnedArchiveBegin,
     checked: CheckedReviewContext,
-    repository: String,
+    /// Absent only when no archive offer is selected: a local policy release.
+    repository: Option<String>,
     executable: PathBuf,
     today: NaiveDate,
     now: DateTime<Utc>,
@@ -117,7 +120,8 @@ impl ApprovalStart {
     }
 }
 
-/// Server prerequisite; the public Home route remains prelaunch-held.
+/// Admit a reviewed selection into the retained approval slot. Selections with
+/// archive offers verify them against the backup; policy-only ones run locally.
 pub fn start(
     deps: &BackupWebDeps,
     context: ReviewContext,
@@ -130,15 +134,19 @@ pub fn start(
     );
     let checked =
         check_review_context(Arc::clone(&root), &context).map_err(ApprovalStartRefusal::Review)?;
-    let repository = checked
+    // An offload mark without its offer has no backup to verify against.
+    if checked
         .marks()
         .iter()
-        .find_map(|mark| {
-            mark.offload
-                .as_ref()
-                .map(|offer| offer.proof.repository_id.clone())
-        })
-        .ok_or(ApprovalStartRefusal::UnsupportedSelection)?;
+        .any(|mark| mark.class == RemovalClass::OffloadRawRelease && mark.offload.is_none())
+    {
+        return Err(ApprovalStartRefusal::UnsupportedSelection);
+    }
+    let repository = checked.marks().iter().find_map(|mark| {
+        mark.offload
+            .as_ref()
+            .map(|offer| offer.proof.repository_id.clone())
+    });
     // Proof rechecks the entire selection and every repository before release.
     let mut state = operation::lock_for_begin(&deps.operations)
         .map_err(|()| ApprovalStartRefusal::Begin(ArchiveBeginRefusal::Busy))?;
@@ -271,9 +279,14 @@ fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
             .budget
             .remaining(input.begin.ticket.0.clock.as_ref())
             .map_err(UnusedRefusal::Budget)?;
+        if input.repository.is_none() {
+            return Ok(None);
+        }
         #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
         tests::before_resolver();
-        resolve_restic_member(&input.executable).map_err(UnusedRefusal::Tools)
+        resolve_restic_member(&input.executable)
+            .map(Some)
+            .map_err(UnusedRefusal::Tools)
     }));
     let restic = match resolution {
         Ok(Ok(restic)) => restic,
@@ -288,6 +301,9 @@ fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
         now,
         ..
     } = input;
+    let (Some(repository), Some(restic)) = (repository, restic) else {
+        return remove_local(slot, begin, checked, today, now);
+    };
     let generation = begin.generation();
     match prepare_read(slot, begin, repository, &restic) {
         Some(worker) => remove(slot, worker, checked, today, now),
@@ -425,6 +441,7 @@ fn snapshot(
             ArchivePayload::EarlyUnknown
             | ArchivePayload::ProofFinishUnknown { .. }
             | ArchivePayload::ProofUnknown { .. }
+            | ArchivePayload::OrdinaryUnknown
             | ArchivePayload::Unknown { .. } => ApprovalState::Unknown,
             ArchivePayload::ProofFinished { runtime, .. }
                 if runtime.state()
@@ -694,6 +711,86 @@ pub fn remove(
 enum Actor {
     Settled(Box<OwnedSettledDirectRead>, ReviewedArchiveReport),
     Refused(Box<RefusedDirectRead>, ReviewedArchiveReport),
+}
+
+/// Release a policy-only selection locally in the same admitted slot. The
+/// executor takes its own activity; any hold stays parked in this slot.
+fn remove_local(
+    slot: &SharedOperationSlot,
+    begin: OwnedArchiveBegin,
+    checked: CheckedReviewContext,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) {
+    let ticket = ArchiveTicket(Arc::clone(&begin.ticket.0));
+    let admitted =
+        if !start_owned_worker(slot, &ticket) || !std::ptr::eq(checked.root(), &*ticket.0.root) {
+            Err("failed")
+        } else {
+            entry_current(slot, &ticket)
+        };
+    if let Err(reason) = admitted {
+        return return_owned(
+            slot,
+            ticket,
+            None,
+            ArchivePayload::BeginHeld(Box::new(begin)),
+            Terminal::error(reason),
+        );
+    }
+    drop(begin);
+    let mut terminal = Terminal::error("failed");
+    let actor = catch_unwind(AssertUnwindSafe(|| {
+        let removal = remove_reviewed(checked, today, now);
+        project(
+            &mut terminal,
+            removal.outcome(),
+            serde_json::to_value(removal_report::ordinary(&removal))
+                .expect("borrowed removal facts serialize"),
+        );
+        match removal.finish() {
+            ReviewedRemovalFinish::Held(held) => {
+                project(
+                    &mut terminal,
+                    held.removal().outcome(),
+                    serde_json::to_value(removal_report::held_ordinary(&held))
+                        .expect("closed removal facts serialize"),
+                );
+                terminal.phase = if held.removal().outcome().removed_paths().next().is_some() {
+                    "degraded"
+                } else {
+                    "refused"
+                }
+                .into();
+                terminal.reason_code = Some("failed".into());
+                if let Some(report) = terminal.report.as_mut() {
+                    report["settlement"] = json!({"state":"held"});
+                }
+                ArchivePayload::OrdinaryHeld(held)
+            }
+            ReviewedRemovalFinish::Settled(report) => {
+                project(
+                    &mut terminal,
+                    report.outcome(),
+                    serde_json::to_value(removal_report::settled_ordinary(&report))
+                        .expect("settled removal facts serialize"),
+                );
+                if let Some(view) = terminal.report.as_mut() {
+                    view["settlement"] = json!({"state":"settled"});
+                }
+                ArchivePayload::OrdinarySettled(report)
+            }
+        }
+    }));
+    let payload = actor.unwrap_or_else(|_| {
+        terminal.phase = "error".into();
+        terminal.reason_code = Some("failed".into());
+        if let Some(report) = terminal.report.as_mut() {
+            report["settlement"] = json!({"state":"unknown"});
+        }
+        ArchivePayload::OrdinaryUnknown
+    });
+    return_owned(slot, ticket, None, payload, terminal);
 }
 
 fn project(terminal: &mut Terminal, outcome: &Outcome, report: Value) {

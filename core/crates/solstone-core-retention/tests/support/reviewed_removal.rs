@@ -105,6 +105,44 @@ impl Fixture {
         self.save();
         mark
     }
+    fn bound(&mut self, target: crate::Target, name: &str) -> Mark {
+        let names = vec![name.to_owned()];
+        let proof = crate::archive_proof::OffloadProof {
+            journal_id: self.root.identity().observation_id(),
+            manifest_id: "manifest".into(),
+            target: target.clone(),
+            layout: solstone_core_journal_io::paths::SegmentLayout::Direct,
+            repository_id: "a".repeat(64),
+            snapshot_id: "b".repeat(64),
+            files: vec![crate::archive_proof::ArchiveFileProof {
+                witness_id: "witness".into(),
+                name: name.to_owned(),
+                bytes: 3,
+                sha256: "c".repeat(64),
+                archive_path: format!("/stage/{name}"),
+                processing: crate::archive_proof::AcceptedProcessingObservation {
+                    record: None,
+                    has_analysis_row: true,
+                },
+            }],
+        };
+        let mark = Mark {
+            id: MarkId::derive(RemovalClass::OffloadRawRelease, &target, &names),
+            target,
+            class: RemovalClass::OffloadRawRelease,
+            marked_at: "first".into(),
+            proposal: Proposal {
+                names,
+                bytes: 3,
+                reason: "release".into(),
+            },
+            state: MarkState::Marked,
+            offload: Some(crate::archive_proof::OffloadOffer::new(proof).unwrap()),
+        };
+        self.marks.push(mark.clone());
+        self.save();
+        mark
+    }
     fn save(&self) {
         let mut r = Register::empty();
         for m in &self.marks {
@@ -236,7 +274,7 @@ fn ordinary_finish_kept_partial_and_direct_hold_preserve_owners() {
             } else {
                 vec!["ordinary.flac"]
             };
-            let mark = f.mark(target, &names, RemovalClass::OffloadRawRelease);
+            let mark = f.mark(target, &names, RemovalClass::PolicyRawRelease);
             let result = f.run(f.checked(std::slice::from_ref(&mark)));
             let held = if direct_hold {
                 Box::new(result.into_owned_hold())
@@ -370,7 +408,7 @@ fn ordinary_finish_removed_but_unsynced_retirement_retains_os_error_and_owners()
 }
 
 #[test]
-fn current_config_age_groups_layouts_and_legacy_partial_govern() {
+fn current_config_age_groups_and_layouts_govern() {
     for named in [false, true] {
         for (raw_rule, preserve, empty, expected) in [
             ("days", false, false, true),
@@ -396,24 +434,6 @@ fn current_config_age_groups_layouts_and_legacy_partial_govern() {
     }
     let mut f = Fixture::new();
     let target = f.target(false);
-    let empty = f.raw(&target, "a.flac", true);
-    let ordinary = f.raw(&target, "b.flac", false);
-    f.config(json!({"retention":{"raw_media":"keep"}}));
-    let mark = f.mark(
-        target,
-        &["a.flac", "b.flac"],
-        RemovalClass::OffloadRawRelease,
-    );
-    let result = f.run(f.checked(std::slice::from_ref(&mark)));
-    assert!(!empty.exists());
-    assert!(ordinary.exists());
-    assert_eq!(result.outcome().removed_paths().count(), 1);
-    assert_eq!(
-        load_at_root(&f.root).unwrap().marks.get(&mark.id),
-        Some(&mark)
-    );
-    let mut f = Fixture::new();
-    let target = f.target(false);
     let raw = f.raw(&target, "audio.flac", false);
     let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
     let result = remove_reviewed(
@@ -436,7 +456,7 @@ fn whole_selection_refuses_stale_unsupported_coordinates_and_metadata() {
             &["audio.flac"],
             RemovalClass::PolicyRawRelease,
         );
-        let mut second = f.mark(target, &["b.flac"], RemovalClass::OffloadRawRelease);
+        let mut second = f.mark(target, &["b.flac"], RemovalClass::PolicyRawRelease);
         match bad {
             0 => {}
             1 => second.target.dir = "a/b".into(),
@@ -444,6 +464,7 @@ fn whole_selection_refuses_stale_unsupported_coordinates_and_metadata() {
             3 => second.proposal.names = vec!["events.jsonl".into()],
             4 => second.class = RemovalClass::OwnerSegmentRemoval,
             _ => {
+                second.class = RemovalClass::OffloadRawRelease;
                 second.offload = Some(
                     crate::archive_proof::OffloadOffer::new(crate::archive_proof::OffloadProof {
                         journal_id: f.root.identity().observation_id(),
@@ -514,7 +535,7 @@ fn whole_selection_refuses_stale_unsupported_coordinates_and_metadata() {
 }
 
 #[test]
-fn overlapping_class_rows_attempt_once_and_share_settlement() {
+fn overlapping_rows_attempt_once_and_share_settlement() {
     for reverse in [false, true] {
         for unsettled in [false, true] {
             let mut f = Fixture::new();
@@ -525,7 +546,11 @@ fn overlapping_class_rows_attempt_once_and_share_settlement() {
                 &["audio.flac"],
                 RemovalClass::PolicyRawRelease,
             );
-            let b = f.mark(target, &["audio.flac"], RemovalClass::OffloadRawRelease);
+            let b = f.mark(
+                target,
+                &["audio.flac", "gone.flac"],
+                RemovalClass::PolicyRawRelease,
+            );
             let selected = if reverse { vec![b, a] } else { vec![a, b] };
             if unsettled {
                 fs::create_dir(f.path(&crate::layout::content_rel(
@@ -570,14 +595,7 @@ fn overlapping_class_rows_attempt_once_and_share_settlement() {
                     .unwrap(),
                 )
                 .unwrap();
-                assert_eq!(
-                    event["class"],
-                    if reverse {
-                        "offload_raw_release"
-                    } else {
-                        "policy_raw_release"
-                    }
-                );
+                assert_eq!(event["class"], "policy_raw_release");
             }
         }
     }
@@ -673,7 +691,10 @@ fn actual_claim_config_contention_and_native_obligations_refuse() {
             None
         };
         if admission == 2 {
+            // An occupied stage is an outstanding obligation; an empty one an
+            // ended owner left behind is retired at admission instead.
             fs::create_dir(f.path(".tmp-offload-held")).unwrap();
+            fs::write(f.path(".tmp-offload-held/audio.flac"), b"held").unwrap();
         }
         let result = f.run(checked);
         assert!(result.refusal().is_some());
@@ -847,4 +868,127 @@ fn owning_guard_refuses_prepublication_swap_and_preserves_published_late_swap() 
             assert!(uncertainty.lock.is_some());
         }
     }
+}
+
+#[test]
+fn legacy_unbound_offload_rows_refuse_the_whole_selection() {
+    for case in ["alone", "policy", "kept_empty"] {
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        let empty = f.raw(&target, "a.flac", true);
+        let ordinary = f.raw(&target, "b.flac", false);
+        if case == "kept_empty" {
+            f.config(json!({"retention":{"raw_media":"keep"}}));
+        }
+        let policy = f.mark(target.clone(), &["b.flac"], RemovalClass::PolicyRawRelease);
+        let legacy = f.mark(
+            target,
+            &["a.flac", "b.flac"],
+            RemovalClass::OffloadRawRelease,
+        );
+        let selected = if case == "policy" {
+            vec![policy, legacy]
+        } else {
+            vec![legacy]
+        };
+        let before = fs::read(f.path("health/retention-marks.json")).unwrap();
+        let result = f.run(f.checked(&selected));
+        assert!(
+            matches!(
+                result.refusal(),
+                Some(ReviewedRemovalRefusal::InvalidSelection)
+            ),
+            "{case}: {:?}",
+            result.refusal()
+        );
+        assert!(result.attempts().is_empty());
+        assert!(empty.exists() && ordinary.exists(), "{case}");
+        assert_eq!(
+            fs::read(f.path("health/retention-marks.json")).unwrap(),
+            before
+        );
+    }
+    // The archive path shares this predicate: a bound offer does not admit an
+    // unbound offload row riding along with it.
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let bound = f.bound(target.clone(), "c.flac");
+    let policy = f.mark(target.clone(), &["b.flac"], RemovalClass::PolicyRawRelease);
+    let mut legacy = bound.clone();
+    legacy.offload = None;
+    legacy.proposal.names = vec!["a.flac".into()];
+    legacy.id = MarkId::derive(legacy.class, &legacy.target, &legacy.proposal.names);
+    assert!(valid_reviewed_coordinates(&[bound.clone(), policy.clone()]));
+    assert!(!valid_reviewed_coordinates(&[bound, policy, legacy]));
+}
+
+#[test]
+fn policy_only_refuses_an_owner_deleted_segment() {
+    for named in [false, true] {
+        let mut f = Fixture::new();
+        let target = f.target(named);
+        let raw = f.raw(&target, "audio.flac", false);
+        let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+        let checked = f.checked(std::slice::from_ref(&mark));
+        let before = fs::read(f.path("health/retention-marks.json")).unwrap();
+        // The owner deletes the segment after the segment claim was checked,
+        // immediately before its first original would be released.
+        let mut fired = false;
+        let result = f.with(checked, |point, path| {
+            if point == ReviewedCheckpoint::BeforeRaw && !fired {
+                fs::write(path.with_file_name("tombstone.json"), b"{}").unwrap();
+                fired = true;
+            }
+        });
+        assert!(fired);
+        assert!(result.refusal().is_some());
+        assert!(result.attempts().is_empty());
+        assert!(raw.exists());
+        assert_eq!(result.outcome().removed_paths().count(), 0);
+        assert_eq!(
+            fs::read(f.path("health/retention-marks.json")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn policy_only_settles_on_a_register_holding_an_unselected_bound_offer() {
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let offered = f.raw(&target, "kept.flac", false);
+    let bound = f.bound(target.clone(), "kept.flac");
+    let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+    assert_eq!(load_at_root(&f.root).unwrap().version, 2);
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    assert!(result.refusal().is_none(), "{:?}", result.refusal());
+    let ReviewedRemovalFinish::Settled(report) = result.finish() else {
+        panic!("a complete policy release on a version 2 register must settle");
+    };
+    assert!(!raw.exists());
+    assert!(offered.exists());
+    assert_eq!(report.outcome().removed_paths().count(), 1);
+    assert!(matches!(
+        report.mutation(),
+        Some(Ok(BoundMutationOutcome::Published(_)))
+    ));
+    let register = load_at_root(&f.root).unwrap();
+    assert_eq!(register.version, 2);
+    assert_eq!(register.marks.len(), 1);
+    assert_eq!(register.marks.get(&bound.id), Some(&bound));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn policy_only_retires_an_empty_reservation_an_ended_owner_left() {
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+    fs::create_dir(f.path(".tmp-offload-held")).unwrap();
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    assert!(result.refusal().is_none(), "{:?}", result.refusal());
+    assert!(!raw.exists());
+    assert!(!f.path(".tmp-offload-held").exists());
 }

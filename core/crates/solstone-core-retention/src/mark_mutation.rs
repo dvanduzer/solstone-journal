@@ -961,7 +961,7 @@ pub(crate) struct CheckedMarkGuard<'a, 'op> {
 #[cfg(unix)]
 impl<'a, 'op> CheckedMarkGuard<'a, 'op> {
     pub(crate) fn acquire(checked: &'a CheckedReviewContext) -> Result<Self, BoundMutationRefusal> {
-        let (lock, register) = begin_bound(checked.root(), checked.health())?;
+        let (lock, register) = begin_bound_read(checked.root(), checked.health())?;
         check_marks(
             &register,
             checked.marks(),
@@ -1022,10 +1022,6 @@ impl<'a, 'op> CheckedMarkGuard<'a, 'op> {
             .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
         if let Some(archive) = self.archive {
             Self::check_archive(self.checked, archive)?;
-        } else if register.version != 1 {
-            return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
-                StoreError::WriterHeld,
-            )));
         }
         check_marks(
             &register,

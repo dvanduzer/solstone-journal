@@ -2,8 +2,8 @@
 // Copyright (c) 2026 sol pbc
 
 //! Consuming settlement for the synchronous local checked executor. Local return
-//! settles only this operation's writers. Unqualified stage-namespace cooperation
-//! holds production invocation, as required by native carrier retirement.
+//! settles only this operation's writers. Its production caller retains the whole
+//! owner, including any hold, in the single admitted operation slot.
 
 use super::*;
 use solstone_core_journal_io::media::ActivityCarrierRetirementReceipt;

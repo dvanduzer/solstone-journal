@@ -30,7 +30,9 @@ use solstone_core_backup_runtime::{
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_offload::restore::owned::{OwnedRestoreFinishHold, SettledRestoreReport};
-use solstone_core_retention::remove_marked::{OwnedReviewedArchiveRemoval, ReviewedArchiveReport};
+use solstone_core_retention::remove_marked::{
+    OwnedReviewedArchiveRemoval, OwnedReviewedRemoval, ReviewedArchiveReport, ReviewedRemovalReport,
+};
 use solstone_core_retention::restore_intent::recover_abandoned_restores;
 
 use crate::archive_operation::ArchiveBeginRefusal;
@@ -178,6 +180,12 @@ pub enum ArchivePayload {
     },
     /// Every owner ended with nothing outstanding. Never retained.
     Released,
+    /// A local policy release keeping its original activity and effects.
+    OrdinaryHeld(Box<OwnedReviewedRemoval>),
+    /// A local policy release whose own activity carrier was retired.
+    OrdinarySettled(Box<ReviewedRemovalReport>),
+    /// A local policy release that unwound; its effects are not known.
+    OrdinaryUnknown,
 }
 
 impl ArchivePayload {
@@ -187,7 +195,8 @@ impl ArchivePayload {
                 .runtime()
                 .is_some_and(|runtime| runtime.state() == DirectReadFinishState::Completed);
         }
-        matches!(self, Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
+        matches!(self, Self::OrdinarySettled(_))
+            || matches!(self, Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
             if runtime.state() == DirectReadFinishState::Completed)
     }
 
@@ -235,6 +244,12 @@ impl ArchivePayload {
                 Ok(())
             }
             Self::Offload(owner) => (*owner).release().map_err(Self::Offload),
+            // A settled local release completes through handoff, which frees
+            // the slot once and records its success; a held or unknown local
+            // release keeps its owner parked.
+            local @ (Self::OrdinarySettled(_) | Self::OrdinaryHeld(_) | Self::OrdinaryUnknown) => {
+                Err(local)
+            }
             other => Err(other),
         }
     }
@@ -253,6 +268,12 @@ impl ArchivePayload {
         let (root, clock) = match self {
             Self::Released => return true,
             Self::Offload(owner) => return owner.matches(reservation, custody),
+            // Local releases never take archive preparation custody.
+            Self::OrdinaryHeld(owner) => {
+                return custody.is_none()
+                    && std::ptr::eq(owner.removal().journal_root(), &*reservation.root);
+            }
+            Self::OrdinarySettled(_) | Self::OrdinaryUnknown => return custody.is_none(),
             Self::BeginHeld(owner) => (&owner.ticket.0.root, Some(&owner.ticket.0.clock)),
             Self::EarlyUnknown
             | Self::NativeFinishUnknown { .. }
@@ -463,28 +484,32 @@ pub fn handoff(
         return Err(returned);
     }
     if returned.payload.completed() {
-        let Some(custody) = returned.custody.as_ref() else {
-            returned.reason = Some(ArchiveHandoffRefusal::CustodyMissing);
-            return Err(returned);
-        };
-        let runtime = match &returned.payload {
-            ArchivePayload::Offload(owner) => {
-                owner.runtime().expect("actual completed offload runtime")
+        // A settled local release confirmed retirement of its own carrier
+        // before returning; only archive owners carry runtime custody.
+        if !matches!(returned.payload, ArchivePayload::OrdinarySettled(_)) {
+            let Some(custody) = returned.custody.as_ref() else {
+                returned.reason = Some(ArchiveHandoffRefusal::CustodyMissing);
+                return Err(returned);
+            };
+            let runtime = match &returned.payload {
+                ArchivePayload::Offload(owner) => {
+                    owner.runtime().expect("actual completed offload runtime")
+                }
+                ArchivePayload::NativeFinished { runtime, .. }
+                | ArchivePayload::ProofFinished { runtime, .. } => runtime,
+                _ => unreachable!("only actual finished owners can complete"),
+            };
+            if !runtime.retirement().is_some_and(|retirement| {
+                std::ptr::eq(custody.activity(), retirement.owned.activity().as_ref())
+            }) {
+                returned.reason = Some(ArchiveHandoffRefusal::OwnerChanged);
+                return Err(returned);
             }
-            ArchivePayload::NativeFinished { runtime, .. }
-            | ArchivePayload::ProofFinished { runtime, .. } => runtime,
-            _ => unreachable!("only actual finished owners can complete"),
-        };
-        if !runtime.retirement().is_some_and(|retirement| {
-            std::ptr::eq(custody.activity(), retirement.owned.activity().as_ref())
-        }) {
-            returned.reason = Some(ArchiveHandoffRefusal::OwnerChanged);
-            return Err(returned);
-        }
-        if let Err(error) = custody.revalidate() {
-            returned.reason = Some(ArchiveHandoffRefusal::BindingChanged);
-            returned.binding_error = Some(error);
-            return Err(returned);
+            if let Err(error) = custody.revalidate() {
+                returned.reason = Some(ArchiveHandoffRefusal::BindingChanged);
+                returned.binding_error = Some(error);
+                return Err(returned);
+            }
         }
         let current = state.current.as_mut().expect("checked current");
         current.worker_active = false;
