@@ -34,7 +34,9 @@ pub use solstone_core_backup::archive_admission::{
 };
 use solstone_core_backup::archive_admission::{AdmissionError, ArchiveBudget, ArchiveCancellation};
 use solstone_core_backup::archive_readback::{
-    DirectReadCompletion, OwnedDirectReadHold, OwnedReadOperation, OwnedReadbackAdmissionError,
+    ArchiveEndpointCapture, ArchivePredecessorCapture, ArchiveWriterObservation,
+    ArchiveWriterSourceObservation, DirectArchiveEffects, DirectReadCompletion,
+    OwnedArchiveCreator, OwnedDirectReadHold, OwnedReadOperation, OwnedReadbackAdmissionError,
     OwnedSettledDirectRead, ReadAdmission, ReadOperation, ReadbackAdmissionError, ReadbackError,
     SettledDirectRead,
 };
@@ -1718,6 +1720,10 @@ pub struct AdmittedArchive<'a> {
     write: Runtime,
     read: Runtime,
     repository_id: String,
+    effects: ArchiveAdmissionEffects,
+    write_repository_id: Option<String>,
+    read_repository_id: Option<String>,
+    archives: Vec<ArchiveWriterObservation>,
 }
 
 fn full_archive_id(value: &str) -> bool {
@@ -1751,6 +1757,7 @@ enum ArchiveAdmissionFailureOwner<'a> {
     Prepared(Box<PreparedArchiveOperation<'a>>),
     Preparation(ArchiveOperationPreparationFailure<'a>),
     Readback(Box<ReadbackAdmissionError<'a>>),
+    Admitted(Box<AdmittedArchive<'a>>),
 }
 impl fmt::Debug for ArchiveAdmissionFailure<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1779,6 +1786,7 @@ impl ArchiveAdmissionFailure<'_> {
             ArchiveAdmissionFailureOwner::Prepared(operation) => operation.journal_root(),
             ArchiveAdmissionFailureOwner::Preparation(preparation) => preparation.journal_root(),
             ArchiveAdmissionFailureOwner::Readback(readback) => readback.journal_root(),
+            ArchiveAdmissionFailureOwner::Admitted(admitted) => admitted.journal_root(),
         }
     }
     pub fn carrier(&self) -> Option<&Arc<solstone_core_journal_io::media::RootActivityCarrier>> {
@@ -1787,6 +1795,7 @@ impl ArchiveAdmissionFailure<'_> {
             ArchiveAdmissionFailureOwner::Prepared(operation) => Some(operation.carrier()),
             ArchiveAdmissionFailureOwner::Preparation(preparation) => preparation.carrier(),
             ArchiveAdmissionFailureOwner::Readback(readback) => Some(readback.carrier()),
+            ArchiveAdmissionFailureOwner::Admitted(admitted) => Some(admitted.carrier()),
         }
     }
     pub fn preparation(&self) -> Option<&ArchiveOperationPreparationFailure<'_>> {
@@ -1810,6 +1819,9 @@ impl ArchiveAdmissionFailure<'_> {
                 preparation.owned_clock().is_some()
             }
             ArchiveAdmissionFailureOwner::Readback(readback) => readback.owned_clock().is_some(),
+            ArchiveAdmissionFailureOwner::Admitted(admitted) => {
+                admitted.operation.owned_clock().is_some()
+            }
         };
         if !transferable {
             return Err(self);
@@ -1841,6 +1853,18 @@ impl ArchiveAdmissionFailure<'_> {
                     readback.into_owned_hold().expect("checked owned clock"),
                 ))
             }
+            ArchiveAdmissionFailureOwner::Admitted(admitted) => match admitted.into_owned_hold() {
+                Ok(hold) => ClosedArchiveAdmissionOwner::Admitted(Box::new(hold)),
+                Err(admitted) => {
+                    return Err(Self {
+                        inner: Box::new(ArchiveAdmissionFailureInner {
+                            error,
+                            effects,
+                            owned: ArchiveAdmissionFailureOwner::Admitted(admitted),
+                        }),
+                    });
+                }
+            },
         };
         Ok(OwnedArchiveAdmissionFailure {
             inner: Box::new(OwnedArchiveAdmissionFailureInner {
@@ -1866,6 +1890,7 @@ enum ClosedArchiveAdmissionOwner {
     Prepared(Box<OwnedPreparedArchiveHold>),
     Preparation(Box<OwnedArchivePreparationFailure>),
     Readback(Box<OwnedReadbackAdmissionError>),
+    Admitted(Box<OwnedAdmittedArchiveHold>),
 }
 impl OwnedArchiveAdmissionFailure {
     pub fn error(&self) -> ArchiveError {
@@ -1880,6 +1905,7 @@ impl OwnedArchiveAdmissionFailure {
             ClosedArchiveAdmissionOwner::Prepared(operation) => operation.journal_root(),
             ClosedArchiveAdmissionOwner::Preparation(preparation) => preparation.journal_root(),
             ClosedArchiveAdmissionOwner::Readback(readback) => readback.journal_root(),
+            ClosedArchiveAdmissionOwner::Admitted(admitted) => admitted.journal_root(),
         }
     }
     pub fn carrier(&self) -> Option<&Arc<solstone_core_journal_io::media::RootActivityCarrier>> {
@@ -1888,6 +1914,7 @@ impl OwnedArchiveAdmissionFailure {
             ClosedArchiveAdmissionOwner::Prepared(operation) => Some(operation.carrier()),
             ClosedArchiveAdmissionOwner::Preparation(preparation) => preparation.carrier(),
             ClosedArchiveAdmissionOwner::Readback(readback) => Some(readback.carrier()),
+            ClosedArchiveAdmissionOwner::Admitted(admitted) => Some(admitted.carrier()),
         }
     }
     pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
@@ -1898,6 +1925,7 @@ impl OwnedArchiveAdmissionFailure {
                 Some(preparation.owned_clock())
             }
             ClosedArchiveAdmissionOwner::Readback(readback) => Some(readback.owned_clock()),
+            ClosedArchiveAdmissionOwner::Admitted(admitted) => Some(admitted.owned_clock()),
         }
     }
 }
@@ -1942,6 +1970,30 @@ pub fn admit_archive_with_budget<'a>(
             }
         };
     admit_prepared_archive(operation, services)
+}
+
+fn capture_byo_archive_pair(
+    config: &solstone_core_backup::archive_admission::ArchiveConfiguration,
+    keys: BackupKeys,
+) -> Result<(Runtime, Runtime), ArchiveError> {
+    if config.mode() != Some("byo") {
+        return Err(ArchiveError::NotConfigured);
+    }
+    let destination = config.destination().ok_or(ArchiveError::NotConfigured)?;
+    let backend_env = value_env(&destination).ok_or(ArchiveError::ConfigurationUnavailable)?;
+    let read = Runtime {
+        destination: destination.clone(),
+        password: keys.daily_key.clone(),
+        backend_env: backend_env.clone(),
+        global_options: vec![],
+    };
+    let write = Runtime {
+        destination,
+        password: keys.daily_key,
+        backend_env,
+        global_options: vec![],
+    };
+    Ok((write, read))
 }
 
 /// Consume the original operation without any replaceable lifetime inputs.
@@ -1996,25 +2048,7 @@ pub fn admit_prepared_archive<'a>(
             };
             (runtime(write), runtime(read))
         } else {
-            if config.mode() != Some("byo") {
-                return Err(ArchiveError::NotConfigured);
-            }
-            let destination = config.destination().ok_or(ArchiveError::NotConfigured)?;
-            let backend_env =
-                value_env(&destination).ok_or(ArchiveError::ConfigurationUnavailable)?;
-            let read = Runtime {
-                destination: destination.clone(),
-                password: keys.daily_key.clone(),
-                backend_env: backend_env.clone(),
-                global_options: vec![],
-            };
-            let write = Runtime {
-                destination,
-                password: keys.daily_key,
-                backend_env,
-                global_options: vec![],
-            };
-            (write, read)
+            capture_byo_archive_pair(config, keys)?
         };
         Ok((restic_path, write, read))
     })();
@@ -2037,17 +2071,24 @@ pub fn admit_prepared_archive<'a>(
         write,
         read,
         repository_id: String::new(),
+        effects,
+        write_repository_id: None,
+        read_repository_id: None,
+        archives: Vec::new(),
     };
     let repositories = (|| {
         effects.write_repository_requested = true;
         let write_id = admitted.read_repository_id(&admitted.write)?;
+        admitted.write_repository_id = Some(write_id.clone());
         effects.read_repository_requested = true;
         let read_id = admitted.read_repository_id(&admitted.read)?;
+        admitted.read_repository_id = Some(read_id.clone());
         if write_id != read_id {
             return Err(ArchiveError::RepositoryIdentityChanged);
         }
         Ok(write_id)
     })();
+    admitted.effects = effects;
     match repositories {
         Ok(repository) => {
             admitted.repository_id = repository;
@@ -2057,7 +2098,7 @@ pub fn admit_prepared_archive<'a>(
             inner: Box::new(ArchiveAdmissionFailureInner {
                 error,
                 effects,
-                owned: ArchiveAdmissionFailureOwner::Prepared(Box::new(admitted.operation)),
+                owned: ArchiveAdmissionFailureOwner::Admitted(Box::new(admitted)),
             }),
         }),
     }
@@ -2663,22 +2704,332 @@ impl OwnedDirectReadFinish {
     }
 }
 
+struct ArchiveCaptureFacts {
+    effects: ArchiveAdmissionEffects,
+    write_repository_id: Option<String>,
+    read_repository_id: Option<String>,
+    repository_id: Option<String>,
+    archives: Vec<ArchiveWriterObservation>,
+}
+fn capture_archive_predecessor(
+    restic_path: PathBuf,
+    write: Runtime,
+    read: Runtime,
+    facts: ArchiveCaptureFacts,
+) -> ArchivePredecessorCapture {
+    let endpoint = |runtime: Runtime| ArchiveEndpointCapture {
+        destination: runtime.destination,
+        password: runtime.password,
+        backend_env: runtime.backend_env,
+        global_options: runtime.global_options,
+    };
+    ArchivePredecessorCapture {
+        restic_path,
+        write: endpoint(write),
+        read: endpoint(read),
+        broker_requested: facts.effects.broker_requested,
+        write_repository_requested: facts.effects.write_repository_requested,
+        read_repository_requested: facts.effects.read_repository_requested,
+        write_repository_id: facts.write_repository_id,
+        read_repository_id: facts.read_repository_id,
+        repository_id: facts.repository_id,
+        archives: facts.archives,
+    }
+}
+
+#[must_use = "Closed archive custody cannot execute or reopen the operation"]
+pub struct OwnedAdmittedArchiveHold {
+    inner: Box<OwnedAdmittedArchiveHoldInner>,
+}
+enum OwnedAdmittedArchiveHoldInner {
+    Captured(Box<OwnedCapturedArchive>),
+    Direct(Box<OwnedDirectReadHold>),
+}
+struct OwnedCapturedArchive {
+    operation: OwnedPreparedArchiveHold,
+    _capture: ArchivePredecessorCapture,
+}
+impl OwnedAdmittedArchiveHold {
+    pub fn carrier(&self) -> &Arc<solstone_core_journal_io::media::RootActivityCarrier> {
+        match &*self.inner {
+            OwnedAdmittedArchiveHoldInner::Captured(capture) => capture.operation.carrier(),
+            OwnedAdmittedArchiveHoldInner::Direct(read) => read.carrier(),
+        }
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.carrier().journal_root()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        match &*self.inner {
+            OwnedAdmittedArchiveHoldInner::Captured(capture) => capture.operation.owned_clock(),
+            OwnedAdmittedArchiveHoldInner::Direct(read) => read.owned_clock(),
+        }
+    }
+}
+
+#[must_use = "Keep the original finish owner outside the creation actor"]
+pub struct OwnedInstalledArchiveCreator {
+    archive: OwnedAdmittedArchive,
+    finish: DirectReadFinishOwner,
+}
+impl OwnedInstalledArchiveCreator {
+    pub fn into_parts(self) -> (OwnedAdmittedArchive, DirectReadFinishOwner) {
+        (self.archive, self.finish)
+    }
+    pub fn into_owned_hold(self) -> (OwnedAdmittedArchiveHold, DirectReadFinishOwner) {
+        (self.archive.into_owned_hold(), self.finish)
+    }
+}
+
+#[must_use = "Consume the same creator into read handoff or closed custody"]
+pub struct OwnedAdmittedArchive {
+    creator: OwnedArchiveCreator,
+}
+impl OwnedAdmittedArchive {
+    pub fn prepared_operation(&self) -> &PreparedArchiveOperation<'static> {
+        self.creator.prepared_operation()
+    }
+    pub fn carrier(&self) -> &Arc<solstone_core_journal_io::media::RootActivityCarrier> {
+        self.creator.carrier()
+    }
+    pub fn activity(&self) -> &Arc<solstone_core_journal_io::activity::ActivityLease> {
+        self.creator.activity()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.creator.journal_root()
+    }
+    pub fn repository_id(&self) -> &str {
+        self.creator.repository_id()
+    }
+    pub fn current_time(&self) -> Result<i64, ArchiveError> {
+        self.creator.current_time().map_err(ArchiveError::Readback)
+    }
+    pub fn revalidate_local(&self) -> Result<(), ArchiveError> {
+        self.creator
+            .revalidate_local()
+            .map_err(ArchiveError::Readback)
+    }
+    pub fn archive_owned(
+        &mut self,
+        sources: &[ArchiveSource<'_>],
+    ) -> Result<ArchiveSnapshot, ArchiveFailure> {
+        self.creator
+            .archive_owned(sources)
+            .map(|snapshot| ArchiveSnapshot {
+                repository_id: snapshot.repository_id,
+                snapshot_id: snapshot.snapshot_id,
+            })
+            .map_err(|failure| ArchiveFailure {
+                error: match failure.reason {
+                    ReadbackError::Admission(reason) => reason.into(),
+                    ReadbackError::NativeFailure => ArchiveError::SourceUnavailable,
+                    ReadbackError::InvalidSelection => ArchiveError::InvalidSelection,
+                    ReadbackError::RepositoryIdentityChanged => {
+                        ArchiveError::RepositoryIdentityChanged
+                    }
+                    ReadbackError::SnapshotNodeUnavailable => ArchiveError::SnapshotIdentityInvalid,
+                    reason => ArchiveError::Readback(reason),
+                },
+                remote_effects: match failure.effects {
+                    DirectArchiveEffects::NotAttempted => ArchiveRemoteEffects::NotAttempted,
+                    DirectArchiveEffects::Attempted {
+                        returncode,
+                        observed_snapshot_id,
+                    } => ArchiveRemoteEffects::Attempted {
+                        returncode,
+                        observed_snapshot_id,
+                    },
+                },
+            })
+    }
+    pub fn into_read_operation(self) -> Result<OwnedReadOperation, OwnedArchiveAdmissionFailure> {
+        self.creator
+            .into_read_operation()
+            .map_err(creator_admission_failure)
+    }
+    pub fn into_owned_hold(self) -> OwnedAdmittedArchiveHold {
+        OwnedAdmittedArchiveHold {
+            inner: Box::new(OwnedAdmittedArchiveHoldInner::Direct(Box::new(
+                self.creator.into_owned_hold(),
+            ))),
+        }
+    }
+}
+
+fn creator_admission_failure(
+    readback: OwnedReadbackAdmissionError,
+) -> OwnedArchiveAdmissionFailure {
+    let (write_repository_requested, read_repository_requested) = readback
+        .archive_admission_effects()
+        .unwrap_or((false, false));
+    OwnedArchiveAdmissionFailure {
+        inner: Box::new(OwnedArchiveAdmissionFailureInner {
+            error: ArchiveError::Readback(readback.reason()),
+            effects: ArchiveAdmissionEffects {
+                broker_requested: false,
+                write_repository_requested,
+                read_repository_requested,
+            },
+            owned: ClosedArchiveAdmissionOwner::Readback(Box::new(readback)),
+        }),
+    }
+}
+
+pub fn admit_prepared_archive_owned_creator_installed(
+    operation: OwnedPreparedArchiveOperation,
+    restic_path: &Path,
+) -> Result<OwnedInstalledArchiveCreator, OwnedArchiveAdmissionFailure> {
+    let captured = (|| {
+        operation.revalidate()?;
+        let config = operation.configuration();
+        if !config.enabled() {
+            return Err(ArchiveError::NotConfigured);
+        }
+        // Operated writes retain their existing rclone policy; never request a broker here.
+        if config.binding().is_some()
+            || config.mode() != Some("byo")
+            || !config
+                .destination()
+                .is_some_and(|destination| matches!(destination.backend.as_str(), "s3" | "b2"))
+        {
+            return Err(ArchiveError::Readback(ReadbackError::UnsupportedBackend));
+        }
+        let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
+        capture_byo_archive_pair(config, keys)
+    })();
+    let (write, read) = match captured {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Err(OwnedArchiveAdmissionFailure {
+                inner: Box::new(OwnedArchiveAdmissionFailureInner {
+                    error,
+                    effects: ArchiveAdmissionEffects::default(),
+                    owned: ClosedArchiveAdmissionOwner::Prepared(Box::new(
+                        operation.into_owned_hold(),
+                    )),
+                }),
+            });
+        }
+    };
+    let clock = Arc::clone(operation.owned_clock());
+    let carrier = Arc::clone(operation.carrier());
+    let capture = capture_archive_predecessor(
+        restic_path.to_path_buf(),
+        write,
+        read,
+        ArchiveCaptureFacts {
+            effects: ArchiveAdmissionEffects::default(),
+            write_repository_id: None,
+            read_repository_id: None,
+            repository_id: None,
+            archives: Vec::new(),
+        },
+    );
+    let creator = operation
+        .bind_archive_creator(capture)
+        .admit()
+        .map_err(creator_admission_failure)?;
+    Ok(OwnedInstalledArchiveCreator {
+        archive: OwnedAdmittedArchive { creator },
+        finish: DirectReadFinishOwner {
+            carrier,
+            clock,
+            broker: DirectBrokerCompletion::CapturedByo,
+        },
+    })
+}
+
 impl<'a> AdmittedArchive<'a> {
     pub fn prepared_operation(&self) -> &PreparedArchiveOperation<'a> {
         &self.operation
+    }
+
+    pub fn into_owned_hold(self) -> Result<OwnedAdmittedArchiveHold, Box<Self>> {
+        let Self {
+            operation,
+            runner,
+            restic_path,
+            write,
+            read,
+            repository_id,
+            effects,
+            write_repository_id,
+            read_repository_id,
+            archives,
+        } = self;
+        match operation.into_owned_hold() {
+            Ok(operation) => {
+                let capture = capture_archive_predecessor(
+                    restic_path,
+                    write,
+                    read,
+                    ArchiveCaptureFacts {
+                        effects,
+                        write_repository_id,
+                        read_repository_id,
+                        repository_id: Some(repository_id),
+                        archives,
+                    },
+                );
+                Ok(OwnedAdmittedArchiveHold {
+                    inner: Box::new(OwnedAdmittedArchiveHoldInner::Captured(Box::new(
+                        OwnedCapturedArchive {
+                            operation,
+                            _capture: capture,
+                        },
+                    ))),
+                })
+            }
+            Err(operation) => Err(Box::new(Self {
+                operation: *operation,
+                runner,
+                restic_path,
+                write,
+                read,
+                repository_id,
+                effects,
+                write_repository_id,
+                read_repository_id,
+                archives,
+            })),
+        }
     }
 
     /// Move this operation's original configuration, credentials and budget into
     /// the concrete installed-tool readback door without renewing its lifetime.
     pub fn into_read_operation(self) -> Result<ReadOperation<'a>, ReadbackAdmissionError<'a>> {
         let unsupported = !self.read.global_options.is_empty();
-        let input = ReadAdmission::bind(
-            self.operation,
-            self.read.destination,
-            self.read.password,
-            self.repository_id,
-            self.restic_path,
+        let destination = self.read.destination.clone();
+        let password = self.read.password.clone();
+        let repository_id = self.repository_id.clone();
+        let restic_path = self.restic_path.clone();
+        let Self {
+            operation,
+            runner: _,
+            restic_path: captured_path,
+            write,
+            read,
+            repository_id: captured_id,
+            effects,
+            write_repository_id,
+            read_repository_id,
+            archives,
+        } = self;
+        let capture = capture_archive_predecessor(
+            captured_path,
+            write,
+            read,
+            ArchiveCaptureFacts {
+                effects,
+                write_repository_id,
+                read_repository_id,
+                repository_id: Some(captured_id),
+                archives,
+            },
         );
+        let input =
+            ReadAdmission::bind(operation, destination, password, repository_id, restic_path)
+                .retain_unqualified_archive(capture);
         if unsupported {
             return Err(input.refuse(ReadbackError::UnsupportedBackend));
         }
@@ -2830,6 +3181,63 @@ impl<'a> AdmittedArchive<'a> {
     }
 
     fn archive_paths(
+        &mut self,
+        paths: &[String],
+        descriptors: &[crate::runner::PassedHandle<'_>],
+        sources: &[ArchiveSource<'_>],
+    ) -> Result<ArchiveSnapshot, ArchiveFailure> {
+        let result = self.archive_paths_inner(paths, descriptors, sources);
+        let mut argv: Vec<std::ffi::OsString> =
+            self.write.global_options.iter().map(Into::into).collect();
+        argv.extend([
+            "backup".into(),
+            "--force".into(),
+            "--no-cache".into(),
+            "--tag".into(),
+            ARCHIVE_TAG.into(),
+            "--retry-lock".into(),
+            REPOSITORY_RETRY_LOCK.into(),
+        ]);
+        argv.extend(paths.iter().map(Into::into));
+        argv.push("--json".into());
+        let effects = match &result {
+            Ok(snapshot) => DirectArchiveEffects::Attempted {
+                returncode: Some(0),
+                observed_snapshot_id: Some(snapshot.snapshot_id.clone()),
+            },
+            Err(failure) => match &failure.remote_effects {
+                ArchiveRemoteEffects::NotAttempted => DirectArchiveEffects::NotAttempted,
+                ArchiveRemoteEffects::Attempted {
+                    returncode,
+                    observed_snapshot_id,
+                } => DirectArchiveEffects::Attempted {
+                    returncode: *returncode,
+                    observed_snapshot_id: observed_snapshot_id.clone(),
+                },
+            },
+        };
+        self.archives.push(ArchiveWriterObservation {
+            ordinal: self.archives.len() as u64,
+            requested_argv: argv,
+            sources: sources
+                .iter()
+                .filter_map(|source| {
+                    source
+                        .name()
+                        .to_str()
+                        .map(|name| ArchiveWriterSourceObservation {
+                            name: name.to_owned(),
+                            identity: source.identity(),
+                            digest: source.digest().clone(),
+                        })
+                })
+                .collect(),
+            effects,
+        });
+        result
+    }
+
+    fn archive_paths_inner(
         &mut self,
         paths: &[String],
         descriptors: &[crate::runner::PassedHandle<'_>],
@@ -3352,6 +3760,174 @@ mod tests {
             write_backup_section(journal.path(), valid_backup_section(valid_destination()));
             let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
             (journal, root)
+        }
+
+        #[test]
+        fn closed_admitted_custody_keeps_pair_clock_and_partial_cat_observations() {
+            for replace_password in [false, true] {
+                let (_journal, root) = fixture();
+                let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+                let original = match OwnedPreparedArchiveOperation::prepare(
+                    Arc::clone(&root),
+                    ArchiveBudget::new(clock.as_ref()).unwrap(),
+                    Arc::clone(&clock),
+                ) {
+                    Ok(original) => original,
+                    Err(failure) => panic!("original fixture: {}", failure.reason()),
+                };
+                let carrier = Arc::clone(original.carrier());
+                let mut destination = original.configuration().destination().unwrap();
+                if !replace_password {
+                    destination.repository = "s3:rerouted".into();
+                }
+                let password = if replace_password {
+                    "replacement"
+                } else {
+                    "daily"
+                };
+                let env = value_env(&destination).unwrap();
+                let input = original.bind_archive_creator(capture_archive_predecessor(
+                    PathBuf::from("/absent/restic"),
+                    Runtime {
+                        destination: destination.clone(),
+                        password: password.into(),
+                        backend_env: env.clone(),
+                        global_options: vec![],
+                    },
+                    Runtime {
+                        destination,
+                        password: password.into(),
+                        backend_env: env,
+                        global_options: vec![],
+                    },
+                    ArchiveCaptureFacts {
+                        effects: ArchiveAdmissionEffects::default(),
+                        write_repository_id: None,
+                        read_repository_id: None,
+                        repository_id: None,
+                        archives: vec![],
+                    },
+                ));
+                let refusal = match input.admit() {
+                    Err(refusal) => refusal,
+                    Ok(_) => panic!("captured pair cannot reroute original configuration"),
+                };
+                assert_eq!(
+                    refusal.reason(),
+                    if replace_password {
+                        ReadbackError::CredentialsUnavailable
+                    } else {
+                        ReadbackError::NotConfigured
+                    }
+                );
+                assert_eq!(refusal.archive_admission_effects(), Some((false, false)));
+                let refusal = std::thread::spawn(move || refusal).join().unwrap();
+                assert!(Arc::ptr_eq(refusal.carrier(), &carrier));
+                assert!(Arc::ptr_eq(refusal.owned_clock(), &clock));
+            }
+            for owned in [true, false] {
+                let (_journal, root) = fixture();
+                let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+                let budget = ArchiveBudget::new(clock.as_ref()).unwrap();
+                let original = if owned {
+                    PreparedArchiveOperation::prepare_owned(
+                        Arc::clone(&root),
+                        budget,
+                        Arc::clone(&clock),
+                    )
+                    .unwrap()
+                } else {
+                    PreparedArchiveOperation::prepare(Arc::clone(&root), budget, clock.as_ref())
+                        .unwrap()
+                };
+                let carrier = Arc::clone(original.carrier());
+                let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                let http = ScriptedHttp {
+                    responses: RefCell::new(VecDeque::new()),
+                    requests: RefCell::new(Vec::new()),
+                };
+                let services = services(&runner, &http, clock.as_ref(), &Maintenance);
+                let admitted = admit_prepared_archive(original, &services).unwrap();
+                let write = admitted.write.destination.clone();
+                let read = admitted.read.destination.clone();
+                let password = admitted.write.password.clone();
+                assert!(Arc::ptr_eq(
+                    admitted.prepared_operation().carrier(),
+                    &carrier
+                ));
+                match admitted.into_owned_hold() {
+                    Ok(hold) => {
+                        assert!(owned);
+                        let hold = std::thread::spawn(move || hold).join().unwrap();
+                        assert!(Arc::ptr_eq(hold.carrier(), &carrier));
+                        assert!(Arc::ptr_eq(hold.owned_clock(), &clock));
+                        let OwnedAdmittedArchiveHoldInner::Captured(captured) = &*hold.inner else {
+                            panic!("generic close must retain captured pair")
+                        };
+                        assert_eq!(captured._capture.write.destination, write);
+                        assert_eq!(captured._capture.read.destination, read);
+                        assert_eq!(captured._capture.write.password, password);
+                        assert_eq!(
+                            captured._capture.write_repository_id.as_deref(),
+                            Some(REPOSITORY_ID)
+                        );
+                        assert_eq!(
+                            captured._capture.read_repository_id.as_deref(),
+                            Some(REPOSITORY_ID)
+                        );
+                    }
+                    Err(original) => {
+                        assert!(!owned);
+                        assert!(Arc::ptr_eq(original.carrier(), &carrier));
+                        assert!(original.operation.owned_clock().is_none());
+                        assert_eq!(original.write.destination, write);
+                        assert_eq!(original.read.destination, read);
+                        assert_eq!(original.write.password, password);
+                    }
+                }
+                assert_eq!(runner.requests.borrow().len(), 2);
+                assert!(http.requests.borrow().is_empty());
+            }
+            for second in [false, true] {
+                let (_journal, root) = fixture();
+                let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+                let original = PreparedArchiveOperation::prepare_owned(
+                    Arc::clone(&root),
+                    ArchiveBudget::new(clock.as_ref()).unwrap(),
+                    Arc::clone(&clock),
+                )
+                .unwrap();
+                let carrier = Arc::clone(original.carrier());
+                let runner = script(if second {
+                    vec![repo(REPOSITORY_ID), output(1, "")]
+                } else {
+                    vec![output(1, "")]
+                });
+                let http = ScriptedHttp {
+                    responses: RefCell::new(VecDeque::new()),
+                    requests: RefCell::new(Vec::new()),
+                };
+                let services = services(&runner, &http, clock.as_ref(), &Maintenance);
+                let failure = refusal(admit_prepared_archive(original, &services));
+                assert!(Arc::ptr_eq(failure.carrier().unwrap(), &carrier));
+                let failure = failure.into_owned_hold().unwrap();
+                let failure = std::thread::spawn(move || failure).join().unwrap();
+                let ClosedArchiveAdmissionOwner::Admitted(hold) = &failure.inner.owned else {
+                    panic!("cat refusal must preserve whole admission")
+                };
+                let OwnedAdmittedArchiveHoldInner::Captured(captured) = &*hold.inner else {
+                    panic!("cat refusal pair")
+                };
+                assert!(Arc::ptr_eq(hold.owned_clock(), &clock));
+                assert!(captured._capture.write_repository_requested);
+                assert_eq!(captured._capture.read_repository_requested, second);
+                assert_eq!(
+                    captured._capture.write_repository_id.as_deref(),
+                    second.then_some(REPOSITORY_ID)
+                );
+                assert!(captured._capture.read_repository_id.is_none());
+                assert_eq!(runner.requests.borrow().len(), if second { 2 } else { 1 });
+            }
         }
 
         #[test]
