@@ -576,6 +576,7 @@ fn execute<'clock, R: RestoreRead<'clock>>(
 pub(crate) mod tests;
 
 mod finish;
+pub mod legacy;
 pub use finish::{
     HeldRestoreFinish, OwnedRestoreFinishHold, RestoreFinishRefusal, SettledRestoreReport,
 };

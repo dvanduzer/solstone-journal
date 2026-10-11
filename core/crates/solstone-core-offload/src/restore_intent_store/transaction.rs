@@ -601,6 +601,24 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         time: u64,
         options: LockOptions,
     ) -> TransactionOutcome<'operation, 'clock> {
+        self.commit_inner(time, options, None)
+    }
+
+    pub(crate) fn commit_preserving_mark(
+        self,
+        time: u64,
+        options: LockOptions,
+        expected: Option<Mark>,
+    ) -> TransactionOutcome<'operation, 'clock> {
+        self.commit_inner(time, options, Some(expected))
+    }
+
+    fn commit_inner(
+        self,
+        time: u64,
+        options: LockOptions,
+        reviewed_mark: Option<Option<Mark>>,
+    ) -> TransactionOutcome<'operation, 'clock> {
         let Self {
             owner,
             witness,
@@ -613,6 +631,11 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             let initial = review_context::load_at_root(result.owner.root())
                 .map_err(|error| Hold::Admission(format!("{error:?}")))?;
             let mark = current_mark(&result.owner, &witness, &initial)?.cloned();
+            if let Some(expected) = reviewed_mark
+                && (legacy_binding.is_none() || mark != expected)
+            {
+                return Err(Hold::Repair(RepairHold::MarkChanged));
+            }
             let intent = if let Some(binding) = legacy_binding {
                 RestoreIntent::new_legacy(
                     binding,
