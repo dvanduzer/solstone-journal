@@ -27,10 +27,12 @@ use solstone_core_retention::archive_catalog::{JournalCatalog, SegmentCatalog};
 use solstone_core_retention::{archive_catalog::read_complete_catalog, review_context};
 
 use super::{ObservedIntent, RestoreIntentStore, StoreProblem, StoreWrite};
-use crate::restore_intent::{RecoveryDecision, RepairHold, RestoreIntent};
-#[cfg(unix)]
-use crate::restore_intent::{content_observation, inspect_recovery, selected_name};
 use crate::restore_prepared::{PreparedRefusal, PreparedRestore};
+use solstone_core_retention::restore_intent::{RecoveryDecision, RepairHold, RestoreIntent};
+#[cfg(unix)]
+use solstone_core_retention::restore_intent::{
+    content_observation, inspect_recovery, selected_name,
+};
 
 #[derive(Debug)]
 enum ReviewProblem {

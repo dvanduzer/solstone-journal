@@ -345,7 +345,7 @@ mod tests {
         .unwrap();
         segment
     }
-    fn bound(journal: &Path, intent: &crate::restore_intent::RestoreIntent) {
+    fn bound(journal: &Path, intent: &solstone_core_retention::restore_intent::RestoreIntent) {
         let witness = &intent.witness;
         fs::create_dir_all(journal.join(intent.locator.relative_segment())).unwrap();
         let event = json!({
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn bound_multi_generation_selection_is_held_without_arbitrary_snapshot() {
         let journal = tempfile::tempdir().unwrap();
-        let first = crate::restore_intent::tests::fixture(false);
+        let first = crate::test_restore_intent::fixture(false);
         bound(journal.path(), &first);
         let mut second = first.clone();
         second.witness.manifest_id = "manifest-2".into();
@@ -482,10 +482,7 @@ mod tests {
     #[test]
     fn mixed_day_and_all_selection_keeps_each_segments_reason() {
         let journal = tempfile::tempdir().unwrap();
-        bound(
-            journal.path(),
-            &crate::restore_intent::tests::fixture(false),
-        );
+        bound(journal.path(), &crate::test_restore_intent::fixture(false));
         legacy(journal.path(), "20261010", "120000_012");
         let harness = Harness::default();
         let day = restore_offload_day(journal.path(), &harness.services(), "20261009");
@@ -545,7 +542,7 @@ mod tests {
     #[test]
     fn directory_read_error_preserves_selection_uncertainty() {
         let journal = tempfile::tempdir().unwrap();
-        let intent = crate::restore_intent::tests::fixture(false);
+        let intent = crate::test_restore_intent::fixture(false);
         bound(journal.path(), &intent);
         let day = journal.path().join("chronicle/20261009");
         fs::rename(&day, journal.path().join("displaced-day")).unwrap();
@@ -562,7 +559,7 @@ mod tests {
     #[test]
     fn unrepresentable_selection_totals_refuse_without_wrapping() {
         let journal = tempfile::tempdir().unwrap();
-        let mut first = crate::restore_intent::tests::fixture(false);
+        let mut first = crate::test_restore_intent::fixture(false);
         first.witness.file.bytes = u64::MAX;
         bound(journal.path(), &first);
         let mut second = first.clone();

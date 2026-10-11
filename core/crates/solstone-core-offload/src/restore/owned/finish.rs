@@ -4,13 +4,13 @@
 //! Consuming settlement preserves receipts and keeps every uncertain owner closed.
 
 use super::*;
-use crate::restore_intent::AttemptEffects;
 use crate::restore_intent_store::transaction::{SettledTransaction, SettlementFailure};
 use solstone_core_backup::archive_readback::{
     HeldDirectRead, OwnedDirectReadHold, OwnedHeldDirectRead, OwnedSettledDirectRead,
     ReadbackError, SettledDirectRead,
 };
 use solstone_core_journal_io::media::RootActivityCarrier;
+use solstone_core_retention::restore_intent::AttemptEffects;
 
 pub enum RestoreFinishRefusal<'a> {
     Native {

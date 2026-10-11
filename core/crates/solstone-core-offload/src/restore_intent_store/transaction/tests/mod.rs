@@ -78,14 +78,14 @@ fn options() -> LockOptions {
 struct Fixture {
     temp: tempfile::TempDir,
     root: Arc<JournalRoot>,
-    locator: crate::restore_intent::RestoreLocator,
+    locator: solstone_core_retention::restore_intent::RestoreLocator,
     witness: ArchiveWitness,
     mark: Option<Mark>,
 }
 
 impl Fixture {
     fn new(with_mark: bool) -> Self {
-        let template = crate::restore_intent::tests::fixture(with_mark);
+        let template = crate::test_restore_intent::fixture(with_mark);
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join(template.locator.relative_segment())).unwrap();
         fs::create_dir(temp.path().join("source")).unwrap();
@@ -715,7 +715,9 @@ fn subset_remainder_is_persisted_before_publication_and_typed_writer_hold_is_tru
     let result = f.staged(&allowed).commit(2, options());
     assert!(matches!(result.hold, Some(Hold::Register)));
     let record = result.record.as_ref().unwrap();
-    let crate::restore_intent::MarkRetirement::Exact { plan } = &record.intent.retirement else {
+    let solstone_core_retention::restore_intent::MarkRetirement::Exact { plan } =
+        &record.intent.retirement
+    else {
         panic!("no exact plan")
     };
     assert_eq!(plan.expected(), f.mark.as_ref().unwrap());

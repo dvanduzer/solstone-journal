@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use super::*;
-use solstone_core_retention::archive_catalog::{ArchiveManifest, LegacyRestoreFileBinding};
+use crate::archive_catalog::{ArchiveManifest, LegacyRestoreFileBinding};
 
 fn fixture(with_mark: bool) -> RestoreIntent {
     let mut intent = tests::fixture(with_mark);

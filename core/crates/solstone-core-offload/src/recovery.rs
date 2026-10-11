@@ -7,12 +7,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::restore_intent::RestoreIntent;
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity_obligations::{
     IntentRead, NativeObligation, RecoveryObservationError,
 };
 use solstone_core_journal_io::media::MediaEntry;
+use solstone_core_retention::restore_intent::RestoreIntent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntentProblem {
@@ -108,9 +108,9 @@ mod tests {
     use solstone_core_journal_io::activity_obligations::MAX_INTENT_BYTES;
     use std::fs;
 
-    use crate::restore_intent::tests::fixture;
-    use crate::restore_intent::{ConfirmedContent, Obligation};
+    use crate::test_restore_intent::fixture;
     use solstone_core_retention::archive_catalog::RestoreDisposition;
+    use solstone_core_retention::restore_intent::{ConfirmedContent, Obligation};
 
     struct Fixture {
         temp: tempfile::TempDir,

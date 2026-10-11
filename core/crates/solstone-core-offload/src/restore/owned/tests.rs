@@ -7,7 +7,7 @@ use super::*;
 use solstone_core_journal_io::paths::SegmentLayout;
 
 fn selected() -> SegmentCatalog {
-    let intent = crate::restore_intent::tests::fixture(false);
+    let intent = crate::test_restore_intent::fixture(false);
     SegmentCatalog {
         day: intent.locator.target.day,
         stream: intent.locator.target.stream,

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::media::{Durability, MediaRead};
 
-use crate::restore_intent::{RepairHold, RestoreIntent};
+use solstone_core_retention::restore_intent::{RepairHold, RestoreIntent};
 
 mod adoption;
 pub(crate) mod transaction;

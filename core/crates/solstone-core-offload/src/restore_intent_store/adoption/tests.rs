@@ -4,16 +4,14 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use super::*;
-use crate::restore_intent::{
-    Obligation, PublicationDecision,
-    tests::{fixture, register},
-};
+use crate::test_restore_intent::{fixture, register};
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::media::{
     Cleanup, Confirmation, Durability, PublicationEffect, PublicationReceipt,
 };
 use solstone_core_retention::archive_catalog::codec::Event;
 use solstone_core_retention::archive_proof::ArchiveFileProof;
+use solstone_core_retention::restore_intent::{Obligation, PublicationDecision};
 use std::fs;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
