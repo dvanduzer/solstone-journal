@@ -26,10 +26,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::{JournalRoot, MediaIdentity, MediaPrimitive, changed, invalid, step};
+use super::{JournalRoot, MediaEntry, MediaIdentity, MediaPrimitive, changed, invalid, step};
+use crate::journal_root::JournalEntryKind;
 use crate::windows_identity::{WindowsFileIdentity, file_identity};
 use crate::windows_ntcreate::{
-    nt_create_relative, nt_create_relative_deny_delete_sharing, nt_create_relative_share_read,
+    nt_create_relative, nt_create_relative_deny_delete_sharing, nt_create_relative_exact,
+    nt_create_relative_share_read,
 };
 use crate::windows_publication_path::{
     AncestorAdmission, WindowsPublicationPath, admit_publication_path,
@@ -106,6 +108,41 @@ impl Directory {
 
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(super) fn open_child(&self, name: &OsStr) -> io::Result<Self> {
+        self.revalidate()?;
+        let file = File::from(nt_create_relative_deny_delete_sharing(
+            self.handle(),
+            name,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+            FILE_OPEN,
+            OPTIONS | FILE_DIRECTORY_FILE,
+        )?);
+        require_kind(file.as_raw_handle(), true)?;
+        let identity = identity(&file)?;
+        let mut nodes = self.nodes.clone();
+        nodes.push(Arc::new(Node {
+            name: name.to_owned(),
+            file,
+            identity: Some(identity),
+        }));
+        let child = Self {
+            root: self.root.clone(),
+            anchor: self.anchor.clone(),
+            nodes,
+            path: self.path.join(name),
+        };
+        child.revalidate()?;
+        Ok(child)
+    }
+
+    pub(super) fn stamp(&self) -> io::Result<Stamp> {
+        let file = match self.nodes.last() {
+            Some(node) => node.file.try_clone()?,
+            None => File::from(self.anchor.terminal_parent().try_clone()?),
+        };
+        stamp(&file)
     }
 
     pub(super) fn revalidate(&self) -> io::Result<()> {
@@ -191,6 +228,99 @@ impl FullSizeInformation {
 
 pub(super) fn supported_mutation() -> io::Result<()> {
     Ok(())
+}
+
+pub(super) fn entries(
+    directory: &Directory,
+    maximum: usize,
+) -> io::Result<Option<Vec<MediaEntry>>> {
+    // An empty native name reopens the actual retained directory object with a
+    // new file object and enumeration cursor; no namespace path is resolved.
+    // Native NtCreateFile rejects dot; duplicated handles share cursor state.
+    let cursor = nt_create_relative_exact(
+        directory.handle(),
+        OsStr::new(""),
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+        OPTIONS | FILE_DIRECTORY_FILE,
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("open independent directory cursor: {error}"),
+        )
+    })?;
+    require_kind(cursor.as_raw_handle(), true)?;
+    if witness(file_identity(cursor.as_raw_handle())?) != directory.identity() {
+        return Err(changed());
+    }
+    let Some(listed) = crate::windows_sync_dir::list_directory_bounded(
+        cursor.as_raw_handle(),
+        directory.path(),
+        maximum,
+    )
+    .map_err(io::Error::other)?
+    else {
+        return Ok(None);
+    };
+    let mut result = Vec::with_capacity(listed.len());
+    for record in listed {
+        step(MediaPrimitive::BeforeEntryObservation)?;
+        let observed = entry(directory, &record.name)?.ok_or_else(changed)?;
+        let MediaIdentity::Windows { file_id, .. } = observed.identity else {
+            return Err(changed());
+        };
+        if file_id != record.file_id {
+            return Err(changed());
+        }
+        result.push(observed);
+    }
+    result.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(Some(result))
+}
+
+pub(super) fn entry(directory: &Directory, name: &OsStr) -> io::Result<Option<MediaEntry>> {
+    super::plain_name(name)?;
+    let handle = match nt_create_relative_exact(
+        directory.handle(),
+        name,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+        OPTIONS,
+    ) {
+        Ok(handle) => handle,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let file = File::from(handle);
+    let metadata = file.metadata()?;
+    use std::os::windows::fs::MetadataExt;
+    let kind = if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        JournalEntryKind::Symlink
+    } else if metadata.is_dir() {
+        JournalEntryKind::Directory
+    } else {
+        JournalEntryKind::RegularFile
+    };
+    let stamp = stamp(&file)?;
+    Ok(Some(MediaEntry {
+        name: name.to_owned(),
+        kind,
+        identity: identity(&file)?,
+        size: stamp.0,
+        stamp,
+    }))
+}
+
+pub(super) fn entry_from_file(name: &OsStr, file: &File) -> io::Result<MediaEntry> {
+    let stamp = stamp(file)?;
+    Ok(MediaEntry {
+        name: name.to_owned(),
+        kind: JournalEntryKind::RegularFile,
+        identity: identity(file)?,
+        size: stamp.0,
+        stamp,
+    })
 }
 
 pub(super) fn archive_path(directory: &Directory, name: &OsStr) -> io::Result<PathBuf> {

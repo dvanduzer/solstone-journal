@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use nix::sys::statvfs::statvfs;
 use solstone_core_format::segment::{is_date_key, segment_key};
-use solstone_core_journal_io::paths::{PathOrDay, SegmentLayout, day_dirs, iter_segments};
+use solstone_core_journal_io::paths::SegmentLayout;
 use solstone_core_retention::content::{ContentName, JournalMedia, MediaClassifier};
 
 pub const MIN_FLOOR_BYTES: u64 = 20_000_000_000;
@@ -241,49 +241,6 @@ pub fn measure_local_media(journal: &Path) -> RawMediaPopulation {
     population.unknown_paths.sort();
     population.unknown_paths.dedup();
     population
-}
-fn raw_files(segment: &Path) -> Vec<std::path::PathBuf> {
-    fs::read_dir(segment)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_none_or(|extension| extension != "jsonl")
-        })
-        .collect()
-}
-pub fn measure_raw_media_usage(journal: &Path) -> RawMediaUsage {
-    let mut days = day_dirs(journal)
-        .unwrap_or_default()
-        .into_keys()
-        .collect::<Vec<_>>();
-    days.sort();
-    let per_day = days
-        .into_iter()
-        .map(|day| {
-            let mut bytes = 0;
-            let mut files = 0;
-            for segment in iter_segments(journal, PathOrDay::Day(&day)).unwrap_or_default() {
-                for file in raw_files(segment.path()) {
-                    if let Ok(metadata) = file.metadata() {
-                        bytes += metadata.len();
-                        files += 1
-                    }
-                }
-            }
-            RawMediaDayUsage { day, bytes, files }
-        })
-        .collect::<Vec<_>>();
-    RawMediaUsage {
-        total_bytes: per_day.iter().map(|day| day.bytes).sum(),
-        total_files: per_day.iter().map(|day| day.files).sum(),
-        per_day,
-    }
 }
 // `statvfs`'s block counts are u64 on Linux and u32 on Darwin, so both of these
 // only compile on Linux unconverted. See the note in

@@ -567,9 +567,64 @@ fn open_relative_exact(
     })
 }
 
-struct ListedEntry {
-    name: OsString,
-    file_id: [u8; 16],
+pub(crate) struct ListedEntry {
+    pub name: OsString,
+    pub file_id: [u8; 16],
+}
+
+/// Caller supplies a private enumeration file object, never a shared cursor.
+pub(crate) fn list_directory_bounded(
+    directory: std::os::windows::io::RawHandle,
+    path: &Path,
+    maximum: usize,
+) -> Result<Option<Vec<ListedEntry>>, FlatDirectoryError> {
+    let mut buffer = vec![0u8; DIRECTORY_BUFFER_BYTES];
+    let mut entries = Vec::new();
+    let mut restart = true;
+    loop {
+        let mut status = IO_STATUS_BLOCK::default();
+        // SAFETY: private retained synchronous directory and exact live output
+        // buffer; returned byte count is validated before decoding.
+        #[allow(unsafe_code)]
+        let result = unsafe {
+            NtQueryDirectoryFile(
+                directory,
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &mut status,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                FileIdExtdDirectoryInformation,
+                false,
+                std::ptr::null(),
+                restart,
+            )
+        };
+        if result == STATUS_SUCCESS {
+            restart = false;
+            let used = status.Information;
+            if used == 0 || used > buffer.len() {
+                return Err(invalid_listing(path));
+            }
+            if !parse_directory_buffer_bounded(&buffer[..used], path, &mut entries, true, maximum)?
+            {
+                return Ok(None);
+            }
+            continue;
+        }
+        // SAFETY: translates only the status returned by the preceding call.
+        #[allow(unsafe_code)]
+        let error = unsafe { RtlNtStatusToDosError(result) };
+        if error == ERROR_NO_MORE_FILES {
+            return Ok(Some(entries));
+        }
+        return Err(FlatDirectoryError::Io {
+            operation: "list bounded native directory",
+            path: path.to_path_buf(),
+            source: io::Error::from_raw_os_error(error as i32),
+        });
+    }
 }
 
 fn list_directory(
@@ -626,6 +681,16 @@ fn parse_directory_buffer(
     entries: &mut Vec<ListedEntry>,
     native: bool,
 ) -> Result<(), FlatDirectoryError> {
+    parse_directory_buffer_bounded(buffer, path, entries, native, usize::MAX).map(|_| ())
+}
+
+fn parse_directory_buffer_bounded(
+    buffer: &[u8],
+    path: &Path,
+    entries: &mut Vec<ListedEntry>,
+    native: bool,
+    maximum: usize,
+) -> Result<bool, FlatDirectoryError> {
     let header_bytes = offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
     let mut offset = 0usize;
     loop {
@@ -667,6 +732,9 @@ fn parse_directory_buffer(
             .try_into()
             .map_err(|_| invalid_listing(path))?;
         if name != "." && name != ".." {
+            if entries.len() == maximum {
+                return Ok(false);
+            }
             entries.push(ListedEntry { name, file_id });
         }
         let next = directory_u32(
@@ -675,7 +743,7 @@ fn parse_directory_buffer(
             path,
         )?;
         if next == 0 {
-            return Ok(());
+            return Ok(true);
         }
         let next = usize::try_from(next).map_err(|_| invalid_listing(path))?;
         if next < record_bytes || next > remaining.len() {
@@ -845,4 +913,75 @@ fn is_directory(attributes: FILE_ATTRIBUTE_TAG_INFO) -> bool {
 
 fn is_reparse_point(attributes: FILE_ATTRIBUTE_TAG_INFO) -> bool {
     attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(test)]
+mod bounded_listing_tests {
+    use super::*;
+
+    fn record(name: &str, identity: [u8; 16]) -> Vec<u8> {
+        let units = name.encode_utf16().collect::<Vec<_>>();
+        let header = offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
+        let mut bytes = vec![0; header + units.len() * 2];
+        let length = offset_of!(FILE_ID_EXTD_DIR_INFO, FileNameLength);
+        bytes[length..length + 4].copy_from_slice(&((units.len() * 2) as u32).to_le_bytes());
+        let id = offset_of!(FILE_ID_EXTD_DIR_INFO, FileId);
+        bytes[id..id + 16].copy_from_slice(&identity);
+        for (index, unit) in units.into_iter().enumerate() {
+            bytes[header + index * 2..header + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn bounded_decoder_preserves_full_ids_and_zero_limit_is_unknown() {
+        let path = Path::new("diagnostic-only");
+        let mut high = [0; 16];
+        high[0] = 1;
+        high[8] = 1;
+        let mut decoded = Vec::new();
+        for id in [[0; 16], high] {
+            assert!(
+                parse_directory_buffer_bounded(&record("leaf", id), path, &mut decoded, true, 2)
+                    .unwrap()
+            );
+        }
+        assert_ne!(decoded[0].file_id, decoded[1].file_id);
+        assert_eq!(decoded[1].file_id, high);
+        let mut decoded = Vec::new();
+        assert!(
+            !parse_directory_buffer_bounded(&record("leaf", high), path, &mut decoded, true, 0)
+                .unwrap()
+        );
+        assert!(decoded.is_empty());
+        for name in [".", ".."] {
+            assert!(
+                parse_directory_buffer_bounded(&record(name, high), path, &mut decoded, true, 0)
+                    .unwrap()
+            );
+        }
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn bounded_decoder_refuses_partial_and_malformed_records() {
+        let path = Path::new("diagnostic-only");
+        let valid = record("leaf", [7; 16]);
+        let mut malformed = Vec::new();
+        malformed.push(valid[..offset_of!(FILE_ID_EXTD_DIR_INFO, FileName) - 1].to_vec());
+        malformed.push(valid[..valid.len() - 1].to_vec());
+        let mut odd = valid.clone();
+        let length = offset_of!(FILE_ID_EXTD_DIR_INFO, FileNameLength);
+        odd[length..length + 4].copy_from_slice(&3u32.to_le_bytes());
+        malformed.push(odd);
+        let mut overlap = valid;
+        let next = offset_of!(FILE_ID_EXTD_DIR_INFO, NextEntryOffset);
+        overlap[next..next + 4].copy_from_slice(&1u32.to_le_bytes());
+        malformed.push(overlap);
+        for buffer in malformed {
+            assert!(
+                parse_directory_buffer_bounded(&buffer, path, &mut Vec::new(), true, 10).is_err()
+            );
+        }
+    }
 }
