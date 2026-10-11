@@ -2664,6 +2664,10 @@ impl OwnedDirectReadFinish {
 }
 
 impl<'a> AdmittedArchive<'a> {
+    pub fn prepared_operation(&self) -> &PreparedArchiveOperation<'a> {
+        &self.operation
+    }
+
     /// Move this operation's original configuration, credentials and budget into
     /// the concrete installed-tool readback door without renewing its lifetime.
     pub fn into_read_operation(self) -> Result<ReadOperation<'a>, ReadbackAdmissionError<'a>> {
