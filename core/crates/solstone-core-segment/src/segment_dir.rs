@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use solstone_core_journal_io::media::{MediaDirectory, MediaEntry};
 
 use solstone_core_journal_io::{
-    DEFAULT_STREAM, PathError, PathEscapeError, PathOrDay, Segment, contained_path, day_dirs,
-    day_path, iter_segments, iter_stream_segments,
+    DEFAULT_STREAM, JournalEntryKind, PathError, PathEscapeError, PathOrDay, Segment,
+    contained_path, day_dirs, day_path, iter_segments, iter_stream_segments,
 };
 
 use crate::SegmentError;
@@ -20,6 +25,174 @@ pub enum OwnerDeletionState {
     Deleted,
     Staged,
     Occupied,
+}
+
+fn classify_owner_markers(
+    tombstone: Option<JournalEntryKind>,
+    staged: Option<JournalEntryKind>,
+) -> OwnerDeletionState {
+    match (tombstone, staged) {
+        (Some(JournalEntryKind::Symlink), _) => OwnerDeletionState::Occupied,
+        (Some(_), _) => OwnerDeletionState::Deleted,
+        (None, Some(JournalEntryKind::Directory)) => OwnerDeletionState::Staged,
+        (None, Some(_)) => OwnerDeletionState::Occupied,
+        (None, None) => OwnerDeletionState::Live,
+    }
+}
+
+/// Owner-deletion observations through an existing retained parent and child.
+/// This does not acquire claims, exclude writers, or authorize publication.
+pub struct RetainedOwnerDeletion {
+    parent: Arc<MediaDirectory>,
+    basename: OsString,
+    staged_name: OsString,
+    directory: Option<Arc<MediaDirectory>>,
+    maximum_entries: usize,
+}
+
+impl RetainedOwnerDeletion {
+    /// Admit the existing child through its actual parent. A supplied live
+    /// directory must match the full identity of the parent-derived child.
+    /// Without one, only initial child-open absence is admitted as absence.
+    pub fn open(
+        parent: Arc<MediaDirectory>,
+        basename: &OsStr,
+        expected_live: Option<&MediaDirectory>,
+        maximum_entries: usize,
+    ) -> Result<Self, SegmentError> {
+        validate_component(
+            basename.to_str().ok_or(SegmentError::StreamInput(
+                "segment must be a UTF-8 path component",
+            ))?,
+            "segment",
+        )?;
+        let child_path = parent.diagnostic_path().join(basename);
+        parent.revalidate().map_err(|source| SegmentError::Io {
+            path: parent.diagnostic_path().to_path_buf(),
+            source,
+        })?;
+        if let Some(expected) = expected_live {
+            expected.revalidate().map_err(|source| SegmentError::Io {
+                path: expected.diagnostic_path().to_path_buf(),
+                source,
+            })?;
+        }
+        let directory = parent
+            .open_child(basename)
+            .map_err(|source| SegmentError::Io {
+                path: child_path.clone(),
+                source,
+            })?;
+        if let Some(expected) = expected_live {
+            if directory.as_ref().map(|child| child.identity()) != Some(expected.identity()) {
+                return Err(SegmentError::Io {
+                    path: child_path,
+                    source: io::Error::other("retained segment identity does not match"),
+                });
+            }
+            expected.revalidate().map_err(|source| SegmentError::Io {
+                path: expected.diagnostic_path().to_path_buf(),
+                source,
+            })?;
+        }
+        let mut staged_name = OsString::from(STAGED_PREFIX);
+        staged_name.push(basename);
+        let admitted = Self {
+            parent,
+            basename: basename.to_os_string(),
+            staged_name,
+            directory,
+            maximum_entries,
+        };
+        admitted.revalidate()?;
+        Ok(admitted)
+    }
+
+    /// The actual parent-derived child, if initially present. Never creates one.
+    pub fn directory(&self) -> Option<&Arc<MediaDirectory>> {
+        self.directory.as_ref()
+    }
+
+    /// Read fresh marker state with complete bounded observations. Any later
+    /// identity, chain, coverage or relevant entry change is an error.
+    pub fn state(&self) -> Result<OwnerDeletionState, SegmentError> {
+        self.revalidate()?;
+        let before = self.parent_markers()?;
+        match (&self.directory, &before.0) {
+            (Some(child), Some(entry))
+                if entry.kind == JournalEntryKind::Directory
+                    && entry.identity == child.identity() => {}
+            (None, None) => {}
+            _ => return Err(self.changed()),
+        }
+        let tombstone = match &self.directory {
+            Some(child) => self
+                .entries(child)?
+                .into_iter()
+                .find(|entry| entry.name == TOMBSTONE_NAME)
+                .map(|entry| entry.kind),
+            None => None,
+        };
+        // Retain MediaEntry equality, including its private native stamp.
+        if self.parent_markers()? != before {
+            return Err(self.changed());
+        }
+        self.revalidate()?;
+        Ok(classify_owner_markers(
+            tombstone,
+            before.1.map(|entry| entry.kind),
+        ))
+    }
+
+    fn parent_markers(&self) -> Result<(Option<MediaEntry>, Option<MediaEntry>), SegmentError> {
+        let mut segment = None;
+        let mut staged = None;
+        for entry in self.entries(&self.parent)? {
+            if entry.name == self.basename {
+                segment = Some(entry);
+            } else if entry.name == self.staged_name {
+                staged = Some(entry);
+            }
+        }
+        Ok((segment, staged))
+    }
+
+    fn entries(&self, directory: &MediaDirectory) -> Result<Vec<MediaEntry>, SegmentError> {
+        directory
+            .entries(self.maximum_entries)
+            .and_then(|entries| {
+                entries.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "owner-deletion entry limit exceeded",
+                    )
+                })
+            })
+            .map_err(|source| SegmentError::Io {
+                path: directory.diagnostic_path().to_path_buf(),
+                source,
+            })
+    }
+
+    fn revalidate(&self) -> Result<(), SegmentError> {
+        if let Some(child) = &self.directory {
+            child.revalidate().map_err(|source| SegmentError::Io {
+                path: child.diagnostic_path().to_path_buf(),
+                source,
+            })?;
+        }
+        self.parent.revalidate().map_err(|source| SegmentError::Io {
+            path: self.parent.diagnostic_path().to_path_buf(),
+            source,
+        })
+    }
+
+    fn changed(&self) -> SegmentError {
+        SegmentError::Io {
+            path: self.parent.diagnostic_path().join(&self.basename),
+            source: io::Error::other("retained owner-deletion observation changed"),
+        }
+    }
 }
 
 /// A resolved journal segment directory with no creation side effect.
@@ -116,9 +289,14 @@ pub fn owner_deletion_state(segment_dir: &Path) -> Result<OwnerDeletionState, Se
                 let tombstone = segment_dir.join(TOMBSTONE_NAME);
                 match std::fs::symlink_metadata(&tombstone) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Ok(OwnerDeletionState::Occupied);
+                        return Ok(classify_owner_markers(
+                            Some(JournalEntryKind::Symlink),
+                            None,
+                        ));
                     }
-                    Ok(_) => return Ok(OwnerDeletionState::Deleted),
+                    Ok(_) => {
+                        return Ok(classify_owner_markers(Some(JournalEntryKind::Other), None));
+                    }
                     Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                     Err(source) => {
                         return Err(SegmentError::Io {
@@ -138,15 +316,21 @@ pub fn owner_deletion_state(segment_dir: &Path) -> Result<OwnerDeletionState, Se
         }
     }
 
-    let mut staged_name = std::ffi::OsString::from(STAGED_PREFIX);
+    let mut staged_name = OsString::from(STAGED_PREFIX);
     staged_name.push(file_name);
     let staged_path = parent.join(staged_name);
     match std::fs::symlink_metadata(&staged_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Ok(OwnerDeletionState::Occupied),
-        Ok(metadata) if metadata.is_dir() => Ok(OwnerDeletionState::Staged),
-        Ok(_) => Ok(OwnerDeletionState::Occupied),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(classify_owner_markers(
+            None,
+            Some(JournalEntryKind::Symlink),
+        )),
+        Ok(metadata) if metadata.is_dir() => Ok(classify_owner_markers(
+            None,
+            Some(JournalEntryKind::Directory),
+        )),
+        Ok(_) => Ok(classify_owner_markers(None, Some(JournalEntryKind::Other))),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok(OwnerDeletionState::Live)
+            Ok(classify_owner_markers(None, None))
         }
         Err(source) => Err(SegmentError::Io {
             path: staged_path,
@@ -226,6 +410,26 @@ mod tests {
     use crate::test_support::TempDir;
 
     use super::*;
+
+    #[test]
+    fn owner_marker_classification() {
+        use JournalEntryKind::{Directory, Other, RegularFile, Symlink};
+        use OwnerDeletionState::{Deleted, Live, Occupied, Staged};
+
+        let cases = [
+            (None, None, Live),
+            (None, Some(Directory), Staged),
+            (None, Some(RegularFile), Occupied),
+            (None, Some(Symlink), Occupied),
+            (Some(RegularFile), None, Deleted),
+            (Some(Directory), Some(Symlink), Deleted),
+            (Some(Other), Some(Directory), Deleted),
+            (Some(Symlink), Some(Directory), Occupied),
+        ];
+        for (tombstone, staged, expected) in cases {
+            assert_eq!(classify_owner_markers(tombstone, staged), expected);
+        }
+    }
 
     #[test]
     fn resolves_default_stream_directly_under_day() {
@@ -335,5 +539,320 @@ mod tests {
         let metadata = fs::symlink_metadata(&tombstone).unwrap();
         assert!(metadata.file_type().is_symlink());
         assert_eq!(metadata.ino(), inode);
+    }
+
+    #[cfg(feature = "full-tests")]
+    mod retained_owner_deletion {
+        use solstone_core_journal_io::JournalRoot;
+        use solstone_core_journal_io::media::{MediaPrimitive, run_with_media_hook};
+
+        use super::*;
+
+        struct Fixture {
+            temporary: TempDir,
+            parent: Arc<MediaDirectory>,
+            parent_path: PathBuf,
+            segment: PathBuf,
+        }
+
+        impl Fixture {
+            fn new(present: bool) -> Self {
+                let temporary = TempDir::new();
+                let journal = temporary.path().join("journal");
+                let parent_path = journal.join("chronicle/20261010");
+                fs::create_dir_all(&parent_path).unwrap();
+                let segment = parent_path.join("120000_60");
+                if present {
+                    fs::create_dir(&segment).unwrap();
+                }
+                let root = Arc::new(JournalRoot::open(&journal).unwrap());
+                let parent = MediaDirectory::open(root, Path::new("chronicle/20261010")).unwrap();
+                Self {
+                    temporary,
+                    parent,
+                    parent_path,
+                    segment,
+                }
+            }
+
+            fn open(&self, maximum: usize) -> RetainedOwnerDeletion {
+                RetainedOwnerDeletion::open(
+                    self.parent.clone(),
+                    OsStr::new("120000_60"),
+                    None,
+                    maximum,
+                )
+                .unwrap()
+            }
+
+            fn staged(&self) -> PathBuf {
+                self.parent_path.join(".removing_120000_60")
+            }
+        }
+
+        #[test]
+        fn live_absent_markers_and_fresh_state() {
+            for present in [false, true] {
+                let fixture = Fixture::new(present);
+                let observed = fixture.open(16);
+                assert_eq!(observed.directory().is_some(), present);
+                assert_eq!(observed.state().unwrap(), OwnerDeletionState::Live);
+                fs::create_dir(fixture.staged()).unwrap();
+                assert_eq!(observed.state().unwrap(), OwnerDeletionState::Staged);
+                fs::remove_dir(fixture.staged()).unwrap();
+                fs::write(fixture.staged(), b"occupied").unwrap();
+                assert_eq!(observed.state().unwrap(), OwnerDeletionState::Occupied);
+                if present {
+                    fs::write(fixture.segment.join(TOMBSTONE_NAME), b"malformed JSON").unwrap();
+                    assert_eq!(observed.state().unwrap(), OwnerDeletionState::Deleted);
+                    fs::remove_file(fixture.segment.join(TOMBSTONE_NAME)).unwrap();
+                    fs::create_dir(fixture.segment.join(TOMBSTONE_NAME)).unwrap();
+                    assert_eq!(observed.state().unwrap(), OwnerDeletionState::Deleted);
+                }
+            }
+        }
+
+        #[test]
+        fn supplied_child_identity_and_missing_refusal() {
+            let fixture = Fixture::new(true);
+            let live = fixture
+                .parent
+                .open_child(OsStr::new("120000_60"))
+                .unwrap()
+                .unwrap();
+            let observed = RetainedOwnerDeletion::open(
+                fixture.parent.clone(),
+                OsStr::new("120000_60"),
+                Some(&live),
+                16,
+            )
+            .unwrap();
+            assert_eq!(observed.directory().unwrap().identity(), live.identity());
+            assert_eq!(observed.state().unwrap(), OwnerDeletionState::Live);
+            fs::create_dir(fixture.parent_path.join("other")).unwrap();
+            let other = fixture
+                .parent
+                .open_child(OsStr::new("other"))
+                .unwrap()
+                .unwrap();
+            assert!(
+                RetainedOwnerDeletion::open(
+                    fixture.parent.clone(),
+                    OsStr::new("120000_60"),
+                    Some(&other),
+                    16
+                )
+                .is_err()
+            );
+            assert!(
+                RetainedOwnerDeletion::open(
+                    fixture.parent.clone(),
+                    OsStr::new("missing"),
+                    Some(&live),
+                    16
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn coverage_and_name_refusals() {
+            let fixture = Fixture::new(true);
+            assert_eq!(fixture.open(1).state().unwrap(), OwnerDeletionState::Live);
+            assert!(fixture.open(0).state().is_err());
+            fs::write(fixture.segment.join("one"), b"one").unwrap();
+            assert_eq!(fixture.open(1).state().unwrap(), OwnerDeletionState::Live);
+            fs::write(fixture.segment.join("two"), b"two").unwrap();
+            assert!(fixture.open(1).state().is_err());
+            fs::write(fixture.parent_path.join("extra"), b"extra").unwrap();
+            assert!(fixture.open(1).state().is_err());
+            for name in ["", ".", "..", ".hidden", "Upper", "a/b", "a\\b"] {
+                assert!(
+                    RetainedOwnerDeletion::open(fixture.parent.clone(), OsStr::new(name), None, 16)
+                        .is_err()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                assert!(
+                    RetainedOwnerDeletion::open(
+                        fixture.parent.clone(),
+                        OsStr::from_bytes(b"\xff"),
+                        None,
+                        16
+                    )
+                    .is_err()
+                );
+            }
+        }
+
+        #[test]
+        fn initial_absence_then_appearance_and_late_loss_refuse() {
+            let fixture = Fixture::new(false);
+            let observed = fixture.open(16);
+            fs::create_dir(&fixture.segment).unwrap();
+            assert!(observed.state().is_err());
+            let observed = fixture.open(16);
+            fs::remove_dir(&fixture.segment).unwrap();
+            assert!(observed.state().is_err());
+            fs::write(&fixture.segment, b"not directory").unwrap();
+            assert!(
+                RetainedOwnerDeletion::open(
+                    fixture.parent.clone(),
+                    OsStr::new("120000_60"),
+                    None,
+                    16
+                )
+                .is_err()
+            );
+            assert_eq!(
+                owner_deletion_state(&fixture.segment).unwrap(),
+                OwnerDeletionState::Live
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn symlinks_are_occupied_or_refused_without_touching_targets() {
+            let fixture = Fixture::new(true);
+            let target = fixture.temporary.path().join("target");
+            fs::write(&target, b"untouched").unwrap();
+            let observed = fixture.open(16);
+            symlink(&target, fixture.segment.join(TOMBSTONE_NAME)).unwrap();
+            assert_eq!(observed.state().unwrap(), OwnerDeletionState::Occupied);
+            fs::remove_file(fixture.segment.join(TOMBSTONE_NAME)).unwrap();
+            symlink(&target, fixture.staged()).unwrap();
+            assert_eq!(observed.state().unwrap(), OwnerDeletionState::Occupied);
+            fs::remove_file(fixture.staged()).unwrap();
+            fs::remove_dir(&fixture.segment).unwrap();
+            symlink(&target, &fixture.segment).unwrap();
+            assert!(
+                RetainedOwnerDeletion::open(
+                    fixture.parent.clone(),
+                    OsStr::new("120000_60"),
+                    None,
+                    16
+                )
+                .is_err()
+            );
+            assert_eq!(
+                owner_deletion_state(&fixture.segment).unwrap(),
+                OwnerDeletionState::Live
+            );
+            assert!(
+                fs::symlink_metadata(&fixture.segment)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"untouched");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn root_ancestor_parent_and_segment_rebinding_refuse() {
+            for relative in [
+                "journal",
+                "journal/chronicle",
+                "journal/chronicle/20261010",
+                "journal/chronicle/20261010/120000_60",
+            ] {
+                let fixture = Fixture::new(true);
+                fs::write(fixture.segment.join("original"), b"original").unwrap();
+                let observed = fixture.open(16);
+                let cut = fixture.temporary.path().join(relative);
+                let parked = fixture.temporary.path().join("parked");
+                let suffix = fixture.segment.strip_prefix(&cut).unwrap();
+                let original = parked.join(suffix).join("original");
+                fs::rename(&cut, &parked).unwrap();
+                fs::create_dir_all(&fixture.segment).unwrap();
+                fs::write(fixture.segment.join("replacement"), b"replacement").unwrap();
+                assert!(observed.state().is_err(), "{relative}");
+                assert_eq!(fs::read(original).unwrap(), b"original");
+                assert_eq!(
+                    fs::read(fixture.segment.join("replacement")).unwrap(),
+                    b"replacement"
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn child_admission_substitution_is_not_initial_absence() {
+            for primitive in [
+                MediaPrimitive::AfterChildOpen,
+                MediaPrimitive::AfterChildObservation,
+            ] {
+                let fixture = Fixture::new(true);
+                let segment = fixture.segment.clone();
+                let parked = fixture.parent_path.join("parked");
+                let (result, fired) = run_with_media_hook(
+                    primitive,
+                    move || {
+                        fs::rename(&segment, &parked)?;
+                        fs::create_dir(&segment)
+                    },
+                    || {
+                        RetainedOwnerDeletion::open(
+                            fixture.parent.clone(),
+                            OsStr::new("120000_60"),
+                            None,
+                            16,
+                        )
+                    },
+                );
+                assert!(fired, "{primitive:?}");
+                assert!(result.is_err(), "{primitive:?}");
+                assert!(fixture.parent_path.join("parked").is_dir());
+                assert!(fixture.segment.is_dir());
+            }
+        }
+
+        #[test]
+        fn first_parent_guard_refuses_staged_insert_remove_replace() {
+            for action in ["insert", "remove", "replace"] {
+                let fixture = Fixture::new(true);
+                let staged = fixture.staged();
+                if action != "insert" {
+                    fs::create_dir(&staged).unwrap();
+                }
+                let observed = fixture.open(16);
+                let (result, fired) = run_with_media_hook(
+                    MediaPrimitive::AfterFirstEnumeration,
+                    move || match action {
+                        "insert" => fs::create_dir(staged),
+                        "remove" => fs::remove_dir(staged),
+                        _ => {
+                            fs::remove_dir(&staged)?;
+                            fs::write(staged, b"replacement")
+                        }
+                    },
+                    || observed.state(),
+                );
+                assert!(fired);
+                assert!(result.is_err(), "{action}");
+            }
+        }
+
+        #[test]
+        fn observation_errors_preserve_their_kind() {
+            for kind in [
+                io::ErrorKind::PermissionDenied,
+                io::ErrorKind::UnexpectedEof,
+            ] {
+                let fixture = Fixture::new(true);
+                let observed = fixture.open(16);
+                let (result, fired) = run_with_media_hook(
+                    MediaPrimitive::AfterFirstEnumeration,
+                    move || Err(io::Error::new(kind, "synthetic observation failure")),
+                    || observed.state(),
+                );
+                assert!(fired);
+                assert!(
+                    matches!(result, Err(SegmentError::Io { source, .. }) if source.kind() == kind)
+                );
+            }
+        }
     }
 }
