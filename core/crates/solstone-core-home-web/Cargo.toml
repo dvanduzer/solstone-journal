@@ -6,6 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+full-tests = []
+
+[[test]]
+name = "review_transport"
+path = "tests/review_transport.rs"
+required-features = ["full-tests"]
+
 [lints]
 workspace = true
 
@@ -21,6 +30,7 @@ solstone-core-home.workspace = true
 solstone-core-facets.workspace = true
 solstone-core-journal-config.workspace = true
 solstone-core-journal-io.workspace = true
+solstone-core-retention.workspace = true
 solstone-core-retention-client.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 

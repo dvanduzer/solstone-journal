@@ -81,6 +81,9 @@
   let mountedRoot = null;
   let rows = [];
   let listState = '';
+  let reviewContext = null;
+  let refreshGeneration = 0;
+  let renderGeneration = 0;
   let confirmation = null;
   let outcomeHtml = '';
   let selected = new Set();
@@ -336,6 +339,7 @@
 
   function render() {
     if (!card) return;
+    renderGeneration += 1;
     pageIndex = Math.min(pageIndex, Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1));
     const heading = '<h2 class="pulse-section-header">' + copy("card.heading") + '</h2><p>' + copy("card.subhead") + '</p>';
     if (listState === 'list.empty') {
@@ -485,24 +489,33 @@
   }
 
   async function refresh() {
-    let trustworthy = false;
+    const generation = ++refreshGeneration;
+    let response;
     try {
-      const response = await request(LIST_URL);
-      listState = response.state;
-      rows = Array.isArray(response.removals) ? response.removals : [];
-      trustworthy = (response.state === 'list.ready' || response.state === 'list.empty')
-        && Array.isArray(response.removals);
+      response = await request(LIST_URL);
     } catch (_) {
-      listState = 'list.register_unavailable';
-      rows = [];
+      response = { state: 'list.register_unavailable' };
     }
+    if (generation !== refreshGeneration) return false;
+    const trustworthy = (response?.state === 'list.ready' || response?.state === 'list.empty')
+      && Array.isArray(response.removals)
+      && typeof response.review_context === 'string' && response.review_context.length > 0;
+    const nextContext = trustworthy ? response.review_context : null;
+    if (nextContext !== reviewContext || !trustworthy) {
+      selected = new Set();
+      confirmation = null;
+    }
+    reviewContext = nextContext;
+    listState = trustworthy ? response.state : 'list.register_unavailable';
+    rows = trustworthy ? response.removals : [];
     const markedIds = new Set(markedRows().map(function (row) { return row.id; }));
     selected = new Set(Array.from(selected).filter(function (id) { return markedIds.has(id); }));
     render();
     return trustworthy;
   }
 
-  async function submit(action, selectionRows) {
+  async function submit(action, selectionRows, context) {
+    if (typeof context !== 'string' || !context || context !== reviewContext) return;
     const endpoint = action === 'approve' ? APPROVE_URL : DECLINE_URL;
     confirmation = null;
     selected = new Set();
@@ -510,7 +523,7 @@
       const response = await request(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mark_ids: selectionRows.map(function (row) { return row.id; }) })
+        body: JSON.stringify({ review_context: context, mark_ids: selectionRows.map(function (row) { return row.id; }) })
       });
       await refresh();
       showOutcome(response, { action: action, rows: selectionRows });
@@ -542,7 +555,8 @@
 
   function openDeleteConfirmation(rows) {
     expanded = true;
-    confirmation = { kind: 'delete', rows: rows };
+    if (!reviewContext) return;
+    confirmation = { kind: 'delete', rows: rows, reviewContext: reviewContext };
     render();
   }
 
@@ -553,11 +567,15 @@
 
   function wire() {
     if (!card) return;
+    const generation = renderGeneration;
+    const context = reviewContext;
+    const renderedRows = rows;
     card.querySelector('.removals-review')?.addEventListener('toggle', event => { expanded = event.currentTarget.open; });
     card.querySelectorAll('[data-removal-action]').forEach(function (control) {
       control.addEventListener('click', function () {
+        if (generation !== renderGeneration || context !== reviewContext) return;
         const action = control.dataset.removalAction;
-        const row = rows.find(function (candidate) {
+        const row = renderedRows.find(function (candidate) {
           return candidate.id === control.dataset.markId;
         });
         if (action === 'previous' || action === 'next') {
@@ -566,13 +584,13 @@
           return;
         }
         if (action === 'approve' && row) openDeleteConfirmation([row]);
-        if (action === 'decline' && row) submit('decline', [row]);
+        if (action === 'decline' && row) submit('decline', [row], context);
         if (action === 'cancel') {
           confirmation = null;
           render();
         }
         if (action === 'confirm' && confirmation && confirmation.kind === 'delete') {
-          submit('approve', confirmation.rows);
+          submit('approve', confirmation.rows, confirmation.reviewContext);
         }
         if (action === 'select-all') {
           selected = new Set(markedRows().map(function (item) { return item.id; }));
@@ -596,7 +614,7 @@
             tooManySelected();
             return;
           }
-          submit('decline', selectedRows());
+          submit('decline', selectedRows(), context);
         }
         if (action === 'finish') {
           confirmation = { kind: 'recover' };
@@ -607,6 +625,7 @@
     });
     card.querySelectorAll('[data-removal-select]').forEach(function (control) {
       control.addEventListener('click', function () {
+        if (generation !== renderGeneration || context !== reviewContext || !context) return;
         const id = control.dataset.markId;
         if (!id) return;
         if (selected.has(id)) selected.delete(id);
@@ -621,7 +640,11 @@
     if (pathname.startsWith('/app/home/week/')) return;
     const root = document.querySelector('[data-home-root]');
     if (!root) return;
-    if (root === mountedRoot && card) return;
+    if (root === mountedRoot && card) { refresh(); return; }
+    refreshGeneration += 1;
+    reviewContext = null;
+    selected = new Set();
+    confirmation = null;
     mountedRoot = root;
     card = document.createElement('div');
     card.setAttribute('data-removals-card', '');

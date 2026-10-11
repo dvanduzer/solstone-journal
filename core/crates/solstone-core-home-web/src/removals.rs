@@ -11,7 +11,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::SecondsFormat;
+use serde::Deserialize;
 use serde_json::{Value, json};
+use solstone_core_journal_io::JournalRoot;
+use solstone_core_retention::marks::{Approval, MarkId, MarkState};
+use solstone_core_retention::review_context::{ReviewContext, load_at_root, read_review_context};
 use solstone_core_retention_client as retention;
 
 const LIST_EMPTY: &str = "list.empty";
@@ -21,15 +25,21 @@ const TOOL_UNAVAILABLE: &str = "tool.unavailable";
 const OUTCOME_UNKNOWN: &str = "outcome.unknown";
 const REQUEST_INVALID: &str = "request.invalid";
 const REQUEST_TOO_LARGE: &str = "request.too_large";
-const APPROVE_POLICY_KEEPS: &str = "approve.policy_keeps";
 const APPROVE_REFUSED_BEFORE_START: &str = "approve.refused_before_start";
+#[cfg(test)]
 const APPROVE_REFUSED_AFTER_START: &str = "approve.refused_after_start";
+#[cfg(test)]
 const APPROVE_PARTIAL: &str = "approve.partial";
+#[cfg(test)]
 const APPROVE_DELETED: &str = "approve.deleted";
+#[cfg(test)]
 const APPROVE_HALTED: &str = "approve.halted";
+#[cfg(test)]
 const DECLINED_DONE: &str = "declined.done";
+#[cfg(test)]
 const DECLINED_PARTIAL: &str = "declined.partial";
 const DECLINED_REFUSED: &str = "declined.refused";
+#[cfg(test)]
 const DECLINED_UNKNOWN: &str = "declined.unknown";
 const REFUSAL_ITEM_NAMED: &str = "refusal.item_named";
 const REFUSAL_ITEM_UNNAMED: &str = "refusal.item_unnamed";
@@ -58,171 +68,116 @@ struct RecoverOutcome {
     refusals: Vec<Value>,
 }
 
+const MAX_REVIEW_CONTEXT_BYTES: usize = 512 * 1024;
+const LIST_REVIEW_TOO_LARGE: &str = "list.review_too_large";
+
 pub async fn list(State(journal_root): State<PathBuf>) -> Response {
-    match call_marks(journal_root).await {
-        ClientCall::Completed(Ok(receipt)) => match project_register(&receipt) {
-            Some(removals) if removals.is_empty() => list_response(LIST_EMPTY, removals),
-            Some(removals) => list_response(LIST_READY, removals),
-            None => list_response(OUTCOME_UNKNOWN, Vec::new()),
-        },
-        ClientCall::Completed(Err(retention::ClientError::Refused(refused)))
-            if marks_store_refusal(refused.receipt_value()) =>
-        {
-            list_response(LIST_REGISTER_UNAVAILABLE, Vec::new())
+    match tokio::task::spawn_blocking(move || rendered_review(&journal_root)).await {
+        Ok(Ok((removals, context))) => {
+            let state = if removals.is_empty() {
+                LIST_EMPTY
+            } else {
+                LIST_READY
+            };
+            list_response(state, removals, Some(context))
         }
-        ClientCall::Completed(Err(error)) => list_response(error_state(&error), Vec::new()),
-        ClientCall::Join => list_response(OUTCOME_UNKNOWN, Vec::new()),
+        Ok(Err(state)) => list_response(state, Vec::new(), None),
+        Err(_) => list_response(OUTCOME_UNKNOWN, Vec::new(), None),
     }
 }
 
-pub async fn approve(
-    State(journal_root): State<PathBuf>,
-    Extension(clock): Extension<crate::Clock>,
-    body: Bytes,
-) -> Response {
-    let mark_ids = match mark_ids(body) {
-        Ok(mark_ids) => mark_ids,
-        Err(state) => return request_response(StatusCode::BAD_REQUEST, state),
-    };
-    if mark_ids.len() > retention::MAX_REMOVE_MARK_IDS {
-        return request_response(StatusCode::BAD_REQUEST, REQUEST_TOO_LARGE);
+fn rendered_review(journal_root: &Path) -> Result<(Vec<Value>, String), &'static str> {
+    let root = JournalRoot::open(journal_root).map_err(|_| LIST_REGISTER_UNAVAILABLE)?;
+    let register = load_at_root(&root).map_err(|_| LIST_REGISTER_UNAVAILABLE)?;
+    let ids = register
+        .marks
+        .values()
+        .filter(|mark| project_mark((*mark).clone()).is_some())
+        .map(|mark| mark.id.clone())
+        .collect::<Vec<_>>();
+    let context = read_review_context(&root, &ids).map_err(|_| LIST_REGISTER_UNAVAILABLE)?;
+    let removals = project_context(&context);
+    let context = serde_json::to_string(&context).map_err(|_| OUTCOME_UNKNOWN)?;
+    if context.len() > MAX_REVIEW_CONTEXT_BYTES {
+        return Err(LIST_REVIEW_TOO_LARGE);
     }
-    let policy = policy(&journal_root);
-    if !retention::policy_would_release(&policy) {
-        return write_response(
-            APPROVE_POLICY_KEEPS,
-            mark_ids.len(),
-            RemovalOutcome {
-                state: APPROVE_POLICY_KEEPS,
-                removed_count: 0,
-                not_removed_count: 0,
-                halted: false,
-                refusals: Vec::new(),
-            },
-        );
+    Ok((removals, context))
+}
+
+pub async fn approve(body: Result<Bytes, axum::extract::rejection::BytesRejection>) -> Response {
+    match action_context(body) {
+        Ok(context) => write_response(context.marks().len(), refused_before_start()),
+        Err((status, state)) => request_response(status, state),
     }
-    let policy = serde_json::to_string(&policy).expect("retention policy serializes");
-    let now = clock.now();
-    let call = call_remove_marked(
-        journal_root.clone(),
-        now.with_timezone(&solstone_core_journal_config::owner_zone(&journal_root))
-            .format("%Y-%m-%d")
-            .to_string(),
-        now.to_rfc3339_opts(SecondsFormat::Secs, true),
-        policy,
-        mark_ids.clone(),
-    )
-    .await;
-    let post_commit_failure_count = match &call {
-        ClientCall::Completed(Ok(receipt)) => Some(receipt),
-        ClientCall::Completed(Err(retention::ClientError::Refused(refused))) => {
-            Some(refused.receipt_value())
+}
+
+pub async fn decline(body: Result<Bytes, axum::extract::rejection::BytesRejection>) -> Response {
+    match action_context(body) {
+        Ok(context) => Json(json!({
+            "state": DECLINED_REFUSED,
+            "requested_count": context.marks().len(),
+            "declined_count": 0,
+            "refused_count": context.marks().len(),
+            "unavailable_count": 0,
+            "unknown_count": 0,
+        }))
+        .into_response(),
+        Err((status, state)) => request_response(status, state),
+    }
+}
+
+fn action_context(
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Result<ReviewContext, (StatusCode, &'static str)> {
+    let body = body.map_err(|error| {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            (StatusCode::PAYLOAD_TOO_LARGE, REQUEST_TOO_LARGE)
+        } else {
+            (StatusCode::BAD_REQUEST, REQUEST_INVALID)
         }
-        _ => None,
-    }
-    .and_then(|r| r.get("outcome"))
-    .and_then(|o| o.get("targets"))
-    .and_then(|t| t.as_array())
-    .map(|targets| {
-        targets
-            .iter()
-            .filter(|target| {
-                target
-                    .as_object()
-                    .and_then(|obj| obj.get("post_commit_failure"))
-                    .is_some_and(Value::is_object)
-            })
-            .count()
+    })?;
+    decode_review_request(&body).map_err(|state| {
+        let status = if state == REQUEST_TOO_LARGE {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        (status, state)
     })
-    .unwrap_or(0);
-    if post_commit_failure_count > 0 {
-        log::warn!(
-            "removal_approve completed with {post_commit_failure_count} post-commit failure(s)"
-        );
-    }
-    let outcome = approve_outcome(call);
-    let requested_count = mark_ids.len();
-    append_action(
-        &journal_root,
-        "removal_approve",
-        json!({
-            "mark_ids": mark_ids.clone(),
-            "requested_count": requested_count,
-            "removed_count": outcome.removed_count,
-            "not_removed_count": outcome.not_removed_count,
-            "halted": outcome.halted,
-            "outcome_state": outcome.state,
-            "post_commit_failure_count": post_commit_failure_count,
-        }),
-    );
-    write_response(outcome.state, requested_count, outcome)
 }
 
-pub async fn decline(State(journal_root): State<PathBuf>, body: Bytes) -> Response {
-    let mark_ids = match mark_ids(body) {
-        Ok(mark_ids) => mark_ids,
-        Err(state) => return request_response(StatusCode::BAD_REQUEST, state),
-    };
-    if mark_ids.len() > retention::MAX_REMOVE_MARK_IDS {
-        return request_response(StatusCode::BAD_REQUEST, REQUEST_TOO_LARGE);
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewRequest {
+    review_context: String,
+    mark_ids: Vec<String>,
+}
 
-    let mut declined_count = 0usize;
-    let mut refused_count = 0usize;
-    let mut unavailable_count = 0usize;
-    let mut unknown_count = 0usize;
-    for mark_id in &mark_ids {
-        match call_decline(journal_root.clone(), mark_id.clone()).await {
-            ClientCall::Completed(Ok(receipt)) if decline_success(&receipt) => {
-                declined_count = declined_count.saturating_add(1);
-            }
-            ClientCall::Completed(Err(retention::ClientError::Refused(refused)))
-                if decline_refusal(refused.receipt_value()) =>
-            {
-                refused_count = refused_count.saturating_add(1);
-            }
-            ClientCall::Completed(Err(retention::ClientError::BinaryUnavailable(_)))
-            | ClientCall::Completed(Err(retention::ClientError::RequestTooLarge(_))) => {
-                unavailable_count = unavailable_count.saturating_add(1);
-            }
-            ClientCall::Completed(Err(retention::ClientError::OutcomeUnknown(_)))
-            | ClientCall::Completed(Err(retention::ClientError::Refused(_)))
-            | ClientCall::Completed(Ok(_))
-            | ClientCall::Join => {
-                unknown_count = unknown_count.saturating_add(1);
-            }
-        }
+fn decode_review_request(body: &[u8]) -> Result<ReviewContext, &'static str> {
+    let request: ReviewRequest = serde_json::from_slice(body).map_err(|_| REQUEST_INVALID)?;
+    if request.mark_ids.len() > retention::MAX_REMOVE_MARK_IDS
+        || request.review_context.len() > MAX_REVIEW_CONTEXT_BYTES
+    {
+        return Err(REQUEST_TOO_LARGE);
     }
-
-    let state = decline_state(
-        declined_count,
-        refused_count,
-        unavailable_count,
-        unknown_count,
-    );
-    let requested_count = mark_ids.len();
-    append_action(
-        &journal_root,
-        "removal_decline",
-        json!({
-            "mark_ids": mark_ids.clone(),
-            "requested_count": requested_count,
-            "declined_count": declined_count,
-            "refused_count": refused_count,
-            "unavailable_count": unavailable_count,
-            "unknown_count": unknown_count,
-            "outcome_state": state,
-        }),
-    );
-    Json(json!({
-        "state": state,
-        "requested_count": requested_count,
-        "declined_count": declined_count,
-        "refused_count": refused_count,
-        "unavailable_count": unavailable_count,
-        "unknown_count": unknown_count,
-    }))
-    .into_response()
+    let context: ReviewContext =
+        serde_json::from_str(&request.review_context).map_err(|_| REQUEST_INVALID)?;
+    let ids = request
+        .mark_ids
+        .iter()
+        .map(|id| MarkId::parse(id).ok_or(REQUEST_INVALID))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = context.select(&ids).map_err(|_| REQUEST_INVALID)?;
+    if selected
+        .marks()
+        .iter()
+        .any(|mark| mark.state != MarkState::Marked || mark.class.axes().1 != Approval::Required)
+    {
+        return Err(REQUEST_INVALID);
+    }
+    // This is rendered transport only. Execution stays refused until the
+    // consuming retained executor and shared worker are available.
+    Ok(selected)
 }
 
 pub async fn recover(
@@ -256,27 +211,6 @@ pub async fn recover(
     .into_response()
 }
 
-fn mark_ids(body: Bytes) -> Result<Vec<String>, &'static str> {
-    let Value::Object(request) =
-        serde_json::from_slice::<Value>(&body).map_err(|_| REQUEST_INVALID)?
-    else {
-        return Err(REQUEST_INVALID);
-    };
-    if request.len() != 1 {
-        return Err(REQUEST_INVALID);
-    }
-    let Some(Value::Array(mark_ids)) = request.get("mark_ids") else {
-        return Err(REQUEST_INVALID);
-    };
-    if mark_ids.is_empty() {
-        return Err(REQUEST_INVALID);
-    }
-    mark_ids
-        .iter()
-        .map(|mark_id| mark_id.as_str().map(str::to_owned).ok_or(REQUEST_INVALID))
-        .collect()
-}
-
 fn recover_empty(body: Bytes) -> Result<(), &'static str> {
     if body.is_empty() {
         return Ok(());
@@ -287,45 +221,6 @@ fn recover_empty(body: Bytes) -> Result<(), &'static str> {
     }
 }
 
-fn policy(journal_root: &Path) -> retention::Policy {
-    let config = solstone_core_journal_config::read_journal_config(journal_root)
-        .expect("session gate handled configuration")
-        .config
-        .unwrap_or_default();
-    retention::policy_from_journal_config(&config)
-}
-
-async fn call_marks(journal_root: PathBuf) -> ClientCall {
-    match tokio::task::spawn_blocking(move || retention::marks(journal_root)).await {
-        Ok(result) => ClientCall::Completed(result),
-        Err(_) => ClientCall::Join,
-    }
-}
-
-async fn call_remove_marked(
-    journal_root: PathBuf,
-    today: String,
-    now: String,
-    policy: String,
-    mark_ids: Vec<String>,
-) -> ClientCall {
-    match tokio::task::spawn_blocking(move || {
-        retention::remove_marked(journal_root, today, now, policy, &mark_ids)
-    })
-    .await
-    {
-        Ok(result) => ClientCall::Completed(result),
-        Err(_) => ClientCall::Join,
-    }
-}
-
-async fn call_decline(journal_root: PathBuf, mark_id: String) -> ClientCall {
-    match tokio::task::spawn_blocking(move || retention::decline(journal_root, mark_id)).await {
-        Ok(result) => ClientCall::Completed(result),
-        Err(_) => ClientCall::Join,
-    }
-}
-
 async fn call_recover(journal_root: PathBuf, at: String) -> ClientCall {
     match tokio::task::spawn_blocking(move || retention::recover(journal_root, at)).await {
         Ok(result) => ClientCall::Completed(result),
@@ -333,17 +228,13 @@ async fn call_recover(journal_root: PathBuf, at: String) -> ClientCall {
     }
 }
 
-fn project_register(receipt: &Value) -> Option<Vec<Value>> {
-    let register = receipt.get("marks")?.as_object()?;
-    register.get("version")?.as_u64()?;
-    let marks = register.get("marks")?.as_object()?;
-    let mut removals = Vec::new();
-    for value in marks.values() {
-        let mark = serde_json::from_value::<retention::Mark>(value.clone()).ok()?;
-        if let Some(row) = project_mark(mark) {
-            removals.push(row);
-        }
-    }
+fn project_context(context: &ReviewContext) -> Vec<Value> {
+    let mut removals = context
+        .marks()
+        .iter()
+        .cloned()
+        .filter_map(project_mark)
+        .collect::<Vec<_>>();
     // The register is keyed by mark id, which is not an order the owner can
     // read. Newest first, so a page of rows is a run of days.
     removals.sort_by(|left, right| {
@@ -365,7 +256,7 @@ fn project_register(receipt: &Value) -> Option<Vec<Value>> {
         };
         key(right).cmp(&key(left))
     });
-    Some(removals)
+    removals
 }
 
 fn project_mark(mark: retention::Mark) -> Option<Value> {
@@ -409,6 +300,7 @@ fn project_mark(mark: retention::Mark) -> Option<Value> {
     Some(Value::Object(row))
 }
 
+#[cfg(test)]
 fn marks_store_refusal(receipt: &Value) -> bool {
     has_exact_keys(receipt, ["ok", "verb", "error"])
         && receipt.get("ok") == Some(&Value::Bool(false))
@@ -416,24 +308,7 @@ fn marks_store_refusal(receipt: &Value) -> bool {
         && receipt.get("error").and_then(Value::as_str).is_some()
 }
 
-fn approve_outcome(call: ClientCall) -> RemovalOutcome {
-    match call {
-        ClientCall::Completed(Ok(receipt)) => {
-            removal_outcome(&receipt).unwrap_or_else(unknown_outcome)
-        }
-        ClientCall::Completed(Err(retention::ClientError::Refused(refused))) => {
-            let receipt = refused.receipt_value();
-            if remove_preflight_refusal(receipt) {
-                refused_before_start()
-            } else {
-                removal_outcome(receipt).unwrap_or_else(unknown_outcome)
-            }
-        }
-        ClientCall::Completed(Err(error)) => error_outcome(&error),
-        ClientCall::Join => unknown_outcome(),
-    }
-}
-
+#[cfg(test)]
 fn removal_outcome(receipt: &Value) -> Option<RemovalOutcome> {
     let outcome = receipt.get("outcome")?.as_object()?;
     let targets = outcome.get("targets")?.as_array()?;
@@ -560,6 +435,7 @@ fn recover_unavailable() -> RecoverOutcome {
     }
 }
 
+#[cfg(test)]
 fn remove_preflight_refusal(receipt: &Value) -> bool {
     has_exact_keys(receipt, ["ok", "verb", "error"])
         && receipt.get("ok") == Some(&Value::Bool(false))
@@ -578,27 +454,7 @@ fn refusal_item(entry: Option<&str>, reason: &str) -> Value {
     }
 }
 
-fn error_outcome(error: &retention::ClientError) -> RemovalOutcome {
-    let state = error_state(error);
-    RemovalOutcome {
-        state,
-        removed_count: 0,
-        not_removed_count: 0,
-        halted: false,
-        refusals: Vec::new(),
-    }
-}
-
-fn unknown_outcome() -> RemovalOutcome {
-    RemovalOutcome {
-        state: OUTCOME_UNKNOWN,
-        removed_count: 0,
-        not_removed_count: 0,
-        halted: false,
-        refusals: Vec::new(),
-    }
-}
-
+#[cfg(test)]
 fn error_state(error: &retention::ClientError) -> &'static str {
     match error {
         retention::ClientError::BinaryUnavailable(_)
@@ -609,19 +465,14 @@ fn error_state(error: &retention::ClientError) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn decline_success(receipt: &Value) -> bool {
     receipt.get("ok") == Some(&Value::Bool(true))
         && receipt.get("verb") == Some(&Value::String("decline".to_owned()))
         && receipt.get("marks").and_then(Value::as_object).is_some()
 }
 
-fn decline_refusal(receipt: &Value) -> bool {
-    has_exact_keys(receipt, ["ok", "verb", "error"])
-        && receipt.get("ok") == Some(&Value::Bool(false))
-        && receipt.get("verb") == Some(&Value::String("decline".to_owned()))
-        && receipt.get("error").and_then(Value::as_str).is_some()
-}
-
+#[cfg(test)]
 fn decline_state(
     declined_count: usize,
     refused_count: usize,
@@ -641,6 +492,7 @@ fn decline_state(
     }
 }
 
+#[cfg(test)]
 fn has_exact_keys<const N: usize>(value: &Value, expected: [&str; N]) -> bool {
     let Some(object) = value.as_object() else {
         return false;
@@ -656,21 +508,17 @@ fn append_action(journal_root: &Path, action: &str, params: Value) {
     }
 }
 
-fn list_response(state: &'static str, removals: Vec<Value>) -> Response {
-    Json(json!({"state": state, "removals": removals})).into_response()
+fn list_response(state: &'static str, removals: Vec<Value>, context: Option<String>) -> Response {
+    Json(json!({"state": state, "removals": removals, "review_context": context})).into_response()
 }
 
 fn request_response(status: StatusCode, state: &'static str) -> Response {
     (status, Json(json!({"state": state}))).into_response()
 }
 
-fn write_response(
-    state: &'static str,
-    requested_count: usize,
-    outcome: RemovalOutcome,
-) -> Response {
+fn write_response(requested_count: usize, outcome: RemovalOutcome) -> Response {
     Json(json!({
-        "state": state,
+        "state": outcome.state,
         "requested_count": requested_count,
         "removed_count": outcome.removed_count,
         "not_removed_count": outcome.not_removed_count,
@@ -1033,5 +881,122 @@ mod tests {
         let join = recover_from_call(ClientCall::Join);
         assert_eq!(join.state, OUTCOME_UNKNOWN);
         assert_eq!(join.finished_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod review_transport_tests {
+    use super::*;
+
+    fn row(class: retention::RemovalClass, name: &str) -> retention::Mark {
+        let target = solstone_core_retention::receipt::Target {
+            day: "20261009".into(),
+            stream: "camera".into(),
+            dir: "120000_60_suffix".into(),
+        };
+        let names = vec![name.to_owned()];
+        retention::Mark {
+            id: MarkId::derive(class, &target, &names),
+            class,
+            target,
+            marked_at: "2026-10-10T00:00:00Z".into(),
+            proposal: solstone_core_retention::marks::Proposal {
+                names,
+                bytes: 9_007_199_254_740_993,
+                reason: "rendered".into(),
+            },
+            state: MarkState::Marked,
+            offload: None,
+        }
+    }
+
+    fn request(marks: &[retention::Mark], ids: &[MarkId]) -> Value {
+        let context = json!({"root_observation": "native-root-v1:unix:0000000000000001:0000000000000002", "marks": marks}).to_string();
+        json!({"review_context": context, "mark_ids": ids})
+    }
+
+    #[test]
+    fn selected_transport_retains_complete_rendered_marks_and_ignores_unselected_failures() {
+        let selected = row(retention::RemovalClass::PolicyRawRelease, "a.flac");
+        let mut failed = row(retention::RemovalClass::PolicyRawRelease, "b.flac");
+        failed.state = MarkState::Failed(solstone_core_retention::marks::Failure {
+            at: "now".into(),
+            reason: "unfinished".into(),
+            staged: None,
+        });
+        let body = request(
+            &[selected.clone(), failed.clone()],
+            std::slice::from_ref(&selected.id),
+        );
+        let decoded =
+            decode_review_request(body.to_string().as_bytes()).expect("valid rendered subset");
+        assert_eq!(decoded.marks(), std::slice::from_ref(&selected));
+        assert_eq!(decoded.marks()[0].proposal.bytes, 9_007_199_254_740_993);
+        let cases = [
+            Vec::new(),
+            vec![selected.id.clone(), selected.id.clone()],
+            vec![failed.id],
+            vec![row(retention::RemovalClass::PolicyRawRelease, "missing.flac").id],
+        ];
+        for ids in cases {
+            let mut invalid = body.clone();
+            invalid["mark_ids"] = json!(ids);
+            assert_eq!(
+                decode_review_request(invalid.to_string().as_bytes()).unwrap_err(),
+                REQUEST_INVALID
+            );
+        }
+        let ordinary = row(retention::RemovalClass::OwnerRawRelease, "ordinary.flac");
+        let body = request(
+            std::slice::from_ref(&ordinary),
+            std::slice::from_ref(&ordinary.id),
+        );
+        assert_eq!(
+            decode_review_request(body.to_string().as_bytes()).unwrap_err(),
+            REQUEST_INVALID
+        );
+    }
+
+    #[test]
+    fn review_request_strictly_refuses_missing_legacy_duplicate_and_oversized_transport() {
+        let selected = row(retention::RemovalClass::PolicyRawRelease, "a.flac");
+        let valid = request(
+            std::slice::from_ref(&selected),
+            std::slice::from_ref(&selected.id),
+        );
+        let mut unknown = valid.clone();
+        unknown["extra"] = json!(true);
+        let mut missing = valid.clone();
+        missing
+            .as_object_mut()
+            .expect("request object")
+            .remove("review_context");
+        let mut malformed = valid.clone();
+        malformed["review_context"] = json!("{}");
+        let mut object = valid.clone();
+        object["review_context"] = json!({});
+        for invalid in [unknown, missing, malformed, object] {
+            assert_eq!(
+                decode_review_request(invalid.to_string().as_bytes()).unwrap_err(),
+                REQUEST_INVALID
+            );
+        }
+        let duplicate = format!("{{\"mark_ids\":[],{}", &valid.to_string()[1..]);
+        assert_eq!(
+            decode_review_request(duplicate.as_bytes()).unwrap_err(),
+            REQUEST_INVALID
+        );
+        let mut oversized = valid.clone();
+        oversized["mark_ids"] = json!(vec![selected.id; 33]);
+        assert_eq!(
+            decode_review_request(oversized.to_string().as_bytes()).unwrap_err(),
+            REQUEST_TOO_LARGE
+        );
+        oversized = valid;
+        oversized["review_context"] = json!("x".repeat(MAX_REVIEW_CONTEXT_BYTES + 1));
+        assert_eq!(
+            decode_review_request(oversized.to_string().as_bytes()).unwrap_err(),
+            REQUEST_TOO_LARGE
+        );
     }
 }
