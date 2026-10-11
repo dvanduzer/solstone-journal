@@ -212,7 +212,21 @@ pub fn fetch_hosted_credentials(
     scope: &str,
     version: &str,
 ) -> Result<HostedCredentials, HostedCredsUnavailable> {
-    let request = HttpRequest {
+    let request = hosted_credentials_request(binding, scope, version);
+    let response = transport
+        .execute(&request)
+        .map_err(|_| HostedCredsUnavailable {
+            reason_code: "broker_unreachable",
+        })?;
+    decode_hosted_credentials(&response)
+}
+
+pub(crate) fn hosted_credentials_request(
+    binding: &HostedBinding,
+    scope: &str,
+    version: &str,
+) -> HttpRequest {
+    HttpRequest {
         method: "POST".into(),
         url: format!(
             "{}/backup/credentials",
@@ -229,12 +243,12 @@ pub fn fetch_hosted_credentials(
         ],
         body: serde_json::to_vec(&json!({"scope":scope})).expect("serializable"),
         timeout: Duration::from_secs(BROKER_TIMEOUT_SECONDS),
-    };
-    let response = transport
-        .execute(&request)
-        .map_err(|_| HostedCredsUnavailable {
-            reason_code: "broker_unreachable",
-        })?;
+    }
+}
+
+pub(crate) fn decode_hosted_credentials(
+    response: &HttpResponse,
+) -> Result<HostedCredentials, HostedCredsUnavailable> {
     let payload = serde_json::from_slice::<Value>(&response.body).ok();
     if response.status == 402 || needs_subscription(payload.as_ref()) {
         return Err(HostedCredsUnavailable {

@@ -19,6 +19,8 @@ use crate::runner::{reason_for_returncode, run_restic};
 use crate::s3_wipe::{S3Credentials, wipe_prefix};
 
 pub const TEARDOWN_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
+
+pub mod owned;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TeardownResult {
     pub status: String,

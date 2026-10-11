@@ -10,6 +10,11 @@ use sha2::{Digest, Sha256};
 
 use crate::hosted_runtime::{HttpError, HttpRequest, HttpTransport};
 
+#[cfg(target_os = "linux")]
+pub(crate) mod owned;
+#[cfg(any(target_os = "linux", test))]
+mod strict;
+
 type HmacSha256 = Hmac<Sha256>;
 pub const S3_WIPE_TIMEOUT_SECONDS: u64 = 60;
 pub const DELETE_OBJECT_BATCH_SIZE: usize = 1000;
@@ -198,13 +203,12 @@ fn http_reason(status: u16) -> &'static str {
     }
 }
 
-struct Client<'a> {
-    transport: &'a dyn HttpTransport,
+struct Signer<'a> {
     credentials: &'a S3Credentials,
-    amz_date: String,
+    amz_date: &'a str,
 }
-impl Client<'_> {
-    fn request(
+impl Signer<'_> {
+    fn signed_request(
         &self,
         method: &str,
         bucket: &str,
@@ -212,7 +216,7 @@ impl Client<'_> {
         query: Vec<(String, String)>,
         body: Vec<u8>,
         extra: Vec<(String, String)>,
-    ) -> Result<Vec<u8>, WipeResult> {
+    ) -> HttpRequest {
         let base = self.credentials.endpoint.trim_end_matches('/');
         let uri = canonical_uri(bucket, key);
         let query_text = canonical_query(&query);
@@ -235,7 +239,7 @@ impl Client<'_> {
         let mut headers = vec![
             ("Host".into(), host.into()),
             ("x-amz-content-sha256".into(), hash.clone()),
-            ("x-amz-date".into(), self.amz_date.clone()),
+            ("x-amz-date".into(), self.amz_date.to_owned()),
             (
                 "x-amz-security-token".into(),
                 self.credentials.session_token.clone(),
@@ -252,25 +256,47 @@ impl Client<'_> {
             &self.credentials.access_key_id,
             &self.credentials.secret_access_key,
             &self.credentials.region,
-            &self.amz_date,
+            self.amz_date,
         );
         headers.push(("Authorization".into(), authorization));
-        let response = self
-            .transport
-            .execute(&HttpRequest {
-                method: method.into(),
-                url,
-                headers,
-                body,
-                timeout: std::time::Duration::from_secs(S3_WIPE_TIMEOUT_SECONDS),
+        HttpRequest {
+            method: method.into(),
+            url,
+            headers,
+            body,
+            timeout: std::time::Duration::from_secs(S3_WIPE_TIMEOUT_SECONDS),
+        }
+    }
+}
+
+struct Client<'a> {
+    transport: &'a dyn HttpTransport,
+    credentials: &'a S3Credentials,
+    amz_date: String,
+}
+
+impl Client<'_> {
+    fn request(
+        &self,
+        method: &str,
+        bucket: &str,
+        key: Option<&str>,
+        query: Vec<(String, String)>,
+        body: Vec<u8>,
+        extra: Vec<(String, String)>,
+    ) -> Result<Vec<u8>, WipeResult> {
+        let request = Signer {
+            credentials: self.credentials,
+            amz_date: &self.amz_date,
+        }
+        .signed_request(method, bucket, key, query, body, extra);
+        let response = self.transport.execute(&request).map_err(|error| {
+            failure(match error {
+                HttpError::Timeout => "timeout",
+                HttpError::Unreachable => "unreachable",
+                HttpError::Other => "failed",
             })
-            .map_err(|error| {
-                failure(match error {
-                    HttpError::Timeout => "timeout",
-                    HttpError::Unreachable => "unreachable",
-                    HttpError::Other => "failed",
-                })
-            })?;
+        })?;
         if !(200..300).contains(&response.status) {
             return Err(failure(http_reason(response.status)));
         }

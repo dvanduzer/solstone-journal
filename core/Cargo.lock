@@ -3653,6 +3653,7 @@ dependencies = [
  "log",
  "md5",
  "nix",
+ "quick-xml",
  "rustix",
  "serde",
  "serde_json",

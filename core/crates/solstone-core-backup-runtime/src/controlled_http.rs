@@ -22,6 +22,26 @@ use ureq::unversioned::transport::{
 
 const CANCEL_POLL: Duration = Duration::from_millis(5);
 const RESOLVER_ENV: [&str; 3] = ["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES"];
+pub(crate) const TEARDOWN_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum RequestPolicy {
+    Archive,
+    Teardown,
+}
+
+impl RequestPolicy {
+    fn supports(self, method: &str) -> bool {
+        matches!(method, "GET" | "POST") || matches!(self, Self::Teardown) && method == "DELETE"
+    }
+
+    fn body_limit(self) -> usize {
+        match self {
+            Self::Archive => usize::MAX,
+            Self::Teardown => TEARDOWN_BODY_LIMIT,
+        }
+    }
+}
 
 struct Control {
     runtime: Runtime,
@@ -278,8 +298,8 @@ impl Transport for OwnedTcp {
     }
 }
 
-fn supported(request: &HttpRequest, config: &ureq::config::Config) -> bool {
-    matches!(request.method.as_str(), "GET" | "POST")
+fn supported(request: &HttpRequest, config: &ureq::config::Config, policy: RequestPolicy) -> bool {
+    policy.supports(&request.method)
         && request
             .url
             .parse::<ureq::http::Uri>()
@@ -297,6 +317,21 @@ pub(crate) fn execute(
     request: &HttpRequest,
     cancellation: &ArchiveCancellation,
 ) -> Result<HttpResponse, HttpError> {
+    execute_with_policy(request, cancellation, RequestPolicy::Archive)
+}
+
+pub(crate) fn execute_teardown(
+    request: &HttpRequest,
+    cancellation: &ArchiveCancellation,
+) -> Result<HttpResponse, HttpError> {
+    execute_with_policy(request, cancellation, RequestPolicy::Teardown)
+}
+
+fn execute_with_policy(
+    request: &HttpRequest,
+    cancellation: &ArchiveCancellation,
+    policy: RequestPolicy,
+) -> Result<HttpResponse, HttpError> {
     // Anchor before admission or thread launch. The owning archive/handoff keeps
     // its pre-existing operation deadline and rejects results against it too.
     let deadline = Instant::now()
@@ -309,13 +344,18 @@ pub(crate) fn execute(
         return Err(HttpError::Timeout);
     }
     let resolver_env_present = RESOLVER_ENV.map(|name| std::env::var_os(name).is_some());
-    let config = ureq::config::Config::builder()
+    let mut builder = ureq::config::Config::builder()
         .http_status_as_error(false)
         .max_idle_connections(0)
         .max_idle_connections_per_host(0)
-        .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
-        .build();
-    if resolver_env_present.into_iter().any(|present| present) || !supported(request, &config) {
+        .timeout_global(Some(deadline.saturating_duration_since(Instant::now())));
+    if matches!(policy, RequestPolicy::Teardown) {
+        builder = builder.max_redirects(0);
+    }
+    let config = builder.build();
+    if resolver_env_present.into_iter().any(|present| present)
+        || !supported(request, &config, policy)
+    {
         return Err(HttpError::Other);
     }
     let cancellation = cancellation.clone();
@@ -323,7 +363,7 @@ pub(crate) fn execute(
         let worker = std::thread::Builder::new()
             .name("controlled-http".into())
             .spawn_scoped(scope, || {
-                run_request(request, &cancellation, deadline, config)
+                run_request(request, &cancellation, deadline, config, policy)
             });
         worker.map(|worker| worker.join())
     });
@@ -347,6 +387,7 @@ fn run_request(
     cancellation: &ArchiveCancellation,
     deadline: Instant,
     config: ureq::config::Config,
+    policy: RequestPolicy,
 ) -> Result<HttpResponse, HttpError> {
     let control = Arc::new(Control {
         runtime: tokio::runtime::Builder::new_current_thread()
@@ -371,13 +412,21 @@ fn run_request(
             }
             builder.send(&request.body)
         }
-        _ => {
+        "DELETE" => {
+            let mut builder = agent.delete(&request.url);
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
+            }
+            builder.call()
+        }
+        "GET" => {
             let mut builder = agent.get(&request.url);
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
             builder.call()
         }
+        _ => return Err(HttpError::Other),
     };
     control.check().map_err(|_| HttpError::Other)?;
     let response = response.map_err(|error| match error {
@@ -386,6 +435,9 @@ fn run_request(
         _ => HttpError::Unreachable,
     })?;
     let status = response.status().as_u16();
+    if matches!(policy, RequestPolicy::Teardown) && (300..400).contains(&status) {
+        return Err(HttpError::Other);
+    }
     let headers = response
         .headers()
         .iter()
@@ -406,6 +458,13 @@ fn run_request(
         if count == 0 {
             break;
         }
+        if body
+            .len()
+            .checked_add(count)
+            .is_none_or(|length| length > policy.body_limit())
+        {
+            return Err(HttpError::Other);
+        }
         body.extend_from_slice(&buffer[..count]);
     }
     drop(reader);
@@ -425,6 +484,197 @@ fn run_request(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn local_request(
+        method: &str,
+        timeout: Duration,
+        cancellation: &ArchiveCancellation,
+        respond: impl FnOnce(&mut std::net::TcpStream, &str) + Send,
+    ) -> Result<HttpResponse, HttpError> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "http://{}/exact?uploadId=a%26b",
+            listener.local_addr().unwrap()
+        );
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let end = Instant::now() + Duration::from_secs(5);
+                let (mut peer, _) = loop {
+                    match listener.accept() {
+                        Ok(peer) => break peer,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < end, "request never arrived");
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                peer.set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    peer.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                    assert!(head.len() <= 65536);
+                }
+                let head = String::from_utf8(head).unwrap();
+                assert!(head.starts_with(&format!("{method} /exact?uploadId=a%26b HTTP/1.1\r\n")));
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                peer.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    body,
+                    if method == "POST" {
+                        b"abc".as_slice()
+                    } else {
+                        b"".as_slice()
+                    }
+                );
+                respond(&mut peer, &url);
+                let _ = peer.shutdown(std::net::Shutdown::Write);
+                let mut extra = Vec::new();
+                match peer.read_to_end(&mut extra) {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                        ) => {}
+                    Err(error) => panic!("client did not close the owned socket: {error}"),
+                }
+                assert!(extra.is_empty());
+            });
+            let result = execute_teardown(
+                &HttpRequest {
+                    method: method.into(),
+                    url: url.clone(),
+                    headers: vec![],
+                    body: if method == "POST" {
+                        b"abc".to_vec()
+                    } else {
+                        vec![]
+                    },
+                    timeout,
+                },
+                cancellation,
+            );
+            eprintln!("teardown HTTP control {method}: {result:?}");
+            server.join().unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+                "unexpected redirect/retry connection"
+            );
+            result
+        })
+    }
+
+    #[test]
+    #[ignore = "requires a copied installed package with the actual owned DNS member"]
+    fn teardown_dispatches_actual_get_post_delete_and_caps_before_extension() {
+        for method in ["GET", "POST", "DELETE"] {
+            let response = local_request(
+                method,
+                Duration::from_secs(5),
+                &ArchiveCancellation::new(),
+                |peer, _| {
+                    peer.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .unwrap();
+                },
+            )
+            .unwrap();
+            assert_eq!(response.body, b"ok");
+        }
+        let response = local_request("GET", Duration::from_secs(5), &ArchiveCancellation::new(), |peer, _| {
+            write!(peer, "HTTP/1.1 200 OK\r\nContent-Length: {TEARDOWN_BODY_LIMIT}\r\nConnection: close\r\n\r\n").unwrap();
+            peer.write_all(&vec![b'x'; TEARDOWN_BODY_LIMIT]).unwrap();
+        }).unwrap();
+        assert_eq!(response.body.len(), TEARDOWN_BODY_LIMIT);
+        assert!(
+            local_request(
+                "GET",
+                Duration::from_secs(5),
+                &ArchiveCancellation::new(),
+                |peer, _| {
+                    write!(
+                        peer,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        TEARDOWN_BODY_LIMIT + 1
+                    )
+                    .unwrap();
+                    let _ = peer.write_all(&vec![b'x'; TEARDOWN_BODY_LIMIT + 1]);
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a copied installed package with the actual owned DNS member"]
+    fn teardown_redirect_cancel_and_body_deadline_close_actual_socket_before_return() {
+        assert!(local_request("DELETE", Duration::from_secs(5), &ArchiveCancellation::new(), |peer, url| {
+            write!(peer, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {url}\r\nContent-Length: 0\r\n\r\n").unwrap();
+        }).is_err());
+        let cancellation = ArchiveCancellation::new();
+        let server_cancel = cancellation.clone();
+        assert!(
+            local_request(
+                "DELETE",
+                Duration::from_secs(5),
+                &cancellation,
+                move |peer, _| {
+                    peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nx")
+                        .unwrap();
+                    server_cancel.cancel();
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            local_request(
+                "GET",
+                Duration::from_secs(3),
+                &ArchiveCancellation::new(),
+                |peer, _| {
+                    peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nx")
+                        .unwrap();
+                    // Keep the write half open until the deadline closes the client.
+                    let mut extra = [0];
+                    assert_eq!(peer.read(&mut extra).unwrap(), 0);
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn teardown_unsupported_method_refuses_without_a_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let request = HttpRequest {
+            method: "PUT".into(),
+            url: format!("http://{}/", listener.local_addr().unwrap()),
+            headers: vec![],
+            body: vec![],
+            timeout: Duration::from_secs(1),
+        };
+        assert!(execute_teardown(&request, &ArchiveCancellation::new()).is_err());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
 
     #[test]
     fn tcp_probe_accepts_idle_socket_and_rejects_pending_bytes() {
