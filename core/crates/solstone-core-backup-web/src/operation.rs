@@ -36,6 +36,8 @@ pub struct Operation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guidance: Option<String>,
     pub recording_failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<serde_json::Value>,
     pub portal_url: Option<String>,
 }
 
@@ -81,6 +83,7 @@ fn apply_terminal(current: &mut Slot, terminal: Terminal) {
     current.view.detail = terminal.detail;
     current.view.guidance = terminal.guidance;
     current.view.recording_failure = terminal.recording_failure;
+    current.view.report = terminal.report;
     current.view.portal_url = None;
     current.nonce = None;
     current.restore_key = None;
@@ -451,6 +454,7 @@ fn install_slot(
         detail: None,
         guidance: None,
         recording_failure: None,
+        report: None,
         portal_url,
     };
     *current = Some(Slot {
@@ -518,6 +522,7 @@ pub fn finish(
             detail: None,
             guidance: None,
             recording_failure,
+            report: None,
         },
     );
 }
@@ -551,6 +556,7 @@ pub struct Terminal {
     pub detail: Option<String>,
     pub guidance: Option<String>,
     pub recording_failure: Option<String>,
+    pub report: Option<serde_json::Value>,
 }
 
 impl Terminal {
@@ -565,6 +571,7 @@ impl Terminal {
             detail: None,
             guidance: None,
             recording_failure: None,
+            report: None,
         }
     }
 
@@ -575,6 +582,7 @@ impl Terminal {
             detail: Some(error.detail().to_owned()),
             guidance: Some(error.guidance().to_owned()),
             recording_failure: None,
+            report: None,
         }
     }
 
@@ -585,6 +593,7 @@ impl Terminal {
             detail: None,
             guidance: None,
             recording_failure: None,
+            report: None,
         }
     }
 
@@ -599,6 +608,7 @@ impl Terminal {
             detail: None,
             guidance: None,
             recording_failure,
+            report: None,
         }
     }
 }
@@ -929,6 +939,7 @@ mod terminal_tests {
                 detail: None,
                 guidance: None,
                 recording_failure: None,
+                report: None,
                 portal_url,
             },
             nonce,
@@ -951,6 +962,7 @@ mod terminal_tests {
             detail: Some("tool detail".into()),
             guidance: Some("next step".into()),
             recording_failure: Some("recording failed".into()),
+            report: Some(serde_json::json!({"files_restored":1, "bytes_restored":7})),
         }
     }
 
@@ -966,6 +978,7 @@ mod terminal_tests {
             Some("recording failed")
         );
         assert!(current.view.portal_url.is_none());
+        assert_eq!(current.view.report, failure().report);
         assert!(current.nonce.is_none());
         assert!(current.restore_key.is_none());
     }
@@ -1056,7 +1069,16 @@ mod terminal_tests {
             .generation;
         assert!(start_worker(&slot, next));
         let current_view = current(&slot).unwrap();
-        settle(&slot, 2, Terminal::error("stale"));
+        assert!(current_view.report.is_none());
+        assert!(
+            serde_json::to_value(&current_view)
+                .unwrap()
+                .get("report")
+                .is_none()
+        );
+        let mut stale = Terminal::error("stale");
+        stale.report = Some(serde_json::json!({"stale":true}));
+        settle(&slot, 2, stale);
         assert_eq!(current(&slot).unwrap(), current_view);
         assert!(slot.lock().unwrap().as_ref().unwrap().worker_active);
         settle(&slot, next, Terminal::done());

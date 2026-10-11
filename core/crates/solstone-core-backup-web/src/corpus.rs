@@ -2750,6 +2750,15 @@ mod held_restore_tests {
                 assert_eq!(terminal["operation"]["kind"], "offload_restore");
                 assert_eq!(terminal["operation"]["phase"], "refused");
                 assert_eq!(terminal["operation"]["reason_code"], reason);
+                assert_eq!(terminal["operation"]["report"]["status"], "refused");
+                assert_eq!(terminal["operation"]["report"]["reason"], reason);
+                assert_eq!(terminal["operation"]["report"]["files_expected"], 1);
+                assert_eq!(terminal["operation"]["report"]["files_restored"], 0);
+                assert_eq!(terminal["operation"]["report"]["bytes_restored"], 0);
+                assert_eq!(
+                    terminal["operation"]["report"]["details"][0]["reason"],
+                    reason
+                );
                 assert!(runner.calls.lock().unwrap().is_empty());
                 assert!(http.requests.lock().unwrap().is_empty());
                 assert_eq!(snapshot(root.path()), before);
