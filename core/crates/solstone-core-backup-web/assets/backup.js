@@ -169,6 +169,18 @@
       "stalled_lead": "offload couldn't finish.",
       "backup_only_label": "kept only in backup",
       "restore_expectation": "restoring {size} from your backup. a large restore can take a while.",
+      "restore_report": {
+        "effects": "files restored: {files} · added to this device: {size}",
+        "files": "file results",
+        "held": "still needs attention",
+        "dispositions": {
+          "published": "restored",
+          "already_present": "already on this device",
+          "conflict": "existing file kept",
+          "unverified": "result not confirmed",
+          "unattempted": "not attempted"
+        }
+      },
       "disable_note": "this stops. days already in your backup stay there, protected and restorable.",
       "unavailable_lead": "can't read offload status right now.",
       "action_error": "media offload couldn't finish. check backup setup, then try again.",
@@ -233,6 +245,7 @@
         "unexpected_error": "media offload stopped unexpectedly. try again after backup maintenance runs."
       },
       "restore_reason_labels": {
+        "archive_unbound": "the backup record doesn't identify the archive needed to restore these files.",
         "auth_failed": "encrypted backup rejected the recovery key or credentials.",
         "backup_not_ready": "encrypted backup is not ready to restore media.",
         "failed": "media restore could not finish.",
@@ -242,6 +255,7 @@
         "missing_file_after_restore": "media restore finished, but a file was still missing.",
         "nothing_to_restore": "nothing to restore for that day.",
         "repo_missing": "encrypted backup could not find the repository.",
+        "restore_held": "restoring offloaded files is temporarily unavailable.",
         "segment_missing": "that day is no longer available locally.",
         "timeout": "media restore took too long. try again later.",
         "verification_failed": "restored media did not match the backup checksum."
@@ -336,6 +350,8 @@
   let offloadState = { status: 'loading', payload: null };
   let currentRecoveryDisplay = '';
   let offloadDaysExpanded = false;
+  let displayedRestoreOperation = null;
+  let displayedRestoreReport = null;
   let pollTimer = null;
   let cleanupRequestRunning = false;
   const cleanupEligibility = new WeakMap();
@@ -1228,9 +1244,10 @@
 
   function reasonFromOffloadMap(labels, path, reason) {
     if (!reason) return '';
-    const label = labels[reason];
+    const label = typeof reason === 'string' && Object.prototype.hasOwnProperty.call(labels, reason)
+      ? labels[reason] : '';
     if (!label) logMissingCopy(`${path}.${reason}`);
-    return label || '';
+    return label || offloadCopy.reason_unavailable || '';
   }
 
   function offloadStallReasonLabel(reason) {
@@ -1642,8 +1659,68 @@
     renderOffloadDays(showProof ? payload.days : []);
   }
 
+  function restoreEffectText(value) {
+    const labels = offloadCopy.restore_report || {};
+    const validCount = (count) => Number.isSafeInteger(count) && count >= 0;
+    const files = validCount(value.files_restored)
+      ? value.files_restored.toLocaleString() : statusLabels.not_available || '';
+    const size = formatBytes(validCount(value.bytes_restored) ? value.bytes_restored : null);
+    return (labels.effects || '').replace('{files}', files).replace('{size}', size);
+  }
+
+  function renderRestoreReport(operation) {
+    const container = root.querySelector('[data-operation-restore-report]');
+    const summary = root.querySelector('[data-operation-restore-summary]');
+    const details = root.querySelector('[data-operation-restore-details]');
+    const rows = root.querySelector('[data-operation-restore-files]');
+    if (!container || !summary || !details || !rows) return;
+    const report = operation && operation.kind === 'offload_restore' && operation.report;
+    if (!report || typeof report !== 'object' || Array.isArray(report)) {
+      container.hidden = true;
+      summary.textContent = '';
+      rows.replaceChildren();
+      details.hidden = true;
+      details.removeAttribute('open');
+      displayedRestoreOperation = null;
+      displayedRestoreReport = null;
+      return;
+    }
+    container.hidden = false;
+    if (operation === displayedRestoreOperation && report === displayedRestoreReport) return;
+    displayedRestoreOperation = operation;
+    displayedRestoreReport = report;
+    summary.textContent = restoreEffectText(report);
+    rows.replaceChildren();
+    details.removeAttribute('open');
+    const files = Array.isArray(report.files) ? report.files : [];
+    details.hidden = files.length === 0;
+    const labels = offloadCopy.restore_report || {};
+    const dispositions = labels.dispositions || {};
+    const unavailable = (offloadCopy.result_labels || {}).unknown || '';
+    for (const file of files) {
+      const row = document.createElement('li');
+      if (!file || typeof file !== 'object' || Array.isArray(file)) {
+        row.setAttribute('data-restore-disposition', 'unknown');
+        row.textContent = unavailable;
+      } else {
+        const known = typeof file.disposition === 'string'
+          && Object.prototype.hasOwnProperty.call(dispositions, file.disposition);
+        row.setAttribute('data-restore-disposition', known ? file.disposition : 'unknown');
+        const location = [file.day, file.stream, file.segment, file.name]
+          .filter((part) => typeof part === 'string' && part.length > 0).join('/');
+        const held = file.evidence && typeof file.evidence === 'object'
+          && !Array.isArray(file.evidence) && file.evidence.hold != null;
+        row.textContent = [location || unavailable,
+          known ? dispositions[file.disposition] : unavailable,
+          restoreEffectText(file), held ? labels.held : ''].filter(Boolean).join(' · ');
+      }
+      rows.appendChild(row);
+    }
+  }
+
   function renderOperation() {
     const operation = state.operation;
+    renderRestoreReport(operation);
     const banner = root.querySelector('[data-operation-banner]');
     if (!banner) return;
     if (

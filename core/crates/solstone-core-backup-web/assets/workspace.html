@@ -12,6 +12,14 @@
     <span class="backup-op-error" data-operation-error></span>
   </div>
 
+  <div class="backup-restore-report" data-operation-restore-report hidden>
+    <p class="backup-note" data-operation-restore-summary role="status" aria-live="polite" aria-atomic="true"></p>
+    <details data-operation-restore-details hidden>
+      <summary data-copy="offload.restore_report.files"></summary>
+      <ol data-operation-restore-files></ol>
+    </details>
+  </div>
+
   <div class="backup-operation" data-cleanup-banner role="status" hidden>
     <span data-cleanup-heading></span>
     <span class="backup-op-error" data-cleanup-reason></span>
