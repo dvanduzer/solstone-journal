@@ -20,31 +20,25 @@ use minisign::KeyPair;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use solstone_core_backup::{
-    Destination, HostedBinding, generate_and_store_keys, get_backup_config, get_keys,
-    set_destination, set_enabled, set_offload, set_recovery_key_confirmed,
+    Destination, HostedBinding, generate_and_store_keys, get_keys, set_destination, set_enabled,
+    set_recovery_key_confirmed,
 };
 use solstone_core_backup_runtime::{
     BackupServices, Clock, HostedCredentials, NativeJournalMaintenance, NativeRestoreRecorder,
-    SystemToolRunner, ToolOutput, ToolRequest, ToolRunner, UreqHttpTransport,
-    hosted_append_only_session, init_repository, restore_journal, rotate_recovery_key, run_backup,
-    run_prune, run_restic, run_verification, validate_destination,
+    SystemToolRunner, UreqHttpTransport, hosted_append_only_session, init_repository,
+    restore_journal, rotate_recovery_key, run_backup, run_prune, run_restic, run_verification,
+    validate_destination,
 };
+#[cfg(windows)]
+use solstone_core_backup_runtime::{ToolOutput, ToolRequest, ToolRunner};
 use solstone_core_distribution::windows_payload::{
     WINDOWS_PAYLOAD_MANIFEST, WINDOWS_PAYLOAD_SIGNATURE, render_windows_payload_manifest,
     verify_windows_payload,
 };
-use solstone_core_offload::{restore_all_offload, run_offload};
-use solstone_core_retention::{Anchor, Days, Policy, Rule, marks, remove_marked::remove_marked};
+use solstone_core_offload::restore_all_offload;
+use solstone_core_retention::archive_catalog::OffloadFile;
 
 struct WallClock;
-struct ShortDeadline;
-impl ToolRunner for ShortDeadline {
-    fn run(&self, request: &ToolRequest<'_>) -> std::io::Result<ToolOutput> {
-        let mut request = request.clone();
-        request.timeout = Some(Duration::from_secs(2));
-        SystemToolRunner.run(&request)
-    }
-}
 impl Clock for WallClock {
     fn now_unix(&self) -> i64 {
         Utc::now().timestamp()
@@ -261,7 +255,7 @@ fn backup_native_round_trip() {
         .prefix("native-backup-data-")
         .tempdir()
         .unwrap();
-    let (mut server, endpoint) = serve_s3(&rclone, &tmp.path().join("s3-storage"));
+    let (server, endpoint) = serve_s3(&rclone, &tmp.path().join("s3-storage"));
     #[cfg(windows)]
     process::installed_tools(&restic, &rclone, tmp.path());
     let destination = Destination {
@@ -354,56 +348,25 @@ fn backup_native_round_trip() {
         &active_keys.recovery_key,
     );
 
-    set_offload(
-        &journal,
-        json!({"enabled":true,"budget_bytes":1,"floor_bytes":1})
-            .as_object()
-            .unwrap(),
-    )
-    .unwrap();
-    let marked = run_offload(&journal, &services, false);
-    assert_eq!(marked.status, "ok", "{marked:?}");
-    assert_eq!(marked.files_marked, 1, "{marked:?}");
-    assert_eq!(
-        fs::read(&raw).unwrap(),
-        original,
-        "marking must preserve local originals"
-    );
-    let register = marks::load(&journal).unwrap();
-    let ids = register.marks.keys().cloned().collect::<Vec<_>>();
-    assert_eq!(ids.len(), 1);
     let prune = run_prune(&journal, &services);
     assert_eq!(prune.status, "ok", "{prune:?}");
-    let approved = marks::preflight(&journal, &ids).unwrap();
-    let policy = Policy {
-        default_rule: Rule {
-            anchor: Anchor::Captured,
-            period: Some(Days(1)),
-            priority: 0,
-        },
-        empty_audio_rule: Rule {
-            anchor: Anchor::Captured,
-            period: Some(Days(1)),
-            priority: 0,
-        },
-        enabled: true,
-        ..Policy::default()
-    };
-    let mut errors = vec![];
-    let removed = remove_marked(
+    // Synthetic legacy history supports only this held-route control. This is
+    // neither an owned archive witness nor production media-removal evidence.
+    solstone_core_offload::append_offload_event(
         &journal,
-        &approved,
-        &policy,
-        Utc::now().date_naive(),
-        Utc::now(),
-        &mut errors,
-    );
-    assert!(errors.is_empty(), "{errors:?}");
-    assert!(removed.halted.is_none(), "{removed:?}");
-    assert!(
-        !raw.exists(),
-        "owner-approved fixture removal must execute: {removed:?}"
-    );
+        "20260101",
+        "default",
+        "010000_001",
+        "synthetic-legacy-snapshot",
+        &[OffloadFile {
+            name: "raw.webm".into(),
+            bytes: original.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&original)),
+        }],
+        1,
+    )
+    .unwrap();
+    fs::remove_file(&raw).unwrap(); // Disposable fixture's missing original.
     #[cfg(windows)]
     process::refused_selective_root(&journal, raw.parent().unwrap(), tmp.path(), &services);
     let ledger = solstone_core_offload::ledger_path_for_day(&journal, "20260101").unwrap();
@@ -414,7 +377,7 @@ fn backup_native_round_trip() {
     assert_eq!((held.files_restored, held.bytes_restored), (0, 0));
     assert!(!raw.exists(), "held restore must not publish live media");
     assert_eq!(fs::read(&ledger).unwrap(), witness);
-    println!("NATIVE_BACKUP_OFFLOAD_PRUNE_RESTORE_HELD_OK");
+    println!("NATIVE_BACKUP_PRUNE_LEGACY_RESTORE_HELD_OK");
 
     // Exercise the actual restic -> rclone parser and no-config mechanism with
     // a synthetic binding. Broker consent is a separate integration proof.
@@ -487,31 +450,6 @@ fn backup_native_round_trip() {
     drop(blackhole);
     println!("NATIVE_BACKUP_RCLONE_TIMEOUT_OK");
 
-    let confirmed_again = run_offload(&journal, &services, false);
-    assert_eq!(confirmed_again.status, "ok", "{confirmed_again:?}");
-    assert_eq!(confirmed_again.files_marked, 1, "{confirmed_again:?}");
-    // The older unconfirmed segment is the first archive attempt on the next run.
-    let pending = raw_fixture(&journal, "20251231", b"never confirmed remotely");
-    let pending_bytes = fs::read(&pending).unwrap();
-    server.0.kill().unwrap();
-    server.0.wait().unwrap();
-    let before = marks::load(&journal).unwrap();
-    assert_eq!(before.marks.len(), 1, "retain the earlier confirmed mark");
-    let failing_services = BackupServices {
-        runner: &ShortDeadline,
-        ..services
-    };
-    let failed = run_offload(&journal, &failing_services, false);
-    assert_eq!(failed.status, "stalled", "{failed:?}");
-    assert_eq!(failed.files_marked, 0, "{failed:?}");
-    assert_eq!(fs::read(&pending).unwrap(), pending_bytes);
-    assert_eq!(marks::load(&journal).unwrap().marks, before.marks);
-    assert!(
-        get_backup_config(&journal)
-            .unwrap()
-            .contains_key("last_offload")
-    );
-    println!("NATIVE_BACKUP_UNVERIFIED_NO_MARK_OR_REMOVAL_OK");
     drop(server);
     #[cfg(windows)]
     process::poisoned_payload(&restic, &rclone, &destination.repository);

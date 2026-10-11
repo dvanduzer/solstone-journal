@@ -3,6 +3,7 @@
 
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, NaiveDate, Utc};
@@ -24,9 +25,10 @@ use solstone_core_backup_runtime::{
     resolve_operational_tools, resolve_restic_member, resolve_tools, restore_journal,
     rotate_recovery_key, run_prune, teardown_backup, validate_destination,
 };
+use solstone_core_offload::cli_run::{OwnedOffloadCliRun, run_cli_offload};
 use solstone_core_offload::{
     OffloadResult, RestoreResult as OffloadRestoreResult, format_offload_result,
-    restore_all_offload, restore_offload_day, run_offload,
+    restore_all_offload, restore_offload_day,
 };
 use solstone_core_offload::{
     measurement::{device_free_bytes, device_total_bytes, suggest_offload_defaults},
@@ -58,7 +60,97 @@ impl std::fmt::Debug for CliRun {
     }
 }
 
-pub fn run_cli(args: &[String], journal: &Path) -> CliRun {
+#[derive(Debug)]
+#[must_use = "Retain the whole command outcome through printing and exit"]
+pub enum CliOutcome {
+    Rendered(CliRun),
+    Offload(Box<OwnedOffloadCliRun>),
+}
+impl CliOutcome {
+    pub fn output(&self) -> (&str, &str, i32) {
+        match self {
+            Self::Rendered(run) => (&run.stdout, &run.stderr, run.exit_code),
+            Self::Offload(run) => run.output(),
+        }
+    }
+}
+
+pub fn run_cli(args: &[String], journal: &Path) -> CliOutcome {
+    if let Some(dry_run) = owned_offload_options(args) {
+        return CliOutcome::Offload(Box::new(run_cli_offload(
+            journal,
+            Arc::new(ProductionClock),
+            dry_run,
+        )));
+    }
+    CliOutcome::Rendered(run_rendered_cli(args, journal))
+}
+
+fn owned_offload_options(args: &[String]) -> Option<bool> {
+    let args = normalize_global_flags(args);
+    if has_help(&args) {
+        return None;
+    }
+    let options = args.strip_prefix(&["offload".into(), "run".into()])?;
+    let (flags, positionals) = split_terminator(options);
+    if !positionals.is_empty() || flags.iter().any(|flag| flag != "--dry-run") {
+        return None;
+    }
+    Some(flags.iter().any(|flag| flag == "--dry-run"))
+}
+
+#[cfg(test)]
+mod owned_offload_tests {
+    use super::*;
+
+    #[test]
+    fn valid_dry_run_retains_finite_prelaunch_outcome_without_resolution() {
+        for args in [
+            vec!["offload".into(), "run".into(), "--dry-run".into()],
+            vec![
+                "--verbose".into(),
+                "offload".into(),
+                "run".into(),
+                "--dry-run".into(),
+                "--".into(),
+            ],
+        ] {
+            let outcome = run_cli(&args, Path::new("/does-not-exist/owned-offload-cli"));
+            let CliOutcome::Offload(run) = &outcome else {
+                panic!("whole offload outcome required")
+            };
+            assert!(matches!(
+                run.prelaunch_refusal(),
+                Some(solstone_core_offload::cli_run::CliPrelaunchRefusal::DryRun)
+            ));
+            assert!(run.preparation_custody().is_none());
+            assert_ne!(outcome.output().2, 0);
+        }
+    }
+
+    #[test]
+    fn help_and_invalid_options_do_not_select_owning_execution() {
+        for args in [
+            vec!["offload".into(), "run".into(), "--help".into()],
+            vec!["offload".into(), "run".into(), "--wat".into()],
+            vec![
+                "offload".into(),
+                "run".into(),
+                "--".into(),
+                "--dry-run".into(),
+            ],
+        ] {
+            assert_eq!(owned_offload_options(&args), None);
+            assert_eq!(classify_tool_resolution(&args), None);
+        }
+        assert_eq!(
+            owned_offload_options(&["offload".into(), "run".into()]),
+            Some(false)
+        );
+    }
+}
+
+fn run_rendered_cli(args: &[String], journal: &Path) -> CliRun {
     let executable = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
@@ -259,16 +351,9 @@ fn classify_tool_resolution(args: &[String]) -> Option<bool> {
                 .then_some(false)
         }
         "offload" => {
-            let (subcommand, options) = rest.split_first()?;
+            let (subcommand, _options) = rest.split_first()?;
             match subcommand.as_str() {
-                "run" => {
-                    let (flags, positionals) = split_terminator(options);
-                    if !positionals.is_empty() || flags.iter().any(|flag| flag != "--dry-run") {
-                        None
-                    } else {
-                        Some(true)
-                    }
-                }
+                "run" => None,
                 // The owning interim restore path is read-only and launches no helper.
                 "restore" => None,
                 _ => None,
@@ -1012,13 +1097,29 @@ fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
 
-fn offload_run(args: &[String], journal: &Path, services: &BackupServices<'_>) -> CliRun {
+fn offload_run(args: &[String], _journal: &Path, _services: &BackupServices<'_>) -> CliRun {
     let (options, positionals) = split_terminator(args);
     if !positionals.is_empty() || options.iter().any(|option| option != "--dry-run") {
         return offload_usage_error(&args.join(" "));
     }
     let dry_run = options.iter().any(|option| option == "--dry-run");
-    offload_run_result(run_offload(journal, services, dry_run))
+    CliRun {
+        stdout: format!(
+            "offload_status=held reason={}\n",
+            if dry_run {
+                "dry_run_unavailable"
+            } else {
+                "owned_operation_required"
+            }
+        ),
+        stderr: if dry_run {
+            "a read-only offload preview is unavailable. no offload work was started.\n".into()
+        } else {
+            "run `solstone journal backup offload run` with the installed solstone command.\n"
+                .into()
+        },
+        exit_code: 1,
+    }
 }
 
 fn offload_run_result(result: OffloadResult) -> CliRun {
@@ -1894,9 +1995,9 @@ mod tests {
     #[test]
     fn malformed_uses_owned_usage() {
         let output = run_cli(&["wat".into()], Path::new("/unused"));
-        assert_eq!(output.exit_code, 2);
+        assert_eq!(output.output().2, 2);
         assert_eq!(
-            output.stderr,
+            output.output().1,
             "usage: solstone journal backup <command> [options]\nsolstone journal backup: error: unrecognized arguments: wat\n"
         );
     }
@@ -2146,9 +2247,9 @@ mod tests {
     #[test]
     fn off_without_yes_refuses_before_constructing_a_teardown_request() {
         let output = run_cli(&["off".into()], Path::new("/unused"));
-        assert_eq!(output.exit_code, 1);
+        assert_eq!(output.output().2, 1);
         assert_eq!(
-            output.stderr,
+            output.output().1,
             "Error: Refusing to tear down backup without --yes. This forgets all snapshots.\n"
         );
     }
@@ -2156,8 +2257,8 @@ mod tests {
     #[test]
     fn off_unknown_option_uses_root_usage() {
         let output = run_cli(&["off".into(), "--wat".into()], Path::new("/unused"));
-        assert_eq!(output.exit_code, 2);
-        assert!(output.stderr.starts_with(USAGE));
+        assert_eq!(output.output().2, 2);
+        assert!(output.output().1.starts_with(USAGE));
     }
 
     #[test]
@@ -2400,7 +2501,7 @@ mod tests {
     }
 
     #[test]
-    fn offload_run_stalled_reports_failure_and_forwards_dry_run() {
+    fn borrowed_services_offload_refuses_before_work() {
         let journal = tempfile::tempdir().unwrap();
         set_offload(
             journal.path(),
@@ -2421,7 +2522,7 @@ mod tests {
         assert_eq!(normal.exit_code, 1);
         assert_eq!(
             normal.stdout,
-            "backup offload: stalled reason=your backup isn't set up or hasn't completed a successful run yet files_marked=0 bytes_marked=0 bytes_released=0 ran_out_of_markable_media=false\n"
+            "offload_status=held reason=owned_operation_required\n"
         );
         let dry_run = run_cli_with(
             &["offload".into(), "run".into(), "--dry-run".into()],
@@ -2431,7 +2532,7 @@ mod tests {
         assert_eq!(dry_run.exit_code, 1);
         assert_eq!(
             dry_run.stdout,
-            "backup offload: stalled reason=your backup isn't set up or hasn't completed a successful run yet dry_run=true\n"
+            "offload_status=held reason=dry_run_unavailable\n"
         );
     }
 
@@ -2509,7 +2610,7 @@ mod tests {
             assert!(output.stderr.starts_with(OFFLOAD_USAGE));
         }
         let help = run_cli(&["offload".into(), "--help".into()], journal.path());
-        assert_eq!(help.stdout, OFFLOAD_USAGE);
+        assert_eq!(help.output().0, OFFLOAD_USAGE);
     }
 
     #[test]
@@ -4529,29 +4630,28 @@ mod resolution_tests {
         assert_ne!(program, "rclone");
     }
 
-    // The operated run passes the verified rclone member path.
     #[test]
-    fn ac5_offload_run_passes_absolute_rclone_program() {
+    fn ac5_borrowed_offload_refuses_without_invoking_rclone() {
         let package_dir = tempfile::tempdir().unwrap();
-        let decoy_dir = tempfile::tempdir().unwrap();
         let exe = build_fixture_tree(package_dir.path(), b"restic", b"rclone");
-        let expected_rclone = package_dir.path().join("lib/solstone-rclone/rclone");
-        let decoy = decoy_dir.path().join("rclone");
-        fs::write(&decoy, b"decoy").unwrap();
         let journal = operated_journal();
         configure_offload(journal.path());
+        let before = fs::read(journal.path().join("config/journal.json")).unwrap();
         let runner = RecordingRunner::new();
-        run_cli_with_deps(
+        let result = run_cli_with_deps(
             &args(&["offload", "run"]),
             journal.path(),
             &runner,
             &BrokerHttp::new(),
             &exe,
         );
-        let program = rclone_program(&runner.argvs.borrow()).expect("rclone.program");
-        assert_eq!(program, format!("\"{}\"", expected_rclone.display()));
-        assert_ne!(program, decoy.display().to_string());
-        assert_ne!(program, "rclone");
+        assert_ne!(result.exit_code, 0);
+        assert!(runner.programs.borrow().is_empty());
+        assert!(runner.argvs.borrow().is_empty());
+        assert_eq!(
+            fs::read(journal.path().join("config/journal.json")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -4639,12 +4739,11 @@ mod resolution_tests {
             args(&["offload", "run"]),
             args(&["offload", "run", "--dry-run"]),
         ] {
-            assert_eq!(classify_tool_resolution(&argv), Some(true));
+            assert_eq!(classify_tool_resolution(&argv), None);
             let runner = RecordingRunner::new();
-            let tools = resolve_operational_tools(&runner, journal.path(), true, &exe)
-                .expect("offload resolves its pinned restic dependency");
-            assert_eq!(tools.restic_path, expected);
-            assert!(tools.rclone_path.is_none());
+            let run = run_cli_with_deps(&argv, journal.path(), &runner, &UnusedHttp, &exe);
+            assert_ne!(run.exit_code, 0);
+            assert!(runner.programs.borrow().is_empty());
         }
 
         // `restore` is JSON-on-stdin. Exercising its command body here blocks

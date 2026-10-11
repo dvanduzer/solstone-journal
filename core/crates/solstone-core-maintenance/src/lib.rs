@@ -66,8 +66,92 @@ impl<'a> MaintenanceServices<'a> {
     }
 }
 
-/// Run the production maintenance command parser.
-pub fn run_cli(args: &[String], journal: &Path) -> CliRun {
+#[derive(Debug)]
+#[must_use = "Retain the whole command outcome through printing and exit"]
+pub enum CliOutcome {
+    Rendered(CliRun),
+    Offload(Box<solstone_core_offload::cli_run::OwnedOffloadCliRun>),
+}
+impl CliOutcome {
+    pub fn output(&self) -> (&str, &str, i32) {
+        match self {
+            Self::Rendered(run) => (&run.stdout, &run.stderr, run.exit_code),
+            Self::Offload(run) => run.output(),
+        }
+    }
+}
+
+/// Run the production maintenance command parser, retaining any offload owner.
+pub fn run_cli(args: &[String], journal: &Path) -> CliOutcome {
+    if let Some(dry_run) = owned_offload_options(args) {
+        return CliOutcome::Offload(Box::new(solstone_core_offload::cli_run::run_cli_offload(
+            journal,
+            std::sync::Arc::new(ProductionClock),
+            dry_run,
+        )));
+    }
+    CliOutcome::Rendered(run_rendered_cli(args, journal))
+}
+
+fn owned_offload_options(args: &[String]) -> Option<bool> {
+    let args = strip_maintenance_global_flags(args);
+    if maintenance_has_help(&args) {
+        return None;
+    }
+    let options = args.strip_prefix(&["run".into(), "backup:offload".into()])?;
+    let options = options.strip_prefix(&["--".into()]).unwrap_or(options);
+    if options.iter().any(|option| option != "--dry-run") {
+        return None;
+    }
+    Some(options.iter().any(|option| option == "--dry-run"))
+}
+
+#[cfg(test)]
+mod owned_offload_tests {
+    use super::*;
+
+    #[test]
+    fn valid_dry_run_retains_finite_prelaunch_outcome_without_resolution() {
+        for args in [
+            vec!["run".into(), "backup:offload".into(), "--dry-run".into()],
+            vec![
+                "--verbose".into(),
+                "run".into(),
+                "backup:offload".into(),
+                "--".into(),
+                "--dry-run".into(),
+            ],
+        ] {
+            let outcome = run_cli(&args, Path::new("/does-not-exist/owned-offload-cli"));
+            let CliOutcome::Offload(run) = &outcome else {
+                panic!("whole offload outcome required")
+            };
+            assert!(matches!(
+                run.prelaunch_refusal(),
+                Some(solstone_core_offload::cli_run::CliPrelaunchRefusal::DryRun)
+            ));
+            assert!(run.preparation_custody().is_none());
+            assert_ne!(outcome.output().2, 0);
+        }
+    }
+
+    #[test]
+    fn help_and_invalid_options_do_not_select_owning_execution() {
+        for args in [
+            vec!["run".into(), "backup:offload".into(), "--help".into()],
+            vec!["run".into(), "backup:offload".into(), "--wat".into()],
+        ] {
+            assert_eq!(owned_offload_options(&args), None);
+            assert_eq!(classify_maintenance_tool_resolution(&args), None);
+        }
+        assert_eq!(
+            owned_offload_options(&["run".into(), "backup:offload".into()]),
+            Some(false)
+        );
+    }
+}
+
+fn run_rendered_cli(args: &[String], journal: &Path) -> CliRun {
     let executable = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
@@ -285,7 +369,7 @@ fn classify_maintenance_tool_resolution(args: &[String]) -> Option<bool> {
     match id.as_str() {
         "backup:prune" if forwarded.is_empty() => Some(false),
         "backup:verify" if forwarded.is_empty() => Some(false),
-        "backup:offload" if !forwarded.iter().any(|argument| argument != "--dry-run") => Some(true),
+        "backup:offload" => None,
         _ => None,
     }
 }
@@ -1856,29 +1940,28 @@ mod resolution_tests {
         assert_ne!(program, "rclone");
     }
 
-    // The operated run passes the verified rclone member path.
     #[test]
-    fn ac5_offload_passes_absolute_rclone_program() {
+    fn ac5_borrowed_offload_refuses_without_invoking_rclone() {
         let package_dir = tempfile::tempdir().unwrap();
-        let decoy_dir = tempfile::tempdir().unwrap();
         let exe = build_fixture_tree(package_dir.path(), b"restic", b"rclone");
-        let expected_rclone = package_dir.path().join("lib/solstone-rclone/rclone");
-        let decoy = decoy_dir.path().join("rclone");
-        fs::write(&decoy, b"decoy").unwrap();
         let journal = operated_journal();
         configure_offload(journal.path());
+        let before = fs::read(journal.path().join("config/journal.json")).unwrap();
         let runner = RecordingRunner::new();
-        run_cli_with_deps(
+        let result = run_cli_with_deps(
             &args(&["run", "backup:offload"]),
             journal.path(),
             &runner,
             &BrokerHttp::new(),
             &exe,
         );
-        let program = rclone_program(&runner.argvs.borrow()).expect("rclone.program");
-        assert_eq!(program, format!("\"{}\"", expected_rclone.display()));
-        assert_ne!(program, decoy.display().to_string());
-        assert_ne!(program, "rclone");
+        assert_ne!(result.exit_code, 0);
+        assert!(runner.programs.borrow().is_empty());
+        assert!(runner.argvs.borrow().is_empty());
+        assert_eq!(
+            fs::read(journal.path().join("config/journal.json")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -1947,12 +2030,11 @@ mod resolution_tests {
             args(&["run", "backup:offload"]),
             args(&["run", "backup:offload", "--dry-run"]),
         ] {
-            assert_eq!(classify_maintenance_tool_resolution(&argv), Some(true));
+            assert_eq!(classify_maintenance_tool_resolution(&argv), None);
             let runner = RecordingRunner::new();
-            let tools = resolve_operational_tools(&runner, journal.path(), true, &exe)
-                .expect("offload resolves its pinned restic dependency");
-            assert_eq!(tools.restic_path, expected);
-            assert!(tools.rclone_path.is_none());
+            let run = run_cli_with_deps(&argv, journal.path(), &runner, &UnusedHttp, &exe);
+            assert_ne!(run.exit_code, 0);
+            assert!(runner.programs.borrow().is_empty());
         }
     }
 

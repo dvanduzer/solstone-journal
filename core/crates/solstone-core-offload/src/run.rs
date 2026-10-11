@@ -3,35 +3,7 @@
 
 //! Archive raw media, record the pre-mark ledger witness, then mint an offload mark.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-
-use chrono::{DateTime, FixedOffset, Local, TimeZone, Utc};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use solstone_core_backup::{get_backup_config, record_offload_result};
-use solstone_core_backup_runtime::{
-    BackupServices, check_archive_snapshot_files, run_archive_backup,
-};
-use solstone_core_journal_io::check_record_identities;
-use solstone_core_journal_io::paths::{PathOrDay, day_dirs, iter_segments};
-use solstone_core_retention::{
-    RawRelease, Target,
-    content::{ClosedHandlerSet, JournalMedia},
-    eligibility::resolve as resolve_segment_gate,
-    marks::{decline_offload, load as load_marks},
-    policy::policy_from_journal_config,
-    scan::scan_segment,
-    sweep::would_empty_audio_offload_mark_still_release,
-    upsert_offload,
-};
-
-use crate::ledger::append_offload_event;
-use crate::marks::OffloadMarkIndex;
-use crate::measurement::measure_local_media;
-use crate::pruning_audit::{PruneAuditWriter, open_prune_audit, write_prune_audit};
-use solstone_core_retention::archive_catalog::OffloadFile;
 
 pub use current::{
     CurrentFileIdentity, CurrentOffloadAvailability, CurrentOffloadDecision, CurrentOffloadRefusal,
@@ -198,19 +170,8 @@ pub fn format_offload_result(result: &OffloadResult) -> String {
     }
 }
 
-/// Turn an offload-run reason code into something an owner can read.
-///
-/// 🔴 The set is closed but spans two places: the 11 `OFFLOAD_STALL_REASONS`
-/// and 3 `OFFLOAD_OK_*` codes this module produces itself, plus
-/// `restic_unavailable`/`rclone_unavailable`, which `solstone-core-maintenance`
-/// hands this same formatter when it can't resolve backup tools before a real
-/// offload run ever starts (`format_backup_resolution_error`). Every value
-/// reaching this function is a `&'static str` literal from one of those two
-/// crates -- never external/untrusted text -- so the fallback below prints the
-/// code itself rather than sanitizing it.
-///
-/// ⛔ The fallback still prints the code rather than swallowing it, matching
-/// `backup_failure_reason`/`restore_failure_reason` in `solstone-core-backup-cli`.
+/// Render existing offload presentation codes, including prelaunch tool errors.
+/// Unknown codes remain visible for diagnostics.
 fn offload_reason_text(reason: &str) -> String {
     match reason {
         OFFLOAD_STALL_BACKUP_NOT_READY => {
@@ -247,8 +208,7 @@ fn offload_reason_text(reason: &str) -> String {
         }
         // ⛔ Never "moved" or "released": offload only marks raw media for a
         // later owner-approved release step and never deletes it itself
-        // (`run_offload`'s own doc comment, and the CLI line this accompanies
-        // prints `bytes_released=0` in the very same breath).
+        // The CLI line also reports `bytes_released=0`.
         OFFLOAD_OK_BUDGET_SATISFIED => {
             "enough media has been marked for release to meet the offload budget".into()
         }
@@ -263,81 +223,6 @@ fn offload_reason_text(reason: &str) -> String {
     }
 }
 
-fn stall(
-    reason: &str,
-    dry_run: bool,
-    details: Vec<OffloadSegmentDetail>,
-    files: u64,
-    bytes: u64,
-    files_already_marked: u64,
-    bytes_already_marked: u64,
-) -> OffloadResult {
-    OffloadResult {
-        status: "stalled".into(),
-        reason: Some(reason.into()),
-        files_marked: files,
-        bytes_marked: bytes,
-        files_already_marked,
-        bytes_already_marked,
-        ran_out_of_markable_media: false,
-        dry_run,
-        reason_detail: None,
-        details,
-        audit_recording_failure: None,
-        recording_failure: None,
-    }
-}
-
-impl OffloadResult {
-    fn with_reason_detail(mut self, detail: String) -> Self {
-        self.reason_detail = Some(detail);
-        self
-    }
-
-    fn with_audit_recording_failure(mut self, failure: Option<String>) -> Self {
-        self.audit_recording_failure = failure;
-        self
-    }
-}
-fn prepare(paths: &[PathBuf]) -> Option<Vec<OffloadFile>> {
-    paths
-        .iter()
-        .map(|path| {
-            let bytes = path.metadata().ok()?.len();
-            let digest = Sha256::digest(fs::read(path).ok()?);
-            Some(OffloadFile {
-                name: path.file_name()?.to_str()?.to_owned(),
-                bytes,
-                sha256: format!("{digest:x}"),
-            })
-        })
-        .collect()
-}
-fn budget_satisfied(start_raw_bytes: u64, freed_bytes: u64, budget_bytes: Option<u64>) -> bool {
-    budget_bytes.is_none_or(|budget| start_raw_bytes.saturating_sub(freed_bytes) <= budget)
-}
-fn local_instant(now_unix: i64) -> Option<DateTime<FixedOffset>> {
-    Local
-        .timestamp_opt(now_unix, 0)
-        .single()
-        .map(|time| time.fixed_offset())
-}
-fn offload_days(journal: &Path) -> Result<Vec<String>, String> {
-    let mut days = day_dirs(journal)
-        .unwrap_or_default()
-        .into_keys()
-        .collect::<Vec<_>>();
-    days.sort();
-    // A segment key is a time of day, so `(stream, key)` is unique only within
-    // one day; every day is still checked before the first release.
-    for day in &days {
-        let listed = iter_segments(journal, PathOrDay::Day(day)).unwrap_or_default();
-        if let Err(error) = check_record_identities(&listed) {
-            return Err(format!("day {day}: {error}"));
-        }
-    }
-    Ok(days)
-}
 fn precondition(config: &serde_json::Map<String, Value>, now: i64) -> Option<&'static str> {
     if config.get("enabled") != Some(&Value::Bool(true)) {
         return Some(OFFLOAD_STALL_BACKUP_NOT_READY);
@@ -385,477 +270,6 @@ fn precondition(config: &serde_json::Map<String, Value>, now: i64) -> Option<&'s
         return Some(OFFLOAD_STALL_VERIFICATION_OVERDUE);
     }
     None
-}
-
-/// Offload only records pending owner-approved release; it never deletes raw files.
-pub fn run_offload(journal: &Path, services: &BackupServices<'_>, dry_run: bool) -> OffloadResult {
-    let config = match get_backup_config(journal) {
-        Ok(config) => config,
-        Err(_) => return stall(OFFLOAD_STALL_UNEXPECTED_ERROR, dry_run, vec![], 0, 0, 0, 0),
-    };
-    finish_offload(
-        journal,
-        services,
-        run_offload_body(journal, services, dry_run, config),
-    )
-}
-
-fn finish_offload(
-    journal: &Path,
-    services: &BackupServices<'_>,
-    mut result: OffloadResult,
-) -> OffloadResult {
-    if result.dry_run {
-        return result;
-    }
-    match record_offload_result(
-        journal,
-        &result.status,
-        serde_json::json!(services.clock.now_unix()),
-        result.reason.clone().map_or(Value::Null, Value::String),
-        serde_json::json!(result.files_marked),
-        serde_json::json!(result.bytes_marked),
-        serde_json::json!(result.ran_out_of_markable_media),
-    ) {
-        Ok(()) => result,
-        Err(error) => {
-            result.recording_failure = Some(error.to_string());
-            result
-        }
-    }
-}
-
-fn run_offload_body(
-    journal: &Path,
-    services: &BackupServices<'_>,
-    dry_run: bool,
-    config: serde_json::Map<String, Value>,
-) -> OffloadResult {
-    if config.get("offload").and_then(|value| value.get("enabled")) != Some(&Value::Bool(true)) {
-        return OffloadResult {
-            status: "skipped".into(),
-            reason: None,
-            files_marked: 0,
-            bytes_marked: 0,
-            files_already_marked: 0,
-            bytes_already_marked: 0,
-            ran_out_of_markable_media: false,
-            dry_run,
-            reason_detail: None,
-            details: vec![],
-            audit_recording_failure: None,
-            recording_failure: None,
-        };
-    }
-    if let Some(reason) = precondition(&config, services.clock.now_unix()) {
-        return stall(reason, dry_run, vec![], 0, 0, 0, 0);
-    }
-    let mark_index = match load_marks(journal) {
-        Ok(register) => OffloadMarkIndex::from_register(&register),
-        Err(_) => return stall(OFFLOAD_STALL_UNEXPECTED_ERROR, dry_run, vec![], 0, 0, 0, 0),
-    };
-    // Policy for reconciling stale OffloadRawRelease marks below. ⚠ `config`
-    // above is `get_backup_config`'s backup-scoped view (only the "backup" key,
-    // merged with backup's own defaults) — it never carries "retention" or
-    // "transcribe", so a policy built from it would silently see every owner's
-    // policy as the untouched default. Read the real top-level journal config
-    // instead, same as `health::mark_raw` does. An unreadable config falls back
-    // to the default policy (release-once-processed) rather than failing the
-    // run: the only consumer below is a decline, so the safe failure direction
-    // is "reconcile nothing this pass," identical to today's behaviour.
-    let retention_config = solstone_core_journal_config::read_journal_config(journal)
-        .ok()
-        .and_then(|read| read.config)
-        .unwrap_or_default();
-    let policy = policy_from_journal_config(&retention_config);
-    // `today` is a UTC calendar date rather than the owner's configured
-    // timezone: the primary case this reconciles — `empty_audio_rule` toggled
-    // to keep-forever — has a `None` period and returns `KeptForever` without
-    // consulting age at all, so the imprecision only ever reaches an age-based
-    // ordinary-media rule, and both anchors already round toward keeping
-    // content longer.
-    let now =
-        DateTime::<Utc>::from_timestamp(services.clock.now_unix(), 0).unwrap_or_else(Utc::now);
-    let today = now.date_naive();
-    // Withdraw any existing OffloadRawRelease mark for an entirely empty-audio
-    // segment that the "keep audio with no speech" policy no longer agrees with
-    // (e.g. the owner turned it on after this segment was marked) —
-    // unconditionally, before the budget check below, because once budget is
-    // satisfied the day/segment loop that owns the rest of this function never
-    // runs again for an already-marked segment. Release was always safe either
-    // way (it re-checks policy at approval time); this is about the owner's
-    // review list staying honest, not a data-safety gap.
-    //
-    // Deliberately empty-audio-only: see `would_empty_audio_offload_mark_still_release`'s
-    // own doc for why applying the *general* retention.raw_media age policy to
-    // ordinary-media offload marks here would create an unbounded
-    // mark/decline/remark cycle instead of a fix, given that policy's shipped
-    // default is keep-forever.
-    //
-    // Deliberately does not touch `mark_index`, `files_already_marked` or
-    // `bytes_already_marked` below, which the day/segment loop's own
-    // already-marked skip and this run's budget accounting still read from the
-    // pre-reconciliation snapshot: re-deriving them here would let the segment
-    // loop immediately re-mark, in this same pass, exactly what this step just
-    // withdrew for failing today's policy.
-    if !dry_run {
-        for mark in &mark_index.entries {
-            let Ok(segments) = iter_segments(journal, PathOrDay::Day(&mark.day)) else {
-                continue;
-            };
-            let Some(segment) = segments.iter().find(|segment| {
-                segment.record_identity().is_ok_and(|identity| {
-                    identity.stream == mark.stream && identity.key == mark.dir
-                })
-            }) else {
-                continue;
-            };
-            let registry = ClosedHandlerSet;
-            let classifier = JournalMedia;
-            let found = scan_segment(segment.path(), &registry, &classifier);
-            if would_empty_audio_offload_mark_still_release(
-                &policy,
-                &registry,
-                found,
-                &mark.stream,
-                &mark.day,
-                today,
-                now,
-            ) {
-                continue;
-            }
-            let target = Target {
-                day: mark.day.clone(),
-                stream: mark.stream.clone(),
-                dir: mark.dir.clone(),
-            };
-            let _ = decline_offload(journal, &target, &mark.names);
-        }
-    }
-    let files_already_marked = mark_index
-        .entries
-        .iter()
-        .map(|mark| mark.names.len() as u64)
-        .sum();
-    let bytes_already_marked = mark_index.entries.iter().map(|mark| mark.bytes).sum();
-    let start_raw_bytes = match measure_local_media(journal).usage() {
-        Ok(usage) => usage.total_bytes,
-        Err(_) => {
-            let mut failure = stall(
-                OFFLOAD_STALL_UNEXPECTED_ERROR,
-                dry_run,
-                vec![],
-                0,
-                0,
-                files_already_marked,
-                bytes_already_marked,
-            );
-            if let Err(detail) = offload_days(journal) {
-                failure.reason = Some(OFFLOAD_STALL_SEGMENT_IDENTITY.into());
-                failure.reason_detail = Some(detail);
-            }
-            return failure;
-        }
-    };
-    let budget = config
-        .get("offload")
-        .and_then(|value| value.get("budget_bytes"))
-        .and_then(Value::as_u64);
-    let mut details = vec![];
-    let (mut files_marked, mut bytes_marked) = (0, 0);
-    if budget_satisfied(start_raw_bytes, bytes_already_marked, budget) {
-        return OffloadResult {
-            status: "ok".into(),
-            reason: Some(OFFLOAD_OK_BUDGET_ALREADY_SATISFIED.into()),
-            files_marked,
-            bytes_marked,
-            files_already_marked,
-            bytes_already_marked,
-            ran_out_of_markable_media: false,
-            dry_run,
-            reason_detail: None,
-            details,
-            audit_recording_failure: None,
-            recording_failure: None,
-        };
-    }
-    let days = match offload_days(journal) {
-        Ok(days) => days,
-        Err(detail) => {
-            return stall(
-                OFFLOAD_STALL_SEGMENT_IDENTITY,
-                dry_run,
-                vec![],
-                0,
-                0,
-                files_already_marked,
-                bytes_already_marked,
-            )
-            .with_reason_detail(detail);
-        }
-    };
-    let (mut audit, mut audit_recording_failure): (Option<PruneAuditWriter>, Option<String>) =
-        if dry_run {
-            (None, None)
-        } else if let Some(opened) = local_instant(services.clock.now_unix()) {
-            let audit = open_prune_audit(journal, opened);
-            let failure = audit.recording_failure();
-            (Some(audit), failure)
-        } else {
-            (
-                None,
-                Some("failed to create offload audit oplog: local time unavailable".into()),
-            )
-        };
-    for day in days {
-        for segment in iter_segments(journal, PathOrDay::Day(&day)).unwrap_or_default() {
-            let identity = match segment.record_identity() {
-                Ok(identity) => identity,
-                Err(error) => {
-                    return stall(
-                        OFFLOAD_STALL_SEGMENT_IDENTITY,
-                        dry_run,
-                        details,
-                        files_marked,
-                        bytes_marked,
-                        files_already_marked,
-                        bytes_already_marked,
-                    )
-                    .with_reason_detail(error.to_string())
-                    .with_audit_recording_failure(audit_recording_failure);
-                }
-            };
-            let registry = ClosedHandlerSet;
-            let classifier = JournalMedia;
-            let found = scan_segment(segment.path(), &registry, &classifier);
-            let RawRelease::Releasable(proven) = resolve_segment_gate(
-                &registry,
-                &classifier,
-                &day,
-                identity.stream,
-                identity.key,
-                &found,
-            ) else {
-                continue;
-            };
-            let mut paths = proven
-                .iter()
-                .map(|file| segment.path().join(file.name()))
-                .collect::<Vec<_>>();
-            paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
-            if paths.is_empty() {
-                continue;
-            }
-            let Some(files) = prepare(&paths) else {
-                return stall(
-                    OFFLOAD_STALL_UNEXPECTED_ERROR,
-                    dry_run,
-                    details,
-                    files_marked,
-                    bytes_marked,
-                    files_already_marked,
-                    bytes_already_marked,
-                )
-                .with_audit_recording_failure(audit_recording_failure);
-            };
-            let bytes = files.iter().map(|file| file.bytes).sum::<u64>();
-            let names = files
-                .iter()
-                .map(|file| file.name.clone())
-                .collect::<Vec<_>>();
-            if mark_index
-                .matches(&day, identity.stream, identity.key, &names)
-                .is_some()
-            {
-                continue;
-            }
-            // `floor_bytes` is intentionally ignored: marking preserves bytes on disk; only status/restore use it.
-            let effective_marked_bytes = if dry_run {
-                details
-                    .iter()
-                    .map(|detail: &OffloadSegmentDetail| detail.bytes)
-                    .sum()
-            } else {
-                bytes_marked
-            };
-            if budget_satisfied(
-                start_raw_bytes,
-                bytes_already_marked.saturating_add(effective_marked_bytes),
-                budget,
-            ) {
-                return OffloadResult {
-                    status: "ok".into(),
-                    reason: Some(OFFLOAD_OK_BUDGET_SATISFIED.into()),
-                    files_marked,
-                    bytes_marked,
-                    files_already_marked,
-                    bytes_already_marked,
-                    ran_out_of_markable_media: false,
-                    dry_run,
-                    reason_detail: None,
-                    details,
-                    audit_recording_failure,
-                    recording_failure: None,
-                };
-            }
-            let detail = OffloadSegmentDetail {
-                day: day.clone(),
-                stream: identity.stream.to_owned(),
-                segment: identity.key.to_owned(),
-                files: files.len() as u64,
-                bytes,
-            };
-            details.push(detail);
-            if dry_run {
-                continue;
-            }
-            let archive = run_archive_backup(journal, services, &paths);
-            let Some(snapshot) = archive.snapshot_id else {
-                return stall(
-                    if archive.error_reason.as_deref() == Some(OFFLOAD_STALL_LOCKED) {
-                        OFFLOAD_STALL_LOCKED
-                    } else {
-                        OFFLOAD_STALL_ARCHIVE_FAILED
-                    },
-                    false,
-                    details,
-                    files_marked,
-                    bytes_marked,
-                    files_already_marked,
-                    bytes_already_marked,
-                )
-                .with_audit_recording_failure(audit_recording_failure);
-            };
-            let expected = paths
-                .iter()
-                .zip(&files)
-                .map(|(path, file)| (path.clone(), file.bytes))
-                .collect::<BTreeMap<_, _>>();
-            let check = check_archive_snapshot_files(journal, services, &snapshot, &expected);
-            let confirmation_reason = match check.status.as_str() {
-                "skipped" => Some(OFFLOAD_STALL_BACKUP_NOT_READY),
-                "error" if check.error_reason.as_deref() == Some(OFFLOAD_STALL_LOCKED) => {
-                    Some(OFFLOAD_STALL_LOCKED)
-                }
-                "error" => Some(OFFLOAD_STALL_CONFIRM_TOOL_FAILED),
-                "ok" => match check.verdicts.as_ref() {
-                    None => Some(OFFLOAD_STALL_CONFIRM_TOOL_FAILED),
-                    Some(verdicts) if verdicts.iter().any(|verdict| !verdict.confirmed) => {
-                        Some(OFFLOAD_STALL_CONFIRM_FAILED)
-                    }
-                    Some(_) => None,
-                },
-                _ => Some(OFFLOAD_STALL_CONFIRM_TOOL_FAILED),
-            };
-            if let Some(reason) = confirmation_reason {
-                return stall(
-                    reason,
-                    false,
-                    details,
-                    files_marked,
-                    bytes_marked,
-                    files_already_marked,
-                    bytes_already_marked,
-                )
-                .with_audit_recording_failure(audit_recording_failure);
-            }
-            if append_offload_event(
-                journal,
-                &day,
-                identity.stream,
-                identity.key,
-                &snapshot,
-                &files,
-                services.clock.now_unix() as u64,
-            )
-            .is_err()
-            {
-                return stall(
-                    OFFLOAD_STALL_UNEXPECTED_ERROR,
-                    false,
-                    details,
-                    files_marked,
-                    bytes_marked,
-                    files_already_marked,
-                    bytes_already_marked,
-                )
-                .with_audit_recording_failure(audit_recording_failure);
-            }
-            let Some(marked_at) = DateTime::<Utc>::from_timestamp(services.clock.now_unix(), 0)
-            else {
-                return stall(
-                    OFFLOAD_STALL_UNEXPECTED_ERROR,
-                    false,
-                    details,
-                    files_marked,
-                    bytes_marked,
-                    files_already_marked,
-                    bytes_already_marked,
-                )
-                .with_audit_recording_failure(audit_recording_failure);
-            };
-            if upsert_offload(
-                journal,
-                &Target {
-                    day: day.clone(),
-                    stream: identity.stream.to_owned(),
-                    dir: identity.key.to_owned(),
-                },
-                names,
-                bytes,
-                format!("restic-snapshot:{snapshot}"),
-                marked_at,
-            )
-            .is_err()
-            {
-                return stall(
-                    OFFLOAD_STALL_UNEXPECTED_ERROR,
-                    false,
-                    details,
-                    files_marked,
-                    bytes_marked,
-                    files_already_marked,
-                    bytes_already_marked,
-                )
-                .with_audit_recording_failure(audit_recording_failure);
-            }
-            let message = format!(
-                "raw-media offload: archived and marked {} raw media file(s)",
-                files.len()
-            );
-            let record = serde_json::json!({
-                "event": "raw_media_offload",
-                "kind": "raw_media_offload",
-                "outcome": "success",
-                "stream": identity.stream,
-                "segment": identity.key,
-                "bytes_marked": bytes,
-                "ts": services.clock.now_unix().saturating_mul(1_000),
-            });
-            if let Some(audit) = audit.as_mut() {
-                let outcome = write_prune_audit(audit, &record, &day, &message);
-                if audit_recording_failure.is_none() {
-                    audit_recording_failure = outcome.recording_failure;
-                }
-            }
-            files_marked += files.len() as u64;
-            bytes_marked += bytes;
-        }
-    }
-    OffloadResult {
-        status: "ok".into(),
-        reason: Some(OFFLOAD_OK_MARKABLE_MEDIA_EXHAUSTED.into()),
-        files_marked,
-        bytes_marked,
-        files_already_marked,
-        bytes_already_marked,
-        ran_out_of_markable_media: true,
-        dry_run,
-        reason_detail: None,
-        details,
-        audit_recording_failure,
-        recording_failure: None,
-    }
 }
 
 mod current {
@@ -1731,25 +1145,51 @@ mod current {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::cell::RefCell;
+    #[cfg(unix)]
     use std::collections::VecDeque;
+    #[cfg(unix)]
     use std::io;
 
+    #[cfg(unix)]
+    use chrono::DateTime;
+    #[cfg(unix)]
+    use chrono::FixedOffset;
     use serde_json::json;
+    #[cfg(unix)]
+    use sha2::{Digest, Sha256};
+    #[cfg(unix)]
     use solstone_core_backup::{
         Destination, generate_and_store_keys, record_backup_result, record_verification_result,
         set_destination, set_enabled, set_offload,
     };
+    #[cfg(unix)]
+    use solstone_core_backup_runtime::BackupServices;
+    #[cfg(unix)]
     use solstone_core_backup_runtime::hosted_runtime::HttpError;
+    #[cfg(unix)]
     use solstone_core_backup_runtime::{
         Clock, HttpRequest, HttpResponse, HttpTransport, JournalMaintenance,
         JournalMaintenanceError, ToolOutput, ToolRequest, ToolRunner,
     };
-    use solstone_core_journal_io::{
-        JournalRoot, MalformedPolicy,
-        operational_log::{OplogFormat, catalog_oplogs},
-        readers::read_jsonl_with_report,
+    #[cfg(unix)]
+    use solstone_core_journal_io::JournalRoot;
+    #[cfg(unix)]
+    use solstone_core_retention::{
+        Target,
+        content::{ClosedHandlerSet, JournalMedia},
+        policy::policy_from_journal_config,
     };
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    use crate::measurement::measure_local_media;
 
     #[cfg(all(test, unix, feature = "full-tests"))]
     mod planner;
@@ -1826,10 +1266,12 @@ mod tests {
         assert_eq!(check(&transient), None);
     }
 
+    #[cfg(unix)]
     struct Script {
         outputs: RefCell<VecDeque<ToolOutput>>,
         calls: RefCell<Vec<Vec<String>>>,
     }
+    #[cfg(unix)]
     impl ToolRunner for Script {
         fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
             self.calls.borrow_mut().push(
@@ -1846,15 +1288,19 @@ mod tests {
                 .expect("fixture output"))
         }
     }
+    #[cfg(unix)]
     struct Http;
+    #[cfg(unix)]
     impl HttpTransport for Http {
         fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
             unreachable!("BYO offload does not use HTTP")
         }
     }
+    #[cfg(unix)]
     struct TestClock {
         now: i64,
     }
+    #[cfg(unix)]
     impl Clock for TestClock {
         fn now_unix(&self) -> i64 {
             self.now
@@ -1863,7 +1309,9 @@ mod tests {
             1
         }
     }
+    #[cfg(unix)]
     struct Maintenance;
+    #[cfg(unix)]
     impl JournalMaintenance for Maintenance {
         fn rebuild_body_history(&self, _: &Path) -> Result<(), JournalMaintenanceError> {
             Ok(())
@@ -1872,6 +1320,7 @@ mod tests {
             Ok(())
         }
     }
+    #[cfg(unix)]
     fn output(stdout: String) -> ToolOutput {
         ToolOutput {
             returncode: 0,
@@ -1880,14 +1329,7 @@ mod tests {
         }
     }
 
-    fn output_with_code(returncode: i32, stdout: String) -> ToolOutput {
-        ToolOutput {
-            returncode,
-            stdout: stdout.into_bytes(),
-            stderr: vec![],
-        }
-    }
-
+    #[cfg(unix)]
     fn write_eligible_sidecar(raw: &Path) {
         let size = raw.metadata().unwrap().len();
         let header = json!({"_solstone_processing": {
@@ -1905,6 +1347,7 @@ mod tests {
     /// side: `.flac` extension and `no_decodable_audio` reason code, so `retention`'s
     /// `empty_audio_rule` (not the ordinary-media default rule) is what a policy
     /// check against this file consults.
+    #[cfg(unix)]
     fn write_empty_audio_sidecar(raw: &Path) {
         let size = raw.metadata().unwrap().len();
         let header = json!({"_solstone_processing": {
@@ -1918,6 +1361,7 @@ mod tests {
         fs::write(raw.with_extension("jsonl"), format!("{header}\n")).unwrap();
     }
 
+    #[cfg(unix)]
     fn configure_offload(journal: &Path, now: i64, budget_bytes: Option<u64>) {
         set_destination(
             journal,
@@ -1945,6 +1389,7 @@ mod tests {
         )
         .unwrap();
     }
+    #[cfg(unix)]
     fn services<'a>(
         runner: &'a Script,
         http: &'a Http,
@@ -1960,729 +1405,6 @@ mod tests {
             version: "test",
             journal_maintenance: maintenance,
         }
-    }
-
-    fn successful_offload(
-        floor_bytes: u64,
-    ) -> (tempfile::TempDir, Vec<(PathBuf, Vec<u8>)>, OffloadResult) {
-        let journal = tempfile::tempdir().unwrap();
-        let first = journal
-            .path()
-            .join("chronicle/20260101/010000_001/raw.webm");
-        let second = journal
-            .path()
-            .join("chronicle/20260102/020000_002/raw.webm");
-        fs::create_dir_all(first.parent().unwrap()).unwrap();
-        fs::create_dir_all(second.parent().unwrap()).unwrap();
-        fs::write(&first, b"one").unwrap();
-        fs::write(&second, b"0123456").unwrap();
-        write_eligible_sidecar(&first);
-        write_eligible_sidecar(&second);
-        let first_bytes = fs::read(&first).unwrap();
-        let second_bytes = fs::read(&second).unwrap();
-
-        configure_offload(journal.path(), 100, Some(1));
-        // Marking releases no bytes. A huge floor would suppress work if this
-        // run path consulted it, so this fixture pins that it deliberately does not.
-        set_offload(
-            journal.path(),
-            &serde_json::json!({"enabled":true,"budget_bytes":1,"floor_bytes":floor_bytes})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-
-        let nodes = json!([
-            {"message_type":"snapshot","id":"snapshot"},
-            {"message_type":"node","path":first.display().to_string(),"size":3},
-            {"message_type":"node","path":second.display().to_string(),"size":7}
-        ]);
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::from([
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(nodes.to_string()),
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(nodes.to_string()),
-            ])),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        (
-            journal,
-            vec![(first, first_bytes), (second, second_bytes)],
-            result,
-        )
-    }
-
-    fn audit_rows(journal: &Path, day: chrono::NaiveDate) -> Vec<Value> {
-        let snapshot = catalog_oplogs(JournalRoot::open(journal).unwrap(), &[day]).unwrap();
-        let entries = snapshot
-            .entries()
-            .iter()
-            .filter(|entry| {
-                entry.name().source().display_slug() == "offload"
-                    && entry.name().run().display_slug() == "raw-media-offload"
-                    && entry.name().format() == OplogFormat::Jsonl
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(entries.len(), 1);
-        read_jsonl_with_report::<Value>(
-            journal
-                .join("chronicle")
-                .join(entries[0].day())
-                .join("health")
-                .join(entries[0].leaf()),
-            Vec::new(),
-            MalformedPolicy::Raise,
-        )
-        .unwrap()
-        .records
-        .into_iter()
-        .map(|record| record.value)
-        .collect()
-    }
-
-    #[test]
-    fn floor_is_ignored_when_marking_raw_media() {
-        // Marking releases no bytes. A huge floor would suppress work if this
-        // run path consulted it, so this fixture pins that it deliberately does not.
-        let (_journal, _files, result) = successful_offload(999_999_999_999);
-
-        assert_eq!(result.status, "ok");
-        assert_eq!(result.bytes_marked, 10);
-        assert_eq!(result.details.len(), 2);
-    }
-
-    #[test]
-    fn successful_offload_keeps_distinct_raw_media_bytes() {
-        let (_journal, files, result) = successful_offload(1);
-
-        assert_eq!(result.status, "ok");
-        // Success is pending owner-approved release, never deletion of raw media.
-        for (path, expected) in files {
-            assert_eq!(fs::read(path).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn successful_offload_writes_per_segment_rows_to_one_invocation_oplog() {
-        let (journal, _, result) = successful_offload(1);
-
-        assert_eq!(result.audit_recording_failure, None);
-        let rows = audit_rows(journal.path(), local_instant(100).unwrap().date_naive());
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| {
-            row["event"] == "raw_media_offload"
-                && row["kind"] == "raw_media_offload"
-                && row["outcome"] == "success"
-                && row["message"]
-                    .as_str()
-                    .is_some_and(|message| message.starts_with("raw-media offload:"))
-        }));
-        let mut days = rows
-            .iter()
-            .map(|row| row["day"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        days.sort_unstable();
-        assert_eq!(days, ["20260101", "20260102"]);
-    }
-
-    #[test]
-    fn partial_pruning_audit_failure_does_not_change_success() {
-        let journal = tempfile::tempdir().unwrap();
-        let raw = journal
-            .path()
-            .join("chronicle/20260103/030000_003/audit.webm");
-        fs::create_dir_all(raw.parent().unwrap()).unwrap();
-        fs::write(&raw, b"audit").unwrap();
-        write_eligible_sidecar(&raw);
-        let clock = TestClock { now: 1_767_225_600 };
-        configure_offload(journal.path(), clock.now, Some(1));
-        let audit_day = local_instant(clock.now)
-            .unwrap()
-            .date_naive()
-            .format("%Y%m%d")
-            .to_string();
-        let audit_parent = journal.path().join("chronicle").join(&audit_day);
-        fs::create_dir_all(&audit_parent).unwrap();
-        // A file where the invocation's health directory belongs makes canonical
-        // oplog creation fail, but a completed archive and mark must still succeed.
-        fs::write(audit_parent.join("health"), b"blocked").unwrap();
-
-        let nodes = json!([
-            {"message_type":"snapshot","id":"snapshot"},
-            {"message_type":"node","path":raw.display().to_string(),"size":5}
-        ]);
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::from([
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(nodes.to_string()),
-            ])),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        assert_eq!(result.status, "ok");
-        assert_eq!(result.files_marked, 1);
-        assert_eq!(result.bytes_marked, 5);
-        assert!(
-            result
-                .audit_recording_failure
-                .as_deref()
-                .is_some_and(|error| error.starts_with("failed to create offload audit oplog:"))
-        );
-        assert!(format_offload_result(&result).contains("audit_recording_failed="));
-    }
-
-    #[test]
-    fn second_run_skips_current_marks_without_rearchiving() {
-        let (journal, _, first) = successful_offload(1);
-        assert_eq!(first.status, "ok");
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-
-        let second = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        assert_eq!(second.status, "ok");
-        assert_eq!(second.files_marked, 0);
-        assert_eq!(second.bytes_marked, 0);
-        assert_eq!(second.files_already_marked, 2);
-        assert_eq!(second.bytes_already_marked, 10);
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn a_stale_offload_mark_is_declined_when_the_owner_turns_on_keep() {
-        // media-lifecycle candidate 2: an OffloadRawRelease mark
-        // must not keep looking approvable once retention policy would no
-        // longer release it. `.flac` + `no_decodable_audio` puts this segment on
-        // the empty-audio side of the policy split, not the ordinary-media side.
-        let journal = tempfile::tempdir().unwrap();
-        let raw = journal
-            .path()
-            .join("chronicle/20260101/010000_001/audio.flac");
-        fs::create_dir_all(raw.parent().unwrap()).unwrap();
-        fs::write(&raw, b"silence").unwrap();
-        write_empty_audio_sidecar(&raw);
-        let raw_bytes = fs::read(&raw).unwrap();
-
-        configure_offload(journal.path(), 100, Some(1));
-
-        let nodes = json!([
-            {"message_type":"snapshot","id":"snapshot"},
-            {"message_type":"node","path":raw.display().to_string(),"size":7}
-        ]);
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::from([
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(nodes.to_string()),
-            ])),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let first = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-        assert_eq!(first.status, "ok");
-        assert_eq!(first.files_marked, 1);
-        assert_eq!(
-            load_marks(journal.path()).unwrap().marks.len(),
-            1,
-            "the segment should be marked, pending owner approval"
-        );
-
-        // The owner turns on "keep audio with no speech" between runs. Merge
-        // into the existing config rather than replacing it wholesale --
-        // `configure_offload` already wrote the backup/destination settings the
-        // second run still needs to reach the reconciliation code at all.
-        let config_path = journal.path().join("config/journal.json");
-        let mut config: serde_json::Map<String, Value> =
-            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-        config.insert("retention".to_owned(), json!({"empty_audio": "keep"}));
-        fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
-
-        let second_runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let second = run_offload(
-            journal.path(),
-            &services(&second_runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        assert_eq!(second.status, "ok");
-        assert_eq!(
-            second.files_marked, 0,
-            "declining a stale mark must not archive anything new"
-        );
-        assert!(
-            second_runner.calls.borrow().is_empty(),
-            "declining a stale mark must not touch the archive tool at all"
-        );
-        assert!(
-            load_marks(journal.path()).unwrap().marks.is_empty(),
-            "the stale mark must be withdrawn once policy says keep"
-        );
-        // Declining a mark never touches the byte it was pending on.
-        assert_eq!(fs::read(&raw).unwrap(), raw_bytes);
-    }
-
-    #[test]
-    fn a_still_eligible_offload_mark_survives_reconciliation() {
-        // Negative twin of the test above: an unrelated ordinary-media mark
-        // (not empty-audio) must not be declined just because reconciliation ran.
-        let (journal, files, first) = successful_offload(1);
-        assert_eq!(first.status, "ok");
-        assert_eq!(load_marks(journal.path()).unwrap().marks.len(), 2);
-
-        let second_runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let second = run_offload(
-            journal.path(),
-            &services(&second_runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        assert_eq!(second.status, "ok");
-        assert_eq!(
-            load_marks(journal.path()).unwrap().marks.len(),
-            2,
-            "still-eligible marks must survive a reconciliation pass"
-        );
-        for (path, expected) in files {
-            assert_eq!(fs::read(path).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn existing_marks_satisfy_the_budget_before_new_archives() {
-        let journal = tempfile::tempdir().unwrap();
-        let marked = journal
-            .path()
-            .join("chronicle/20260101/010000_001/marked.webm");
-        let pending = journal
-            .path()
-            .join("chronicle/20260102/020000_002/pending.webm");
-        fs::create_dir_all(marked.parent().unwrap()).unwrap();
-        fs::create_dir_all(pending.parent().unwrap()).unwrap();
-        fs::write(&marked, b"marked").unwrap();
-        fs::write(&pending, b"pending").unwrap();
-        write_eligible_sidecar(&marked);
-        write_eligible_sidecar(&pending);
-        configure_offload(journal.path(), 100, Some(7));
-        upsert_offload(
-            journal.path(),
-            &Target {
-                day: "20260101".into(),
-                stream: "default".into(),
-                dir: "010000_001".into(),
-            },
-            vec!["marked.webm".into()],
-            6,
-            "restic-snapshot:existing".into(),
-            DateTime::<Utc>::from_timestamp(100, 0).unwrap(),
-        )
-        .unwrap();
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        // 13 bytes raw minus the 6-byte current mark is within the 7-byte budget.
-        assert_eq!(result.status, "ok");
-        assert!(!result.ran_out_of_markable_media);
-        assert_eq!(result.bytes_already_marked, 6);
-        assert_eq!(result.files_marked, 0);
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn last_offload_records_mid_loop_budget_satisfaction() {
-        let journal = tempfile::tempdir().unwrap();
-        let first = journal
-            .path()
-            .join("chronicle/20260101/010000_001/raw.webm");
-        let second = journal
-            .path()
-            .join("chronicle/20260102/020000_002/raw.webm");
-        fs::create_dir_all(first.parent().unwrap()).unwrap();
-        fs::create_dir_all(second.parent().unwrap()).unwrap();
-        fs::write(&first, b"one").unwrap();
-        fs::write(&second, b"0123456").unwrap();
-        write_eligible_sidecar(&first);
-        write_eligible_sidecar(&second);
-        configure_offload(journal.path(), 100, Some(7));
-        let nodes = json!([
-            {"message_type":"snapshot","id":"snapshot"},
-            {"message_type":"node","path":first.display().to_string(),"size":3}
-        ]);
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::from([
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(nodes.to_string()),
-            ])),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        assert_eq!(result.status, "ok");
-        assert_eq!(result.files_marked, 1);
-        assert_eq!(result.bytes_marked, 3);
-        assert!(!result.ran_out_of_markable_media);
-        let register = load_marks(journal.path()).unwrap();
-        assert_eq!(register.marks.len(), 1);
-        let mark = register.marks.values().next().unwrap();
-        assert_eq!(mark.proposal.names.len(), 1);
-        assert_eq!(mark.proposal.bytes, 3);
-        let last = get_backup_config(journal.path()).unwrap()["last_offload"].clone();
-        assert_eq!(last["status"], "ok");
-        assert_eq!(last["files_marked"], 1);
-        assert_eq!(last["bytes_marked"], 3);
-        assert_eq!(last["reason"], OFFLOAD_OK_BUDGET_SATISFIED);
-        assert_eq!(last["ran_out_of_markable_media"], false);
-    }
-
-    fn last_offload(journal: &Path) -> Value {
-        get_backup_config(journal).unwrap()["last_offload"].clone()
-    }
-
-    fn raw_config_bytes(journal: &Path) -> Vec<u8> {
-        fs::read(journal.join("config/journal.json")).unwrap()
-    }
-
-    fn raw_config(journal: &Path) -> Value {
-        serde_json::from_slice(&raw_config_bytes(journal)).unwrap()
-    }
-
-    fn raw_last_ok_time(journal: &Path) -> Value {
-        raw_config(journal)["backup"]["last_offload"]["last_ok_time"].clone()
-    }
-
-    fn marks_path(journal: &Path) -> PathBuf {
-        journal.join("health/retention-marks.json")
-    }
-
-    fn assert_dry_run_wrote_nothing(journal: &Path, before: &[u8]) {
-        assert_eq!(raw_config_bytes(journal), before);
-        assert!(!marks_path(journal).exists());
-    }
-
-    fn run_offload_dry(journal: &Path) -> OffloadResult {
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        run_offload(
-            journal,
-            &services(&runner, &http, &clock, &maintenance),
-            true,
-        )
-    }
-
-    fn seed_last_ok(journal: &Path, last_ok: i64) {
-        record_offload_result(
-            journal,
-            "ok",
-            json!(last_ok),
-            Value::Null,
-            json!(0),
-            json!(0),
-            json!(false),
-        )
-        .unwrap();
-    }
-
-    fn eligible_pair(journal: &Path) -> (PathBuf, PathBuf) {
-        let first = journal.join("chronicle/20260101/010000_001/raw.webm");
-        let second = journal.join("chronicle/20260102/020000_002/raw.webm");
-        fs::create_dir_all(first.parent().unwrap()).unwrap();
-        fs::create_dir_all(second.parent().unwrap()).unwrap();
-        fs::write(&first, b"one").unwrap();
-        fs::write(&second, b"0123456").unwrap();
-        write_eligible_sidecar(&first);
-        write_eligible_sidecar(&second);
-        (first, second)
-    }
-
-    #[cfg(unix)]
-    struct RestoreMode {
-        path: PathBuf,
-        previous: fs::Permissions,
-    }
-
-    #[cfg(unix)]
-    impl RestoreMode {
-        fn chmod(path: &Path, mode: u32) -> Self {
-            use std::os::unix::fs::PermissionsExt;
-            let previous = fs::metadata(path).unwrap().permissions();
-            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-            Self {
-                path: path.to_path_buf(),
-                previous,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for RestoreMode {
-        fn drop(&mut self) {
-            let _ = fs::set_permissions(&self.path, self.previous.clone());
-        }
-    }
-
-    #[test]
-    fn last_offload_records_skipped_when_disabled() {
-        let journal = tempfile::tempdir().unwrap();
-        configure_offload(journal.path(), 100, Some(1));
-        set_offload(
-            journal.path(),
-            &serde_json::json!({"enabled":false,"budget_bytes":1,"floor_bytes":1})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-        assert_eq!(result.status, "skipped");
-        assert_eq!(result.reason, None);
-        let last = last_offload(journal.path());
-        assert_eq!(last["status"], "skipped");
-        assert_eq!(last["time"], 100);
-        assert!(last["reason"].is_null());
-    }
-
-    #[test]
-    fn budget_uses_checked_local_media_and_refuses_incomplete_coverage() {
-        fn checked_run(journal: &Path) -> OffloadResult {
-            let runner = Script {
-                outputs: RefCell::new(VecDeque::new()),
-                calls: RefCell::new(vec![]),
-            };
-            let result = run_offload(
-                journal,
-                &services(&runner, &Http, &TestClock { now: 100 }, &Maintenance),
-                false,
-            );
-            assert!(runner.calls.borrow().is_empty());
-            result
-        }
-        for populated in [false, true] {
-            let journal = tempfile::tempdir().unwrap();
-            configure_offload(journal.path(), 100, Some(3));
-            let raw = journal
-                .path()
-                .join("chronicle/20260101/work/120000_60/raw.webm");
-            if populated {
-                fs::create_dir_all(raw.parent().unwrap()).unwrap();
-                fs::write(&raw, b"raw").unwrap();
-                fs::write(
-                    raw.with_file_name("notes.txt"),
-                    b"not owner media; larger than budget",
-                )
-                .unwrap();
-            }
-            let result = checked_run(journal.path());
-            assert_eq!(result.status, "ok");
-            assert_eq!(
-                result.reason.as_deref(),
-                Some(OFFLOAD_OK_BUDGET_ALREADY_SATISFIED)
-            );
-            assert_eq!(result.files_marked, 0);
-            assert!(!marks_path(journal.path()).exists());
-            if populated {
-                assert_eq!(fs::read(&raw).unwrap(), b"raw");
-                let duplicate = raw.parent().unwrap().with_file_name("120000_60_duplicate");
-                fs::create_dir(&duplicate).unwrap();
-                fs::write(duplicate.join("raw.webm"), b"raw").unwrap();
-                configure_offload(journal.path(), 100, Some(6));
-                let result = checked_run(journal.path());
-                assert_eq!(
-                    result.reason.as_deref(),
-                    Some(OFFLOAD_OK_BUDGET_ALREADY_SATISFIED)
-                );
-                assert!(!marks_path(journal.path()).exists());
-            }
-        }
-        for budget in [None, Some(i64::MAX as u64)] {
-            let journal = tempfile::tempdir().unwrap();
-            configure_offload(journal.path(), 100, budget);
-            let chronicle = journal.path().join("chronicle");
-            fs::write(&chronicle, b"unchanged non-directory").unwrap();
-            let result = checked_run(journal.path());
-            assert_eq!(result.status, "stalled");
-            assert_eq!(
-                result.reason.as_deref(),
-                Some(OFFLOAD_STALL_UNEXPECTED_ERROR)
-            );
-            assert_eq!(result.files_marked, 0);
-            assert!(!marks_path(journal.path()).exists());
-            assert_eq!(fs::read(chronicle).unwrap(), b"unchanged non-directory");
-        }
-    }
-
-    #[test]
-    fn last_offload_records_budget_already_satisfied_at_entry() {
-        let journal = tempfile::tempdir().unwrap();
-        eligible_pair(journal.path());
-        configure_offload(journal.path(), 100, Some(999_999));
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-        assert_eq!(result.status, "ok");
-        assert_eq!(
-            result.reason.as_deref(),
-            Some(OFFLOAD_OK_BUDGET_ALREADY_SATISFIED)
-        );
-        assert!(!result.ran_out_of_markable_media);
-        let last = last_offload(journal.path());
-        assert_eq!(last["status"], "ok");
-        assert_eq!(last["reason"], OFFLOAD_OK_BUDGET_ALREADY_SATISFIED);
-        assert_eq!(last["files_marked"], 0);
-        assert_eq!(last["ran_out_of_markable_media"], false);
-    }
-
-    #[test]
-    fn last_offload_records_markable_media_exhausted() {
-        let (journal, _, result) = successful_offload(1);
-        assert_eq!(result.status, "ok");
-        assert_eq!(
-            result.reason.as_deref(),
-            Some(OFFLOAD_OK_MARKABLE_MEDIA_EXHAUSTED)
-        );
-        assert!(result.ran_out_of_markable_media);
-        let last = last_offload(journal.path());
-        assert_eq!(last["status"], "ok");
-        assert_eq!(last["reason"], OFFLOAD_OK_MARKABLE_MEDIA_EXHAUSTED);
-        assert_eq!(last["files_marked"], 2);
-        assert_eq!(last["bytes_marked"], 10);
-        assert_eq!(last["ran_out_of_markable_media"], true);
-    }
-
-    #[test]
-    fn last_offload_records_stall_after_a_mark_and_preserves_last_ok_time() {
-        let journal = tempfile::tempdir().unwrap();
-        let (first, second) = eligible_pair(journal.path());
-        configure_offload(journal.path(), 100, Some(1));
-        seed_last_ok(journal.path(), 50);
-        let prior = raw_last_ok_time(journal.path());
-        assert_eq!(prior, 50);
-        let first_nodes = json!([
-            {"message_type":"snapshot","id":"snapshot"},
-            {"message_type":"node","path":first.display().to_string(),"size":3}
-        ]);
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::from([
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(first_nodes.to_string()),
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output_with_code(1, String::new()),
-            ])),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-        assert_eq!(result.status, "stalled");
-        assert_eq!(
-            result.reason.as_deref(),
-            Some(OFFLOAD_STALL_CONFIRM_TOOL_FAILED)
-        );
-        assert_eq!(result.files_marked, 1);
-        assert_eq!(result.bytes_marked, 3);
-        assert_eq!(load_marks(journal.path()).unwrap().marks.len(), 1);
-        let last = last_offload(journal.path());
-        assert_eq!(last["status"], "stalled");
-        assert_eq!(last["reason"], OFFLOAD_STALL_CONFIRM_TOOL_FAILED);
-        assert_eq!(last["files_marked"], 1);
-        assert_eq!(last["bytes_marked"], 3);
-        assert_eq!(last["last_ok_time"], prior);
-        assert_eq!(raw_last_ok_time(journal.path()), prior);
-        let _ = second;
     }
 
     #[test]
@@ -2712,373 +1434,6 @@ mod tests {
         // ⛔ An unmapped code still reaches support rather than being swallowed.
         let unmapped = offload_reason_text("some_new_code");
         assert!(unmapped.contains("some_new_code"), "{unmapped}");
-    }
-
-    #[test]
-    fn ok_reason_tokens_are_pairwise_distinct_and_match_ran_out() {
-        assert_ne!(
-            OFFLOAD_OK_BUDGET_ALREADY_SATISFIED,
-            OFFLOAD_OK_BUDGET_SATISFIED
-        );
-        assert_ne!(
-            OFFLOAD_OK_BUDGET_ALREADY_SATISFIED,
-            OFFLOAD_OK_MARKABLE_MEDIA_EXHAUSTED
-        );
-        assert_ne!(
-            OFFLOAD_OK_BUDGET_SATISFIED,
-            OFFLOAD_OK_MARKABLE_MEDIA_EXHAUSTED
-        );
-        let journal = tempfile::tempdir().unwrap();
-        configure_offload(journal.path(), 100, Some(1));
-        seed_last_ok(journal.path(), 50);
-        let prior = raw_last_ok_time(journal.path());
-        record_verification_result(
-            journal.path(),
-            "ok",
-            json!(100 - VERIFICATION_MAX_AGE_SECONDS - 1),
-            Value::Null,
-            json!("1/52"),
-        )
-        .unwrap();
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-        assert_eq!(result.status, "stalled");
-        assert_eq!(
-            result.reason.as_deref(),
-            Some(OFFLOAD_STALL_VERIFICATION_OVERDUE)
-        );
-        let last = last_offload(journal.path());
-        assert_eq!(last["status"], "stalled");
-        assert_eq!(last["reason"], OFFLOAD_STALL_VERIFICATION_OVERDUE);
-        assert_eq!(last["last_ok_time"], prior);
-        assert_eq!(raw_last_ok_time(journal.path()), prior);
-    }
-
-    #[test]
-    fn dry_run_does_not_write_last_offload_for_reachable_outcomes() {
-        {
-            let journal = tempfile::tempdir().unwrap();
-            configure_offload(journal.path(), 100, Some(1));
-            set_offload(
-                journal.path(),
-                &serde_json::json!({"enabled":false,"budget_bytes":1,"floor_bytes":1})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap();
-            let before = raw_config_bytes(journal.path());
-            let result = run_offload_dry(journal.path());
-            assert_eq!(result.status, "skipped");
-            assert_eq!(result.reason, None);
-            assert_dry_run_wrote_nothing(journal.path(), &before);
-        }
-        {
-            let journal = tempfile::tempdir().unwrap();
-            configure_offload(journal.path(), 100, Some(1));
-            record_verification_result(
-                journal.path(),
-                "ok",
-                json!(100 - VERIFICATION_MAX_AGE_SECONDS - 1),
-                Value::Null,
-                json!("1/52"),
-            )
-            .unwrap();
-            let before = raw_config_bytes(journal.path());
-            let result = run_offload_dry(journal.path());
-            assert_eq!(result.status, "stalled");
-            assert_eq!(
-                result.reason.as_deref(),
-                Some(OFFLOAD_STALL_VERIFICATION_OVERDUE)
-            );
-            assert_dry_run_wrote_nothing(journal.path(), &before);
-        }
-        {
-            let journal = tempfile::tempdir().unwrap();
-            eligible_pair(journal.path());
-            configure_offload(journal.path(), 100, Some(999_999));
-            let before = raw_config_bytes(journal.path());
-            let result = run_offload_dry(journal.path());
-            assert_eq!(result.status, "ok");
-            assert_eq!(
-                result.reason.as_deref(),
-                Some(OFFLOAD_OK_BUDGET_ALREADY_SATISFIED)
-            );
-            assert_eq!(result.files_marked, 0);
-            assert!(!result.ran_out_of_markable_media);
-            assert_dry_run_wrote_nothing(journal.path(), &before);
-        }
-        {
-            let journal = tempfile::tempdir().unwrap();
-            eligible_pair(journal.path());
-            configure_offload(journal.path(), 100, Some(7));
-            let before = raw_config_bytes(journal.path());
-            let result = run_offload_dry(journal.path());
-            assert_eq!(result.status, "ok");
-            assert_eq!(result.reason.as_deref(), Some(OFFLOAD_OK_BUDGET_SATISFIED));
-            assert_eq!(result.files_marked, 0);
-            assert_eq!(result.details.len(), 1);
-            assert!(!result.ran_out_of_markable_media);
-            assert_dry_run_wrote_nothing(journal.path(), &before);
-        }
-        {
-            let journal = tempfile::tempdir().unwrap();
-            eligible_pair(journal.path());
-            configure_offload(journal.path(), 100, Some(1));
-            let before = raw_config_bytes(journal.path());
-            let result = run_offload_dry(journal.path());
-            assert_eq!(result.status, "ok");
-            assert_eq!(
-                result.reason.as_deref(),
-                Some(OFFLOAD_OK_MARKABLE_MEDIA_EXHAUSTED)
-            );
-            assert_eq!(result.files_marked, 0);
-            assert_eq!(result.details.len(), 2);
-            assert!(result.ran_out_of_markable_media);
-            assert_dry_run_wrote_nothing(journal.path(), &before);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn config_read_failure_stalls_without_last_offload() {
-        let journal = tempfile::tempdir().unwrap();
-        configure_offload(journal.path(), 100, Some(1));
-        let config_path = journal.path().join("config/journal.json");
-        let _restore = RestoreMode::chmod(&config_path, 0o000);
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-        assert_eq!(result.status, "stalled");
-        assert_eq!(
-            result.reason.as_deref(),
-            Some(OFFLOAD_STALL_UNEXPECTED_ERROR)
-        );
-        drop(_restore);
-        let backup = &raw_config(journal.path())["backup"];
-        assert!(backup.get("last_offload").is_none(), "{backup:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn recording_failure_after_marks_when_config_dir_is_unwritable() {
-        let journal = tempfile::tempdir().unwrap();
-        let (first, second) = eligible_pair(journal.path());
-        configure_offload(journal.path(), 100, Some(1));
-        let first_nodes = json!([
-            {"message_type":"snapshot","id":"snapshot"},
-            {"message_type":"node","path":first.display().to_string(),"size":3},
-            {"message_type":"node","path":second.display().to_string(),"size":7}
-        ]);
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::from([
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(first_nodes.to_string()),
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                output(first_nodes.to_string()),
-            ])),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        let config_dir = journal.path().join("config");
-        let before = raw_config_bytes(journal.path());
-        let _restore = RestoreMode::chmod(&config_dir, 0o555);
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-        assert_eq!(result.status, "ok");
-        assert!(result.files_marked > 0);
-        assert!(result.recording_failure.is_some());
-        assert_eq!(
-            result.reason.as_deref(),
-            Some(OFFLOAD_OK_MARKABLE_MEDIA_EXHAUSTED)
-        );
-        assert!(
-            format_offload_result(&result).contains("recording_failed="),
-            "{}",
-            format_offload_result(&result)
-        );
-        assert!(marks_path(journal.path()).exists());
-        assert_eq!(load_marks(journal.path()).unwrap().marks.len(), 2);
-        drop(_restore);
-        assert_eq!(raw_config_bytes(journal.path()), before);
-    }
-
-    #[test]
-    fn offload_mark_uses_rfc3339_from_clock() {
-        let (journal, _, result) = successful_offload(1);
-        assert_eq!(result.status, "ok");
-        let register = load_marks(journal.path()).unwrap();
-        for mark in register.marks.values() {
-            assert_eq!(mark.marked_at, "1970-01-01T00:01:40Z");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn identity_stall_keeps_reason_token_and_carries_detail() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let journal = tempfile::tempdir().unwrap();
-        let raw = journal
-            .path()
-            .join("chronicle/20260101/010000_001/raw.webm");
-        fs::create_dir_all(raw.parent().unwrap()).unwrap();
-        fs::write(&raw, b"raw-bytes").unwrap();
-        write_eligible_sidecar(&raw);
-        let unreadable = journal
-            .path()
-            .join("chronicle/20260101")
-            .join(OsStr::from_bytes(b"s\xff"))
-            .join("020000_002");
-        fs::create_dir_all(&unreadable).unwrap();
-        fs::write(unreadable.join("raw.webm"), b"other").unwrap();
-        configure_offload(journal.path(), 100, Some(1));
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            true,
-        );
-
-        assert_eq!(result.status, "stalled");
-        assert_eq!(result.reason.as_deref(), Some("segment_identity"));
-        let detail = result.reason_detail.expect("identity detail");
-        assert!(detail.contains("not UTF-8 representable"), "{detail}");
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn same_key_on_two_days_does_not_stall_offload() {
-        let journal = tempfile::tempdir().unwrap();
-        for day in ["20260101", "20260102"] {
-            let raw = journal
-                .path()
-                .join(format!("chronicle/{day}/010000_001/raw.webm"));
-            fs::create_dir_all(raw.parent().unwrap()).unwrap();
-            fs::write(&raw, b"raw-bytes").unwrap();
-            write_eligible_sidecar(&raw);
-        }
-        configure_offload(journal.path(), 100, Some(1));
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            true,
-        );
-
-        assert_ne!(
-            result.reason.as_deref(),
-            Some("segment_identity"),
-            "{result:?}"
-        );
-    }
-
-    #[test]
-    fn two_directories_sharing_one_key_on_one_day_stall_offload() {
-        let journal = tempfile::tempdir().unwrap();
-        for name in ["010000_001", "010000_001_copy"] {
-            let raw = journal
-                .path()
-                .join(format!("chronicle/20260101/{name}/raw.webm"));
-            fs::create_dir_all(raw.parent().unwrap()).unwrap();
-            fs::write(&raw, b"raw-bytes").unwrap();
-            write_eligible_sidecar(&raw);
-        }
-        configure_offload(journal.path(), 100, Some(1));
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            true,
-        );
-
-        assert_eq!(result.status, "stalled");
-        assert_eq!(result.reason.as_deref(), Some("segment_identity"));
-        let detail = result.reason_detail.expect("identity detail");
-        assert!(detail.contains("day 20260101"), "{detail}");
-        assert!(
-            detail.contains("multiple segments share stream"),
-            "{detail}"
-        );
-        assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn held_segment_is_not_prepared_archived_or_marked() {
-        let journal = tempfile::tempdir().unwrap();
-        let raw = journal
-            .path()
-            .join("chronicle/20260103/030000_003/photo.png");
-        fs::create_dir_all(raw.parent().unwrap()).unwrap();
-        fs::write(&raw, b"owner-image").unwrap();
-        configure_offload(journal.path(), 100, Some(1));
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-
-        let result = run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        );
-
-        assert_eq!(result.status, "ok");
-        assert!(result.details.is_empty());
-        assert_eq!(result.files_marked, 0);
-        assert!(runner.calls.borrow().is_empty());
-        assert!(!journal.path().join("health/retention-marks.json").exists());
     }
 
     #[cfg(unix)]
@@ -3998,50 +2353,5 @@ mod tests {
             &CurrentOffloadRefusalReason::ExecutionUnavailable
         );
         assert_eq!(runner.calls.borrow().len(), 2);
-    }
-
-    fn confirmation_failure(check: ToolOutput) -> OffloadResult {
-        let journal = tempfile::tempdir().unwrap();
-        let raw = journal
-            .path()
-            .join("chronicle/20260104/040000_004/confirm.webm");
-        fs::create_dir_all(raw.parent().unwrap()).unwrap();
-        fs::write(&raw, b"confirm").unwrap();
-        write_eligible_sidecar(&raw);
-        configure_offload(journal.path(), 100, Some(1));
-        let runner = Script {
-            outputs: RefCell::new(VecDeque::from([
-                output(String::new()),
-                output("[{\"message_type\":\"summary\",\"snapshot_id\":\"snapshot\"}]".into()),
-                check,
-            ])),
-            calls: RefCell::new(vec![]),
-        };
-        let http = Http;
-        let clock = TestClock { now: 100 };
-        let maintenance = Maintenance;
-        run_offload(
-            journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
-            false,
-        )
-    }
-
-    #[test]
-    fn archive_content_mismatch_is_confirm_failed() {
-        let result = confirmation_failure(output(
-            serde_json::json!([{"message_type":"snapshot","id":"snapshot"}]).to_string(),
-        ));
-
-        assert_eq!(result.status, "stalled");
-        assert_eq!(result.reason.as_deref(), Some("confirm_failed"));
-    }
-
-    #[test]
-    fn archive_check_tool_failure_is_confirm_tool_failed() {
-        let result = confirmation_failure(output_with_code(1, String::new()));
-
-        assert_eq!(result.status, "stalled");
-        assert_eq!(result.reason.as_deref(), Some("confirm_tool_failed"));
     }
 }

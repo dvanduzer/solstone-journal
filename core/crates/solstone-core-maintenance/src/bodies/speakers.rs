@@ -177,9 +177,9 @@ mod tests {
         std::fs::write(&cache, "prior cache").unwrap();
         let mut args = vec!["run".to_owned(), "speakers:discover-voices".to_owned()];
         let result = crate::run_cli(&args, root.path());
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap()["status"],
+            serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["status"],
             "skipped"
         );
         std::fs::create_dir_all(root.path().join("entities/owner")).unwrap();
@@ -189,14 +189,14 @@ mod tests {
         )
         .unwrap();
         let result = crate::run_cli(&args, root.path());
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap()["reason_code"],
+            serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["reason_code"],
             "speaker_discovery_owner_voice_unavailable"
         );
         assert_eq!(std::fs::read(&cache).unwrap(), b"prior cache");
         args.push("--commit".to_owned());
-        assert_eq!(crate::run_cli(&args, root.path()).exit_code, 2);
+        assert_eq!(crate::run_cli(&args, root.path()).output().2, 2);
         assert_eq!(std::fs::read(&cache).unwrap(), b"prior cache");
     }
 
@@ -233,9 +233,9 @@ mod tests {
             &["run".to_owned(), "speakers:discover-voices".to_owned()],
             root.path(),
         );
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap()["clusters"],
+            serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["clusters"],
             0
         );
         for name in [
@@ -254,9 +254,9 @@ mod tests {
             "speakers:candidate-pair-suggestions".to_owned(),
         ];
         let result = crate::run_cli(&args, root.path());
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap()["found"],
+            serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["found"],
             0
         );
         assert!(
@@ -266,7 +266,7 @@ mod tests {
                 .exists()
         );
         args.push("--commit".to_owned());
-        assert_eq!(crate::run_cli(&args, root.path()).exit_code, 2);
+        assert_eq!(crate::run_cli(&args, root.path()).output().2, 2);
     }
 
     #[test]
@@ -274,9 +274,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let args = vec!["run".to_owned(), "speakers:name-variants".to_owned()];
         let result = crate::run_cli(&args, root.path());
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap()["found"],
+            serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["found"],
             0
         );
         assert!(
@@ -287,7 +287,7 @@ mod tests {
         );
         let mut bad = args;
         bad.push("--commit".into());
-        assert_eq!(crate::run_cli(&bad, root.path()).exit_code, 2);
+        assert_eq!(crate::run_cli(&bad, root.path()).output().2, 2);
     }
 
     #[test]
@@ -295,9 +295,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut args = vec!["run".to_owned(), "speakers:consolidate-pool".to_owned()];
         let result = crate::run_cli(&args, root.path());
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap()["merged"],
+            serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["merged"],
             0
         );
         assert!(
@@ -307,13 +307,13 @@ mod tests {
                 .exists()
         );
         args.push("--commit".to_owned());
-        assert_eq!(crate::run_cli(&args, root.path()).exit_code, 2);
+        assert_eq!(crate::run_cli(&args, root.path()).output().2, 2);
         std::fs::write(
             root.path().join("awareness/speaker_candidates.json"),
             "invalid",
         )
         .unwrap();
-        assert_eq!(crate::run_cli(&args[..2], root.path()).exit_code, 1);
+        assert_eq!(crate::run_cli(&args[..2], root.path()).output().2, 1);
     }
 
     #[test]
@@ -321,18 +321,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut args = vec!["run".to_owned(), "speakers:backfill-pool".to_owned()];
         let result = crate::run_cli(&args, root.path());
-        assert_eq!(result.exit_code, 0, "{}", result.stderr);
-        assert!(result.stderr.is_empty());
-        let report = serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap();
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
+        assert!(result.output().1.is_empty());
+        let report = serde_json::from_str::<serde_json::Value>(result.output().0).unwrap();
         assert_eq!(report["complete"], false);
         assert_eq!(report["sources_read"], 0);
 
         args.push("--commit".to_owned());
         let bad_arg = crate::run_cli(&args, root.path());
-        assert_eq!(bad_arg.exit_code, 2);
-        assert!(bad_arg.stdout.is_empty());
+        assert_eq!(bad_arg.output().2, 2);
+        assert!(bad_arg.output().0.is_empty());
         assert_eq!(
-            bad_arg.stderr,
+            bad_arg.output().1,
             "usage: solstone journal maintenance run speakers:backfill-pool\n"
         );
 
@@ -340,10 +340,10 @@ mod tests {
         std::fs::create_dir_all(&awareness).unwrap();
         std::fs::write(awareness.join("speaker_candidates_backfill.json"), b"{").unwrap();
         let invalid = crate::run_cli(&args[..2], root.path());
-        assert_eq!(invalid.exit_code, 1);
-        assert!(invalid.stdout.is_empty());
+        assert_eq!(invalid.output().2, 1);
+        assert!(invalid.output().0.is_empty());
         assert_eq!(
-            invalid.stderr,
+            invalid.output().1,
             "voice list catch-up refused: catch-up progress file is invalid; removing awareness/speaker_candidates_backfill.json from your journal restarts the catch-up safely\n"
         );
     }

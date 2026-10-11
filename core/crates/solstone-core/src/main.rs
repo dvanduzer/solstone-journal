@@ -1246,9 +1246,23 @@ fn run_storage_ops_verb(
     args: Vec<OsString>,
     call: impl FnOnce(&[String], &Path) -> (String, String, i32),
 ) -> ExitCode {
+    let (arguments, journal_path) = match storage_ops_arguments(verb, args) {
+        Ok(input) => input,
+        Err(code) => return code,
+    };
+    let (stdout, stderr, exit_code) = call(&arguments, &journal_path);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    ExitCode::from(exit_code as u8)
+}
+
+fn storage_ops_arguments(
+    verb: &str,
+    args: Vec<OsString>,
+) -> Result<(Vec<String>, PathBuf), ExitCode> {
     let arguments = match require_utf8_argv(verb, &args) {
         Ok(arguments) => arguments,
-        Err(code) => return code,
+        Err(code) => return Err(code),
     };
     let is_help = arguments
         .iter()
@@ -1260,14 +1274,36 @@ fn run_storage_ops_verb(
             Ok(journal) => journal.path,
             Err(error) => {
                 eprint_journal_path_error(error);
-                return ExitCode::from(EXIT_TEMPFAIL);
+                return Err(ExitCode::from(EXIT_TEMPFAIL));
             }
         }
     };
-    let (stdout, stderr, exit_code) = call(&arguments, &journal_path);
+    Ok((arguments, journal_path))
+}
+
+enum OwnedBackupCommand {
+    Backup(solstone_core_backup_cli::CliOutcome),
+    Maintenance(solstone_core_maintenance::CliOutcome),
+}
+
+fn run_owned_backup_command(
+    verb: &str,
+    args: Vec<OsString>,
+    call: impl FnOnce(&[String], &Path) -> OwnedBackupCommand,
+) -> ExitCode {
+    let (arguments, journal) = match storage_ops_arguments(verb, args) {
+        Ok(input) => input,
+        Err(code) => return code,
+    };
+    let owned = call(&arguments, &journal);
+    let (stdout, stderr, code) = match &owned {
+        OwnedBackupCommand::Backup(run) => run.output(),
+        OwnedBackupCommand::Maintenance(run) => run.output(),
+    };
     print!("{stdout}");
     eprint!("{stderr}");
-    ExitCode::from(exit_code as u8)
+    // The actual whole outcome remains alive through both print operations.
+    ExitCode::from(code as u8)
 }
 
 fn run_streams(args: Vec<OsString>) -> ExitCode {
@@ -1306,9 +1342,8 @@ fn run_segment(args: Vec<OsString>) -> ExitCode {
 }
 
 fn run_backup(args: Vec<OsString>) -> ExitCode {
-    run_storage_ops_verb("backup", args, |arguments, journal| {
-        let run = solstone_core_backup_cli::run_cli(arguments, journal);
-        (run.stdout, run.stderr, run.exit_code)
+    run_owned_backup_command("backup", args, |arguments, journal| {
+        OwnedBackupCommand::Backup(solstone_core_backup_cli::run_cli(arguments, journal))
     })
 }
 
@@ -1316,7 +1351,7 @@ fn run_maintenance(
     args: Vec<OsString>,
     #[cfg(windows)] admitted: Option<&solstone_core_system::process::AdmittedWindowsLaunch>,
 ) -> ExitCode {
-    run_storage_ops_verb("maintenance", args, |arguments, journal| {
+    run_owned_backup_command("maintenance", args, |arguments, journal| {
         #[cfg(windows)]
         let _speakers_generation = if solstone_core_maintenance::is_discovery_run(arguments) {
             match solstone_core_transcribe::enter_speakers_analyze_generation(
@@ -1326,13 +1361,17 @@ fn run_maintenance(
             ) {
                 Ok(generation) => Some(generation),
                 Err(error) => {
-                    return (
-                        String::new(),
-                        error
-                            .message()
-                            .map(|message| format!("{message}\n"))
-                            .unwrap_or_default(),
-                        error.exit_code(),
+                    return OwnedBackupCommand::Maintenance(
+                        solstone_core_maintenance::CliOutcome::Rendered(
+                            solstone_core_maintenance::CliRun {
+                                stdout: String::new(),
+                                stderr: error
+                                    .message()
+                                    .map(|message| format!("{message}\n"))
+                                    .unwrap_or_default(),
+                                exit_code: error.exit_code(),
+                            },
+                        ),
                     );
                 }
             }
@@ -1346,10 +1385,11 @@ fn run_maintenance(
                 journal,
                 &generation.child_launch_context(),
             );
-            return (run.stdout, run.stderr, run.exit_code);
+            return OwnedBackupCommand::Maintenance(
+                solstone_core_maintenance::CliOutcome::Rendered(run),
+            );
         }
-        let run = solstone_core_maintenance::run_cli(arguments, journal);
-        (run.stdout, run.stderr, run.exit_code)
+        OwnedBackupCommand::Maintenance(solstone_core_maintenance::run_cli(arguments, journal))
     })
 }
 

@@ -3,6 +3,7 @@
 
 //! Native media-offload runtime authorities.
 
+pub mod cli_run;
 pub mod ledger;
 pub mod marks;
 pub mod measurement;
@@ -27,5 +28,5 @@ pub use ledger::{
 pub use marks::OffloadMarkIndex;
 pub use measurement::suggest_offload_defaults;
 pub use restore::{RestoreResult, restore_all_offload, restore_offload_day};
-pub use run::{OffloadResult, format_offload_result, run_offload};
+pub use run::{OffloadResult, format_offload_result};
 pub use status::OffloadStatus;
