@@ -15,10 +15,9 @@ mod unix {
 
     use super::super::*;
     use crate::ledger::{append_offload_event, ledger_path_for_day};
-    use crate::recovery::{
-        IntentObservation, RecoveryObligation, RecoveryObservationFailure, observe_obligations,
-    };
+    use crate::recovery::{IntentObservation, RecoveryObligation, observe_obligations};
     use crate::restore_intent::{ConfirmedContent, Obligation};
+    use solstone_core_journal_io::activity_obligations::RecoveryObservationFailure;
 
     struct Fixture {
         temp: tempfile::TempDir,

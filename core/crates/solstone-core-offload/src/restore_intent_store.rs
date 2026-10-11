@@ -173,7 +173,7 @@ mod unix {
     use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity};
     use solstone_core_journal_io::observation::FileObservation;
 
-    use crate::restore_intent::MAX_INTENT_BYTES;
+    use solstone_core_journal_io::activity_obligations::{MAX_INTENT_BYTES, intent_filename};
 
     const LOCK: &str = "restore-intents.lock";
     const PARENTS: [&str; 3] = ["health", "health/offload", "health/offload/restore-intents"];
@@ -229,15 +229,8 @@ mod unix {
     pub(super) struct NativeHooks;
     impl Hooks for NativeHooks {}
 
-    fn name(operation: &str) -> Result<String, StoreProblem> {
-        if operation.len() != 32
-            || !operation
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(StoreProblem::Invalid(RepairHold::InvalidIntent));
-        }
-        Ok(format!("{operation}.json"))
+    fn name(operation: &str) -> Result<std::ffi::OsString, StoreProblem> {
+        intent_filename(operation).ok_or(StoreProblem::Invalid(RepairHold::InvalidIntent))
     }
 
     impl RestoreIntentStore {
