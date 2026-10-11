@@ -2406,6 +2406,8 @@ fn admit_prepared_archive_owned_read_installed_with(
                 owned: ClosedArchiveAdmissionOwner::Readback(Box::new(readback)),
             }),
         })?;
+    #[cfg(feature = "test-support")]
+    crate::test_support::after_owned_read_admission();
     Ok(OwnedInstalledArchiveRead {
         read,
         finish: DirectReadFinishOwner {

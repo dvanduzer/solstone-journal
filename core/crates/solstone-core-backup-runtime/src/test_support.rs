@@ -18,6 +18,75 @@ const RESTIC_VERSION: &str = "0.19.0";
 const REFUSED_LATEST_EXIT: i32 = 97;
 const REFUSED_UNEXPECTED_EXIT: i32 = 98;
 
+type OwnedReadAdmissionHook = Box<dyn FnOnce()>;
+thread_local! {
+    static OWNED_READ_ADMISSION_HOOK: std::cell::RefCell<Option<OwnedReadAdmissionHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run on the admission thread; the cut follows its real Version/Config children.
+pub fn run_with_owned_read_admission_hook<T>(
+    hook: impl FnOnce() + 'static,
+    operation: impl FnOnce() -> T,
+) -> (T, bool) {
+    OWNED_READ_ADMISSION_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OWNED_READ_ADMISSION_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    let _guard = Guard;
+    let result = operation();
+    let consumed = OWNED_READ_ADMISSION_HOOK.with(|slot| slot.borrow().is_none());
+    (result, consumed)
+}
+
+pub(crate) fn after_owned_read_admission() {
+    let hook = OWNED_READ_ADMISSION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+mod owned_read_admission_hook_tests {
+    use super::{after_owned_read_admission, run_with_owned_read_admission_hook};
+
+    #[test]
+    fn unwind_clears_the_hook_before_the_next_admission() {
+        let panic = std::panic::catch_unwind(|| {
+            run_with_owned_read_admission_hook(
+                || panic!("actual admission-cut unwind"),
+                after_owned_read_admission,
+            );
+        });
+        assert!(panic.is_err());
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = std::sync::Arc::clone(&observed);
+        let ((), consumed) = run_with_owned_read_admission_hook(
+            move || captured.store(true, std::sync::atomic::Ordering::SeqCst),
+            after_owned_read_admission,
+        );
+        assert!(consumed);
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+
+        let unused = std::panic::catch_unwind(|| {
+            run_with_owned_read_admission_hook(
+                || panic!("unused callback must be cleared"),
+                || panic!("before admission"),
+            );
+        });
+        assert!(unused.is_err());
+        after_owned_read_admission();
+    }
+}
+
 pub struct ArgvResticFixture {
     catalog: String,
     restore: ToolOutput,
