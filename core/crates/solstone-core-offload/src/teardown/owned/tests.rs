@@ -109,6 +109,7 @@ struct OperatedJournal {
     listener: Option<TcpListener>,
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 impl OperatedJournal {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();

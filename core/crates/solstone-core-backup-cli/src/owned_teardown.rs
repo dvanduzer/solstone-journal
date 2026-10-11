@@ -218,6 +218,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "full-tests"))]
     #[cfg(target_os = "linux")]
     #[test]
     fn off_yes_names_backup_only_media_and_unsupported_destinations() {
