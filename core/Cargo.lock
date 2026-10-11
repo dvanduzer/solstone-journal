@@ -5153,8 +5153,10 @@ dependencies = [
  "solstone-core-depict",
  "solstone-core-generate",
  "solstone-core-indexer-store",
+ "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-processing-record",
+ "solstone-core-segment",
  "tempfile",
 ]
 

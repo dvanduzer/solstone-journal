@@ -80,6 +80,7 @@ const REMOVAL_PRIMITIVES: &[&str] = &[
     "remove_file(",
     "remove_dir_all(",
     "rename_within(",
+    "remove_observed(",
 ];
 
 /// Forms that silence `#[must_use]`.

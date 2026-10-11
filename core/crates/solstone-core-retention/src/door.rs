@@ -65,6 +65,28 @@ pub struct EvidenceTally {
     pub on_legacy_rows: usize,
 }
 
+#[cfg(unix)]
+pub(crate) struct BoundOrdinaryRelease {
+    pub(crate) native: solstone_core_journal_io::media::MediaRemoval,
+    pub(crate) removed: Option<RemovedPath>,
+}
+
+#[cfg(unix)]
+pub(crate) fn release_reviewed_ordinary(
+    release: crate::remove_marked::OrdinaryRelease,
+    stage: solstone_core_journal_io::media::MediaStage,
+) -> BoundOrdinaryRelease {
+    use solstone_core_journal_io::media::{Confirmation, OriginalName, RemovalEffect};
+    let (source, proven, observation) = release.into_parts();
+    let native = source.remove_observed(std::ffi::OsStr::new(proven.name()), &observation, stage);
+    let receipt = native.receipt();
+    let removed = (receipt.effect == RemovalEffect::Deleted
+        && receipt.original_name == OriginalName::Absent
+        && receipt.claim_confirmation == Confirmation::Confirmed)
+        .then(|| RemovedPath::confirmed(proven.rel()));
+    BoundOrdinaryRelease { native, removed }
+}
+
 /// Release proven raw originals, leaving every derived output in place.
 ///
 /// ⛔ Takes proofs, never paths. A caller cannot ask this to remove a sidecar, a
