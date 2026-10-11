@@ -595,6 +595,49 @@ impl<'a> ReadOperation<'a> {
         result.map_err(|_| ReadbackError::NativeFailure)
     }
 
+    /// Observe one retained source's exact snapshot path. This checks metadata;
+    /// content verification still requires an independent read of its bytes.
+    pub fn discover_owned_snapshot(
+        &mut self,
+        snapshot_id: &str,
+        source: &ArchiveSource<'_>,
+    ) -> Result<ExactArchiveFile, ReadbackError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (snapshot_id, source);
+            Err(ReadbackError::Unsupported)
+        }
+        #[cfg(unix)]
+        {
+            self.revalidate_source(source)?;
+            let name = source
+                .name()
+                .to_str()
+                .filter(|name| plain_name(name))
+                .ok_or(ReadbackError::InvalidSelection)?;
+            if !full_hex_identity(snapshot_id) || !full_hex_identity(&source.digest().sha256) {
+                return Err(ReadbackError::InvalidSelection);
+            }
+            self.check_repository()?;
+            self.revalidate_source(source)?;
+            let output = self.query(vec![
+                "ls".into(),
+                "--json".into(),
+                snapshot_id.into(),
+                "--no-cache".into(),
+            ])?;
+            let file = owned_snapshot_file(
+                &output.output().stdout,
+                &self.repository_id,
+                snapshot_id,
+                name,
+                source.digest(),
+            )?;
+            self.revalidate_source(source)?;
+            Ok(file)
+        }
+    }
+
     /// Discover one retained source's exact snapshot path and independently read
     /// its bytes. Other group members must have distinct original basenames.
     pub fn read_owned_snapshot(
@@ -623,34 +666,7 @@ impl<'a> ReadOperation<'a> {
                     Arc::clone(self.carrier()),
                 ));
             }
-            let discovery = (|| {
-                self.revalidate_source(source)?;
-                let name = source
-                    .name()
-                    .to_str()
-                    .filter(|name| plain_name(name))
-                    .ok_or(ReadbackError::InvalidSelection)?;
-                if !full_hex_identity(snapshot_id) || !full_hex_identity(&source.digest().sha256) {
-                    return Err(ReadbackError::InvalidSelection);
-                }
-                self.check_repository()?;
-                self.revalidate_source(source)?;
-                let output = self.query(vec![
-                    "ls".into(),
-                    "--json".into(),
-                    snapshot_id.into(),
-                    "--no-cache".into(),
-                ])?;
-                let file = owned_snapshot_file(
-                    &output.output().stdout,
-                    &self.repository_id,
-                    snapshot_id,
-                    name,
-                    source.digest(),
-                )?;
-                self.revalidate_source(source)?;
-                Ok(file)
-            })();
+            let discovery = self.discover_owned_snapshot(snapshot_id, source);
             let file = match discovery {
                 Ok(file) => file,
                 Err(reason) => {
