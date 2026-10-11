@@ -22,13 +22,20 @@
     reason = "this is the door: the crate-wide ban exists so that only this module reaches a removal primitive"
 )]
 
+use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use solstone_core_callosum::{CallosumEnvelope, DurableEvent, append_durable_event};
+use solstone_core_journal_io::activity::{ActivityAdmissionError, ActivityLease};
+use solstone_core_journal_io::activity_obligations::{
+    is_stage_namespace_name, observe_obligations, observe_with_carrier,
+};
 use solstone_core_journal_io::atomic::atomic_replace;
 use solstone_core_journal_io::entry::{Removed, remove_file, rename_within, sync_dir};
+use solstone_core_journal_io::media::RootActivityCarrier;
 use solstone_core_journal_io::operational_log::{
     LeaseProbe, catalog_oplogs, probe_retained_oplog_lease,
 };
@@ -311,6 +318,47 @@ pub fn remove_segments(
     reason: RemovalReason,
     cid: &str,
 ) -> Outcome {
+    if targets.is_empty() {
+        return Outcome {
+            targets: Vec::new(),
+            halted: None,
+        };
+    }
+    match admit_whole_segment_activity(journal) {
+        Ok(activity) => {
+            remove_segments_with_activity(&activity, None, targets, deleted_at, reason, cid)
+        }
+        Err(reason) => {
+            let mut outcome = Outcome {
+                targets: Vec::new(),
+                halted: None,
+            };
+            for target in targets {
+                if !outcome.targets.iter().any(|row| &row.target == target) {
+                    outcome
+                        .targets
+                        .push(refused(target, segment_rel(target), reason.clone()));
+                }
+            }
+            outcome
+        }
+    }
+}
+
+/// Remove segments using the caller's original activity, without reacquiring it.
+///
+/// The caller must serialize its own stage creators before this phase. A shared
+/// activity and a fresh census do not establish sibling quiescence.
+/// The caller must not already hold a target's whole-segment lock.
+pub fn remove_segments_with_activity(
+    activity: &Arc<ActivityLease>,
+    carrier: Option<&RootActivityCarrier>,
+    targets: &[Target],
+    deleted_at: &str,
+    reason: RemovalReason,
+    cid: &str,
+) -> Outcome {
+    let guard = WholeSegmentActivity { activity, carrier };
     let mut outcome = Outcome {
         targets: Vec::new(),
         halted: None,
@@ -321,9 +369,9 @@ pub fn remove_segments(
             continue;
         }
         seen.push(target);
-        let (mut row, mutated) = remove_one(journal, target, deleted_at, reason, cid);
+        let (mut row, mutated) = remove_one(&guard, target, deleted_at, reason, cid);
         if mutated {
-            dirty_removed_day(journal, &mut row);
+            dirty_whole_segment_day(&guard, &mut row);
         }
         outcome.targets.push(row);
     }
@@ -577,6 +625,127 @@ pub fn compact_log(journal: &Path, planned: &crate::logs::Compaction) -> Outcome
     }
 }
 
+const WHOLE_ACTIVITY_HOLD: &str =
+    "another journal operation needs attention before this removal can continue";
+const WHOLE_BINDING_HOLD: &str = "the journal could not be checked, so this removal is on hold";
+const WHOLE_RESERVATION_HOLD: &str =
+    "this location is reserved for a journal operation and cannot be removed";
+
+fn admit_whole_segment_activity(journal: &Path) -> Result<Arc<ActivityLease>, String> {
+    let root = JournalRoot::open(journal).map_err(|_| WHOLE_BINDING_HOLD.to_owned())?;
+    ActivityLease::try_acquire(Arc::new(root)).map_err(|error| match error {
+        ActivityAdmissionError::Busy => WHOLE_ACTIVITY_HOLD.to_owned(),
+        ActivityAdmissionError::Unavailable(_) => WHOLE_BINDING_HOLD.to_owned(),
+    })
+}
+
+// A phase-local borrow, never a certificate or a substitute for creator exclusion.
+struct WholeSegmentActivity<'a> {
+    activity: &'a Arc<ActivityLease>,
+    carrier: Option<&'a RootActivityCarrier>,
+}
+
+impl WholeSegmentActivity<'_> {
+    fn journal(&self) -> &Path {
+        self.activity.journal_root().canonical_path()
+    }
+
+    fn revalidate(&self) -> Result<(), String> {
+        self.activity
+            .revalidate()
+            .map_err(|_| WHOLE_BINDING_HOLD.to_owned())?;
+        self.activity
+            .journal_root()
+            .revalidate_canonical_binding()
+            .map_err(|_| WHOLE_BINDING_HOLD.to_owned())?;
+        if let Some(carrier) = self.carrier {
+            if !Arc::ptr_eq(self.activity, carrier.activity())
+                || !Arc::ptr_eq(self.activity.journal_root(), carrier.journal_root())
+            {
+                return Err(WHOLE_BINDING_HOLD.to_owned());
+            }
+            carrier
+                .revalidate()
+                .map_err(|_| WHOLE_BINDING_HOLD.to_owned())?;
+        }
+        Ok(())
+    }
+
+    fn population(&self) -> Result<(), String> {
+        self.revalidate()?;
+        let root = self.activity.journal_root();
+        let clear = match self.carrier {
+            Some(carrier) => observe_with_carrier(root, carrier.observation())
+                .map(|population| population.unresolved_entries().next().is_none()),
+            None => observe_obligations(root).map(|population| population.entries().is_empty()),
+        }
+        .map_err(|_| WHOLE_BINDING_HOLD.to_owned())?;
+        if !clear {
+            return Err(WHOLE_ACTIVITY_HOLD.to_owned());
+        }
+        self.revalidate()
+    }
+
+    fn target(&self, target: &Target) -> Result<(), String> {
+        self.revalidate()?;
+        let live = segment_rel(target);
+        let staged = format!("{}/{}", parent_rel(target), staged_name(&target.dir));
+        for relative in [&live, &staged] {
+            if Path::new(relative)
+                .components()
+                .any(|part| reserved_whole_component(part.as_os_str()))
+            {
+                return Err(WHOLE_RESERVATION_HOLD.to_owned());
+            }
+            let path =
+                contained_path(self.journal(), relative).map_err(|error| owner_reason(&error))?;
+            if let Some(carrier) = self.carrier
+                && carrier.diagnostic_path().starts_with(&path)
+            {
+                return Err(WHOLE_RESERVATION_HOLD.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn before_phase(&self, target: &Target) -> Result<(), String> {
+        self.target(target)?;
+        self.population()
+    }
+}
+
+fn reserved_whole_component(name: &OsStr) -> bool {
+    let mut current = name;
+    loop {
+        if is_stage_namespace_name(current) {
+            return true;
+        }
+        let Some(original) = current.to_str().and_then(crate::staging::original_name) else {
+            return false;
+        };
+        current = OsStr::new(original);
+    }
+}
+
+fn dirty_whole_segment_day(guard: &WholeSegmentActivity<'_>, row: &mut TargetOutcome) {
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    cooperation_tests::checkpoint(cooperation_tests::Phase::BeforeMarker, &row.target);
+    if let Err(reason) = guard.revalidate() {
+        if row.post_commit_failure.is_none() {
+            row.post_commit_failure = Some(PostCommitFailure {
+                entry: health_marker_path(Path::new(""), &row.target.day, HealthMarkerKind::Stream)
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                reason,
+            });
+        }
+        return;
+    }
+    dirty_removed_day(guard.journal(), row);
+}
+
 /// The parent directory of a segment, journal-relative.
 fn parent_rel(target: &Target) -> String {
     crate::layout::stream_rel(&target.day, &target.stream)
@@ -613,14 +782,18 @@ fn refused_staged(target: &Target, staged: String, reason: String) -> TargetOutc
 }
 
 fn remove_one(
-    journal: &Path,
+    guard: &WholeSegmentActivity<'_>,
     target: &Target,
     deleted_at: &str,
     reason: RemovalReason,
     cid: &str,
 ) -> (TargetOutcome, bool) {
+    let journal = guard.journal();
     let live = segment_rel(target);
     let staged = format!("{}/{}", parent_rel(target), staged_name(&target.dir));
+    if let Err(reason) = guard.target(target) {
+        return (refused(target, live, reason), false);
+    }
 
     // ⚠ A pre-lock existence filter, before step 0. Taking the lock creates the
     // sidecar's parent directories, so locking a target whose day or stream
@@ -709,15 +882,23 @@ fn remove_one(
     }
 
     // Step 2: stage, then make the move durable.
+    if let Err(reason) = guard.before_phase(target) {
+        return (refused(target, live, reason), false);
+    }
     if let Err(error) = rename_within(journal, &live, &staged) {
         return (refused(target, live, owner_reason(&error)), false);
+    }
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    cooperation_tests::checkpoint(cooperation_tests::Phase::AfterPivot, target);
+    if let Err(reason) = guard.revalidate() {
+        return (refused_staged(target, staged, reason), true);
     }
     if let Err(error) = sync_dir(journal, &parent_rel(target)) {
         return (refused_staged(target, staged, owner_reason(&error)), true);
     }
 
     (
-        finish_staged(journal, target, &staged, deleted_at, reason, cid),
+        finish_staged(guard, target, &staged, deleted_at, reason, cid),
         true,
     )
 }
@@ -757,14 +938,18 @@ fn dirty_removed_day(journal: &Path, row: &mut TargetOutcome) -> bool {
 
 /// Steps 3 to 6, from a staged directory. Shared with the recovery pass.
 fn finish_staged(
-    journal: &Path,
+    guard: &WholeSegmentActivity<'_>,
     target: &Target,
     staged: &str,
     deleted_at: &str,
     reason: RemovalReason,
     cid: &str,
 ) -> TargetOutcome {
+    let journal = guard.journal();
     let live = segment_rel(target);
+    if let Err(reason) = guard.before_phase(target) {
+        return refused_staged(target, staged.to_owned(), reason);
+    }
 
     // Step 3: the manifest and the tombstone, written INTO the staged directory.
     //
@@ -805,6 +990,9 @@ fn finish_staged(
                 );
             }
         };
+        if let Err(reason) = guard.revalidate() {
+            return refused_staged(target, staged.to_owned(), reason);
+        }
         if write_bytes_exclusive(&tombstone_path, &bytes, AtomicWriteOptions::default()).is_err() {
             return refused_staged(
                 target,
@@ -821,6 +1009,14 @@ fn finish_staged(
     let mut failures = Vec::new();
     for (name, kind) in &to_remove {
         let rel = format!("{staged}/{name}");
+        if let Err(reason) = guard.revalidate() {
+            failures.push(NotRemoved {
+                entry: format!("{live}/{name}"),
+                reason,
+                staged: None,
+            });
+            break;
+        }
         let result = match kind {
             DirEntryKind::Directory => remove_dir_all(journal, &rel).map(|()| Removed::Unlinked),
             _ => remove_file(journal, &rel),
@@ -851,11 +1047,19 @@ fn finish_staged(
             post_commit_failure: None,
         };
     }
+    if let Err(reason) = guard.revalidate() {
+        return refused_staged(target, staged.to_owned(), reason);
+    }
     if let Err(error) = sync_dir(journal, staged) {
         return refused_staged(target, staged.to_owned(), owner_reason(&error));
     }
 
     // Step 5: restore, refusing a name something else has taken.
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    cooperation_tests::checkpoint(cooperation_tests::Phase::BeforeRestore, target);
+    if let Err(reason) = guard.before_phase(target) {
+        return refused_staged(target, staged.to_owned(), reason);
+    }
     if !matches!(path_lexists(&journal.join(&live)), Ok(false)) {
         return refused_staged(
             target,
@@ -867,6 +1071,9 @@ fn finish_staged(
     }
     if let Err(error) = rename_within(journal, staged, &live) {
         return refused_staged(target, staged.to_owned(), owner_reason(&error));
+    }
+    if let Err(reason) = guard.revalidate() {
+        return refused(target, live, reason);
     }
     if let Err(error) = sync_dir(journal, &parent_rel(target)) {
         return refused(target, live, owner_reason(&error));
@@ -907,10 +1114,34 @@ fn finish_staged(
 /// — including any segment where a *raw release* was merely interrupted, which by
 /// definition must keep its derived output.
 pub fn recover(journal: &Path, deleted_at: &str, reason: RemovalReason, cid: &str) -> Outcome {
+    match admit_whole_segment_activity(journal) {
+        Ok(activity) => recover_with_activity(&activity, None, deleted_at, reason, cid),
+        Err(reason) => Outcome {
+            targets: Vec::new(),
+            halted: Some(RunHalt { reason }),
+        },
+    }
+}
+
+/// Resume staged removals under the caller's original serial activity.
+/// The caller must not already hold a target's whole-segment lock.
+pub fn recover_with_activity(
+    activity: &Arc<ActivityLease>,
+    carrier: Option<&RootActivityCarrier>,
+    deleted_at: &str,
+    reason: RemovalReason,
+    cid: &str,
+) -> Outcome {
+    let guard = WholeSegmentActivity { activity, carrier };
+    let journal = guard.journal();
     let mut outcome = Outcome {
         targets: Vec::new(),
         halted: None,
     };
+    if let Err(reason) = guard.population() {
+        outcome.halted = Some(RunHalt { reason });
+        return outcome;
+    }
     let chronicle = journal.join("chronicle");
     let days = match list_dir_entries(&chronicle) {
         Ok(days) => days,
@@ -945,12 +1176,18 @@ pub fn recover(journal: &Path, deleted_at: &str, reason: RemovalReason, cid: &st
                 };
                 let live = segment_rel(&target);
                 let staged = format!("{}/{}", parent_rel(&target), staged_dir);
+                if let Err(reason) = guard.before_phase(&target) {
+                    outcome
+                        .targets
+                        .push(refused_staged(&target, staged, reason));
+                    continue;
+                }
                 // Same key as the door's, derived from the LIVE name.
                 let Ok(_lock) = hold_lock(journal.join(&live), LockOptions::default()) else {
                     continue;
                 };
-                let mut row = finish_staged(journal, &target, &staged, deleted_at, reason, cid);
-                dirty_removed_day(journal, &mut row);
+                let mut row = finish_staged(&guard, &target, &staged, deleted_at, reason, cid);
+                dirty_whole_segment_day(&guard, &mut row);
                 outcome.targets.push(row);
             }
         }
@@ -972,9 +1209,41 @@ pub fn recover_segment(
     reason: RemovalReason,
     cid: &str,
 ) -> Option<TargetOutcome> {
+    match admit_whole_segment_activity(journal) {
+        Ok(activity) => {
+            recover_segment_with_activity(&activity, None, target, deleted_at, reason, cid)
+        }
+        Err(reason) => Some(refused_staged(
+            target,
+            format!("{}/{}", parent_rel(target), staged_name(&target.dir)),
+            reason,
+        )),
+    }
+}
+
+/// Resume one staged removal without reacquiring the original activity.
+/// The caller must not already hold the target's whole-segment lock.
+pub fn recover_segment_with_activity(
+    activity: &Arc<ActivityLease>,
+    carrier: Option<&RootActivityCarrier>,
+    target: &Target,
+    deleted_at: &str,
+    reason: RemovalReason,
+    cid: &str,
+) -> Option<TargetOutcome> {
+    let guard = WholeSegmentActivity { activity, carrier };
+    let journal = guard.journal();
     let staged = format!("{}/{}", parent_rel(target), staged_name(&target.dir));
-    if !matches!(path_lexists(&journal.join(&staged)), Ok(true)) {
-        return None;
+    if let Err(reason) = guard.target(target) {
+        return Some(refused_staged(target, staged, reason));
+    }
+    match path_lexists(&journal.join(&staged)) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => return Some(refused_staged(target, staged, owner_reason(&error))),
+    }
+    if let Err(reason) = guard.before_phase(target) {
+        return Some(refused_staged(target, staged, reason));
     }
     // Same key as the door's, derived from the LIVE name.
     let live = segment_rel(target);
@@ -985,11 +1254,16 @@ pub fn recover_segment(
             "another process is working on this segment".to_owned(),
         ));
     };
-    if !matches!(path_lexists(&journal.join(&staged)), Ok(true)) {
-        return None;
+    if let Err(reason) = guard.revalidate() {
+        return Some(refused_staged(target, staged, reason));
     }
-    let mut row = finish_staged(journal, target, &staged, deleted_at, reason, cid);
-    dirty_removed_day(journal, &mut row);
+    match path_lexists(&journal.join(&staged)) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => return Some(refused_staged(target, staged, owner_reason(&error))),
+    }
+    let mut row = finish_staged(&guard, target, &staged, deleted_at, reason, cid);
+    dirty_whole_segment_day(&guard, &mut row);
     Some(row)
 }
 
@@ -1118,6 +1392,10 @@ pub fn confirmed_absent(journal: &Path, target: &Target) -> Outcome {
         halted: None,
     }
 }
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+#[path = "door/cooperation_tests.rs"]
+mod cooperation_tests;
 
 #[cfg(test)]
 #[allow(

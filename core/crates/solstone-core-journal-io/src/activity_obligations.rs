@@ -277,6 +277,41 @@ pub fn observe_obligations(
     observe_with(root, Limits::default(), |_, _| {})
 }
 
+/// Classify the reserved stage namespace; this grants no mutation authority.
+pub fn is_stage_namespace_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(".tmp-offload-"))
+}
+
+#[cfg(test)]
+mod namespace_name_tests {
+    use super::is_stage_namespace_name;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn classification_preserves_exact_prefix_behavior() {
+        for (name, reserved) in [
+            (".tmp-offload-", true),
+            (".tmp-offload-anything", true),
+            (".tmp-offload", false),
+            (".removing_.tmp-offload-x", false),
+            ("segment.tmp-offload-x", false),
+            ("070000_17", false),
+        ] {
+            assert_eq!(is_stage_namespace_name(OsStr::new(name)), reserved);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_remains_unclassified() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(!is_stage_namespace_name(OsStr::from_bytes(
+            b".tmp-offload-\xff"
+        )));
+    }
+}
+
 /// Fresh complete census recognizing only this borrowed live empty root carrier.
 /// Every other stage/intent remains unresolved; errors never yield partial success.
 pub fn observe_with_carrier<'a>(
@@ -553,11 +588,7 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
         for entry in &entries {
             if matches!(role, Role::Intents) {
                 self.intent(directory, entry, relative)?;
-            } else if entry
-                .name
-                .to_str()
-                .is_some_and(|name| name.starts_with(".tmp-offload-"))
-            {
+            } else if is_stage_namespace_name(&entry.name) {
                 let stage_relative = relative.join(&entry.name);
                 self.encountered = Some((stage_relative.clone(), entry.clone()));
                 self.add(
