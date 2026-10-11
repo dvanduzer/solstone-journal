@@ -19,6 +19,8 @@ pub(super) const PRELAUNCH_HELD: &str =
     "turning off and deleting your backup isn't available here. no backup changes were made.";
 pub(super) const BACKUP_ONLY_HELD: &str = "your backup holds the only copy of some of your media, so no backup changes were made. restore everything from the backup page first, then try again.";
 pub(super) const DESTINATION_UNSUPPORTED: &str = "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made.";
+pub(super) const BACKUP_ONLY_UNPLACED: &str = "your backup holds the only copy of some older media that can't be matched to a recording on this device, so it can't be restored and no backup changes were made. if your journal was moved or copied, bring back its missing days, then try again.";
+pub(super) const OFFLOAD_RECORD_UNAVAILABLE: &str = "the record of what media offload moved into your backup is missing or can't be read, so no backup changes were made. if your journal was moved or copied, bring back its health folder, then try again.";
 pub(super) const NOT_STARTED: &str =
     "turning off and deleting your backup couldn't start. no backup changes were made.";
 
@@ -66,18 +68,29 @@ pub(super) fn run(journal: &Path) -> OwnedTeardownCliRun {
     ))
 }
 
-fn backup_only_held(outcome: &OwnedTeardownOutcome) -> bool {
-    outcome.preparation_failure().is_some_and(|failure| {
+/// Coverage refusals the owner can act on, with their reason and message.
+fn coverage_refusal(outcome: &OwnedTeardownOutcome) -> Option<(&'static str, &'static str)> {
+    let failure = outcome.preparation_failure()?;
+    let TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(reader)) =
         failure.refusal()
-            == TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(
-                TeardownReaderRefusal::BackupOnlyHeld,
-            ))
-    })
+    else {
+        return None;
+    };
+    match reader {
+        TeardownReaderRefusal::BackupOnlyHeld => Some(("backup_only_held", BACKUP_ONLY_HELD)),
+        TeardownReaderRefusal::BackupOnlyUnplaced => {
+            Some(("backup_only_unplaced", BACKUP_ONLY_UNPLACED))
+        }
+        TeardownReaderRefusal::CatalogUnavailable => {
+            Some(("offload_record_unavailable", OFFLOAD_RECORD_UNAVAILABLE))
+        }
+        TeardownReaderRefusal::RecoveryUnavailable | TeardownReaderRefusal::RecoveryHeld => None,
+    }
 }
 
 fn reason(outcome: &OwnedTeardownOutcome) -> &'static str {
-    if backup_only_held(outcome) {
-        return "backup_only_held";
+    if let Some((reason, _)) = coverage_refusal(outcome) {
+        return reason;
     }
     match outcome.refusal() {
         Some(TeardownRunRefusal::UnsupportedPlatform) => "platform_unavailable",
@@ -144,8 +157,8 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
     } else if outcome.phase() == solstone_core_offload::teardown::TeardownRunPhase::Prelaunch {
         format!("{PRELAUNCH_HELD}\n")
     } else if outcome.refused_before_effects() {
-        let message = if backup_only_held(outcome) {
-            BACKUP_ONLY_HELD
+        let message = if let Some((_, message)) = coverage_refusal(outcome) {
+            message
         } else if matches!(
             outcome.refusal(),
             Some(TeardownRunRefusal::UnsupportedDestination)
@@ -257,19 +270,33 @@ mod tests {
             1,
         )
         .unwrap();
-        let before = std::fs::read(&config).unwrap();
         let args = vec!["off".into(), "--yes".into()];
-        let run = run_cli(&args, journal.path());
-        let (stdout, stderr, code) = run.output();
-        assert_eq!(code, 1);
-        assert!(stdout.contains("reason=backup_only_held"), "{stdout}");
-        assert_eq!(stderr, format!("{BACKUP_ONLY_HELD}\n"));
-        assert!(matches!(
-            listener.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-        assert_eq!(std::fs::read(&config).unwrap(), before);
-        drop(run);
+        let refuses = |reason: &str, message: &str| {
+            let before = std::fs::read(&config).unwrap();
+            let run = run_cli(&args, journal.path());
+            let (stdout, stderr, code) = run.output();
+            assert_eq!(code, 1);
+            assert!(stdout.contains(&format!("reason={reason}")), "{stdout}");
+            assert_eq!(stderr, format!("{message}\n"));
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            assert_eq!(std::fs::read(&config).unwrap(), before);
+        };
+        // The recording this historical media belongs to is not on this device.
+        refuses("backup_only_unplaced", BACKUP_ONLY_UNPLACED);
+        let segment = journal.path().join("chronicle/20260101/010000_001");
+        std::fs::create_dir_all(&segment).unwrap();
+        refuses("backup_only_held", BACKUP_ONLY_HELD);
+        // Offload was on, but its record is gone.
+        std::fs::remove_dir_all(journal.path().join("health/offload")).unwrap();
+        std::fs::write(
+            &config,
+            br#"{"backup":{"enabled":true,"mode":"operated","offload":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        refuses("offload_record_unavailable", OFFLOAD_RECORD_UNAVAILABLE);
 
         std::fs::write(
             &config,

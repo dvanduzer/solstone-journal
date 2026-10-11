@@ -2292,6 +2292,7 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
             assert_eq!(done["enabled"], true);
 
             // Media recorded only in this backup must stop teardown before any request.
+            std::fs::create_dir_all(journal_path.join("chronicle/20260101/010000_001")).unwrap();
             solstone_core_offload::append_offload_event(
                 journal_path.as_path(),
                 "20260101",

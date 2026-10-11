@@ -26,6 +26,9 @@ pub enum TeardownReaderRefusal {
     /// Some cataloged media is not verifiably present locally, so the backup may
     /// hold the only copy.
     BackupOnlyHeld,
+    /// Some media only in the backup has no single local recording to return to,
+    /// so restoring it first is not possible here.
+    BackupOnlyUnplaced,
 }
 
 pub type TeardownReader<'a> = dyn for<'carrier> FnMut(

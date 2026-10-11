@@ -452,7 +452,8 @@ fn select(
     Ok((report, files))
 }
 
-fn discover(root: &Arc<JournalRoot>, day: &str) -> Result<Vec<Segment>, String> {
+/// Every segment of one day, refusing unrepresentable or duplicate identities.
+pub(crate) fn discover(root: &Arc<JournalRoot>, day: &str) -> Result<Vec<Segment>, String> {
     let directory = MediaDirectory::open(Arc::clone(root), &Path::new("chronicle").join(day))
         .map_err(|error| error.to_string())?;
     let segments = iter_segments(root.canonical_path(), PathOrDay::Day(day))

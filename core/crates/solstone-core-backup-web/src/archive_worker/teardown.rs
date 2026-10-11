@@ -304,14 +304,21 @@ fn unstarted_reason(outcome: &OwnedTeardownOutcome) -> Option<&'static str> {
     if !outcome.refused_before_effects() {
         return None;
     }
-    let backup_only = outcome.preparation_failure().is_some_and(|failure| {
-        failure.refusal()
-            == TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(
-                TeardownReaderRefusal::BackupOnlyHeld,
-            ))
-    });
-    if backup_only {
-        Some("backup_only_held")
+    let reader = outcome
+        .preparation_failure()
+        .and_then(|failure| match failure.refusal() {
+            TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(reader)) => {
+                Some(reader)
+            }
+            _ => None,
+        });
+    if let Some(reason) = reader.and_then(|reader| match reader {
+        TeardownReaderRefusal::BackupOnlyHeld => Some("backup_only_held"),
+        TeardownReaderRefusal::BackupOnlyUnplaced => Some("backup_only_unplaced"),
+        TeardownReaderRefusal::CatalogUnavailable => Some("offload_record_unavailable"),
+        TeardownReaderRefusal::RecoveryUnavailable | TeardownReaderRefusal::RecoveryHeld => None,
+    }) {
+        Some(reason)
     } else if matches!(
         outcome.refusal(),
         Some(TeardownRunRefusal::UnsupportedDestination)
@@ -470,6 +477,7 @@ mod tests {
             },
         )
         .unwrap();
+        fs::create_dir_all(root.path().join("chronicle/20260101/010000_001")).unwrap();
         solstone_core_offload::append_offload_event(
             root.path(),
             "20260101",
@@ -792,6 +800,34 @@ mod tests {
         fs::write(config, original).unwrap();
         assert!(response(&deps).unwrap().status().is_success());
         successor(&deps);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_names_unplaced_media_and_a_missing_offload_record() {
+        let (root, deps, io) = fixture();
+        fs::remove_dir(root.path().join("chronicle/20260101/010000_001")).unwrap();
+        let returned = actual_return(&deps);
+        assert_eq!(
+            returned.terminal.reason_code.as_deref(),
+            Some("backup_only_unplaced")
+        );
+        assert!(returned.dischargeable());
+        drop(returned);
+
+        let (root, deps, _) = fixture();
+        fs::remove_dir_all(root.path().join("health/offload")).unwrap();
+        let config = root.path().join("config/journal.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        value["backup"]["offload"] = serde_json::json!({"enabled": true});
+        fs::write(&config, serde_json::to_vec(&value).unwrap()).unwrap();
+        let returned = actual_return(&deps);
+        assert_eq!(
+            returned.terminal.reason_code.as_deref(),
+            Some("offload_record_unavailable")
+        );
+        assert!(returned.dischargeable());
+        assert_eq!(io.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

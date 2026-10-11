@@ -26,11 +26,15 @@ mod unix {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_backup(json!({"mode":"byo"}))
+        }
+
+        fn with_backup(backup: serde_json::Value) -> Self {
             let temp = tempfile::tempdir().unwrap();
             fs::create_dir(temp.path().join("config")).unwrap();
             fs::write(
                 temp.path().join("config/journal.json"),
-                br#"{"backup":{"mode":"byo"},"private":"fixture-secret"}"#,
+                json!({"backup":backup,"private":"fixture-secret"}).to_string(),
             )
             .unwrap();
             let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
@@ -249,12 +253,19 @@ mod unix {
             witness: segment.active[0].clone(),
             presence: CatalogLocalPresence::Present { local_bytes: 3 },
         };
-        assert!(locally_covered(&f.root, &observed));
+        let mut days = BTreeMap::new();
+        assert!(matches!(
+            coverage(&f.root, &mut days, &observed),
+            Coverage::Covered
+        ));
         // An incomplete local scan reports Unknown even when the same-size file is seen.
         observed.presence = CatalogLocalPresence::Unknown {
             known_local_bytes: Some(3),
         };
-        assert!(!locally_covered(&f.root, &observed));
+        assert!(matches!(
+            coverage(&f.root, &mut days, &observed),
+            Coverage::Restorable
+        ));
     }
 
     #[test]
@@ -273,11 +284,91 @@ mod unix {
         assert_eq!(check(&admission), Ok(()));
         assert_eq!(f.snapshot(), before);
 
-        // A legacy witness names no segment directory, so deletion cannot be proven.
+        // A legacy witness resolves by stream and segment key, as legacy restore does.
         let f = Fixture::new();
-        let local = f.archive(false);
-        fs::write(local.parent().unwrap().join("tombstone.json"), b"{}").unwrap();
+        let segment = f.archive(false).parent().unwrap().to_path_buf();
+        let admission = f.admit();
+        assert_eq!(check(&admission), backup_only());
+        std::os::unix::fs::symlink("elsewhere", segment.join("tombstone.json")).unwrap();
+        assert_eq!(check(&admission), backup_only());
+        fs::remove_file(segment.join("tombstone.json")).unwrap();
+        fs::write(segment.join("tombstone.json"), b"{}").unwrap();
+        let before = f.snapshot();
+        assert_eq!(check(&admission), Ok(()));
+        assert_eq!(f.snapshot(), before);
+    }
+
+    fn unplaced() -> Result<(), TeardownAdmissionRefusal> {
+        Err(TeardownAdmissionRefusal::Reader(
+            TeardownReaderRefusal::BackupOnlyUnplaced,
+        ))
+    }
+
+    #[test]
+    fn backup_only_media_without_one_local_recording_is_named_unplaced() {
+        // Legacy: the segment directory is gone, the day is gone, or two share its key.
+        for case in ["segment", "day", "ambiguous"] {
+            let f = Fixture::new();
+            let segment = f.archive(false).parent().unwrap().to_path_buf();
+            match case {
+                "segment" => fs::remove_dir(&segment).unwrap(),
+                "day" => fs::remove_dir_all(segment.parent().unwrap()).unwrap(),
+                _ => fs::create_dir(segment.with_file_name("010000_001_full")).unwrap(),
+            }
+            let admission = f.admit();
+            let before = f.snapshot();
+            assert_eq!(check(&admission), unplaced(), "{case}");
+            assert_eq!(f.snapshot(), before, "{case}");
+        }
+        // Bound: its exact segment directory is gone.
+        let f = Fixture::new();
+        fs::remove_dir(f.archive(true).parent().unwrap()).unwrap();
+        assert_eq!(check(&f.admit()), unplaced());
+        // Media that can still be restored is named first.
+        let restorable = f.path("chronicle/20260101/010000_001");
+        fs::create_dir(&restorable).unwrap();
+        append_offload_event(
+            f.temp.path(),
+            "20260101",
+            "_default",
+            "010000_001",
+            "legacy-snapshot",
+            &[OffloadFile {
+                name: "other.webm".into(),
+                bytes: 3,
+                sha256: "a".repeat(64),
+            }],
+            3,
+        )
+        .unwrap();
         assert_eq!(check(&f.admit()), backup_only());
+    }
+
+    #[test]
+    fn missing_ledger_after_offload_was_recorded_refuses_as_unavailable() {
+        let unavailable = Err(TeardownAdmissionRefusal::Reader(
+            TeardownReaderRefusal::CatalogUnavailable,
+        ));
+        for backup in [
+            json!({"mode":"byo","offload":{"enabled":true}}),
+            json!({"mode":"byo","offload":{"enabled":false},
+                "last_offload":{"time":"2026-01-01T00:00:00Z","files_marked":0}}),
+            json!({"mode":"byo","last_offload":{"time":null,"files_marked":2}}),
+        ] {
+            let f = Fixture::with_backup(backup.clone());
+            let admission = f.admit();
+            let before = f.snapshot();
+            assert_eq!(check(&admission), unavailable, "{backup}");
+            assert_eq!(f.snapshot(), before, "{backup}");
+            drop(admission);
+            // A present, complete ledger with every file still local is enough.
+            fs::write(f.archive(true), b"abc").unwrap();
+            assert_eq!(check(&f.admit()), Ok(()), "{backup}");
+        }
+        // Offload that was never on and never ran needs no ledger.
+        let f = Fixture::with_backup(json!({"mode":"byo","offload":{"enabled":false},
+            "last_offload":{"time":null,"last_ok_time":null,"files_marked":0}}));
+        assert_eq!(check(&f.admit()), Ok(()));
     }
 
     #[test]

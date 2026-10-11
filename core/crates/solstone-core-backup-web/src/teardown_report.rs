@@ -152,6 +152,7 @@ fn admission(value: TeardownAdmissionRefusal) -> Value {
         TeardownAdmissionRefusal::Reader(reason) => json!({"kind":"reader", "reason":match reason {
             TeardownReaderRefusal::CatalogUnavailable => "catalog_unavailable", TeardownReaderRefusal::RecoveryUnavailable => "recovery_unavailable", TeardownReaderRefusal::RecoveryHeld => "recovery_held",
             TeardownReaderRefusal::BackupOnlyHeld => "backup_only_held",
+            TeardownReaderRefusal::BackupOnlyUnplaced => "backup_only_unplaced",
         }}),
     }
 }

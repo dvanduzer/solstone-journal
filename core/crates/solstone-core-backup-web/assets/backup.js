@@ -306,7 +306,9 @@
       "broker_error": "encrypted backup didn't return usable settings. try again shortly.",
       "hosted_entitlement_inactive": "turn on encrypted backup in the services portal, then try again.",
       "backup_only_held": "your backup holds the only copy of some of your media, so no backup changes were made. restore everything first, then try again.",
-      "destination_unsupported": "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made."
+      "destination_unsupported": "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made.",
+      "backup_only_unplaced": "your backup holds the only copy of some older media that can't be matched to a recording on this device, so it can't be restored and no backup changes were made. if your journal was moved or copied, bring back its missing days, then try again.",
+      "offload_record_unavailable": "the record of what media offload moved into your backup is missing or can't be read, so no backup changes were made. if your journal was moved or copied, bring back its health folder, then try again."
     },
     "action_labels": {
       "finish_cleanup": "finish stopping backup",
