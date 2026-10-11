@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,16 +16,17 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation, FileFsFullSizeInformation,
     FileRenameInformation, NtQueryVolumeInformationFile, NtSetInformationFile,
 };
-use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_SUCCESS};
+use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, RtlNtStatusToDosError, STATUS_SUCCESS};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_BASIC_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE,
-    FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandleEx,
+    FILE_BASIC_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandleEx, ReOpenFile,
     SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::{JournalRoot, MediaIdentity, changed, invalid};
+use super::{JournalRoot, MediaIdentity, MediaPrimitive, changed, invalid, step};
 use crate::windows_identity::{WindowsFileIdentity, file_identity};
 use crate::windows_ntcreate::{
     nt_create_relative, nt_create_relative_deny_delete_sharing, nt_create_relative_share_read,
@@ -54,6 +55,10 @@ pub(super) struct Directory {
 }
 
 impl Directory {
+    pub(super) fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+
     pub(super) fn open(root: Arc<JournalRoot>, names: &[OsString]) -> io::Result<Self> {
         root.revalidate_canonical_binding()
             .map_err(io::Error::other)?;
@@ -185,6 +190,66 @@ impl FullSizeInformation {
 }
 
 pub(super) fn supported_mutation() -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn archive_path(directory: &Directory, name: &OsStr) -> io::Result<PathBuf> {
+    let mut path = PathBuf::from(directory.anchor.move_spelling());
+    for node in &directory.nodes {
+        path.push(&node.name);
+    }
+    path.push(name);
+    // The extended-length Win32 spelling includes its terminal NUL.
+    if path.as_os_str().encode_wide().count() >= 32767 {
+        return Err(invalid("Windows archive input path exceeds native budget"));
+    }
+    Ok(path)
+}
+
+fn reopen(file: &File, access: u32, sharing: u32) -> io::Result<File> {
+    let expected = identity(file)?;
+    // SAFETY: synchronous reopen of a retained plain object; the actual prior
+    // handle stays live until the new handle's full identity has been checked.
+    #[allow(unsafe_code)]
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            access,
+            sharing,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile returned this uniquely owned native handle.
+    #[allow(unsafe_code)]
+    let reopened = unsafe { File::from_raw_handle(handle) };
+    require_kind(reopened.as_raw_handle(), false)?;
+    if identity(&reopened)? != expected {
+        return Err(changed());
+    }
+    Ok(reopened)
+}
+
+pub(super) fn transition_access(file: &mut File, mutation: bool) -> io::Result<()> {
+    let read = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    let bridge = reopen(
+        file,
+        read,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    // Retain the actual object through the sharing gap. The caller revalidates
+    // leaf/chain and prepared stamp after final restrictive admission.
+    drop(std::mem::replace(file, bridge));
+    step(MediaPrimitive::ArchiveAccessGap)?;
+    let access = if mutation {
+        read | FILE_WRITE_DATA | DELETE
+    } else {
+        read
+    };
+    let restrictive = reopen(file, access, FILE_SHARE_READ)?;
+    *file = restrictive;
     Ok(())
 }
 

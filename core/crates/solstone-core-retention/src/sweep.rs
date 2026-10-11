@@ -44,7 +44,8 @@ use solstone_core_journal_io::paths::{PathOrDay, day_dirs, iter_segments};
 use crate::class::{classify, partition_empty_audio};
 use crate::content::{HandlerRegistry, MediaClassifier};
 use crate::door::{EvidenceTally, release_raw};
-use crate::eligibility::{Blocker, FoundContent, ProvenRaw, RawRelease, resolve};
+use crate::eligibility::{Blocker, FoundContent, ProvenRaw};
+use crate::grouped::{DecisionPurpose, SideDecision};
 use crate::original_deletion::RawReleaseClass;
 use crate::policy::{Eligibility, Policy};
 use crate::receipt::{Outcome, Target};
@@ -283,33 +284,28 @@ fn decide_side(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> SideOutcome {
-    if side.is_empty() {
-        return SideOutcome::None;
-    }
-    let records: Vec<Option<&serde_json::Value>> = side
-        .iter()
-        .map(|item| item.sidecar.record.as_ref())
-        .collect();
-    let age = crate::age::segment_age(&target.day, &records, today, now);
-    let class = classify(side, registry);
-    let verdict = policy.evaluate(&target.stream, age, class);
-    if !verdict.is_eligible() {
-        return SideOutcome::Policy(verdict);
-    }
-    match resolve(
+    match crate::grouped::decide_side(
+        side,
         registry,
         classifier,
-        &target.day,
-        &target.stream,
-        &target.dir,
-        side,
+        policy,
+        target,
+        today,
+        now,
+        DecisionPurpose::PolicyRelease,
     ) {
-        RawRelease::Releasable(proven) if proven.is_empty() => SideOutcome::None,
-        RawRelease::Releasable(proven) => SideOutcome::Proved {
-            eligibility: verdict,
+        SideDecision::NoMedia => SideOutcome::None,
+        SideDecision::Kept(verdict) => SideOutcome::Policy(verdict),
+        SideDecision::Unproven(blockers) => SideOutcome::Held(blockers),
+        SideDecision::Eligible {
+            policy: Some(eligibility),
+            proven,
+        } => SideOutcome::Proved {
+            eligibility,
             proven,
         },
-        RawRelease::Held(blockers) => SideOutcome::Held(blockers),
+        // Every policy-release decision carries its policy verdict.
+        SideDecision::Eligible { policy: None, .. } => SideOutcome::None,
     }
 }
 

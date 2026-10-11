@@ -25,8 +25,12 @@ use solstone_core_backup_runtime::{
     rotate_recovery_key, run_prune, teardown_backup, validate_destination,
 };
 use solstone_core_offload::{
-    OffloadResult, RestoreResult as OffloadRestoreResult, build_offload_status,
-    format_offload_result, restore_all_offload, restore_offload_day, run_offload,
+    OffloadResult, RestoreResult as OffloadRestoreResult, format_offload_result,
+    restore_all_offload, restore_offload_day, run_offload,
+};
+use solstone_core_offload::{
+    measurement::{device_free_bytes, device_total_bytes, suggest_offload_defaults},
+    status::build_checked_offload_status,
 };
 
 pub const USAGE: &str = "usage: solstone journal backup <command> [options]\n";
@@ -926,10 +930,17 @@ fn offload_status(args: &[String], journal: &Path) -> CliRun {
         return offload_usage_error(&args.join(" "));
     }
     let json = options.iter().any(|option| option == "--json");
-    let value = match build_offload_status(journal) {
+    let mut value = match build_checked_offload_status(journal) {
         Ok(status) => status.value,
         Err(error) => return runtime_error(error),
     };
+    let free_bytes = device_free_bytes(journal).ok();
+    let total_bytes = device_total_bytes(journal).ok();
+    value["device"] = json!({"free_bytes": free_bytes, "total_bytes": total_bytes});
+    value["suggested_defaults"] = total_bytes
+        .and_then(|total| suggest_offload_defaults(total).ok())
+        .map(|defaults| json!({"budget_bytes":defaults.budget_bytes,"floor_bytes":defaults.floor_bytes}))
+        .unwrap_or(Value::Null);
     if json {
         return render_json(Ok::<_, String>(value));
     }
@@ -944,35 +955,55 @@ fn offload_status_line(value: &Value) -> Result<String, String> {
             .try_fold(value, |current, field| current.get(*field))
             .ok_or_else(|| "invalid offload status.".to_owned())
     };
-    let enabled = field(&["offload", "enabled"]).and_then(|value| {
-        value
+    let flag = |path: &[&str]| {
+        field(path)?
             .as_bool()
-            .ok_or_else(|| "invalid offload status.".into())
-    })?;
-    let raw = field(&["raw_media", "total_bytes"]).and_then(|value| {
+            .ok_or_else(|| "invalid offload status.".to_owned())
+    };
+    let bytes = |path: &[&str]| -> Result<String, String> {
+        let value = field(path)?;
+        if value.is_null() {
+            return Ok("unavailable".into());
+        }
         value
             .as_u64()
-            .ok_or_else(|| "invalid offload status.".into())
-    })?;
-    let pending = field(&["pending_release", "total_bytes"]).and_then(|value| {
-        value
-            .as_u64()
-            .ok_or_else(|| "invalid offload status.".into())
-    })?;
-    let backup_only = field(&["backup_only", "total_bytes"]).and_then(|value| {
-        value
-            .as_u64()
-            .ok_or_else(|| "invalid offload status.".into())
-    })?;
-    let degraded = field(&["backup_only", "degraded"]).and_then(|value| {
-        value
-            .as_bool()
-            .ok_or_else(|| "invalid offload status.".into())
-    })?;
+            .map(|amount| amount.to_string())
+            .ok_or_else(|| "invalid offload status.".to_owned())
+    };
+    let enabled = flag(&["offload", "enabled"])?;
+    let raw_complete = flag(&["raw_media", "complete"])?;
+    let backup_complete = flag(&["backup_only", "complete"])?;
+    let degraded = flag(&["backup_only", "degraded"])?;
+    let available = flag(&["proposed_release", "available"])?;
+    let mut raw = bytes(&["raw_media", "total_bytes"])?;
+    let mut backup_only = bytes(&["backup_only", "total_bytes"])?;
+    let mut pending = bytes(&["pending_release", "total_bytes"])?;
+    let known_raw = bytes(&["raw_media", "known_bytes"])?;
+    let known_backup = bytes(&["backup_only", "known_bytes"])?;
+    let proposed = bytes(&["proposed_release", "structural_bytes"])?;
+    let mut eligible = bytes(&["proposed_release", "eligible_bytes"])?;
+    let mut projected = bytes(&["proposed_release", "projected_local_bytes"])?;
+    let free = bytes(&["device", "free_bytes"])?;
+    let total = bytes(&["device", "total_bytes"])?;
+    if !raw_complete {
+        raw = "unavailable".into();
+    }
+    if !backup_complete {
+        backup_only = "unavailable".into();
+    }
+    if !available {
+        eligible = "unavailable".into();
+        pending = "unavailable".into();
+    }
+    if !available || !raw_complete {
+        projected = "unavailable".into();
+    }
     Ok(format!(
-        "backup offload: enabled={} raw_media_bytes={raw} pending_release_bytes={pending} backup_only_bytes={backup_only} degraded={}\n",
+        "backup offload: enabled={} raw_media_bytes={raw} pending_release_bytes={pending} backup_only_bytes={backup_only} degraded={} raw_media_known_bytes={known_raw} raw_media_complete={} backup_only_known_bytes={known_backup} backup_only_complete={} proposed_bytes={proposed} eligible_bytes={eligible} projected_local_bytes={projected} device_free_bytes={free} device_total_bytes={total}\n",
         python_bool(enabled),
         python_bool(degraded),
+        python_bool(raw_complete),
+        python_bool(backup_complete),
     ))
 }
 
@@ -2176,6 +2207,92 @@ mod tests {
     }
 
     #[test]
+    fn offload_status_line_preserves_nullable_totals_and_independent_geometry() {
+        let mut value = json!({
+            "offload": {"enabled":true},
+            "raw_media": {"total_bytes":23,"known_bytes":23,"complete":true},
+            "backup_only": {"total_bytes":3,"known_bytes":3,"complete":true,"degraded":false},
+            "pending_release": {"total_bytes":7},
+            "proposed_release": {"structural_bytes":11,"eligible_bytes":7,"projected_local_bytes":16,"available":true},
+            "device": {"free_bytes":31,"total_bytes":100}
+        });
+        let fields = offload_status_fields(&value);
+        for (name, expected) in [
+            ("raw_media_bytes", "23"),
+            ("proposed_bytes", "11"),
+            ("eligible_bytes", "7"),
+            ("projected_local_bytes", "16"),
+            ("device_free_bytes", "31"),
+            ("device_total_bytes", "100"),
+        ] {
+            assert_eq!(fields[name], expected);
+        }
+
+        value["proposed_release"]["available"] = json!(false);
+        let fields = offload_status_fields(&value);
+        assert_eq!(fields["eligible_bytes"], "unavailable");
+        assert_eq!(fields["pending_release_bytes"], "unavailable");
+        assert_eq!(fields["projected_local_bytes"], "unavailable");
+        assert_eq!(fields["proposed_bytes"], "11");
+        value["backup_only"] =
+            json!({"total_bytes":null,"known_bytes":5,"complete":false,"degraded":true});
+        let fields = offload_status_fields(&value);
+        assert_eq!(fields["raw_media_bytes"], "23");
+        assert_eq!(fields["backup_only_bytes"], "unavailable");
+        assert_eq!(fields["backup_only_known_bytes"], "5");
+        assert_eq!(fields["backup_only_complete"], "False");
+
+        value["raw_media"] = json!({"total_bytes":null,"known_bytes":13,"complete":false});
+        value["proposed_release"]["available"] = json!(true);
+        let fields = offload_status_fields(&value);
+        assert_eq!(fields["raw_media_bytes"], "unavailable");
+        assert_eq!(fields["raw_media_known_bytes"], "13");
+        assert_eq!(fields["raw_media_complete"], "False");
+        assert_eq!(fields["projected_local_bytes"], "unavailable");
+
+        for (free, total, expected_free, expected_total) in [
+            (json!(31), Value::Null, "31", "unavailable"),
+            (Value::Null, json!(100), "unavailable", "100"),
+            (json!(0), json!(0), "0", "0"),
+        ] {
+            value["device"] = json!({"free_bytes":free,"total_bytes":total});
+            let fields = offload_status_fields(&value);
+            assert_eq!(fields["device_free_bytes"], expected_free);
+            assert_eq!(fields["device_total_bytes"], expected_total);
+            assert_eq!(fields["raw_media_known_bytes"], "13");
+        }
+        value["raw_media"] = json!({"total_bytes":0,"known_bytes":0,"complete":true});
+        value["backup_only"] =
+            json!({"total_bytes":0,"known_bytes":0,"complete":true,"degraded":false});
+        value["proposed_release"] = json!({"structural_bytes":0,"eligible_bytes":0,"projected_local_bytes":0,"available":true});
+        value["pending_release"]["total_bytes"] = json!(0);
+        let fields = offload_status_fields(&value);
+        for name in [
+            "raw_media_bytes",
+            "backup_only_bytes",
+            "proposed_bytes",
+            "eligible_bytes",
+            "projected_local_bytes",
+            "pending_release_bytes",
+        ] {
+            assert_eq!(fields[name], "0");
+        }
+        for invalid in [json!(-1), json!("0"), json!(true)] {
+            value["raw_media"]["total_bytes"] = invalid;
+            assert!(offload_status_line(&value).is_err());
+        }
+    }
+
+    fn offload_status_fields(value: &Value) -> std::collections::BTreeMap<String, String> {
+        offload_status_line(value)
+            .unwrap()
+            .split_whitespace()
+            .filter_map(|word| word.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect()
+    }
+
+    #[test]
     fn offload_status_renders_distinct_human_and_json_values_without_writing() {
         let journal = offload_status_fixture();
         let runner = UnusedRunner;
@@ -2194,19 +2311,29 @@ mod tests {
             journal.path(),
             &services,
         );
-        assert_eq!(
-            human.stdout,
-            "backup offload: enabled=False raw_media_bytes=30 pending_release_bytes=3 backup_only_bytes=7 degraded=False\n"
-        );
+        assert_eq!(human.exit_code, 0);
+        assert!(human.stdout.contains("raw_media_bytes=33 "));
+        assert!(human.stdout.contains("pending_release_bytes=unavailable "));
+        assert!(human.stdout.contains("backup_only_bytes=unavailable "));
+        assert!(human.stdout.contains("raw_media_known_bytes=33 "));
+        assert!(human.stdout.contains("backup_only_complete=False "));
         let machine = run_cli_with(
             &["offload".into(), "status".into(), "--json".into()],
             journal.path(),
             &services,
         );
+        assert_eq!(machine.exit_code, 0);
         let value: Value = serde_json::from_str(&machine.stdout).unwrap();
-        assert_eq!(value["raw_media"]["total_bytes"], 30);
-        assert_eq!(value["pending_release"]["total_bytes"], 3);
-        assert_eq!(value["backup_only"]["total_bytes"], 7);
+        assert_eq!(value["raw_media"]["total_bytes"], 33);
+        assert_eq!(value["raw_media"]["complete"], true);
+        assert!(value["pending_release"]["total_bytes"].is_null());
+        assert!(value["backup_only"]["total_bytes"].is_null());
+        assert_eq!(value["backup_only"]["unbound_files"], 2);
+        assert_eq!(value["backup_only"]["complete"], false);
+        assert_eq!(value["proposed_release"]["available"], false);
+        assert!(value["proposed_release"]["eligible_bytes"].is_null());
+        assert!(value["device"].get("free_bytes").is_some());
+        assert!(value["device"].get("total_bytes").is_some());
         assert_eq!(fs::read(ledger).unwrap(), before, "status is read-only");
         assert!(!config.exists(), "status must not create journal config");
     }

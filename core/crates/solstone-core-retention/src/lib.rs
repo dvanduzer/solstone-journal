@@ -55,6 +55,7 @@ pub mod class;
 pub mod content;
 pub mod door;
 pub mod eligibility;
+pub mod grouped;
 pub mod layout;
 pub mod logs;
 pub mod mark_mutation;

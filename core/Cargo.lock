@@ -4413,6 +4413,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "solstone-core-backup-web",
  "solstone-core-convey-http",
  "solstone-core-convey-shell",
  "solstone-core-facets",

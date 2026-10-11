@@ -55,6 +55,33 @@ impl ReviewContext {
     pub fn marks(&self) -> &[Mark] {
         &self.marks
     }
+
+    /// Select complete rows from this rendered context without reading newer
+    /// proposals. Current validation remains the checked entry's responsibility.
+    pub fn select(&self, ids: &[MarkId]) -> Result<Self, ReviewRefusal> {
+        if ids.is_empty() {
+            return Err(ReviewRefusal::Empty);
+        }
+        let mut unique = BTreeSet::new();
+        let mut marks = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.insert(id) {
+                return Err(ReviewRefusal::Duplicate);
+            }
+            let mut matching = self.marks.iter().filter(|mark| &mark.id == id);
+            let selected = matching
+                .next()
+                .ok_or_else(|| ReviewRefusal::Missing { id: id.clone() })?;
+            if matching.next().is_some() {
+                return Err(ReviewRefusal::Duplicate);
+            }
+            marks.push(selected.clone());
+        }
+        Ok(Self {
+            root_observation: self.root_observation.clone(),
+            marks,
+        })
+    }
 }
 
 /// Fresh action preflight that retains the root. Execution must still recheck

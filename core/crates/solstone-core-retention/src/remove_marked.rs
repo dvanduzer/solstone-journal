@@ -9,11 +9,11 @@ use std::path::Path;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use solstone_core_journal_io::{LockOptions, hold_lock};
 
-use crate::age::segment_age;
-use crate::class::{classify, partition_empty_audio};
+use crate::class::partition_empty_audio;
 use crate::content::{ClosedHandlerSet, JournalMedia};
 use crate::door::release_raw;
-use crate::eligibility::{Blocker, FoundContent, ProvenRaw, RawRelease, resolve};
+use crate::eligibility::{Blocker, FoundContent, ProvenRaw};
+use crate::grouped::{DecisionPurpose, SideDecision};
 use crate::mark_mutation::{PlannedMarkMutation, conditional_mutate};
 use crate::marks::{
     Failure, Mark, MarkId, PreflightMarks, PreflightRefusal, RemovalClass, load as load_marks,
@@ -272,32 +272,20 @@ fn decide_side(
     target: &crate::Target,
     context: &RemovalContext<'_>,
 ) -> SideOutcome {
-    if side.is_empty() {
-        return SideOutcome::None;
-    }
-    let records = side
-        .iter()
-        .map(|item| item.sidecar.record.as_ref())
-        .collect::<Vec<_>>();
-    let verdict = context.policy.evaluate(
-        &target.stream,
-        segment_age(&target.day, &records, context.today, context.now),
-        classify(side, &ClosedHandlerSet),
-    );
-    if !verdict.is_eligible() {
-        return SideOutcome::Policy(verdict);
-    }
-    match resolve(
+    match crate::grouped::decide_side(
+        side,
         &ClosedHandlerSet,
         &JournalMedia,
-        &target.day,
-        &target.stream,
-        &target.dir,
-        side,
+        context.policy,
+        target,
+        context.today,
+        context.now,
+        DecisionPurpose::PolicyRelease,
     ) {
-        RawRelease::Releasable(ready) if ready.is_empty() => SideOutcome::None,
-        RawRelease::Releasable(ready) => SideOutcome::Proved(ready),
-        RawRelease::Held(blockers) => SideOutcome::Held(blockers),
+        SideDecision::NoMedia => SideOutcome::None,
+        SideDecision::Kept(verdict) => SideOutcome::Policy(verdict),
+        SideDecision::Unproven(blockers) => SideOutcome::Held(blockers),
+        SideDecision::Eligible { proven, .. } => SideOutcome::Proved(proven),
     }
 }
 

@@ -234,3 +234,55 @@ fn an_empty_or_absent_segment_yields_no_content() {
     assert!(scan_segment(&root.join("nosuch"), &ClosedHandlerSet, &JournalMedia).is_empty());
     fs::remove_dir_all(&root).expect("teardown");
 }
+
+#[test]
+fn checked_scan_distinguishes_empty_from_incomplete_observations() {
+    use solstone_core_retention::scan::scan_segment_checked;
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        scan_segment_checked(root.path(), &ClosedHandlerSet, &JournalMedia)
+            .unwrap()
+            .files()
+            .is_empty()
+    );
+    assert!(
+        scan_segment_checked(
+            &root.path().join("missing"),
+            &ClosedHandlerSet,
+            &JournalMedia
+        )
+        .is_err()
+    );
+    fs::write(root.path().join("not_directory"), b"bytes").unwrap();
+    assert!(
+        scan_segment_checked(
+            &root.path().join("not_directory"),
+            &ClosedHandlerSet,
+            &JournalMedia
+        )
+        .is_err()
+    );
+    fs::write(root.path().join("audio.flac"), b"bytes").unwrap();
+    assert_eq!(
+        scan_segment_checked(root.path(), &ClosedHandlerSet, &JournalMedia)
+            .unwrap()
+            .files()
+            .len(),
+        1
+    );
+    fs::create_dir(root.path().join("audio.jsonl")).unwrap();
+    assert!(scan_segment_checked(root.path(), &ClosedHandlerSet, &JournalMedia).is_err());
+    fs::remove_dir(root.path().join("audio.jsonl")).unwrap();
+    fs::write(root.path().join("audio.jsonl"), [0xff, b'\n']).unwrap();
+    assert!(scan_segment_checked(root.path(), &ClosedHandlerSet, &JournalMedia).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_scan_refuses_media_symlinks_instead_of_omitting_siblings() {
+    use solstone_core_retention::scan::scan_segment_checked;
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("target"), b"bytes").unwrap();
+    std::os::unix::fs::symlink("target", root.path().join("audio.flac")).unwrap();
+    assert!(scan_segment_checked(root.path(), &ClosedHandlerSet, &JournalMedia).is_err());
+}

@@ -81,11 +81,7 @@ impl WindowsFlatDirectory {
     }
 
     /// Full identity captured when this directory was bound.
-    #[allow(
-        dead_code,
-        reason = "retained for generic capability-bound file operations"
-    )]
-    pub(crate) const fn identity(&self) -> WindowsFileIdentity {
+    pub const fn identity(&self) -> WindowsFileIdentity {
         self.identity
     }
 

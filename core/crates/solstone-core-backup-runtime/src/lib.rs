@@ -46,10 +46,11 @@ pub use destination_admission::{
     AdmittedDestination, DestinationAdmissionError, admit_restore_destination,
 };
 pub use engine::{
-    ARCHIVE_TAG, AdmittedCapability, ArchiveCheckResult, ArchiveFileVerdict, ArchiveReadSession,
+    ARCHIVE_TAG, AdmittedArchive, AdmittedCapability, ArchiveCheckResult, ArchiveError,
+    ArchiveFailure, ArchiveFileVerdict, ArchiveReadSession, ArchiveRemoteEffects, ArchiveSnapshot,
     BACKUP_EXCLUDES, BackupResult, BackupServices, Clock, ClosedToolError, JournalMaintenance,
     JournalMaintenanceError, NativeJournalMaintenance, NativeRestoreRecorder, PruneResult,
-    RestoreRecorder, UnreadableSources, VerificationResult, archive_read_session,
+    RestoreRecorder, UnreadableSources, VerificationResult, admit_archive, archive_read_session,
     check_archive_snapshot_files, prepare, run_archive_backup, run_prune, run_verification,
 };
 // The legacy direct entry points: production goes through admission, so only

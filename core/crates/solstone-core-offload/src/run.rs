@@ -294,18 +294,28 @@ fn precondition(config: &serde_json::Map<String, Value>, now: i64) -> Option<&'s
     if config.get("enabled") != Some(&Value::Bool(true)) {
         return Some(OFFLOAD_STALL_BACKUP_NOT_READY);
     }
-    let backup = config.get("last_backup")?.as_object()?;
+    let Some(backup) = config.get("last_backup").and_then(Value::as_object) else {
+        return Some(OFFLOAD_STALL_BACKUP_NOT_READY);
+    };
     if backup.get("status") != Some(&Value::String("ok".into())) {
         return Some(OFFLOAD_STALL_BACKUP_FAILING);
     }
     if backup
         .get("snapshot_id")
         .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
+        .is_none_or(|snapshot| snapshot.trim().is_empty())
     {
         return Some(OFFLOAD_STALL_BACKUP_NOT_READY);
     }
-    let verification = config.get("last_verification")?.as_object()?;
+    let Some(verification) = config.get("last_verification").and_then(Value::as_object) else {
+        return Some(OFFLOAD_STALL_VERIFICATION_MISSING);
+    };
+    if !matches!(
+        verification.get("status").and_then(Value::as_str),
+        Some("ok" | "skipped" | "error")
+    ) {
+        return Some(OFFLOAD_STALL_VERIFICATION_MISSING);
+    }
     if verification.get("status") == Some(&Value::String("error".into()))
         && verification
             .get("reason")
@@ -314,8 +324,16 @@ fn precondition(config: &serde_json::Map<String, Value>, now: i64) -> Option<&'s
     {
         return Some(OFFLOAD_STALL_VERIFICATION_FAILED);
     }
-    let last_ok = verification.get("last_ok_time").and_then(Value::as_i64)?;
-    if now - last_ok > VERIFICATION_MAX_AGE_SECONDS {
+    let Some(last_ok) = verification.get("last_ok_time").and_then(Value::as_i64) else {
+        return Some(OFFLOAD_STALL_VERIFICATION_MISSING);
+    };
+    let Some(age) = now.checked_sub(last_ok) else {
+        return Some(OFFLOAD_STALL_VERIFICATION_OVERDUE);
+    };
+    if age < 0 {
+        return Some(OFFLOAD_STALL_VERIFICATION_MISSING);
+    }
+    if age > VERIFICATION_MAX_AGE_SECONDS {
         return Some(OFFLOAD_STALL_VERIFICATION_OVERDUE);
     }
     None
@@ -803,6 +821,78 @@ mod tests {
         operational_log::{OplogFormat, catalog_oplogs},
         readers::read_jsonl_with_report,
     };
+
+    #[test]
+    fn prerequisites_refuse_missing_malformed_future_and_expired_observations() {
+        let now = 2_000_000;
+        let ready = json!({
+            "enabled":true,
+            "last_backup":{"status":"ok","snapshot_id":"ready"},
+            "last_verification":{"status":"ok","last_ok_time":now}
+        });
+        let check = |value: &Value| precondition(value.as_object().unwrap(), now);
+        assert_eq!(check(&ready), None);
+        for key in ["last_backup", "last_verification"] {
+            let reason = if key == "last_backup" {
+                OFFLOAD_STALL_BACKUP_NOT_READY
+            } else {
+                OFFLOAD_STALL_VERIFICATION_MISSING
+            };
+            for value in [Value::Null, json!([]), json!("ok"), json!(1)] {
+                let mut changed = ready.clone();
+                changed[key] = value;
+                assert_eq!(check(&changed), Some(reason));
+            }
+            let mut missing = ready.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert_eq!(check(&missing), Some(reason));
+        }
+        for value in [Value::Null, json!("ready"), json!(1.5), json!(now + 1)] {
+            let mut changed = ready.clone();
+            changed["last_verification"]["last_ok_time"] = value;
+            assert_eq!(check(&changed), Some(OFFLOAD_STALL_VERIFICATION_MISSING));
+        }
+        for key in ["status", "last_ok_time"] {
+            let mut missing = ready.clone();
+            missing["last_verification"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert_eq!(check(&missing), Some(OFFLOAD_STALL_VERIFICATION_MISSING));
+        }
+        for value in [Value::Null, json!(true), json!("unknown")] {
+            let mut changed = ready.clone();
+            changed["last_verification"]["status"] = value;
+            assert_eq!(check(&changed), Some(OFFLOAD_STALL_VERIFICATION_MISSING));
+        }
+        for snapshot in [Value::Null, json!(""), json!(" \t"), json!(7)] {
+            let mut changed = ready.clone();
+            changed["last_backup"]["snapshot_id"] = snapshot;
+            assert_eq!(check(&changed), Some(OFFLOAD_STALL_BACKUP_NOT_READY));
+        }
+        for (time, expected) in [
+            (now - VERIFICATION_MAX_AGE_SECONDS, None),
+            (
+                now - VERIFICATION_MAX_AGE_SECONDS - 1,
+                Some(OFFLOAD_STALL_VERIFICATION_OVERDUE),
+            ),
+            (i64::MIN, Some(OFFLOAD_STALL_VERIFICATION_OVERDUE)),
+        ] {
+            let mut changed = ready.clone();
+            changed["last_verification"]["last_ok_time"] = json!(time);
+            assert_eq!(check(&changed), expected);
+        }
+        for reason in VERIFICATION_INTEGRITY_REASONS {
+            let mut changed = ready.clone();
+            changed["last_verification"]["status"] = json!("error");
+            changed["last_verification"]["reason"] = json!(reason);
+            assert_eq!(check(&changed), Some(OFFLOAD_STALL_VERIFICATION_FAILED));
+        }
+        let mut transient = ready;
+        transient["last_verification"]["status"] = json!("error");
+        transient["last_verification"]["reason"] = json!("locked");
+        assert_eq!(check(&transient), None);
+    }
 
     struct Script {
         outputs: RefCell<VecDeque<ToolOutput>>,

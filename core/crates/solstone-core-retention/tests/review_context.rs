@@ -115,6 +115,65 @@ fn unchanged_restart_roundtrip_order_and_deserialized_duplicates() {
 }
 
 #[test]
+fn rendered_selection_keeps_full_rows_and_excludes_unselected_failures() {
+    let journal = tempfile::tempdir().unwrap();
+    let root = root(journal.path());
+    let first = mark(&root, "a.flac", false);
+    let second = mark(&root, "b.flac", true);
+    let mut failed = mark(&root, "failed.flac", false);
+    failed.state = MarkState::Failed(Failure {
+        at: "now".into(),
+        reason: "failed".into(),
+        staged: None,
+    });
+    save(&root, &[first.clone(), second.clone(), failed.clone()]);
+    let rendered = read_review_context(
+        &root,
+        &[first.id.clone(), failed.id.clone(), second.id.clone()],
+    )
+    .unwrap();
+    let selected = rendered
+        .select(&[second.id.clone(), first.id.clone()])
+        .unwrap();
+    assert_eq!(selected.root_observation(), rendered.root_observation());
+    assert_eq!(selected.marks(), &[second.clone(), first.clone()]);
+    assert!(check_review_context(Arc::clone(&root), &selected).is_ok());
+    assert!(matches!(rendered.select(&[]), Err(ReviewRefusal::Empty)));
+    assert!(matches!(
+        rendered.select(&[first.id.clone(), first.id.clone()]),
+        Err(ReviewRefusal::Duplicate)
+    ));
+    let missing = mark(&root, "missing.flac", false);
+    assert!(matches!(
+        rendered.select(&[missing.id]),
+        Err(ReviewRefusal::Missing { .. })
+    ));
+    let selected_failed = rendered.select(std::slice::from_ref(&failed.id)).unwrap();
+    assert!(matches!(
+        check_review_context(Arc::clone(&root), &selected_failed),
+        Err(ReviewRefusal::Failed { .. })
+    ));
+    let mut changed = second.clone();
+    changed.marked_at = "2026-10-10T00:00:01Z".into();
+    save(&root, &[first, changed, failed]);
+    // Selection uses rendered bytes, even after a newer row was written.
+    let selected = rendered.select(std::slice::from_ref(&second.id)).unwrap();
+    assert_eq!(selected.marks(), &[second]);
+    assert!(matches!(
+        check_review_context(root, &selected),
+        Err(ReviewRefusal::Stale { .. })
+    ));
+    let mut ambiguous = serde_json::to_value(&rendered).unwrap();
+    let repeated = ambiguous["marks"][0].clone();
+    ambiguous["marks"].as_array_mut().unwrap().push(repeated);
+    let ambiguous: ReviewContext = serde_json::from_value(ambiguous).unwrap();
+    assert!(matches!(
+        ambiguous.select(std::slice::from_ref(&rendered.marks()[0].id)),
+        Err(ReviewRefusal::Duplicate)
+    ));
+}
+
+#[test]
 fn copied_context_and_copied_typed_offer_refuse_new_root() {
     for bound in [false, true] {
         let source = tempfile::tempdir().unwrap();
