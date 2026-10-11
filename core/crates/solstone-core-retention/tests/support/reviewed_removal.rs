@@ -235,13 +235,15 @@ fn ordinary_finish_preserves_actual_receipts_and_releases_activity() {
             report.mutation(),
             Some(Ok(BoundMutationOutcome::Published(_)))
         ));
+        let retirement = report.retirement().unwrap();
         assert_eq!(
-            report.retirement().effect(),
+            retirement.effect(),
             ActivityCarrierRetirementEffect::Removed
         );
-        assert_eq!(report.retirement().root_durability(), Durability::Synced);
-        assert_eq!(report.retirement().confirmation(), Confirmation::Confirmed);
-        assert!(report.retirement().failures().is_empty());
+        assert_eq!(retirement.root_durability(), Durability::Synced);
+        assert_eq!(retirement.confirmation(), Confirmation::Confirmed);
+        assert!(retirement.failures().is_empty());
+        assert!(report.refusal().is_none());
         assert!(load_at_root(&f.root).unwrap().marks.is_empty());
         assert!(
             solstone_core_journal_io::activity_obligations::observe_obligations(&f.root)
@@ -260,59 +262,46 @@ fn ordinary_finish_preserves_actual_receipts_and_releases_activity() {
 }
 
 #[test]
-fn ordinary_finish_kept_partial_and_direct_hold_preserve_owners() {
+fn ordinary_direct_hold_of_a_kept_partial_preserves_owners() {
     use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
     for partial in [false, true] {
-        for direct_hold in [false, true] {
-            let mut f = Fixture::new();
-            let target = f.target(false);
-            let raw = f.raw(&target, "ordinary.flac", false);
-            let empty = partial.then(|| f.raw(&target, "empty.flac", true));
-            f.config(json!({"retention":{"raw_media":"keep"}}));
-            let names = if partial {
-                vec!["empty.flac", "ordinary.flac"]
-            } else {
-                vec!["ordinary.flac"]
-            };
-            let mark = f.mark(target, &names, RemovalClass::PolicyRawRelease);
-            let result = f.run(f.checked(std::slice::from_ref(&mark)));
-            let held = if direct_hold {
-                Box::new(result.into_owned_hold())
-            } else {
-                let ReviewedRemovalFinish::Held(held) = result.finish() else {
-                    panic!("incomplete local selection must remain held");
-                };
-                assert!(matches!(
-                    held.finish_refusal(),
-                    Some(ReviewedRemovalFinishRefusal::IncompleteSelection)
-                ));
-                held
-            };
-            assert_eq!(held.removal().selected_marks(), std::slice::from_ref(&mark));
+        let mut f = Fixture::new();
+        let target = f.target(false);
+        let raw = f.raw(&target, "ordinary.flac", false);
+        let empty = partial.then(|| f.raw(&target, "empty.flac", true));
+        f.config(json!({"retention":{"raw_media":"keep"}}));
+        let names = if partial {
+            vec!["empty.flac", "ordinary.flac"]
+        } else {
+            vec!["ordinary.flac"]
+        };
+        let mark = f.mark(target, &names, RemovalClass::PolicyRawRelease);
+        let result = f.run(f.checked(std::slice::from_ref(&mark)));
+        let held = Box::new(result.into_owned_hold());
+        assert_eq!(held.removal().selected_marks(), std::slice::from_ref(&mark));
+        assert_eq!(
+            held.removal().outcome().removed_paths().count(),
+            usize::from(partial)
+        );
+        assert_eq!(held.removal().attempts().len(), usize::from(partial));
+        if partial {
             assert_eq!(
-                held.removal().outcome().removed_paths().count(),
-                usize::from(partial)
+                held.removal().attempts()[0].native().receipt().effect,
+                RemovalEffect::Deleted
             );
-            assert_eq!(held.removal().attempts().len(), usize::from(partial));
-            if partial {
-                assert_eq!(
-                    held.removal().attempts()[0].native().receipt().effect,
-                    RemovalEffect::Deleted
-                );
-            }
-            assert!(held.retirement().is_none());
-            assert!(held.removal().carrier_preparation().is_some());
-            assert!(raw.exists());
-            assert!(empty.is_none_or(|path| !path.exists()));
-            assert_eq!(
-                load_at_root(&f.root).unwrap().marks.get(&mark.id),
-                Some(&mark)
-            );
-            assert!(matches!(
-                TeardownLease::try_acquire(Arc::clone(&f.root)),
-                Err(ActivityAdmissionError::Busy)
-            ));
         }
+        assert!(held.retirement().is_none());
+        assert!(held.removal().carrier_preparation().is_some());
+        assert!(raw.exists());
+        assert!(empty.is_none_or(|path| !path.exists()));
+        assert_eq!(
+            load_at_root(&f.root).unwrap().marks.get(&mark.id),
+            Some(&mark)
+        );
+        assert!(matches!(
+            TeardownLease::try_acquire(Arc::clone(&f.root)),
+            Err(ActivityAdmissionError::Busy)
+        ));
     }
 }
 
@@ -991,4 +980,83 @@ fn policy_only_retires_an_empty_reservation_an_ended_owner_left() {
     assert!(result.refusal().is_none(), "{:?}", result.refusal());
     assert!(!raw.exists());
     assert!(!f.path(".tmp-offload-held").exists());
+}
+
+#[test]
+fn known_unremoved_files_settle_and_an_uncertain_remnant_holds() {
+    use solstone_core_journal_io::activity::TeardownLease;
+    // One original is released, one is kept by the current policy and one is
+    // already gone. Every outcome is known, so the run settles.
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let empty = f.raw(&target, "a.flac", true);
+    let kept = f.raw(&target, "b.flac", false);
+    f.config(json!({"retention":{"raw_media":"keep"}}));
+    let mark = f.mark(
+        target.clone(),
+        &["a.flac", "b.flac", "gone.flac"],
+        RemovalClass::PolicyRawRelease,
+    );
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    let ReviewedRemovalFinish::Settled(report) = result.finish() else {
+        panic!("known unremoved files must not hold the run");
+    };
+    assert!(!empty.exists());
+    assert!(kept.exists());
+    assert_eq!(report.outcome().removed_paths().count(), 1);
+    let reasons = report.outcome().targets[0]
+        .not_removed
+        .iter()
+        .map(|item| (item.entry.rsplit('/').next().unwrap(), item.reason.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        [("b.flac", KEPT_FOREVER), ("gone.flac", NO_LONGER_PRESENT)]
+    );
+    assert!(report.retirement().unwrap().failures().is_empty());
+    assert!(TeardownLease::try_acquire(Arc::clone(&f.root)).is_ok());
+    // A refusal before any staging is known too, even without a carrier.
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let mark = f.mark(
+        target.clone(),
+        &["audio.flac"],
+        RemovalClass::PolicyRawRelease,
+    );
+    fs::create_dir(f.path(".tmp-offload-held")).unwrap();
+    fs::write(f.path(".tmp-offload-held/audio.flac"), b"held").unwrap();
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    let ReviewedRemovalFinish::Settled(report) = result.finish() else {
+        panic!("a refusal before staging must not hold the run");
+    };
+    assert!(matches!(
+        report.refusal(),
+        Some(ReviewedRemovalRefusal::Obligations(_))
+    ));
+    assert!(report.retirement().is_none());
+    assert!(raw.exists());
+    // A deletion whose record could not be written is an owned remnant.
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let mark = f.mark(
+        target.clone(),
+        &["audio.flac"],
+        RemovalClass::PolicyRawRelease,
+    );
+    fs::create_dir(raw.with_file_name("events.jsonl")).unwrap();
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    let ReviewedRemovalFinish::Held(held) = result.finish() else {
+        panic!("an unrecorded deletion must remain held");
+    };
+    assert!(matches!(
+        held.finish_refusal(),
+        Some(ReviewedRemovalFinishRefusal::IncompleteSelection)
+    ));
+    assert!(!raw.exists());
+    assert!(matches!(
+        TeardownLease::try_acquire(Arc::clone(&f.root)),
+        Err(solstone_core_journal_io::activity::ActivityAdmissionError::Busy)
+    ));
 }

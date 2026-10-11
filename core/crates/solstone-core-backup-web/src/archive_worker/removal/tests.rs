@@ -1228,12 +1228,68 @@ fn policy_only_approval_settles_locally_and_frees_the_slot() {
 }
 
 #[test]
-fn policy_only_hold_stays_in_the_slot_and_status_reports_it() {
-    // One selected original is already gone, so the selection cannot settle.
-    let (journal, root, marks) = policy_fixture(&["audio.flac", "gone.flac"], false);
-    let raw = journal
-        .path()
-        .join("chronicle/20261009/120000_60_policy/audio.flac");
+fn policy_only_known_unremoved_files_settle_and_free_the_slot() {
+    // One original is released, one is kept by the current policy and one is
+    // already gone: every outcome is known, so nothing stays held.
+    let (journal, root, marks) = policy_fixture(&["a.flac", "audio.flac", "gone.flac"], false);
+    let segment = journal.path().join("chronicle/20261009/120000_60_policy");
+    fs::write(segment.join("a.flac"), b"raw").unwrap();
+    fs::write(
+        segment.join("a.jsonl"),
+        "{\"_solstone_processing\":{\"schema\":\"solstone.processing.v1\",\"state\":\"empty\",\"reason_code\":\"no_decodable_audio\",\"handler\":\"transcribe\",\"input_size\":3,\"attempted_at\":\"2026-10-09T12:00:00Z\"}}\n",
+    )
+    .unwrap();
+    fs::write(
+        journal.path().join("config/journal.json"),
+        br#"{"retention":{"raw_media":"keep"}}"#,
+    )
+    .unwrap();
+    let (deps, started) = policy_start(&journal, &root, &marks);
+    let started = started.unwrap();
+    let observed = status(&deps.operations, started.generation()).unwrap();
+    assert!(observed.worker_settled);
+    assert_eq!(observed.state, ApprovalState::Completed);
+    assert_eq!(observed.actor_phase.as_deref(), Some("degraded"));
+    let report = observed.report.as_ref().unwrap();
+    assert_eq!(report["settlement"]["state"], "settled");
+    let row = &report["outcome"]["targets"][0];
+    assert_eq!(row["removed"].as_array().unwrap().len(), 1);
+    let reasons = row["not_removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["entry"].as_str().unwrap().rsplit('/').next().unwrap(),
+                item["reason"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        [
+            ("audio.flac", "this one is kept indefinitely."),
+            (
+                "gone.flac",
+                "this file was on the removal list but is no longer present"
+            ),
+        ]
+    );
+    assert!(!segment.join("a.flac").exists());
+    assert!(segment.join("audio.flac").exists());
+    assert!(!operation::is_busy(&deps.operations));
+    assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+    assert!(
+        crate::archive_operation::begin(&deps.operations, "backup", deps.clock.as_ref()).is_ok()
+    );
+}
+
+#[test]
+fn policy_only_uncertain_remnant_stays_in_the_slot_and_status_reports_it() {
+    let (journal, root, marks) = policy_fixture(&["audio.flac"], false);
+    let segment = journal.path().join("chronicle/20261009/120000_60_policy");
+    // The deletion succeeds but its event record cannot be written.
+    fs::create_dir(segment.join("events.jsonl")).unwrap();
     let (deps, started) = policy_start(&journal, &root, &marks);
     let started = started.unwrap();
     let observed = status(&deps.operations, started.generation()).unwrap();
@@ -1245,7 +1301,7 @@ fn policy_only_hold_stays_in_the_slot_and_status_reports_it() {
         observed.report.as_ref().unwrap()["settlement"]["state"],
         "held"
     );
-    assert!(!raw.exists());
+    assert!(!segment.join("audio.flac").exists());
     {
         let state = deps.operations.lock().unwrap();
         let returned = state.archive_returns().next().unwrap();
