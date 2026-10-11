@@ -609,7 +609,7 @@ where
     #[cfg(windows)]
     cleanup::spawn_worker(deps, generation, work);
     #[cfg(not(windows))]
-    operation::spawn_worker(deps.operations.clone(), generation, move || work(deps));
+    let _ = operation::spawn_worker(deps.operations.clone(), generation, move || work(deps));
 }
 
 fn map_restore(result: RestoreOutcome) -> Terminal {

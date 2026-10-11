@@ -403,25 +403,14 @@ fn backup_native_round_trip() {
     #[cfg(windows)]
     process::refused_selective_root(&journal, raw.parent().unwrap(), tmp.path(), &services);
     let ledger = solstone_core_offload::ledger_path_for_day(&journal, "20260101").unwrap();
-    let witness = fs::read_to_string(&ledger).unwrap();
-    let expected_digest = format!("{:x}", Sha256::digest(&original));
-    assert!(witness.contains(&expected_digest));
-    fs::write(&ledger, witness.replace(&expected_digest, &"0".repeat(64))).unwrap();
-    let rejected = restore_all_offload(&journal, &services);
-    assert_eq!(rejected.status, "error", "{rejected:?}");
-    assert!(
-        !raw.exists(),
-        "digest mismatch must roll back newly restored bytes"
-    );
-    fs::write(&ledger, witness).unwrap();
-    let restored = restore_all_offload(&journal, &services);
-    assert_eq!(restored.status, "ok", "{restored:?}");
-    assert_eq!(
-        fs::read(&raw).unwrap(),
-        original,
-        "archive survived prune and restored exact bytes"
-    );
-    println!("NATIVE_BACKUP_OFFLOAD_PRUNE_RESTORE_OK");
+    let witness = fs::read(&ledger).unwrap();
+    let held = restore_all_offload(&journal, &services);
+    assert_eq!(held.status, "refused", "{held:?}");
+    assert_eq!(held.reason.as_deref(), Some("archive_unbound"));
+    assert_eq!((held.files_restored, held.bytes_restored), (0, 0));
+    assert!(!raw.exists(), "held restore must not publish live media");
+    assert_eq!(fs::read(&ledger).unwrap(), witness);
+    println!("NATIVE_BACKUP_OFFLOAD_PRUNE_RESTORE_HELD_OK");
 
     // Exercise the actual restic -> rclone parser and no-config mechanism with
     // a synthetic binding. Broker consent is a separate integration proof.
