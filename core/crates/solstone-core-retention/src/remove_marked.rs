@@ -945,7 +945,7 @@ const REVIEW_MAX_ENTRIES: usize = 65_536;
 const REVIEW_MAX_CONFIG: usize = 1024 * 1024;
 
 #[cfg(unix)]
-struct ReviewedPolicy {
+pub(crate) struct ReviewedPolicy {
     root: std::sync::Arc<solstone_core_journal_io::JournalRoot>,
     directory: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
     parent: solstone_core_journal_io::FlatDirectory,
@@ -957,7 +957,7 @@ struct ReviewedPolicy {
 
 #[cfg(unix)]
 impl ReviewedPolicy {
-    fn capture(
+    pub(crate) fn capture(
         root: &std::sync::Arc<solstone_core_journal_io::JournalRoot>,
     ) -> Result<Self, ReviewedRemovalRefusal> {
         use solstone_core_journal_io::media::MediaDirectory;
@@ -1010,7 +1010,20 @@ impl ReviewedPolicy {
         admitted.revalidate()?;
         Ok(admitted)
     }
-    fn revalidate(&self) -> Result<(), ReviewedRemovalRefusal> {
+    pub(crate) fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    pub(crate) fn observation(
+        &self,
+    ) -> (
+        &solstone_core_journal_config::JournalConfigRead,
+        &Option<solstone_core_journal_io::media::MediaEntry>,
+    ) {
+        (&self.read, &self.entry)
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), ReviewedRemovalRefusal> {
         self.root
             .revalidate_canonical_binding()
             .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?;
