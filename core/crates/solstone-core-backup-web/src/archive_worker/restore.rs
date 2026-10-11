@@ -13,51 +13,39 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use solstone_core_backup::archive_readback::OwnedSettledDirectRead;
-use solstone_core_backup_runtime::OwnedInstalledArchiveRead;
 use solstone_core_offload::restore::RestoreResult;
 use solstone_core_offload::restore::owned::{
     self, OwnedRestoreFinishHold, OwnedRestoreRunOutcome, RestoreFinishRefusal,
     SettledRestoreReport,
 };
 
-use super::{ArchivePayload, ArchiveTicket, entry, return_owned, runtime_facts};
+use super::{ArchivePayload, PreparedArchiveWorker, entry, return_owned, runtime_facts};
 use crate::operation::{SharedOperationSlot, Terminal};
 use crate::restore_report;
 
 /// Called synchronously inside the worker holding the original admission.
-pub fn day(
-    slot: &SharedOperationSlot,
-    ticket: ArchiveTicket,
-    installed: OwnedInstalledArchiveRead,
-    day: &str,
-    now: u64,
-) {
-    run(slot, ticket, installed, Some(day), now);
+pub fn day(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: &str, now: u64) {
+    run(slot, worker, Some(day), now);
 }
 
 /// Called synchronously inside the worker holding the original admission.
-pub fn all(
-    slot: &SharedOperationSlot,
-    ticket: ArchiveTicket,
-    installed: OwnedInstalledArchiveRead,
-    now: u64,
-) {
-    run(slot, ticket, installed, None, now);
+pub fn all(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, now: u64) {
+    run(slot, worker, None, now);
 }
 
-fn run(
-    slot: &SharedOperationSlot,
-    ticket: ArchiveTicket,
-    installed: OwnedInstalledArchiveRead,
-    day: Option<&str>,
-    now: u64,
-) {
+fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&str>, now: u64) {
     // The outside owner never enters the actor's unwind boundary.
-    let (read, outside) = installed.into_parts();
+    let PreparedArchiveWorker {
+        ticket,
+        custody,
+        read,
+        outside,
+    } = worker;
     if let Err(reason) = entry(slot, &ticket, &read, &outside) {
         return return_owned(
             slot,
             ticket,
+            Some(custody),
             ArchivePayload::ReadHeld {
                 read: Box::new(read.into_owned_hold()),
                 outside,
@@ -111,15 +99,26 @@ fn run(
         Ok(Ok((settled, report))) => {
             #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
             tests::before_finish(slot);
-            // Runtime finish has a separate consuming boundary; actor unwind
-            // protection does not claim to cover a panic inside this call.
-            let runtime = outside.finish_owned(settled);
-            if let Some(view) = terminal.report.as_mut() {
-                view["runtime"] = runtime_facts(&runtime);
+            // The genuine settled report and original custody survive a
+            // consuming Runtime-finish unwind independently of confirmation.
+            match catch_unwind(AssertUnwindSafe(|| outside.finish_owned(settled))) {
+                Ok(runtime) => {
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = runtime_facts(&runtime);
+                    }
+                    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+                    tests::before_handoff(slot);
+                    ArchivePayload::NativeFinished { report, runtime }
+                }
+                Err(_) => {
+                    terminal.phase = "error".into();
+                    terminal.reason_code = Some("failed".into());
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = json!({"state":"unknown"});
+                    }
+                    ArchivePayload::NativeFinishUnknown { report }
+                }
             }
-            #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
-            tests::before_handoff(slot);
-            ArchivePayload::NativeFinished { report, runtime }
         }
         Err(_) => {
             let runtime = outside.into_unknown();
@@ -137,7 +136,7 @@ fn run(
             }
         }
     };
-    return_owned(slot, ticket, payload, terminal);
+    return_owned(slot, ticket, Some(custody), payload, terminal);
 }
 
 fn settle(

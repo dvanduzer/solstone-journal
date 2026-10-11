@@ -2,7 +2,6 @@
 // Copyright (c) 2026 sol pbc
 
 use super::*;
-use solstone_core_backup::archive_activity::PreparedArchiveOperation;
 use solstone_core_journal_io::activity::{ActivityAdmissionError, ActivityLease, TeardownLease};
 use std::{sync::mpsc, thread, time::Duration};
 
@@ -29,14 +28,15 @@ fn fixture() -> (
     (dir, root, Arc::new(FixedClock), operation::new_slot())
 }
 
-fn closed(begin: OwnedArchiveBegin) -> (ArchiveTicket, ArchivePayload) {
+fn closed(begin: OwnedArchiveBegin) -> (ArchiveTicket, ArchivePreparationCustody, ArchivePayload) {
     let (ticket, root, budget, clock) = begin.into_parts();
-    let prepared = PreparedArchiveOperation::prepare_owned(root, budget, clock).unwrap();
-    let owner = match prepared.into_owned_hold() {
-        Ok(owner) => owner,
-        Err(_) => panic!("actual prepare_owned must retain its owned clock"),
-    };
-    (ticket, ArchivePayload::Prepared(Box::new(owner)))
+    let (input, custody) = OwnedArchivePreparationInput::capture(root, budget, clock)
+        .unwrap_or_else(|_| panic!("actual original capture"));
+    let owner = input
+        .prepare()
+        .unwrap_or_else(|_| panic!("actual original preparation"))
+        .into_owned_hold();
+    (ticket, custody, ArchivePayload::Prepared(Box::new(owner)))
 }
 
 fn terminal() -> Terminal {
@@ -87,13 +87,14 @@ fn real_worker_retains_closed_owner_after_matching_and_rejected_handoffs() {
         let (release, released) = mpsc::channel();
         let worker_slot = Arc::clone(&slot);
         let worker = thread::spawn(move || {
-            let (ticket, payload) = closed(begin);
+            let (ticket, custody, payload) = closed(begin);
             let ArchivePayload::Prepared(owner) = &payload else {
                 unreachable!()
             };
             entered.send(Arc::downgrade(owner.carrier())).unwrap();
             released.recv_timeout(Duration::from_secs(10)).unwrap();
-            if let Err(rejected) = handoff(&worker_slot, ticket, payload, terminal()) {
+            if let Err(rejected) = handoff(&worker_slot, ticket, Some(custody), payload, terminal())
+            {
                 // This is the actual worker caller, before thread return.
                 park_rejected(&worker_slot, rejected);
             }
@@ -177,10 +178,10 @@ fn live_reservation_blocks_absent_terminal_and_replacement_view_before_handoff()
     let (release, released) = mpsc::channel();
     let worker_slot = Arc::clone(&slot);
     let worker = thread::spawn(move || {
-        let (ticket, payload) = closed(begin);
+        let (ticket, custody, payload) = closed(begin);
         entered.send(()).unwrap();
         released.recv_timeout(Duration::from_secs(10)).unwrap();
-        if let Err(refusal) = handoff(&worker_slot, ticket, payload, terminal()) {
+        if let Err(refusal) = handoff(&worker_slot, ticket, Some(custody), payload, terminal()) {
             park_rejected(&worker_slot, refusal);
         }
     });
@@ -231,4 +232,50 @@ fn intact_original_begin_cancels_only_before_preparation_and_releases_reservatio
             .is_empty()
     );
     assert!(operation::begin(&slot, "restore", None, None, None).is_ok());
+}
+
+#[test]
+fn refused_prepare_start_retains_original_unused_begin_without_native_capture() {
+    let (dir, root, clock, slot) = fixture();
+    let begin = begin_owned(
+        &slot,
+        "offload_restore",
+        Arc::clone(&root),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+    let generation = begin.generation();
+    assert!(matches!(
+        crate::archive_operation::request_cancellation(&slot, generation),
+        crate::archive_operation::ArchiveCancellationRequest::Requested
+    ));
+    let worker_slot = Arc::clone(&slot);
+    thread::spawn(move || {
+        assert!(prepare_read(&worker_slot, begin, "unused".into(), Path::new("unused")).is_none());
+    })
+    .join()
+    .unwrap();
+    blocked(&slot, &root, &clock);
+    let state = slot.lock().unwrap();
+    let returned = &state.archive.retained[0];
+    assert_eq!(state.archive.retained.len(), 1);
+    assert_eq!(returned.generation(), generation);
+    assert!(returned.custody().is_none() && returned.binding_error().is_none());
+    let ArchivePayload::BeginHeld(begin) = returned.payload() else {
+        panic!("original unused begin");
+    };
+    assert!(Arc::ptr_eq(&begin.ticket.0.root, &root));
+    assert!(Arc::ptr_eq(&begin.ticket.0.clock, &clock));
+    assert!(begin.budget.cancellation().unwrap().is_cancelled());
+    assert!(!dir.path().join("backup-activity.lock").exists());
+    assert!(
+        solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    drop(state);
+    // No actual native lease was captured; only the keeper is Busy.
+    assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+    assert!(TeardownLease::try_acquire(root).is_ok());
 }

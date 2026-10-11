@@ -7,32 +7,36 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
-use solstone_core_backup_runtime::OwnedInstalledArchiveRead;
 use solstone_core_retention::Outcome;
 use solstone_core_retention::remove_marked::{
     OwnedReviewedArchiveFinish, remove_reviewed_with_owned_archive,
 };
 use solstone_core_retention::review_context::CheckedReviewContext;
 
-use super::{ArchivePayload, ArchiveTicket, entry, return_owned, runtime_facts};
+use super::{ArchivePayload, PreparedArchiveWorker, entry, return_owned, runtime_facts};
 use crate::operation::{SharedOperationSlot, Terminal};
 use crate::removal_report;
 
 /// Called synchronously inside the worker holding the original admission.
 pub fn remove(
     slot: &SharedOperationSlot,
-    ticket: ArchiveTicket,
-    installed: OwnedInstalledArchiveRead,
+    worker: PreparedArchiveWorker,
     checked: CheckedReviewContext,
     today: NaiveDate,
     now: DateTime<Utc>,
 ) {
     // The outside owner never enters the actor's unwind boundary.
-    let (read, outside) = installed.into_parts();
+    let PreparedArchiveWorker {
+        ticket,
+        custody,
+        read,
+        outside,
+    } = worker;
     if let Err(reason) = entry(slot, &ticket, &read, &outside) {
         return return_owned(
             slot,
             ticket,
+            Some(custody),
             ArchivePayload::ReadHeld {
                 read: Box::new(read.into_owned_hold()),
                 outside,
@@ -91,14 +95,26 @@ pub fn remove(
         Ok(Ok((read, report))) => {
             #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
             tests::before_finish(slot);
-            // Runtime finish is separate; this guard makes no claim about its unwind.
-            let runtime = outside.finish_owned(read);
-            if let Some(view) = terminal.report.as_mut() {
-                view["runtime"] = runtime_facts(&runtime);
+            // Keep the genuine settled report and original custody outside
+            // consuming Runtime finish; an unwind cannot certify retirement.
+            match catch_unwind(AssertUnwindSafe(|| outside.finish_owned(read))) {
+                Ok(runtime) => {
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = runtime_facts(&runtime);
+                    }
+                    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+                    tests::before_handoff(slot);
+                    ArchivePayload::ProofFinished { report, runtime }
+                }
+                Err(_) => {
+                    terminal.phase = "error".into();
+                    terminal.reason_code = Some("failed".into());
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = json!({"state":"unknown"});
+                    }
+                    ArchivePayload::ProofFinishUnknown { report }
+                }
             }
-            #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
-            tests::before_handoff(slot);
-            ArchivePayload::ProofFinished { report, runtime }
         }
         Err(_) => {
             let runtime = outside.into_unknown();
@@ -111,7 +127,7 @@ pub fn remove(
             ArchivePayload::ProofUnknown { runtime }
         }
     };
-    return_owned(slot, ticket, payload, terminal);
+    return_owned(slot, ticket, Some(custody), payload, terminal);
 }
 
 fn project(terminal: &mut Terminal, outcome: &Outcome, report: Value) {

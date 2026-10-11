@@ -6,11 +6,8 @@ use std::{cell::Cell, fs, path::PathBuf, sync::Arc, thread, time::Instant};
 
 use chrono::TimeZone;
 use serde::Deserialize;
-use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
 use solstone_core_backup::archive_admission::Clock;
-use solstone_core_backup_runtime::{
-    DirectReadFinishState, UreqHttpTransport, admit_prepared_archive_owned_read_installed,
-};
+use solstone_core_backup_runtime::DirectReadFinishState;
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity::{ActivityAdmissionError, ActivityLease, TeardownLease};
 use solstone_core_journal_io::media::{MediaDirectory, RemovalEffect};
@@ -29,7 +26,7 @@ use solstone_core_retention::review_context::{
 };
 
 use crate::archive_operation::ArchiveBeginRefusal;
-use crate::archive_worker::{begin_owned, start_owned_worker};
+use crate::archive_worker::{begin_owned, prepare_read};
 use crate::operation;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -41,6 +38,12 @@ enum Cut {
     ActorPanic,
     CancelBeforeActor,
     CancelBeforeFinish,
+    PreparationRefusal,
+    AdmissionRefusal,
+    PreparationPanic,
+    AdmissionPanic,
+    FinishPanic,
+    LateLockLoss,
 }
 thread_local! { static CONTROL: Cell<Option<Cut>> = const { Cell::new(None) }; }
 
@@ -74,6 +77,15 @@ pub(super) fn before_finish(slot: &SharedOperationSlot) {
     }
 }
 pub(super) fn before_handoff(slot: &SharedOperationSlot) {
+    if CONTROL.get() == Some(Cut::LateLockLoss) {
+        let state = slot.lock().unwrap();
+        let root = &state.archive.reservation.as_ref().unwrap().root;
+        let path = root.canonical_path().join("backup-activity.lock");
+        fs::rename(&path, root.canonical_path().join("retired-test-lock")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
     if CONTROL.get() == Some(Cut::Stale) {
         let mut state = slot.lock().unwrap();
         let current = state.current.as_mut().unwrap();
@@ -280,46 +292,82 @@ fn packaged_owned_removal_worker() {
     )
     .unwrap();
     let generation = begin.generation();
-    assert!(start_owned_worker(&slot, &begin.ticket));
     let worker_slot = Arc::clone(&slot);
     let restic = input.restic_path.clone();
     let repository = input.repository_id.clone();
     let mode = input.mode;
+    if mode == Cut::PreparationRefusal {
+        fs::write(input.journal.join("config/journal.json"), b"{").unwrap();
+    }
     let worker = thread::spawn(move || {
-        let (ticket, root, budget, clock) = begin.into_parts();
-        let prepared = OwnedPreparedArchiveOperation::prepare(root, budget, clock)
-            .unwrap_or_else(|_| panic!("original preparation"));
-        let carrier = Arc::downgrade(prepared.carrier());
-        let lease = Arc::downgrade(prepared.activity());
-        let installed = admit_prepared_archive_owned_read_installed(
-            prepared,
-            repository,
-            &restic,
-            env!("CARGO_PKG_VERSION"),
-            &UreqHttpTransport,
-        )
-        .unwrap_or_else(|_| panic!("installed admission"));
+        use solstone_core_journal_io::media::{MediaPrimitive, run_with_media_hook};
         CONTROL.set(Some(mode));
+        let prepare = || prepare_read(&worker_slot, begin, repository, &restic);
+        let (ready, preparation_hook, admission_hook) = if mode == Cut::PreparationPanic {
+            let (ready, consumed) = run_with_media_hook(
+                MediaPrimitive::CarrierRootSync,
+                || panic!("actual stage creation"),
+                prepare,
+            );
+            (ready, consumed, false)
+        } else if mode == Cut::AdmissionPanic {
+            let (ready, consumed) =
+                solstone_core_backup_runtime::test_support::run_with_owned_read_admission_hook(
+                    || panic!("actual admitted read before installed pair"),
+                    prepare,
+                );
+            (ready, false, consumed)
+        } else {
+            (prepare(), false, false)
+        };
+        let Some(ready) = ready else {
+            CONTROL.set(None);
+            return (None, None, preparation_hook, admission_hook, false);
+        };
+        let carrier = Arc::downgrade(ready.outside.carrier());
+        let lease = Arc::downgrade(ready.outside.carrier().activity());
+        assert!(std::ptr::eq(
+            ready.custody.activity(),
+            ready.outside.carrier().activity().as_ref()
+        ));
         if mode == Cut::CancelBeforeActor {
             cancel(&worker_slot);
         }
-        remove(
-            &worker_slot,
-            ticket,
-            installed,
-            checked,
-            NaiveDate::from_ymd_opt(2026, 10, 11).unwrap(),
-            Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0)
-                .single()
-                .unwrap(),
-        );
+        let run = || {
+            remove(
+                &worker_slot,
+                ready,
+                checked,
+                NaiveDate::from_ymd_opt(2026, 10, 11).unwrap(),
+                Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0)
+                    .single()
+                    .unwrap(),
+            )
+        };
+        let finish_hook = if mode == Cut::FinishPanic {
+            run_with_media_hook(
+                MediaPrimitive::CarrierRetirementRootSync,
+                || panic!("actual consuming carrier retirement after removal"),
+                run,
+            )
+            .1
+        } else {
+            run();
+            false
+        };
         CONTROL.set(None);
-        (carrier, lease)
+        (
+            Some(carrier),
+            Some(lease),
+            preparation_hook,
+            admission_hook,
+            finish_hook,
+        )
     });
-    let (carrier, lease) = worker.join().unwrap();
+    let (carrier, lease, preparation_hook, admission_hook, finish_hook) = worker.join().unwrap();
     let guard = slot.lock().unwrap();
     let current = guard.current.as_ref().unwrap();
-    let mut result = json!({"mode":format!("{mode:?}"),"view":current.view});
+    let mut result = json!({"mode":format!("{mode:?}"),"view":current.view,"preparation_hook":preparation_hook,"admission_hook":admission_hook,"finish_hook":finish_hook});
     if mode == Cut::Complete {
         assert!(guard.archive.retained.is_empty() && guard.archive.reservation.is_none());
         assert_eq!(current.view.phase, "done");
@@ -328,30 +376,23 @@ fn packaged_owned_removal_worker() {
         assert_eq!(report["archive_reads"][0]["state"], "confirmed");
         assert_eq!(report["runtime"]["state"], "completed");
         assert_eq!(report["runtime"]["retirement"]["effect"], "removed");
-        assert!(carrier.upgrade().is_none() && lease.upgrade().is_none());
+        assert!(
+            carrier.as_ref().unwrap().upgrade().is_none()
+                && lease.as_ref().unwrap().upgrade().is_none()
+        );
         drop(guard);
         assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
         assert!(TeardownLease::try_acquire(Arc::clone(&root)).is_ok());
         let next = begin_owned(&slot, "archive", Arc::clone(&root), Arc::clone(&clock)).unwrap();
-        assert!(start_owned_worker(&slot, &next.ticket));
-        let (ticket, root, budget, clock) = next.into_parts();
-        let prepared = OwnedPreparedArchiveOperation::prepare(root, budget, clock)
-            .unwrap_or_else(|_| panic!("successor preparation"));
-        let installed = admit_prepared_archive_owned_read_installed(
-            prepared,
-            input.repository_id,
-            &input.restic_path,
-            env!("CARGO_PKG_VERSION"),
-            &UreqHttpTransport,
-        )
-        .unwrap_or_else(|_| panic!("successor installed admission"));
-        let (read, outside) = installed.into_owned_hold();
+        let next = prepare_read(&slot, next, input.repository_id, &input.restic_path)
+            .unwrap_or_else(|| panic!("successor original installed entrance"));
         return_owned(
             &slot,
-            ticket,
+            next.ticket,
+            Some(next.custody),
             ArchivePayload::ReadHeld {
-                read: Box::new(read),
-                outside,
+                read: Box::new(next.read.into_owned_hold()),
+                outside: next.outside,
             },
             Terminal::error("cancelled"),
         );
@@ -366,9 +407,19 @@ fn packaged_owned_removal_worker() {
                 Some(super::super::ArchiveHandoffRefusal::Stale)
             );
             assert_eq!(current.view.report, Some(json!({"replacement":true})));
+        } else if mode == Cut::LateLockLoss {
+            assert_eq!(
+                retained.reason(),
+                Some(super::super::ArchiveHandoffRefusal::BindingChanged)
+            );
+            assert!(retained.binding_error().is_some());
         } else {
             assert!(retained.reason().is_none());
         }
+        let custody = retained.custody().expect("actual original custody");
+        assert!(Arc::ptr_eq(custody.journal_root(), &root));
+        assert!(Arc::ptr_eq(custody.owned_clock(), &clock));
+        assert_eq!(custody.revalidate().is_err(), mode == Cut::LateLockLoss);
         let facts = retained.terminal().report.as_ref();
         match retained.payload() {
             ArchivePayload::ReadHeld { read, outside } => {
@@ -408,7 +459,10 @@ fn packaged_owned_removal_worker() {
                 assert_eq!(proof.archive_reads().count(), 1);
             }
             ArchivePayload::ProofFinished { report, runtime } => {
-                assert!(matches!(mode, Cut::Stale | Cut::CancelBeforeFinish));
+                assert!(matches!(
+                    mode,
+                    Cut::Stale | Cut::CancelBeforeFinish | Cut::LateLockLoss
+                ));
                 positive(facts.unwrap());
                 assert_eq!(facts.unwrap()["archive_reads"][0]["state"], "confirmed");
                 assert_eq!(report.outcome().removed_paths().count(), 1);
@@ -416,16 +470,20 @@ fn packaged_owned_removal_worker() {
                 assert!(Arc::ptr_eq(runtime.owned_clock(), &clock));
                 assert_eq!(
                     runtime.state(),
-                    if mode == Cut::Stale {
+                    if matches!(mode, Cut::Stale | Cut::LateLockLoss) {
                         DirectReadFinishState::Completed
                     } else {
                         DirectReadFinishState::Held
                     }
                 );
-                if mode == Cut::Stale {
+                if matches!(mode, Cut::Stale | Cut::LateLockLoss) {
+                    assert!(std::ptr::eq(
+                        custody.activity(),
+                        runtime.retirement().unwrap().owned.activity().as_ref()
+                    ));
                     assert!(std::ptr::eq(
                         Arc::as_ptr(runtime.retirement().unwrap().owned.activity()),
-                        lease.as_ptr()
+                        lease.as_ref().unwrap().as_ptr()
                     ));
                 } else {
                     assert!(runtime.reason().is_some());
@@ -441,20 +499,99 @@ fn packaged_owned_removal_worker() {
                 assert!(Arc::ptr_eq(runtime.owned_clock(), &clock));
                 assert_eq!(facts.unwrap()["settlement"]["state"], "unknown");
             }
+            ArchivePayload::PreparationFailure(failure) => {
+                assert_eq!(mode, Cut::PreparationRefusal);
+                assert!(failure.carrier().is_some());
+                assert!(Arc::ptr_eq(failure.journal_root(), &root));
+                assert!(Arc::ptr_eq(failure.owned_clock(), &clock));
+                assert_eq!(facts.unwrap()["preparation"]["state"], "refused");
+            }
+            ArchivePayload::AdmissionFailure(failure) => {
+                assert_eq!(mode, Cut::AdmissionRefusal);
+                assert!(failure.effects().broker_requested);
+                assert!(
+                    !failure.effects().write_repository_requested
+                        && !failure.effects().read_repository_requested
+                );
+                assert!(failure.carrier().is_some());
+                assert!(Arc::ptr_eq(failure.owned_clock().unwrap(), &clock));
+                assert_eq!(facts.unwrap()["admission"]["broker_requested"], true);
+            }
+            ArchivePayload::EarlyUnknown => {
+                assert!(matches!(mode, Cut::PreparationPanic | Cut::AdmissionPanic));
+                assert_eq!(preparation_hook, mode == Cut::PreparationPanic);
+                assert_eq!(admission_hook, mode == Cut::AdmissionPanic);
+                assert!(
+                    !solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+                        .unwrap()
+                        .entries()
+                        .is_empty()
+                );
+                result["early_unknown"] = json!(true);
+            }
+            ArchivePayload::ProofFinishUnknown { report } => {
+                assert_eq!(mode, Cut::FinishPanic);
+                assert!(finish_hook);
+                positive(facts.unwrap());
+                assert_eq!(report.outcome().removed_paths().count(), 1);
+                assert_eq!(facts.unwrap()["settlement"]["state"], "settled");
+                assert_eq!(facts.unwrap()["runtime"]["state"], "unknown");
+                assert!(
+                    solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+                        .unwrap()
+                        .entries()
+                        .is_empty()
+                );
+                result["observed_stage_removed"] = json!(true);
+            }
             _ => panic!("actual concrete Proof custody required"),
         }
         result["terminal"] = json!({"phase":retained.terminal().phase,"reason_code":retained.terminal().reason_code,"report":retained.terminal().report});
         result["held"] = json!(true);
+        if matches!(
+            mode,
+            Cut::PreparationRefusal
+                | Cut::AdmissionRefusal
+                | Cut::PreparationPanic
+                | Cut::AdmissionPanic
+        ) {
+            assert!(segment.join("audio.flac").exists());
+            assert_eq!(
+                load_at_root(&root).unwrap().marks.get(&mark.id),
+                Some(&mark)
+            );
+        }
+        result["binding_error"] = retained
+            .binding_error()
+            .map(|error| error.kind().to_string())
+            .into();
         drop(guard);
-        blocked(&slot, &root, &clock);
-        assert!(lease.upgrade().is_some());
-        if mode != Cut::Stale {
+        if mode == Cut::LateLockLoss {
+            assert!(operation::is_busy(&slot));
+            assert!(begin_owned(&slot, "archive", Arc::clone(&root), Arc::clone(&clock)).is_err());
+            // The replacement native lock can be acquired; keeper refusal is
+            // independent of exclusion on the displaced original file.
+            assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+        } else {
+            blocked(&slot, &root, &clock);
+        }
+        if let Some(lease) = lease {
+            assert!(lease.upgrade().is_some());
+        }
+        if !matches!(mode, Cut::Stale | Cut::LateLockLoss | Cut::FinishPanic)
+            && let Some(carrier) = carrier
+        {
             assert!(carrier.upgrade().is_some());
         }
     }
     if matches!(
         mode,
-        Cut::Complete | Cut::Stale | Cut::ActorPanic | Cut::CancelBeforeFinish
+        Cut::Complete
+            | Cut::Stale
+            | Cut::ActorPanic
+            | Cut::CancelBeforeFinish
+            | Cut::FinishPanic
+            | Cut::LateLockLoss
     ) {
         assert!(!segment.join("audio.flac").exists());
         assert!(load_at_root(&root).unwrap().marks.is_empty());

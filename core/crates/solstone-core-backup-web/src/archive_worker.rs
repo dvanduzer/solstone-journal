@@ -7,17 +7,23 @@
 pub mod removal;
 pub mod restore;
 
-use std::sync::Arc;
+use std::{
+    io,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
+    sync::Arc,
+};
 
 use serde_json::{Value, json};
 use solstone_core_backup::archive_activity::{
-    OwnedArchivePreparationFailure, OwnedPreparedArchiveHold,
+    ArchivePreparationCustody, OwnedArchivePreparationFailure, OwnedArchivePreparationInput,
+    OwnedPreparedArchiveHold,
 };
 use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation, Clock};
 use solstone_core_backup::archive_readback::{OwnedDirectReadHold, OwnedReadOperation};
 use solstone_core_backup_runtime::{
     DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
-    OwnedDirectReadFinish,
+    OwnedDirectReadFinish, UreqHttpTransport, admit_prepared_archive_owned_read_installed,
 };
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_offload::restore::owned::{OwnedRestoreFinishHold, SettledRestoreReport};
@@ -118,6 +124,14 @@ pub fn begin_owned(
 /// Closed concrete values only; no report can construct a native owner.
 #[must_use]
 pub enum ArchivePayload {
+    BeginHeld(Box<OwnedArchiveBegin>),
+    EarlyUnknown,
+    NativeFinishUnknown {
+        report: SettledRestoreReport,
+    },
+    ProofFinishUnknown {
+        report: ReviewedArchiveReport,
+    },
     Prepared(Box<OwnedPreparedArchiveHold>),
     PreparationFailure(Box<OwnedArchivePreparationFailure>),
     AdmissionFailure(OwnedArchiveAdmissionFailure),
@@ -156,11 +170,30 @@ impl ArchivePayload {
             if runtime.state() == DirectReadFinishState::Completed)
     }
 
-    fn matches(&self, reservation: &Reservation) -> bool {
+    fn matches(
+        &self,
+        reservation: &Reservation,
+        custody: Option<&ArchivePreparationCustody>,
+    ) -> bool {
+        if custody.is_some_and(|owner| {
+            !Arc::ptr_eq(owner.journal_root(), &reservation.root)
+                || !Arc::ptr_eq(owner.owned_clock(), &reservation.clock)
+        }) {
+            return false;
+        }
         let (root, clock) = match self {
+            Self::BeginHeld(owner) => (&owner.ticket.0.root, Some(&owner.ticket.0.clock)),
+            Self::EarlyUnknown
+            | Self::NativeFinishUnknown { .. }
+            | Self::ProofFinishUnknown { .. } => {
+                let Some(owner) = custody else {
+                    return false;
+                };
+                (owner.journal_root(), Some(owner.owned_clock()))
+            }
             Self::Prepared(owner) => (owner.journal_root(), Some(owner.owned_clock())),
             Self::PreparationFailure(owner) => (owner.journal_root(), Some(owner.owned_clock())),
-            Self::AdmissionFailure(owner) => (owner.journal_root(), None),
+            Self::AdmissionFailure(owner) => (owner.journal_root(), owner.owned_clock()),
             Self::ReadHeld { read, outside } => {
                 if !Arc::ptr_eq(read.carrier(), outside.carrier())
                     || !Arc::ptr_eq(read.journal_root(), outside.journal_root())
@@ -190,7 +223,7 @@ impl ArchivePayload {
             }
         };
         Arc::ptr_eq(root, &reservation.root)
-            && clock.is_none_or(|clock| Arc::ptr_eq(clock, &reservation.clock))
+            && clock.is_some_and(|clock| Arc::ptr_eq(clock, &reservation.clock))
     }
 }
 
@@ -203,6 +236,8 @@ pub enum ArchiveHandoffRefusal {
     ReservationChanged,
     OwnerChanged,
     NonterminalCompletion,
+    CustodyMissing,
+    BindingChanged,
 }
 
 /// A rejected handoff still owns the exact ticket, payload and effect projection.
@@ -210,6 +245,8 @@ pub enum ArchiveHandoffRefusal {
 pub struct RejectedArchiveReturn {
     ticket: ArchiveTicket,
     payload: ArchivePayload,
+    custody: Option<ArchivePreparationCustody>,
+    binding_error: Option<io::Error>,
     terminal: Terminal,
     reason: Option<ArchiveHandoffRefusal>,
 }
@@ -223,6 +260,12 @@ impl RejectedArchiveReturn {
     }
     pub fn payload(&self) -> &ArchivePayload {
         &self.payload
+    }
+    pub fn custody(&self) -> Option<&ArchivePreparationCustody> {
+        self.custody.as_ref()
+    }
+    pub fn binding_error(&self) -> Option<&io::Error> {
+        self.binding_error.as_ref()
     }
     pub fn terminal(&self) -> &Terminal {
         &self.terminal
@@ -283,42 +326,37 @@ pub fn start_owned_worker(slot: &SharedOperationSlot, ticket: &ArchiveTicket) ->
     true
 }
 
-/// Return a complete closed owner; only genuine matching completion releases it.
+/// Return complete original custody; matching completion also needs fresh binding.
 pub fn handoff(
     slot: &SharedOperationSlot,
     ticket: ArchiveTicket,
+    custody: Option<ArchivePreparationCustody>,
     payload: ArchivePayload,
     terminal: Terminal,
 ) -> Result<(), Box<RejectedArchiveReturn>> {
-    fn refuse(
-        ticket: ArchiveTicket,
-        payload: ArchivePayload,
-        terminal: Terminal,
-        reason: ArchiveHandoffRefusal,
-    ) -> Box<RejectedArchiveReturn> {
-        Box::new(RejectedArchiveReturn {
-            ticket,
-            payload,
-            terminal,
-            reason: Some(reason),
-        })
-    }
+    let mut returned = Box::new(RejectedArchiveReturn {
+        ticket,
+        payload,
+        custody,
+        binding_error: None,
+        terminal,
+        reason: None,
+    });
     let Ok(mut state) = slot.lock() else {
-        return Err(refuse(
-            ticket,
-            payload,
-            terminal,
-            ArchiveHandoffRefusal::Poisoned,
-        ));
+        returned.reason = Some(ArchiveHandoffRefusal::Poisoned);
+        return Err(returned);
     };
-    let reason = if !state.archive.matches(&ticket) || !state.archive.retained.is_empty() {
+    let reason = if !state.archive.matches(&returned.ticket) || !state.archive.retained.is_empty() {
         Some(ArchiveHandoffRefusal::ReservationChanged)
-    } else if !payload.matches(&ticket.0) {
+    } else if !returned
+        .payload
+        .matches(&returned.ticket.0, returned.custody.as_ref())
+    {
         Some(ArchiveHandoffRefusal::OwnerChanged)
     } else {
         match &state.current {
             None => Some(ArchiveHandoffRefusal::Missing),
-            Some(current) if current.generation != ticket.generation() => {
+            Some(current) if current.generation != returned.ticket.generation() => {
                 Some(ArchiveHandoffRefusal::Stale)
             }
             Some(current)
@@ -329,34 +367,54 @@ pub fn handoff(
             {
                 Some(ArchiveHandoffRefusal::Inactive)
             }
-            Some(_) if payload.completed() && !operation::is_terminal(&terminal.phase) => {
+            Some(_)
+                if returned.payload.completed()
+                    && !operation::is_terminal(&returned.terminal.phase) =>
+            {
                 Some(ArchiveHandoffRefusal::NonterminalCompletion)
             }
             Some(_) => None,
         }
     };
     if let Some(reason) = reason {
-        return Err(refuse(ticket, payload, terminal, reason));
+        returned.reason = Some(reason);
+        return Err(returned);
     }
-    let current = state.current.as_mut().expect("checked current");
-    current.worker_active = false;
-    if payload.completed() {
-        operation::apply_terminal(current, terminal);
-        // Keep admission excluded until the actual completed owners release their
-        // leases. A destructor unwind poisons this same mutex and stays closed.
-        drop(payload);
-        drop(ticket);
+    if returned.payload.completed() {
+        let Some(custody) = returned.custody.as_ref() else {
+            returned.reason = Some(ArchiveHandoffRefusal::CustodyMissing);
+            return Err(returned);
+        };
+        let runtime = match &returned.payload {
+            ArchivePayload::NativeFinished { runtime, .. }
+            | ArchivePayload::ProofFinished { runtime, .. } => runtime,
+            _ => unreachable!("only actual finished owners can complete"),
+        };
+        if !runtime.retirement().is_some_and(|retirement| {
+            std::ptr::eq(custody.activity(), retirement.owned.activity().as_ref())
+        }) {
+            returned.reason = Some(ArchiveHandoffRefusal::OwnerChanged);
+            return Err(returned);
+        }
+        if let Err(error) = custody.revalidate() {
+            returned.reason = Some(ArchiveHandoffRefusal::BindingChanged);
+            returned.binding_error = Some(error);
+            return Err(returned);
+        }
+        let current = state.current.as_mut().expect("checked current");
+        current.worker_active = false;
+        operation::apply_terminal(current, returned.terminal.clone());
+        // All actual owners, including original lease custody, release while
+        // this same admission mutex excludes a successor.
+        drop(returned);
         state.archive.reservation = None;
     } else {
+        let current = state.current.as_mut().expect("checked current");
+        current.worker_active = false;
         let phase = current.view.phase.clone();
-        operation::apply_terminal(current, terminal.clone());
+        operation::apply_terminal(current, returned.terminal.clone());
         current.view.phase = phase;
-        state.archive.retained.push(RejectedArchiveReturn {
-            ticket,
-            payload,
-            terminal,
-            reason: None,
-        });
+        state.archive.retained.push(*returned);
     }
     Ok(())
 }
@@ -376,6 +434,7 @@ mod type_tests {
         check::<ArchivePayload>();
         check::<RejectedArchiveReturn>();
         check::<OwnedArchiveBegin>();
+        check::<ArchivePreparationCustody>();
     }
 }
 
@@ -451,10 +510,103 @@ pub(super) fn runtime_facts(runtime: &OwnedDirectReadFinish) -> Value {
 pub(super) fn return_owned(
     slot: &SharedOperationSlot,
     ticket: ArchiveTicket,
+    custody: Option<ArchivePreparationCustody>,
     payload: ArchivePayload,
     terminal: Terminal,
 ) {
-    if let Err(rejected) = handoff(slot, ticket, payload, terminal) {
+    if let Err(rejected) = handoff(slot, ticket, custody, payload, terminal) {
         park_rejected(slot, rejected);
     }
+}
+
+/// Original preparation custody and installed read pair, kept worker-local.
+#[must_use]
+pub struct PreparedArchiveWorker {
+    ticket: ArchiveTicket,
+    custody: ArchivePreparationCustody,
+    read: OwnedReadOperation,
+    outside: DirectReadFinishOwner,
+}
+
+/// Consume one original admission; every refusal is parked before returning.
+pub fn prepare_read(
+    slot: &SharedOperationSlot,
+    begin: OwnedArchiveBegin,
+    repository_id: String,
+    restic_path: &Path,
+) -> Option<PreparedArchiveWorker> {
+    if !start_owned_worker(slot, &begin.ticket) {
+        let ticket = ArchiveTicket(Arc::clone(&begin.ticket.0));
+        return_owned(
+            slot,
+            ticket,
+            None,
+            ArchivePayload::BeginHeld(Box::new(begin)),
+            Terminal::error("failed"),
+        );
+        return None;
+    }
+    let (ticket, root, budget, clock) = begin.into_parts();
+    let (input, custody) = match OwnedArchivePreparationInput::capture(root, budget, clock) {
+        Ok(pair) => pair,
+        Err(failure) => {
+            let mut terminal = Terminal::error("failed");
+            terminal.report = Some(
+                json!({"preparation":{"state":"refused","reason":failure.reason().to_string()}}),
+            );
+            return_owned(
+                slot,
+                ticket,
+                None,
+                ArchivePayload::PreparationFailure(Box::new(failure)),
+                terminal,
+            );
+            return None;
+        }
+    };
+    let mut terminal = Terminal::error("failed");
+    let mut phase = "preparation";
+    let admitted = catch_unwind(AssertUnwindSafe(|| {
+        let prepared = input.prepare().map_err(|failure| {
+            terminal.report = Some(
+                json!({"preparation":{"state":"refused","reason":failure.reason().to_string()}}),
+            );
+            ArchivePayload::PreparationFailure(Box::new(failure))
+        })?;
+        phase = "admission";
+        admit_prepared_archive_owned_read_installed(
+            prepared,
+            repository_id,
+            restic_path,
+            env!("CARGO_PKG_VERSION"),
+            &UreqHttpTransport,
+        )
+        .map_err(|failure| {
+            terminal.report = Some(
+                json!({"admission":{"state":"refused","reason":failure.error().to_string(),
+                    "broker_requested":failure.effects().broker_requested,
+                    "write_repository_requested":failure.effects().write_repository_requested,
+                    "read_repository_requested":failure.effects().read_repository_requested}}),
+            );
+            ArchivePayload::AdmissionFailure(failure)
+        })
+    }));
+    let payload = match admitted {
+        Ok(Ok(installed)) => {
+            let (read, outside) = installed.into_parts();
+            return Some(PreparedArchiveWorker {
+                ticket,
+                custody,
+                read,
+                outside,
+            });
+        }
+        Ok(Err(payload)) => payload,
+        Err(_) => {
+            terminal.report = Some(json!({phase:{"state":"unknown"}}));
+            ArchivePayload::EarlyUnknown
+        }
+    };
+    return_owned(slot, ticket, Some(custody), payload, terminal);
+    None
 }

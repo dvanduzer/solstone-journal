@@ -5,11 +5,7 @@ use super::*;
 use std::{cell::RefCell, fs, path::PathBuf, thread, time::Instant};
 
 use serde::Deserialize;
-use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
 use solstone_core_backup::archive_admission::Clock;
-use solstone_core_backup_runtime::{
-    UreqHttpTransport, admit_prepared_archive_owned_read_installed,
-};
 use solstone_core_journal_io::activity::{ActivityAdmissionError, ActivityLease, TeardownLease};
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_journal_io::media::{MediaPrimitive, run_with_media_hook};
@@ -20,7 +16,7 @@ use solstone_core_retention::archive_proof::{
 };
 
 use crate::archive_operation::ArchiveBeginRefusal;
-use crate::archive_worker::{begin_owned, start_owned_worker};
+use crate::archive_worker::{begin_owned, prepare_read};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -217,31 +213,21 @@ fn packaged_owned_restore_worker() {
     )
     .unwrap();
     let generation = begin.generation();
-    assert!(start_owned_worker(&slot, &begin.ticket));
     let worker_slot = Arc::clone(&slot);
     let worker_segment = segment.clone();
     let restic = input.restic_path.clone();
     let repository = input.repository_id.clone();
     let mode = input.mode;
     let worker = thread::spawn(move || {
-        let (ticket, root, budget, clock) = begin.into_parts();
-        let prepared = OwnedPreparedArchiveOperation::prepare(root, budget, clock)
-            .unwrap_or_else(|_| panic!("actual original preparation"));
-        let carrier = Arc::downgrade(prepared.carrier());
-        let lease = Arc::downgrade(prepared.activity());
-        let installed = admit_prepared_archive_owned_read_installed(
-            prepared,
-            repository,
-            &restic,
-            env!("CARGO_PKG_VERSION"),
-            &UreqHttpTransport,
-        )
-        .unwrap_or_else(|_| panic!("actual installed admission"));
+        let worker = prepare_read(&worker_slot, begin, repository, &restic)
+            .unwrap_or_else(|| panic!("actual original worker entrance"));
+        let carrier = Arc::downgrade(worker.outside.carrier());
+        let lease = Arc::downgrade(worker.outside.carrier().activity());
         CONTROL.with(|control| *control.borrow_mut() = Some((mode, worker_segment)));
         if mode == Cut::CancelBeforeActor {
             cancel(&worker_slot);
         }
-        day(&worker_slot, ticket, installed, "20261009", 2);
+        day(&worker_slot, worker, "20261009", 2);
         CONTROL.with(|control| *control.borrow_mut() = None);
         (carrier, lease)
     });
@@ -273,25 +259,15 @@ fn packaged_owned_restore_worker() {
             Arc::clone(&clock),
         )
         .unwrap();
-        assert!(start_owned_worker(&slot, &next.ticket));
-        let (ticket, root, budget, clock) = next.into_parts();
-        let prepared = OwnedPreparedArchiveOperation::prepare(root, budget, clock)
-            .unwrap_or_else(|_| panic!("successor preparation"));
-        let installed = admit_prepared_archive_owned_read_installed(
-            prepared,
-            input.repository_id,
-            &input.restic_path,
-            env!("CARGO_PKG_VERSION"),
-            &UreqHttpTransport,
-        )
-        .unwrap_or_else(|_| panic!("successor installed admission"));
-        let (read, outside) = installed.into_owned_hold();
+        let next = prepare_read(&slot, next, input.repository_id, &input.restic_path)
+            .unwrap_or_else(|| panic!("successor original installed entrance"));
         return_owned(
             &slot,
-            ticket,
+            next.ticket,
+            Some(next.custody),
             ArchivePayload::ReadHeld {
-                read: Box::new(read),
-                outside,
+                read: Box::new(next.read.into_owned_hold()),
+                outside: next.outside,
             },
             Terminal::error("cancelled"),
         );
