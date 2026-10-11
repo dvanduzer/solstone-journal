@@ -99,6 +99,15 @@ pub fn begin_owned(
     clock: OwnedClock,
 ) -> Result<OwnedArchiveBegin, ArchiveBeginRefusal> {
     let mut state = operation::lock_for_begin(slot).map_err(|()| ArchiveBeginRefusal::Busy)?;
+    begin_owned_locked(&mut state, kind, root, clock)
+}
+
+fn begin_owned_locked(
+    state: &mut operation::OperationState,
+    kind: &str,
+    root: Arc<JournalRoot>,
+    clock: OwnedClock,
+) -> Result<OwnedArchiveBegin, ArchiveBeginRefusal> {
     let cancellation = ArchiveCancellation::new();
     let budget = ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone())
         .map_err(ArchiveBeginRefusal::Admission)?;
@@ -287,11 +296,15 @@ pub(crate) struct ArchiveCustody {
     // Never replace a retained return, even after a rejected/stale handoff.
     retained: Vec<RejectedArchiveReturn>,
     teardown: teardown::Custody,
+    approval: removal::ApprovalCustody,
 }
 
 impl ArchiveCustody {
     pub(crate) fn is_busy(&self) -> bool {
-        self.reservation.is_some() || !self.retained.is_empty() || self.teardown.is_busy()
+        self.reservation.is_some()
+            || !self.retained.is_empty()
+            || self.teardown.is_busy()
+            || self.approval.is_busy()
     }
 
     pub(crate) fn retained(&self) -> impl Iterator<Item = &RejectedArchiveReturn> {
@@ -417,6 +430,9 @@ pub fn handoff(
         let current = state.current.as_mut().expect("checked current");
         current.worker_active = false;
         operation::apply_terminal(current, returned.terminal.clone());
+        if state.archive.approval.generation == Some(returned.ticket.generation()) {
+            state.archive.approval.accepted_completion = true;
+        }
         // All actual owners, including original lease custody, release while
         // this same admission mutex excludes a successor.
         drop(returned);

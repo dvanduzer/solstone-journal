@@ -113,6 +113,25 @@ pub async fn approve(body: Result<Bytes, axum::extract::rejection::BytesRejectio
     }
 }
 
+// Classified consumer join only. Public dispatch remains held until the
+// browser/current-result and namespace cooperation boundaries are qualified.
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(target_os = "linux")]
+fn dispatch_approval(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<solstone_core_backup_web::archive_worker::removal::ApprovalStart, &'static str> {
+    let context = action_context(body).map_err(|(_, state)| state)?;
+    let Extension(deps) = deps.ok_or(APPROVE_REFUSED_BEFORE_START)?;
+    solstone_core_backup_web::archive_worker::removal::start(&deps, context, now.date_naive(), now)
+        .map_err(|_| APPROVE_REFUSED_BEFORE_START)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(target_os = "linux")]
+mod approval_tests;
+
 pub async fn decline(
     State(journal_root): State<PathBuf>,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
