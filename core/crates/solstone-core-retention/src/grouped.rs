@@ -269,7 +269,10 @@ mod tests {
         };
         let now = Utc.with_ymd_and_hms(2026, 10, 10, 1, 0, 0).unwrap();
         inspect_grouped(
-            &CheckedSegment { found: files },
+            &CheckedSegment {
+                found: files,
+                bound_entries: std::collections::BTreeMap::new(),
+            },
             &target,
             SegmentLayout::Direct,
             policy,
