@@ -172,6 +172,46 @@ mod native {
         assert!(receipt.failures().is_empty());
     }
 
+    #[test]
+    fn confirmation_resyncs_existing_archive_without_duplicate_bytes() {
+        let fixture = Fixture::new();
+        let proof = fixture.proof("confirm", SegmentLayout::Direct);
+        confirmed(&append_archive_witness(&fixture.root, &proof, 1).unwrap());
+        let before = fs::read(fixture.path(&proof.target.day)).unwrap();
+        let receipt = confirm_archive_witness(&fixture.root, &proof, 2).unwrap();
+        assert_eq!(receipt.effect(), LedgerWriteEffect::AlreadyRecorded);
+        confirmed(&receipt);
+        assert_eq!(fs::read(fixture.path(&proof.target.day)).unwrap(), before);
+    }
+
+    #[test]
+    fn confirmation_never_appends_a_disappeared_or_changed_manifest() {
+        for absent in [false, true] {
+            let fixture = Fixture::new();
+            let proof = fixture.proof("confirm", SegmentLayout::Named);
+            confirmed(&append_archive_witness(&fixture.root, &proof, 1).unwrap());
+            let path = fixture.path(&proof.target.day);
+            if absent {
+                fs::write(&path, b"").unwrap();
+            } else {
+                let mut changed = proof.clone();
+                changed.files[0].archive_path = "/changed/audio.flac".into();
+                fs::write(&path, {
+                    let mut bytes = serde_json::to_vec(&archive_event(&changed)).unwrap();
+                    bytes.push(b'\n');
+                    bytes
+                })
+                .unwrap();
+            }
+            let before = fs::read(&path).unwrap();
+            assert!(matches!(
+                confirm_archive_witness(&fixture.root, &proof, 2),
+                Err(LedgerWriteRefusal::Changed | LedgerWriteRefusal::Collision)
+            ));
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+    }
+
     enum WriteFault {
         None,
         Prefix,

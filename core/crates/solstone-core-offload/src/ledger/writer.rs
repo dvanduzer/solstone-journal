@@ -88,6 +88,23 @@ pub(crate) fn append_archive_witness(
     }
 }
 
+/// Resync an exact existing complete manifest without republishing missing history.
+pub(crate) fn confirm_archive_witness(
+    root: &Arc<JournalRoot>,
+    proof: &OffloadProof,
+    time: u64,
+) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+    #[cfg(unix)]
+    {
+        unix::confirm_archive(root, proof, time, &mut unix::NoHooks)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, proof, time);
+        Err(LedgerWriteRefusal::Unsupported)
+    }
+}
+
 pub(crate) fn append_restore_operation(
     root: &Arc<JournalRoot>,
     target: &Target,
@@ -303,6 +320,12 @@ mod unix {
         event: Event,
     }
 
+    #[derive(Clone, Copy)]
+    enum AppendMode {
+        AppendOrConfirm,
+        ConfirmExisting,
+    }
+
     fn encode(event: &Event) -> Result<Vec<u8>, LedgerWriteRefusal> {
         let mut bytes = serde_json::to_vec(event).map_err(io_refusal)?;
         bytes.push(b'\n');
@@ -313,6 +336,25 @@ mod unix {
         root: &Arc<JournalRoot>,
         proof: &OffloadProof,
         time: u64,
+        hooks: &mut impl Hooks,
+    ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+        archive_record(root, proof, time, AppendMode::AppendOrConfirm, hooks)
+    }
+
+    pub(super) fn confirm_archive(
+        root: &Arc<JournalRoot>,
+        proof: &OffloadProof,
+        time: u64,
+        hooks: &mut impl Hooks,
+    ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+        archive_record(root, proof, time, AppendMode::ConfirmExisting, hooks)
+    }
+
+    fn archive_record(
+        root: &Arc<JournalRoot>,
+        proof: &OffloadProof,
+        time: u64,
+        mode: AppendMode,
         hooks: &mut impl Hooks,
     ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
         proof
@@ -347,6 +389,7 @@ mod unix {
                 segment,
                 event,
             },
+            mode,
             hooks,
         )
     }
@@ -385,6 +428,7 @@ mod unix {
                 segment,
                 event,
             },
+            AppendMode::AppendOrConfirm,
             hooks,
         )
     }
@@ -496,6 +540,7 @@ mod unix {
     fn append(
         root: &Arc<JournalRoot>,
         request: Request,
+        mode: AppendMode,
         hooks: &mut impl Hooks,
     ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
         let bound = BoundLedger::open(root)?;
@@ -535,6 +580,9 @@ mod unix {
         }
         let line = encode(&request.event)?;
         let already = already_recorded(&request, &baseline, &line)?;
+        if !already && matches!(mode, AppendMode::ConfirmExisting) {
+            return Err(LedgerWriteRefusal::Changed);
+        }
         let mut expected_bytes = bytes.clone();
         if !already {
             expected_bytes.extend_from_slice(&line);
