@@ -10,7 +10,8 @@
 use super::*;
 use solstone_core_journal_io::media::{Cleanup, Confirmation, Durability, PublicationEffect};
 use solstone_core_offload::restore::owned::{
-    LedgerFacts, NoEffectCleanupFacts, RetirementFacts, StagingFacts, StorePreparationFacts,
+    LedgerFacts, NoEffectCleanupFacts, RetirementFacts, SettlementCleanupFacts, StagingFacts,
+    StorePreparationFacts,
 };
 use solstone_core_retention::archive_catalog::{ArchiveWitness, OffloadFile, RestoreDisposition};
 use solstone_core_retention::mark_mutation::{
@@ -31,6 +32,7 @@ fn transaction<'a>() -> TransactionFacts<'a> {
         ledger: None,
         register: None,
         no_effect_cleanup: None,
+        settlement_cleanup: None,
         retirement: None,
         operation_id: Some(PRIVATE),
         store_exclusion_retained: true,
@@ -230,6 +232,7 @@ fn opaque_diagnostics_keep_presence_without_disclosing_messages() {
         "preparation",
         "retirement",
         "no_effect_cleanup",
+        "settlement_cleanup",
     ] {
         assert!(empty[field].is_null());
     }
@@ -249,6 +252,10 @@ fn no_effect_retirement_sync_ledger_and_register_facts_stay_independent() {
     ] {
         let mut facts = transaction();
         facts.no_effect_cleanup = Some(NoEffectCleanupFacts {
+            cleanup: Cleanup::Complete,
+            parent_sync: sync,
+        });
+        facts.settlement_cleanup = Some(SettlementCleanupFacts {
             cleanup: Cleanup::Complete,
             parent_sync: sync,
         });
@@ -273,6 +280,10 @@ fn no_effect_retirement_sync_ledger_and_register_facts_stay_independent() {
         assert_eq!(row["evidence"]["retirement"]["retired"], true);
         assert_eq!(
             row["evidence"]["no_effect_cleanup"]["parent_sync"],
+            expected
+        );
+        assert_eq!(
+            row["evidence"]["settlement_cleanup"]["parent_sync"],
             expected
         );
     }

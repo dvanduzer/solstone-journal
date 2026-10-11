@@ -153,6 +153,9 @@ fn transaction_facts(facts: &TransactionFacts<'_>) -> Value {
         "no_effect_cleanup":facts.no_effect_cleanup.as_ref().map(|cleanup| json!({
             "cleanup":cleanup.cleanup, "parent_sync":cleanup.parent_sync.map(sync_facts),
         })),
+        "settlement_cleanup":facts.settlement_cleanup.as_ref().map(|cleanup| json!({
+            "cleanup":cleanup.cleanup, "parent_sync":cleanup.parent_sync.map(sync_facts),
+        })),
         "retirement":facts.retirement.as_ref().map(|retirement| json!({
             "removal":retirement.removal.map(removal_facts), "retained_stage":retirement.retained_stage,
             "ancestors":retirement.ancestors, "failures":unavailable_details(&retirement.failures),

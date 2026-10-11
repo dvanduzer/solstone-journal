@@ -167,6 +167,7 @@ async fn stop_spawn_and_binding_failure_preserve_poll_and_prevent_unadmitted_eff
                     .operations
                     .lock()
                     .unwrap()
+                    .current
                     .as_ref()
                     .unwrap()
                     .worker_active
@@ -241,6 +242,7 @@ async fn settled_poll_cannot_finish_a_paused_successor_closure() {
                 deps.operations
                     .lock()
                     .unwrap()
+                    .current
                     .as_ref()
                     .unwrap()
                     .worker_active

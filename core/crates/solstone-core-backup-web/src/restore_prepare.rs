@@ -357,7 +357,15 @@ mod ownership_tests {
         let refusal = cancel(&shared, &operations, "capability").unwrap_err();
         assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
         assert!(shared.lock().unwrap().is_some());
-        assert!(operations.lock().unwrap().as_ref().unwrap().worker_active);
+        assert!(
+            operations
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .worker_active
+        );
         assert_eq!(operation::current(&operations).unwrap().phase, "restoring");
 
         #[cfg(windows)]

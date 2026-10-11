@@ -140,7 +140,7 @@ fn retry_owned(deps: &BackupWebDeps, deadline: Instant) -> Response {
         let Ok(guard) = deps.operations.try_lock() else {
             return operation::busy_response();
         };
-        guard.as_ref().map(|slot| slot.generation)
+        guard.current.as_ref().map(|slot| slot.generation)
     };
     let _ = retry_bounded_helper_admission_until(deadline);
     let current = match operation::observed_generation(&deps.operations, generation) {

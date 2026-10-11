@@ -584,7 +584,7 @@ async fn backup_native_cleanup_ownership() {
     assert!(staging_path.is_dir());
     {
         let slot = deps.operations.lock().unwrap();
-        let slot = slot.as_ref().unwrap();
+        let slot = slot.current.as_ref().unwrap();
         assert!(slot.nonce.is_none() && slot.restore_key.is_none());
         assert!(slot.view.portal_url.is_none());
     }

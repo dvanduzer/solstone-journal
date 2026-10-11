@@ -50,9 +50,9 @@ pub struct Slot {
     pub started: Instant,
     pub generation: u64,
     pub(crate) worker_active: bool,
-    archive_cancellation: Option<ArchiveCancellation>,
-    handoff_poll: Option<ArchiveCancellation>,
-    pending_handoff_terminal: Option<Terminal>,
+    pub(crate) archive_cancellation: Option<ArchiveCancellation>,
+    pub(crate) handoff_poll: Option<ArchiveCancellation>,
+    pub(crate) pending_handoff_terminal: Option<Terminal>,
     #[cfg(windows)]
     pub(crate) cleanup: Option<PendingCleanup>,
 }
@@ -77,7 +77,7 @@ fn observe_cleanup(current: &mut Slot) {
     }
 }
 
-fn apply_terminal(current: &mut Slot, terminal: Terminal) {
+pub(crate) fn apply_terminal(current: &mut Slot, terminal: Terminal) {
     current.view.phase = terminal.phase;
     current.view.reason_code = terminal.reason_code;
     current.view.detail = terminal.detail;
@@ -107,7 +107,27 @@ fn finish_or_defer(current: &mut Slot, terminal: Terminal) {
     }
 }
 
-pub type SharedOperationSlot = Arc<Mutex<Option<Slot>>>;
+pub struct OperationState {
+    pub(crate) current: Option<Slot>,
+    pub(crate) archive: crate::archive_worker::ArchiveCustody,
+}
+
+impl OperationState {
+    pub fn archive_returns(
+        &self,
+    ) -> impl Iterator<Item = &crate::archive_worker::RejectedArchiveReturn> {
+        self.archive.retained()
+    }
+
+    fn new(current: Option<Slot>) -> Self {
+        Self {
+            current,
+            archive: Default::default(),
+        }
+    }
+}
+
+pub type SharedOperationSlot = Arc<Mutex<OperationState>>;
 
 #[cfg(test)]
 thread_local! {
@@ -115,7 +135,7 @@ thread_local! {
 }
 
 pub fn new_slot() -> SharedOperationSlot {
-    Arc::new(Mutex::new(None))
+    Arc::new(Mutex::new(OperationState::new(None)))
 }
 
 pub fn is_terminal(phase: &str) -> bool {
@@ -174,19 +194,27 @@ pub fn is_busy(slot: &SharedOperationSlot) -> bool {
         ) {
             return true;
         }
-        return observed_current(slot).map_or(true, |operation| {
-            operation.is_some_and(|operation| !is_terminal(&operation.phase))
-        });
+        let Ok(mut guard) = slot.try_lock() else {
+            return true;
+        };
+        return guard.archive.is_busy()
+            || observe(&mut guard.current)
+                .is_some_and(|current| !is_terminal(&current.view.phase));
     }
     #[cfg(not(windows))]
-    observe(&mut slot.lock().expect("operation slot lock"))
-        .is_some_and(|slot| !is_terminal(&slot.view.phase))
+    {
+        let Ok(mut guard) = slot.lock() else {
+            return true;
+        };
+        guard.archive.is_busy()
+            || observe(&mut guard.current).is_some_and(|slot| !is_terminal(&slot.view.phase))
+    }
 }
 
 #[cfg(windows)]
 pub(crate) fn observed_current(slot: &SharedOperationSlot) -> Result<Option<Operation>, ()> {
     let mut guard = slot.try_lock().map_err(|_| ())?;
-    Ok(observe(&mut guard).map(|slot| slot.view.clone()))
+    Ok(observe(&mut guard.current).map(|slot| slot.view.clone()))
 }
 
 #[cfg(windows)]
@@ -195,10 +223,10 @@ pub(crate) fn observed_generation(
     generation: Option<u64>,
 ) -> Result<Option<Operation>, ()> {
     let mut guard = slot.try_lock().map_err(|_| ())?;
-    if guard.as_ref().map(|current| current.generation) != generation {
+    if guard.current.as_ref().map(|current| current.generation) != generation {
         return Err(());
     }
-    Ok(observe(&mut guard).map(|current| current.view.clone()))
+    Ok(observe(&mut guard.current).map(|current| current.view.clone()))
 }
 
 #[cfg(all(test, windows))]
@@ -206,7 +234,7 @@ pub(crate) fn worker_or_cleanup_active(slot: &SharedOperationSlot, generation: u
     let Ok(guard) = slot.try_lock() else {
         return true;
     };
-    guard.as_ref().is_some_and(|current| {
+    guard.current.as_ref().is_some_and(|current| {
         current.generation == generation && (current.worker_active || current.cleanup.is_some())
     })
 }
@@ -218,7 +246,10 @@ pub(crate) fn start_worker(slot: &SharedOperationSlot, generation: u64) -> bool 
     };
     #[cfg(not(windows))]
     let mut guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_mut() else {
+    if guard.archive.is_busy() {
+        return false;
+    }
+    let Some(current) = guard.current.as_mut() else {
         return false;
     };
     if current.generation != generation
@@ -246,7 +277,10 @@ pub(crate) fn finish_worker(
     let Ok(mut guard) = slot.lock() else {
         return;
     };
-    let Some(current) = guard.as_mut() else {
+    if guard.archive.is_busy() {
+        return;
+    }
+    let Some(current) = guard.current.as_mut() else {
         return;
     };
     if current.generation != generation || !current.worker_active {
@@ -273,7 +307,10 @@ pub(crate) fn finish_worker(
 #[cfg(not(windows))]
 pub(crate) fn finish_worker(slot: &SharedOperationSlot, generation: u64, terminal: Terminal) {
     let mut guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_mut() else {
+    if guard.archive.is_busy() {
+        return;
+    }
+    let Some(current) = guard.current.as_mut() else {
         return;
     };
     if current.generation != generation || !current.worker_active {
@@ -288,7 +325,10 @@ pub(crate) fn start_handoff_poll(
     generation: u64,
 ) -> Option<ArchiveCancellation> {
     let mut guard = slot.lock().expect("operation slot lock");
-    let current = guard.as_mut()?;
+    if guard.archive.is_busy() {
+        return None;
+    }
+    let current = guard.current.as_mut()?;
     if current.generation != generation {
         return None;
     }
@@ -312,7 +352,7 @@ pub(crate) fn start_handoff_poll(
 
 pub(crate) fn finish_handoff_poll(slot: &SharedOperationSlot, generation: u64) {
     let mut guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_mut() else {
+    let Some(current) = guard.current.as_mut() else {
         return;
     };
     if current.generation != generation || current.handoff_poll.take().is_none() {
@@ -335,6 +375,7 @@ pub(crate) fn handoff_poll_active(slot: &SharedOperationSlot) -> bool {
     slot.try_lock()
         .map(|guard| {
             guard
+                .current
                 .as_ref()
                 .is_some_and(|current| current.handoff_poll.is_some())
         })
@@ -349,7 +390,7 @@ pub(crate) fn fail_handoff_poll(
     reason: &str,
 ) {
     let mut guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_mut() else {
+    let Some(current) = guard.current.as_mut() else {
         return;
     };
     if current.generation != generation
@@ -365,7 +406,7 @@ pub(crate) fn fail_handoff_poll(
 
 #[cfg(any(not(windows), test))]
 pub fn current(slot: &SharedOperationSlot) -> Option<Operation> {
-    observe(&mut slot.lock().expect("operation slot lock")).map(|slot| slot.view.clone())
+    observe(&mut slot.lock().expect("operation slot lock").current).map(|slot| slot.view.clone())
 }
 
 pub fn busy_response() -> Response {
@@ -390,7 +431,7 @@ pub fn begin(
 ) -> Result<Begin, Response> {
     let mut guard = lock_for_begin(slot).map_err(|()| busy_response())?;
     Ok(install_slot(
-        &mut guard,
+        &mut guard.current,
         kind,
         portal_url,
         nonce,
@@ -408,11 +449,20 @@ pub(crate) fn begin_archive(
     let cancellation = ArchiveCancellation::new();
     let budget = ArchiveBudget::new_cancellable(clock, cancellation.clone())
         .map_err(ArchiveBeginRefusal::Admission)?;
-    let begun = install_slot(&mut guard, kind, None, None, None, Some(cancellation));
+    let begun = install_slot(
+        &mut guard.current,
+        kind,
+        None,
+        None,
+        None,
+        Some(cancellation),
+    );
     Ok(ArchiveBegin::new(begun.generation, budget))
 }
 
-fn lock_for_begin(slot: &SharedOperationSlot) -> Result<MutexGuard<'_, Option<Slot>>, ()> {
+pub(crate) fn lock_for_begin(
+    slot: &SharedOperationSlot,
+) -> Result<MutexGuard<'_, OperationState>, ()> {
     #[cfg(windows)]
     {
         use solstone_core_system::process::{
@@ -428,14 +478,16 @@ fn lock_for_begin(slot: &SharedOperationSlot) -> Result<MutexGuard<'_, Option<Sl
     #[cfg(windows)]
     let mut guard = slot.try_lock().map_err(|_| ())?;
     #[cfg(not(windows))]
-    let mut guard = slot.lock().expect("operation slot lock");
-    if observe(&mut guard).is_some_and(|slot| !is_terminal(&slot.view.phase)) {
+    let mut guard = slot.lock().map_err(|_| ())?;
+    if guard.archive.is_busy()
+        || observe(&mut guard.current).is_some_and(|slot| !is_terminal(&slot.view.phase))
+    {
         return Err(());
     }
     Ok(guard)
 }
 
-fn install_slot(
+pub(crate) fn install_slot(
     current: &mut Option<Slot>,
     kind: &str,
     portal_url: Option<String>,
@@ -483,7 +535,8 @@ pub(crate) fn request_archive_cancellation(
     };
     #[cfg(not(windows))]
     let mut guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_mut() else {
+    let owning_archive = guard.archive.is_busy();
+    let Some(current) = guard.current.as_mut() else {
         return ArchiveCancellationRequest::Refused;
     };
     if current.generation != generation || is_terminal(&current.view.phase) {
@@ -497,7 +550,7 @@ pub(crate) fn request_archive_cancellation(
         return ArchiveCancellationRequest::Refused;
     };
     cancellation.cancel();
-    if current.worker_active {
+    if current.worker_active || owning_archive {
         current.view.phase = "cancelling".into();
         ArchiveCancellationRequest::Requested
     } else {
@@ -529,7 +582,10 @@ pub fn finish(
 
 fn finish_terminal(slot: &SharedOperationSlot, generation: u64, terminal: Terminal) -> bool {
     let mut guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_mut() else {
+    if guard.archive.is_busy() {
+        return false;
+    }
+    let Some(current) = guard.current.as_mut() else {
         return false;
     };
     if current.generation != generation || is_terminal(&current.view.phase) {
@@ -729,7 +785,7 @@ pub fn match_handoff(
     expected_generation: Option<u64>,
 ) -> Result<HandoffMatch, HandoffError> {
     let mut guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_mut() else {
+    let Some(current) = guard.current.as_mut() else {
         return Err(HandoffError::Invalid);
     };
     if expected_generation.is_some_and(|generation| generation != current.generation) {
@@ -798,7 +854,7 @@ pub fn mark_cancelled(slot: &SharedOperationSlot, generation: u64) -> bool {
 
 pub fn nonce_for_generation(slot: &SharedOperationSlot, generation: u64) -> Option<String> {
     let guard = slot.lock().expect("operation slot lock");
-    let current = guard.as_ref()?;
+    let current = guard.current.as_ref()?;
     (current.generation == generation
         && !is_terminal(&current.view.phase)
         && current.view.kind == "restore_hosted")
@@ -809,6 +865,7 @@ pub fn nonce_for_generation(slot: &SharedOperationSlot, generation: u64) -> Opti
 pub fn generation_of(slot: &SharedOperationSlot) -> Option<u64> {
     slot.lock()
         .expect("operation slot lock")
+        .current
         .as_ref()
         .map(|slot| slot.generation)
 }
@@ -816,7 +873,7 @@ pub fn generation_of(slot: &SharedOperationSlot) -> Option<u64> {
 #[cfg(test)]
 pub fn backdate_started(slot: &SharedOperationSlot, age: Duration) {
     let mut guard = slot.lock().expect("operation slot lock");
-    if let Some(current) = guard.as_mut() {
+    if let Some(current) = guard.current.as_mut() {
         current.started = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
     }
 }
@@ -895,7 +952,7 @@ mod tests {
     #[test]
     fn match_handoff_classifies_prepare_lease_expiry_as_expired_not_invalid() {
         let slot = new_slot();
-        *slot.lock().unwrap() = Some(admitted_slot(
+        slot.lock().unwrap().current = Some(admitted_slot(
             "restore_hosted",
             1,
             None,
@@ -915,13 +972,13 @@ mod terminal_tests {
     use super::*;
 
     pub(super) fn running_slot() -> SharedOperationSlot {
-        Arc::new(Mutex::new(Some(admitted_slot(
+        Arc::new(Mutex::new(OperationState::new(Some(admitted_slot(
             "restore_hosted",
             2,
             Some("https://example.test/restore".into()),
             Some("test-nonce".into()),
             Some("test-key".into()),
-        ))))
+        )))))
     }
 
     pub(super) fn admitted_slot(
@@ -968,7 +1025,7 @@ mod terminal_tests {
 
     pub(super) fn assert_failure(slot: &SharedOperationSlot) {
         let guard = slot.lock().unwrap();
-        let current = guard.as_ref().unwrap();
+        let current = guard.current.as_ref().unwrap();
         assert_eq!(current.view.phase, "degraded");
         assert_eq!(current.view.reason_code.as_deref(), Some("tool_failed"));
         assert_eq!(current.view.detail.as_deref(), Some("tool detail"));
@@ -994,13 +1051,24 @@ mod terminal_tests {
     fn complete_terminal_ignores_absent_stale_and_terminal_slots() {
         let absent = new_slot();
         finish_terminal(&absent, 2, failure());
-        assert!(absent.lock().unwrap().is_none());
+        assert!(absent.lock().unwrap().current.is_none());
 
         let slot = running_slot();
-        let original = slot.lock().unwrap().as_ref().unwrap().view.clone();
+        let original = slot.lock().unwrap().current.as_ref().unwrap().view.clone();
         finish_terminal(&slot, 1, failure());
-        assert_eq!(slot.lock().unwrap().as_ref().unwrap().view, original);
-        assert!(slot.lock().unwrap().as_ref().unwrap().restore_key.is_some());
+        assert_eq!(
+            slot.lock().unwrap().current.as_ref().unwrap().view,
+            original
+        );
+        assert!(
+            slot.lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .restore_key
+                .is_some()
+        );
         finish_terminal(&slot, 2, failure());
         finish_terminal(&slot, 2, Terminal::done());
         assert_failure(&slot);
@@ -1010,13 +1078,16 @@ mod terminal_tests {
     #[test]
     fn complete_terminal_respects_worker_and_cleanup_ownership() {
         let slot = running_slot();
-        let original = slot.lock().unwrap().as_ref().unwrap().view.clone();
-        slot.lock().unwrap().as_mut().unwrap().worker_active = true;
+        let original = slot.lock().unwrap().current.as_ref().unwrap().view.clone();
+        slot.lock().unwrap().current.as_mut().unwrap().worker_active = true;
         finish_terminal(&slot, 2, failure());
-        assert_eq!(slot.lock().unwrap().as_ref().unwrap().view, original);
+        assert_eq!(
+            slot.lock().unwrap().current.as_ref().unwrap().view,
+            original
+        );
         {
             let mut guard = slot.lock().unwrap();
-            let current = guard.as_mut().unwrap();
+            let current = guard.current.as_mut().unwrap();
             current.worker_active = false;
             current.cleanup = Some(PendingCleanup {
                 owners: Vec::new(),
@@ -1025,7 +1096,7 @@ mod terminal_tests {
         }
         finish_terminal(&slot, 2, Terminal::done());
         let guard = slot.lock().unwrap();
-        let current = guard.as_ref().unwrap();
+        let current = guard.current.as_ref().unwrap();
         assert_eq!(current.view, original);
         assert!(current.cleanup.is_some());
         assert!(current.nonce.is_some() && current.restore_key.is_some());
@@ -1034,11 +1105,11 @@ mod terminal_tests {
     #[test]
     fn active_worker_refuses_other_terminal_transitions_until_actual_settlement() {
         let slot = running_slot();
-        let original = slot.lock().unwrap().as_ref().unwrap().view.clone();
+        let original = slot.lock().unwrap().current.as_ref().unwrap().view.clone();
         assert!(start_worker(&slot, 2));
         assert!(!start_worker(&slot, 2));
         assert!(!start_worker(&slot, 1));
-        slot.lock().unwrap().as_mut().unwrap().started =
+        slot.lock().unwrap().current.as_mut().unwrap().started =
             Instant::now() - HANDOFF_TTL - Duration::from_secs(1);
         assert!(!mark_cancelled(&slot, 2));
         mark_expired(&slot, 2);
@@ -1047,7 +1118,7 @@ mod terminal_tests {
         assert!(is_busy(&slot));
         assert!(begin(&slot, "rotate", None, None, None).is_err());
         settle(&slot, 1, Terminal::done());
-        assert!(slot.lock().unwrap().as_ref().unwrap().worker_active);
+        assert!(slot.lock().unwrap().current.as_ref().unwrap().worker_active);
         settle(&slot, 2, failure());
         assert_failure(&slot);
         #[cfg(not(windows))]
@@ -1056,11 +1127,11 @@ mod terminal_tests {
         #[cfg(windows)]
         let next = {
             let mut guard = slot.lock().unwrap();
-            let settled = guard.as_ref().unwrap();
+            let settled = guard.current.as_ref().unwrap();
             assert!(!settled.worker_active);
             assert!(settled.cleanup.is_none());
             let generation = settled.generation.wrapping_add(1);
-            *guard = Some(admitted_slot("restore", generation, None, None, None));
+            guard.current = Some(admitted_slot("restore", generation, None, None, None));
             generation
         };
         #[cfg(not(windows))]
@@ -1080,7 +1151,7 @@ mod terminal_tests {
         stale.report = Some(serde_json::json!({"stale":true}));
         settle(&slot, 2, stale);
         assert_eq!(current(&slot).unwrap(), current_view);
-        assert!(slot.lock().unwrap().as_ref().unwrap().worker_active);
+        assert!(slot.lock().unwrap().current.as_ref().unwrap().worker_active);
         settle(&slot, next, Terminal::done());
     }
 
@@ -1102,7 +1173,7 @@ mod terminal_tests {
         assert!(!mark_cancelled(&slot, 2));
         assert!(!start_worker(&slot, 2));
         let guard = slot.lock().unwrap();
-        let current = guard.as_ref().unwrap();
+        let current = guard.current.as_ref().unwrap();
         assert_eq!(current.view.reason_code.as_deref(), Some("cancelled"));
         assert!(current.nonce.is_none() && current.restore_key.is_none());
     }
@@ -1150,7 +1221,7 @@ mod worker_tests {
         let slot = running_slot();
         wait_for_worker(spawn_worker(slot.clone(), 2, || panic!("test worker panic")).unwrap());
         let guard = slot.lock().unwrap();
-        let current = guard.as_ref().unwrap();
+        let current = guard.current.as_ref().unwrap();
         assert_eq!(current.view.phase, "error");
         assert_eq!(current.view.reason_code.as_deref(), Some("failed"));
         assert!(current.view.detail.is_none() && current.view.guidance.is_none());
@@ -1170,7 +1241,7 @@ mod worker_tests {
         })
         .unwrap();
         observed.recv_timeout(Duration::from_secs(5)).unwrap();
-        slot.lock().unwrap().as_mut().unwrap().started =
+        slot.lock().unwrap().current.as_mut().unwrap().started =
             Instant::now() - HANDOFF_TTL - Duration::from_secs(1);
         assert!(!mark_cancelled(&slot, 2));
         mark_expired(&slot, 2);
@@ -1208,7 +1279,7 @@ mod worker_tests {
         assert_eq!(current.phase, "error");
         assert_eq!(current.reason_code.as_deref(), Some("failed"));
         assert!(current.portal_url.is_none());
-        assert!(!slot.lock().unwrap().as_ref().unwrap().worker_active);
+        assert!(!slot.lock().unwrap().current.as_ref().unwrap().worker_active);
         assert!(!is_busy(&slot));
         let next = begin(&slot, "rotate", None, None, None).unwrap().generation;
         wait_for_worker(spawn_worker(slot.clone(), next, Terminal::done).unwrap());
@@ -1260,13 +1331,13 @@ mod handoff_state_tests {
     use super::*;
 
     fn admitted_poll() -> SharedOperationSlot {
-        Arc::new(Mutex::new(Some(admitted_slot(
+        Arc::new(Mutex::new(OperationState::new(Some(admitted_slot(
             "restore_hosted",
             2,
             Some("portal".into()),
             Some("nonce".into()),
             Some("key".into()),
-        ))))
+        )))))
     }
 
     #[test]
@@ -1281,7 +1352,15 @@ mod handoff_state_tests {
         assert!(!mark_cancelled(&slot, 2));
         assert!(!start_worker(&slot, 2));
         assert!(!is_terminal(&current(&slot).unwrap().phase));
-        assert!(slot.lock().unwrap().as_ref().unwrap().nonce.is_none());
+        assert!(
+            slot.lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .unwrap()
+                .nonce
+                .is_none()
+        );
         fail_handoff_poll(&slot, 2, "nonce", "expired");
         finish_handoff_poll(&slot, 1);
         assert_eq!(current(&slot).unwrap().phase, "cancelling");
@@ -1291,7 +1370,7 @@ mod handoff_state_tests {
             Some("cancelled")
         );
         let next = 3;
-        *slot.lock().unwrap() = Some(admitted_slot("restore", next, None, None, None));
+        slot.lock().unwrap().current = Some(admitted_slot("restore", next, None, None, None));
         finish_handoff_poll(&slot, 2);
         fail_handoff_poll(&slot, 2, "nonce", "failed");
         assert_eq!(generation_of(&slot), Some(next));
@@ -1335,29 +1414,29 @@ mod cleanup_state_tests {
     #[test]
     fn poll_and_native_cleanup_each_hold_the_complete_terminal() {
         for poll_first in [false, true] {
-            let slot = Arc::new(Mutex::new(Some(admitted_slot(
+            let slot = Arc::new(Mutex::new(OperationState::new(Some(admitted_slot(
                 "restore_hosted",
                 2,
                 None,
                 Some("nonce".into()),
                 None,
-            ))));
+            )))));
             start_handoff_poll(&slot, 2).unwrap();
             match_handoff(&slot, "nonce", Some(2)).unwrap_or_else(|_| panic!("match"));
-            slot.lock().unwrap().as_mut().unwrap().cleanup = Some(PendingCleanup {
+            slot.lock().unwrap().current.as_mut().unwrap().cleanup = Some(PendingCleanup {
                 owners: Vec::new(),
                 terminal: super::terminal_tests::failure(),
             });
             if poll_first {
                 finish_handoff_poll(&slot, 2);
             } else {
-                observe_cleanup(slot.lock().unwrap().as_mut().unwrap());
+                observe_cleanup(slot.lock().unwrap().current.as_mut().unwrap());
                 assert!(!is_terminal(
-                    &slot.lock().unwrap().as_ref().unwrap().view.phase
+                    &slot.lock().unwrap().current.as_ref().unwrap().view.phase
                 ));
             }
             if poll_first {
-                observe_cleanup(slot.lock().unwrap().as_mut().unwrap());
+                observe_cleanup(slot.lock().unwrap().current.as_mut().unwrap());
             } else {
                 finish_handoff_poll(&slot, 2);
             }
@@ -1370,7 +1449,7 @@ mod cleanup_state_tests {
         let flag = ArchiveCancellation::new();
         let mut admitted = admitted_slot("offload_approve", 2, None, None, None);
         admitted.archive_cancellation = Some(flag.clone());
-        let slot = Arc::new(Mutex::new(Some(admitted)));
+        let slot = Arc::new(Mutex::new(OperationState::new(Some(admitted))));
         assert!(start_worker(&slot, 2));
         assert_eq!(
             request_archive_cancellation(&slot, 2),
@@ -1381,7 +1460,7 @@ mod cleanup_state_tests {
         assert!(!mark_cancelled(&slot, 2));
         {
             let mut guard = slot.lock().unwrap();
-            let current = guard.as_mut().unwrap();
+            let current = guard.current.as_mut().unwrap();
             current.worker_active = false;
             current.view.phase = "cleanup_pending".into();
             current.cleanup = Some(PendingCleanup {
@@ -1394,7 +1473,7 @@ mod cleanup_state_tests {
             ArchiveCancellationRequest::Refused
         );
         let guard = slot.lock().unwrap();
-        let current = guard.as_ref().unwrap();
+        let current = guard.current.as_ref().unwrap();
         assert_eq!(current.view.phase, "cleanup_pending");
         assert!(current.cleanup.is_some());
     }
@@ -1403,7 +1482,7 @@ mod cleanup_state_tests {
     fn active_worker_keeps_ownership_across_cancel_and_hosted_expiry() {
         let slot = new_slot();
         let generation = 1;
-        *slot.lock().unwrap() = Some(admitted_slot(
+        slot.lock().unwrap().current = Some(admitted_slot(
             "restore_hosted",
             generation,
             Some("portal".into()),
@@ -1411,7 +1490,7 @@ mod cleanup_state_tests {
             Some("key".into()),
         ));
         assert!(start_worker(&slot, generation));
-        slot.lock().unwrap().as_mut().unwrap().started =
+        slot.lock().unwrap().current.as_mut().unwrap().started =
             Instant::now() - HANDOFF_TTL - Duration::from_secs(1);
         mark_cancelled(&slot, generation);
         mark_expired(&slot, generation);
@@ -1428,7 +1507,7 @@ mod cleanup_state_tests {
         assert_eq!(current.phase, "error");
         assert_eq!(current.reason_code.as_deref(), Some("original_failure"));
         let guard = slot.lock().unwrap();
-        let current = guard.as_ref().unwrap();
+        let current = guard.current.as_ref().unwrap();
         assert!(!current.worker_active);
         assert!(current.cleanup.is_none());
         assert!(
@@ -1442,17 +1521,17 @@ mod cleanup_state_tests {
     fn stale_worker_and_recovery_cannot_clear_a_new_generation() {
         let slot = new_slot();
         let first = 1;
-        *slot.lock().unwrap() = Some(admitted_slot("rotate", first, None, None, None));
+        slot.lock().unwrap().current = Some(admitted_slot("rotate", first, None, None, None));
         assert!(start_worker(&slot, first));
         finish_worker(&slot, first, Terminal::done(), Vec::new());
         let second = {
             let mut guard = slot.lock().unwrap();
-            let settled = guard.as_ref().unwrap();
+            let settled = guard.current.as_ref().unwrap();
             assert_eq!(settled.view.phase, "done");
             assert!(!settled.worker_active);
             assert!(settled.cleanup.is_none());
             let generation = settled.generation.wrapping_add(1);
-            *guard = Some(admitted_slot("restore", generation, None, None, None));
+            guard.current = Some(admitted_slot("restore", generation, None, None, None));
             generation
         };
         assert!(start_worker(&slot, second));

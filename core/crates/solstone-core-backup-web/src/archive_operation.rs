@@ -138,7 +138,7 @@ mod tests {
                 AdmissionError::DeadlineExceeded
             ))
         ));
-        assert!(slot.lock().unwrap().is_none());
+        assert!(slot.lock().unwrap().current.is_none());
         let generation = operation::begin(
             &slot,
             "restore_hosted",
@@ -148,7 +148,7 @@ mod tests {
         )
         .unwrap()
         .generation;
-        slot.lock().unwrap().as_mut().unwrap().started =
+        slot.lock().unwrap().current.as_mut().unwrap().started =
             Instant::now() - operation::HANDOFF_TTL - Duration::from_secs(1);
         assert!(matches!(
             begin(&slot, "archive", &clock),

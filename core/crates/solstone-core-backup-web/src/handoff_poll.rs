@@ -216,7 +216,7 @@ fn watchdog_loop(slot: &SharedOperationSlot, generation: u64) {
 
 fn live_wait(slot: &SharedOperationSlot, generation: u64) -> LiveWait {
     let guard = slot.lock().expect("operation slot lock");
-    let Some(current) = guard.as_ref() else {
+    let Some(current) = guard.current.as_ref() else {
         return LiveWait::Gone;
     };
     if current.generation != generation

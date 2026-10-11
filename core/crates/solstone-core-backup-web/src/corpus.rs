@@ -770,7 +770,13 @@ async fn fixture_generation(deps: &crate::BackupWebDeps) -> u64 {
     let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
     loop {
         match deps.operations.try_lock() {
-            Ok(guard) => return guard.as_ref().expect("fixture operation").generation,
+            Ok(guard) => {
+                return guard
+                    .current
+                    .as_ref()
+                    .expect("fixture operation")
+                    .generation;
+            }
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Poisoned(_)) => panic!("fixture operation slot poisoned"),
         }
@@ -793,7 +799,10 @@ async fn wait_started_or_terminal(
         }
         match deps.operations.try_lock() {
             Ok(guard) => {
-                let current = guard.as_ref().ok_or(HoldStartFailure::NoOperation)?;
+                let current = guard
+                    .current
+                    .as_ref()
+                    .ok_or(HoldStartFailure::NoOperation)?;
                 if current.generation != generation {
                     return Err(HoldStartFailure::GenerationChanged);
                 }
@@ -871,7 +880,7 @@ async fn settle_held_fixture(
             && !crate::operation::handoff_poll_active(&deps.operations);
         let owner_settled = match deps.operations.try_lock() {
             Ok(mut guard) => {
-                if let Some(current) = guard.as_mut() {
+                if let Some(current) = guard.current.as_mut() {
                     // This is the existing test-only backdate state update, made
                     // under a fallible lock rather than the blocking helper.
                     if released
@@ -1376,7 +1385,7 @@ async fn wait_terminal(deps: &crate::BackupWebDeps) -> Value {
             .expect("operation status timed out");
         let phase = body["operation"]["phase"].as_str().unwrap_or("");
         let settled = match deps.operations.try_lock() {
-            Ok(guard) => guard.as_ref().is_none_or(fixture_worker_settled),
+            Ok(guard) => guard.current.as_ref().is_none_or(fixture_worker_settled),
             Err(TryLockError::WouldBlock) => false,
             Err(TryLockError::Poisoned(_)) => panic!("operation slot poisoned"),
         };
@@ -1395,7 +1404,7 @@ async fn drain_hosted_wait(deps: &crate::BackupWebDeps) {
     loop {
         let updated = match deps.operations.try_lock() {
             Ok(mut guard) => {
-                if let Some(current) = guard.as_mut() {
+                if let Some(current) = guard.current.as_mut() {
                     current.started = Instant::now()
                         .checked_sub(crate::operation::HANDOFF_TTL + Duration::from_secs(1))
                         .expect("fixture backdate");
@@ -1664,7 +1673,11 @@ async fn held_fixture_failure_releases_and_settles_before_dropping_roots() {
                     assert_eq!(http.active_executions(), 1);
                     let worker_active = {
                         let guard = deps.operations.try_lock().expect("fixture slot");
-                        guard.as_ref().expect("fixture operation").worker_active
+                        guard
+                            .current
+                            .as_ref()
+                            .expect("fixture operation")
+                            .worker_active
                     };
                     assert!(worker_active);
                 }
@@ -1683,7 +1696,7 @@ async fn held_fixture_failure_releases_and_settles_before_dropping_roots() {
         assert!(!deps.handoff_poll_lease.load(Ordering::Acquire));
         let view = {
             let guard = deps.operations.try_lock().expect("fixture slot");
-            let current = guard.as_ref().expect("fixture operation");
+            let current = guard.current.as_ref().expect("fixture operation");
             let settled = fixture_worker_settled(current);
             (current.view.clone(), settled)
         };
@@ -2255,7 +2268,7 @@ async fn enable_hosted_verifies_refusals_and_busy_behavior() {
     let (status, body) = post_json(&missing_deps, "/app/backup/enable-hosted", None).await;
     assert_eq!(status, 500);
     assert_eq!(body["reason_code"], "internal_error");
-    assert!(missing_deps.operations.lock().unwrap().is_none());
+    assert!(missing_deps.operations.lock().unwrap().current.is_none());
 
     // Corrupt CA
     let corrupt_ca_root = crate::test_support::root("healthy");
@@ -2271,7 +2284,7 @@ async fn enable_hosted_verifies_refusals_and_busy_behavior() {
     let (status, body) = post_json(&corrupt_deps, "/app/backup/enable-hosted", None).await;
     assert_eq!(status, 500);
     assert_eq!(body["reason_code"], "internal_error");
-    assert!(corrupt_deps.operations.lock().unwrap().is_none());
+    assert!(corrupt_deps.operations.lock().unwrap().current.is_none());
 
     // Missing state
     let missing_state_root = crate::test_support::root("healthy");
@@ -2283,7 +2296,14 @@ async fn enable_hosted_verifies_refusals_and_busy_behavior() {
     let (status, body) = post_json(&missing_state_deps, "/app/backup/enable-hosted", None).await;
     assert_eq!(status, 500);
     assert_eq!(body["reason_code"], "internal_error");
-    assert!(missing_state_deps.operations.lock().unwrap().is_none());
+    assert!(
+        missing_state_deps
+            .operations
+            .lock()
+            .unwrap()
+            .current
+            .is_none()
+    );
 
     // Mismatched state
     let mismatched_state_root = crate::test_support::root("healthy");
@@ -2299,7 +2319,14 @@ async fn enable_hosted_verifies_refusals_and_busy_behavior() {
     let (status, body) = post_json(&mismatched_state_deps, "/app/backup/enable-hosted", None).await;
     assert_eq!(status, 500);
     assert_eq!(body["reason_code"], "internal_error");
-    assert!(mismatched_state_deps.operations.lock().unwrap().is_none());
+    assert!(
+        mismatched_state_deps
+            .operations
+            .lock()
+            .unwrap()
+            .current
+            .is_none()
+    );
 
     // Fault primitives
     for primitive in [
@@ -2318,7 +2345,7 @@ async fn enable_hosted_verifies_refusals_and_busy_behavior() {
         assert_eq!(status, 500);
         assert_eq!(body["reason_code"], "internal_error");
         assert!(guard.was_consumed());
-        assert!(fault_deps.operations.lock().unwrap().is_none());
+        assert!(fault_deps.operations.lock().unwrap().current.is_none());
     }
 }
 
@@ -3114,7 +3141,7 @@ async fn activate_unbound_restore(deps: &crate::BackupWebDeps, capability: &str)
 
 fn assert_handoff_state_cleared(deps: &crate::BackupWebDeps) {
     let guard = deps.operations.lock().expect("operation slot lock");
-    let slot = guard.as_ref().expect("operation slot");
+    let slot = guard.current.as_ref().expect("operation slot");
     assert!(slot.view.portal_url.is_none());
     assert!(slot.nonce.is_none());
     assert!(slot.restore_key.is_none());
@@ -3192,7 +3219,7 @@ async fn restore_prepare_does_not_allocate_identity_before_activation() {
     assert_eq!(status, 200);
     let (view, worker_active) = {
         let guard = deps.operations.lock().unwrap();
-        let current = guard.as_ref().unwrap();
+        let current = guard.current.as_ref().unwrap();
         (current.view.clone(), current.worker_active)
     };
     assert_eq!(view.phase, "error");
@@ -5329,7 +5356,7 @@ async fn wait_watchdog_expired(slot: &crate::operation::SharedOperationSlot) {
     let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
     loop {
         let expired = match slot.try_lock() {
-            Ok(guard) => guard.as_ref().is_some_and(|current| {
+            Ok(guard) => guard.current.as_ref().is_some_and(|current| {
                 current.view.phase == "cancelling"
                     && current.view.reason_code.as_deref() == Some("expired")
             }),
@@ -5413,7 +5440,7 @@ async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observati
             {
                 let (view, has_nonce, has_key) = {
                     let guard = deps.operations.try_lock().expect("fixture slot");
-                    let slot = guard.as_ref().expect("slot");
+                    let slot = guard.current.as_ref().expect("slot");
                     (
                         slot.view.clone(),
                         slot.nonce.is_some(),
@@ -5433,7 +5460,7 @@ async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observati
             {
                 let (view, has_nonce, has_key) = {
                     let guard = deps.operations.try_lock().expect("fixture slot");
-                    let slot = guard.as_ref().expect("slot");
+                    let slot = guard.current.as_ref().expect("slot");
                     (
                         slot.view.clone(),
                         slot.nonce.is_some(),
@@ -5453,7 +5480,7 @@ async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observati
             {
                 let (view, has_nonce, has_key) = {
                     let guard = deps.operations.try_lock().expect("fixture slot");
-                    let slot = guard.as_ref().expect("slot");
+                    let slot = guard.current.as_ref().expect("slot");
                     (
                         slot.view.clone(),
                         slot.nonce.is_some(),
@@ -5776,7 +5803,7 @@ async fn hosted_poll_second_get_is_resource_bounded_and_lease_releases_on_comple
             let second_generation = {
                 let (view, generation) = {
                     let guard = deps.operations.try_lock().expect("fixture slot");
-                    let slot = guard.as_ref().expect("slot");
+                    let slot = guard.current.as_ref().expect("slot");
                     (slot.view.clone(), slot.generation)
                 };
                 assert_eq!(view.phase, "cancelling");
@@ -5791,7 +5818,7 @@ async fn hosted_poll_second_get_is_resource_bounded_and_lease_releases_on_comple
             {
                 let (view, generation) = {
                     let guard = deps.operations.try_lock().expect("fixture slot");
-                    let slot = guard.as_ref().expect("slot");
+                    let slot = guard.current.as_ref().expect("slot");
                     (slot.view.clone(), slot.generation)
                 };
                 assert_eq!(generation, second_generation);

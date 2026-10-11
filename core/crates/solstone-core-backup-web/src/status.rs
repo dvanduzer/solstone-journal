@@ -204,7 +204,7 @@ mod tests {
             (true, ())
         })
         .expect("record result");
-        worker.as_mut().expect("slot").view.phase = "done".to_owned();
+        worker.current.as_mut().expect("slot").view.phase = "done".to_owned();
         drop(worker);
 
         let body = reader.join().expect("reader");
