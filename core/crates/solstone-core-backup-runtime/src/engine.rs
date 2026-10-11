@@ -1811,6 +1811,13 @@ impl<'a> AdmittedArchive<'a> {
         &self.root
     }
 
+    /// Sample the admitted clock after checking the original local lifetime.
+    /// This observation cannot extend the operation's deadline or credentials.
+    pub fn current_time(&self) -> Result<i64, ArchiveError> {
+        self.revalidate_local()?;
+        Ok(self.clock.now_unix())
+    }
+
     /// Recheck the retained root, captured backup configuration and remaining
     /// lifetime without issuing any remote request.
     pub fn revalidate_local(&self) -> Result<(), ArchiveError> {
