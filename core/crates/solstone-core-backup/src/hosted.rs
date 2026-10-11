@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
-use solstone_core_journal_io::{JsonWriteOptions, write_json};
+use solstone_core_journal_io::{JsonWriteOptions, LockOptions, hold_lock, write_json};
 
 use crate::{BackupError, HostedBinding};
 
@@ -43,6 +43,7 @@ pub(crate) fn decode_hosted_binding(bytes: &[u8]) -> Option<HostedBinding> {
 
 pub fn save_hosted_binding(journal: &Path, binding: &HostedBinding) -> Result<(), BackupError> {
     let path = hosted_binding_path(journal).map_err(|_| BackupError::HostedWrite)?;
+    let _guard = hold_lock(&path, binding_lock_options()).map_err(|_| BackupError::HostedWrite)?;
     let value = Map::from_iter([
         (
             "broker_endpoint".to_owned(),
@@ -76,11 +77,29 @@ pub fn save_hosted_binding(journal: &Path, binding: &HostedBinding) -> Result<()
 
 pub fn delete_hosted_binding(journal: &Path) -> Result<(), BackupError> {
     let path = hosted_binding_path(journal).map_err(|_| BackupError::HostedDelete)?;
+    let _guard = hold_lock(&path, binding_lock_options()).map_err(|_| BackupError::HostedDelete)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(BackupError::HostedDelete),
     }
+}
+
+fn binding_lock_options() -> LockOptions {
+    let options = LockOptions {
+        mode: Some(0o600),
+        ..crate::state::mutation_lock_options()
+    };
+    #[cfg(all(test, feature = "full-tests"))]
+    if let Some(timeout) = BINDING_LOCK_TIMEOUT.with(std::cell::Cell::get) {
+        return LockOptions { timeout, ..options };
+    }
+    options
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+thread_local! {
+    static BINDING_LOCK_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
 }
 
 fn non_blank(raw: &Map<String, Value>, key: &str) -> Option<String> {
@@ -229,5 +248,85 @@ mod tests {
         let unlink_failure = temp();
         fs::create_dir_all(unlink_failure.path().join("backup/hosted/binding.json")).unwrap();
         assert!(delete_hosted_binding(unlink_failure.path()).is_err());
+    }
+}
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+mod lock_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::time::Duration;
+
+    use solstone_core_journal_io::{FlatDirectory, JournalRoot, open_existing_parent_lock_bound};
+
+    struct ImmediateLock;
+    impl ImmediateLock {
+        fn install() -> Self {
+            BINDING_LOCK_TIMEOUT.with(|timeout| timeout.set(Some(Duration::ZERO)));
+            Self
+        }
+    }
+    impl Drop for ImmediateLock {
+        fn drop(&mut self) {
+            BINDING_LOCK_TIMEOUT.with(|timeout| timeout.set(None));
+        }
+    }
+
+    #[test]
+    fn actual_save_and_delete_share_the_retained_persistent_lock() {
+        let journal = tempfile::tempdir().unwrap();
+        let value = HostedBinding {
+            broker_endpoint: "https://example.invalid".into(),
+            account_id: "account".into(),
+            instance_id: "instance".into(),
+            bucket: "bucket".into(),
+            prefix: "prefix/".into(),
+            broker_token: "secret".into(),
+        };
+        save_hosted_binding(journal.path(), &value).unwrap();
+        let path = hosted_binding_read_path(journal.path());
+        let lock_path = path.with_file_name("binding.json.lock");
+        let prior = fs::read(&path).unwrap();
+        assert_eq!(fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::metadata(&lock_path).unwrap();
+        assert!(!path.with_file_name("binding.json.lock.lock").exists());
+        let root = JournalRoot::open(journal.path()).unwrap();
+        let directory = FlatDirectory::open(&root, Path::new("backup/hosted")).unwrap();
+        let held = open_existing_parent_lock_bound(
+            &directory,
+            OsStr::new("binding.json.lock"),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap()
+        .unwrap();
+        let _immediate = ImmediateLock::install();
+        let changed = HostedBinding {
+            bucket: "changed-bucket".into(),
+            ..value
+        };
+        assert!(matches!(
+            save_hosted_binding(journal.path(), &changed),
+            Err(BackupError::HostedWrite)
+        ));
+        assert!(matches!(
+            delete_hosted_binding(journal.path()),
+            Err(BackupError::HostedDelete)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), prior);
+        held.revalidate_bound(&directory, OsStr::new("binding.json.lock"))
+            .unwrap();
+        drop(held);
+        save_hosted_binding(journal.path(), &changed).unwrap();
+        assert_eq!(load_hosted_binding(journal.path()), Some(changed));
+        delete_hosted_binding(journal.path()).unwrap();
+        assert!(!path.exists());
+        let after = fs::metadata(lock_path).unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode()),
+            (after.dev(), after.ino(), after.mode())
+        );
     }
 }
