@@ -63,22 +63,43 @@ impl ActivityPreparationFailure {
 
 impl ArchiveActivity {
     fn prepare(root: Arc<JournalRoot>) -> Result<Self, ActivityPreparationFailure> {
+        let lease = Self::acquire(Arc::clone(&root))?;
+        Self::prepare_acquired(root, lease)
+    }
+
+    fn acquire(root: Arc<JournalRoot>) -> Result<Arc<ActivityLease>, ActivityPreparationFailure> {
+        ActivityLease::try_acquire(Arc::clone(&root)).map_err(|error| ActivityPreparationFailure {
+            inner: Box::new(ActivityPreparationFailureInner {
+                error: io::Error::other(error.to_string()),
+                root,
+                lease: None,
+                partial: None,
+            }),
+        })
+    }
+
+    fn prepare_acquired(
+        root: Arc<JournalRoot>,
+        lease: Arc<ActivityLease>,
+    ) -> Result<Self, ActivityPreparationFailure> {
         let mut failure = ActivityPreparationFailureInner {
             error: io::Error::other("activity preparation failed"),
             root: Arc::clone(&root),
-            lease: None,
+            lease: Some(Arc::clone(&lease)),
             partial: None,
         };
-        let lease = match ActivityLease::try_acquire(Arc::clone(&root)) {
-            Ok(lease) => lease,
-            Err(error) => {
-                failure.error = io::Error::other(error.to_string());
-                return Err(ActivityPreparationFailure {
-                    inner: Box::new(failure),
-                });
-            }
-        };
-        failure.lease = Some(Arc::clone(&lease));
+        if !Arc::ptr_eq(lease.journal_root(), &root) {
+            failure.error = io::Error::other("original activity root changed");
+            return Err(ActivityPreparationFailure {
+                inner: Box::new(failure),
+            });
+        }
+        if let Err(error) = lease.revalidate() {
+            failure.error = io::Error::other(error);
+            return Err(ActivityPreparationFailure {
+                inner: Box::new(failure),
+            });
+        }
         let census = match observe_obligations(&root) {
             Ok(census) => census,
             Err(error) => {
@@ -174,6 +195,7 @@ pub struct OwnedArchivePreparationFailure {
     root: Arc<JournalRoot>,
     activity: Option<ArchiveActivity>,
     preparation: Option<ActivityPreparationFailure>,
+    configuration: Option<Box<ArchiveConfiguration>>,
     _budget: ArchiveBudget,
     clock: Arc<dyn Clock + Send + Sync>,
 }
@@ -189,6 +211,9 @@ impl OwnedArchivePreparationFailure {
     }
     pub fn preparation(&self) -> Option<&ActivityPreparationFailure> {
         self.preparation.as_ref()
+    }
+    pub fn configuration(&self) -> Option<&ArchiveConfiguration> {
+        self.configuration.as_deref()
     }
     pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
         &self.clock
@@ -269,6 +294,7 @@ impl ArchiveOperationPreparationFailure<'_> {
             root,
             activity,
             preparation,
+            configuration: None,
             _budget,
             clock,
         })
@@ -288,6 +314,15 @@ impl<'a> PreparedArchiveOperation<'a> {
         budget: ArchiveBudget,
         clock: ArchiveOperationClock<'a>,
     ) -> Result<Self, ArchiveOperationPreparationFailure<'a>> {
+        Self::prepare_with_lease(root, budget, clock, None)
+    }
+
+    fn prepare_with_lease(
+        root: Arc<JournalRoot>,
+        budget: ArchiveBudget,
+        clock: ArchiveOperationClock<'a>,
+        lease: Option<Arc<ActivityLease>>,
+    ) -> Result<Self, ArchiveOperationPreparationFailure<'a>> {
         let mut failure = ArchiveOperationPreparationFailureInner {
             reason: AdmissionError::JournalIdentityChanged,
             root: Arc::clone(&root),
@@ -298,11 +333,25 @@ impl<'a> PreparedArchiveOperation<'a> {
         };
         if let Err(reason) = failure._budget.remaining(failure._clock.clock()) {
             failure.reason = reason;
+            if let Some(lease) = lease {
+                failure.preparation = Some(ActivityPreparationFailure {
+                    inner: Box::new(ActivityPreparationFailureInner {
+                        error: io::Error::other(reason),
+                        root: Arc::clone(&failure.root),
+                        lease: Some(lease),
+                        partial: None,
+                    }),
+                });
+            }
             return Err(ArchiveOperationPreparationFailure {
                 inner: Box::new(failure),
             });
         }
-        let activity = match ArchiveActivity::prepare(root) {
+        let prepared_activity = match lease {
+            Some(lease) => ArchiveActivity::prepare_acquired(root, lease),
+            None => ArchiveActivity::prepare(root),
+        };
+        let activity = match prepared_activity {
             Ok(activity) => activity,
             Err(preparation) => {
                 failure.preparation = Some(preparation);
@@ -422,7 +471,20 @@ impl OwnedPreparedArchiveOperation {
         budget: ArchiveBudget,
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Result<Self, OwnedArchivePreparationFailure> {
-        match PreparedArchiveOperation::prepare_owned(root, budget, Arc::clone(&clock)) {
+        Self::from_preparation(
+            PreparedArchiveOperation::prepare_owned(root, budget, Arc::clone(&clock)),
+            clock,
+        )
+    }
+
+    fn from_preparation(
+        prepared: Result<
+            PreparedArchiveOperation<'static>,
+            ArchiveOperationPreparationFailure<'static>,
+        >,
+        clock: Arc<dyn Clock + Send + Sync>,
+    ) -> Result<Self, OwnedArchivePreparationFailure> {
+        match prepared {
             Ok(operation) => Ok(Self { operation, clock }),
             Err(failure) => {
                 let ArchiveOperationPreparationFailureInner {
@@ -439,6 +501,7 @@ impl OwnedPreparedArchiveOperation {
                     root,
                     activity,
                     preparation,
+                    configuration: None,
                     _budget,
                     clock,
                 })
@@ -490,6 +553,145 @@ impl OwnedPreparedArchiveOperation {
         (self.operation, self.clock)
     }
 }
+
+/// Original native exclusion kept outside consuming preparation and finish calls.
+/// This closed owner grants no stage construction, admission or retirement.
+#[must_use = "Retain original custody through the actual receiving boundary"]
+pub struct ArchivePreparationCustody {
+    root: Arc<JournalRoot>,
+    lease: Arc<ActivityLease>,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+
+impl ArchivePreparationCustody {
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+    /// Borrow the original allocation without exposing a cloneable capability.
+    pub fn activity(&self) -> &ActivityLease {
+        self.lease.as_ref()
+    }
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.lease.revalidate().map_err(io::Error::other)
+    }
+}
+
+/// The original budget and one already acquired lease, before any stage exists.
+#[must_use = "Consume the original input or retain it in closed custody"]
+pub struct OwnedArchivePreparationInput {
+    root: Arc<JournalRoot>,
+    lease: Arc<ActivityLease>,
+    budget: ArchiveBudget,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+
+/// Original unused input with no execution entrance.
+#[must_use]
+pub struct OwnedArchivePreparationInputHold {
+    input: OwnedArchivePreparationInput,
+}
+
+impl OwnedArchivePreparationInputHold {
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.input.root
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.input.clock
+    }
+    pub fn activity(&self) -> &ActivityLease {
+        self.input.lease.as_ref()
+    }
+}
+
+impl OwnedArchivePreparationInput {
+    /// Acquire native exclusion before any consuming stage/config/helper work.
+    pub fn capture(
+        root: Arc<JournalRoot>,
+        budget: ArchiveBudget,
+        clock: Arc<dyn Clock + Send + Sync>,
+    ) -> Result<(Self, ArchivePreparationCustody), OwnedArchivePreparationFailure> {
+        let mut failure = OwnedArchivePreparationFailure {
+            reason: AdmissionError::JournalIdentityChanged,
+            root: Arc::clone(&root),
+            activity: None,
+            preparation: None,
+            configuration: None,
+            _budget: budget,
+            clock: Arc::clone(&clock),
+        };
+        if let Err(reason) = failure._budget.remaining(clock.as_ref()) {
+            failure.reason = reason;
+            return Err(failure);
+        }
+        let lease = match ArchiveActivity::acquire(Arc::clone(&root)) {
+            Ok(lease) => lease,
+            Err(preparation) => {
+                failure.preparation = Some(preparation);
+                return Err(failure);
+            }
+        };
+        let custody = ArchivePreparationCustody {
+            root: Arc::clone(&root),
+            lease: Arc::clone(&lease),
+            clock: Arc::clone(&clock),
+        };
+        Ok((
+            Self {
+                root,
+                lease,
+                budget: failure._budget,
+                clock,
+            },
+            custody,
+        ))
+    }
+
+    pub fn prepare(self) -> Result<OwnedPreparedArchiveOperation, OwnedArchivePreparationFailure> {
+        let Self {
+            root,
+            lease,
+            budget,
+            clock,
+        } = self;
+        let prepared = PreparedArchiveOperation::prepare_with_lease(
+            root,
+            budget,
+            ArchiveOperationClock::Owned(Arc::clone(&clock)),
+            Some(lease),
+        );
+        let owned = OwnedPreparedArchiveOperation::from_preparation(prepared, clock)?;
+        if let Err(reason) = owned.revalidate() {
+            let OwnedPreparedArchiveOperation { operation, clock } = owned;
+            let PreparedArchiveOperation {
+                activity,
+                configuration,
+                budget,
+                clock: old_clock,
+            } = operation;
+            drop(old_clock);
+            return Err(OwnedArchivePreparationFailure {
+                reason,
+                root: Arc::clone(activity.journal_root()),
+                activity: Some(activity),
+                preparation: None,
+                configuration: Some(Box::new(configuration)),
+                _budget: budget,
+                clock,
+            });
+        }
+        Ok(owned)
+    }
+
+    pub fn into_owned_hold(self) -> OwnedArchivePreparationInputHold {
+        OwnedArchivePreparationInputHold { input: self }
+    }
+}
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+mod custody_tests;
 
 // Only the owned preparation/read wrappers supply their captured clock here.
 pub(crate) fn close_owned_prepared(
