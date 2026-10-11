@@ -1260,10 +1260,7 @@ fn storage_ops_arguments(
     verb: &str,
     args: Vec<OsString>,
 ) -> Result<(Vec<String>, PathBuf), ExitCode> {
-    let arguments = match require_utf8_argv(verb, &args) {
-        Ok(arguments) => arguments,
-        Err(code) => return Err(code),
-    };
+    let arguments = require_utf8_argv(verb, &args)?;
     let is_help = arguments
         .iter()
         .any(|argument| argument == "-h" || argument == "--help");
