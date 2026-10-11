@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use solstone_core_format::segment::segment_key;
+use solstone_core_journal_io::activity_obligations::{MAX_INTENT_BYTES, intent_filename};
 use solstone_core_journal_io::journal_root::is_canonical_identity_observation;
 use solstone_core_journal_io::media::{
     Cleanup, Confirmation, Durability, MediaDigest, MediaIdentity, MediaObservation,
@@ -25,7 +26,6 @@ use solstone_core_retention::archive_catalog::{
 };
 
 const INTENT_VERSION: u32 = 1;
-pub(crate) const MAX_INTENT_BYTES: usize = 1024 * 1024;
 
 struct BoundedDocument {
     bytes: Vec<u8>,
@@ -397,12 +397,7 @@ impl RestoreIntent {
         self.locator.validate()?;
         validate_witness(&self.locator, &self.witness)?;
         if self.version != INTENT_VERSION
-            || self.event.operation_id.len() != 32
-            || !self
-                .event
-                .operation_id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || intent_filename(&self.event.operation_id).is_none()
             || !is_canonical_identity_observation(&self.destination.root)
             || self.destination.root.starts_with("native-root-v1:unix:")
                 != matches!(self.destination.parent, MediaIdentity::Unix { .. })

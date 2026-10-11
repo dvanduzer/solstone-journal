@@ -74,6 +74,22 @@ pub trait HttpTransport {
 #[derive(Debug, Default)]
 pub struct UreqHttpTransport;
 impl HttpTransport for UreqHttpTransport {
+    fn execute_cancellable(
+        &self,
+        request: &HttpRequest,
+        cancellation: &ArchiveCancellation,
+    ) -> Result<HttpResponse, HttpError> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::controlled_http::execute(request, cancellation)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (request, cancellation);
+            Err(HttpError::Other)
+        }
+    }
+
     fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let deadline = Instant::now()
             .checked_add(request.timeout)

@@ -95,6 +95,31 @@ pub(crate) fn run_owned(
     execute(request, capture_limit, cancellation).map_err(ChildFailure::new)
 }
 
+/// The DNS leaf supplies only an admitted executable, fixed DNS arguments and
+/// the original absolute end. No ambient environment or descriptors are passed.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_owned_dns(
+    program: &std::ffi::OsStr,
+    argv: &[OsString],
+    deadline: Instant,
+    cancellation: &ArchiveCancellation,
+    capture_limit: usize,
+) -> io::Result<CompletedChild> {
+    let request = Request {
+        program: program.to_owned(),
+        argv: argv.to_vec(),
+        env: BTreeMap::new(),
+        timeout: None,
+        pass_fds: Vec::new(),
+    };
+    execute_request(
+        &request,
+        Some(capture_limit),
+        Some(cancellation),
+        Some(deadline),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Observe,
@@ -294,6 +319,29 @@ fn inherit_in_child(command: &mut Command, descriptors: &[BorrowedFd<'_>]) -> io
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_dns_child(command: &mut Command) {
+    let expected_parent = std::process::id() as nix::libc::pid_t;
+    // SAFETY: this child-local hook allocates nothing. Only direct Linux OS
+    // calls run between fork and exec; no parent descriptor flags are changed.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            if nix::libc::close_range(3, u32::MAX, nix::libc::CLOSE_RANGE_CLOEXEC as i32) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if nix::libc::getppid() != expected_parent {
+                nix::libc::kill(nix::libc::getpid(), nix::libc::SIGKILL);
+                return Err(io::Error::from_raw_os_error(nix::libc::ECANCELED));
+            }
+            Ok(())
+        });
+    }
+}
+
 fn read_output(
     fd: OwnedFd,
     limit: Option<usize>,
@@ -402,10 +450,28 @@ fn execute(
     capture_limit: Option<usize>,
     cancellation: Option<&ArchiveCancellation>,
 ) -> io::Result<CompletedChild> {
+    execute_request(request, capture_limit, cancellation, None)
+}
+
+fn execute_request(
+    request: &Request<'_>,
+    capture_limit: Option<usize>,
+    cancellation: Option<&ArchiveCancellation>,
+    dns_deadline: Option<Instant>,
+) -> io::Result<CompletedChild> {
     let start = Instant::now();
+    let timeout = dns_deadline
+        .map(|deadline| deadline.saturating_duration_since(start))
+        .or(request.timeout);
     let cancelled = || io::Error::new(io::ErrorKind::Interrupted, "archive operation cancelled");
     if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
         return Err(cancelled());
+    }
+    if dns_deadline.is_some_and(|deadline| start >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP DNS deadline reached",
+        ));
     }
     let (stdout_r, stdout_w) = pipe_cloexec()?;
     let (stderr_r, stderr_w) = pipe_cloexec()?;
@@ -416,9 +482,22 @@ fn execute(
         .stdout(Stdio::from(stdout_w.try_clone()?))
         .stderr(Stdio::from(stderr_w.try_clone()?));
     command.process_group(0);
+    #[cfg(target_os = "linux")]
+    if dns_deadline.is_some() {
+        prepare_dns_child(&mut command);
+    } else {
+        inherit_in_child(&mut command, &request.pass_fds)?;
+    }
+    #[cfg(not(target_os = "linux"))]
     inherit_in_child(&mut command, &request.pass_fds)?;
     if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
         return Err(cancelled());
+    }
+    if dns_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP DNS deadline reached",
+        ));
     }
     let child = command.spawn()?;
     let pgid = Pid::from_raw(child.id() as i32);
@@ -440,7 +519,7 @@ fn execute(
         capture_limit,
         session.reader_signals.clone(),
         start,
-        request.timeout,
+        timeout,
         cancellation.cloned(),
     )?);
     session.stderr_reader = Some(spawn_reader(
@@ -448,10 +527,10 @@ fn execute(
         capture_limit,
         session.reader_signals.clone(),
         start,
-        request.timeout,
+        timeout,
         cancellation.cloned(),
     )?);
-    let stopped = await_exit(&mut session, start, request.timeout, cancellation);
+    let stopped = await_exit(&mut session, start, timeout, cancellation);
     if stopped.is_err() || matches!(&stopped, Ok(StopReason::ReaderFailed)) {
         session.stop_readers();
     }
@@ -466,9 +545,7 @@ fn execute(
     Ok(CompletedChild {
         output: Output {
             returncode: if stopped == StopReason::TimedOut
-                || request
-                    .timeout
-                    .is_some_and(|timeout| start.elapsed() >= timeout)
+                || timeout.is_some_and(|timeout| start.elapsed() >= timeout)
             {
                 124
             } else if status >= 0 {

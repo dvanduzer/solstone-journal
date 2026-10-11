@@ -399,7 +399,7 @@ tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tower-http = { version = "0.6.11", default-features = false, features = ["limit", "compression-gzip"] }
 unicode-normalization = "0.1.25"
 unidecode = "0.3.0"
-ureq = { version = "3.3.0", default-features = false }
+ureq = { version = "=3.4.0", default-features = false }
 tar = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 bzip2-rs = "0.1.2"
