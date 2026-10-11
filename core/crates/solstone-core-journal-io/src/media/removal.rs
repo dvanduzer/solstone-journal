@@ -170,6 +170,11 @@ impl MediaRemoval {
         &self.receipt
     }
 
+    /// Move the original facts and close handles. This performs no cleanup or mutation.
+    pub fn into_receipt(self) -> RemovalReceipt {
+        self.receipt
+    }
+
     pub fn stage_observation(&self) -> Option<&StageObservation> {
         self.stage_observation.as_ref()
     }

@@ -1099,7 +1099,7 @@ mod tests;
 mod retirement;
 
 mod owned;
-pub(crate) use owned::DetachedTransaction;
+pub(crate) use owned::{DetachedTransaction, SettledTransaction, SettlementFailure};
 
 fn capacity_allows(available: std::io::Result<u64>, required: u64) -> Result<(), Hold> {
     match available {

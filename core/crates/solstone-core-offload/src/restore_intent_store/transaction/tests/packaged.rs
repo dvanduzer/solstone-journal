@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Explicit copied-package Native restore controls; no root finish authority.
+//! Explicit copied-package Native restore and consuming finish controls.
 #![cfg(all(test, feature = "full-tests"))]
 #![cfg(unix)]
 
@@ -317,4 +317,324 @@ fn packaged_native_restored_mark_entry() {
             serde_json::json!({"case":input.case,"files":1,"bytes":first.bytes,"event":operation,"retired":false,"carrier":carrier.diagnostic_path(),"parent_refusal":true})
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinishInput {
+    mode: String,
+    journal: PathBuf,
+    restic_path: PathBuf,
+    repository_id: String,
+    snapshot_id: String,
+    archive_path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[cfg(target_os = "linux")]
+fn finished_native_facts(
+    file: crate::restore::owned::RestoreFileFacts<'_>,
+    bytes: u64,
+    retains_media: bool,
+) -> serde_json::Value {
+    use crate::restore::owned::FileEvidence;
+    use solstone_core_journal_io::media::{OriginalName, RemovalEffect};
+
+    assert_eq!(file.disposition, RestoreDisposition::Published);
+    assert_eq!((file.files_restored, file.bytes_restored), (1, bytes));
+    let FileEvidence::Transaction(facts) = file.evidence else {
+        panic!("actual Native transaction receipt required");
+    };
+    assert!(facts.completed);
+    assert!(facts.hold.is_none());
+    assert!(!facts.store_exclusion_retained);
+    assert_eq!(facts.retained_media, retains_media);
+    assert!(facts.register.is_none());
+    let publication = facts.publication.unwrap();
+    assert_eq!(publication.effect, PublicationEffect::Published);
+    assert_eq!(publication.confirmation, Confirmation::Confirmed);
+    assert_eq!(publication.file_durability, Durability::Synced);
+    assert_eq!(publication.parent_durability, Durability::Synced);
+    assert!(publication.identity.is_some() && publication.error.is_none());
+    assert!(facts.intent_writes.iter().all(|write| {
+        write.named_read_confirmed && write.durability == [Some(Durability::Synced); 4]
+    }));
+    assert!(facts.marker.as_ref().unwrap().is_ok());
+    assert_eq!(facts.marker_ancestor_sync.len(), 2);
+    assert!(facts.marker_ancestor_sync.iter().all(Result::is_ok));
+    let ledger = facts.ledger.unwrap();
+    assert!(ledger.confirmed && ledger.durability == [true; 4]);
+    assert!(ledger.failures.is_empty());
+    let retired = facts.retirement.unwrap();
+    assert!(retired.retired && !retired.retained_stage);
+    assert_eq!(retired.ancestors, [Durability::Synced; 4]);
+    assert!(retired.failures.is_empty());
+    let removal = retired.removal.unwrap();
+    assert_eq!(removal.effect, RemovalEffect::Deleted);
+    assert_eq!(removal.original_name, OriginalName::Absent);
+    assert_eq!(removal.claim_confirmation, Confirmation::Confirmed);
+    assert_eq!(removal.cleanup, Cleanup::Complete);
+    assert!(removal.failures.is_empty());
+    let cleanup = facts.settlement_cleanup.unwrap();
+    assert_eq!(cleanup.cleanup, Cleanup::Complete);
+    assert!(cleanup.parent_sync.unwrap().is_ok());
+    serde_json::json!({
+        "disposition":"Published", "files":1, "bytes":bytes,
+        "operation_id":facts.operation_id.unwrap(),
+        "publication":"Published/Synced/Synced/Confirmed",
+        "event_confirmed":true, "intent_retired":true,
+        "removal":"Deleted/Absent/Confirmed/Complete",
+        "settlement_cleanup":"Complete/Synced"
+    })
+}
+
+#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[test]
+#[ignore = "requires a copied current package and synthetic direct Native finish fixture"]
+fn packaged_native_restore_finish_entry() {
+    use crate::restore::owned::{RestoreFinishRefusal, restore_bound_day};
+    use solstone_core_backup_runtime::{
+        DirectReadFinishState, UreqHttpTransport, admit_prepared_archive_read_installed,
+    };
+    use solstone_core_journal_io::activity::ActivityAdmissionError;
+    use solstone_core_retention::archive_proof::AcceptedProcessingObservation;
+    use std::time::Instant;
+
+    struct OwnedClock(Instant);
+    impl Clock for OwnedClock {
+        fn now_unix(&self) -> i64 {
+            10_000 + self.0.elapsed().as_secs() as i64
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    let input: FinishInput = serde_json::from_slice(
+        &fs::read(std::env::var_os("NATIVE_FINISH_PROBE_JSON").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        input.mode.as_str(),
+        "complete" | "late_destination"
+    ));
+    let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
+    // Synthetic historical metadata backed by the fixture's actual snapshot,
+    // full LS path and bytes. The public entry still performs real exact dump.
+    let proof = OffloadProof {
+        journal_id: root.identity().observation_id(),
+        manifest_id: "native-finish-manifest".into(),
+        target: solstone_core_retention::Target {
+            day: "20261009".into(),
+            stream: "_default".into(),
+            dir: "120000_60_fixture".into(),
+        },
+        layout: solstone_core_journal_io::paths::SegmentLayout::Direct,
+        repository_id: input.repository_id.clone(),
+        snapshot_id: input.snapshot_id.clone(),
+        files: vec![ArchiveFileProof {
+            witness_id: "native-finish-witness".into(),
+            name: "audio.flac".into(),
+            bytes: input.bytes,
+            sha256: input.sha256.clone(),
+            archive_path: input.archive_path.clone(),
+            processing: AcceptedProcessingObservation {
+                record: None,
+                has_analysis_row: true,
+            },
+        }],
+    };
+    proof.validate().unwrap();
+    let segment = input.journal.join("chronicle/20261009/120000_60_fixture");
+    fs::create_dir_all(&segment).unwrap();
+    let ledger = crate::ledger::writer::append_archive_witness(&root, &proof, 1).unwrap();
+    assert_eq!(ledger.confirmation(), LedgerConfirmation::Confirmed);
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
+    let prepared = PreparedArchiveOperation::prepare_owned(
+        Arc::clone(&root),
+        ArchiveBudget::new(clock.as_ref()).unwrap(),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+    let lease = Arc::downgrade(prepared.activity());
+    let carrier = Arc::downgrade(prepared.carrier());
+    let installed = admit_prepared_archive_read_installed(
+        prepared,
+        input.repository_id.clone(),
+        &input.restic_path,
+        "2.0.40",
+        &UreqHttpTransport,
+    )
+    .unwrap();
+    let (read, finish) = installed.into_parts();
+    assert!(Arc::ptr_eq(read.carrier(), finish.carrier()));
+    assert!(Arc::ptr_eq(read.owned_clock().unwrap(), &clock));
+    assert!(Arc::ptr_eq(finish.owned_clock(), &clock));
+    let outcome = restore_bound_day(read, &proof.target.day, 2);
+    assert_eq!(outcome.report().status, "ok", "{:?}", outcome.report());
+    assert_eq!(outcome.report().files_restored, 1);
+    assert_eq!(outcome.report().bytes_restored, input.bytes);
+    assert_eq!(outcome.files().len(), 1);
+    assert_eq!(
+        outcome.files().next().unwrap().disposition,
+        RestoreDisposition::Published
+    );
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(fs::read(segment.join("audio.flac")).unwrap())
+        ),
+        input.sha256
+    );
+    let result = if input.mode == "complete" {
+        let (settled, report) = match outcome.settle_direct() {
+            Ok(settled) => settled,
+            Err(_) => panic!("genuine Native settlement remained held"),
+        };
+        let facts = finished_native_facts(report.files().next().unwrap(), input.bytes, false);
+        let completed = match finish.finish(settled).into_owned_hold() {
+            Ok(value) => value,
+            Err(_) => panic!("original owned Runtime finish must close"),
+        };
+        assert_eq!(completed.state(), DirectReadFinishState::Completed);
+        assert!(Arc::ptr_eq(completed.owned_clock(), &clock));
+        let retirement = completed.retirement().unwrap();
+        assert!(retirement.receipt.failures().is_empty());
+        let retirement = format!(
+            "{:?}/{:?}/{:?}",
+            retirement.receipt.effect(),
+            retirement.receipt.root_durability(),
+            retirement.receipt.confirmation()
+        );
+        assert!(matches!(
+            ActivityLease::try_acquire(Arc::clone(&root)),
+            Err(ActivityAdmissionError::Busy)
+        ));
+        assert!(
+            PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock)
+            )
+            .is_err()
+        );
+        drop(completed);
+        assert!(
+            lease.upgrade().is_none(),
+            "settled report must retain no activity lease"
+        );
+        assert!(
+            carrier.upgrade().is_none(),
+            "settled report must retain no carrier"
+        );
+        let next = PreparedArchiveOperation::prepare_owned(
+            Arc::clone(&root),
+            ArchiveBudget::new(clock.as_ref()).unwrap(),
+            Arc::clone(&clock),
+        )
+        .unwrap();
+        let second = admit_prepared_archive_read_installed(
+            next,
+            input.repository_id.clone(),
+            &input.restic_path,
+            "2.0.40",
+            &UreqHttpTransport,
+        )
+        .unwrap();
+        let (second_read, second_finish) = second.into_parts();
+        let second_read = match second_read.settle_direct() {
+            Ok(value) => value,
+            Err(_) => panic!("fresh installed read must settle"),
+        };
+        let second = match second_finish.finish(second_read).into_owned_hold() {
+            Ok(value) => value,
+            Err(_) => panic!("fresh owned Runtime result must close"),
+        };
+        assert_eq!(second.state(), DirectReadFinishState::Completed);
+        drop(second);
+        assert_eq!(
+            finished_native_facts(report.files().next().unwrap(), input.bytes, false),
+            facts
+        );
+        assert_eq!(report.report().bytes_restored, input.bytes);
+        serde_json::json!({"state":"Completed","facts":facts,"retirement":retirement,
+            "held_lease_busy":true,"next_installed_admission":true,"next_completed":true,
+            "settled_report_retained":true})
+    } else {
+        let tombstone = segment.join("tombstone.json");
+        let (held, fired) = run_with_media_hook(
+            MediaPrimitive::ParentSync,
+            move || fs::write(tombstone, b"{}"),
+            || outcome.settle_direct(),
+        );
+        assert!(fired);
+        let held = match held {
+            Err(value) => value,
+            Ok(_) => panic!("late owner tombstone must refuse Native settlement"),
+        };
+        assert!(matches!(
+            held.refusal(),
+            RestoreFinishRefusal::Native {
+                file: Some(0),
+                reason: "settlement_destination_changed",
+                ..
+            }
+        ));
+        assert_eq!(
+            held.report().status,
+            "ok",
+            "finish refusal is independent of prior report"
+        );
+        let before = finished_native_facts(held.files().next().unwrap(), input.bytes, true);
+        let held = match held.into_owned_hold() {
+            Ok(value) => value,
+            Err(_) => panic!("original owned Native read must close"),
+        };
+        assert!(std::ptr::eq(Arc::as_ptr(held.carrier()), carrier.as_ptr()));
+        let unknown = finish.into_unknown();
+        let custody = std::thread::spawn(move || (held, unknown)).join().unwrap();
+        assert!(matches!(
+            custody.0.refusal(),
+            RestoreFinishRefusal::Native {
+                file: Some(0),
+                reason: "settlement_destination_changed",
+                ..
+            }
+        ));
+        assert_eq!(
+            finished_native_facts(custody.0.files().next().unwrap(), input.bytes, true),
+            before
+        );
+        assert_eq!(custody.1.state(), DirectReadFinishState::Unknown);
+        assert!(custody.1.retirement().is_none());
+        assert!(Arc::ptr_eq(custody.1.owned_clock(), &clock));
+        assert!(Arc::ptr_eq(custody.1.journal_root(), &root));
+        assert!(std::ptr::eq(
+            Arc::as_ptr(custody.0.carrier()),
+            carrier.as_ptr()
+        ));
+        assert!(lease.upgrade().is_some());
+        assert!(matches!(
+            ActivityLease::try_acquire(Arc::clone(&root)),
+            Err(ActivityAdmissionError::Busy)
+        ));
+        assert!(
+            PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock)
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(segment.join("tombstone.json")).unwrap(), b"{}");
+        serde_json::json!({"state":"NativeHeld","reason":"settlement_destination_changed",
+            "facts":before,"closed_transfer":true,"runtime":"Unknown",
+            "same_original_carrier":true,"same_runtime_clock_root":true,
+            "held_lease_busy":true,"retirement":false})
+    };
+    println!(
+        "NATIVE_FINISH_RESULT {}",
+        serde_json::json!({"mode":input.mode,"result":result})
+    );
 }

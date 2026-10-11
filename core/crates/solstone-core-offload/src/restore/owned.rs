@@ -83,6 +83,11 @@ pub struct StorePreparationFacts<'a> {
     pub failures: Vec<String>,
 }
 
+pub struct SettlementCleanupFacts<'a> {
+    pub cleanup: Cleanup,
+    pub parent_sync: Option<&'a std::io::Result<()>>,
+}
+
 pub struct NoEffectCleanupFacts<'a> {
     pub cleanup: Cleanup,
     pub parent_sync: Option<&'a std::io::Result<()>>,
@@ -109,6 +114,7 @@ pub struct TransactionFacts<'a> {
     pub ledger: Option<LedgerFacts>,
     pub register: Option<&'a Result<BoundMutationOutcome, RestoreRegisterRefusal>>,
     pub no_effect_cleanup: Option<NoEffectCleanupFacts<'a>>,
+    pub settlement_cleanup: Option<SettlementCleanupFacts<'a>>,
     pub retirement: Option<RetirementFacts<'a>>,
     pub operation_id: Option<&'a str>,
     pub store_exclusion_retained: bool,
@@ -548,3 +554,8 @@ fn execute<'clock>(
 
 #[cfg(all(test, feature = "full-tests", unix))]
 pub(crate) mod tests;
+
+mod finish;
+pub use finish::{
+    HeldRestoreFinish, OwnedRestoreFinishHold, RestoreFinishRefusal, SettledRestoreReport,
+};

@@ -20,6 +20,11 @@ pub(crate) struct DetachedTransaction {
     owner: DetachedOwner,
     record: Option<Record>,
     store_failure: Option<StoreAdmissionFailure>,
+    retirement: Option<retirement::RetirementFacts>,
+    receipts: TransactionReceipts,
+}
+
+struct TransactionReceipts {
     preparation: Option<super::super::PreparationReceipt>,
     publication: Option<PublicationReceipt>,
     #[cfg(unix)]
@@ -34,10 +39,13 @@ pub(crate) struct DetachedTransaction {
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
     register: Option<Result<BoundMutationOutcome, RestoreRegisterRefusal>>,
     no_effect_cleanup: Option<NoEffectCleanup>,
-    retirement: Option<retirement::RetirementFacts>,
+    settlement_cleanup: Option<NoEffectCleanup>,
     effects: AttemptEffects,
     hold: Option<Hold>,
 }
+
+mod settlement;
+pub(crate) use settlement::{SettledTransaction, SettlementFailure};
 
 impl TransactionOutcome<'_, '_> {
     pub(crate) fn into_owned(self) -> DetachedTransaction {
@@ -80,25 +88,28 @@ impl TransactionOutcome<'_, '_> {
             },
             record,
             store_failure,
-            preparation,
-            publication,
-            #[cfg(unix)]
-            marker,
-            #[cfg(unix)]
-            marker_ancestor_sync,
-            ledger,
-            register,
-            no_effect_cleanup,
             retirement,
-            effects,
-            hold,
+            receipts: TransactionReceipts {
+                preparation,
+                publication,
+                #[cfg(unix)]
+                marker,
+                #[cfg(unix)]
+                marker_ancestor_sync,
+                ledger,
+                register,
+                no_effect_cleanup,
+                settlement_cleanup: None,
+                effects,
+                hold,
+            },
         }
     }
 }
 
 impl DetachedTransaction {
     pub(crate) fn completed(&self) -> bool {
-        self.hold.is_none()
+        self.receipts.hold.is_none()
             && self.retirement.as_ref().is_some_and(|facts| facts.retired)
             && self
                 .record
@@ -107,7 +118,7 @@ impl DetachedTransaction {
     }
 
     pub(crate) fn effects(&self) -> AttemptEffects {
-        self.effects
+        self.receipts.effects
     }
 
     pub(crate) fn disposition(&self) -> RestoreDisposition {
@@ -118,6 +129,94 @@ impl DetachedTransaction {
     }
 
     pub(crate) fn facts(&self) -> TransactionFacts<'_> {
+        let retirement = self.retirement.as_ref().map(|facts| RetirementFacts {
+            removal: match &facts.native {
+                retirement::NativeRetirement::Removal(removal) => Some(removal.receipt()),
+                _ => None,
+            },
+            retained_stage: match &facts.native {
+                retirement::NativeRetirement::StageFailure(error) => error.owned.is_some(),
+                retirement::NativeRetirement::Unconsumed(_) => true,
+                retirement::NativeRetirement::Removal(removal) => {
+                    removal.receipt().cleanup != solstone_core_journal_io::media::Cleanup::Complete
+                }
+                retirement::NativeRetirement::None => false,
+            },
+            ancestors: facts.ancestors,
+            failures: facts
+                .failures
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect(),
+            retired: facts.retired,
+        });
+        let preparation = self
+            .receipts
+            .preparation
+            .as_ref()
+            .or_else(|| {
+                self.record
+                    .as_ref()
+                    .and_then(|record| record.store.as_ref())
+                    .map(|store| &store.preparation)
+            })
+            .or_else(|| {
+                self.store_failure
+                    .as_ref()
+                    .map(|failure| &failure.owner.preparation)
+            })
+            .map(|facts| StorePreparationFacts {
+                attempted: &facts.attempted,
+                durability: facts.durability,
+                confirmed: facts.confirmed,
+                failures: facts
+                    .failures
+                    .iter()
+                    .map(|error| format!("{error:?}"))
+                    .collect(),
+            });
+        self.receipts.facts(
+            self.record
+                .as_ref()
+                .map(|record| (&record.intent, record.writes.as_slice())),
+            retirement,
+            self.record
+                .as_ref()
+                .is_some_and(|record| record.store.is_some())
+                || self.store_failure.is_some(),
+            self.owner.media.is_some(),
+            preparation,
+            self.store_failure
+                .as_ref()
+                .map_or_else(Vec::new, |failure| {
+                    let mut failures = vec![format!("{:?}", failure.problem)];
+                    failures.extend(
+                        failure
+                            .owner
+                            .preparation
+                            .failures
+                            .iter()
+                            .map(|error| format!("{error:?}")),
+                    );
+                    failures
+                }),
+            self.completed(),
+        )
+    }
+}
+
+impl TransactionReceipts {
+    #[allow(clippy::too_many_arguments)]
+    fn facts<'a>(
+        &'a self,
+        record: Option<(&'a RestoreIntent, &'a [StoreWriteReceipt])>,
+        retirement: Option<RetirementFacts<'a>>,
+        store_exclusion_retained: bool,
+        retained_media: bool,
+        preparation: Option<StorePreparationFacts<'a>>,
+        preparation_failures: Vec<String>,
+        completed: bool,
+    ) -> TransactionFacts<'a> {
         let ledger = self.ledger.as_ref().map(|result| match result {
             Ok(receipt) => LedgerFacts {
                 effect: Some(match receipt.effect() {
@@ -144,56 +243,10 @@ impl DetachedTransaction {
                 failures: vec![format!("{error:?}")],
             },
         });
-        let retirement = self.retirement.as_ref().map(|facts| RetirementFacts {
-            removal: match &facts.native {
-                retirement::NativeRetirement::Removal(removal) => Some(removal.receipt()),
-                _ => None,
-            },
-            retained_stage: match &facts.native {
-                retirement::NativeRetirement::StageFailure(error) => error.owned.is_some(),
-                retirement::NativeRetirement::Unconsumed(_) => true,
-                retirement::NativeRetirement::Removal(removal) => {
-                    removal.receipt().cleanup != solstone_core_journal_io::media::Cleanup::Complete
-                }
-                retirement::NativeRetirement::None => false,
-            },
-            ancestors: facts.ancestors,
-            failures: facts
-                .failures
-                .iter()
-                .map(|error| format!("{error:?}"))
-                .collect(),
-            retired: facts.retired,
-        });
-        let preparation = self
-            .preparation
-            .as_ref()
-            .or_else(|| {
-                self.record
-                    .as_ref()
-                    .and_then(|record| record.store.as_ref())
-                    .map(|store| &store.preparation)
-            })
-            .or_else(|| {
-                self.store_failure
-                    .as_ref()
-                    .map(|failure| &failure.owner.preparation)
-            })
-            .map(|facts| StorePreparationFacts {
-                attempted: &facts.attempted,
-                durability: facts.durability,
-                confirmed: facts.confirmed,
-                failures: facts
-                    .failures
-                    .iter()
-                    .map(|error| format!("{error:?}"))
-                    .collect(),
-            });
         TransactionFacts {
             publication: self.publication.as_ref(),
-            intent_writes: self.record.as_ref().map_or_else(Vec::new, |record| {
-                record
-                    .writes
+            intent_writes: record.map_or_else(Vec::new, |(_, writes)| {
+                writes
                     .iter()
                     .map(|write| IntentWriteFacts {
                         #[cfg(unix)]
@@ -230,37 +283,22 @@ impl DetachedTransaction {
                     cleanup: facts.cleanup,
                     parent_sync: facts.parent_sync.as_ref(),
                 }),
+            settlement_cleanup: self.settlement_cleanup.as_ref().map(|facts| {
+                crate::restore::owned::SettlementCleanupFacts {
+                    cleanup: facts.cleanup,
+                    parent_sync: facts.parent_sync.as_ref(),
+                }
+            }),
             retirement,
-            operation_id: self
-                .record
-                .as_ref()
-                .map(|record| record.intent.event.operation_id.as_str()),
-            store_exclusion_retained: self
-                .record
-                .as_ref()
-                .is_some_and(|record| record.store.is_some())
-                || self.store_failure.is_some(),
-            retained_media: self.owner.media.is_some(),
+            operation_id: record.map(|(intent, _)| intent.event.operation_id.as_str()),
+            store_exclusion_retained,
+            retained_media,
             hold: self.hold.as_ref().map(|hold| format!("{hold:?}")),
             preparation,
-            preparation_failures: self
-                .store_failure
-                .as_ref()
-                .map_or_else(Vec::new, |failure| {
-                    let mut failures = vec![format!("{:?}", failure.problem)];
-                    failures.extend(
-                        failure
-                            .owner
-                            .preparation
-                            .failures
-                            .iter()
-                            .map(|error| format!("{error:?}")),
-                    );
-                    failures
-                }),
+            preparation_failures,
             // Borrowing these owners is unnecessary for a diagnostic view; they
             // remain in this value even after confirmed local retirement.
-            completed: self.completed(),
+            completed,
         }
     }
 }
