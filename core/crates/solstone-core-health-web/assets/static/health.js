@@ -23,6 +23,8 @@
     "HEALTH_GLANCE_DEVICES_SILENT": "{n} devices haven't added to your journal recently: {devices}.",
     "HEALTH_GLANCE_DEVICES_UNAVAILABLE": "your devices' delivery status is unavailable right now.",
     "HEALTH_GLANCE_DEVICES_UNKNOWN": "delivery from some of your devices isn't known right now.",
+    "HEALTH_GLANCE_WORK_HELD": "some queued work is on hold for a safety check.",
+    "HEALTH_GLANCE_WORK_UNAVAILABLE": "queued work status is unavailable right now.",
     "HEALTH_GLANCE_OK": "everything's working. the solstone app last added to your journal {age}.",
     "HEALTH_GLANCE_BRAIN_ATTENTION": "{headline}",
     "HEALTH_GLANCE_CHECKIN_STALE": "a journal run on {name} stopped checking in with your journal.",
@@ -76,6 +78,8 @@
   let connectError = false;
 
   const state = {
+    heldWorkSnapshot: null,
+    heldWorkCurrent: false,
     supervisorSeen: false,
     supervisorStatusAt: null,
     cortexStatusAt: null,
@@ -804,6 +808,82 @@
     return null;
   }
 
+  // Only the complete status snapshot joins a hold to queued intended work.
+  // The one-off held event does not establish that consequence.
+  function queuedWorkHolds(snapshot) {
+    if (!snapshot) return [];
+    const queues = Object.entries(snapshot.queues).filter(([, count]) => count > 0);
+    const holds = snapshot.held.filter(hold => snapshot.queues[hold.partition] > 0)
+      .map(hold => ({ key: 'partition:' + hold.partition, partition: hold.partition,
+        count: snapshot.queues[hold.partition], evidence: hold }));
+    if (snapshot.queueHold && queues.length) {
+      holds.unshift({ key: 'queue', partition: null,
+        count: queues.reduce((sum, [, count]) => sum + count, 0),
+        evidence: { ...snapshot.queueHold, queues: Object.fromEntries(queues) } });
+    }
+    return holds;
+  }
+
+  function heldWorkVerdict() {
+    const action = { href: '#processingHolds', label: 'view queued work' };
+    if (!state.heldWorkCurrent) {
+      return { key: 'HEALTH_GLANCE_WORK_UNAVAILABLE', vars: {}, action };
+    }
+    return queuedWorkHolds(state.heldWorkSnapshot).length
+      ? { key: 'HEALTH_GLANCE_WORK_HELD', vars: {}, action } : null;
+  }
+
+  let heldWorkDeepLinkScrolled = false;
+
+  function renderHeldWork() {
+    const section = document.getElementById('processingHolds');
+    if (!section) return;
+    const holds = queuedWorkHolds(state.heldWorkSnapshot);
+    section.hidden = state.heldWorkCurrent && holds.length === 0;
+    section.dataset.current = String(state.heldWorkCurrent);
+    const notice = section.querySelector('[data-held-work-notice]');
+    notice.textContent = state.heldWorkCurrent ? '' : state.heldWorkSnapshot
+      ? 'queued work status is unavailable. last known status, checked '
+        + new Date(state.heldWorkSnapshot.observedAt).toLocaleString() + '.'
+      : 'queued work status is unavailable.';
+    notice.hidden = state.heldWorkCurrent;
+    const rows = section.querySelector('[data-held-work-rows]');
+    const keys = new Set(holds.map(hold => hold.key));
+    for (const row of Array.from(rows.children)) {
+      if (!keys.has(row.dataset.key)) rows.removeChild(row);
+    }
+    for (const hold of holds) {
+      let row = Array.from(rows.children).find(row => row.dataset.key === hold.key);
+      if (!row) {
+        row = document.createElement('div');
+        row.className = 'held-work-row';
+        row.dataset.key = hold.key;
+        const line = document.createElement('p');
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = 'technical details';
+        details.append(summary, document.createElement('pre'));
+        row.append(line, details);
+        rows.appendChild(row);
+      }
+      const names = { daily: 'daily processing', activity: 'activity processing',
+        segment: 'segment processing', flush: 'finishing activities', weekly: 'weekly reflection',
+        indexer: 'search updates' };
+      const scope = hold.partition
+        ? names[hold.partition] || scheduleName(hold.partition) || 'queued processing'
+        : 'all queued work';
+      row.querySelector('p').textContent = scope + ': ' + hold.count
+        + (hold.count === 1 ? ' task' : ' tasks')
+        + (state.heldWorkCurrent ? ' on hold for a safety check.' : ' on hold at the last check.');
+      row.querySelector('pre').textContent = JSON.stringify(hold.evidence, null, 2);
+    }
+    section.querySelector('[data-held-work-support]').hidden = holds.length === 0;
+    if (!section.hidden && !heldWorkDeepLinkScrolled && window.location.hash === '#processingHolds') {
+      heldWorkDeepLinkScrolled = true;
+      requestAnimationFrame(() => section.scrollIntoView({ block: 'start' }));
+    }
+  }
+
 	  function selectGlanceSentence(state, now) {
     const activeAgents = Array.from(state.agents.values()).filter(agent => agent.event !== 'finish' && agent.event !== 'error').length;
     const activeImports = Array.from(state.imports.values()).filter(imp => imp.event !== 'completed' && imp.event !== 'error').length;
@@ -847,6 +927,10 @@
     const deviceUnassessed = deviceVerdict && ['HEALTH_GLANCE_DEVICES_UNAVAILABLE', 'HEALTH_GLANCE_DEVICES_UNKNOWN', 'HEALTH_GLANCE_CHECKING'].includes(deviceVerdict.key);
     if (deviceVerdict && !deviceUnassessed) return deviceVerdict;
 
+    const workVerdict = heldWorkVerdict();
+    if (workVerdict?.key === 'HEALTH_GLANCE_WORK_HELD'
+        && state.searchIndex?.state !== 'failing') return workVerdict;
+
     const clients = Array.from(state.clients.values());
     if (!deviceUnassessed && clients.length > 0 && clients.every(client => (now - client.lastSeen) >= STALE_MS)) {
       const ageMs = Math.min(...clients.map(client => now - client.lastSeen));
@@ -865,6 +949,7 @@
     }
 
     if (deviceVerdict) return deviceVerdict;
+    if (workVerdict) return workVerdict;
 
 	    if (activeAgents > 0 || activeImports > 0) {
       const catchingUp = activeAgents + activeImports;
@@ -910,6 +995,8 @@
     'HEALTH_GLANCE_DEVICE_FAILING',
     'HEALTH_GLANCE_DEVICES_FAILING',
     'HEALTH_GLANCE_DEVICES_UNAVAILABLE',
+    'HEALTH_GLANCE_WORK_HELD',
+    'HEALTH_GLANCE_WORK_UNAVAILABLE',
   ]);
 
   // Anything the verdict calls out has to be somewhere the owner can go.
@@ -932,6 +1019,7 @@
   }
 
   function updateStatusSummary() {
+    renderHeldWork();
     const now = Date.now();
     const selection = selectGlanceSentence(state, now);
     renderGlanceVerdict(selection);
@@ -2949,6 +3037,11 @@
     if (msg.event === 'status') {
       state.supervisorSeen = true;
       state.supervisorStatusAt = Date.now();
+      state.heldWorkSnapshot = {
+        queues: msg.queues || {}, held: msg.held || [], queueHold: msg.queue_hold || null,
+        observedAt: state.supervisorStatusAt,
+      };
+      state.heldWorkCurrent = true;
       if (!state.connected) {
         state.connected = true;
         connectError = false;
@@ -3339,6 +3432,7 @@
 	  let healthInitialized = false;
 
   function invalidateRealtime() {
+    state.heldWorkCurrent = false;
     state.connected = false;
     state.supervisorSeen = false;
     state.cortexSeen = false;
