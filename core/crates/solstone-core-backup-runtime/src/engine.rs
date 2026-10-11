@@ -1568,6 +1568,7 @@ pub enum ArchiveError {
     InvalidSelection,
     SourceUnavailable,
     SnapshotIdentityInvalid,
+    Readback(ReadbackError),
 }
 
 impl fmt::Display for ArchiveError {
@@ -1591,6 +1592,7 @@ impl fmt::Display for ArchiveError {
             }
             Self::SourceUnavailable => "the prepared archive files could not be confirmed",
             Self::SnapshotIdentityInvalid => "the archive did not return a full snapshot identity",
+            Self::Readback(error) => return error.fmt(formatter),
         };
         formatter.write_str(reason)
     }
@@ -1738,9 +1740,14 @@ pub struct ArchiveAdmissionFailure<'a> {
 struct ArchiveAdmissionFailureInner<'a> {
     error: ArchiveError,
     effects: ArchiveAdmissionEffects,
-    root: Arc<JournalRoot>,
-    operation: Option<PreparedArchiveOperation<'a>>,
-    preparation: Option<ArchiveOperationPreparationFailure<'a>>,
+    owned: ArchiveAdmissionFailureOwner<'a>,
+}
+
+enum ArchiveAdmissionFailureOwner<'a> {
+    BeforePreparation(Arc<JournalRoot>),
+    Prepared(Box<PreparedArchiveOperation<'a>>),
+    Preparation(ArchiveOperationPreparationFailure<'a>),
+    Readback(Box<ReadbackAdmissionError<'a>>),
 }
 impl fmt::Debug for ArchiveAdmissionFailure<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1764,22 +1771,32 @@ impl ArchiveAdmissionFailure<'_> {
         &self.inner.effects
     }
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
-        &self.inner.root
+        match &self.inner.owned {
+            ArchiveAdmissionFailureOwner::BeforePreparation(root) => root,
+            ArchiveAdmissionFailureOwner::Prepared(operation) => operation.journal_root(),
+            ArchiveAdmissionFailureOwner::Preparation(preparation) => preparation.journal_root(),
+            ArchiveAdmissionFailureOwner::Readback(readback) => readback.journal_root(),
+        }
     }
     pub fn carrier(&self) -> Option<&Arc<solstone_core_journal_io::media::RootActivityCarrier>> {
-        self.inner
-            .operation
-            .as_ref()
-            .map(PreparedArchiveOperation::carrier)
-            .or_else(|| {
-                self.inner
-                    .preparation
-                    .as_ref()
-                    .and_then(ArchiveOperationPreparationFailure::carrier)
-            })
+        match &self.inner.owned {
+            ArchiveAdmissionFailureOwner::BeforePreparation(_) => None,
+            ArchiveAdmissionFailureOwner::Prepared(operation) => Some(operation.carrier()),
+            ArchiveAdmissionFailureOwner::Preparation(preparation) => preparation.carrier(),
+            ArchiveAdmissionFailureOwner::Readback(readback) => Some(readback.carrier()),
+        }
     }
     pub fn preparation(&self) -> Option<&ArchiveOperationPreparationFailure<'_>> {
-        self.inner.preparation.as_ref()
+        match &self.inner.owned {
+            ArchiveAdmissionFailureOwner::Preparation(preparation) => Some(preparation),
+            _ => None,
+        }
+    }
+    pub fn readback(&self) -> Option<&ReadbackAdmissionError<'_>> {
+        match &self.inner.owned {
+            ArchiveAdmissionFailureOwner::Readback(readback) => Some(readback),
+            _ => None,
+        }
     }
 }
 
@@ -1795,9 +1812,7 @@ pub fn admit_archive<'a>(
                 inner: Box::new(ArchiveAdmissionFailureInner {
                     error: error.into(),
                     effects: ArchiveAdmissionEffects::default(),
-                    root,
-                    operation: None,
-                    preparation: None,
+                    owned: ArchiveAdmissionFailureOwner::BeforePreparation(root),
                 }),
             });
         }
@@ -1819,9 +1834,7 @@ pub fn admit_archive_with_budget<'a>(
                     inner: Box::new(ArchiveAdmissionFailureInner {
                         error: preparation.reason().into(),
                         effects: ArchiveAdmissionEffects::default(),
-                        root,
-                        operation: None,
-                        preparation: Some(preparation),
+                        owned: ArchiveAdmissionFailureOwner::Preparation(preparation),
                     }),
                 });
             }
@@ -1834,7 +1847,6 @@ pub fn admit_prepared_archive<'a>(
     mut operation: PreparedArchiveOperation<'a>,
     services: &BackupServices<'a>,
 ) -> Result<AdmittedArchive<'a>, ArchiveAdmissionFailure<'a>> {
-    let root = Arc::clone(operation.journal_root());
     let mut effects = ArchiveAdmissionEffects::default();
     let admission = (|| {
         operation.revalidate()?;
@@ -1911,9 +1923,7 @@ pub fn admit_prepared_archive<'a>(
                 inner: Box::new(ArchiveAdmissionFailureInner {
                     error,
                     effects,
-                    root,
-                    operation: Some(operation),
-                    preparation: None,
+                    owned: ArchiveAdmissionFailureOwner::Prepared(Box::new(operation)),
                 }),
             });
         }
@@ -1945,12 +1955,89 @@ pub fn admit_prepared_archive<'a>(
             inner: Box::new(ArchiveAdmissionFailureInner {
                 error,
                 effects,
-                root,
-                operation: Some(admitted.operation),
-                preparation: None,
+                owned: ArchiveAdmissionFailureOwner::Prepared(Box::new(admitted.operation)),
             }),
         }),
     }
+}
+
+/// Admit the original operation directly for an existing repository identity.
+pub fn admit_prepared_archive_read<'a>(
+    mut operation: PreparedArchiveOperation<'a>,
+    expected_repository_id: String,
+    services: &BackupServices<'a>,
+) -> Result<ReadOperation<'a>, ArchiveAdmissionFailure<'a>> {
+    let mut effects = ArchiveAdmissionEffects::default();
+    let admission = (|| {
+        if !full_archive_id(&expected_repository_id) {
+            return Err(ArchiveError::RepositoryIdentityInvalid);
+        }
+        operation.revalidate()?;
+        let config = operation.configuration();
+        if !config.enabled() {
+            return Err(ArchiveError::NotConfigured);
+        }
+        let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
+        let restic_path = services
+            .restic_path
+            .ok_or(ArchiveError::ToolUnavailable)?
+            .to_path_buf();
+        let destination = if let Some(binding) = config.binding() {
+            let http = ArchiveAdmissionHttp {
+                inner: services.http,
+                operation: &operation,
+            };
+            effects.broker_requested = true;
+            let credentials =
+                fetch_hosted_credentials(&http, binding, "operated", services.version);
+            operation.revalidate()?;
+            let credentials =
+                credentials.map_err(|error| ArchiveError::CredentialsUnavailable {
+                    reason: error.reason_code,
+                })?;
+            let expiry = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
+                .map_err(|_| ArchiveError::InvalidCredentialExpiry)?
+                .timestamp();
+            let session = hosted_session(binding, &credentials)
+                .map_err(|_| ArchiveError::ConfigurationUnavailable)?;
+            operation.cap_credential_expiry(expiry);
+            operation.revalidate()?;
+            session.destination
+        } else {
+            if config.mode() != Some("byo") {
+                return Err(ArchiveError::NotConfigured);
+            }
+            config.destination().ok_or(ArchiveError::NotConfigured)?
+        };
+        Ok((restic_path, destination, keys.daily_key))
+    })();
+    let (restic_path, destination, password) = match admission {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            return Err(ArchiveAdmissionFailure {
+                inner: Box::new(ArchiveAdmissionFailureInner {
+                    error,
+                    effects,
+                    owned: ArchiveAdmissionFailureOwner::Prepared(Box::new(operation)),
+                }),
+            });
+        }
+    };
+    let input = ReadAdmission::bind(
+        operation,
+        destination,
+        password,
+        expected_repository_id,
+        restic_path,
+    );
+    effects.read_repository_requested = true;
+    ReadOperation::admit(input).map_err(|readback| ArchiveAdmissionFailure {
+        inner: Box::new(ArchiveAdmissionFailureInner {
+            error: ArchiveError::Readback(readback.reason()),
+            effects,
+            owned: ArchiveAdmissionFailureOwner::Readback(Box::new(readback)),
+        }),
+    })
 }
 
 impl<'a> AdmittedArchive<'a> {

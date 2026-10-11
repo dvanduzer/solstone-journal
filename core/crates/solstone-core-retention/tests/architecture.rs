@@ -40,6 +40,7 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../src/archive_approval.rs"),
     ),
     ("archive_catalog", include_str!("../src/archive_catalog.rs")),
+    ("archive_offer", include_str!("../src/archive_offer.rs")),
     ("archive_proof", include_str!("../src/archive_proof.rs")),
     ("class", include_str!("../src/class.rs")),
     ("content", include_str!("../src/content.rs")),
