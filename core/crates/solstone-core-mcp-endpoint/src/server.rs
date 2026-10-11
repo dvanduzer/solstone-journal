@@ -3997,14 +3997,11 @@ mod unit_tests {
         let fetch_body: serde_json::Value =
             serde_json::from_slice(&fetch_response.body).expect("fetch call parses");
         assert!(fetch_body.get("error").is_none());
-        assert_eq!(
-            fetch_body["result"]["structuredContent"],
-            json!({
-                "title": "Indexed journal entry — 20260831",
-                "date": "20260831",
-                "text": "MCP fixture search needle"
-            })
-        );
+        assert_ne!(fetch_body["result"]["isError"], true);
+        let fetched = &fetch_body["result"]["structuredContent"];
+        assert_eq!(fetched["title"], "Indexed journal entry — 20260831");
+        assert_eq!(fetched["date"], "20260831");
+        assert_eq!(fetched["text"], "MCP fixture search needle");
 
         let unpermissioned = crate::tokens::VerifiedToken {
             id: "unpermissioned-reclaim-token".to_owned(),

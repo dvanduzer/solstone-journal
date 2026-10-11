@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+#[cfg(all(test, feature = "full-tests"))]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "synthetic journals own all fixture bytes"
+    )]
+
+    use std::fs;
+    use std::path::Path;
+
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use chrono::{TimeZone, Utc};
+    use serde_json::{Value, json};
+    use solstone_core_journal_io::JournalRoot;
+    use solstone_core_retention::archive_proof::{
+        AcceptedProcessingObservation, ArchiveFileProof, OffloadOffer, OffloadProof,
+    };
+    use solstone_core_retention::marks::{
+        Failure, Mark, MarkId, MarkState, Proposal, Register, RemovalClass,
+    };
+    use solstone_core_retention::receipt::Target;
+    use solstone_core_retention::review_context::ReviewContext;
+    use tower::ServiceExt;
+
+    fn journal() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        fs::write(root.path().join("config/journal.json"), br#"{"setup":{"completed_at":1700000000000},"retention":{"raw_media":"days","raw_media_days":1}}"#).unwrap();
+        fs::create_dir(root.path().join("chronicle")).unwrap();
+        fs::write(root.path().join("chronicle/raw.flac"), b"original bytes").unwrap();
+        root
+    }
+
+    fn mark(root: &Path, name: &str, bound: bool) -> Mark {
+        let class = if bound {
+            RemovalClass::OffloadRawRelease
+        } else {
+            RemovalClass::PolicyRawRelease
+        };
+        let target = Target {
+            day: "20261009".into(),
+            stream: "camera".into(),
+            dir: "120000_60_suffix".into(),
+        };
+        let proposal = Proposal {
+            bytes: 9_007_199_254_740_993,
+            reason: "archive".into(),
+            names: vec![name.into()],
+        };
+        let offload = bound.then(|| {
+            OffloadOffer::new(OffloadProof {
+                journal_id: JournalRoot::open(root).unwrap().identity().observation_id(),
+                manifest_id: "manifest".into(),
+                target: target.clone(),
+                layout: solstone_core_journal_io::paths::SegmentLayout::Named,
+                repository_id: "a".repeat(64),
+                snapshot_id: "b".repeat(64),
+                files: vec![ArchiveFileProof {
+                    witness_id: "witness".into(),
+                    name: name.into(),
+                    bytes: proposal.bytes,
+                    sha256: "c".repeat(64),
+                    archive_path: format!("/stage/{name}"),
+                    processing: AcceptedProcessingObservation {
+                        record: Some(json!({
+                            "schema": "solstone.processing.v1", "handler": "transcribe",
+                            "state": "analyzed", "input_size": proposal.bytes,
+                            "reason_code": "ok", "attempted_at": "2026-10-09T00:00:00Z",
+                            "large": 9_007_199_254_740_993_u64,
+                        })),
+                        has_analysis_row: true,
+                    },
+                }],
+            })
+            .unwrap()
+        });
+        Mark {
+            id: MarkId::derive(class, &target, &proposal.names),
+            class,
+            target,
+            proposal,
+            offload,
+            marked_at: "2026-10-10T00:00:00Z".into(),
+            state: MarkState::Marked,
+        }
+    }
+
+    fn save(root: &Path, marks: &[Mark]) -> Vec<u8> {
+        let mut register = Register::empty();
+        if marks.iter().any(|mark| mark.offload.is_some()) {
+            register.version = 2;
+        }
+        register.marks = marks
+            .iter()
+            .map(|mark| (mark.id.clone(), mark.clone()))
+            .collect();
+        let bytes = serde_json::to_vec(&register).unwrap();
+        fs::create_dir_all(root.join("health")).unwrap();
+        fs::write(root.join("health/retention-marks.json"), &bytes).unwrap();
+        bytes
+    }
+
+    async fn call(root: &Path, method: &str, endpoint: &str, body: String) -> (StatusCode, Value) {
+        let router = solstone_core_home_web::routes(
+            root.to_path_buf(),
+            solstone_core_home_web::Clock::fixed(
+                Utc.with_ymd_and_hms(2026, 10, 10, 12, 0, 0).unwrap(),
+            ),
+            |_| false,
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(endpoint)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn list(root: &Path) -> Value {
+        call(root, "GET", "/app/home/api/removals", String::new())
+            .await
+            .1
+    }
+
+    #[tokio::test]
+    async fn current_review_carries_full_marks_and_same_root_restart_preserves_context() {
+        let root = journal();
+        let first = mark(root.path(), "first.flac", false);
+        let second = mark(root.path(), "second.flac", true);
+        let mut failed = mark(root.path(), "failed.flac", false);
+        failed.state = MarkState::Failed(Failure {
+            at: "now".into(),
+            reason: "unfinished".into(),
+            staged: None,
+        });
+        let before = save(root.path(), &[first.clone(), second.clone(), failed]);
+        let response = list(root.path()).await;
+        assert_eq!(response["state"], "list.ready");
+        let context = response["review_context"].as_str().unwrap();
+        let decoded: ReviewContext = serde_json::from_str(context).unwrap();
+        assert_eq!(decoded.marks().len(), 3);
+        assert!(decoded.marks().contains(&first));
+        assert!(decoded.marks().contains(&second));
+        assert!(context.contains("9007199254740993"));
+        assert_eq!(response["removals"].as_array().unwrap().len(), 3);
+        assert_eq!(list(root.path()).await["review_context"], context);
+        assert_eq!(
+            fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn copied_policy_context_changes_and_copied_bound_offer_refuses() {
+        let original = journal();
+        let copied = journal();
+        let policy = mark(original.path(), "policy.flac", false);
+        let bytes = save(original.path(), &[policy]);
+        fs::create_dir(copied.path().join("health")).unwrap();
+        fs::write(copied.path().join("health/retention-marks.json"), &bytes).unwrap();
+        assert_ne!(
+            list(original.path()).await["review_context"],
+            list(copied.path()).await["review_context"]
+        );
+        let bound = mark(original.path(), "bound.flac", true);
+        let bytes = save(original.path(), &[bound]);
+        fs::write(copied.path().join("health/retention-marks.json"), &bytes).unwrap();
+        let response = list(copied.path()).await;
+        assert_eq!(response["state"], "list.register_unavailable");
+        assert!(response["review_context"].is_null());
+        assert_eq!(
+            fs::read(copied.path().join("health/retention-marks.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_invalid_and_oversized_lists_remain_distinct() {
+        let root = journal();
+        let empty = list(root.path()).await;
+        assert_eq!(empty["state"], "list.empty");
+        assert!(empty["review_context"].is_string());
+        fs::create_dir(root.path().join("health")).unwrap();
+        for bytes in [
+            b"{".as_slice(),
+            br#"{"version":3,"marks":{}}"#,
+            br#"{"version":2,"marks":{},"extra":true}"#,
+        ] {
+            fs::write(root.path().join("health/retention-marks.json"), bytes).unwrap();
+            let unavailable = list(root.path()).await;
+            assert_eq!(unavailable["state"], "list.register_unavailable");
+            assert!(unavailable["review_context"].is_null());
+        }
+        let mut large = mark(root.path(), "large.flac", false);
+        large.proposal.reason = "x".repeat(512 * 1024);
+        let before = save(root.path(), &[large]);
+        let response = list(root.path()).await;
+        assert_eq!(response["state"], "list.review_too_large");
+        assert!(response["review_context"].is_null());
+        assert_eq!(
+            fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn actions_refuse_valid_context_and_legacy_ids_without_any_file_effects() {
+        let root = journal();
+        let row = mark(root.path(), "a.flac", false);
+        let before = save(root.path(), std::slice::from_ref(&row));
+        let config = fs::read(root.path().join("config/journal.json")).unwrap();
+        let context = list(root.path()).await["review_context"].clone();
+        for (endpoint, state) in [
+            ("/app/home/api/approve", "approve.refused_before_start"),
+            ("/app/home/api/decline", "declined.refused"),
+        ] {
+            let (status, response) = call(
+                root.path(),
+                "POST",
+                endpoint,
+                json!({"review_context": context, "mark_ids": [row.id]}).to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response["state"], state);
+            assert_eq!(response["requested_count"], 1);
+            assert_eq!(
+                response
+                    .get("removed_count")
+                    .or_else(|| response.get("declined_count")),
+                Some(&json!(0))
+            );
+            let (status, response) = call(
+                root.path(),
+                "POST",
+                endpoint,
+                json!({"mark_ids": [row.id]}).to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(response["state"], "request.invalid");
+        }
+        assert_eq!(
+            fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(root.path().join("config/journal.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read(root.path().join("chronicle/raw.flac")).unwrap(),
+            b"original bytes"
+        );
+        assert!(
+            !root
+                .path()
+                .join("health/retention-marks.json.lock")
+                .exists()
+        );
+        assert!(!root.path().join("config/actions").exists());
+    }
+
+    #[tokio::test]
+    async fn context_and_extractor_size_limits_return_specific_refusal_without_effects() {
+        let root = journal();
+        let row = mark(root.path(), "a.flac", false);
+        let before = save(root.path(), std::slice::from_ref(&row));
+        for context_bytes in [512 * 1024 + 1, 2 * 1024 * 1024 + 1] {
+            for endpoint in ["/app/home/api/approve", "/app/home/api/decline"] {
+                let (status, response) = call(
+                    root.path(),
+                    "POST",
+                    endpoint,
+                    json!({"review_context": "x".repeat(context_bytes), "mark_ids": [row.id]})
+                        .to_string(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(response["state"], "request.too_large");
+            }
+        }
+        assert_eq!(
+            fs::read(root.path().join("health/retention-marks.json")).unwrap(),
+            before
+        );
+        assert!(!root.path().join("config/actions").exists());
+    }
+}

@@ -14,6 +14,7 @@
 //! }
 //! ```
 
+mod bound_commit;
 mod commit;
 mod config;
 mod direct_port;
@@ -23,6 +24,10 @@ mod thinking_migration;
 #[cfg(test)]
 mod test_support;
 
+pub use bound_commit::{
+    BoundConfigConfirmationRefusal, BoundConfigOutcome, BoundConfigPublication, BoundConfigRefusal,
+    MAX_BOUND_CONFIG_BYTES, conditional_update_journal_config_at_root,
+};
 pub use commit::{
     CommitConfigError, ConfigConflict, ConfigExpectation, ConfigFingerprint, commit_journal_config,
 };

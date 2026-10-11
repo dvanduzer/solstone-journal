@@ -198,13 +198,11 @@ pub(crate) fn cancel(
     require_capability(lease, capability)?;
     let stage = lease.stage;
     let generation = lease.baseline_generation;
-    #[cfg(windows)]
-    if operation::worker_or_cleanup_active(operations, generation) {
-        return Err(operation::busy_response());
-    }
     if stage != RestorePrepareStage::Prepared {
         require_live_generation(lease, operations)?;
-        operation::mark_cancelled(operations, generation);
+        if !operation::mark_cancelled(operations, generation) {
+            return Err(operation::busy_response());
+        }
     }
     *guard = None;
     Ok(())
@@ -329,5 +327,49 @@ mod tests {
     #[test]
     fn consent_window_stays_under_the_worker_handoff_row_ttl() {
         assert!(RESTORE_PREPARE_CONSENT_WINDOW < Duration::from_secs(5 * 60));
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn active_worker_cancellation_refuses_without_losing_the_prepare_lease() {
+        let shared = new_shared();
+        let operations = operation::new_slot();
+        let generation = operation::begin(
+            &operations,
+            "restore_hosted",
+            Some("portal".into()),
+            Some("nonce".into()),
+            Some("key".into()),
+        )
+        .unwrap()
+        .generation;
+        *shared.lock().unwrap() = Some(RestorePrepareLease {
+            token: "capability".into(),
+            issued_at: Instant::now(),
+            baseline_generation: generation,
+            stage: RestorePrepareStage::Activated,
+        });
+        assert!(operation::start_worker(&operations, generation));
+        let refusal = cancel(&shared, &operations, "capability").unwrap_err();
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        assert!(shared.lock().unwrap().is_some());
+        assert!(operations.lock().unwrap().as_ref().unwrap().worker_active);
+        assert_eq!(operation::current(&operations).unwrap().phase, "restoring");
+
+        #[cfg(windows)]
+        operation::finish_worker(
+            &operations,
+            generation,
+            operation::Terminal::done(),
+            Vec::new(),
+        );
+        #[cfg(not(windows))]
+        operation::finish_worker(&operations, generation, operation::Terminal::done());
+        reconcile(&shared, &operations);
+        assert!(shared.lock().unwrap().is_none());
     }
 }

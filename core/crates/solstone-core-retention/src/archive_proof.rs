@@ -110,48 +110,8 @@ fn plain_component(value: &str) -> bool {
             .any(|c| c.is_control() || c == '/' || c == '\\')
 }
 
-pub fn full_hex_identity(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn exact_archive_path(value: &str) -> bool {
-    let Some(path) = value.strip_prefix('/') else {
-        return false;
-    };
-    let mut components = path.split('/');
-    let Some(first) = components.next() else {
-        return false;
-    };
-    if snapshot_volume(first) {
-        // The virtual volume is a directory, never the selected file itself.
-        let Some(next) = components.next() else {
-            return false;
-        };
-        plain_component(next) && components.all(plain_component)
-    } else {
-        plain_component(first) && components.all(plain_component)
-    }
-}
-
-fn snapshot_volume(value: &str) -> bool {
-    let Some(guid) = value
-        .strip_prefix(r"\\?\Volume{")
-        .and_then(|guid| guid.strip_suffix('}'))
-    else {
-        return false;
-    };
-    guid.len() == 36
-        && guid.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
+use solstone_core_backup::archive_readback::exact_archive_path;
+pub use solstone_core_backup::archive_readback::full_hex_identity;
 
 impl OffloadProof {
     pub fn validate(&self) -> Result<(), ProofError> {

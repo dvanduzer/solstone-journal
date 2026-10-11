@@ -2,13 +2,16 @@
 // Copyright (c) 2026 sol pbc
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use solstone_core_journal_config::read_journal_config;
 use solstone_core_journal_config_write::{
-    CommitConfigError, ConfigExpectation, ConfigMutationError, JournalConfigMutation, LockOptions,
-    commit_journal_config, mutate_journal_config,
+    BoundConfigOutcome, BoundConfigRefusal, CommitConfigError, ConfigExpectation,
+    ConfigMutationError, JournalConfigMutation, LockOptions, commit_journal_config,
+    conditional_update_journal_config_at_root, mutate_journal_config,
 };
+use solstone_core_journal_io::JournalRoot;
 
 use crate::{
     BackupError, BackupKeys, Destination, HostedBinding, OFFLOAD_STATUSES, RESTORE_SCOPES,
@@ -207,6 +210,28 @@ pub fn clear_backup_config_if_unchanged(
             ConfigMutationError::Write(error),
         )),
     }
+}
+
+/// Clear only the originally admitted backup settings beneath the retained root.
+/// This preserves publication uncertainty and supplies no teardown authorization.
+pub fn clear_backup_config_at_root(
+    root: &Arc<JournalRoot>,
+    expected_sha256: &str,
+    expected_backup: &Map<String, Value>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    conditional_update_journal_config_at_root(
+        root,
+        expected_sha256,
+        |config| {
+            if merge_backup_config(config) != *expected_backup {
+                return None;
+            }
+            let mut replacement = config.clone();
+            replacement.insert("backup".into(), Value::Object(backup_defaults()));
+            Some(replacement)
+        },
+        mutation_lock_options(),
+    )
 }
 
 pub fn record_backup_result(
@@ -1309,5 +1334,164 @@ mod conditional_clear_tests {
                 None => assert!(!path.exists(), "refusal must not materialize config"),
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod retained_clear_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use serde_json::json;
+        use solstone_core_journal_config_write::BoundConfigOutcome;
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, is_publication_candidate_name,
+            run_with_bound_publication_faults_and_barrier,
+        };
+        use std::fs;
+
+        fn fixture() -> (
+            tempfile::TempDir,
+            Arc<JournalRoot>,
+            String,
+            Map<String, Value>,
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join("config")).unwrap();
+            fs::write(
+                root.path().join("config/journal.json"),
+                serde_json::to_vec(&json!({
+                    "backup": {"enabled":true,"daily_key":"backup-secret","unknown":{"keep":7}},
+                    "providers":{"credential":"provider-secret"}, "other":42
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let read = read_journal_config(root.path()).unwrap();
+            let expected = merge_backup_config(read.config.as_ref().unwrap());
+            let admitted = Arc::new(JournalRoot::open(root.path()).unwrap());
+            (root, admitted, read.sha256.unwrap(), expected)
+        }
+
+        #[test]
+        fn retained_clear_matches_partial_legacy_defaults_and_preserves_other_settings() {
+            let (root, admitted, sha, expected) = fixture();
+            let BoundConfigOutcome::Published(receipt) =
+                clear_backup_config_at_root(&admitted, &sha, &expected).unwrap()
+            else {
+                panic!("must publish")
+            };
+            assert!(receipt.confirmation_refusal.is_none());
+            assert!(receipt.durability_uncertainty.is_none());
+            assert!(receipt.observation_uncertainty.is_none());
+            let config = read_journal_config(root.path()).unwrap().config.unwrap();
+            assert_eq!(config["backup"], Value::Object(backup_defaults()));
+            assert_eq!(config["other"], 42);
+            assert_eq!(config["providers"]["credential"], "provider-secret");
+            let diagnostic = format!("{receipt:?}");
+            assert!(!diagnostic.contains("provider-secret"));
+            assert!(!diagnostic.contains("backup-secret"));
+        }
+
+        #[test]
+        fn retained_clear_refuses_changed_expected_backup_and_original_full_config_bytes() {
+            for field in ["daily_key", "unknown"] {
+                let (root, admitted, sha, mut expected) = fixture();
+                let before = fs::read(root.path().join("config/journal.json")).unwrap();
+                expected.insert(field.into(), json!("changed"));
+                assert!(matches!(
+                    clear_backup_config_at_root(&admitted, &sha, &expected).unwrap(),
+                    BoundConfigOutcome::Unchanged
+                ));
+                assert_eq!(
+                    fs::read(root.path().join("config/journal.json")).unwrap(),
+                    before
+                );
+            }
+            let (root, admitted, sha, expected) = fixture();
+            let path = root.path().join("config/journal.json");
+            let mut config = read_journal_config(root.path()).unwrap().config.unwrap();
+            config.insert("other".into(), json!(43));
+            let newer = serde_json::to_vec(&config).unwrap();
+            fs::write(&path, &newer).unwrap();
+            assert!(matches!(
+                clear_backup_config_at_root(&admitted, &sha, &expected),
+                Err(BoundConfigRefusal::Conflict)
+            ));
+            assert_eq!(fs::read(path).unwrap(), newer);
+        }
+
+        #[test]
+        fn retained_clear_preserves_combined_native_and_confirmation_uncertainty_without_secrets() {
+            let (root, admitted, sha, expected) = fixture();
+            let path = root.path().join("config/journal.json");
+            let newer = br#"{"providers":{"credential":"newer-provider-secret"},"newer":true}"#;
+            let directory = root.path().join("config");
+            let (result, faults, fired) = run_with_bound_publication_faults_and_barrier(
+                [(BoundPublicationPrimitive::ParentSync, 1, 5)],
+                BoundPublicationPrimitive::Rename,
+                1,
+                move || {
+                    let stage = fs::read_dir(directory)
+                        .unwrap()
+                        .map(|entry| entry.unwrap())
+                        .find(|entry| is_publication_candidate_name(&entry.file_name()))
+                        .unwrap()
+                        .path();
+                    fs::write(stage, newer).unwrap();
+                },
+                || clear_backup_config_at_root(&admitted, &sha, &expected),
+            );
+            assert_eq!(faults, 1);
+            assert!(fired);
+            let BoundConfigOutcome::Published(receipt) = result.unwrap() else {
+                panic!("rename landed")
+            };
+            assert!(receipt.published_file.size > 0);
+            assert!(receipt.durability_uncertainty.is_some());
+            assert!(receipt.observation_uncertainty.is_some());
+            assert!(receipt.confirmation_refusal.is_some());
+            assert_eq!(fs::read(path).unwrap(), newer);
+            let diagnostic = format!("{receipt:?}");
+            for secret in ["backup-secret", "provider-secret", "newer-provider-secret"] {
+                assert!(!diagnostic.contains(secret));
+            }
+        }
+
+        #[test]
+        fn retained_clear_load_refusal_diagnostics_omit_configuration_credentials() {
+            let (root, admitted, sha, expected) = fixture();
+            let path = root.path().join("config/journal.json");
+            let malformed = br#"{"providers":{"credential":"provider-secret"},"backup":{"daily_key":"backup-secret"},"torn":"#;
+            fs::write(&path, malformed).unwrap();
+            let error = clear_backup_config_at_root(&admitted, &sha, &expected).unwrap_err();
+            assert!(matches!(error, BoundConfigRefusal::Load(_)));
+            let diagnostic = format!("{error} {error:?}");
+            for secret in ["backup-secret", "provider-secret"] {
+                assert!(!diagnostic.contains(secret));
+            }
+            assert_eq!(fs::read(path).unwrap(), malformed);
+            assert!(!root.path().join("config/journal.json.lock").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_clear_windows_refuses_before_lock_or_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("config")).unwrap();
+        let path = root.path().join("config/journal.json");
+        let original = br#"{"backup":{"enabled":true}}"#;
+        std::fs::write(&path, original).unwrap();
+        let admitted = Arc::new(JournalRoot::open(root.path()).unwrap());
+        let expected = get_backup_config(root.path()).unwrap();
+        assert!(matches!(
+            clear_backup_config_at_root(&admitted, "unneeded", &expected),
+            Err(BoundConfigRefusal::Unsupported)
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert!(!root.path().join("config/journal.json.lock").exists());
     }
 }

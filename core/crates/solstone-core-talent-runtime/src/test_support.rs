@@ -219,13 +219,16 @@ pub fn sequenced_one_shot_stub(root: &std::path::Path, responses: &[serde_json::
 
 #[cfg(all(test, feature = "full-tests"))]
 mod tests {
-    use std::io::ErrorKind;
-    use std::process::Command;
-
-    use super::*;
-
+    // Only Linux refuses to exec a file another process holds open for
+    // writing; macOS runs it, so the race this guards has no failure there.
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_stub_waits_out_a_child_holding_the_file_open_for_writing() {
+        use std::io::ErrorKind;
+        use std::process::Command;
+
+        use super::*;
+
         let root = tempfile::Builder::new()
             .prefix("solstone-talent-stub-busy-")
             .tempdir_in("/var/tmp")

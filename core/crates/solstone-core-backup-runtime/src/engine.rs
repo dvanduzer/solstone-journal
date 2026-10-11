@@ -25,8 +25,15 @@ use crate::hosted_runtime::{
 use crate::runner::{ToolRunner, reason_for_returncode, run_restic, select_summary};
 
 pub const ARCHIVE_TAG: &str = "solstone-archive";
-pub const ARCHIVE_BACKUP_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
-pub const ARCHIVE_LS_TIMEOUT_SECONDS: u64 = 30 * 60;
+pub use solstone_core_backup::archive_admission::{
+    ARCHIVE_BACKUP_TIMEOUT_SECONDS, ARCHIVE_LS_TIMEOUT_SECONDS, Clock,
+};
+use solstone_core_backup::archive_admission::{
+    AdmissionError, ArchiveBudget, ArchiveConfiguration,
+};
+use solstone_core_backup::archive_readback::{
+    ReadAdmission, ReadOperation, ReadbackAdmissionError,
+};
 // Repository contention is coordinated by Restic, within each operation’s deadline.
 const REPOSITORY_RETRY_LOCK: &str = "30m";
 pub const BACKUP_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
@@ -63,12 +70,6 @@ pub const BACKUP_EXCLUDES: [&str; 20] = [
     "scheduler.json",
     "health/sync",
 ];
-
-/// Clock boundary used for state records and the rotating verification bucket.
-pub trait Clock {
-    fn now_unix(&self) -> i64;
-    fn iso_week(&self) -> u8;
-}
 
 /// Write boundary for whole-journal restore attempts.
 pub trait RestoreRecorder {
@@ -1559,6 +1560,7 @@ pub enum ArchiveError {
     CredentialsExpired,
     DeadlineExceeded,
     ClockChanged,
+    Cancelled,
     RepositoryIdentityInvalid,
     RepositoryIdentityChanged,
     ToolFailed { reason: &'static str },
@@ -1572,15 +1574,16 @@ impl fmt::Display for ArchiveError {
             Self::NotConfigured => "archive backup is not configured",
             Self::ConfigurationUnavailable => "archive configuration could not be read",
             Self::ConfigurationChanged => "archive configuration changed",
-            Self::JournalIdentityChanged => "your journal changed",
+            Self::JournalIdentityChanged => "your journal could not be confirmed",
             Self::ToolUnavailable => "an archive tool is unavailable",
             Self::CredentialsUnavailable { reason } | Self::ToolFailed { reason } => reason,
             Self::InvalidCredentialExpiry => "archive credentials have an invalid expiry",
             Self::CredentialsExpired => "archive credentials expired",
             Self::DeadlineExceeded => "the archive operation deadline was reached",
             Self::ClockChanged => "the archive clock moved backward",
-            Self::RepositoryIdentityInvalid => "the archive repository identity is invalid",
-            Self::RepositoryIdentityChanged => "the archive repository identity changed",
+            Self::Cancelled => "the archive operation was cancelled",
+            Self::RepositoryIdentityInvalid => "the backup could not be identified",
+            Self::RepositoryIdentityChanged => "the backup no longer matches",
             Self::InvalidSelection => {
                 "archive sources must be a nonempty selection of absolute paths"
             }
@@ -1591,6 +1594,20 @@ impl fmt::Display for ArchiveError {
 }
 
 impl std::error::Error for ArchiveError {}
+
+impl From<AdmissionError> for ArchiveError {
+    fn from(error: AdmissionError) -> Self {
+        match error {
+            AdmissionError::ConfigurationUnavailable => Self::ConfigurationUnavailable,
+            AdmissionError::ConfigurationChanged => Self::ConfigurationChanged,
+            AdmissionError::JournalIdentityChanged => Self::JournalIdentityChanged,
+            AdmissionError::DeadlineExceeded => Self::DeadlineExceeded,
+            AdmissionError::ClockChanged => Self::ClockChanged,
+            AdmissionError::CredentialsExpired => Self::CredentialsExpired,
+            AdmissionError::Cancelled => Self::Cancelled,
+        }
+    }
+}
 
 /// Remote effects observed on a refused archive. An attempted request may have
 /// written remotely even when no snapshot identity was returned.
@@ -1622,121 +1639,6 @@ impl std::error::Error for ArchiveFailure {}
 pub struct ArchiveSnapshot {
     pub repository_id: String,
     pub snapshot_id: String,
-}
-
-#[derive(PartialEq)]
-struct ArchiveConfiguration {
-    settings: Map<String, Value>,
-    binding: Option<HostedBinding>,
-}
-
-const MAX_ARCHIVE_CONFIGURATION_BYTES: usize = 1024 * 1024;
-
-impl ArchiveConfiguration {
-    fn read(root: &JournalRoot) -> Result<Self, ArchiveError> {
-        root.revalidate_canonical_binding()
-            .map_err(|_| ArchiveError::JournalIdentityChanged)?;
-        let raw = Self::read_object(root, Path::new("config/journal.json"))?;
-        let config = solstone_core_backup::merge_backup_config(&raw);
-        let binding = if config.get("mode") == Some(&Value::String("operated".into())) {
-            let raw = Self::read_object(root, Path::new("backup/hosted/binding.json"))?;
-            let nonblank = |key| {
-                raw.get(key)
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_owned)
-                    .ok_or(ArchiveError::ConfigurationUnavailable)
-            };
-            Some(HostedBinding {
-                broker_endpoint: nonblank("broker_endpoint")?,
-                account_id: nonblank("account_id")?,
-                instance_id: nonblank("instance_id")?,
-                bucket: nonblank("bucket")?,
-                prefix: nonblank("prefix")?,
-                broker_token: nonblank("broker_token")?,
-            })
-        } else {
-            None
-        };
-        root.revalidate_canonical_binding()
-            .map_err(|_| ArchiveError::JournalIdentityChanged)?;
-        // Status, schedules and accounting are not transport identity.
-        let settings = [
-            "enabled",
-            "mode",
-            "destination",
-            "daily_key",
-            "recovery_key",
-        ]
-        .into_iter()
-        .filter_map(|key| {
-            config
-                .get(key)
-                .cloned()
-                .map(|value| (key.to_owned(), value))
-        })
-        .collect();
-        Ok(Self { settings, binding })
-    }
-
-    fn read_object(
-        root: &JournalRoot,
-        relative: &Path,
-    ) -> Result<Map<String, Value>, ArchiveError> {
-        let observed = solstone_core_journal_io::read_relative_file_bounded(
-            root,
-            relative,
-            MAX_ARCHIVE_CONFIGURATION_BYTES,
-        )
-        .map_err(|_| ArchiveError::ConfigurationUnavailable)?
-        .ok_or(ArchiveError::ConfigurationUnavailable)?;
-        serde_json::from_slice(&observed.bytes).map_err(|_| ArchiveError::ConfigurationUnavailable)
-    }
-}
-
-struct ArchiveBudget {
-    deadline: i64,
-    last_now: std::cell::Cell<Option<i64>>,
-    credential_expiry: Option<i64>,
-}
-
-impl ArchiveBudget {
-    fn new(clock: &dyn Clock) -> Result<Self, ArchiveError> {
-        let now = clock.now_unix();
-        let deadline = now
-            .checked_add(ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64)
-            .ok_or(ArchiveError::DeadlineExceeded)?;
-        Ok(Self {
-            deadline,
-            last_now: std::cell::Cell::new(Some(now)),
-            credential_expiry: None,
-        })
-    }
-
-    fn remaining(&self, clock: &dyn Clock) -> Result<Duration, ArchiveError> {
-        let now = clock.now_unix();
-        let last_now = self.last_now.get().ok_or(ArchiveError::ClockChanged)?;
-        if now < last_now {
-            self.last_now.set(None);
-            return Err(ArchiveError::ClockChanged);
-        }
-        self.last_now.set(Some(now));
-        let deadline = self
-            .deadline
-            .checked_sub(now)
-            .filter(|remaining| *remaining > 0)
-            .ok_or(ArchiveError::DeadlineExceeded)?;
-        let remaining = match self.credential_expiry {
-            Some(expiry) => deadline.min(
-                expiry
-                    .checked_sub(now)
-                    .filter(|remaining| *remaining > 0)
-                    .ok_or(ArchiveError::CredentialsExpired)?,
-            ),
-            None => deadline,
-        };
-        Ok(Duration::from_secs(remaining as u64))
-    }
 }
 
 // Keep the existing broker protocol while bounding its request by this operation.
@@ -1790,18 +1692,16 @@ pub fn admit_archive<'a>(
     services: &BackupServices<'a>,
 ) -> Result<AdmittedArchive<'a>, ArchiveError> {
     let mut budget = ArchiveBudget::new(services.clock)?;
-    let config = ArchiveConfiguration::read(&root)?;
-    if config.settings.get("enabled") != Some(&Value::Bool(true)) {
+    let config = ArchiveConfiguration::capture(&root)?;
+    if !config.enabled() {
         return Err(ArchiveError::NotConfigured);
     }
-    let keys = keys_from_backup_config(&config.settings)
-        .map_err(|_| ArchiveError::ConfigurationUnavailable)?
-        .ok_or(ArchiveError::NotConfigured)?;
+    let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
     let restic_path = services
         .restic_path
         .ok_or(ArchiveError::ToolUnavailable)?
         .to_path_buf();
-    let (write, read) = if let Some(binding) = &config.binding {
+    let (write, read) = if let Some(binding) = config.binding() {
         let http = ArchiveAdmissionHttp {
             inner: services.http,
             clock: services.clock,
@@ -1815,7 +1715,7 @@ pub fn admit_archive<'a>(
         let expiry = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
             .map_err(|_| ArchiveError::InvalidCredentialExpiry)?
             .timestamp();
-        budget.credential_expiry = Some(expiry);
+        budget.cap_credential_expiry(expiry);
         budget.remaining(services.clock)?;
         let rclone = services.rclone_path.ok_or(ArchiveError::ToolUnavailable)?;
         let write = hosted_append_only_session(binding, &credentials, rclone)
@@ -1834,11 +1734,10 @@ pub fn admit_archive<'a>(
         };
         (runtime(write), runtime(read))
     } else {
-        if config.settings.get("mode") != Some(&Value::String("byo".into())) {
+        if config.mode() != Some("byo") {
             return Err(ArchiveError::NotConfigured);
         }
-        let destination =
-            destination_from_backup_config(&config.settings).ok_or(ArchiveError::NotConfigured)?;
+        let destination = config.destination().ok_or(ArchiveError::NotConfigured)?;
         let backend_env = value_env(&destination).ok_or(ArchiveError::ConfigurationUnavailable)?;
         let read = Runtime {
             destination: destination.clone(),
@@ -1874,7 +1773,39 @@ pub fn admit_archive<'a>(
     Ok(admitted)
 }
 
-impl AdmittedArchive<'_> {
+impl<'a> AdmittedArchive<'a> {
+    /// Move this operation's original configuration, credentials and budget into
+    /// the concrete installed-tool readback door without renewing its lifetime.
+    pub fn into_read_operation(self) -> Result<ReadOperation<'a>, ReadbackAdmissionError> {
+        ReadOperation::admit(self.into_read_admission()?)
+    }
+
+    fn into_read_admission(self) -> Result<ReadAdmission<'a>, ReadbackAdmissionError> {
+        if !self.read.global_options.is_empty() {
+            return Err(ReadbackAdmissionError::UnsupportedBackend);
+        }
+        let Self {
+            root,
+            config,
+            budget,
+            clock,
+            read,
+            repository_id,
+            restic_path,
+            ..
+        } = self;
+        Ok(ReadAdmission {
+            root,
+            configuration: config,
+            budget,
+            clock,
+            destination: read.destination,
+            password: read.password,
+            repository_id,
+            expected_restic_path: restic_path,
+        })
+    }
+
     pub fn repository_id(&self) -> &str {
         &self.repository_id
     }
@@ -1883,13 +1814,18 @@ impl AdmittedArchive<'_> {
         &self.root
     }
 
+    /// Sample the admitted clock after checking the original local lifetime.
+    /// This observation cannot extend the operation's deadline or credentials.
+    pub fn current_time(&self) -> Result<i64, ArchiveError> {
+        self.revalidate_local()?;
+        Ok(self.clock.now_unix())
+    }
+
     /// Recheck the retained root, captured backup configuration and remaining
     /// lifetime without issuing any remote request.
     pub fn revalidate_local(&self) -> Result<(), ArchiveError> {
         self.budget.remaining(self.clock)?;
-        if ArchiveConfiguration::read(&self.root)? != self.config {
-            return Err(ArchiveError::ConfigurationChanged);
-        }
+        self.config.revalidate(&self.root)?;
         Ok(())
     }
 
@@ -1953,7 +1889,10 @@ impl AdmittedArchive<'_> {
             return Err(before(ArchiveError::InvalidSelection));
         }
         self.revalidate().map_err(before)?;
-        let timeout = self.budget.remaining(self.clock).map_err(before)?;
+        let timeout = self
+            .budget
+            .remaining(self.clock)
+            .map_err(|error| before(error.into()))?;
         let mut args = self.write.global_options.clone();
         args.extend([
             "backup".into(),
@@ -2486,6 +2425,82 @@ mod tests {
         }
 
         #[test]
+        fn readback_transfer_moves_original_admission_and_remaining_lifetime() {
+            let (_journal, root) = fixture();
+            let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+            let now = Rc::new(Cell::new(50));
+            let clock = MutableClock(Rc::clone(&now));
+            let services = services(&runner, &PanicHttp, &clock, &Maintenance);
+            let admitted = admit_archive(Arc::clone(&root), &services).unwrap();
+            now.set(50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - 5);
+            let transferred = admitted.into_read_admission().unwrap();
+            assert!(Arc::ptr_eq(&transferred.root, &root));
+            assert!(std::ptr::eq(transferred.clock, services.clock));
+            assert_eq!(transferred.repository_id, REPOSITORY_ID);
+            assert_eq!(
+                transferred.expected_restic_path,
+                Path::new("/fixture/bin/restic")
+            );
+            assert_eq!(transferred.destination.repository, "s3:repo");
+            assert_eq!(transferred.password, "daily");
+            transferred.configuration.revalidate(&root).unwrap();
+            assert_eq!(
+                transferred.budget.remaining(&clock).unwrap(),
+                Duration::from_secs(5)
+            );
+            now.set(50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64);
+            assert_eq!(
+                transferred.budget.remaining(&clock),
+                Err(AdmissionError::DeadlineExceeded)
+            );
+            assert_eq!(runner.requests.borrow().len(), 2);
+        }
+
+        #[test]
+        fn readback_transfer_cannot_renew_expiry_or_poisoned_clock() {
+            for poison in [false, true] {
+                let (journal, root) = fixture();
+                let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                let http = hosted(journal.path(), "1970-01-01T00:01:00Z");
+                let now = Rc::new(Cell::new(50));
+                let clock = MutableClock(Rc::clone(&now));
+                let mut services = services(&runner, &http, &clock, &Maintenance);
+                services.rclone_path = Some(Path::new("/fixture/bin/rclone"));
+                let admitted = admit_archive(root, &services).unwrap();
+                let expected = if poison {
+                    now.set(49);
+                    assert_eq!(admitted.revalidate_local(), Err(ArchiveError::ClockChanged));
+                    now.set(55);
+                    AdmissionError::ClockChanged
+                } else {
+                    now.set(60);
+                    AdmissionError::CredentialsExpired
+                };
+                assert!(matches!(admitted.into_read_operation(),
+                    Err(ReadbackAdmissionError::Admission(error)) if error == expected));
+                assert_eq!(runner.requests.borrow().len(), 2);
+                assert_eq!(http.requests.borrow().len(), 1);
+            }
+        }
+
+        #[test]
+        fn readback_transfer_refuses_extra_read_options_before_actual_execution() {
+            let (_journal, root) = fixture();
+            let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+            let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+            let mut admitted = admit_archive(root, &services).unwrap();
+            admitted
+                .read
+                .global_options
+                .push("--password-command=helper".into());
+            assert!(matches!(
+                admitted.into_read_operation(),
+                Err(ReadbackAdmissionError::UnsupportedBackend)
+            ));
+            assert_eq!(runner.requests.borrow().len(), 2);
+        }
+
+        #[test]
         fn byo_pairs_and_archives_with_captured_transport_and_forced_source_read() {
             let (journal, root) = fixture();
             let runner = script(vec![
@@ -2720,7 +2735,7 @@ mod tests {
             assert_eq!(http.requests.borrow().len(), 1);
 
             let budget = ArchiveBudget::new(&FixedClock).unwrap();
-            now.set(budget.deadline - 5);
+            now.set(FixedClock.now_unix() + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - 5);
             let http = ScriptedHttp {
                 requests: RefCell::new(vec![]),
                 responses: RefCell::new(VecDeque::from([Ok(credentials_response())])),
@@ -2886,7 +2901,7 @@ mod tests {
                 let path = journal.path().join(relative);
                 let mut oversized: Value =
                     serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                oversized["padding"] = json!("x".repeat(MAX_ARCHIVE_CONFIGURATION_BYTES));
+                oversized["padding"] = json!("x".repeat(2 * 1024 * 1024));
                 fs::write(path, serde_json::to_vec(&oversized).unwrap()).unwrap();
                 let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
                 assert_eq!(
