@@ -1149,16 +1149,22 @@ async fn offload_restore_route(deps: BackupWebDeps, body: Bytes) -> axum::respon
         Err(error) => return error,
     };
     spawn_backup_worker(deps.clone(), started.generation, move |worker| {
-        let tools = match resolve_tools(&worker) {
-            Ok(tools) => tools,
-            Err(error) => return Terminal::tool_error(error),
+        // The owning restore path is held before any tool can run.
+        let restore_services = BackupServices {
+            runner: worker.runner.as_ref(),
+            http: worker.http.as_ref(),
+            clock: worker.clock.as_ref(),
+            restic_path: None,
+            rclone_path: None,
+            version: worker.version,
+            journal_maintenance: worker.journal_maintenance.as_ref(),
         };
         let result = if all {
-            restore_all_offload(&worker.journal_root, &services(&worker, &tools))
+            restore_all_offload(&worker.journal_root, &restore_services)
         } else {
             restore_offload_day(
                 &worker.journal_root,
-                &services(&worker, &tools),
+                &restore_services,
                 day.as_deref().unwrap_or_default(),
             )
         };

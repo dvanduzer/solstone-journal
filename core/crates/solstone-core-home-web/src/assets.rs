@@ -226,6 +226,9 @@ mod tests {
         assert!(outcomes.contains("case 'approve.policy_keeps':"));
         assert!(outcomes.contains("refusalList(items)"));
         assert!(source.contains("refusal.item_unnamed"));
+        assert!(source.contains(
+            "confirmation = { kind: 'delete', rows: rows, reviewContext: reviewContext };"
+        ));
         assert!(source.contains("confirmation = { kind: 'recover' };"));
 
         let (_, recover_map) = source

@@ -23,6 +23,7 @@ mod run_log;
 mod segment;
 mod settle;
 pub mod snapshot;
+mod topics;
 pub use snapshot::compute_daily_evidence_revision;
 mod weekly;
 mod workers;

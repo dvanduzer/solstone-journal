@@ -562,6 +562,88 @@ mod tests {
         ])));
     }
 
+    #[test]
+    fn shipped_sense_schema_composed_with_topics_and_quotes_validates_draft_2020_12() {
+        let talent_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../payload/solstone/talent")
+            .canonicalize()
+            .expect("shipped talent directory");
+        let mut schema =
+            crate::schema::load_talent_schema("sense", &talent_dir, "sense.schema.json")
+                .expect("shipped sense schema");
+        super::substitute_runtime_facets_with(&mut schema, &["personal".to_owned()]);
+
+        let required = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            required.contains(&"topics"),
+            "required should contain topics"
+        );
+        assert!(
+            required.contains(&"quotes"),
+            "required should contain quotes"
+        );
+
+        assert!(schema["properties"]["topics"].get("minItems").is_none());
+        assert!(schema["properties"]["topics"].get("maxItems").is_none());
+        assert!(schema["properties"]["quotes"].get("minItems").is_none());
+        assert!(schema["properties"]["quotes"].get("maxItems").is_none());
+
+        assert_eq!(
+            schema["properties"]["facets"]["items"]["properties"]["facet"]["enum"],
+            json!(["personal"])
+        );
+
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&schema)
+            .expect("valid sense schema");
+
+        let valid = json!({
+            "density": "idle",
+            "content_type": "idle",
+            "activity_summary": "Held a quiet synthetic cleanroom interval.",
+            "entities": [],
+            "facets": [{"facet": "personal", "activity": "Quiet interval", "level": "low"}],
+            "speculative_facet": null,
+            "meeting_detected": false,
+            "speakers": [],
+            "recommend": {"screen_record": false, "speaker_attribution": false},
+            "emotional_register": "neutral",
+            "topics": ["quiet time"],
+            "quotes": [{"speaker": "User", "text": "silence"}]
+        });
+        assert!(
+            validator.is_valid(&valid),
+            "valid sample should pass schema validation"
+        );
+
+        let mut missing_topics = valid.clone();
+        missing_topics.as_object_mut().unwrap().remove("topics");
+        assert!(
+            !validator.is_valid(&missing_topics),
+            "removing topics must fail validation"
+        );
+
+        let mut missing_quotes = valid.clone();
+        missing_quotes.as_object_mut().unwrap().remove("quotes");
+        assert!(
+            !validator.is_valid(&missing_quotes),
+            "removing quotes must fail validation"
+        );
+
+        let mut missing_density = valid.clone();
+        missing_density.as_object_mut().unwrap().remove("density");
+        assert!(
+            !validator.is_valid(&missing_density),
+            "removing density must fail validation"
+        );
+    }
+
     /// ⚠ With no enabled facets the enum is REMOVED, not emptied — an empty enum
     /// permits nothing, and the Sense schema requires a facet.
     #[test]
