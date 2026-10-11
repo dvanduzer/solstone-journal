@@ -1,8 +1,10 @@
 # Microsoft Visual C++ runtime components
 
-The files bin/msvcp140.dll, bin/vcruntime140.dll, bin/vcruntime140_1.dll and
-bin/vcomp140.dll in this installation are unmodified Microsoft redistributable
-runtime libraries, Copyright (c) Microsoft Corporation. All rights reserved.
+The files msvcp140.dll, vcruntime140.dll, vcruntime140_1.dll and vcomp140.dll
+in this installation's lib/solstone-native/ folder, and the copies of
+msvcp140.dll, vcruntime140.dll and vcruntime140_1.dll in its
+lib/solstone-nvattest/ folder, are unmodified Microsoft redistributable runtime
+libraries, Copyright (c) Microsoft Corporation. All rights reserved.
 
 sol pbc redistributes them under the Distributable Code terms of the Microsoft
 Visual Studio 2022 license. Those terms are published at
