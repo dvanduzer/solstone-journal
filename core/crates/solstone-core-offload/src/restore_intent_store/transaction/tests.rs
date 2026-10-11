@@ -3,6 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
+use super::retirement::NativeRetirement;
 use super::*;
 use sha2::{Digest, Sha256};
 use solstone_core_journal_io::activity::ActivityLease;
@@ -616,6 +617,256 @@ fn late_owner_delete_or_missing_segment_refuses_without_recreation_or_intent() {
                 fs::read(segment.join("tombstone.json")).unwrap(),
                 b"owner deleted"
             );
+        }
+    }
+}
+
+fn intent_path(f: &Fixture, result: &TransactionOutcome<'_, '_>) -> PathBuf {
+    f.temp
+        .path()
+        .join("health/offload/restore-intents")
+        .join(format!(
+            "{}.json",
+            result.record.as_ref().unwrap().intent.event.operation_id
+        ))
+}
+
+#[test]
+fn retirement_deletes_only_the_confirmed_metadata_record_and_keeps_root_carrier() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let result = f.staged(&allowed).commit(2, options());
+    let path = intent_path(&f, &result);
+    let ledger = fs::read(f.ledger()).unwrap();
+    let marker = fs::read(f.marker()).unwrap();
+    let retired = result.retire_intent(options());
+    assert!(retired.hold.is_none(), "{:?}", retired.hold);
+    assert!(retired.retirement.as_ref().unwrap().retired);
+    assert!(!path.exists());
+    assert_eq!(fs::read(f.raw()).unwrap(), b"abc");
+    assert_eq!(fs::read(f.ledger()).unwrap(), ledger);
+    assert_eq!(fs::read(f.marker()).unwrap(), marker);
+    let census = observe_with_carrier(&f.root, retired.owner.carrier.observation()).unwrap();
+    assert_eq!(census.entries().len(), 1);
+    assert!(census.unresolved_entries().next().is_none());
+}
+
+#[test]
+fn retirement_refuses_identical_replacement_before_first_read_and_complete_replay_without_token() {
+    for replace in [true, false] {
+        let f = Fixture::new(false);
+        let allowed = Cell::new(true);
+        let result = f.staged(&allowed).commit(2, options());
+        let path = intent_path(&f, &result);
+        let bytes = fs::read(&path).unwrap();
+        let result = if replace {
+            fs::rename(&path, f.temp.path().join("saved-original-intent")).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            result
+        } else {
+            let id = result
+                .record
+                .as_ref()
+                .unwrap()
+                .intent
+                .event
+                .operation_id
+                .clone();
+            let owner = result.owner;
+            drop(result.record);
+            let replayed = replay_local(owner, &id, 3, options());
+            assert!(replayed.hold.is_none());
+            assert!(replayed.record.as_ref().unwrap().writes.is_empty());
+            replayed
+        };
+        let retired = result.retire_intent(options());
+        assert!(matches!(
+            retired.hold,
+            Some(Hold::Retirement | Hold::Store(StoreProblem::Changed))
+        ));
+        assert!(retired.retirement.is_none());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn retirement_keeps_pending_register_and_unknown_stage() {
+    for with_mark in [true, false] {
+        let f = Fixture::new(with_mark);
+        let allowed = Cell::new(true);
+        let result = f.staged(&allowed).commit(2, options());
+        let path = intent_path(&f, &result);
+        let bytes = fs::read(&path).unwrap();
+        let unknown = f.temp.path().join("health/offload/.tmp-offload-unknown");
+        if !with_mark {
+            fs::create_dir(&unknown).unwrap();
+        }
+        let retired = result.retire_intent(options());
+        assert!(matches!(
+            retired.hold,
+            Some(Hold::Register | Hold::Obligations)
+        ));
+        assert!(retired.retirement.is_none());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        if !with_mark {
+            assert!(unknown.is_dir());
+        }
+    }
+}
+
+#[test]
+fn retirement_keeps_actual_unused_stage_after_successful_creation_then_preclaim_refusal() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let result = f.staged(&allowed).commit(2, options());
+    let path = intent_path(&f, &result);
+    let bytes = fs::read(&path).unwrap();
+    let moved = f.temp.path().join("saved-original-intent");
+    let replacement_path = path.clone();
+    let replacement_bytes = bytes.clone();
+    let (retired, fired) = run_with_media_hook(
+        MediaPrimitive::StageCreated,
+        move || {
+            fs::rename(&replacement_path, moved)?;
+            fs::write(&replacement_path, replacement_bytes)?;
+            Ok(())
+        },
+        || result.retire_intent(options()),
+    );
+    assert!(fired);
+    assert!(matches!(
+        retired.hold,
+        Some(Hold::Store(StoreProblem::Changed))
+    ));
+    let facts = retired.retirement.as_ref().unwrap();
+    let NativeRetirement::Unconsumed(stage) = &facts.native else {
+        panic!("stage ownership lost")
+    };
+    assert!(stage.diagnostic_path().is_dir());
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert!(!facts.retired);
+}
+
+#[test]
+fn retirement_interrupted_claim_preserves_exact_record_in_census_visible_stage() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let result = f.staged(&allowed).commit(2, options());
+    let path = intent_path(&f, &result);
+    let bytes = fs::read(&path).unwrap();
+    let (retired, fired) = run_with_media_hook(
+        MediaPrimitive::AfterRemovalClaim,
+        || Err(std::io::Error::other("claimed intent cut")),
+        || result.retire_intent(options()),
+    );
+    assert!(fired);
+    assert!(matches!(retired.hold, Some(Hold::Retirement)));
+    let facts = retired.retirement.as_ref().unwrap();
+    let NativeRetirement::Removal(removal) = &facts.native else {
+        panic!("claim ownership lost")
+    };
+    assert_eq!(
+        removal.receipt().effect,
+        solstone_core_journal_io::media::RemovalEffect::Claimed
+    );
+    assert!(!path.exists());
+    let stage = removal.stage_observation().unwrap();
+    assert_eq!(
+        fs::read(
+            f.temp
+                .path()
+                .join("health/offload")
+                .join(&stage.directory_name)
+                .join(&facts.observed.entry.name)
+        )
+        .unwrap(),
+        bytes
+    );
+    let census = observe_with_carrier(&f.root, retired.owner.carrier.observation()).unwrap();
+    assert!(census.unresolved_entries().any(|entry| matches!(
+        entry,
+        solstone_core_journal_io::activity_obligations::NativeObligation::Stage { .. }
+    )));
+    assert!(!facts.retired);
+}
+
+#[test]
+fn retirement_native_sync_failure_keeps_deleted_effect_and_refuses_completion() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let result = f.staged(&allowed).commit(2, options());
+    let path = intent_path(&f, &result);
+    let (retired, fired) = run_with_media_hook(
+        MediaPrimitive::RemovalSourceSync,
+        || Err(std::io::Error::other("intent source sync cut")),
+        || result.retire_intent(options()),
+    );
+    assert!(fired);
+    assert!(matches!(retired.hold, Some(Hold::Retirement)));
+    let facts = retired.retirement.as_ref().unwrap();
+    let NativeRetirement::Removal(removal) = &facts.native else {
+        panic!("removal receipt lost")
+    };
+    assert_eq!(
+        removal.receipt().effect,
+        solstone_core_journal_io::media::RemovalEffect::Deleted
+    );
+    assert_eq!(removal.receipt().source_durability, Durability::Unproven);
+    assert!(!path.exists());
+    assert!(!facts.retired);
+}
+
+#[test]
+fn retirement_preserves_actual_deleted_effect_when_ancestor_sync_fails_or_final_census_changes() {
+    struct FailHealth;
+    impl super::super::unix::Hooks for FailHealth {
+        fn sync(
+            &mut self,
+            directory: &impl std::os::fd::AsFd,
+            index: usize,
+        ) -> std::io::Result<()> {
+            if index == 2 {
+                return Err(std::io::Error::other("health sync cut"));
+            }
+            nix::unistd::fsync(directory).map_err(std::io::Error::from)
+        }
+    }
+    for final_stage in [false, true] {
+        let f = Fixture::new(false);
+        let allowed = Cell::new(true);
+        let result = f.staged(&allowed).commit(2, options());
+        let path = intent_path(&f, &result);
+        let unknown = f.temp.path().join("health/offload/.tmp-offload-final");
+        let retired = if final_stage {
+            let created = unknown.clone();
+            let (retired, fired) = run_with_media_hook(
+                MediaPrimitive::RemovalParentSync,
+                move || fs::create_dir(created),
+                || result.retire_intent(options()),
+            );
+            assert!(fired);
+            retired
+        } else {
+            result.retire_with(options(), &mut FailHealth)
+        };
+        assert!(matches!(
+            retired.hold,
+            Some(Hold::Retirement | Hold::Obligations)
+        ));
+        assert!(!path.exists());
+        let facts = retired.retirement.as_ref().unwrap();
+        let NativeRetirement::Removal(removal) = &facts.native else {
+            panic!("removal receipt lost")
+        };
+        assert_eq!(
+            removal.receipt().effect,
+            solstone_core_journal_io::media::RemovalEffect::Deleted
+        );
+        assert!(!facts.retired);
+        if final_stage {
+            assert!(unknown.is_dir());
+        } else {
+            assert_eq!(facts.ancestors[2], Durability::Unproven);
         }
     }
 }
