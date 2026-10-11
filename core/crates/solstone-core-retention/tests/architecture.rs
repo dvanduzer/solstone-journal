@@ -70,10 +70,16 @@ const SOURCES: &[(&str, &str)] = &[
 
 const LIB: &str = include_str!("../src/lib.rs");
 
-const CHILD_SOURCES: &[(&str, &str)] = &[(
-    "archive_offer/reconciliation",
-    include_str!("../src/archive_offer/reconciliation.rs"),
-)];
+const CHILD_SOURCES: &[(&str, &str)] = &[
+    (
+        "archive_offer/reconciliation",
+        include_str!("../src/archive_offer/reconciliation.rs"),
+    ),
+    (
+        "remove_marked::archive_finish",
+        include_str!("../src/remove_marked/archive_finish.rs"),
+    ),
+];
 
 /// Primitives that remove or rename a directory entry.
 ///

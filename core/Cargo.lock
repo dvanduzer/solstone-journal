@@ -5151,6 +5151,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "solstone-core-backup",
+ "solstone-core-backup-runtime",
  "solstone-core-callosum",
  "solstone-core-depict",
  "solstone-core-format",

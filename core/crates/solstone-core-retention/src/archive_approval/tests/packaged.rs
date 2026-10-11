@@ -107,14 +107,14 @@ fn failure<'a>(
 }
 
 fn check_owner(
-    owner: &ApprovalOwner<'_>,
+    owner: &ApprovalOwner<ReadOperation<'_>>,
     root: &Arc<JournalRoot>,
     activity: &Arc<ActivityLease>,
     marks: &[Mark],
 ) {
     assert!(Arc::ptr_eq(owner.read.journal_root(), root));
-    assert!(Arc::ptr_eq(owner.carrier.activity(), activity));
-    assert_eq!(owner.expected, marks);
+    assert!(Arc::ptr_eq(owner.resources.carrier.activity(), activity));
+    assert_eq!(owner.resources.expected, marks);
 }
 
 fn check_prepared(prepared: &PreparedRead) {
@@ -123,9 +123,9 @@ fn check_prepared(prepared: &PreparedRead) {
     assert_eq!(prepared.file.sha256, prepared.media.digest().sha256);
 }
 
-fn check_complete(owner: &ApprovalOwner<'_>, count: usize) -> TestResult {
-    assert_eq!(owner.held.len(), count);
-    for resource in &owner.held {
+fn check_complete(owner: &ApprovalOwner<ReadOperation<'_>>, count: usize) -> TestResult {
+    assert_eq!(owner.resources.held.len(), count);
+    for resource in &owner.resources.held {
         match resource {
             HeldResource::Prepared(prepared) => {
                 assert_eq!(prepared.cleanup, Some(Cleanup::Complete));
@@ -141,10 +141,11 @@ fn check_complete(owner: &ApprovalOwner<'_>, count: usize) -> TestResult {
 
 fn evidence(
     phase: &str,
-    owner: &ApprovalOwner<'_>,
+    owner: &ApprovalOwner<ReadOperation<'_>>,
     reason: Option<&ArchiveApprovalError>,
 ) -> TestResult {
     let held: Vec<_> = owner
+        .resources
         .held
         .iter()
         .map(|resource| match resource {
@@ -172,7 +173,7 @@ fn evidence(
         "ARCHIVE_APPROVAL_EVIDENCE {}",
         serde_json::json!({
             "phase": phase, "reason": reason.map(|reason| format!("{reason:?}")),
-            "held": held, "stages": stages(owner.carrier.journal_root().canonical_path())?,
+            "held": held, "stages": stages(owner.resources.carrier.journal_root().canonical_path())?,
         })
     );
     std::io::stdout().flush()?;
@@ -188,8 +189,12 @@ fn check_drop(failed: ArchiveApprovalFailure<'_>, root: &Path) -> TestResult {
     Ok(())
 }
 
-fn check_failed_read(owner: &ApprovalOwner<'_>, file: &ExactArchiveFile) -> TestResult {
+fn check_failed_read(
+    owner: &ApprovalOwner<ReadOperation<'_>>,
+    file: &ExactArchiveFile,
+) -> TestResult {
     let failed = owner
+        .resources
         .held
         .iter()
         .find_map(|resource| match resource {
@@ -201,7 +206,7 @@ fn check_failed_read(owner: &ApprovalOwner<'_>, file: &ExactArchiveFile) -> Test
     assert_eq!(failed.file.archive_path, file.archive_path);
     assert_eq!(failed.file.snapshot_id, file.snapshot_id);
     assert!(
-        payloads(owner.carrier.journal_root().canonical_path())?
+        payloads(owner.resources.carrier.journal_root().canonical_path())?
             .iter()
             .any(|(_, identity, _)| *identity == failed.target_identity)
     );
@@ -338,9 +343,12 @@ fn packaged_archive_approval_entry() -> TestResult {
         }
         let ApprovalOwner {
             read,
-            carrier,
-            expected,
-            held,
+            resources:
+                ApprovalResources {
+                    carrier,
+                    expected,
+                    held,
+                },
         } = *positive.owner;
         let positive_history = (expected, held);
         let failed = failure(create_archive_approval_batch(read, carrier, &changed))?;
@@ -349,9 +357,10 @@ fn packaged_archive_approval_entry() -> TestResult {
             ArchiveApprovalError::Readback(ReadbackError::NativeFailure)
         ));
         check_owner(&failed.owner, &root, &activity, &changed);
-        assert_eq!(failed.owner.held.len(), 2);
+        assert_eq!(failed.owner.resources.held.len(), 2);
         let first = failed
             .owner
+            .resources
             .held
             .first()
             .ok_or_else(|| invalid("first owner missing"))?;
@@ -407,7 +416,7 @@ fn packaged_archive_approval_entry() -> TestResult {
             ArchiveApprovalError::Readback(ReadbackError::Admission(AdmissionError::Cancelled))
         ));
         check_owner(&failed.owner, &root, &activity, &input.marks);
-        assert_eq!(failed.owner.held.len(), 1);
+        assert_eq!(failed.owner.resources.held.len(), 1);
         check_failed_read(
             &failed.owner,
             files
@@ -571,9 +580,9 @@ fn packaged_archive_approval_entry() -> TestResult {
             } else {
                 assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
             }
-            assert_eq!(failed.owner.held.len(), 1);
+            assert_eq!(failed.owner.resources.held.len(), 1);
             assert!(
-                matches!(failed.owner.held.first(), Some(HeldResource::Stage(Some(stage))) if stage.diagnostic_path().is_dir())
+                matches!(failed.owner.resources.held.first(), Some(HeldResource::Stage(Some(stage))) if stage.diagnostic_path().is_dir())
             );
             assert_eq!(stages(&input.journal)?.len(), 2);
             if input.case == "target_fail" {
@@ -598,11 +607,11 @@ fn packaged_archive_approval_entry() -> TestResult {
             assert!(
                 matches!(failed.reason(), ArchiveApprovalError::Cleanup(actual) if *actual == expected_cleanup)
             );
-            assert_eq!(failed.owner.held.len(), 1);
+            assert_eq!(failed.owner.resources.held.len(), 1);
             assert!(
-                matches!(failed.owner.held.first(), Some(HeldResource::Prepared(prepared)) if prepared.cleanup == Some(expected_cleanup) && prepared.target_identity == prepared.media.identity())
+                matches!(failed.owner.resources.held.first(), Some(HeldResource::Prepared(prepared)) if prepared.cleanup == Some(expected_cleanup) && prepared.target_identity == prepared.media.identity())
             );
-            match failed.owner.held.first() {
+            match failed.owner.resources.held.first() {
                 Some(HeldResource::Prepared(prepared)) => check_prepared(prepared),
                 _ => return Err(invalid("uncertain original preparation missing").into()),
             }
@@ -629,21 +638,21 @@ fn packaged_archive_approval_entry() -> TestResult {
         "root_arc" => {
             assert!(matches!(failed.reason(), ArchiveApprovalError::RootChanged));
             assert!(!Arc::ptr_eq(failed.journal_root(), &root));
-            assert!(failed.owner.held.is_empty());
+            assert!(failed.owner.resources.held.is_empty());
         }
         "invalid_later" => {
             assert!(matches!(
                 failed.reason(),
                 ArchiveApprovalError::InvalidSelection
             ));
-            assert!(failed.owner.held.is_empty());
+            assert!(failed.owner.resources.held.is_empty());
         }
         "pre_cancel" => {
             assert!(matches!(
                 failed.reason(),
                 ArchiveApprovalError::Readback(ReadbackError::Admission(AdmissionError::Cancelled))
             ));
-            assert!(failed.owner.held.is_empty());
+            assert!(failed.owner.resources.held.is_empty());
         }
         "pre_expire" => {
             assert!(matches!(
@@ -652,7 +661,7 @@ fn packaged_archive_approval_entry() -> TestResult {
                     AdmissionError::DeadlineExceeded
                 ))
             ));
-            assert!(failed.owner.held.is_empty());
+            assert!(failed.owner.resources.held.is_empty());
         }
         _ => return Err(invalid("unexpected refusal case").into()),
     }
@@ -1393,8 +1402,8 @@ fn packaged_archive_parent_entry() -> TestResult {
             &activity,
             std::slice::from_ref(&fixture.mark),
         );
-        assert_eq!(failed.owner.held.len(), 1);
-        match failed.owner.held.first() {
+        assert_eq!(failed.owner.resources.held.len(), 1);
+        match failed.owner.resources.held.first() {
             Some(HeldResource::Prepared(prepared)) => {
                 check_prepared(prepared);
                 assert_eq!(prepared.cleanup, Some(Cleanup::Pending));
@@ -2089,4 +2098,591 @@ fn packaged_restored_mark_cas_entry() -> TestResult {
     );
     std::io::stdout().flush()?;
     Ok(())
+}
+
+// Additive total-owned finish controls. Synthetic ledger data is grounded in the
+// existing real snapshot; all admission, read, removal and finish owners are real.
+#[cfg(all(test, unix, feature = "full-tests"))]
+mod owned_finish_qualification {
+    use super::*;
+    use crate::mark_mutation::{BoundMutationOutcome, BoundMutationRefusal, MutationStatus};
+    use crate::remove_marked::{
+        ArchiveReadState, OwnedReviewedArchiveFinish, ReviewedArchiveFinishRefusal,
+        ReviewedFileRemoval, ReviewedRemovalRefusal, remove_reviewed_with_owned_archive,
+    };
+    use chrono::{Datelike, TimeZone};
+    use serde_json::{Value, json};
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    use solstone_core_backup::archive_readback::ReadbackError;
+    use solstone_core_backup_runtime::{
+        DirectReadFinishState, admit_prepared_archive_owned_read_installed,
+    };
+    use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
+    use solstone_core_journal_io::activity_obligations::{
+        NativeObligation, observe_obligations, observe_with_carrier,
+    };
+    use solstone_core_journal_io::media::{
+        ActivityCarrierRetirementEffect, Confirmation, Durability, OriginalName, RemovalEffect,
+        RemovalReceipt,
+    };
+
+    struct NativeClock;
+    impl Clock for NativeClock {
+        fn now_unix(&self) -> i64 {
+            chrono::Utc::now().timestamp()
+        }
+        fn iso_week(&self) -> u8 {
+            chrono::Utc::now().iso_week().week() as u8
+        }
+    }
+
+    fn field(value: &Value, key: &str) -> TestResult<Value> {
+        value
+            .get(key)
+            .cloned()
+            .ok_or_else(|| invalid("actual evidence field missing").into())
+    }
+
+    fn file_facts(file: &ExactArchiveFile, identity: &MediaIdentity) -> Value {
+        json!({"repository":file.repository_id,"snapshot":file.snapshot_id,
+            "path":file.archive_path,"name":file.name,"bytes":file.bytes,
+            "sha256":file.sha256,"identity":identity})
+    }
+
+    fn read_facts<'a>(reads: impl Iterator<Item = ArchiveReadState<'a>>) -> TestResult<Vec<Value>> {
+        reads.map(|read| match read {
+            ArchiveReadState::Prepared { file, target_identity, media, cleanup } => {
+                assert_eq!(cleanup, Some(Cleanup::Complete));
+                assert_eq!(*target_identity, media.identity());
+                assert_eq!(file.bytes, media.digest().size);
+                assert_eq!(file.sha256, media.digest().sha256);
+                Ok(json!({"kind":"prepared","file":file_facts(file,target_identity),
+                    "owner_address":format!("{media:p}"),"digest":media.digest(),"cleanup":cleanup}))
+            }
+            ArchiveReadState::Readback { file, target_identity, failure } => {
+                assert_eq!(failure.reason(), ReadbackError::NativeFailure);
+                Ok(json!({"kind":"readback_failure","file":file_facts(file,target_identity),
+                    "owner_address":format!("{failure:p}"),"reason":format!("{:?}",failure.reason()),
+                    "carrier_address":format!("{:p}",Arc::as_ptr(failure.carrier()))}))
+            }
+            _ => Err(invalid("actual allocated Prepared/readback owner missing").into()),
+        }).collect()
+    }
+
+    fn native_facts(receipt: &RemovalReceipt) -> Value {
+        json!({"effect":format!("{:?}",receipt.effect),
+            "original_name":format!("{:?}",receipt.original_name),
+            "claim_confirmation":format!("{:?}",receipt.claim_confirmation),
+            "file_durability":format!("{:?}",receipt.file_durability),
+            "source_durability":format!("{:?}",receipt.source_durability),
+            "claim_durability":format!("{:?}",receipt.claim_durability),
+            "stage_parent_durability":format!("{:?}",receipt.stage_parent_durability),
+            "cleanup":receipt.cleanup,"claimed_identity":receipt.claimed_identity,
+            "restoration_attempted":receipt.restoration_attempted,
+            "failures":receipt.failures.iter().map(|f|format!("{:?}:{}",f.phase,f.error)).collect::<Vec<_>>()})
+    }
+
+    fn qualified_native(receipt: &RemovalReceipt) {
+        assert_eq!(receipt.effect, RemovalEffect::Deleted);
+        assert_eq!(receipt.original_name, OriginalName::Absent);
+        assert_eq!(receipt.claim_confirmation, Confirmation::Confirmed);
+        assert_eq!(receipt.cleanup, Cleanup::Complete);
+        assert!(receipt.claimed_identity.is_some());
+        assert!(!receipt.restoration_attempted);
+        assert!(receipt.failures.is_empty());
+        for fact in [
+            receipt.file_durability,
+            receipt.source_durability,
+            receipt.claim_durability,
+            receipt.stage_parent_durability,
+        ] {
+            assert_eq!(fact, Durability::Synced);
+        }
+    }
+
+    fn bookkeeping_facts(
+        append: Option<&solstone_core_journal_io::append::BoundAppendReceipt>,
+        marker: Option<
+            &Result<
+                solstone_core_journal_io::health_marker::BoundStreamMarkerPublication,
+                solstone_core_journal_io::health_marker::BoundStreamMarkerError,
+            >,
+        >,
+        binding: Option<&io::Error>,
+    ) -> TestResult<Value> {
+        let append = append.ok_or_else(|| invalid("actual event receipt missing"))?;
+        let marker = marker
+            .ok_or_else(|| invalid("actual marker receipt missing"))?
+            .as_ref()
+            .map_err(|e| invalid(&format!("actual marker error: {e:?}")))?;
+        assert_eq!(
+            append.confirmation(),
+            solstone_core_journal_io::append::BoundAppendConfirmation::Confirmed
+        );
+        assert_eq!(
+            append.file_durability(),
+            solstone_core_journal_io::append::BoundAppendDurability::Synced
+        );
+        assert_eq!(
+            append.parent_durability(),
+            solstone_core_journal_io::append::BoundAppendDurability::Synced
+        );
+        assert!(append.failures().is_empty());
+        assert!(matches!(
+            marker.publication(),
+            solstone_core_journal_io::BoundAtomicOutcome::Published { .. }
+        ));
+        assert!(marker.binding_error().is_none());
+        assert!(marker.lock_error().is_none());
+        assert!(binding.is_none());
+        Ok(
+            json!({"append":format!("{append:?}"),"marker":format!("{marker:?}"),"binding_error":false}),
+        )
+    }
+
+    fn attempt_facts(attempts: &[ReviewedFileRemoval]) -> TestResult<Vec<Value>> {
+        attempts.iter().map(|a| {
+            qualified_native(a.native().receipt());
+            Ok(json!({"relative":a.relative(),"class":a.class(),"native":native_facts(a.native().receipt()),
+                "bookkeeping":bookkeeping_facts(a.append(),a.marker(),a.binding_error())?}))
+        }).collect()
+    }
+
+    fn mutation_facts(
+        mutation: Option<&Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    ) -> TestResult<Value> {
+        match mutation {
+            None => Ok(Value::Null),
+            Some(Ok(BoundMutationOutcome::Published(result))) => {
+                assert_eq!(result.status, MutationStatus::Applied);
+                Ok(
+                    json!({"kind":"published","status":format!("{:?}",result.status),"register":result.register}),
+                )
+            }
+            Some(Ok(BoundMutationOutcome::Unchanged(result))) => {
+                assert_eq!(result.status, MutationStatus::AlreadyApplied);
+                Ok(
+                    json!({"kind":"unchanged","status":format!("{:?}",result.status),"register":result.register}),
+                )
+            }
+            _ => Err(invalid("actual confirmed CAS result missing").into()),
+        }
+    }
+
+    fn replace_second_digest(
+        input: &Input,
+        fixture: &mut ParentFixture,
+        root: &Arc<JournalRoot>,
+    ) -> TestResult {
+        use crate::archive_catalog::codec::Event;
+        let offer = fixture
+            .mark
+            .offload
+            .as_ref()
+            .ok_or_else(|| invalid("real offer missing"))?;
+        let mut proof = offer.proof.clone();
+        assert_eq!(proof.files.len(), 2);
+        let second = proof
+            .files
+            .get_mut(1)
+            .ok_or_else(|| invalid("second file missing"))?;
+        second.sha256 = if second.sha256 == "0".repeat(64) {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        };
+        let rebuilt = OffloadOffer::with_nonce(proof, offer.nonce.clone())?;
+        assert_ne!(rebuilt.revision, offer.revision);
+        fixture.mark.offload = Some(rebuilt);
+        fixture.register_bytes = parent_save_register(input, &fixture.mark)?;
+        let proof = &fixture
+            .mark
+            .offload
+            .as_ref()
+            .ok_or_else(|| invalid("rebuilt offer missing"))?
+            .proof;
+        let event = Event::ArchiveV2 {
+            schema_version: 2,
+            time: 1,
+            day: proof.target.day.clone(),
+            stream: proof.target.stream.clone(),
+            segment: solstone_core_format::segment::segment_key(&proof.target.dir)
+                .ok_or_else(|| invalid("actual segment key missing"))?,
+            segment_dir: proof.target.dir.clone(),
+            layout: proof.layout,
+            journal_id: proof.journal_id.clone(),
+            manifest_id: proof.manifest_id.clone(),
+            repository_id: proof.repository_id.clone(),
+            snapshot_id: proof.snapshot_id.clone(),
+            files: proof.files.clone(),
+        };
+        assert_eq!(fs::read_to_string(&fixture.ledger)?.lines().count(), 1);
+        let mut bytes = serde_json::to_vec(&event)?;
+        bytes.push(b'\n');
+        fs::write(&fixture.ledger, bytes)?;
+        let catalog =
+            crate::archive_catalog::read_complete_catalog(root).map_err(|e| invalid(&e))?;
+        for file in &proof.files {
+            assert!(catalog.active_witness(proof, file).is_some());
+        }
+        Ok(())
+    }
+
+    fn unchanged(
+        input: &Input,
+        fixture: &ParentFixture,
+        original: &[solstone_core_journal_io::media::MediaObservation],
+    ) -> TestResult {
+        assert_eq!(parent_raw_observations(fixture)?, original);
+        assert_eq!(
+            fs::read(input.journal.join("health/retention-marks.json"))?,
+            fixture.register_bytes
+        );
+        for (path, complete, _) in &fixture.sidecars {
+            assert_eq!(fs::read(path)?, *complete);
+        }
+        parent_check_bookkeeping(input, fixture, &[])
+    }
+
+    fn emit(case: &str, phase: &str, value: Value) -> TestResult {
+        println!(
+            "OWNED_FINISH_EVIDENCE {}",
+            json!({"case":case,"phase":phase,"facts":value})
+        );
+        std::io::stdout().flush()?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the exact total-owned Proof composition and owning historical-package-adapted synthetic fixture"]
+    fn packaged_owned_finish_entry() -> TestResult {
+        let input: Input = serde_json::from_slice(&fs::read(
+            std::env::var_os("ARCHIVE_APPROVAL_PROBE_JSON")
+                .ok_or_else(|| invalid("explicit owned finish input required"))?,
+        )?)?;
+        assert!(matches!(
+            input.case.as_str(),
+            "owned_finish_complete"
+                | "owned_finish_unproven"
+                | "owned_finish_late_obligation"
+                | "owned_finish_second_failure"
+        ));
+        let root = Arc::new(JournalRoot::open(&input.journal)?);
+        let mut fixture = parent_fixture(&input, &root)?;
+        let original = parent_raw_observations(&fixture)?;
+        if input.case == "owned_finish_second_failure" {
+            replace_second_digest(&input, &mut fixture, &root)?;
+        }
+        let checked = parent_checked(&root, &fixture.mark)?;
+        if input.case == "owned_finish_unproven" {
+            fs::copy(
+                fixture
+                    .raw
+                    .first()
+                    .ok_or_else(|| invalid("real first raw missing"))?,
+                fixture.directory.diagnostic_path().join("extra.flac"),
+            )?;
+        }
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(NativeClock);
+        let budget = ArchiveBudget::new_cancellable(clock.as_ref(), ArchiveCancellation::new())?;
+        let operation = OwnedPreparedArchiveOperation::prepare(root.clone(), budget, clock.clone())
+            .map_err(|e| invalid(&format!("actual original preparation: {:?}", e.reason())))?;
+        assert!(Arc::ptr_eq(operation.owned_clock(), &clock));
+        let carrier_address = format!("{:p}", Arc::as_ptr(operation.carrier()));
+        let activity_address = format!("{:p}", Arc::as_ptr(operation.activity()));
+        let carrier_path = operation.carrier().diagnostic_path();
+        let carrier_identity = {
+            let m = fs::metadata(&carrier_path)?;
+            (m.dev(), m.ino())
+        };
+        let installed = admit_prepared_archive_owned_read_installed(
+            operation,
+            input.repository_id.clone(),
+            &input.expected_restic_path,
+            env!("CARGO_PKG_VERSION"),
+            &solstone_core_backup_runtime::UreqHttpTransport,
+        )
+        .map_err(|e| invalid(&format!("actual installed admission: {:?}", e.error())))?;
+        let (read, outside) = installed.into_parts();
+        assert!(Arc::ptr_eq(read.journal_root(), &root));
+        assert!(Arc::ptr_eq(read.carrier(), outside.carrier()));
+        assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+        assert!(Arc::ptr_eq(outside.owned_clock(), &clock));
+        assert_eq!(
+            format!("{:p}", Arc::as_ptr(read.carrier())),
+            carrier_address
+        );
+        assert_eq!(
+            format!("{:p}", Arc::as_ptr(read.activity())),
+            activity_address
+        );
+        emit(
+            &input.case,
+            "admitted",
+            json!({"carrier":carrier_path,"carrier_identity":carrier_identity,
+            "carrier_address":carrier_address,"activity_address":activity_address,
+            "clock_address":format!("{:p}",Arc::as_ptr(&clock)),"marks":[fixture.mark.clone()],
+            "package_admission_version":env!("CARGO_PKG_VERSION")}),
+        )?;
+        parent_observer_cut(&input, b"admitted")?;
+        let today =
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 11).ok_or_else(|| invalid("date missing"))?;
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 11, 12, 0, 0)
+            .single()
+            .ok_or_else(|| invalid("time missing"))?;
+        let run = remove_reviewed_with_owned_archive(checked, read, today, now);
+        assert!(Arc::ptr_eq(run.archive_journal_root(), &root));
+        assert_eq!(
+            format!("{:p}", Arc::as_ptr(run.archive_activity())),
+            activity_address
+        );
+        assert_eq!(
+            run.archive_expected_marks(),
+            Some(std::slice::from_ref(&fixture.mark))
+        );
+        assert_eq!(run.selected_marks(), std::slice::from_ref(&fixture.mark));
+        assert!(run.stage_failures().is_empty());
+        let reads = read_facts(run.archive_reads())?;
+        assert_eq!(reads.len(), 2);
+        let first = reads
+            .first()
+            .ok_or_else(|| invalid("first real read missing"))?;
+        let second_read = reads
+            .get(1)
+            .ok_or_else(|| invalid("second real read missing"))?;
+        assert_eq!(field(first, "kind")?, "prepared");
+        let attempts = attempt_facts(run.attempts())?;
+        let mutation = mutation_facts(run.mutation())?;
+        let outcome = serde_json::to_value(run.outcome())?;
+        let failed = input.case == "owned_finish_second_failure";
+        let unproven = input.case == "owned_finish_unproven";
+        if failed {
+            assert!(matches!(
+                run.refusal(),
+                Some(ReviewedRemovalRefusal::ArchiveApproval)
+            ));
+            assert_eq!(
+                run.approval_readback_error(),
+                Some(&ReadbackError::NativeFailure)
+            );
+            assert_eq!(field(second_read, "kind")?, "readback_failure");
+            assert_eq!(field(second_read, "carrier_address")?, carrier_address);
+            assert!(attempts.is_empty());
+            assert!(run.mutation().is_none());
+            let second = field(&field(second_read, "file")?, "identity")?;
+            assert!(payloads(&input.journal)?.iter().any(|(_, id, bytes)| {
+                serde_json::to_value(id).ok().as_ref() == Some(&second) && *bytes == 2097162
+            }));
+            unchanged(&input, &fixture, &original)?;
+        } else {
+            assert!(run.refusal().is_none(), "{:?}", run.refusal());
+            assert_eq!(field(second_read, "kind")?, "prepared");
+            if unproven {
+                assert!(attempts.is_empty());
+                assert_eq!(field(&mutation, "kind")?, "unchanged");
+                assert_eq!(run.outcome().targets.len(), 1);
+                assert_eq!(
+                    run.outcome()
+                        .targets
+                        .first()
+                        .ok_or_else(|| invalid("actual selected outcome missing"))?
+                        .not_removed
+                        .len(),
+                    2
+                );
+                unchanged(&input, &fixture, &original)?;
+            } else {
+                assert_eq!(attempts.len(), 2);
+                let expected = fixture
+                    .mark
+                    .proposal
+                    .names
+                    .iter()
+                    .map(|name| {
+                        crate::layout::content_rel(
+                            &fixture.mark.target.day,
+                            &fixture.mark.target.stream,
+                            &fixture.mark.target.dir,
+                            name,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    run.attempts()
+                        .iter()
+                        .map(|a| a.relative())
+                        .collect::<Vec<_>>(),
+                    expected.iter().map(String::as_str).collect::<Vec<_>>()
+                );
+                assert_eq!(field(&mutation, "kind")?, "published");
+                assert!(fixture.raw.iter().all(|p| !p.exists()));
+                assert!(
+                    crate::review_context::load_at_root(&root)
+                        .map_err(|e| invalid(&format!("register: {e:?}")))?
+                        .marks
+                        .is_empty()
+                );
+                parent_check_bookkeeping(&input, &fixture, &fixture.mark.proposal.names)?;
+            }
+        }
+        let before = json!({"outcome":outcome,"attempts":attempts,"mutation":mutation,"reads":reads,
+            "refusal":format!("{:?}",run.refusal()),"carrier":carrier_path,
+            "marks":run.selected_marks(),"stages":stages(&input.journal)?});
+        emit(&input.case, "returned", before.clone())?;
+        parent_observer_cut(&input, b"returned")?;
+        let late = input.case == "owned_finish_late_obligation";
+        let mut late_identity = None;
+        if late {
+            let path = input.journal.join(".tmp-offload-finish-late-obligation");
+            fs::create_dir(&path)?;
+            let m = fs::metadata(&path)?;
+            late_identity = Some(MediaIdentity::Unix {
+                device: m.dev(),
+                inode: m.ino(),
+            });
+            let census = observe_with_carrier(&root, outside.carrier().observation())?;
+            assert!(census.unresolved_entries().any(|e|matches!(e,NativeObligation::Stage {relative,entry}
+                if relative==Path::new(".tmp-offload-finish-late-obligation")&&Some(entry.identity)==late_identity)));
+        }
+        let before_stages = stages(&input.journal)?;
+        let before_payloads = payloads(&input.journal)?;
+        match run.finish() {
+            OwnedReviewedArchiveFinish::Settled(settled) => {
+                assert_eq!(input.case, "owned_finish_complete");
+                let (settled_read, report) = settled.into_parts();
+                assert!(Arc::ptr_eq(settled_read.carrier(), outside.carrier()));
+                assert!(Arc::ptr_eq(settled_read.owned_clock(), &clock));
+                assert_eq!(
+                    serde_json::to_value(report.outcome())?,
+                    field(&before, "outcome")?
+                );
+                assert_eq!(
+                    serde_json::to_value(report.selected_marks())?,
+                    field(&before, "marks")?
+                );
+                assert_eq!(
+                    mutation_facts(report.mutation())?,
+                    field(&before, "mutation")?
+                );
+                let report_attempts=report.attempts().iter().map(|a| {
+                    qualified_native(a.native());
+                    Ok(json!({"relative":a.relative(),"class":a.class(),"native":native_facts(a.native()),
+                        "bookkeeping":bookkeeping_facts(a.append(),a.marker(),a.binding_error())?}))
+                }).collect::<TestResult<Vec<_>>>()?;
+                assert_eq!(json!(report_attempts), field(&before, "attempts")?);
+                assert_eq!(report.archive_reads().len(), 2);
+                for (record, saved) in report.archive_reads().iter().zip(&reads) {
+                    assert_eq!(
+                        file_facts(record.file(), record.target_identity()),
+                        field(saved, "file")?
+                    );
+                    assert_eq!(json!(record.digest()), field(saved, "digest")?);
+                    assert_eq!(json!(record.cleanup()), field(saved, "cleanup")?);
+                }
+                let completed = outside.finish_owned(settled_read);
+                assert_eq!(completed.state(), DirectReadFinishState::Completed);
+                assert!(completed.reason().is_none());
+                assert!(Arc::ptr_eq(completed.journal_root(), &root));
+                assert!(Arc::ptr_eq(completed.owned_clock(), &clock));
+                let retirement = &completed
+                    .retirement()
+                    .ok_or_else(|| invalid("actual retirement missing"))?
+                    .receipt;
+                assert_eq!(
+                    retirement.effect(),
+                    ActivityCarrierRetirementEffect::Removed
+                );
+                assert_eq!(retirement.root_durability(), Durability::Synced);
+                assert_eq!(retirement.confirmation(), Confirmation::Confirmed);
+                assert!(retirement.failures().is_empty());
+                assert!(stages(&input.journal)?.is_empty());
+                emit(
+                    &input.case,
+                    "finished",
+                    json!({"finish":"Completed","retirement":format!("{retirement:?}"),
+                    "before":before,"report_attempts":report_attempts,"stages":stages(&input.journal)?}),
+                )?;
+                parent_observer_cut(&input, b"finished")?;
+                drop(completed);
+                assert!(observe_obligations(&root)?.entries().is_empty());
+                drop(ActivityLease::try_acquire(root.clone())?);
+                drop(TeardownLease::try_acquire(root.clone())?);
+                emit(
+                    &input.case,
+                    "released",
+                    json!({"empty_census":true,"next_activity":true,"next_teardown":true}),
+                )?;
+            }
+            OwnedReviewedArchiveFinish::Held(held) => {
+                assert_ne!(input.case, "owned_finish_complete");
+                if late {
+                    let Some(ReviewedArchiveFinishRefusal::Obligations(entries)) =
+                        held.finish_refusal()
+                    else {
+                        return Err(invalid("actual late census hold missing").into());
+                    };
+                    assert!(entries.iter().any(|e|matches!(e,NativeObligation::Stage {relative,entry}
+                        if relative==Path::new(".tmp-offload-finish-late-obligation")&&Some(entry.identity)==late_identity)));
+                } else {
+                    assert!(matches!(
+                        held.finish_refusal(),
+                        Some(ReviewedArchiveFinishRefusal::IncompleteSelection)
+                    ));
+                }
+                assert!(Arc::ptr_eq(held.archive_journal_root(), &root));
+                assert_eq!(held.selected_marks(), std::slice::from_ref(&fixture.mark));
+                assert_eq!(
+                    held.archive_expected_marks(),
+                    Some(std::slice::from_ref(&fixture.mark))
+                );
+                assert_eq!(read_facts(held.archive_reads())?, reads);
+                assert_eq!(
+                    serde_json::to_value(held.outcome())?,
+                    field(&before, "outcome")?
+                );
+                assert_eq!(attempt_facts(held.attempts())?, attempts);
+                assert_eq!(mutation_facts(held.mutation())?, mutation);
+                assert_eq!(format!("{:?}", held.refusal()), field(&before, "refusal")?);
+                assert!(held.stage_failures().is_empty());
+                if failed {
+                    assert_eq!(
+                        held.approval_readback_error(),
+                        Some(ReadbackError::NativeFailure)
+                    );
+                }
+                assert_eq!(stages(&input.journal)?, before_stages);
+                assert_eq!(payloads(&input.journal)?, before_payloads);
+                assert_eq!(
+                    format!("{:p}", Arc::as_ptr(outside.carrier())),
+                    carrier_address
+                );
+                assert!(Arc::ptr_eq(outside.owned_clock(), &clock));
+                let m = fs::metadata(&carrier_path)?;
+                assert_eq!((m.dev(), m.ino()), carrier_identity);
+                assert!(matches!(
+                    TeardownLease::try_acquire(root.clone()),
+                    Err(ActivityAdmissionError::Busy)
+                ));
+                if failed || unproven {
+                    unchanged(&input, &fixture, &original)?;
+                } else {
+                    assert!(fixture.raw.iter().all(|p| !p.exists()));
+                    parent_check_bookkeeping(&input, &fixture, &fixture.mark.proposal.names)?;
+                }
+                emit(
+                    &input.case,
+                    "finished",
+                    json!({"finish":"Held","finish_refusal":if late {"Obligations"} else {"IncompleteSelection"},
+                    "before":before,"reads":reads,"late_identity":late_identity,"stages":before_stages,
+                    "payloads":before_payloads,"outside_original_retained":true,"teardown_busy":true}),
+                )?;
+                parent_observer_cut(&input, b"finished")?;
+                // Whole real held and outside owners remain live until this final observation.
+                assert_eq!(read_facts(held.archive_reads())?, reads);
+                outside.carrier().revalidate()?;
+            }
+        }
+        Ok(())
+    }
 }

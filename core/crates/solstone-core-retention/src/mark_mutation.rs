@@ -837,7 +837,7 @@ fn check_restored_catalog(
 pub(crate) struct CheckedMarkGuard<'a, 'op> {
     checked: &'a CheckedReviewContext,
     lock: BoundParentLock,
-    archive: Option<&'a crate::archive_approval::ArchiveApprovalBatch<'op>>,
+    archive: Option<crate::archive_approval::ArchiveApprovalRef<'a, 'op>>,
 }
 
 #[cfg(unix)]
@@ -858,7 +858,7 @@ impl<'a, 'op> CheckedMarkGuard<'a, 'op> {
 
     pub(crate) fn acquire_archive(
         checked: &'a CheckedReviewContext,
-        archive: &'a crate::archive_approval::ArchiveApprovalBatch<'op>,
+        archive: crate::archive_approval::ArchiveApprovalRef<'a, 'op>,
     ) -> Result<Self, BoundMutationRefusal> {
         Self::check_archive(checked, archive)?;
         let (lock, register) = begin_bound_read(checked.root(), checked.health())?;
@@ -876,7 +876,7 @@ impl<'a, 'op> CheckedMarkGuard<'a, 'op> {
 
     fn check_archive(
         checked: &CheckedReviewContext,
-        archive: &crate::archive_approval::ArchiveApprovalBatch<'_>,
+        archive: crate::archive_approval::ArchiveApprovalRef<'_, '_>,
     ) -> Result<(), BoundMutationRefusal> {
         if !std::sync::Arc::ptr_eq(checked.root_arc(), archive.journal_root())
             || checked

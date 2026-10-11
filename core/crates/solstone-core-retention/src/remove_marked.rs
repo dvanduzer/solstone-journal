@@ -561,6 +561,14 @@ pub fn remove_reviewed(
     ReviewedRemoval { checked, execution }
 }
 
+mod archive_finish;
+pub use archive_finish::{
+    OwnedReviewedArchiveFinish, OwnedReviewedArchiveRemoval, OwnedReviewedArchiveRun,
+    OwnedSettledReviewedArchiveRemoval, ReviewedArchiveFinish, ReviewedArchiveFinishRefusal,
+    ReviewedArchiveReadReport, ReviewedArchiveReport, ReviewedRemovalFileReport,
+    SettledReviewedArchiveRemoval, remove_reviewed_with_owned_archive,
+};
+
 /// Retains exact archive confirmation and all effects through caller settlement.
 #[must_use]
 pub struct ReviewedArchiveRemoval<'a> {
@@ -570,6 +578,7 @@ pub struct ReviewedArchiveRemoval<'a> {
 }
 
 enum ArchiveReviewOwner<'a> {
+    Finishing(Box<crate::archive_approval::ArchiveApprovalFinishing<'a>>),
     Pending {
         _read: Box<solstone_core_backup::archive_readback::ReadOperation<'a>>,
     },
@@ -634,6 +643,9 @@ impl ReviewedArchiveRemoval<'_> {
         if let Some(ReviewedRemovalRefusal::Readback(error)) = self.refusal() {
             return Some(error);
         }
+        if let ArchiveReviewOwner::Finishing(owner) = &self.approval {
+            return owner.readback_error();
+        }
         let ArchiveReviewOwner::Approval(approval) = &self.approval else {
             return None;
         };
@@ -662,6 +674,7 @@ impl ReviewedArchiveRemoval<'_> {
     }
     pub fn archive_journal_root(&self) -> &std::sync::Arc<solstone_core_journal_io::JournalRoot> {
         match &self.approval {
+            ArchiveReviewOwner::Finishing(owner) => owner.carrier().journal_root(),
             ArchiveReviewOwner::Pending { _read: read } => read.journal_root(),
             ArchiveReviewOwner::Approval(Ok(batch)) => batch.journal_root(),
             ArchiveReviewOwner::Approval(Err(failure)) => failure.journal_root(),
@@ -671,6 +684,7 @@ impl ReviewedArchiveRemoval<'_> {
         &self,
     ) -> &std::sync::Arc<solstone_core_journal_io::activity::ActivityLease> {
         match &self.approval {
+            ArchiveReviewOwner::Finishing(owner) => owner.carrier().activity(),
             ArchiveReviewOwner::Pending { _read: read } => read.activity(),
             ArchiveReviewOwner::Approval(Ok(batch)) => batch.activity(),
             ArchiveReviewOwner::Approval(Err(failure)) => failure.activity(),
@@ -678,6 +692,7 @@ impl ReviewedArchiveRemoval<'_> {
     }
     pub fn archive_expected_marks(&self) -> Option<&[Mark]> {
         match &self.approval {
+            ArchiveReviewOwner::Finishing(owner) => Some(owner.expected_marks()),
             ArchiveReviewOwner::Pending { .. } => None,
             ArchiveReviewOwner::Approval(Ok(batch)) => Some(batch.expected_marks()),
             ArchiveReviewOwner::Approval(Err(failure)) => Some(failure.expected_marks()),
@@ -685,6 +700,7 @@ impl ReviewedArchiveRemoval<'_> {
     }
     pub fn archive_reads(&self) -> impl Iterator<Item = ArchiveReadState<'_>> {
         match &self.approval {
+            ArchiveReviewOwner::Finishing(owner) => owner.read_states(),
             ArchiveReviewOwner::Pending { .. } => {
                 crate::archive_approval::ArchiveReadStates::empty()
             }
@@ -864,7 +880,7 @@ fn remove_reviewed_approved_with<'a>(
             today,
             now,
             &mut execution,
-            Some(batch),
+            Some(batch.view()),
             checkpoint,
         ),
         Err(_) => Err(ReviewedRemovalRefusal::ArchiveApproval),
@@ -909,6 +925,18 @@ fn finish_archive_review_owner<'a>(
     mut execution: ReviewedExecution,
     result: Result<(), ReviewedRemovalRefusal>,
 ) -> ReviewedArchiveRemoval<'a> {
+    finish_archive_execution(&mut execution, result);
+    ReviewedArchiveRemoval {
+        checked,
+        approval,
+        execution,
+    }
+}
+
+fn finish_archive_execution(
+    execution: &mut ReviewedExecution,
+    result: Result<(), ReviewedRemovalRefusal>,
+) {
     if let Err(error) = result {
         execution.refusal = Some(error);
         reviewed_mark_unsaved_deletions(&mut execution.outcome);
@@ -920,11 +948,6 @@ fn finish_archive_review_owner<'a>(
             }
             .to_owned(),
         });
-    }
-    ReviewedArchiveRemoval {
-        checked,
-        approval,
-        execution,
     }
 }
 
@@ -1218,7 +1241,7 @@ fn valid_reviewed_selection(marks: &[Mark]) -> bool {
 
 #[cfg(unix)]
 fn reviewed_admission(
-    archive: Option<&crate::archive_approval::ArchiveApprovalBatch<'_>>,
+    archive: Option<crate::archive_approval::ArchiveApprovalRef<'_, '_>>,
     execution: &ReviewedExecution,
 ) -> Result<(), ReviewedRemovalRefusal> {
     if let Some(archive) = archive {
@@ -1237,7 +1260,7 @@ fn reviewed_admission(
 
 #[cfg(unix)]
 fn reviewed_archive_processing<'a>(
-    archive: &crate::archive_approval::ArchiveApprovalBatch<'_>,
+    archive: crate::archive_approval::ArchiveApprovalRef<'_, '_>,
     mark: &'a Mark,
     group: &ReviewedGroup,
     name: &str,
@@ -1286,7 +1309,7 @@ fn reviewed_archive_processing<'a>(
 
 #[cfg(unix)]
 fn reviewed_archive_file(
-    archive: &crate::archive_approval::ArchiveApprovalBatch<'_>,
+    archive: crate::archive_approval::ArchiveApprovalRef<'_, '_>,
     mark: &Mark,
     group: &ReviewedGroup,
     name: &str,
@@ -1317,7 +1340,7 @@ fn reviewed_archive_file(
 /// Only the retained current verifier can mint the ordinary-age exception.
 #[cfg(unix)]
 pub(crate) struct ArchiveRelease<'a, 'op> {
-    archive: &'a crate::archive_approval::ArchiveApprovalBatch<'op>,
+    archive: crate::archive_approval::ArchiveApprovalRef<'a, 'op>,
     register: &'a crate::mark_mutation::CheckedMarkGuard<'a, 'op>,
     policy: &'a ReviewedPolicy,
     group: &'a ReviewedGroup,
@@ -1431,7 +1454,7 @@ fn execute_reviewed_mode(
     today: NaiveDate,
     now: DateTime<Utc>,
     execution: &mut ReviewedExecution,
-    archive: Option<&crate::archive_approval::ArchiveApprovalBatch<'_>>,
+    archive: Option<crate::archive_approval::ArchiveApprovalRef<'_, '_>>,
     mut checkpoint: impl FnMut(ReviewedCheckpoint, &Path),
 ) -> Result<(), ReviewedRemovalRefusal> {
     use crate::mark_mutation::CheckedMarkGuard;

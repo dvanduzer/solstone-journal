@@ -34,6 +34,7 @@ solstone-core-processing-record = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+solstone-core-backup-runtime.workspace = true
 solstone-core-journal-io = { workspace = true, features = ["test-hooks"] }
 # The index-ordering test drives a real SQLite index through the notification
 # boundary. ⛔ Dev-only: the executor depends on the trait, never on a database,
