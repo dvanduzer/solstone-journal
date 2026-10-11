@@ -220,6 +220,7 @@ mod tests {
             detail: None,
             guidance: None,
             recording_failure: None,
+            report: None,
             portal_url: None,
         }
     }

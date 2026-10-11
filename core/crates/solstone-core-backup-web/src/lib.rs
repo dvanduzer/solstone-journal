@@ -640,12 +640,31 @@ fn publish_restore_error(deps: &BackupWebDeps, reason_code: &str) -> Terminal {
 }
 
 fn map_offload_restore(result: solstone_core_offload::RestoreResult) -> Terminal {
-    match result.status.as_str() {
+    let report = offload_restore_report(&result);
+    let mut terminal = match result.status.as_str() {
         "ok" | "no_op" => Terminal::phase("done", result.reason),
         "refused" => Terminal::phase("refused", result.reason),
         "degraded" => Terminal::phase("degraded", result.reason),
         _ => Terminal::phase("error", result.reason.or_else(|| Some("failed".into()))),
-    }
+    };
+    terminal.report = Some(report);
+    terminal
+}
+
+fn offload_restore_report(result: &solstone_core_offload::RestoreResult) -> Value {
+    json!({
+        "status":result.status, "reason":result.reason, "scope":result.scope, "day":result.day,
+        "segments_selected":result.segments_selected, "segments_restored":result.segments_restored,
+        "files_expected":result.files_expected, "files_restored":result.files_restored,
+        "bytes_expected":result.bytes_expected, "bytes_restored":result.bytes_restored,
+        "reason_detail":result.reason_detail,
+        "details":result.details.iter().map(|detail| json!({
+            "status":detail.status, "reason":detail.reason, "day":detail.day, "stream":detail.stream,
+            "segment":detail.segment, "snapshot_id":detail.snapshot_id,
+            "files_expected":detail.files_expected, "files_restored":detail.files_restored,
+            "bytes_expected":detail.bytes_expected, "bytes_restored":detail.bytes_restored,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 async fn enable_backup(deps: BackupWebDeps) -> axum::response::Response {
@@ -1408,3 +1427,87 @@ mod corpus;
 mod resolution_tests;
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod offload_report_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "pure restore DTO forwarding controls"
+    )]
+
+    use super::*;
+    use solstone_core_offload::restore::{RestoreResult, RestoreSegmentResult};
+
+    #[test]
+    fn terminal_mapping_keeps_partial_reports_and_exact_json_integers() {
+        let bytes = (1_u64 << 53) + 17;
+        let first = RestoreSegmentResult {
+            status: "ok".into(),
+            reason: None,
+            day: "20260101".into(),
+            stream: "_default".into(),
+            segment: "010000_001".into(),
+            snapshot_id: Some("snapshot".into()),
+            files_expected: 1,
+            files_restored: 1,
+            bytes_expected: bytes,
+            bytes_restored: bytes,
+        };
+        let mut later = first.clone();
+        later.status = "error".into();
+        later.reason = Some("verification_failed".into());
+        later.files_restored = 0;
+        later.bytes_expected = 100;
+        later.bytes_restored = 0;
+        for (status, phase) in [
+            ("ok", "done"),
+            ("no_op", "done"),
+            ("refused", "refused"),
+            ("degraded", "degraded"),
+            ("error", "error"),
+            ("unknown", "error"),
+        ] {
+            let result = RestoreResult {
+                status: status.into(),
+                reason: Some("verification_failed".into()),
+                scope: "all".into(),
+                day: None,
+                segments_selected: 2,
+                segments_restored: 1,
+                files_expected: 2,
+                files_restored: 1,
+                bytes_expected: bytes + 100,
+                bytes_restored: bytes,
+                reason_detail: Some("segment identity changed".into()),
+                details: vec![first.clone(), later.clone()],
+            };
+            let terminal = map_offload_restore(result);
+            assert_eq!(terminal.phase, phase);
+            assert_eq!(terminal.reason_code.as_deref(), Some("verification_failed"));
+            let encoded = serde_json::to_string(&terminal.report).unwrap();
+            let report: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(report["status"], status);
+            assert_eq!(report["scope"], "all");
+            assert!(report["day"].is_null());
+            assert_eq!(report["reason"], "verification_failed");
+            assert_eq!(report["reason_detail"], "segment identity changed");
+            assert_eq!(report["segments_selected"], 2);
+            assert_eq!(report["segments_restored"], 1);
+            assert_eq!(report["files_expected"], 2);
+            assert_eq!(report["files_restored"], 1);
+            assert_eq!(report["bytes_expected"].as_u64(), Some(bytes + 100));
+            assert_eq!(report["bytes_restored"].as_u64(), Some(bytes));
+            assert_eq!(report["details"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                report["details"][0]["segment"],
+                report["details"][1]["segment"]
+            );
+            assert_eq!(report["details"][0]["status"], "ok");
+            assert_eq!(report["details"][0]["bytes_restored"].as_u64(), Some(bytes));
+            assert_eq!(report["details"][1]["status"], "error");
+            assert_eq!(report["details"][1]["reason"], "verification_failed");
+            assert_eq!(report["details"][1]["bytes_restored"], 0);
+        }
+    }
+}

@@ -329,6 +329,7 @@ mod tests {
             assert_eq!(actual.detail, expected.detail);
             assert_eq!(actual.guidance, expected.guidance);
             assert_eq!(actual.recording_failure, expected.recording_failure);
+            assert_eq!(actual.report, expected.report);
             assert!(!operation::is_busy(&slot));
             let (next, next_budget) = admitted(&slot, &clock);
             assert_eq!(
@@ -353,6 +354,7 @@ mod tests {
                 detail: Some("earlier effects retained".into()),
                 guidance: Some("review remaining targets".into()),
                 recording_failure: Some("recording failed".into()),
+                report: Some(serde_json::json!({"files_restored":1, "bytes_restored":7})),
             });
         }
 

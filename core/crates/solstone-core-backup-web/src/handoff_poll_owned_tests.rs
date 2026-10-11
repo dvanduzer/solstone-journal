@@ -25,6 +25,7 @@ fn full_terminal() -> Terminal {
         detail: Some("detail".into()),
         guidance: Some("guidance".into()),
         recording_failure: Some("recording".into()),
+        report: Some(serde_json::json!({"files_restored":1, "bytes_restored":7})),
     }
 }
 
@@ -99,6 +100,7 @@ async fn late_poll_failures_preserve_callback_admission_and_complete_worker_term
                     assert_eq!(current.detail, expected.detail);
                     assert_eq!(current.guidance, expected.guidance);
                     assert_eq!(current.recording_failure, expected.recording_failure);
+                    assert_eq!(current.report, expected.report);
                     let next = operation::begin(&deps.operations, "restore", None, None, None)
                         .unwrap()
                         .generation;
@@ -110,6 +112,12 @@ async fn late_poll_failures_preserve_callback_admission_and_complete_worker_term
                         "expired",
                     );
                     assert_eq!(operation::generation_of(&deps.operations), Some(next));
+                    assert!(
+                        operation::current(&deps.operations)
+                            .unwrap()
+                            .report
+                            .is_none()
+                    );
                     assert!(operation::is_busy(&deps.operations));
                     assert!(operation::mark_cancelled(&deps.operations, next));
                 },
