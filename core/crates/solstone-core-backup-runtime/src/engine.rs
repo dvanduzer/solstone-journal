@@ -1661,11 +1661,10 @@ impl HttpTransport for ArchiveAdmissionHttp<'_> {
             .map_err(|_| crate::hosted_runtime::HttpError::Timeout)?;
         let mut request = request.clone();
         request.timeout = request.timeout.min(remaining);
-        if self.budget.cancellation().is_some() {
-            // Operated cancellation requires an explicit controlled HTTP transport.
-            return Err(crate::hosted_runtime::HttpError::Other);
+        match self.budget.cancellation() {
+            Some(cancellation) => self.inner.execute_cancellable(&request, cancellation),
+            None => self.inner.execute(&request),
         }
-        self.inner.execute(&request)
     }
 }
 
@@ -2554,6 +2553,113 @@ mod tests {
                 responses: RefCell::new(VecDeque::from([Ok(response)])),
                 requests: RefCell::new(vec![]),
             }
+        }
+
+        struct ControlledHttp {
+            response: Result<HttpResponse, HttpError>,
+            cancel_during: bool,
+            requests: RefCell<Vec<HttpRequest>>,
+            observed: RefCell<Option<ArchiveCancellation>>,
+        }
+
+        impl HttpTransport for ControlledHttp {
+            fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
+                panic!("controlled HTTP must never fall back to ordinary execution")
+            }
+
+            fn execute_cancellable(
+                &self,
+                request: &HttpRequest,
+                cancellation: &ArchiveCancellation,
+            ) -> Result<HttpResponse, HttpError> {
+                assert!(!cancellation.is_cancelled());
+                self.requests.borrow_mut().push(request.clone());
+                *self.observed.borrow_mut() = Some(cancellation.clone());
+                if self.cancel_during {
+                    cancellation.cancel();
+                }
+                self.response.clone()
+            }
+        }
+
+        fn controlled_http(journal: &Path, cancel_during: bool, fails: bool) -> ControlledHttp {
+            let script = hosted(journal, "2030-01-01T00:00:00Z");
+            ControlledHttp {
+                response: if fails {
+                    Err(HttpError::Other)
+                } else {
+                    script.responses.borrow_mut().pop_front().unwrap()
+                },
+                cancel_during,
+                requests: RefCell::new(vec![]),
+                observed: RefCell::new(None),
+            }
+        }
+
+        #[test]
+        fn controlled_broker_keeps_request_ceiling_original_budget_and_stop_signal() {
+            for seconds_left in [5, 35] {
+                let (journal, root) = fixture();
+                let http = controlled_http(journal.path(), false, false);
+                let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                let now = Rc::new(Cell::new(50));
+                let clock = MutableClock(now.clone());
+                let cancellation = ArchiveCancellation::new();
+                let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+                now.set(50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - seconds_left);
+                let mut services = services(&runner, &http, &clock, &Maintenance);
+                services.rclone_path = Some(Path::new("/fixture/bin/rclone"));
+                let admitted = admit_archive_with_budget(root, &services, budget).unwrap();
+                assert_eq!(http.requests.borrow().len(), 1);
+                assert_eq!(
+                    http.requests.borrow()[0].timeout,
+                    Duration::from_secs(seconds_left.min(30) as u64)
+                );
+                assert!(
+                    runner
+                        .requests
+                        .borrow()
+                        .iter()
+                        .all(|r| r.timeout == Some(Duration::from_secs(seconds_left as u64)))
+                );
+                http.observed.borrow().as_ref().unwrap().cancel();
+                assert!(cancellation.is_cancelled());
+                assert_eq!(admitted.revalidate_local(), Err(ArchiveError::Cancelled));
+            }
+        }
+
+        #[test]
+        fn controlled_broker_cancellation_after_success_or_error_refuses_before_tools() {
+            for fails in [false, true] {
+                let (journal, root) = fixture();
+                let http = controlled_http(journal.path(), true, fails);
+                let cancellation = ArchiveCancellation::new();
+                let budget =
+                    ArchiveBudget::new_cancellable(&FixedClock, cancellation.clone()).unwrap();
+                let services = services(&PanicRunner, &http, &FixedClock, &Maintenance);
+                assert_eq!(
+                    refusal(admit_archive_with_budget(root, &services, budget)),
+                    ArchiveError::Cancelled
+                );
+                assert!(cancellation.is_cancelled());
+                assert_eq!(http.requests.borrow().len(), 1);
+            }
+        }
+
+        #[test]
+        fn precancelled_operated_budget_refuses_before_controlled_http() {
+            let (journal, root) = fixture();
+            let http = controlled_http(journal.path(), false, false);
+            let cancellation = ArchiveCancellation::new();
+            let budget = ArchiveBudget::new_cancellable(&FixedClock, cancellation.clone()).unwrap();
+            cancellation.cancel();
+            let services = services(&PanicRunner, &http, &FixedClock, &Maintenance);
+            assert_eq!(
+                refusal(admit_archive_with_budget(root, &services, budget)),
+                ArchiveError::Cancelled
+            );
+            assert!(http.requests.borrow().is_empty());
+            assert!(http.observed.borrow().is_none());
         }
 
         #[cfg(all(test, feature = "full-tests", unix))]
