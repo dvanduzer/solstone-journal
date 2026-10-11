@@ -2008,6 +2008,7 @@ impl<'a> AdmittedArchive<'a> {
         args.extend([
             "backup".into(),
             "--force".into(),
+            "--no-cache".into(),
             "--tag".into(),
             ARCHIVE_TAG.into(),
             "--retry-lock".into(),
@@ -2738,6 +2739,7 @@ mod tests {
                     if request.argv.iter().any(|arg| arg == "backup") {
                         assert!(request.argv.iter().any(|arg| arg == OsStr::new(&expected)));
                         assert!(request.argv.iter().any(|arg| arg == "--force"));
+                        assert!(request.argv.iter().any(|arg| arg == "--no-cache"));
                         assert_eq!(
                             request
                                 .pass_fds
