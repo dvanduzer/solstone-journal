@@ -1229,3 +1229,256 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "full-tests"))]
+mod ancestor_cut_tests {
+    use std::ffi::OsStr;
+    use std::fs::{self, File};
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    use super::{file_identity, run_with_windows_detailed_atomic_barrier};
+    use crate::atomic::{DetailedAtomicOutcome, atomic_replace_detailed_bound};
+    use crate::journal_root::{JournalRoot, ObjectIdentity};
+    use crate::locking::{BoundParentLock, acquire_existing_parent_lock_bound};
+    use crate::media::MediaDirectory;
+    use crate::windows_identity::WindowsFileIdentity;
+    use crate::windows_sync_dir::{WindowsFlatDirectory, open_windows_flat_directory_bound};
+
+    const DESTINATION: &str = "journal.json";
+    const LOCK: &str = "journal.json.lock";
+    const ORIGINAL: &[u8] = b"original config";
+    const PREPARED: &[u8] = b"prepared config";
+    const COMPETITOR: &[u8] = b"replacement destination";
+    const COMPETITOR_STAGE: &[u8] = b"replacement stage";
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        ancestor: PathBuf,
+        journal: PathBuf,
+        config: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+                Some(root) => tempfile::tempdir_in(root).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let ancestor = temp.path().join("ancestor");
+            let journal = ancestor.join("journal");
+            let config = journal.join("config");
+            fs::create_dir_all(&config).unwrap();
+            fs::write(config.join(DESTINATION), ORIGINAL).unwrap();
+            Self {
+                _temp: temp,
+                ancestor,
+                journal,
+                config,
+            }
+        }
+
+        fn admission(
+            &self,
+        ) -> (
+            Arc<JournalRoot>,
+            Arc<MediaDirectory>,
+            WindowsFlatDirectory,
+            BoundParentLock,
+        ) {
+            let root = Arc::new(JournalRoot::open(&self.journal).unwrap());
+            let media = MediaDirectory::open(Arc::clone(&root), Path::new("config")).unwrap();
+            let flat = open_windows_flat_directory_bound(
+                root.as_ref(),
+                OsStr::new("config"),
+                root.canonical_path(),
+            )
+            .unwrap()
+            .unwrap();
+            let identity = flat.identity();
+            assert_eq!(
+                media.object_identity(),
+                ObjectIdentity::from_volume_and_file_id(
+                    identity.volume_serial(),
+                    identity.file_id()
+                )
+            );
+            root.revalidate_canonical_binding().unwrap();
+            media.revalidate().unwrap();
+            let lock = acquire_existing_parent_lock_bound(
+                &flat,
+                OsStr::new(LOCK),
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .unwrap();
+            (root, media, flat, lock)
+        }
+
+        fn cut(&self, level: usize) -> &Path {
+            match level {
+                0 => &self.config,
+                1 => &self.journal,
+                _ => &self.ancestor,
+            }
+        }
+    }
+
+    fn staged_file(config: &Path) -> PathBuf {
+        let entries = fs::read_dir(config)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name() != Some(OsStr::new(DESTINATION))
+                    && path.file_name() != Some(OsStr::new(LOCK))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "must observe the one real staged file");
+        entries[0].clone()
+    }
+
+    fn identity(path: &Path) -> WindowsFileIdentity {
+        file_identity(File::open(path).unwrap().as_raw_handle()).unwrap()
+    }
+
+    #[test]
+    fn unguarded_parent_root_and_ancestor_substitution_controls_succeed() {
+        for level in 0..3 {
+            let f = Fixture::new();
+            let cut = f.cut(level);
+            let saved = cut.with_extension("retired");
+            let original_config = saved.join(f.config.strip_prefix(cut).unwrap());
+            fs::rename(cut, &saved).unwrap();
+            fs::create_dir_all(&f.config).unwrap();
+            fs::write(f.config.join(DESTINATION), COMPETITOR).unwrap();
+            assert_eq!(
+                fs::read(original_config.join(DESTINATION)).unwrap(),
+                ORIGINAL
+            );
+            assert_eq!(fs::read(f.config.join(DESTINATION)).unwrap(), COMPETITOR);
+            eprintln!(
+                "UNGUARDED_SUBSTITUTION level={level} path={} success=true",
+                cut.display()
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_positive_publication_confirms_real_stage_full_identity() {
+        let f = Fixture::new();
+        let (root, media, flat, lock) = f.admission();
+        let stage_id = Arc::new(Mutex::new(None));
+        let captured_id = Arc::clone(&stage_id);
+        let config = f.config.clone();
+        let (outcome, fired) = run_with_windows_detailed_atomic_barrier(
+            "rename",
+            1,
+            move || {
+                *captured_id.lock().unwrap() = Some(identity(&staged_file(&config)));
+            },
+            || {
+                atomic_replace_detailed_bound(
+                    &flat,
+                    &lock,
+                    OsStr::new(DESTINATION),
+                    PREPARED,
+                    0o600,
+                )
+            },
+        );
+        eprintln!("GUARDED_POSITIVE outcome={outcome:?} metadata_durability=unproven");
+        assert!(fired);
+        assert!(matches!(outcome, Ok(DetailedAtomicOutcome::Published)));
+        assert_eq!(fs::read(f.config.join(DESTINATION)).unwrap(), PREPARED);
+        assert_eq!(
+            Some(identity(&f.config.join(DESTINATION))),
+            *stage_id.lock().unwrap()
+        );
+        root.revalidate_canonical_binding().unwrap();
+        media.revalidate().unwrap();
+        // Published is effect/name evidence; this Windows primitive does not sync the parent.
+    }
+
+    #[test]
+    fn final_gap_parent_root_and_ancestor_cuts_preserve_replacement_namespace() {
+        for level in 0..3 {
+            let f = Fixture::new();
+            let (root, media, flat, lock) = f.admission();
+            let cut = f.cut(level).to_path_buf();
+            let saved = cut.with_extension("retired");
+            let original_config = saved.join(f.config.strip_prefix(&cut).unwrap());
+            let config = f.config.clone();
+            let observations = Arc::new(Mutex::new(None));
+            let captured = Arc::clone(&observations);
+            let (outcome, fired) = run_with_windows_detailed_atomic_barrier(
+                "rename",
+                1,
+                move || {
+                    let stage = staged_file(&config);
+                    let stage_name = stage.file_name().unwrap().to_os_string();
+                    let original_stage_id = identity(&stage);
+                    let result = fs::rename(&cut, &saved);
+                    let raw_error = result.as_ref().err().and_then(std::io::Error::raw_os_error);
+                    let swapped = result.is_ok();
+                    if swapped {
+                        fs::create_dir_all(&config).unwrap();
+                        fs::write(config.join(&stage_name), COMPETITOR_STAGE).unwrap();
+                        fs::write(config.join(DESTINATION), COMPETITOR).unwrap();
+                    }
+                    eprintln!(
+                        "FINAL_GAP_CUT level={level} path={} swapped={swapped} raw_error={raw_error:?} stage={} stage_id={original_stage_id:?}",
+                        cut.display(),
+                        stage_name.to_string_lossy()
+                    );
+                    *captured.lock().unwrap() =
+                        Some((swapped, raw_error, stage_name, original_stage_id));
+                },
+                || {
+                    atomic_replace_detailed_bound(
+                        &flat,
+                        &lock,
+                        OsStr::new(DESTINATION),
+                        PREPARED,
+                        0o600,
+                    )
+                },
+            );
+            assert!(fired, "the final native cut must be reached");
+            let (swapped, raw_error, stage_name, stage_id) =
+                observations.lock().unwrap().take().unwrap();
+            let current = fs::read(f.config.join(DESTINATION)).unwrap();
+            eprintln!(
+                "FINAL_GAP_RESULT level={level} outcome={outcome:?} current_bytes={current:?} metadata_durability=unproven"
+            );
+            if swapped {
+                let original = fs::read(original_config.join(DESTINATION)).unwrap();
+                eprintln!("FINAL_GAP_ORIGINAL level={level} original_bytes={original:?}");
+                assert_eq!(
+                    current, COMPETITOR,
+                    "publication touched a replacement destination"
+                );
+                assert_eq!(
+                    fs::read(f.config.join(stage_name)).unwrap(),
+                    COMPETITOR_STAGE
+                );
+                assert!(!matches!(outcome, Ok(DetailedAtomicOutcome::Published)));
+                assert!(original == ORIGINAL || original == PREPARED);
+            } else {
+                assert!(matches!(
+                    raw_error,
+                    Some(code) if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32
+                ));
+                assert!(matches!(outcome, Ok(DetailedAtomicOutcome::Published)));
+                assert_eq!(current, PREPARED);
+                assert_eq!(identity(&f.config.join(DESTINATION)), stage_id);
+                root.revalidate_canonical_binding().unwrap();
+                media.revalidate().unwrap();
+                assert!(!original_config.exists());
+            }
+        }
+    }
+}

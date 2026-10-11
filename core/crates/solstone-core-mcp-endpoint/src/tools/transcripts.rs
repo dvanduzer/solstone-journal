@@ -13,6 +13,9 @@ pub(crate) struct ValidatedListTranscripts {
     pub(crate) day: Option<String>,
     pub(crate) facet_id: Option<String>,
     pub(crate) limit: usize,
+    pub(crate) cursor: Option<String>,
+    pub(crate) time_from: Option<String>,
+    pub(crate) time_to: Option<String>,
 }
 
 pub(crate) struct ValidatedGetTranscript {
@@ -29,6 +32,12 @@ struct ListParams {
     facet: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    time_from: Option<String>,
+    #[serde(default)]
+    time_to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +52,31 @@ const fn default_limit() -> usize {
     10
 }
 
+fn validate_time(time_str: &str) -> Result<(), ToolError> {
+    if time_str.len() != 5 {
+        return Err(ToolError::InvalidInput);
+    }
+    let bytes = time_str.as_bytes();
+    if !bytes[0].is_ascii_digit()
+        || !bytes[1].is_ascii_digit()
+        || bytes[2] != b':'
+        || !bytes[3].is_ascii_digit()
+        || !bytes[4].is_ascii_digit()
+    {
+        return Err(ToolError::InvalidInput);
+    }
+    let hour = time_str[0..2]
+        .parse::<u32>()
+        .map_err(|_| ToolError::InvalidInput)?;
+    let minute = time_str[3..5]
+        .parse::<u32>()
+        .map_err(|_| ToolError::InvalidInput)?;
+    if hour > 23 || minute > 59 {
+        return Err(ToolError::InvalidInput);
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_list(params: Option<&Value>) -> Result<ValidatedListTranscripts, ToolError> {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let params =
@@ -53,10 +87,33 @@ pub(crate) fn validate_list(params: Option<&Value>) -> Result<ValidatedListTrans
     {
         return Err(ToolError::InvalidInput);
     }
+    let normalized_day = super::normalize_day(params.day)?;
+    if (params.time_from.is_some() || params.time_to.is_some()) && normalized_day.is_none() {
+        return Err(ToolError::InvalidInput);
+    }
+    if let Some(ref tf) = params.time_from {
+        validate_time(tf)?;
+    }
+    if let Some(ref tt) = params.time_to {
+        validate_time(tt)?;
+    }
+    if matches!((&params.time_from, &params.time_to), (Some(tf), Some(tt)) if tf > tt) {
+        return Err(ToolError::InvalidInput);
+    }
+    if params
+        .cursor
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > MAX_OPAQUE_REFERENCE_BYTES)
+    {
+        return Err(ToolError::InvalidInput);
+    }
     Ok(ValidatedListTranscripts {
-        day: super::normalize_day(params.day)?,
+        day: normalized_day,
         facet_id: params.facet,
         limit: params.limit,
+        cursor: params.cursor,
+        time_from: params.time_from,
+        time_to: params.time_to,
     })
 }
 

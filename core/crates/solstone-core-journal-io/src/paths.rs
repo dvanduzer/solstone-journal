@@ -611,6 +611,64 @@ pub fn iter_segments(journal: &Path, day: PathOrDay<'_>) -> Result<Vec<Segment>,
     Ok(segments)
 }
 
+/// Iterate direct and named segment directories, skipping unreadable stream directories
+/// or stream entries rather than failing the whole day walk.
+pub fn iter_segments_skipping_unreadable_streams(
+    journal: &Path,
+    day: PathOrDay<'_>,
+) -> Result<Vec<Segment>, PathError> {
+    let day_dir = match day {
+        PathOrDay::Day(day) => day_path(journal, day, false)?,
+        PathOrDay::Directory(path) => path.to_path_buf(),
+    };
+    if !day_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(&day_dir).map_err(|source| path_io(&day_dir, source))? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let entry_name = entry.file_name();
+        if let Some(key) = segment_key_os(&entry_name).map(str::to_owned) {
+            segments.push(Segment {
+                stream: StreamLocation::Direct,
+                name: entry_name,
+                key,
+                path: entry.path(),
+            });
+            continue;
+        }
+        if entry_name == OsStr::new("health") {
+            continue;
+        }
+        let Ok(stream_entries) = fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for segment_entry in stream_entries {
+            let Ok(segment_entry) = segment_entry else {
+                continue;
+            };
+            let name = segment_entry.file_name();
+            if segment_entry.path().is_dir()
+                && let Some(key) = segment_key_os(&name).map(str::to_owned)
+            {
+                segments.push(Segment {
+                    stream: StreamLocation::Named(entry_name.clone()),
+                    name,
+                    key,
+                    path: segment_entry.path(),
+                });
+            }
+        }
+    }
+    segments.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(segments)
+}
+
 /// Segment directories of one stream on one day, in name order.
 ///
 /// Reads the day directory for the default stream, or the one named stream

@@ -537,7 +537,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+                Some(root) => tempfile::tempdir_in(root).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
             let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
             Self { temp, root }
         }

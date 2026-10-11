@@ -90,7 +90,11 @@ pub fn search_connection(
         }
         Err(error) => return Err(error),
     };
-    if no_tokenizable_term {
+    // A query with no searchable word still lists a bounded day range, as an
+    // empty query does; without a day bound it finds nothing.
+    let day_bounded =
+        request.day.is_some() || request.day_from.is_some() || request.day_to.is_some();
+    if no_tokenizable_term && !day_bounded {
         return Ok(ConnectionSearchResponse {
             coverage_complete: connection.classification_coverage_complete()?,
             degraded: connection.connection_index_degraded()?,
