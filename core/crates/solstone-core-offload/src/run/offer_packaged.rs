@@ -1960,3 +1960,593 @@ mod owned_creation_qualification {
         Ok(())
     }
 }
+
+mod owned_planner_qualification {
+    use super::*;
+    use crate::run::{
+        CurrentOffloadAvailability, OffloadLedgerEffect, OffloadLedgerSync, OffloadLedgerWrite,
+        OffloadPlanning, OffloadPlanningPhase, OffloadPlanningReport, OwnedOffloadCreationOwner,
+        OwnedOffloadPlanFinish, OwnedOffloadPlanFinishRefusal, OwnedOffloadPlanOwner,
+        create_owned_planned_offload_offers, prepare_owned_offload_plan,
+    };
+    use chrono::Datelike;
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    use solstone_core_backup_runtime::{
+        DirectReadFinishState, OwnedDirectReadFinish,
+        admit_prepared_archive_owned_creator_installed,
+    };
+    use solstone_core_journal_io::activity::{ActivityLease, TeardownLease};
+    use solstone_core_journal_io::activity_obligations::NativeObligation;
+    use solstone_core_journal_io::media::{
+        MediaDirectory, MediaIdentity, MediaStage, PreparedMedia,
+    };
+    use solstone_core_retention::archive_offer::OffloadReconciliationDisposition;
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+    enum PlannerCase {
+        #[serde(rename = "owned_planner_needed_complete")]
+        Needed,
+        #[serde(rename = "owned_planner_metadata_complete")]
+        Metadata,
+        #[serde(rename = "owned_planner_metadata_final_obligation")]
+        Obligation,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PlannerInput {
+        case: PlannerCase,
+        journal: PathBuf,
+        repository_id: String,
+        expected_restic_path: PathBuf,
+        control: PathBuf,
+    }
+    struct ActualClock;
+    impl Clock for ActualClock {
+        fn now_unix(&self) -> i64 {
+            Utc::now().timestamp()
+        }
+        fn iso_week(&self) -> u8 {
+            Utc::now().iso_week().week() as u8
+        }
+    }
+    fn directory_fact(path: &Path) -> TestResult<Value> {
+        let m = fs::symlink_metadata(path)?;
+        assert!(m.is_dir() && !m.file_type().is_symlink());
+        Ok(json!({"device":m.dev(),"inode":m.ino()}))
+    }
+    fn copy_facts<'a>(
+        journal: &Path,
+        copies: impl Iterator<Item = &'a PreparedMedia>,
+    ) -> TestResult<Vec<Value>> {
+        copies.map(|media| {
+            let mut found = Vec::new();
+            for stage in stages(journal)? {
+                for leaf in fs::read_dir(&stage)? {
+                    let leaf=leaf?.path(); let m=fs::symlink_metadata(&leaf)?;
+                    if media.identity()==(MediaIdentity::Unix{device:m.dev(),inode:m.ino()}) {
+                        found.push((stage.clone(),leaf));
+                    }
+                }
+            }
+            assert_eq!(found.len(),1);
+            let (stage,leaf)=&found[0]; let fact=file_fact(leaf)?;
+            assert_eq!(fact["bytes"],media.digest().size);
+            assert_eq!(fact["sha256"],media.digest().sha256);
+            Ok(json!({"name":leaf.file_name().unwrap().to_string_lossy(),"identity":media.identity(),
+                "digest":media.digest(),"stage":stage,"stage_identity":directory_fact(stage)?,"path":leaf,"fact":fact}))
+        }).collect()
+    }
+    fn ledger_facts<'a>(writes: impl Iterator<Item = OffloadLedgerWrite<'a>>) -> Vec<Value> {
+        writes.map(|write| match write {
+            OffloadLedgerWrite::Recorded{effect,durability,confirmation,failures} => {
+                assert!(matches!(effect,OffloadLedgerEffect::Appended{bytes} if bytes>0));
+                assert_eq!(durability,[OffloadLedgerSync::Confirmed;4]);
+                assert_eq!(confirmation,OffloadLedgerSync::Confirmed); assert!(failures.is_empty());
+                json!({"effect":format!("{effect:?}"),"durability":durability.map(|v|format!("{v:?}")),"confirmation":format!("{confirmation:?}"),"failures":failures})
+            }
+            OffloadLedgerWrite::Refused{reason,detail} => panic!("actual writer refused: {reason} {detail:?}"),
+        }).collect()
+    }
+    fn projection_fact(
+        local: &crate::measurement::RawMediaPopulation,
+        projection: &crate::measurement::ProposedRelief,
+    ) -> TestResult<Value> {
+        assert!(local.complete());
+        assert_eq!(local.usage().map_err(invalid)?, projection.local);
+        Ok(
+            json!({"local":projection.local,"eligible_bytes":projection.eligible_bytes,"eligible_files":projection.eligible_files,
+            "projected_local_bytes":projection.projected_local_bytes}),
+        )
+    }
+    fn planning_fact(
+        planning: &OffloadPlanning,
+        root: &JournalRoot,
+        needed: bool,
+    ) -> TestResult<Value> {
+        let reconciliation = planning
+            .reconciliation()
+            .expect("actual reconciliation")
+            .as_ref()
+            .unwrap_or_else(|failure| {
+                panic!("actual reconciliation failed: {:?}", failure.reason())
+            });
+        assert_eq!(reconciliation.journal_root().identity(), root.identity());
+        assert!(
+            reconciliation
+                .groups()
+                .iter()
+                .all(|g| matches!(g.disposition(), OffloadReconciliationDisposition::Unchanged))
+        );
+        let decision = planning.decision().expect("actual current decision");
+        assert_eq!(
+            decision.availability(),
+            CurrentOffloadAvailability::Available
+        );
+        assert_eq!(
+            decision.root_observation(),
+            root.identity().observation_id()
+        );
+        assert!(decision.refusals().is_empty());
+        let eligible=decision.eligible().map(|e|json!({"name":e.name(),"bytes":e.bytes(),"witness":e.witness_id(),"mark":e.mark()})).collect::<Vec<_>>();
+        assert_eq!(eligible.len(), if needed { 0 } else { 2 });
+        if !needed {
+            assert_eq!(
+                eligible
+                    .iter()
+                    .map(|v| v["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["file1.flac", "file2.flac"]
+            );
+        }
+        Ok(
+            json!({"phase":format!("{:?}",planning.phase()),"budget_bytes":planning.budget_bytes(),
+            "projection":projection_fact(planning.local().expect("complete L"),planning.initial_projection().expect("actual P projection"))?,
+            "eligible":eligible,"root":decision.root_observation(),"reconciliation_register":reconciliation.register(),
+            "reconciliation_groups":reconciliation.groups().len()}),
+        )
+    }
+    fn report_fact(report: &OffloadPlanningReport) -> TestResult<Value> {
+        let decision = report.decision().expect("actual current report");
+        assert_eq!(
+            decision.availability(),
+            CurrentOffloadAvailability::Available
+        );
+        assert!(decision.refusals().is_empty());
+        assert_eq!(
+            report.reconciliation().root_observation(),
+            decision.root_observation()
+        );
+        assert!(
+            report
+                .reconciliation()
+                .groups()
+                .iter()
+                .all(|g| matches!(g.disposition(), OffloadReconciliationDisposition::Unchanged))
+        );
+        Ok(
+            json!({"phase":format!("{:?}",report.phase()),"budget_bytes":report.budget_bytes(),
+            "projection":projection_fact(report.local().unwrap(),report.initial_projection().unwrap())?,"root":decision.root_observation(),
+            "eligible":decision.eligible().map(|e|json!({"name":e.name(),"bytes":e.bytes(),"witness":e.witness_id(),"mark":e.mark()})).collect::<Vec<_>>(),
+            "reconciliation_register":report.reconciliation().register(),"reconciliation_groups":report.reconciliation().groups().len()}),
+        )
+    }
+    fn completed_fact(
+        finish: &OwnedDirectReadFinish,
+        clock: &Arc<dyn Clock + Send + Sync>,
+    ) -> Value {
+        assert_eq!(finish.state(), DirectReadFinishState::Completed);
+        assert!(finish.reason().is_none());
+        assert!(Arc::ptr_eq(finish.owned_clock(), clock));
+        let retired = finish.retirement().expect("actual retirement");
+        assert!(retired.receipt.failures().is_empty());
+        json!({"state":format!("{:?}",finish.state()),"root":finish.journal_root().identity().observation_id(),
+            "carrier":retired.owned.diagnostic_path(),"effect":format!("{:?}",retired.receipt.effect()),
+            "root_durability":format!("{:?}",retired.receipt.root_durability()),"confirmation":format!("{:?}",retired.receipt.confirmation()),
+            "failures":retired.receipt.failures().iter().map(|e|e.to_string()).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    #[ignore = "requires exact copied package and original owned planner/finish S3/process fixture"]
+    fn packaged_owned_planner_finish_entry() -> TestResult {
+        let input: PlannerInput = serde_json::from_slice(&fs::read(
+            std::env::var_os("OFFLOAD_OWNED_PLANNER_PROBE_JSON")
+                .ok_or_else(|| invalid("explicit owned planner input required"))?,
+        )?)?;
+        let needed = input.case == PlannerCase::Needed;
+        let names = if needed {
+            vec!["file1.flac", "file2.flac"]
+        } else {
+            vec!["file1.flac", "file2.flac", "file3.flac"]
+        };
+        let root = Arc::new(JournalRoot::open(&input.journal)?);
+        assert!(stages(&input.journal)?.is_empty());
+        let root_identity = root.identity().observation_id();
+        let register_path = input.journal.join("health/retention-marks.json");
+        let ledger_path = input.journal.join("health/offload/20261009.jsonl");
+        let before_register = register_path
+            .try_exists()?
+            .then(|| fs::read(&register_path))
+            .transpose()?;
+        let before_ledger = ledger_path
+            .try_exists()?
+            .then(|| fs::read(&ledger_path))
+            .transpose()?;
+        assert_eq!(before_register.is_none(), needed);
+        assert_eq!(before_ledger.is_none(), needed);
+        let raw_dir = input.journal.join("chronicle/20261009/120000_60_fixture");
+        let raw = names
+            .iter()
+            .map(|n| file_fact(&raw_dir.join(n)))
+            .collect::<TestResult<Vec<_>>>()?;
+        let headers = names
+            .iter()
+            .map(|n| fs::read(raw_dir.join(n).with_extension("jsonl")))
+            .collect::<io::Result<Vec<_>>>()?;
+        let config = fs::read(input.journal.join("config/journal.json"))?;
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(ActualClock);
+        let cancellation = ArchiveCancellation::new();
+        let budget = ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone())?;
+        let original = match OwnedPreparedArchiveOperation::prepare(
+            Arc::clone(&root),
+            budget,
+            Arc::clone(&clock),
+        ) {
+            Ok(original) => original,
+            Err(failure) => {
+                std::hint::black_box(&failure);
+                panic!("actual original prepare refused: {:?}", failure.reason())
+            }
+        };
+        let carrier = Arc::clone(original.carrier());
+        let carrier_path = carrier.diagnostic_path();
+        let carrier_identity = directory_fact(&carrier_path)?;
+        let mut control = UnixStream::connect(&input.control)?;
+        control.write_all(b"prepared")?;
+        control.write_all(&std::process::id().to_be_bytes())?;
+        let mut ack = [0];
+        control.read_exact(&mut ack)?;
+        assert_eq!(ack, [b'a']);
+        let inputs = match prepare_owned_offload_plan(&original, Utc::now().fixed_offset()) {
+            Ok(inputs) => inputs,
+            Err(failure) => {
+                let closed = original.into_owned_hold();
+                assert!(Arc::ptr_eq(closed.carrier(), failure.carrier()));
+                let reason = format!("{:?}", failure.reason());
+                std::hint::black_box(&(closed, failure));
+                panic!("actual preflight refused before admission: {reason}")
+            }
+        };
+        assert!(Arc::ptr_eq(inputs.carrier(), &carrier));
+        assert_eq!(
+            inputs.planning().budget_bytes(),
+            Some(if needed { 0 } else { 2097162 })
+        );
+        let preflight_usage = inputs
+            .planning()
+            .local()
+            .unwrap()
+            .usage()
+            .map_err(invalid)?;
+        assert_eq!(preflight_usage.total_bytes, 2097162 * names.len() as u64);
+        assert_eq!(preflight_usage.total_files, names.len() as u64);
+        cut(&mut control, b"captured")?;
+        let installed = match admit_prepared_archive_owned_creator_installed(
+            original,
+            &input.expected_restic_path,
+        ) {
+            Ok(installed) => installed,
+            Err(failure) => {
+                std::hint::black_box(&failure);
+                panic!("actual installed admission refused: {:?}", failure.error())
+            }
+        };
+        let (admitted, outside) = installed.into_parts();
+        assert!(Arc::ptr_eq(admitted.carrier(), &carrier));
+        assert!(Arc::ptr_eq(outside.carrier(), &carrier));
+        assert!(Arc::ptr_eq(outside.owned_clock(), &clock));
+        assert_eq!(admitted.repository_id(), input.repository_id);
+        cut(&mut control, b"admitted")?;
+        let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_owned_planned_offload_offers(admitted, inputs)
+        }));
+        let plan = match planned {
+            Ok(plan) => plan,
+            Err(error) => {
+                let unknown = outside.into_unknown();
+                std::hint::black_box(&unknown);
+                std::panic::resume_unwind(error)
+            }
+        };
+        assert!(Arc::ptr_eq(plan.carrier(), &carrier));
+        assert!(
+            plan.reason().is_none(),
+            "actual planning refusal: {:?}",
+            plan.reason()
+        );
+        assert!(plan.capture_failure().is_none());
+        let planning = planning_fact(plan.planning(), &root, needed)?;
+        let projection = plan.planning().initial_projection().unwrap();
+        assert_eq!(projection.eligible_bytes, if needed { 0 } else { 4194324 });
+        assert_eq!(projection.eligible_files, if needed { 0 } else { 2 });
+        assert_eq!(
+            projection.projected_local_bytes,
+            if needed { 4194324 } else { 2097162 }
+        );
+        if !needed {
+            assert!(projection.local.total_bytes > plan.planning().budget_bytes().unwrap());
+            assert!(projection.projected_local_bytes <= plan.planning().budget_bytes().unwrap());
+        }
+        let mut source_copies = Vec::new();
+        let mut reads = Vec::new();
+        let mut archives = Vec::new();
+        let mut ledger = Vec::new();
+        let marks;
+        match plan.owner() {
+            OwnedOffloadPlanOwner::Creation(creation) => {
+                assert!(needed);
+                assert_eq!(plan.planning().phase(), OffloadPlanningPhase::Held);
+                assert!(creation.reason().is_none());
+                assert!(creation.partial_copy().is_none());
+                let OwnedOffloadCreationOwner::Published(outcome) = creation.owner() else {
+                    panic!("genuine creation not published")
+                };
+                let Ok(BoundMutationOutcome::Published(published)) = outcome.publication() else {
+                    panic!("genuine publication not confirmed")
+                };
+                assert_eq!(published.status, MutationStatus::Applied);
+                let verified = outcome.verified();
+                marks = verified.marks().to_vec();
+                assert_eq!(marks.len(), 1);
+                assert_eq!(marks[0].proposal.names, vec!["file1.flac", "file2.flac"]);
+                assert_eq!(marks[0].proposal.bytes, 4194324);
+                let proof = &marks[0].offload.as_ref().unwrap().proof;
+                assert_eq!(proof.repository_id, input.repository_id);
+                assert_eq!(proof.files.len(), 2);
+                let catalog = read_complete_catalog(&root).map_err(invalid)?;
+                for (index, file) in proof.files.iter().enumerate() {
+                    assert!(catalog.active_witness(proof, file).is_some());
+                    assert_eq!(file.name, names[index]);
+                    assert_eq!(file.bytes, raw[index]["bytes"]);
+                    assert_eq!(file.sha256, raw[index]["sha256"]);
+                }
+                reads=verified.archive_reads().map(|read|{let ArchiveReadState::Prepared{file,target_identity,media,cleanup}=read else{panic!("original prepared read missing")};
+                    assert_eq!(cleanup,Some(Cleanup::Complete));assert_eq!(*target_identity,media.identity());json!({"name":file.name,"repository":file.repository_id,"snapshot":file.snapshot_id,"path":file.archive_path,"identity":target_identity,"digest":media.digest(),"cleanup":cleanup})}).collect();
+                assert_eq!(reads.len(), 2);
+                ledger = ledger_facts(creation.ledger_writes());
+                assert_eq!(ledger.len(), 1);
+                archives = creation
+                    .archives()
+                    .iter()
+                    .map(|r| match r {
+                        Ok(s) => json!({"repository":s.repository_id,"snapshot":s.snapshot_id}),
+                        Err(e) => panic!("actual archive failed: {e:?}"),
+                    })
+                    .collect();
+                assert_eq!(archives.len(), 1);
+                source_copies = copy_facts(&input.journal, creation.source_copies())?;
+                assert_eq!(source_copies.len(), 2);
+            }
+            OwnedOffloadPlanOwner::Read(read) => {
+                assert!(!needed);
+                assert_eq!(
+                    plan.planning().phase(),
+                    OffloadPlanningPhase::AlreadySatisfied
+                );
+                assert!(Arc::ptr_eq(read.carrier(), &carrier));
+                assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+                let register: marks::Register =
+                    serde_json::from_slice(before_register.as_ref().unwrap())?;
+                marks = register.marks.into_values().collect::<Vec<_>>();
+                assert_eq!(marks.len(), 1);
+                assert_eq!(marks[0].proposal.names, vec!["file1.flac", "file2.flac"]);
+                assert_eq!(
+                    fs::read(&register_path)?,
+                    *before_register.as_ref().unwrap()
+                );
+                assert_eq!(fs::read(&ledger_path)?, *before_ledger.as_ref().unwrap());
+            }
+            _ => panic!("actual plan has wrong concrete owner"),
+        }
+        let register_before_finish = fs::read(&register_path)?;
+        let ledger_before_finish = fs::read(&ledger_path)?;
+        cut(&mut control, b"planned_")?;
+        let mut foreign_stage = None;
+        let mut foreign_fact = None;
+        if input.case == PlannerCase::Obligation {
+            let parent = MediaDirectory::open(Arc::clone(&root), Path::new(""))?;
+            let stage = match MediaStage::create(parent, Arc::clone(carrier.activity())) {
+                Ok(stage) => stage,
+                Err(failure) => {
+                    std::hint::black_box(&failure);
+                    panic!("actual distinct stage creation failed")
+                }
+            };
+            foreign_fact = Some(
+                json!({"path":stage.diagnostic_path(),"identity":directory_fact(&stage.diagnostic_path())?}),
+            );
+            foreign_stage = Some(stage);
+        }
+        let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plan.finish()));
+        let finished = match finished {
+            Ok(finished) => finished,
+            Err(error) => {
+                let unknown = outside.into_unknown();
+                std::hint::black_box(&unknown);
+                std::panic::resume_unwind(error)
+            }
+        };
+        let mut completion = None;
+        let mut next = None;
+        let mut held_custody = None;
+        let finish_fact = match finished {
+            OwnedOffloadPlanFinish::Settled(settled) => {
+                assert_ne!(input.case, PlannerCase::Obligation);
+                let (read, report) = settled.into_parts();
+                assert!(Arc::ptr_eq(read.carrier(), &carrier));
+                assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+                let final_planning = report_fact(report.planning())?;
+                let mut expected_planning = planning.clone();
+                if needed {
+                    assert_eq!(
+                        report.planning().phase(),
+                        OffloadPlanningPhase::OffersPublished
+                    );
+                    expected_planning["phase"] = json!("OffersPublished");
+                }
+                assert_eq!(final_planning, expected_planning);
+                let source_cleanup = if needed {
+                    let creation = report.creation().expect("actual settled creation report");
+                    assert_eq!(creation.source_copies().len(), 2);
+                    creation.source_copies().iter().zip(&source_copies).map(|(actual,before)|{
+                        assert_eq!(actual.cleanup,Cleanup::Complete);assert_eq!(serde_json::to_value(actual.identity).unwrap(),before["identity"]);assert_eq!(serde_json::to_value(&actual.digest).unwrap(),before["digest"]);
+                        assert!(!Path::new(before["stage"].as_str().unwrap()).try_exists().unwrap());json!({"identity":actual.identity,"digest":actual.digest,"cleanup":actual.cleanup})}).collect::<Vec<_>>()
+                } else {
+                    assert!(report.creation().is_none());
+                    Vec::new()
+                };
+                check_carrier(&carrier)?;
+                assert_eq!(stages(&input.journal)?.len(), 1);
+                cut(&mut control, b"finished")?;
+                drop(carrier);
+                let completed = outside.finish_owned(read);
+                completion = Some(completed_fact(&completed, &clock));
+                assert_eq!(completion.as_ref().unwrap()["root"], root_identity);
+                assert!(stages(&input.journal)?.is_empty());
+                drop(completed);
+                cut(&mut control, b"retired_")?;
+                if input.case == PlannerCase::Metadata {
+                    let next_clock: Arc<dyn Clock + Send + Sync> = Arc::new(ActualClock);
+                    let budget = ArchiveBudget::new_cancellable(
+                        next_clock.as_ref(),
+                        ArchiveCancellation::new(),
+                    )?;
+                    let original = match OwnedPreparedArchiveOperation::prepare(
+                        Arc::clone(&root),
+                        budget,
+                        Arc::clone(&next_clock),
+                    ) {
+                        Ok(original) => original,
+                        Err(failure) => {
+                            std::hint::black_box(&failure);
+                            panic!("next actual original refused")
+                        }
+                    };
+                    let installed = match admit_prepared_archive_owned_creator_installed(
+                        original,
+                        &input.expected_restic_path,
+                    ) {
+                        Ok(installed) => installed,
+                        Err(failure) => {
+                            std::hint::black_box(&failure);
+                            panic!("next actual installed admission refused")
+                        }
+                    };
+                    let (admitted, outside) = installed.into_parts();
+                    let read = match admitted.into_read_operation() {
+                        Ok(read) => read,
+                        Err(failure) => {
+                            std::hint::black_box(&failure);
+                            panic!("next genuine NoWriter handoff refused")
+                        }
+                    };
+                    let settled = match read.settle_direct() {
+                        Ok(settled) => settled,
+                        Err(failure) => {
+                            std::hint::black_box(&failure);
+                            panic!("next real settlement refused")
+                        }
+                    };
+                    let completed = outside.finish_owned(settled);
+                    next = Some(completed_fact(&completed, &next_clock));
+                    drop(completed);
+                    let teardown = TeardownLease::try_acquire(Arc::clone(&root))?;
+                    teardown.revalidate()?;
+                    drop(teardown);
+                    assert!(stages(&input.journal)?.is_empty());
+                    cut(&mut control, b"nextdone")?;
+                }
+                std::hint::black_box(&report);
+                json!({"kind":"settled","planning":final_planning,"creation_present":report.creation().is_some(),"source_cleanups":source_cleanup})
+            }
+            OwnedOffloadPlanFinish::Held(held) => {
+                assert_eq!(input.case, PlannerCase::Obligation);
+                assert!(Arc::ptr_eq(held.carrier(), &carrier));
+                assert!(held.metadata_settled());
+                assert!(held.settlement_failure().is_none());
+                assert!(held.creation().is_none());
+                assert!(held.settled_creation().is_none());
+                assert!(held.reason().is_none());
+                assert!(held.capture_failure().is_none());
+                let read = held.read().expect("actual settled-phase read retained");
+                assert!(Arc::ptr_eq(read.carrier(), &carrier));
+                assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+                assert_eq!(read.journal_root().identity(), root.identity());
+                assert_eq!(planning_fact(held.planning(), &root, false)?, planning);
+                let stage = foreign_stage.as_ref().unwrap();
+                let relative = stage
+                    .diagnostic_path()
+                    .strip_prefix(&input.journal)?
+                    .to_path_buf();
+                let Some(OwnedOffloadPlanFinishRefusal::Obligations(obligations)) =
+                    held.finish_refusal()
+                else {
+                    panic!("actual late census refusal absent")
+                };
+                assert!(
+                    obligations.iter().any(
+                        |v| matches!(v,NativeObligation::Stage{relative:r,..} if r==&relative)
+                    )
+                );
+                assert_eq!(
+                    directory_fact(&stage.diagnostic_path())?,
+                    foreign_fact.as_ref().unwrap()["identity"]
+                );
+                assert_eq!(directory_fact(&carrier_path)?, carrier_identity);
+                let mut expected_stages = vec![carrier_path.clone(), stage.diagnostic_path()];
+                expected_stages.sort();
+                assert_eq!(stages(&input.journal)?, expected_stages);
+                carrier.revalidate()?;
+                assert_eq!(fs::read_dir(&carrier_path)?.count(), 0);
+                assert_eq!(fs::read_dir(stage.diagnostic_path())?.count(), 0);
+                assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_err());
+                assert!(TeardownLease::try_acquire(Arc::clone(&root)).is_err());
+                let fact = json!({"kind":"held","planning":planning,"refusal":format!("{:?}",held.finish_refusal()),"metadata_settled":held.metadata_settled(),"settlement_failure_absent":true,"creation_present":false,"read_retained":true});
+                cut(&mut control, b"finished")?;
+                let (held, outside, stage) =
+                    std::thread::spawn(move || (held, outside, foreign_stage))
+                        .join()
+                        .expect("actual metadata closed custody thread joined");
+                assert!(Arc::ptr_eq(held.carrier(), &carrier));
+                assert!(Arc::ptr_eq(outside.carrier(), &carrier));
+                assert!(Arc::ptr_eq(outside.owned_clock(), &clock));
+                held_custody = Some((held, outside, stage));
+                fact
+            }
+        };
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(file_fact(&raw_dir.join(name))?, raw[index]);
+            assert_eq!(
+                fs::read(raw_dir.join(name).with_extension("jsonl"))?,
+                headers[index]
+            );
+        }
+        assert_eq!(fs::read(input.journal.join("config/journal.json"))?, config);
+        assert_eq!(fs::read(&register_path)?, register_before_finish);
+        assert_eq!(fs::read(&ledger_path)?, ledger_before_finish);
+        cut(&mut control, b"returned")?;
+        println!(
+            "OWNED_PLANNER_PROBE_JSON={}",
+            serde_json::to_string(
+                &json!({"case":input.case,"harness_pid":std::process::id(),"root":root_identity,
+            "carrier":carrier_path,"carrier_identity":carrier_identity,"original_clock":true,"raw":raw,"marks":marks,"planning":planning,
+            "archives":archives,"ledger":ledger,"reads":reads,"source_copies":source_copies,"finish":finish_fact,"completion":completion,"next":next,
+            "foreign":foreign_fact,"closed_thread_joined":held_custody.is_some(),"stages":stages(&input.journal)?,
+            "limits":"historical-package-adapted synthetic local Linux owned planner only; no activation/provider/route/recovery claim"})
+            )?
+        );
+        std::hint::black_box(&held_custody);
+        std::hint::black_box(&cancellation);
+        Ok(())
+    }
+}

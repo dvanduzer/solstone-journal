@@ -34,7 +34,11 @@ mod planner;
 #[cfg(all(test, unix, feature = "full-tests"))]
 pub(super) use planner::with_payload_capacity_fault;
 pub use planner::{
-    OffloadPlanning, OffloadPlanningPhase, OffloadPlanningRefusal, create_planned_offload_offers,
+    OffloadPlanning, OffloadPlanningPhase, OffloadPlanningRefusal, OffloadPlanningReport,
+    OwnedOffloadPlan, OwnedOffloadPlanFinish, OwnedOffloadPlanFinishRefusal, OwnedOffloadPlanHold,
+    OwnedOffloadPlanInputFailure, OwnedOffloadPlanInputs, OwnedOffloadPlanOwner,
+    SettledOffloadPlan, SettledOffloadPlanReport, create_owned_planned_offload_offers,
+    create_planned_offload_offers, prepare_owned_offload_plan,
 };
 
 use crate::ledger::writer::{

@@ -309,3 +309,146 @@ fn owning_planner_post_p_capacity_error_retains_same_admission() {
             .is_empty()
     );
 }
+
+#[test]
+fn owned_planner_preflight_refusals_retain_original_before_admission() {
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    use std::sync::Arc;
+    for case in ["budget", "floor", "local", "drift", "disabled"] {
+        let fixture = CurrentFixture::new(SegmentLayout::Direct);
+        match case {
+            "budget" => fixture
+                .change_config(|config| config["backup"]["offload"]["budget_bytes"] = json!("16")),
+            "floor" => fixture
+                .change_config(|config| config["backup"]["offload"]["floor_bytes"] = Value::Null),
+            "disabled" => fixture
+                .change_config(|config| config["backup"]["offload"]["enabled"] = json!(false)),
+            _ => {}
+        }
+        let clock = Arc::new(TestClock { now: CURRENT_NOW });
+        let original = OwnedPreparedArchiveOperation::prepare(
+            Arc::clone(&fixture.root),
+            ArchiveBudget::new(clock.as_ref()).unwrap(),
+            clock,
+        )
+        .unwrap_or_else(|failure| panic!("preparation: {:?}", failure.reason()));
+        if case == "local" {
+            use std::os::unix::ffi::OsStringExt;
+            fs::write(
+                fixture
+                    .segment
+                    .join(std::ffi::OsString::from_vec(vec![0xff])),
+                b"unknown",
+            )
+            .unwrap();
+        }
+        if case == "drift" {
+            fixture.change_config(|config| config["backup"]["offload"]["budget_bytes"] = json!(16));
+        }
+        let (failure, copied) = run_with_media_hook(
+            MediaPrimitive::StageCreated,
+            || panic!("pre-admission refusal cannot copy media"),
+            || {
+                prepare_owned_offload_plan(&original, at())
+                    .err()
+                    .expect("preflight refusal")
+            },
+        );
+        assert!(!copied);
+        assert!(Arc::ptr_eq(failure.carrier(), original.carrier()));
+        if case == "budget" || case == "floor" {
+            assert!(failure.planning().reconciliation().unwrap().is_ok());
+        }
+        assert!(failure.planning().decision().is_none());
+        assert!(failure.planning().initial_projection().is_none());
+        assert_eq!(
+            solstone_core_retention::review_context::load_at_root(&fixture.root)
+                .unwrap()
+                .marks
+                .len(),
+            2
+        );
+        let original = original.into_owned_hold();
+        assert!(Arc::ptr_eq(failure.carrier(), original.carrier()));
+        let coverage = solstone_core_journal_io::activity_obligations::observe_with_carrier(
+            &fixture.root,
+            original.carrier().observation(),
+        );
+        if case == "local" {
+            assert!(
+                coverage.is_err(),
+                "the same uncertain name must also refuse census"
+            );
+        } else {
+            assert!(coverage.unwrap().unresolved_entries().next().is_none());
+        }
+    }
+}
+
+#[test]
+fn owned_planner_keeps_actual_withdrawal_when_later_floor_refuses() {
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    use solstone_core_retention::archive_offer::OffloadReconciliationDisposition;
+    use std::sync::Arc;
+    let mut fixture = CurrentFixture::new(SegmentLayout::Named);
+    let directory = fixture.journal.path().join("chronicle/20260101/030000_001");
+    fs::create_dir(&directory).unwrap();
+    let raw = directory.join("empty.flac");
+    fs::write(&raw, b"empty").unwrap();
+    write_empty_audio_sidecar(&raw);
+    let proof = fixture.observe_offer(
+        SegmentLayout::Direct,
+        "030000_001",
+        &["empty.flac"],
+        "kept-empty",
+    );
+    fixture.add_offer(proof);
+    let empty_id = fixture.marks.last().unwrap().id.clone();
+    fixture.change_config(|config| {
+        config["retention"] = json!({"empty_audio":"keep"});
+        config["backup"]["offload"]["floor_bytes"] = Value::Null;
+    });
+    let clock = Arc::new(TestClock { now: CURRENT_NOW });
+    let original = OwnedPreparedArchiveOperation::prepare(
+        Arc::clone(&fixture.root),
+        ArchiveBudget::new(clock.as_ref()).unwrap(),
+        clock,
+    )
+    .unwrap_or_else(|failure| panic!("preparation: {:?}", failure.reason()));
+    let failure = prepare_owned_offload_plan(&original, at())
+        .err()
+        .expect("floor refusal");
+    assert!(matches!(
+        failure.reason(),
+        OffloadCreationRefusal::Inputs(OffloadOfferRefusal::Admission(_))
+    ));
+    let reconciled = failure
+        .planning()
+        .reconciliation()
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|failure| panic!("reconciliation: {:?}", failure.reason()));
+    assert!(!reconciled.register().marks.contains_key(&empty_id));
+    assert!(reconciled.groups().iter().any(|group| matches!(
+        group.disposition(),
+        OffloadReconciliationDisposition::Publication { .. }
+    )));
+    for mark in &fixture.marks[..2] {
+        assert_eq!(reconciled.register().marks.get(&mark.id), Some(mark));
+    }
+    assert!(raw.exists());
+    assert!(failure.planning().decision().is_none());
+    assert!(Arc::ptr_eq(failure.carrier(), original.carrier()));
+}
+
+#[test]
+fn owned_planner_closed_and_settled_fields_are_send_static() {
+    fn require<T: Send + 'static>() {}
+    require::<OwnedOffloadPlanInputFailure>();
+    require::<OwnedOffloadPlanHold>();
+    require::<OwnedOffloadPlanFinish>();
+    require::<SettledOffloadPlan>();
+    require::<SettledOffloadPlanReport>();
+    require::<OffloadPlanningReport>();
+    require::<CurrentOffloadReport>();
+}

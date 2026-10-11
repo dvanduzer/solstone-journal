@@ -4,11 +4,22 @@
 //! Plan additional offers from the original admission and actual current relief.
 
 use chrono::{DateTime, FixedOffset};
-use solstone_core_retention::archive_offer::{OffloadReconciliation, OffloadReconciliationFailure};
+use solstone_core_retention::archive_offer::{
+    OffloadReconciliation, OffloadReconciliationFailure, OffloadReconciliationReport,
+};
 
 use super::*;
 use crate::measurement::{ProposedRelief, RawMediaPopulation};
-use crate::run::{CurrentOffloadDecision, CurrentOffloadRefusalReason};
+use crate::run::{CurrentOffloadDecision, CurrentOffloadRefusalReason, CurrentOffloadReport};
+
+#[path = "owned_planner.rs"]
+mod owning;
+pub use owning::{
+    OwnedOffloadPlan, OwnedOffloadPlanFinish, OwnedOffloadPlanFinishRefusal, OwnedOffloadPlanHold,
+    OwnedOffloadPlanInputFailure, OwnedOffloadPlanInputs, OwnedOffloadPlanOwner,
+    SettledOffloadPlan, SettledOffloadPlanReport, create_owned_planned_offload_offers,
+    prepare_owned_offload_plan,
+};
 
 #[cfg(all(test, unix, feature = "full-tests"))]
 thread_local! {
@@ -91,6 +102,53 @@ impl OffloadPlanning {
     pub fn initial_projection(&self) -> Option<&ProposedRelief> {
         self.initial_projection.as_ref()
     }
+
+    fn into_report(self) -> Result<OffloadPlanningReport, Box<Self>> {
+        if !self.reconciliation.as_ref().is_some_and(Result::is_ok) {
+            return Err(Box::new(self));
+        }
+        let Some(Ok(reconciliation)) = self.reconciliation else {
+            unreachable!("checked reconciliation")
+        };
+        Ok(OffloadPlanningReport {
+            phase: self.phase,
+            reconciliation: reconciliation.into_report(),
+            budget: self.budget,
+            local: self.local,
+            decision: self.decision.map(CurrentOffloadDecision::into_report),
+            initial_projection: self.initial_projection,
+        })
+    }
+}
+
+/// Observed planning facts after actual settlement, retaining no journal handles.
+pub struct OffloadPlanningReport {
+    phase: OffloadPlanningPhase,
+    reconciliation: OffloadReconciliationReport,
+    budget: Option<u64>,
+    local: Option<RawMediaPopulation>,
+    decision: Option<CurrentOffloadReport>,
+    initial_projection: Option<ProposedRelief>,
+}
+impl OffloadPlanningReport {
+    pub fn phase(&self) -> OffloadPlanningPhase {
+        self.phase
+    }
+    pub fn reconciliation(&self) -> &OffloadReconciliationReport {
+        &self.reconciliation
+    }
+    pub fn budget_bytes(&self) -> Option<u64> {
+        self.budget
+    }
+    pub fn local(&self) -> Option<&RawMediaPopulation> {
+        self.local.as_ref()
+    }
+    pub fn decision(&self) -> Option<&CurrentOffloadReport> {
+        self.decision.as_ref()
+    }
+    pub fn initial_projection(&self) -> Option<&ProposedRelief> {
+        self.initial_projection.as_ref()
+    }
 }
 
 /// Reconcile, inspect actual pending relief, then create only needed offers.
@@ -140,8 +198,7 @@ mod bound {
 
     use super::*;
     use crate::measurement::{measure_local_media, project_current_offload};
-    use crate::run::current::{CurrentPolicyObservation, MAX_CURRENT_ENTRIES};
-    use crate::run::inspect_current_offload;
+    use crate::run::current::{CurrentArchive, CurrentPolicyObservation, MAX_CURRENT_ENTRIES};
 
     fn planning(error: OffloadPlanningRefusal) -> OffloadCreationRefusal {
         OffloadCreationRefusal::Planning(error)
@@ -151,7 +208,7 @@ mod bound {
     }
 
     // Validate the sole local census before admission, including exact-key uniqueness.
-    fn complete(local: &RawMediaPopulation) -> Result<(), OffloadCreationRefusal> {
+    pub(super) fn complete(local: &RawMediaPopulation) -> Result<(), OffloadCreationRefusal> {
         local
             .usage()
             .map_err(|error| planning(OffloadPlanningRefusal::Local(error)))?;
@@ -166,7 +223,7 @@ mod bound {
 
     type GroupKey = (String, String, String, SegmentLayout);
 
-    fn payload_capacity(
+    pub(super) fn payload_capacity(
         operation: &PreparedArchiveOperation<'_>,
         observed: &ObservedOffloadOffers,
     ) -> Result<Arc<MediaDirectory>, OffloadCreationRefusal> {
@@ -182,8 +239,8 @@ mod bound {
         unix::capacity(operation, observed)
     }
 
-    fn candidates(
-        admitted: &AdmittedArchive<'_>,
+    pub(super) fn candidates(
+        admitted: CurrentArchive<'_, '_>,
         report: &OffloadPlanning,
         at: DateTime<FixedOffset>,
     ) -> Result<Vec<OffloadOfferSelection>, OffloadCreationRefusal> {
@@ -302,6 +359,76 @@ mod bound {
         Ok(selected)
     }
 
+    pub(super) fn preflight(
+        operation: &PreparedArchiveOperation<'_>,
+        report: &mut OffloadPlanning,
+        at: DateTime<FixedOffset>,
+    ) -> Result<(), OffloadCreationRefusal> {
+        let today = at.date_naive();
+        let now = at.with_timezone(&Utc);
+        operation
+            .revalidate()
+            .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
+        if !operation.configuration().offload_enabled() {
+            return Err(planning(OffloadPlanningRefusal::Disabled));
+        }
+        report.reconciliation = Some(reconcile_offload_empty(operation, today, now));
+        if !report.reconciliation.as_ref().is_some_and(Result::is_ok) {
+            return Err(planning(OffloadPlanningRefusal::Reconciliation));
+        }
+        report.budget = operation
+            .configuration()
+            .offload_budget_bytes()
+            .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
+        report.local = Some(measure_local_media(
+            operation.journal_root().canonical_path(),
+        ));
+        complete(report.local.as_ref().expect("local measurement"))?;
+        unix::capacity_for_payload(operation, 0)?;
+        Ok(())
+    }
+
+    pub(super) fn inspect_plan(
+        admitted: CurrentArchive<'_, '_>,
+        report: &mut OffloadPlanning,
+        at: DateTime<FixedOffset>,
+    ) -> Result<Option<Vec<OffloadOfferSelection>>, OffloadCreationRefusal> {
+        let register = load_at_root(admitted.journal_root())
+            .map_err(|error| unix::inputs(OffloadOfferRefusal::Review(error)))?;
+        let expected = register
+            .marks
+            .values()
+            .filter(|mark| mark.class == RemovalClass::OffloadRawRelease)
+            .cloned()
+            .collect::<Vec<_>>();
+        report.decision = Some(crate::run::current::inspect(admitted, &expected, at));
+        report.initial_projection = project_current_offload(
+            report.local.as_ref().expect("complete local population"),
+            report.decision.as_ref().expect("current inspection"),
+        )
+        .map_err(|error| planning(OffloadPlanningRefusal::Local(error)))?;
+        let projection = report
+            .initial_projection
+            .as_ref()
+            .ok_or_else(|| planning(OffloadPlanningRefusal::Unavailable))?;
+        if measure_local_media(admitted.journal_root().canonical_path())
+            != *report.local.as_ref().expect("complete local population")
+        {
+            return Err(unix::inputs(OffloadOfferRefusal::Changed));
+        }
+        admitted
+            .revalidate()
+            .map_err(OffloadCreationRefusal::Archive)?;
+        if report
+            .budget
+            .is_none_or(|budget| projection.projected_local_bytes <= budget)
+        {
+            return Ok(None);
+        }
+        let selected = candidates(admitted, report, at)?;
+        Ok(Some(selected))
+    }
+
     pub(super) fn create<'clock>(
         operation: PreparedArchiveOperation<'clock>,
         services: &BackupServices<'clock>,
@@ -311,33 +438,12 @@ mod bound {
         let now = at.with_timezone(&Utc);
         let mut report = OffloadPlanning::new();
         let mut resources = Resources::default();
-        let prepared = (|| {
-            operation
-                .revalidate()
-                .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
-            if !operation.configuration().offload_enabled() {
-                return Err(planning(OffloadPlanningRefusal::Disabled));
-            }
-            report.reconciliation = Some(reconcile_offload_empty(&operation, today, now));
-            if !report.reconciliation.as_ref().is_some_and(Result::is_ok) {
-                return Err(planning(OffloadPlanningRefusal::Reconciliation));
-            }
-            report.budget = operation
-                .configuration()
-                .offload_budget_bytes()
-                .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
-            report.local = Some(measure_local_media(
-                operation.journal_root().canonical_path(),
-            ));
-            complete(report.local.as_ref().expect("local measurement"))?;
-            unix::capacity_for_payload(&operation, 0)?;
-            Ok(())
-        })();
+        let prepared = preflight(&operation, &mut report, at);
         if let Err(reason) = prepared {
             resources.planning = Some(report);
             return unix::fail(Owner::Prepared(Box::new(operation)), resources, reason);
         }
-        let mut admitted =
+        let admitted =
             match solstone_core_backup_runtime::admit_prepared_archive(operation, services) {
                 Ok(admitted) => admitted,
                 Err(failure) => {
@@ -350,42 +456,7 @@ mod bound {
                     );
                 }
             };
-        let inspected = (|| {
-            let register = load_at_root(admitted.journal_root())
-                .map_err(|error| unix::inputs(OffloadOfferRefusal::Review(error)))?;
-            let expected = register
-                .marks
-                .values()
-                .filter(|mark| mark.class == RemovalClass::OffloadRawRelease)
-                .cloned()
-                .collect::<Vec<_>>();
-            report.decision = Some(inspect_current_offload(&mut admitted, &expected, at));
-            report.initial_projection = project_current_offload(
-                report.local.as_ref().expect("complete local population"),
-                report.decision.as_ref().expect("current inspection"),
-            )
-            .map_err(|error| planning(OffloadPlanningRefusal::Local(error)))?;
-            let projection = report
-                .initial_projection
-                .as_ref()
-                .ok_or_else(|| planning(OffloadPlanningRefusal::Unavailable))?;
-            if measure_local_media(admitted.journal_root().canonical_path())
-                != *report.local.as_ref().expect("complete local population")
-            {
-                return Err(unix::inputs(OffloadOfferRefusal::Changed));
-            }
-            admitted
-                .revalidate()
-                .map_err(OffloadCreationRefusal::Archive)?;
-            if report
-                .budget
-                .is_none_or(|budget| projection.projected_local_bytes <= budget)
-            {
-                return Ok(None);
-            }
-            let selected = candidates(&admitted, &report, at)?;
-            Ok(Some(selected))
-        })();
+        let inspected = inspect_plan(CurrentArchive::Generic(&admitted), &mut report, at);
         let selections = match inspected {
             Err(reason) => {
                 resources.planning = Some(report);
