@@ -98,23 +98,46 @@ impl JournalCatalog {
             .flat_map(|day| &day.segments)
             .filter(|segment| segment.stream == proof.target.stream && segment.segment == key)
             .flat_map(|segment| &segment.active)
-            .filter(|witness| {
-                witness.manifest_id == proof.manifest_id
-                    && witness.witness_id == file.witness_id
-                    && witness.snapshot_id == proof.snapshot_id
-                    && witness.journal_id.as_deref() == Some(proof.journal_id.as_str())
-                    && witness.layout == Some(proof.layout)
-                    && witness.segment_dir.as_deref() == Some(proof.target.dir.as_str())
-                    && witness.repository_id.as_deref() == Some(proof.repository_id.as_str())
-                    && witness.archive_path.as_deref() == Some(file.archive_path.as_str())
-                    && witness.file.name == file.name
-                    && witness.file.bytes == file.bytes
-                    && witness.file.sha256 == file.sha256
-                    && witness.processing.as_ref() == Some(&file.processing)
-            });
+            .filter(|witness| exact_witness(witness, proof, file));
         let witness = matches.next()?;
         matches.next().is_none().then_some(witness)
     }
+
+    /// Finds one exact historical witness, including generations already restored.
+    /// This data comparison supplies no current input or mutation authority.
+    pub fn historical_witness(
+        &self,
+        proof: &OffloadProof,
+        file: &ArchiveFileProof,
+    ) -> Option<&ArchiveWitness> {
+        let key = solstone_core_format::segment::segment_key(&proof.target.dir)?;
+        let mut matches = self
+            .days
+            .iter()
+            .filter(|day| day.day == proof.target.day)
+            .flat_map(|day| &day.segments)
+            .filter(|segment| segment.stream == proof.target.stream && segment.segment == key)
+            .flat_map(|segment| &segment.history)
+            .flat_map(|manifest| &manifest.files)
+            .filter(|witness| exact_witness(witness, proof, file));
+        let witness = matches.next()?;
+        matches.next().is_none().then_some(witness)
+    }
+}
+
+fn exact_witness(witness: &ArchiveWitness, proof: &OffloadProof, file: &ArchiveFileProof) -> bool {
+    witness.manifest_id == proof.manifest_id
+        && witness.witness_id == file.witness_id
+        && witness.snapshot_id == proof.snapshot_id
+        && witness.journal_id.as_deref() == Some(proof.journal_id.as_str())
+        && witness.layout == Some(proof.layout)
+        && witness.segment_dir.as_deref() == Some(proof.target.dir.as_str())
+        && witness.repository_id.as_deref() == Some(proof.repository_id.as_str())
+        && witness.archive_path.as_deref() == Some(file.archive_path.as_str())
+        && witness.file.name == file.name
+        && witness.file.bytes == file.bytes
+        && witness.file.sha256 == file.sha256
+        && witness.processing.as_ref() == Some(&file.processing)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

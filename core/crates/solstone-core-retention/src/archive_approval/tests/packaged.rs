@@ -1634,3 +1634,459 @@ fn packaged_archive_parent_entry() -> TestResult {
     }
     Ok(())
 }
+
+// These CAS controls use synthetic recorded history, genuine original admission
+// and retained live observations. They make no Native restore/publication claim.
+fn cas_synthetic_restore(
+    ledger: &Path,
+    proof: &OffloadProof,
+    operation: &crate::archive_catalog::RestoreOperation,
+) -> TestResult {
+    let event = crate::archive_catalog::codec::Event::RestoreV2 {
+        schema_version: 2,
+        time: 2,
+        day: proof.target.day.clone(),
+        stream: proof.target.stream.clone(),
+        segment: solstone_core_format::segment::segment_key(&proof.target.dir)
+            .ok_or_else(|| invalid("actual CAS segment key missing"))?,
+        operation_id: operation.operation_id.clone(),
+        files: operation.files.clone(),
+    };
+    solstone_core_journal_io::append_jsonl(ledger, &event)?;
+    Ok(())
+}
+
+fn cas_cross_day_fixture(
+    input: &Input,
+    proof: &OffloadProof,
+    operation: &crate::archive_catalog::RestoreOperation,
+) -> TestResult<PathBuf> {
+    let mut other = proof.clone();
+    other.target.day = "20261008".into();
+    other.manifest_id = "synthetic-cas-other-manifest".into();
+    other.files.truncate(1);
+    let file = other
+        .files
+        .first_mut()
+        .ok_or_else(|| invalid("actual CAS selected file missing"))?;
+    file.witness_id = "synthetic-cas-other-witness".into();
+    match input.case.as_str() {
+        "cas_cross_day_manifest" => other.manifest_id.clone_from(&proof.manifest_id),
+        "cas_cross_day_witness" => file.witness_id.clone_from(
+            &operation
+                .files
+                .first()
+                .ok_or_else(|| invalid("actual original CAS witness missing"))?
+                .witness_id,
+        ),
+        "cas_cross_day_operation" => {}
+        _ => return Err(invalid("unexpected cross-day CAS case").into()),
+    }
+    other.validate()?;
+    let event = crate::archive_catalog::codec::Event::ArchiveV2 {
+        schema_version: 2,
+        time: 1,
+        day: other.target.day.clone(),
+        stream: other.target.stream.clone(),
+        segment: solstone_core_format::segment::segment_key(&other.target.dir)
+            .ok_or_else(|| invalid("actual other-day segment key missing"))?,
+        segment_dir: other.target.dir.clone(),
+        layout: other.layout,
+        journal_id: other.journal_id.clone(),
+        manifest_id: other.manifest_id.clone(),
+        repository_id: other.repository_id.clone(),
+        snapshot_id: other.snapshot_id.clone(),
+        files: other.files.clone(),
+    };
+    let ledger = input.journal.join("health/offload/20261008.jsonl");
+    solstone_core_journal_io::append_jsonl(&ledger, &event)?;
+    if input.case == "cas_cross_day_operation" {
+        let file = other
+            .files
+            .first()
+            .ok_or_else(|| invalid("actual other-day witness missing"))?;
+        let other_operation = crate::archive_catalog::RestoreOperation {
+            operation_id: operation.operation_id.clone(),
+            files: vec![crate::archive_catalog::RestoreFileV2 {
+                witness_id: file.witness_id.clone(),
+                name: file.name.clone(),
+                disposition: crate::archive_catalog::RestoreDisposition::AlreadyPresent,
+            }],
+        };
+        cas_synthetic_restore(&ledger, &other, &other_operation)?;
+    }
+    Ok(ledger)
+}
+
+fn cas_catalog_counts(
+    catalog: &crate::archive_catalog::JournalCatalog,
+    proof: &OffloadProof,
+    operation: &crate::archive_catalog::RestoreOperation,
+) -> TestResult<(usize, usize, usize)> {
+    let selected = operation
+        .files
+        .first()
+        .ok_or_else(|| invalid("actual CAS operation member missing"))?;
+    let segments = || catalog.days.iter().flat_map(|day| &day.segments);
+    Ok((
+        segments()
+            .flat_map(|segment| &segment.history)
+            .filter(|manifest| manifest.manifest_id == proof.manifest_id)
+            .count(),
+        segments()
+            .flat_map(|segment| &segment.history)
+            .flat_map(|manifest| &manifest.files)
+            .filter(|witness| witness.witness_id == selected.witness_id)
+            .count(),
+        segments()
+            .flat_map(|segment| &segment.restores)
+            .filter(|recorded| recorded.operation_id == operation.operation_id)
+            .count(),
+    ))
+}
+
+#[test]
+#[ignore = "requires frozen admitted CAS overlay and owning copied-package fixture"]
+fn packaged_restored_mark_cas_entry() -> TestResult {
+    use crate::archive_catalog::{RestoreDisposition, RestoreFileV2, RestoreOperation};
+    use crate::mark_mutation::{
+        BoundMutationOutcome, MutationStatus, PlannedMarkMutation, RestoredMarkMutation,
+        RestoredMarkRefusal, conditional_retire_restored,
+    };
+    use solstone_core_segment::output_attempt::OutputClaims;
+
+    let input: Input = serde_json::from_slice(&fs::read(
+        std::env::var_os("ARCHIVE_APPROVAL_PROBE_JSON")
+            .ok_or_else(|| invalid("explicit CAS probe input required"))?,
+    )?)?;
+    let root = Arc::new(JournalRoot::open(&input.journal)?);
+    let fixture = parent_fixture(&input, &root)?;
+    let original = parent_raw_observations(&fixture)?;
+    assert_eq!(original.len(), 2);
+    let proof = &fixture
+        .mark
+        .offload
+        .as_ref()
+        .ok_or_else(|| invalid("actual CAS typed offer missing"))?
+        .proof;
+    let first = proof
+        .files
+        .first()
+        .ok_or_else(|| invalid("actual first CAS file missing"))?;
+    let second = proof
+        .files
+        .get(1)
+        .ok_or_else(|| invalid("actual second CAS file missing"))?;
+    let plan = PlannedMarkMutation::remainder(&fixture.mark, std::slice::from_ref(&second.name))?;
+    let replacement = plan
+        .replacement()
+        .ok_or_else(|| invalid("actual nonempty CAS remainder missing"))?;
+    let original_offer = fixture
+        .mark
+        .offload
+        .as_ref()
+        .ok_or_else(|| invalid("actual original CAS offer missing"))?;
+    let replacement_offer = replacement
+        .offload
+        .as_ref()
+        .ok_or_else(|| invalid("actual replacement CAS offer missing"))?;
+    assert_ne!(replacement.id, fixture.mark.id);
+    assert_ne!(replacement_offer.revision, original_offer.revision);
+    assert_eq!(replacement_offer.nonce, original_offer.nonce);
+    assert_eq!(replacement.proposal.bytes, second.bytes);
+    assert_eq!(replacement_offer.proof.files, vec![second.clone()]);
+    let unrelated = Mark {
+        id: MarkId::derive(
+            RemovalClass::OwnerRawRelease,
+            &fixture.mark.target,
+            std::slice::from_ref(&first.name),
+        ),
+        class: RemovalClass::OwnerRawRelease,
+        target: fixture.mark.target.clone(),
+        marked_at: fixture.mark.marked_at.clone(),
+        proposal: Proposal {
+            names: vec![first.name.clone()],
+            bytes: first.bytes,
+            reason: "synthetic unrelated row".into(),
+        },
+        state: MarkState::Marked,
+        offload: None,
+    };
+    let mut register = Register {
+        version: 2,
+        marks: BTreeMap::from([
+            (fixture.mark.id.clone(), fixture.mark.clone()),
+            (unrelated.id.clone(), unrelated.clone()),
+        ]),
+    };
+    match input.case.as_str() {
+        "cas_stale" => {
+            register
+                .marks
+                .get_mut(&fixture.mark.id)
+                .ok_or_else(|| invalid("actual stored CAS mark missing"))?
+                .proposal
+                .reason = "synthetic newer proposal".into();
+        }
+        "cas_replacement_collision" => {
+            let mut occupied = replacement.clone();
+            occupied.proposal.reason = "synthetic occupied remainder".into();
+            assert!(
+                register
+                    .marks
+                    .insert(occupied.id.clone(), occupied)
+                    .is_none()
+            );
+        }
+        "cas_remainder_retry"
+        | "cas_cross_day_manifest"
+        | "cas_cross_day_witness"
+        | "cas_cross_day_operation" => {}
+        _ => return Err(invalid("unexpected admitted CAS case").into()),
+    }
+    validate(&register)?;
+    let register_path = input.journal.join("health/retention-marks.json");
+    let register_before = serde_json::to_vec(&register)?;
+    fs::write(&register_path, &register_before)?;
+    let operation = RestoreOperation {
+        operation_id: "synthetic-cas-already-present".into(),
+        files: vec![RestoreFileV2 {
+            witness_id: first.witness_id.clone(),
+            name: first.name.clone(),
+            disposition: RestoreDisposition::AlreadyPresent,
+        }],
+    };
+    cas_synthetic_restore(&fixture.ledger, proof, &operation)?;
+    let mut ledgers = vec![fixture.ledger.clone()];
+    if input.case.starts_with("cas_cross_day_") {
+        ledgers.push(cas_cross_day_fixture(&input, proof, &operation)?);
+    }
+    let ledger_before = ledgers
+        .iter()
+        .map(|path| Ok((path.clone(), fs::read(path)?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let catalog = crate::archive_catalog::read_complete_catalog(&root)
+        .map_err(|error| invalid(&format!("actual CAS catalog: {error}")))?;
+    assert!(!catalog.degraded());
+    assert!(catalog.days.iter().all(|day| !day.degraded()));
+    assert!(
+        catalog
+            .days
+            .iter()
+            .flat_map(|day| &day.segments)
+            .all(|s| !s.degraded())
+    );
+    assert!(catalog.historical_witness(proof, first).is_some());
+    assert!(catalog.active_witness(proof, first).is_none());
+    assert!(catalog.active_witness(proof, second).is_some());
+    let counts = cas_catalog_counts(&catalog, proof, &operation)?;
+    let expected_counts = match input.case.as_str() {
+        "cas_cross_day_manifest" => (2, 1, 1),
+        "cas_cross_day_witness" => (1, 2, 1),
+        "cas_cross_day_operation" => (1, 1, 2),
+        _ => (1, 1, 1),
+    };
+    assert_eq!(counts, expected_counts);
+    let key = solstone_core_format::segment::segment_key(&proof.target.dir)
+        .ok_or_else(|| invalid("actual target CAS key missing"))?;
+    assert_eq!(
+        catalog
+            .days
+            .iter()
+            .flat_map(|day| &day.segments)
+            .filter(|s| s.day == proof.target.day
+                && s.stream == proof.target.stream
+                && s.segment == key)
+            .flat_map(|s| &s.restores)
+            .filter(|recorded| **recorded == operation)
+            .count(),
+        1
+    );
+    if input.case.starts_with("cas_cross_day_") {
+        assert_eq!(catalog.days.len(), 2);
+        assert!(catalog.days.iter().any(|day| day.day == "20261008"));
+        assert!(catalog.days.iter().any(|day| day.day == "20261009"));
+    }
+    let configuration_path = input.journal.join("config/journal.json");
+    let configuration_before = fs::read(&configuration_path)?;
+    let directory_identity = fixture.directory.object_identity();
+    let started = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    let clock = ProbeClock(Rc::new(Cell::new(started)));
+    let prepared =
+        PreparedArchiveOperation::prepare(root.clone(), ArchiveBudget::new(&clock)?, &clock)
+            .map_err(|error| invalid(&format!("actual original CAS preparation: {error:?}")))?;
+    let destination = prepared
+        .configuration()
+        .destination()
+        .ok_or_else(|| invalid("actual CAS destination missing"))?;
+    let password = prepared
+        .configuration()
+        .keys()?
+        .ok_or_else(|| invalid("actual CAS keys missing"))?
+        .daily_key;
+    let read = ReadOperation::admit(ReadAdmission::bind(
+        prepared,
+        destination,
+        password,
+        input.repository_id.clone(),
+        input.expected_restic_path.clone(),
+    ))
+    .map_err(|error| invalid(&format!("actual CAS read admission: {error:?}")))?;
+    let activity = Arc::clone(read.activity());
+    let carrier = Arc::clone(read.carrier());
+    let carrier_path = carrier.diagnostic_path();
+    assert!(Arc::ptr_eq(read.journal_root(), &root));
+    assert!(Arc::ptr_eq(carrier.activity(), &activity));
+    parent_observer_cut(&input, b"admitted")?;
+    let segment = fixture.directory.diagnostic_path();
+    let outputs = fixture
+        .mark
+        .proposal
+        .names
+        .iter()
+        .map(|name| {
+            let mut output = segment.join(name);
+            output.set_extension("jsonl");
+            output
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 2);
+    let claims = OutputClaims::acquire(outputs.clone(), crate::marks::register_lock_options())?;
+    let commit = claims.commit(segment)?;
+    commit.require_outputs(&claims, segment, outputs)?;
+    assert_eq!(claims.segment_identity(segment)?, directory_identity);
+    let confirmed = fixture
+        .directory
+        .observe_file(std::ffi::OsStr::new(&first.name))?
+        .ok_or_else(|| invalid("actual CAS live file disappeared"))?;
+    assert_eq!(
+        &confirmed,
+        original
+            .first()
+            .ok_or_else(|| invalid("actual original live CAS observation missing"))?
+    );
+    assert_eq!(confirmed.digest.size, first.bytes);
+    assert_eq!(confirmed.digest.sha256, first.sha256);
+    let result = conditional_retire_restored(RestoredMarkMutation {
+        read: &read,
+        operation: &operation,
+        confirmed: &confirmed,
+        plan: &plan,
+        claims: &claims,
+        commit: &commit,
+    });
+    let mut outcomes = vec![format!("{result:?}")];
+    match input.case.as_str() {
+        "cas_remainder_retry" => {
+            let actual = match result {
+                Ok(BoundMutationOutcome::Published(actual)) => actual,
+                other => {
+                    return Err(invalid(&format!("actual CAS did not publish: {other:?}")).into());
+                }
+            };
+            assert_eq!(actual.status, MutationStatus::Applied);
+            let mut expected = register.clone();
+            assert!(expected.marks.remove(&fixture.mark.id).is_some());
+            assert!(
+                expected
+                    .marks
+                    .insert(replacement.id.clone(), replacement.clone())
+                    .is_none()
+            );
+            assert_eq!(actual.register, expected);
+            let loaded = crate::review_context::load_at_root(&root)
+                .map_err(|error| invalid(&format!("actual CAS register read: {error:?}")))?;
+            assert_eq!(loaded, expected);
+            let published_bytes = fs::read(&register_path)?;
+            let repeated = conditional_retire_restored(RestoredMarkMutation {
+                read: &read,
+                operation: &operation,
+                confirmed: &confirmed,
+                plan: &plan,
+                claims: &claims,
+                commit: &commit,
+            });
+            outcomes.push(format!("{repeated:?}"));
+            let repeated = match repeated {
+                Ok(BoundMutationOutcome::Unchanged(actual)) => actual,
+                other => {
+                    return Err(
+                        invalid(&format!("actual CAS retry was not unchanged: {other:?}")).into(),
+                    );
+                }
+            };
+            assert_eq!(repeated.status, MutationStatus::AlreadyApplied);
+            assert_eq!(repeated.register, expected);
+            assert_eq!(fs::read(&register_path)?, published_bytes);
+        }
+        "cas_stale" | "cas_replacement_collision" => {
+            let actual = match result {
+                Ok(BoundMutationOutcome::Unchanged(actual)) => actual,
+                other => {
+                    return Err(invalid(&format!("actual CAS negative changed: {other:?}")).into());
+                }
+            };
+            assert_eq!(
+                actual.status,
+                if input.case == "cas_stale" {
+                    MutationStatus::Stale
+                } else {
+                    MutationStatus::Collision
+                }
+            );
+            assert_eq!(actual.register, register);
+            assert_eq!(fs::read(&register_path)?, register_before);
+        }
+        _ => {
+            assert!(
+                matches!(result, Err(RestoredMarkRefusal::Changed)),
+                "{result:?}"
+            );
+            assert_eq!(fs::read(&register_path)?, register_before);
+        }
+    }
+    let loaded = crate::review_context::load_at_root(&root)
+        .map_err(|error| invalid(&format!("actual final CAS register read: {error:?}")))?;
+    assert_eq!(loaded.marks.get(&unrelated.id), Some(&unrelated));
+    read.revalidate_admission()?;
+    assert!(Arc::ptr_eq(read.journal_root(), &root));
+    assert!(Arc::ptr_eq(read.activity(), &activity));
+    assert!(Arc::ptr_eq(read.carrier(), &carrier));
+    commit.require_outputs(
+        &claims,
+        segment,
+        fixture.mark.proposal.names.iter().map(|name| {
+            let mut output = segment.join(name);
+            output.set_extension("jsonl");
+            output
+        }),
+    )?;
+    fixture.directory.revalidate()?;
+    assert_eq!(fixture.directory.object_identity(), directory_identity);
+    assert_eq!(parent_raw_observations(&fixture)?, original);
+    for (path, complete, _) in &fixture.sidecars {
+        assert_eq!(fs::read(path)?, *complete);
+    }
+    assert_eq!(fs::read(configuration_path)?, configuration_before);
+    for (path, before) in &ledger_before {
+        assert_eq!(fs::read(path)?, *before);
+    }
+    parent_check_bookkeeping(&input, &fixture, &[])?;
+    assert!(carrier_path.is_dir());
+    assert_eq!(stages(&input.journal)?, vec![carrier_path.to_path_buf()]);
+    assert!(payloads(&input.journal)?.is_empty());
+    println!(
+        "ARCHIVE_APPROVAL_CAS_EVIDENCE {}",
+        serde_json::json!({
+            "case":input.case,
+            "event_provenance":"SYNTHETIC fixture AlreadyPresent via shared codec/append_jsonl; no Native publication or restore-effect receipt",
+            "outcomes":outcomes, "register":loaded, "global_counts":counts,
+            "raw":original.iter().map(|o| serde_json::json!({"identity":o.identity,"size":o.digest.size,"sha256":o.digest.sha256})).collect::<Vec<_>>(),
+            "carrier":carrier_path,"payloads":0,"native_restore_effect_claim":false,
+            "same_original_owner":true,"whole_mark_outputs":2,
+            "scope":"actual admitted/live/whole-Mark-claims/CAS under synthetic event history; no Native publication or lower settlement qualification"
+        })
+    );
+    std::io::stdout().flush()?;
+    Ok(())
+}
