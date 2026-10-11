@@ -192,8 +192,24 @@ fn record_finished_import_at(
 /// Save a source that renders into text segments: conversation exports, calendars, notes.
 ///
 /// Admit, render, write, then publish and record under the import lock. Segment keys come
-/// from the source's own timestamps, so importing the same source again rewrites the same
-/// files: there is nothing to deduplicate, and every run records its own outcome.
+/// from the source's own timestamps, so importing the same file again would rewrite the same
+/// segments and re-run every day they touch. Unless forced, a file already imported is
+/// skipped, as the web import refuses it.
+/// Whether these exact bytes already landed entries through an earlier import.
+fn already_saved(journal: &Path, media: &Path) -> bool {
+    solstone_core_import::hash_source(media)
+        .ok()
+        .and_then(|hash| solstone_core_import::find_manifest_by_hash(journal, &hash).ok())
+        .and_then(|scan| scan.found)
+        .and_then(|found| {
+            found
+                .manifest
+                .get("entry_count")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .is_some_and(|entries| entries > 0)
+}
+
 fn run_save<E>(
     mut dispatch: RegistryDispatch,
     journal: &Path,
@@ -210,6 +226,11 @@ where
             Ok(preview) => success(cli_render::source_preview(source, &preview)),
             Err(error) => failure(format!("{name} preview failed: {error}\n")),
         };
+    }
+    if !dispatch.force && already_saved(journal, &dispatch.media) {
+        return success(cli_render::resolution_skipped(
+            solstone_core_import::SkipReason::AlreadyImported,
+        ));
     }
     if let Err(error) = claim_dispatch_id(journal, &mut dispatch, selected) {
         return failure(format!("{name} import failed: {error}\n"));
@@ -2732,8 +2753,34 @@ mod tests {
             }
         }
 
+        // The same file again is skipped, and touches nothing, unless forced.
+        let imports_before = fs::read_dir(journal.path().join("imports"))
+            .unwrap()
+            .count();
+        let (skipped, skipped_id) =
+            run_bound(chat_dispatch(&zip_path, "20260104_103000"), journal.path());
+        assert_eq!(skipped.exit_code, 0, "{}", skipped.stderr);
+        assert!(
+            skipped.stdout.contains("already imported"),
+            "{}",
+            skipped.stdout
+        );
+        assert_eq!(skipped_id, None);
+        assert_eq!(
+            fs::read_dir(journal.path().join("imports"))
+                .unwrap()
+                .count(),
+            imports_before
+        );
+
         // Run 2
-        let (run2, id2) = run_bound(chat_dispatch(&zip_path, "20260104_110000"), journal.path());
+        let (run2, id2) = run_bound(
+            RegistryDispatch {
+                force: true,
+                ..chat_dispatch(&zip_path, "20260104_110000")
+            },
+            journal.path(),
+        );
         assert_eq!(run2.exit_code, 0, "{}", run2.stderr);
         let id2 = id2.unwrap();
 

@@ -9,6 +9,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - your weekly page is written again on large journals. in 2.0.41, putting the week together could take longer than the ten minutes your journal allows, so no page was written for that week, and it isn't written later on its own.
+- if you delete or edit something your journal made for a day, your journal now leaves it as you left it and counts the day as done. before, it kept treating that day as unfinished and processing it again. to have it made again, run `solstone journal reprocess DAY --from-scratch`. it redoes that whole day.
+- when your journal can't get a usable story for an activity even after trying again, it now waits until the activity changes before it asks again. before, it kept asking again, at least once an hour, with no end, and each try used your thinking provider.
+- importing the same AI conversation export, calendar file or notes again with `solstone journal import` now skips it, as the import page already does. before, it wrote everything again and your journal processed every day it covered again. to import it again on purpose, add `--force`.
 
 ## [2.0.41] - 2026-10-11
 

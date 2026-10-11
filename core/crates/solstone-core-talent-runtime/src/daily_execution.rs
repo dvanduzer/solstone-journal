@@ -184,18 +184,8 @@ pub(crate) fn execute(
     if record.status.is_terminal_success()
         && record.is_reusable_for(&record.evidence_revision, &record.contract_digest)
     {
-        return match solstone_core_journal_io::accepted_daily_artifacts_valid(
-            &context.journal,
-            &record,
-        ) {
-            Ok(true) => finished(&record)
-                .unwrap_or_else(|error| RuntimeOutcome::StageFailed(failure(name, error))),
-            Ok(false) => RuntimeOutcome::StageFailed(failure(
-                name,
-                "accepted daily artifact is missing or changed",
-            )),
-            Err(error) => RuntimeOutcome::StageFailed(failure(name, error)),
-        };
+        return finished(&record)
+            .unwrap_or_else(|error| RuntimeOutcome::StageFailed(failure(name, error)));
     }
     let skip = prepared
         .config
@@ -322,14 +312,6 @@ fn publish(
     if record.status.is_terminal_success()
         && record.is_reusable_for(&record.evidence_revision, &record.contract_digest)
     {
-        if !solstone_core_journal_io::accepted_daily_artifacts_valid(&context.journal, record)
-            .map_err(|e| failure(name, e))?
-        {
-            return Err(failure(
-                name,
-                "accepted daily artifact is missing or changed",
-            ));
-        }
         return finished(record).map_err(|e| failure(name, e));
     }
     let (response, usage, degraded) = if let Some(value) = record.generated_result.as_ref() {
