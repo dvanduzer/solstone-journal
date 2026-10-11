@@ -211,7 +211,71 @@ mod unix {
     }
 
     pub(super) struct NoHooks;
-    impl Hooks for NoHooks {}
+    impl Hooks for NoHooks {
+        #[cfg(all(test, feature = "full-tests"))]
+        fn sync(&mut self, file: &impl AsFd, point: SyncPoint) -> io::Result<()> {
+            let injected = FILE_SYNC_FAULT.with_borrow(|state| {
+                state.as_ref().is_some_and(|state| {
+                    if point != SyncPoint::File {
+                        return false;
+                    }
+                    state.calls.set(state.calls.get() + 1);
+                    !state.consumed.replace(true)
+                })
+            });
+            if injected {
+                Err(io::Error::other(
+                    "injected owning caller FileSync uncertainty",
+                ))
+            } else {
+                nix::unistd::fsync(file).map_err(io::Error::from)
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    std::thread_local! {
+        static FILE_SYNC_FAULT: std::cell::RefCell<Option<std::rc::Rc<FileSyncState>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    struct FileSyncState {
+        calls: std::cell::Cell<usize>,
+        consumed: std::cell::Cell<bool>,
+    }
+
+    /// Thread-bound fixture state only; Drop never disposes any native owner.
+    #[cfg(all(test, feature = "full-tests"))]
+    pub(super) struct FileSyncUncertainty(std::rc::Rc<FileSyncState>);
+
+    #[cfg(all(test, feature = "full-tests"))]
+    impl FileSyncUncertainty {
+        pub(super) fn arm() -> io::Result<Self> {
+            FILE_SYNC_FAULT.with_borrow_mut(|slot| {
+                if slot.is_some() {
+                    return Err(io::Error::other("FileSync fixture already armed"));
+                }
+                let state = std::rc::Rc::new(FileSyncState {
+                    calls: std::cell::Cell::new(0),
+                    consumed: std::cell::Cell::new(false),
+                });
+                *slot = Some(std::rc::Rc::clone(&state));
+                Ok(Self(state))
+            })
+        }
+        pub(super) fn observations(&self) -> (usize, bool) {
+            (self.0.calls.get(), self.0.consumed.get())
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    impl Drop for FileSyncUncertainty {
+        fn drop(&mut self) {
+            FILE_SYNC_FAULT.with_borrow_mut(|slot| *slot = None);
+        }
+    }
 
     struct BoundLedger<'a> {
         root: &'a Arc<JournalRoot>,

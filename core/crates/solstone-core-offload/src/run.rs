@@ -38,6 +38,12 @@ pub use current::{
     CurrentOffloadRefusalReason, EligibleOffloadFile, inspect_current_offload,
 };
 
+mod offer_creation;
+pub use offer_creation::{
+    OffloadCreation, OffloadCreationNative, OffloadCreationOwner, OffloadCreationRefusal,
+    OffloadLedgerEffect, OffloadLedgerSync, OffloadLedgerWrite, create_offload_offers,
+};
+
 pub const OFFLOAD_STALL_BACKUP_NOT_READY: &str = "backup_not_ready";
 pub const OFFLOAD_STALL_BACKUP_FAILING: &str = "backup_failing";
 pub const OFFLOAD_STALL_VERIFICATION_MISSING: &str = "verification_missing";
