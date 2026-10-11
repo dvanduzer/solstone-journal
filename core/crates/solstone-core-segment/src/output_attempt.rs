@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use solstone_core_journal_io::{
-    BoundParentLock, JournalRoot, LockOptions, acquire_existing_parent_lock_bound,
+    BoundParentLock, JournalRoot, LockOptions, ObjectIdentity, acquire_existing_parent_lock_bound,
     open_existing_parent_lock_bound,
 };
 use solstone_core_processing_record::media::is_media_extension;
@@ -204,12 +204,16 @@ impl OutputClaims {
         root.revalidate()
     }
 
-    /// Hold the short segment exclusion through the caller's final publication.
-    pub fn commit(&self, segment: &Path) -> Result<SegmentCommit<'_>> {
+    /// Exact retained identity of a covered parent, after binding validation.
+    pub fn segment_identity(&self, segment: &Path) -> Result<ObjectIdentity> {
         self.validate_parent(segment)?;
-        let segment_parent = admit(parent(segment)?)?;
-        let lock = acquire_bound(&segment_parent, &lock_name(segment)?, self.options)?;
-        revalidate(&segment_parent)?;
+        self.parents
+            .get(segment)
+            .map(|binding| binding.root.identity())
+            .ok_or_else(|| refusal("segment is not covered by these output attempts"))
+    }
+
+    fn revalidate_commit(&self, segment: &Path) -> Result<()> {
         for binding in self.parents.values() {
             binding.revalidate()?;
         }
@@ -221,9 +225,20 @@ impl OutputClaims {
                 "segment output set changed; release claims and rediscover",
             ));
         }
+        Ok(())
+    }
+
+    /// Hold the short segment exclusion through the caller's final publication.
+    pub fn commit(&self, segment: &Path) -> Result<SegmentCommit<'_>> {
+        self.validate_parent(segment)?;
+        let segment_parent = admit(parent(segment)?)?;
+        let lock = acquire_bound(&segment_parent, &lock_name(segment)?, self.options)?;
+        revalidate(&segment_parent)?;
+        self.revalidate_commit(segment)?;
         Ok(SegmentCommit {
-            _claims: self,
-            _parent: segment_parent,
+            claims: self,
+            parent: segment_parent,
+            segment: segment.to_path_buf(),
             _lock: lock,
         })
     }
@@ -231,9 +246,20 @@ impl OutputClaims {
 
 /// A publication boundary retaining its attempts and segment lock.
 pub struct SegmentCommit<'a> {
-    _claims: &'a OutputClaims,
-    _parent: JournalRoot,
+    claims: &'a OutputClaims,
+    parent: JournalRoot,
+    segment: PathBuf,
     _lock: BoundParentLock,
+}
+
+impl SegmentCommit<'_> {
+    /// Recheck the same claims, ancestry and discovery while exclusion stays held.
+    /// This does not acquire another lock or cover additional output names.
+    pub fn revalidate(&self) -> Result<()> {
+        self.claims.validate_parent(&self.segment)?;
+        revalidate(&self.parent)?;
+        self.claims.revalidate_commit(&self.segment)
+    }
 }
 
 /// Existing live-name exclusion for directory allocation or a directory pivot.
@@ -509,6 +535,78 @@ mod tests {
         let input = InputObservation::capture(&fixed, &raw).unwrap();
         fs::write(segment.join("screen.mp4"), b"unrelated").unwrap();
         assert!(input.commit(&fixed).is_ok());
+    }
+
+    #[test]
+    fn held_commit_exposes_exact_identity_and_keeps_exclusion() {
+        let (_root, segment, raw) = fixture();
+        let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
+        assert_eq!(
+            claims.segment_identity(&segment).unwrap(),
+            JournalRoot::open(&segment).unwrap().identity()
+        );
+        assert!(claims.segment_identity(&segment.join("uncovered")).is_err());
+        let commit = claims.commit(&segment).unwrap();
+        commit.revalidate().unwrap();
+        assert!(solstone_core_journal_io::hold_lock(&segment, no_wait()).is_err());
+        assert!(OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).is_err());
+        commit.revalidate().unwrap();
+    }
+
+    #[test]
+    fn held_discovery_refuses_new_names_while_fixed_claims_keep_their_scope() {
+        let (_root, segment, raw) = fixture();
+        let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
+        let commit = claims.commit(&segment).unwrap();
+        fs::write(raw.with_extension("flac"), b"same output stem").unwrap();
+        assert!(commit.revalidate().is_err());
+        drop(commit);
+        drop(claims);
+        let fixed = OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).unwrap();
+        let commit = fixed.commit(&segment).unwrap();
+        fs::write(segment.join("unrelated.mp4"), b"new output").unwrap();
+        commit.revalidate().unwrap();
+    }
+
+    #[test]
+    fn held_commit_refuses_tombstone_replacement_and_transplanted_ancestry() {
+        for change in 0..3 {
+            let (root, segment, _raw) = fixture();
+            let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
+            let commit = claims.commit(&segment).unwrap();
+            match change {
+                0 => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
+                1 => {
+                    fs::rename(&segment, root.path().join("moved")).unwrap();
+                    fs::create_dir(&segment).unwrap();
+                }
+                _ => {
+                    fs::rename(root.path().join("chronicle"), root.path().join("old")).unwrap();
+                    fs::create_dir_all(segment.parent().unwrap()).unwrap();
+                    fs::rename(root.path().join("old/20260101/work/120000_60"), &segment).unwrap();
+                }
+            }
+            assert!(commit.revalidate().is_err());
+            if change != 0 {
+                assert!(claims.segment_identity(&segment).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_discovery_and_same_retained_ancestry_restoration_stay_valid() {
+        let root = TempDir::new();
+        let segment = root.path().join("parent/segment");
+        fs::create_dir_all(&segment).unwrap();
+        let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
+        let commit = claims.commit(&segment).unwrap();
+        commit.revalidate().unwrap();
+        let parent = root.path().join("parent");
+        let moved = root.path().join("moved");
+        fs::rename(&parent, &moved).unwrap();
+        assert!(commit.revalidate().is_err());
+        fs::rename(&moved, &parent).unwrap();
+        commit.revalidate().unwrap();
     }
 
     #[test]
