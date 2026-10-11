@@ -3638,6 +3638,7 @@ dependencies = [
  "solstone-core-backup-runtime",
  "solstone-core-installed-payload",
  "solstone-core-offload",
+ "solstone-core-retention",
  "solstone-core-system-health",
  "tempfile",
 ]
@@ -3656,16 +3657,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "solstone-core-backup",
  "solstone-core-backup-runtime",
  "solstone-core-body-rebuild",
  "solstone-core-distribution",
  "solstone-core-indexer-store",
  "solstone-core-installed-payload",
+ "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "solstone-core-system",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "ureq",
 ]
 
@@ -3690,6 +3694,7 @@ dependencies = [
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
  "solstone-core-offload",
+ "solstone-core-retention",
  "solstone-core-sol-link",
  "solstone-core-system",
  "tempfile",
@@ -4750,6 +4755,7 @@ dependencies = [
 name = "solstone-core-journal-config"
 version = "2.0.40"
 dependencies = [
+ "chrono",
  "chrono-tz",
  "iana-time-zone",
  "serde",
@@ -5146,10 +5152,13 @@ dependencies = [
  "solstone-core-backup",
  "solstone-core-callosum",
  "solstone-core-depict",
+ "solstone-core-format",
  "solstone-core-generate",
  "solstone-core-indexer-store",
+ "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-processing-record",
+ "solstone-core-segment",
  "tempfile",
 ]
 
@@ -5875,6 +5884,7 @@ dependencies = [
  "chrono",
  "log",
  "serde_json",
+ "solstone-core-entity",
  "solstone-core-format",
  "solstone-core-journal-io",
  "solstone-core-memory-original",

@@ -15,6 +15,7 @@ pub mod operational_log_parse;
 pub mod owner_path;
 pub mod partition;
 pub mod process;
+pub mod processing;
 #[cfg(any(unix, windows))]
 pub mod provider_runtime;
 pub mod queue;

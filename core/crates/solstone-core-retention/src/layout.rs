@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use solstone_core_journal_io::paths::DEFAULT_STREAM;
+use solstone_core_journal_io::paths::{DEFAULT_STREAM, SegmentLayout};
 
 /// Whether the journal has a chronicle directory to scan.
 pub fn chronicle_root_is_dir(journal: &Path) -> bool {
@@ -49,9 +49,43 @@ pub fn content_rel(day: &str, stream: &str, dir: &str, name: &str) -> String {
     format!("{}/{}", segment_rel(day, stream, dir), name)
 }
 
+/// The exact stream parent selected by an observed layout.
+pub(crate) fn stream_rel_with_layout(day: &str, stream: &str, layout: SegmentLayout) -> String {
+    match layout {
+        SegmentLayout::Direct => format!("chronicle/{day}"),
+        SegmentLayout::Named => format!("chronicle/{day}/{stream}"),
+    }
+}
+
+pub(crate) fn segment_rel_with_layout(
+    day: &str,
+    stream: &str,
+    dir: &str,
+    layout: SegmentLayout,
+) -> String {
+    format!("{}/{dir}", stream_rel_with_layout(day, stream, layout))
+}
+
+pub(crate) fn content_rel_with_layout(
+    day: &str,
+    stream: &str,
+    dir: &str,
+    name: &str,
+    layout: SegmentLayout,
+) -> String {
+    format!(
+        "{}/{name}",
+        segment_rel_with_layout(day, stream, dir, layout)
+    )
+}
+
 /// A canonical operational-log leaf inside one Chronicle day health directory.
 pub fn oplog_rel(day: &str, leaf: &str) -> String {
-    format!("chronicle/{day}/health/{leaf}")
+    format!("{}/{leaf}", day_health_rel(day))
+}
+
+pub(crate) fn day_health_rel(day: &str) -> String {
+    format!("chronicle/{day}/health")
 }
 
 /// The stream name for a segment found directly under a day directory.
@@ -67,6 +101,30 @@ pub fn default_stream() -> &'static str {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_layout_keeps_named_default_distinct() {
+        assert_eq!(
+            content_rel_with_layout(
+                "20261010",
+                "_default",
+                "120000_60",
+                "a.flac",
+                SegmentLayout::Direct
+            ),
+            "chronicle/20261010/120000_60/a.flac"
+        );
+        assert_eq!(
+            content_rel_with_layout(
+                "20261010",
+                "_default",
+                "120000_60",
+                "a.flac",
+                SegmentLayout::Named
+            ),
+            "chronicle/20261010/_default/120000_60/a.flac"
+        );
+    }
 
     #[test]
     fn a_named_stream_carries_its_component() {

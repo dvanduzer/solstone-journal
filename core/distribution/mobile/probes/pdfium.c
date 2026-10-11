@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
 // Compile/link probe only; target execution is outside this build evidence.
 #include "fpdfview.h"
 #include "fpdf_doc.h"

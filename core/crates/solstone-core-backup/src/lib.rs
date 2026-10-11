@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use solstone_core_journal_config::ConfigLoadError;
 use solstone_core_journal_config_write::ConfigMutationError;
 
+pub mod archive_activity;
 pub mod archive_admission;
 pub mod archive_readback;
 #[cfg(unix)]
@@ -16,6 +17,8 @@ mod destination;
 mod hosted;
 mod keys;
 mod merge;
+#[cfg(target_os = "linux")]
+pub mod owned_dns;
 mod state;
 pub mod teardown_configuration;
 

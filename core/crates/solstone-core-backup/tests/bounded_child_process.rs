@@ -334,6 +334,7 @@ fn active_cancellation_reaps_the_root_and_retains_parent_descriptor_flags() {
 #[test]
 #[ignore = "requires an admitted copied package and synthetic direct S3 fixture"]
 fn packaged_readback_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
     use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveConfiguration, Clock};
     use solstone_core_backup::archive_readback::{
         ExactArchiveFile, ReadAdmission, ReadOperation, ReadbackError, ReadbackFailure,
@@ -360,7 +361,6 @@ fn packaged_readback_entry() {
     let root = std::sync::Arc::new(
         JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap(),
     );
-    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
     let configuration = ArchiveConfiguration::capture(&root).unwrap();
     let destination = configuration.destination().unwrap();
     let keys = configuration.keys().unwrap().unwrap();
@@ -373,47 +373,67 @@ fn packaged_readback_entry() {
         .as_secs() as i64;
     let clock = ProbeClock(std::cell::Cell::new(started));
     let refused_admission = |repository_id: String, expected_restic_path: std::path::PathBuf| {
-        match ReadOperation::admit(ReadAdmission {
-            root: root.clone(),
-            configuration: ArchiveConfiguration::capture(&root).unwrap(),
-            budget: ArchiveBudget::new(&clock).unwrap(),
-            clock: &clock,
-            destination: destination.clone(),
-            password: keys.daily_key.clone(),
+        // Independent admission controls use fresh synthetic roots: a refusal
+        // retains its original reservation and cannot be followed by rebinding.
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("config")).unwrap();
+        fs::create_dir(directory.path().join("media")).unwrap();
+        fs::copy(
+            root.canonical_path().join("config/journal.json"),
+            directory.path().join("config/journal.json"),
+        )
+        .unwrap();
+        let refusal_root = Arc::new(JournalRoot::open(directory.path()).unwrap());
+        let operation = PreparedArchiveOperation::prepare(
+            refusal_root,
+            ArchiveBudget::new(&clock).unwrap(),
+            &clock,
+        )
+        .unwrap();
+        let error = ReadOperation::admit(ReadAdmission::bind(
+            operation,
+            destination.clone(),
+            keys.daily_key.clone(),
             repository_id,
             expected_restic_path,
-        }) {
-            Err(error) => error,
-            Ok(_) => panic!("archive admission should refuse"),
-        }
+        ))
+        .err()
+        .expect("archive admission should refuse");
+        (directory, error)
     };
-    assert_eq!(
-        refused_admission(
-            input["repository_id"].as_str().unwrap().into(),
-            member.path().with_file_name("other-restic")
-        ),
-        ReadbackError::ToolChanged
+    let (_tool_root, tool_refusal) = refused_admission(
+        input["repository_id"].as_str().unwrap().into(),
+        member.path().with_file_name("other-restic"),
     );
+    assert_eq!(tool_refusal.reason(), ReadbackError::ToolChanged);
     let mismatched_repository = if input["repository_id"].as_str().unwrap().starts_with('d') {
         "e".repeat(64)
     } else {
         "d".repeat(64)
     };
+    let (_repository_root, repository_refusal) =
+        refused_admission(mismatched_repository, member.path().into());
     assert_eq!(
-        refused_admission(mismatched_repository, member.path().into()),
+        repository_refusal.reason(),
         ReadbackError::RepositoryIdentityChanged
     );
-    let mut operation = ReadOperation::admit(ReadAdmission {
-        root: root.clone(),
-        configuration,
-        budget: ArchiveBudget::new(&clock).unwrap(),
-        clock: &clock,
-        destination,
-        password: keys.daily_key,
-        repository_id: input["repository_id"].as_str().unwrap().into(),
-        expected_restic_path: member.path().into(),
-    })
+    let original = PreparedArchiveOperation::prepare(
+        root.clone(),
+        ArchiveBudget::new(&clock).unwrap(),
+        &clock,
+    )
     .unwrap();
+    let carrier = original.carrier().clone();
+    let activity = original.activity().clone();
+    let mut operation = ReadOperation::admit(ReadAdmission::bind(
+        original,
+        destination,
+        keys.daily_key,
+        input["repository_id"].as_str().unwrap().into(),
+        member.path().into(),
+    ))
+    .unwrap();
+    assert!(Arc::ptr_eq(operation.carrier(), &carrier));
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let fresh = || {
         MediaStage::create(parent.clone(), activity.clone())
@@ -532,6 +552,7 @@ fn packaged_readback_entry() {
 #[test]
 #[ignore = "requires an admitted copied package and controlled synthetic S3 fixture"]
 fn packaged_cancellation_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
     use solstone_core_backup::archive_admission::{
         AdmissionError, ArchiveBudget, ArchiveConfiguration, Clock,
     };
@@ -555,7 +576,6 @@ fn packaged_cancellation_entry() {
     let root = std::sync::Arc::new(
         JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap(),
     );
-    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -565,27 +585,33 @@ fn packaged_cancellation_entry() {
         solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
             .unwrap();
     let admit = |cancellation: ArchiveCancellation| {
-        let configuration = ArchiveConfiguration::capture(&root).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("config")).unwrap();
+        fs::create_dir(directory.path().join("media")).unwrap();
+        fs::copy(
+            root.canonical_path().join("config/journal.json"),
+            directory.path().join("config/journal.json"),
+        )
+        .unwrap();
+        let owned_root = Arc::new(JournalRoot::open(directory.path()).unwrap());
+        let configuration = ArchiveConfiguration::capture(&owned_root).unwrap();
         let destination = configuration.destination().unwrap();
         let password = configuration.keys().unwrap().unwrap().daily_key;
-        ReadOperation::admit(ReadAdmission {
-            root: root.clone(),
-            configuration,
-            budget: ArchiveBudget::new_cancellable(&clock, cancellation).unwrap(),
-            clock: &clock,
+        let original = PreparedArchiveOperation::prepare(
+            owned_root,
+            ArchiveBudget::new_cancellable(&clock, cancellation).unwrap(),
+            &clock,
+        )
+        .unwrap();
+        let operation = ReadOperation::admit(ReadAdmission::bind(
+            original,
             destination,
             password,
-            repository_id: input["repository_id"].as_str().unwrap().into(),
-            expected_restic_path: member.path().into(),
-        })
-        .unwrap()
-    };
-    let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
-    let fresh = || {
-        MediaStage::create(parent.clone(), activity.clone())
-            .unwrap()
-            .create_target()
-            .unwrap()
+            input["repository_id"].as_str().unwrap().into(),
+            member.path().into(),
+        ))
+        .unwrap();
+        (directory, operation)
     };
     let file = ExactArchiveFile {
         repository_id: input["repository_id"].as_str().unwrap().into(),
@@ -595,8 +621,19 @@ fn packaged_cancellation_entry() {
         bytes: input["bytes"].as_u64().unwrap(),
         sha256: input["sha256"].as_str().unwrap().into(),
     };
-    let mut positive = admit(ArchiveCancellation::new())
-        .read_exact(&file, fresh())
+    let (_positive_root, mut positive_operation) = admit(ArchiveCancellation::new());
+    let positive_parent = MediaDirectory::open(
+        positive_operation.journal_root().clone(),
+        Path::new("media"),
+    )
+    .unwrap();
+    let positive_target =
+        MediaStage::create(positive_parent, positive_operation.activity().clone())
+            .unwrap()
+            .create_target()
+            .unwrap();
+    let mut positive = positive_operation
+        .read_exact(&file, positive_target)
         .unwrap();
     assert_eq!(positive.digest().size, file.bytes);
     assert_eq!(positive.digest().sha256, file.sha256);
@@ -604,7 +641,16 @@ fn packaged_cancellation_entry() {
 
     for mode in ["query", "dump"] {
         let cancellation = ArchiveCancellation::new();
-        let mut operation = admit(cancellation.clone());
+        let (_case_root, mut operation) = admit(cancellation.clone());
+        let parent =
+            MediaDirectory::open(operation.journal_root().clone(), Path::new("media")).unwrap();
+        let activity = operation.activity().clone();
+        let fresh = || {
+            MediaStage::create(parent.clone(), activity.clone())
+                .unwrap()
+                .create_target()
+                .unwrap()
+        };
         let target = fresh();
         let identity = target.identity();
         let mut control = UnixStream::connect(input["control"].as_str().unwrap()).unwrap();
@@ -650,7 +696,7 @@ fn packaged_cancellation_entry() {
                 MediaIdentity::Unix { device, inode } => (device, inode),
                 _ => unreachable!(),
             };
-            let media = Path::new(input["journal"].as_str().unwrap()).join("media");
+            let media = operation.journal_root().canonical_path().join("media");
             let retained = fs::read_dir(media).unwrap().any(|stage| {
                 fs::read_dir(stage.unwrap().path()).unwrap().any(|entry| {
                     let metadata = entry.unwrap().metadata().unwrap();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Read-only restore selection while the durable prepared-media executor is held.
+//! Restore selection and owning prepared-media execution.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -12,7 +12,10 @@ use solstone_core_journal_io::media::MediaDirectory;
 use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
 use solstone_core_journal_io::{JournalRoot, check_record_identities};
 
-use crate::ledger::{self, SegmentCatalog};
+pub mod owned;
+
+use crate::ledger;
+use solstone_core_retention::archive_catalog::{SegmentCatalog, read_complete_catalog};
 
 pub const RESTORE_RESERVE_BYTES: u64 = 1_000_000_000;
 pub const OFFLOAD_RESTORE_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
@@ -162,7 +165,7 @@ fn run(journal: &Path, scope: &str, day: Option<&str>) -> RestoreResult {
                 .with_reason_detail(error.to_string());
         }
     };
-    let catalog = match ledger::read_complete_catalog(&root) {
+    let catalog = match read_complete_catalog(&root) {
         Ok(catalog) if !catalog.degraded() => catalog,
         Ok(_) => return base("error", Some("ledger_degraded"), scope, day),
         Err(error) => {
@@ -238,13 +241,14 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
 
-    use crate::ledger::{OffloadFile, append_offload_event};
+    use crate::ledger::append_offload_event;
     use serde_json::json;
     use solstone_core_backup_runtime::hosted_runtime::HttpError;
     use solstone_core_backup_runtime::{
         Clock, HttpRequest, HttpResponse, HttpTransport, JournalMaintenance,
         JournalMaintenanceError, ToolOutput, ToolRequest, ToolRunner,
     };
+    use solstone_core_retention::archive_catalog::OffloadFile;
     use solstone_core_retention::{Target, upsert_offload};
 
     #[derive(Default)]

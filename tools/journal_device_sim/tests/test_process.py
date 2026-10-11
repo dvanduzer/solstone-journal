@@ -33,7 +33,7 @@ _FIXED_CERTIFICATE_CID = (
 )
 _VALID_NATIVE_SCRIPT = """#!/bin/sh
 case "$1" in
-    --help) printf '%s\\n' 'solstone - journal access CLI' ;;
+    --help) printf '%s\\n' 'solstone - your journal, from the command line' ;;
     --version) printf '%s\\n' 'solstone-test 3.1.4' ;;
     *) exit 8 ;;
 esac
@@ -332,7 +332,7 @@ class LinkBridgeTests(unittest.TestCase):
                     import sys
 
                     if sys.argv[1:] == ["--help"]:
-                        print("solstone - journal access CLI")
+                        print("solstone - your journal, from the command line")
                         raise SystemExit(0)
                     if sys.argv[1:] == ["--version"]:
                         print("solstone-test 3.1.4")
@@ -389,7 +389,7 @@ class LinkBridgeTests(unittest.TestCase):
                     import time
 
                     if sys.argv[1:] == ["--help"]:
-                        print("solstone - journal access CLI")
+                        print("solstone - your journal, from the command line")
                         raise SystemExit(0)
                     if sys.argv[1:] == ["--version"]:
                         print("solstone-test 3.1.4")
@@ -404,7 +404,7 @@ class LinkBridgeTests(unittest.TestCase):
                         (bundle / "peer.json").write_text(json.dumps({"instance_id": "home-test", "home_label": "Test Home"}), encoding="utf-8")
                         raise SystemExit(0)
                     if sys.argv[1:3] == ["link", "serve"]:
-                        print("forwarding 127.0.0.1:43129 -> home test via direct connection", flush=True)
+                        print("forwarding 127.0.0.1:43129 -> stuck·pox via direct connection", flush=True)
                         while True:
                             time.sleep(60)
                     raise SystemExit(8)
@@ -486,7 +486,7 @@ class LinkBridgeTests(unittest.TestCase):
                     import time
 
                     if sys.argv[1:] == ["--help"]:
-                        print("solstone - journal access CLI")
+                        print("solstone - your journal, from the command line")
                         raise SystemExit(0)
                     if sys.argv[1:] == ["--version"]:
                         print("solstone-test 3.1.4")
@@ -511,7 +511,8 @@ class LinkBridgeTests(unittest.TestCase):
                             raise SystemExit(12)
                         if "--relay-only" in sys.argv:
                             raise SystemExit(13)
-                        print("forwarding 127.0.0.1:43127 -> home test via direct connection", flush=True)
+                        print("fixture diagnostic", file=sys.stderr, flush=True)
+                        print("forwarding 127.0.0.1:43127 -> stuck·pox via direct connection", flush=True)
                         while True:
                             time.sleep(60)
                     raise SystemExit(8)
@@ -581,7 +582,7 @@ class LinkBridgeTests(unittest.TestCase):
                     import time
 
                     if sys.argv[1:] == ["--help"]:
-                        print("solstone - journal access CLI")
+                        print("solstone - your journal, from the command line")
                         raise SystemExit(0)
                     if sys.argv[1:3] == ["link", "join"]:
                         raise SystemExit(11)
@@ -596,7 +597,8 @@ class LinkBridgeTests(unittest.TestCase):
                             relay_url = sys.argv[sys.argv.index("--relay-url") + 1]
                             if relay_url != "wss://relay.test/v1":
                                 raise SystemExit(14)
-                        print("forwarding 127.0.0.1:43128 -> home test via relay only", flush=True)
+                        print("forwarding 127.0.0.1:43128 -> stuck·pox via relay only", flush=True)
+                        print("fixture diagnostic", file=sys.stderr, flush=True)
                         while True:
                             time.sleep(60)
                     raise SystemExit(8)

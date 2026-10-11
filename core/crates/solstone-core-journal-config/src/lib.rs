@@ -10,6 +10,7 @@ mod name;
 mod notification_labels;
 pub mod parakeet_coreml;
 mod path;
+pub mod processing;
 mod read;
 mod zone;
 
@@ -39,11 +40,14 @@ pub use notification_labels::{
 pub use path::get_journal_config_path;
 pub use read::{
     ConfigLoadError, JournalConfigMutationBase, JournalConfigRead,
-    entity_tier8_typo_acceptance_enabled, load_mutation_base, no_thinking_engine_chosen,
-    read_journal_config,
+    entity_tier8_typo_acceptance_enabled, fingerprint_journal_config_bytes, load_mutation_base,
+    no_thinking_engine_chosen, read_journal_config,
 };
 #[cfg(unix)]
-pub use read::{read_journal_config_bound, read_journal_config_in_directory};
+pub use read::{
+    read_journal_config_bound, read_journal_config_in_directory,
+    read_journal_config_observed_in_directory,
+};
 pub use zone::{Tz, host_zone, owner_zone, parse_zone, zone_label};
 
 #[cfg(test)]

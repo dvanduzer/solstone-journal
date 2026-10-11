@@ -328,6 +328,8 @@ pub(crate) async fn run(
         &solstone_core_system::process::AdmittedInstalledTaskLaunch,
     >,
 ) -> SupervisorStopReason {
+    let mut deferred_recovery = processing_is_deferred(&state.journal);
+    let mut last_deferred_drain = None;
     let mut last_status = Instant::now() - state.timing.status_interval;
     let mut last_sync = Instant::now() - Duration::from_secs_f64(DEFAULT_INTERVAL_SECONDS);
     loop {
@@ -344,6 +346,8 @@ pub(crate) async fn run(
         let _ = solstone_core_system::process::observe_windows_launch_cleanup();
         let app_samples = reconcile_app_processes(state);
         let tick = Instant::now();
+        solstone_core_system::processing::publish_display_snapshot(&state.journal);
+        state.queue.resume_processing();
         state.queue.enforce_deadlines(tick);
         record_schedule_completions(state);
         reconcile_providers(state);
@@ -368,7 +372,7 @@ pub(crate) async fn run(
         );
         let (seed_outcome, drain_outcome) = activity_retry_drain_with(
             state.no_daily,
-            processing_is_deferred(&state.journal),
+            !solstone_core_system::processing::processing_allowed(&state.journal),
             no_thinking_engine_chosen(&state.journal),
             &mut state.activity_retry_seed_day,
             &mut state.last_activity_retry_drain,
@@ -395,6 +399,16 @@ pub(crate) async fn run(
             log::warn!("supervisor: activity retry drain failed: {error}");
         }
         if !state.no_daily {
+            if let Err(error) = handle_deferred_drain(
+                &state.journal,
+                &state.queue,
+                &mut deferred_recovery,
+                &mut last_deferred_drain,
+                tick,
+                wall_now,
+            ) {
+                log::warn!("supervisor: deferred catchup drain failed: {error}");
+            }
             let daily_outcome = compose_daily_and_retry_expiry_with(
                 &mut state.last_retry_expiry_drain,
                 tick,
@@ -563,7 +577,7 @@ pub(crate) fn check_segment_flush(
     now: Instant,
 ) {
     if flush.pending.is_empty()
-        || processing_is_deferred(journal)
+        || !solstone_core_system::processing::processing_allowed(journal)
         || no_thinking_engine_chosen(journal)
     {
         return;
@@ -599,7 +613,7 @@ pub(crate) fn check_activity_settle(
     today: &str,
 ) {
     if tick.saturating_duration_since(*last_scan) < SETTLE_SCAN_INTERVAL
-        || processing_is_deferred(journal)
+        || !solstone_core_system::processing::processing_allowed(journal)
         || no_thinking_engine_chosen(journal)
     {
         return;
@@ -911,7 +925,18 @@ pub(crate) fn run_catchup_drain(
     force_days: &[String],
     now: SystemTime,
 ) -> Result<(), CatchupError> {
-    if no_thinking_engine_chosen(journal) {
+    run_catchup_drain_limited(journal, queue, exclude, force_days, now, usize::MAX)
+}
+
+fn run_catchup_drain_limited(
+    journal: &Path,
+    queue: &TaskQueue,
+    exclude: &BTreeSet<String>,
+    force_days: &[String],
+    now: SystemTime,
+    limit: usize,
+) -> Result<(), CatchupError> {
+    if no_thinking_engine_chosen(journal) || !processing_allowed_at(journal, now) {
         return Ok(());
     }
     let mut exclude = exclude.clone();
@@ -919,12 +944,80 @@ pub(crate) fn run_catchup_drain(
         log::debug!("supervisor: {day} is still closing; its daily run waits");
         exclude.insert(day);
     }
-    for day in eligible_catchup_days(journal, force_days, &exclude, now)? {
+    for day in eligible_catchup_days(journal, force_days, &exclude, now)?
+        .into_iter()
+        .take(limit)
+    {
         let reference = format!("supervisor-catchup-{day}");
+        if queue.contains_reference(&reference) {
+            continue;
+        }
         let provenance = DailyCatchupProvenance { day: day.clone() };
         let _ = submit_catchup_think(queue, daily_think_argv(&day), &day, reference, provenance);
     }
     Ok(())
+}
+
+fn processing_allowed_at(journal: &Path, now: SystemTime) -> bool {
+    solstone_core_system::processing::policy_at(journal, now.into())
+        .is_ok_and(|(settings, gate)| !settings.deferred || gate.open)
+}
+
+/// Deferred capture includes today, which closed-day reconciliation deliberately
+/// excludes. Use ordinary eligibility and generation markers, never force a retry.
+fn handle_deferred_drain(
+    journal: &Path,
+    queue: &TaskQueue,
+    recovery_pending: &mut bool,
+    last_drain: &mut Option<Instant>,
+    tick: Instant,
+    now: SystemTime,
+) -> Result<(), CatchupError> {
+    let deferred = processing_is_deferred(journal);
+    *recovery_pending |= deferred;
+    if !*recovery_pending
+        || no_thinking_engine_chosen(journal)
+        || !processing_allowed_at(journal, now)
+        || last_drain
+            .is_some_and(|last| tick.saturating_duration_since(last) < RETRY_EXPIRY_INTERVAL)
+    {
+        return Ok(());
+    }
+    let result = (|| {
+        let today = chrono::DateTime::<chrono::Utc>::from(now)
+            .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+            .format("%Y%m%d")
+            .to_string();
+        let dirty = solstone_core_system::daily_coverage::raw_marker_dirty(journal, &today)
+            .map_err(CatchupError::State)?;
+        if dirty
+            && solstone_core_system::catchup::eligible_or_fail_open(journal, &today, false, now)
+        {
+            let reference = format!("supervisor-catchup-{today}");
+            if !queue.contains_reference(&reference) {
+                let _ = submit_catchup_think(
+                    queue,
+                    daily_think_argv(&today),
+                    &today,
+                    reference,
+                    DailyCatchupProvenance { day: today.clone() },
+                );
+            }
+        }
+        // A mode change keeps recovery owed until today's held generation is done.
+        *recovery_pending = deferred || dirty;
+        run_catchup_drain_limited(
+            journal,
+            queue,
+            &BTreeSet::from([today]),
+            &[],
+            now,
+            if dirty { 3 } else { 4 },
+        )
+    })();
+    // Pace from completion, including errors and slow reconciliation scans.
+    *last_drain = Some(scan_finished(tick));
+    result
 }
 
 fn run_activity_retry_drain(journal: &Path, queue: &TaskQueue, now_ms: i64) -> Result<(), String> {
@@ -3702,6 +3795,157 @@ mod tests {
             marker < last_drain,
             "marker advances after retry-expiry scan"
         );
+    }
+
+    #[test]
+    fn deferred_drain_obeys_window_recovers_today_and_deduplicates() {
+        let bed = Bed::new("deferred-drain");
+        fs::write(
+            bed.root.join("config/journal.json"),
+            serde_json::to_vec(&json!({
+                "identity":{"timezone":"UTC"},"providers":{"active":{"provider":"local"}},
+                "processing":{"mode":"deferred"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for day in ["20260101", "20260103"] {
+            fs::create_dir_all(bed.root.join("chronicle").join(day)).unwrap();
+            solstone_core_journal_io::bump_stream_marker(&bed.root, day).unwrap();
+        }
+        let queue = queue(&bed.root);
+        let origin = Instant::now();
+        let mut recovery = false;
+        let mut last = None;
+        // Midnight/bus requests have the same closed gate as a paced pass.
+        run_catchup_drain(
+            &bed.root,
+            &queue,
+            &BTreeSet::new(),
+            &["20260101".into()],
+            wall_time(3, 0),
+        )
+        .unwrap();
+        handle_deferred_drain(
+            &bed.root,
+            &queue,
+            &mut recovery,
+            &mut last,
+            origin,
+            wall_time(3, 0),
+        )
+        .unwrap();
+        assert_eq!(pending(&queue), 0);
+        assert!(last.is_none());
+        handle_deferred_drain(
+            &bed.root,
+            &queue,
+            &mut recovery,
+            &mut last,
+            origin,
+            wall_time(3, 3 * 3600),
+        )
+        .unwrap();
+        assert_eq!(pending(&queue), 2);
+        assert!(queue.contains_reference("supervisor-catchup-20260103"));
+        assert!(queue.contains_reference("supervisor-catchup-20260101"));
+        handle_deferred_drain(
+            &bed.root,
+            &queue,
+            &mut recovery,
+            &mut last,
+            origin + Duration::from_secs(61),
+            wall_time(3, 3 * 3600 + 60),
+        )
+        .unwrap();
+        assert_eq!(pending(&queue), 2);
+        assert!(
+            !bed.root.join("health/catchup-state.json").exists(),
+            "queue wait never admits an attempt"
+        );
+        // Realtime re-entry retains today's owed work until it is completed.
+        bed.enable_thinking();
+        let restarted_queue = self::queue(&bed.root);
+        handle_deferred_drain(
+            &bed.root,
+            &restarted_queue,
+            &mut recovery,
+            &mut last,
+            origin + Duration::from_secs(122),
+            wall_time(3, 12 * 3600),
+        )
+        .unwrap();
+        assert!(restarted_queue.contains_reference("supervisor-catchup-20260103"));
+        fs::write(
+            bed.root.join("chronicle/20260103/health/daily.updated"),
+            br#"{"version":1,"generation":1,"fingerprint":null}"#,
+        )
+        .unwrap();
+        let completed_queue = self::queue(&bed.root);
+        handle_deferred_drain(
+            &bed.root,
+            &completed_queue,
+            &mut recovery,
+            &mut None,
+            origin,
+            wall_time(3, 12 * 3600),
+        )
+        .unwrap();
+        assert!(!completed_queue.contains_reference("supervisor-catchup-20260103"));
+        assert!(
+            !recovery,
+            "realtime recovery ends after the held generation completes"
+        );
+    }
+
+    #[test]
+    fn deferred_current_day_respects_retry_backoff_and_the_four_day_cap() {
+        let bed = Bed::new("deferred-backoff");
+        fs::write(bed.root.join("config/journal.json"), serde_json::to_vec(&json!({
+            "identity":{"timezone":"UTC"},"providers":{"active":{"provider":"local"}},"processing":{"mode":"deferred"}
+        })).unwrap()).unwrap();
+        for n in 1..=6 {
+            let day = format!("202601{n:02}");
+            fs::create_dir_all(bed.root.join("chronicle").join(&day)).unwrap();
+            solstone_core_journal_io::bump_stream_marker(&bed.root, &day).unwrap();
+        }
+        fs::create_dir_all(bed.root.join("health")).unwrap();
+        let now = wall_time(6, 3 * 3600);
+        fs::write(bed.root.join("health/catchup-state.json"), serde_json::to_vec(&json!({"version":1,"entries":{
+            "20260106:daily-catchup":{"day":"20260106","command_kind":"daily-catchup","active":null,
+            "fingerprint":solstone_core_system::catchup::read_raw_input_fingerprint(&bed.root,"20260106").unwrap(),
+            "next_retry_at":now.duration_since(UNIX_EPOCH).unwrap().as_secs_f64()+600.0}
+        }})).unwrap()).unwrap();
+        let queue = queue(&bed.root);
+        handle_deferred_drain(
+            &bed.root,
+            &queue,
+            &mut false,
+            &mut None,
+            Instant::now(),
+            now,
+        )
+        .unwrap();
+        assert!(!queue.contains_reference("supervisor-catchup-20260106"));
+        assert!(pending(&queue) <= 4);
+        assert!(pending(&queue) > 0);
+        // New input supersedes the old fingerprint/backoff normally.
+        let segment = bed.root.join("chronicle/20260106/device/120000_60");
+        fs::create_dir_all(&segment).unwrap();
+        fs::write(segment.join("audio.json"), b"new raw input").unwrap();
+        solstone_core_journal_io::bump_stream_marker(&bed.root, "20260106").unwrap();
+        let next_queue = self::queue(&bed.root);
+        handle_deferred_drain(
+            &bed.root,
+            &next_queue,
+            &mut false,
+            &mut None,
+            Instant::now(),
+            now,
+        )
+        .unwrap();
+        assert!(next_queue.contains_reference("supervisor-catchup-20260106"));
+        assert!(pending(&next_queue) <= 4);
     }
 
     #[test]

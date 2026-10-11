@@ -221,16 +221,21 @@ pub fn clear_backup_config_at_root(
     conditional_update_journal_config_at_root(
         root,
         expected_sha256,
-        |config| {
-            if merge_backup_config(config) != *expected_backup {
-                return None;
-            }
-            let mut replacement = config.clone();
-            replacement.insert("backup".into(), Value::Object(backup_defaults()));
-            Some(replacement)
-        },
+        |config| cleared_backup_configuration(config, expected_backup),
         mutation_lock_options(),
     )
+}
+
+pub(crate) fn cleared_backup_configuration(
+    config: &Map<String, Value>,
+    expected_backup: &Map<String, Value>,
+) -> Option<Map<String, Value>> {
+    if merge_backup_config(config) != *expected_backup {
+        return None;
+    }
+    let mut replacement = config.clone();
+    replacement.insert("backup".into(), Value::Object(backup_defaults()));
+    Some(replacement)
 }
 
 pub fn record_backup_result(
@@ -578,7 +583,7 @@ fn run_mutation_hook() {
 }
 #[cfg(not(test))]
 fn run_mutation_hook() {}
-fn mutation_lock_options() -> LockOptions {
+pub(crate) fn mutation_lock_options() -> LockOptions {
     LockOptions::default()
 }
 

@@ -28,7 +28,10 @@ mod unix {
         let admitted = admit_teardown(root.clone()).unwrap();
         let original_view = admitted.configuration();
         let mut calls = 0;
-        let mut reader = |supplied: &Arc<JournalRoot>, view: &TeardownConfiguration| {
+        let mut reader = |supplied: &Arc<JournalRoot>,
+                          view: &TeardownConfiguration,
+                          carrier: Option<RootCarrierObservation<'_>>| {
+            assert!(carrier.is_none());
             calls += 1;
             assert!(Arc::ptr_eq(supplied, &root));
             assert!(std::ptr::eq(view, original_view));
@@ -89,7 +92,7 @@ mod unix {
         ] {
             let mut calls = 0;
             assert_eq!(
-                admitted.check(&mut |_, _| {
+                admitted.check(&mut |_, _, _| {
                     calls += 1;
                     Err(refusal)
                 }),
@@ -106,7 +109,7 @@ mod unix {
         fs::write(temp.path().join("config/journal.json"), CHANGED).unwrap();
         let mut calls = 0;
         assert_eq!(
-            admitted.check(&mut |_, _| {
+            admitted.check(&mut |_, _, _| {
                 calls += 1;
                 Ok(())
             }),
@@ -128,7 +131,7 @@ mod unix {
             let admitted = admit_teardown(root).unwrap();
             let original_sha = admitted.configuration().sha256().to_owned();
             let mut calls = 0;
-            let result = admitted.check(&mut |_, original| {
+            let result = admitted.check(&mut |_, original, _| {
                 calls += 1;
                 fs::write(temp.path().join("config/journal.json"), CHANGED).unwrap();
                 assert_eq!(original.sha256(), original_sha);
@@ -158,7 +161,7 @@ mod unix {
         fs::write(&entry, b"replacement").unwrap();
         let mut calls = 0;
         assert_eq!(
-            admitted.check(&mut |_, _| {
+            admitted.check(&mut |_, _, _| {
                 calls += 1;
                 Ok(())
             }),
@@ -179,7 +182,7 @@ mod unix {
         fs::rename(&path, parent.path().join("original")).unwrap();
         fs::rename(&replacement, &path).unwrap();
         assert_eq!(
-            admitted.check(&mut |_, _| {
+            admitted.check(&mut |_, _, _| {
                 calls += 1;
                 Ok(())
             }),

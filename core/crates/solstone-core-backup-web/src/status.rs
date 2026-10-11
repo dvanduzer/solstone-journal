@@ -114,7 +114,8 @@ mod tests {
     #[test]
     fn offload_keeps_actual_media_and_cached_geometry_when_catalog_is_uncertain() {
         use serde_json::json;
-        use solstone_core_offload::{OffloadFile, append_offload_event};
+        use solstone_core_offload::append_offload_event;
+        use solstone_core_retention::archive_catalog::OffloadFile;
         use std::fs;
 
         let root = crate::test_support::root("healthy");
@@ -219,6 +220,7 @@ mod tests {
             detail: None,
             guidance: None,
             recording_failure: None,
+            report: None,
             portal_url: None,
         }
     }

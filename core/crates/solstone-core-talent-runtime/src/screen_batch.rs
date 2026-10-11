@@ -107,10 +107,10 @@ where
             }
         };
         let response = match super::execute_bounded_attempts(
-            batch.config.contains_key("json_schema"),
+            &request,
             Some(batch_idx),
-            |_attempt| {
-                client.execute(&request).map_err(|error| {
+            |_attempt, request| {
+                client.execute(request).map_err(|error| {
                     stage_error("generate", "screen_batch", prepared, format!("{error}"))
                 })
             },
@@ -1050,7 +1050,14 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
     #[cfg(target_os = "linux")]
-    fn screen_batch_retries_schema_validation_failure_on_individual_batch() {
+    fn screen_batch_retries_only_the_failed_batch() {
+        for cause in ["schema_validation_failed", "incomplete_json_length"] {
+            assert_screen_batch_retry(cause);
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+    fn assert_screen_batch_retry(cause: &str) {
         use crate::test_support;
 
         let root = TempDir::new().unwrap();
@@ -1105,10 +1112,17 @@ mod tests {
                     r#"{"narrative":"Narrative 1","entities":[]}"#,
                     json!({"valid": true, "errors": []}),
                 ),
-                test_support::generated_response_value(
-                    "attempt 1 invalid json",
-                    json!({"valid": false, "errors": [{"path": "/body", "constraint": "required"}]}),
-                ),
+                if cause == "schema_validation_failed" {
+                    test_support::generated_response_value("invalid", json!({"valid": false}))
+                } else {
+                    test_support::refused_response_value(
+                        Some(cause),
+                        true,
+                        false,
+                        "test",
+                        "incomplete",
+                    )
+                },
                 test_support::generated_response_value(
                     r#"{"narrative":"Narrative 2","entities":[]}"#,
                     json!({"valid": true, "errors": []}),
@@ -1157,7 +1171,7 @@ mod tests {
         assert_eq!(attempts[1]["batch"], 1);
         assert_eq!(attempts[1]["ordinal"], 0);
         assert_eq!(attempts[1]["status"], "retry_eligible");
-        assert_eq!(attempts[1]["cause"], "schema_validation_failed");
+        assert_eq!(attempts[1]["cause"], cause);
         assert_eq!(attempts[1]["retry"], true);
 
         assert_eq!(attempts[2]["batch"], 1);
@@ -1192,6 +1206,13 @@ mod tests {
         assert!(req2.contains("beta_batch2"));
         assert!(req3.contains("beta_batch2"));
         assert!(req4.contains("gamma_batch3"));
+        let first = solstone_core_generate::decode_one_shot_request(&req2).unwrap();
+        let mut retry = solstone_core_generate::decode_one_shot_request(&req3).unwrap();
+        if cause == "incomplete_json_length" {
+            assert_ne!(retry.system_instruction, first.system_instruction);
+            retry.system_instruction = first.system_instruction.clone();
+        }
+        assert_eq!(retry, first);
     }
 
     #[cfg(all(test, feature = "full-tests"))]

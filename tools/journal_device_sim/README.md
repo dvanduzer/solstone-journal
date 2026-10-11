@@ -47,7 +47,7 @@ an absolute override path, and bare or relative values are rejected
 [`test_relative_or_bare_native_override_is_rejected_at_construction`](tests/test_process.py#L152)).
 Before pairing, validating a pre-paired bundle, or starting a native bridge, it
 runs the selected launcher with `--help` and requires stdout byte 0 to start
-with `solstone - journal access CLI`
+with `solstone - your journal, from the command line`
 ([`test_native_header_preflight_preserves_version_provenance`](tests/test_process.py#L167),
 [`test_wrong_header_refuses_fresh_and_prepaired_before_bundle_validation`](tests/test_process.py#L186),
 [`test_impostor_cli_is_refused_before_join_or_serve`](tests/test_process.py#L435)).

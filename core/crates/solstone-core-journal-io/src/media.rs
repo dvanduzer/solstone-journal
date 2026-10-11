@@ -23,7 +23,8 @@ mod activity_carrier;
 pub use activity_carrier::{
     ActivityCarrierPreparationFailure, ActivityCarrierPreparationReceipt,
     ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,
-    RootActivityCarrier,
+    RootActivityCarrier, RootCarrierObservation, RootTeardownCarrier,
+    TeardownCarrierPreparationFailure,
 };
 mod observation;
 pub use observation::{MediaEntry, MediaRead};
@@ -248,6 +249,15 @@ impl MediaDirectory {
         self.inner.revalidate()
     }
 
+    /// Sync this retained directory, bracketing native IO with binding checks.
+    /// Success reports durability only, never cleanup or writer settlement.
+    pub fn sync(&self) -> io::Result<()> {
+        self.revalidate()?;
+        step(MediaPrimitive::ParentSync)?;
+        self.inner.sync()?;
+        self.revalidate()
+    }
+
     /// Available bytes on this retained directory's filesystem, with checked
     /// arithmetic and binding validation surrounding the native query.
     pub fn available_bytes(&self) -> io::Result<u64> {
@@ -306,10 +316,32 @@ struct Leaf {
     mutation_access: bool,
 }
 
+#[derive(Clone)]
+enum StageLease {
+    Activity(Arc<crate::activity::ActivityLease>),
+    Teardown(Arc<crate::activity::TeardownLease>),
+}
+
+impl StageLease {
+    fn journal_root(&self) -> &Arc<JournalRoot> {
+        match self {
+            Self::Activity(lease) => lease.journal_root(),
+            Self::Teardown(lease) => lease.journal_root(),
+        }
+    }
+
+    fn revalidate(&self) -> Result<(), crate::activity::ActivityAdmissionError> {
+        match self {
+            Self::Activity(lease) => lease.revalidate(),
+            Self::Teardown(lease) => lease.revalidate(),
+        }
+    }
+}
+
 /// Exactly one private sibling stage. Drop only closes handles, never unlinks.
 pub struct MediaStage {
     parent: Arc<MediaDirectory>,
-    activity: Arc<crate::activity::ActivityLease>,
+    activity: StageLease,
     name: OsString,
     directory: Option<Arc<MediaDirectory>>,
     leaf: Option<Box<Leaf>>,
@@ -328,6 +360,14 @@ impl MediaStage {
     pub fn create(
         parent: Arc<MediaDirectory>,
         activity: Arc<crate::activity::ActivityLease>,
+    ) -> Result<Self, OwnedMediaFailure<Option<Self>>> {
+        Self::create_with_lease(parent, StageLease::Activity(activity))
+    }
+
+    // The teardown variant is used only by the opaque empty root carrier.
+    fn create_with_lease(
+        parent: Arc<MediaDirectory>,
+        activity: StageLease,
     ) -> Result<Self, OwnedMediaFailure<Option<Self>>> {
         let preflight = (|| {
             platform::supported_mutation()?;

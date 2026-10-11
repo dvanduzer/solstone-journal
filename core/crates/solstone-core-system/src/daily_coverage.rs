@@ -862,7 +862,7 @@ pub fn settle_daily_day(
 /// capture date -- makes an old or finished day owed again.  Health markers are
 /// plain files on every platform the journal ships, so this must hold on every
 /// target: a platform where it reads `false` never processes late material.
-fn raw_marker_dirty(journal: &Path, day: &str) -> Result<bool, String> {
+pub fn raw_marker_dirty(journal: &Path, day: &str) -> Result<bool, String> {
     use solstone_core_journal_io::{HealthMarkerKind, HealthMarkerState, read_health_marker};
     let stream =
         read_health_marker(journal, day, HealthMarkerKind::Stream).map_err(|e| e.to_string())?;

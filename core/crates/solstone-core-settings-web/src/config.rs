@@ -35,6 +35,33 @@ pub async fn get(journal_root: PathBuf) -> Response {
     }
 }
 
+/// A partial update keeps the other condition and its unspecified fields.
+fn merge_processing(target: &mut Map<String, Value>, patch: &Map<String, Value>) {
+    if let Some(mode) = patch.get("mode") {
+        target.insert("mode".into(), mode.clone());
+    }
+    if let Some(gate_patch) = patch.get("gate").and_then(Value::as_object) {
+        let gate = target.entry("gate").or_insert_with(|| json!({}));
+        if !gate.is_object() {
+            *gate = json!({});
+        }
+        let gate = gate.as_object_mut().expect("object");
+        for (name, condition_patch) in gate_patch {
+            if !matches!(name.as_str(), "time_window" | "display_powersave") {
+                continue;
+            }
+            let condition = gate.entry(name.clone()).or_insert_with(|| json!({}));
+            if !condition.is_object() {
+                *condition = json!({});
+            }
+            let condition = condition.as_object_mut().expect("object");
+            for (key, value) in condition_patch.as_object().expect("validated condition") {
+                condition.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// Off, then the three budgets an owner can choose on the "your own model" lane.
 const BYO_THINKING_BUDGETS: [u64; 4] = [0, 8192, 16384, 32768];
 
@@ -154,6 +181,13 @@ pub async fn update(journal_root: PathBuf, lock_options: LockOptions, body: Byte
     {
         return invalid_config_value("home timezone must be a name like America/Denver");
     }
+    if section == "processing"
+        && let Err(error) = solstone_core_journal_config::processing::validate_processing(Some(
+            &Value::Object(data.clone()),
+        ))
+    {
+        return invalid_config_value(error);
+    }
     let data_for_write = data.clone();
     let section_for_write = section.clone();
     let result = mutate_journal_config(&journal_root, lock_options, move |config| {
@@ -163,29 +197,25 @@ pub async fn update(journal_root: PathBuf, lock_options: LockOptions, body: Byte
         let Some(target) = target.as_object_mut() else {
             return JournalConfigMutation {
                 changed: false,
-                value: Err(()),
+                value: Err("section must be an object".to_owned()),
             };
         };
         let mut changed = false;
         let mut changed_fields = Map::new();
         if section_for_write == "processing" {
             let before = Value::Object(target.clone());
-            let mode = data_for_write
-                .get("mode")
-                .cloned()
-                .or_else(|| target.get("mode").cloned())
-                .unwrap_or_else(|| json!("realtime"));
-            if target.get("mode") != Some(&mode) {
-                target.insert("mode".to_owned(), mode);
-                changed = true;
+            let mut proposed = target.clone();
+            merge_processing(&mut proposed, &data_for_write);
+            if let Err(error) = solstone_core_journal_config::processing::validate_processing(Some(
+                &Value::Object(proposed.clone()),
+            )) {
+                return JournalConfigMutation {
+                    changed: false,
+                    value: Err(error),
+                };
             }
-            if !target.contains_key("gate") {
-                target.insert(
-                    "gate".to_owned(),
-                    json!({"time_window":{"enabled":true,"start":"02:00","end":"06:00"},"display_powersave":{"enabled":false}}),
-                );
-                changed = true;
-            }
+            *target = proposed;
+            changed = before != Value::Object(target.clone());
             if changed {
                 changed_fields.insert(
                     "processing".to_owned(),
@@ -244,7 +274,7 @@ pub async fn update(journal_root: PathBuf, lock_options: LockOptions, body: Byte
     let (config, changed_fields) = match result {
         Ok(value) => match value.value {
             Ok(config) => config,
-            Err(()) => return invalid_config_value("section must be an object"),
+            Err(error) => return invalid_config_value(error),
         },
         Err(error) => {
             return match error {
@@ -448,6 +478,75 @@ mod tests {
     };
     use serde_json::json;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn processing_gate_roundtrips_partial_updates_and_rejects_invalid_without_writing() {
+        let root = crate::test_support::phase_root("established");
+        let path = root.path().join("config/journal.json");
+        for (patch, status) in [
+            (
+                json!({"mode":"deferred","gate":{"time_window":{"start":"23:00","end":"05:00","enabled":true},"display_powersave":{"enabled":true}}}),
+                200,
+            ),
+            (json!({"gate":{"time_window":{"end":"04:00"}}}), 200),
+            (json!({"gate":{"time_window":{"start":"25:00"}}}), 400),
+            (json!({"mode":"unknown"}), 400),
+            (json!({"gate":{"display_powersave":{"enabled":"yes"}}}), 400),
+        ] {
+            let before = std::fs::read(&path).unwrap();
+            let response = crate::test_support::shell_router(root.path())
+                .oneshot(
+                    Request::put("/app/settings/api/config")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"section":"processing","data":patch}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{patch}");
+            if status == 400 {
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+        }
+        let response = crate::test_support::shell_router(root.path())
+            .oneshot(
+                Request::get("/app/settings/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let public: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            public["processing"]["gate"]["time_window"]["start"],
+            "23:00"
+        );
+        assert_eq!(public["processing"]["gate"]["time_window"]["end"], "04:00");
+        assert_eq!(
+            public["processing"]["gate"]["display_powersave"]["enabled"],
+            true
+        );
+        let config = solstone_core_journal_config::read_journal_config(root.path())
+            .unwrap()
+            .config
+            .unwrap();
+        let settings =
+            solstone_core_journal_config::processing::processing_settings(&config).unwrap();
+        assert!(settings.deferred);
+        assert!(
+            solstone_core_journal_config::processing::evaluate_drain_gate(
+                settings,
+                chrono::NaiveTime::from_hms_opt(23, 30, 0).unwrap(),
+                solstone_core_journal_config::processing::DisplayPowersaveReading::UNAVAILABLE
+            )
+            .open
+        );
+    }
 
     #[tokio::test]
     async fn the_byo_thinking_budget_saves_only_a_value_processing_reads() {

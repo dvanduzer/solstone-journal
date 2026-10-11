@@ -13,12 +13,15 @@ pub mod restore;
 #[allow(dead_code)]
 mod restore_intent;
 #[allow(dead_code)]
+mod restore_intent_store;
+#[allow(dead_code)]
 mod restore_prepared;
 pub mod run;
 pub mod status;
+pub mod teardown;
 
 pub use ledger::{
-    OffloadFile, append_offload_event, append_restore_event, ledger_path_for_day, summarize_day,
+    append_offload_event, append_restore_event, ledger_path_for_day, summarize_day,
     summarize_journal, summarize_segment,
 };
 pub use marks::OffloadMarkIndex;

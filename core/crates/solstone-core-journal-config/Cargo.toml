@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+chrono.workspace = true
 chrono-tz.workspace = true
 iana-time-zone.workspace = true
 serde.workspace = true

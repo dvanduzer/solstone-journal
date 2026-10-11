@@ -65,6 +65,67 @@ pub struct EvidenceTally {
     pub on_legacy_rows: usize,
 }
 
+#[cfg(unix)]
+pub(crate) struct BoundOrdinaryRelease {
+    pub(crate) native: solstone_core_journal_io::media::MediaRemoval,
+    pub(crate) removed: Option<RemovedPath>,
+}
+
+#[cfg(unix)]
+pub(crate) fn release_reviewed_ordinary(
+    release: crate::remove_marked::OrdinaryRelease,
+    stage: solstone_core_journal_io::media::MediaStage,
+) -> BoundOrdinaryRelease {
+    let (source, proven, observation) = release.into_parts();
+    let relative = proven.rel();
+    release_reviewed_parts(&source, proven.name(), &observation, stage, relative)
+}
+
+#[cfg(unix)]
+pub(crate) struct BoundArchiveRefusal {
+    pub(crate) reason: crate::remove_marked::ReviewedRemovalRefusal,
+    pub(crate) stage: solstone_core_journal_io::media::MediaStage,
+}
+
+#[cfg(unix)]
+pub(crate) fn release_reviewed_archive(
+    release: crate::remove_marked::ArchiveRelease<'_, '_>,
+    stage: solstone_core_journal_io::media::MediaStage,
+) -> Result<BoundOrdinaryRelease, Box<BoundArchiveRefusal>> {
+    if let Err(reason) = release.revalidate() {
+        return Err(Box::new(BoundArchiveRefusal { reason, stage }));
+    }
+    let (source, proven, observation, relative) = match release.into_parts() {
+        Ok(parts) => parts,
+        Err(reason) => return Err(Box::new(BoundArchiveRefusal { reason, stage })),
+    };
+    Ok(release_reviewed_parts(
+        &source,
+        proven.name(),
+        &observation,
+        stage,
+        relative,
+    ))
+}
+
+#[cfg(unix)]
+fn release_reviewed_parts(
+    source: &std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
+    name: &str,
+    observation: &solstone_core_journal_io::media::MediaObservation,
+    stage: solstone_core_journal_io::media::MediaStage,
+    relative: String,
+) -> BoundOrdinaryRelease {
+    use solstone_core_journal_io::media::{Confirmation, OriginalName, RemovalEffect};
+    let native = source.remove_observed(std::ffi::OsStr::new(name), observation, stage);
+    let receipt = native.receipt();
+    let removed = (receipt.effect == RemovalEffect::Deleted
+        && receipt.original_name == OriginalName::Absent
+        && receipt.claim_confirmation == Confirmation::Confirmed)
+        .then(|| RemovedPath::confirmed(relative));
+    BoundOrdinaryRelease { native, removed }
+}
+
 /// Release proven raw originals, leaving every derived output in place.
 ///
 /// ⛔ Takes proofs, never paths. A caller cannot ask this to remove a sidecar, a

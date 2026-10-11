@@ -1363,6 +1363,63 @@ impl TaskQueue {
         }
     }
 
+    /// Resume work held by the owner's processing window without disturbing
+    /// shutdown or the queue's independent process-tree safety holds.
+    pub fn resume_processing(&self) {
+        let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
+        let dispatches = {
+            let mut state = self.inner.state.lock().expect("queue state");
+            if !state.ready || state.shutdown || state.queue_hold.is_some() {
+                return;
+            }
+            let partitions = state
+                .queues
+                .keys()
+                .filter(|partition| {
+                    !state.running.contains_key(*partition)
+                        && !state.held.contains_key(*partition)
+                        && state.queues[*partition]
+                            .front()
+                            .is_some_and(|entry| allowed || !is_analysis_command(&entry.command))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut dispatches = Vec::new();
+            for partition in partitions {
+                let entry = state
+                    .queues
+                    .get_mut(&partition)
+                    .expect("queue")
+                    .pop_front()
+                    .expect("front");
+                let submission = Submission {
+                    partition: partition.clone(),
+                    cap: entry.cap,
+                    command: entry.command,
+                    reference: entry.references[0].clone(),
+                    day: entry.day,
+                    scheduler_name: entry.scheduler_name,
+                    daily_catchup_provenance: entry.daily_catchup_provenance,
+                };
+                state.running.insert(
+                    partition,
+                    RunningSlot {
+                        reference: submission.reference.clone(),
+                    },
+                );
+                dispatches.push(Dispatch {
+                    submission,
+                    references: entry.references,
+                    daily_catchup_admission: None,
+                });
+            }
+            dispatches
+        };
+        for dispatch in dispatches {
+            start_dispatch(Arc::clone(&self.inner), dispatch);
+        }
+    }
+
     pub fn enforce_deadlines(&self, now: Instant) {
         let (has_held, has_queue_hold) = {
             let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -2663,6 +2720,10 @@ fn admit_locked(
 ) -> (SubmitOutcome, Option<Dispatch>) {
     if state.running.contains_key(&submission.partition)
         || state.held.contains_key(&submission.partition)
+        || state
+            .queues
+            .get(&submission.partition)
+            .is_some_and(|queue| !queue.is_empty())
     {
         let queue = state
             .queues
@@ -2704,7 +2765,34 @@ fn admit_locked(
     )
 }
 
+fn is_analysis_command(command: &[String]) -> bool {
+    let alias = crate::partition::journal_alias_form(command);
+    let Some(program) = alias
+        .first()
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    if (program.eq_ignore_ascii_case("solstone.exe") || program == "solstone")
+        && alias.get(1).is_some_and(|v| v == "journal")
+    {
+        return alias.get(2).is_some_and(|v| v == "think");
+    }
+    matches!(program, "journal" | "solstone" | "solstone-core-journal")
+        && alias.get(1).is_some_and(|v| v == "think")
+}
+
 fn start_dispatch(inner: Arc<QueueInner>, mut dispatch: Dispatch) {
+    if is_analysis_command(&dispatch.submission.command)
+        && !crate::processing::processing_allowed(&inner.options.journal_root)
+    {
+        let partition = dispatch.submission.partition.clone();
+        requeue_dispatch_at_head(&inner, dispatch);
+        let event = queue_changed_event(&inner.state.lock().expect("queue state"), &partition);
+        emit_queue_event(&inner.options.queue_sink, Some(event));
+        return;
+    }
     let partition = dispatch.submission.partition.clone();
     let reference = dispatch.submission.reference.clone();
     let worker_inner = Arc::clone(&inner);
@@ -5529,6 +5617,9 @@ mod tests {
         );
         drop(state);
 
+        queue.submit(request("queued-behind-safety-hold"));
+        queue.resume_processing();
+        assert!(queue.contains_reference("queued-behind-safety-hold"));
         let snapshot = queue.collect_status_snapshot(Instant::now());
         assert_eq!(snapshot.held.len(), 1);
         assert_eq!(snapshot.held[0].partition, Partition::new("svc"));
@@ -5537,6 +5628,201 @@ mod tests {
             snapshot.held[0].reasons,
             vec![ReasonCode::RootLive, ReasonCode::GroupMemberLive]
         );
+    }
+
+    fn processing_test_queue(root: &Path, ready: bool, plans: VecDeque<SpawnPlan>) -> TaskQueue {
+        let queue = TaskQueue::new(TaskQueueOptions {
+            #[cfg(windows)]
+            read_file_grants: Vec::new(),
+            journal_root: root.to_path_buf(),
+            cap_resolver: Arc::new(FixedCap(10)),
+            process_state_probe: Arc::new(UnreachableProcessStateProbe),
+            queue_sink: None,
+            process_sink: None,
+            ready,
+            before_deadline_commit: None,
+            child_environment: BTreeMap::new(),
+            task_binary: None,
+        });
+        queue.set_tree_observer(Arc::new(FakeTreeObserver::default()));
+        queue.set_worker_spawner(plan_spawner(plans));
+        queue
+    }
+
+    fn set_processing(root: &Path, deferred: bool) {
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::json!({"processing":{
+                "mode":if deferred {"deferred"} else {"realtime"},
+                "gate":{"time_window":{"enabled":false},"display_powersave":{"enabled":false}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn processing_gate_preserves_pending_fifo_deduplication_and_safety_holds() {
+        for ready in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            set_processing(root.path(), true);
+            let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let queue = processing_test_queue(
+                root.path(),
+                ready,
+                VecDeque::from([
+                    SpawnPlan::Process(FakeProcess::complete(1, Arc::clone(&cleanups))),
+                    SpawnPlan::Process(FakeProcess::complete(2, Arc::clone(&cleanups))),
+                    SpawnPlan::Process(FakeProcess::complete(3, Arc::clone(&cleanups))),
+                ]),
+            );
+            let command = ["solstone", "journal", "think", "--day", "20260101"];
+            queue.submit(command_request(&command, "first", None));
+            if !ready {
+                queue.resume_processing();
+                queue.set_ready();
+            }
+            assert_eq!(
+                queue.submit(command_request(&command, "first", None)),
+                SubmitOutcome::DuplicateQueuedReference
+            );
+            assert_eq!(
+                queue.submit(command_request(&command, "coalesced", None)),
+                SubmitOutcome::Coalesced
+            );
+            queue.submit(command_request(
+                &["journal", "think", "--day", "20260102"],
+                "second",
+                None,
+            ));
+            // Maintenance is still admitted in its own partition.
+            queue.submit(command_request(
+                &["journal", "indexer", "refresh"],
+                "maintenance",
+                None,
+            ));
+            queue.join_test_workers(1, TEST_TRANSITION_TIMEOUT).unwrap();
+            let snapshot = queue.collect_status_snapshot(Instant::now());
+            assert_eq!(snapshot.recent_tasks.len(), 1);
+            assert_eq!(snapshot.recent_tasks[0].reference, "maintenance");
+            assert!(queue.contains_reference("coalesced"));
+            assert!(!crate::catchup::catchup_state_path(root.path()).exists());
+            set_processing(root.path(), false);
+            // Neither shutdown nor a queue-wide forensic hold may be bypassed.
+            {
+                queue.inner.state.lock().unwrap().shutdown = true;
+            }
+            queue.resume_processing();
+            assert!(queue.contains_reference("first"));
+            {
+                let mut state = queue.inner.state.lock().unwrap();
+                assert!(state.running.is_empty());
+                state.shutdown = false;
+                state.queue_hold = Some(QueueHoldStatus {
+                    reason: QueueHoldReason::RecordsUnreadable,
+                    detail: "fixture".into(),
+                });
+            }
+            queue.resume_processing();
+            {
+                let mut state = queue.inner.state.lock().unwrap();
+                assert!(state.running.is_empty());
+                state.queue_hold = None;
+            }
+            queue.resume_processing();
+            queue.join_test_workers(2, TEST_TRANSITION_TIMEOUT).unwrap();
+            let snapshot = queue.collect_status_snapshot(Instant::now());
+            assert_eq!(
+                snapshot
+                    .recent_tasks
+                    .iter()
+                    .map(|task| task.reference.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["maintenance", "first", "second"]
+            );
+            assert!(!queue.contains_reference("coalesced"));
+        }
+    }
+
+    #[test]
+    fn processing_gate_holds_follower_before_catchup_admission_then_resumes_once() {
+        let root = tempfile::tempdir().unwrap();
+        set_processing(root.path(), false);
+        let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let queue = processing_test_queue(
+            root.path(),
+            true,
+            VecDeque::from([
+                gated_plan(
+                    Arc::clone(&arrived),
+                    Arc::clone(&release),
+                    Arc::clone(&cleanups),
+                ),
+                SpawnPlan::Process(FakeProcess::complete(2, Arc::clone(&cleanups))),
+            ]),
+        );
+        queue.submit(command_request(
+            &["journal", "think", "--day", "20260101"],
+            "running",
+            None,
+        ));
+        arrived.wait();
+        let day = "20260102";
+        queue.submit(command_request(
+            &["journal", "think", "--day", day],
+            "follower",
+            Some(DailyCatchupProvenance { day: day.into() }),
+        ));
+        set_processing(root.path(), true);
+        release.wait();
+        queue.join_test_workers(1, TEST_TRANSITION_TIMEOUT).unwrap();
+        assert!(queue.contains_reference("follower"));
+        assert_eq!(
+            queue
+                .collect_status_snapshot(Instant::now())
+                .recent_tasks
+                .len(),
+            1
+        );
+        assert!(!crate::catchup::catchup_state_path(root.path()).exists());
+        // Keep the production admission record, but use the existing capability seam.
+        queue.set_catchup_admission_capability(Arc::new(|| Ok(())));
+        set_processing(root.path(), false);
+        queue.resume_processing();
+        queue.join_test_workers(1, TEST_TRANSITION_TIMEOUT).unwrap();
+        queue.resume_processing();
+        assert!(!queue.contains_reference("follower"));
+        assert_eq!(
+            queue
+                .collect_status_snapshot(Instant::now())
+                .recent_tasks
+                .len(),
+            2
+        );
+        assert!(crate::catchup::catchup_state_path(root.path()).exists());
+    }
+
+    #[test]
+    fn processing_gate_recognizes_native_thinking_forms_only() {
+        for command in [
+            vec!["solstone", "journal", "think"],
+            vec!["journal", "think"],
+            vec!["/bin/solstone-core-journal", "think"],
+            vec!["/bin/solstone.exe", "journal", "think"],
+            vec!["/bin/solstone", "journal", "think"],
+        ] {
+            assert!(is_analysis_command(
+                &command.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
+        assert!(!is_analysis_command(&[
+            "journal".into(),
+            "indexer".into(),
+            "refresh".into()
+        ]));
     }
 
     #[test]

@@ -1578,6 +1578,35 @@ mod tests {
     }
 
     #[test]
+    fn deferred_batch_bypasses_live_hold_while_live_still_emits_observed() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("config")).unwrap();
+        std::fs::write(
+            temp.path().join("config/journal.json"),
+            br#"{"providers":{"active":{"provider":"openai"}},"processing":{"mode":"deferred"}}"#,
+        )
+        .unwrap();
+        for batch in [false, true] {
+            let (outbound, receiver) = mpsc::channel();
+            let dispatcher =
+                SenseDispatcher::new(temp.path().to_path_buf(), false, false, outbound);
+            let mut message = observing("one", "120000_1");
+            message.extra.insert("batch".into(), json!(batch));
+            message.extra.insert("files".into(), json!(["ignored.txt"]));
+            dispatcher.handle(&message);
+            let event = receiver
+                .try_iter()
+                .find(|event| event.event == "observed")
+                .unwrap();
+            assert_eq!(
+                event.fields["note"],
+                if batch { "no handlers" } else { "deferred" }
+            );
+            assert!(dispatcher.stop_and_wait());
+        }
+    }
+
+    #[test]
     fn no_handlers_note_does_not_count_as_dispatch_failure() {
         let temp = tempfile::tempdir().expect("temp journal");
         std::fs::create_dir_all(temp.path().join("config")).expect("config");

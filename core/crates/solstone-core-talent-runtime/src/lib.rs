@@ -576,18 +576,20 @@ fn emit_start(writer: &mut impl Write, prepared: &PreparedTalent) {
 }
 
 pub(crate) fn execute_bounded_attempts<F, E>(
-    schema_checked: bool,
+    request: &GenerateRequest,
     batch: Option<usize>,
     mut execute: F,
     mut emit_attempt: E,
 ) -> Result<GenerateResponse, RuntimeOutcome>
 where
-    F: FnMut(usize) -> Result<GenerateResponse, StageError>,
+    F: FnMut(usize, &GenerateRequest) -> Result<GenerateResponse, StageError>,
     E: FnMut(Value),
 {
+    let schema_checked = request.json_schema.is_some();
+    let mut retry_request = None;
     let mut last_response = None;
     for ordinal in 0..=VALIDATION_RETRY_ATTEMPTS {
-        let response = match execute(ordinal) {
+        let response = match execute(ordinal, retry_request.as_ref().unwrap_or(request)) {
             Ok(response) => response,
             Err(error) => {
                 emit_attempt(json!({
@@ -617,6 +619,9 @@ where
         };
         let is_eligible = is_bounded_retry_eligible(&response, schema_checked);
         if is_eligible && ordinal < VALIDATION_RETRY_ATTEMPTS {
+            if request.context == "screen" && cause == Some("incomplete_json_length") {
+                retry_request = Some(compact_screen_retry(request));
+            }
             emit_attempt(json!({
                 "event": "generate_attempt",
                 "terminal": false,
@@ -646,6 +651,32 @@ where
         break;
     }
     Ok(last_response.expect("loop executed at least once"))
+}
+
+/// Keep the source and reply ceiling intact. Only the existing length retry
+/// changes shape; incomplete JSON is never repaired or published locally.
+fn compact_screen_retry(request: &GenerateRequest) -> GenerateRequest {
+    let mut retry = request.clone();
+    let instruction = retry.system_instruction.get_or_insert_default();
+    if !instruction.is_empty() {
+        instruction.push_str("\n\n");
+    }
+    instruction.push_str(&format!(
+        "The previous screen response ran out of output space before its JSON was complete. \
+         Start again from the supplied source and return one complete JSON object with narrative \
+         and entities. Aim for at most {} tokens for the whole object. \
+         Use concise chronological paragraphs covering every distinct activity and significant \
+         fact through the end of the segment. Preserve timestamps, people, decisions, key commands, \
+         files, URLs, errors and outcomes. Consolidate repeated observations of the same activity; \
+         summarize long excerpts instead of copying them. List each significant entity once with \
+         a brief context, including the source's significant file paths and URLs. Use role mentioned \
+         for every non-person entity and for people mentioned in text. Use attendee only for a \
+         person visibly participating in a meeting or call. Preserve who did what, negation and \
+         uncertainty. Do not invent outcomes \
+         or omit later activity to save space. Keep the required schema and voice.",
+        request.max_output_tokens / 2
+    ));
+    retry
 }
 
 type GeneratedTalentResponse = (String, Option<Box<Value>>, Option<Box<Value>>);
@@ -722,10 +753,10 @@ fn generate_response(
                 emit_generate_input(writer, &request);
             }
             let response = execute_bounded_attempts(
-                prepared.config.contains_key("json_schema"),
+                &request,
                 None,
-                |_attempt| {
-                    let response = generate.execute(&request).map_err(|error| {
+                |_attempt, request| {
+                    let response = generate.execute(request).map_err(|error| {
                         stage_error("generate", "runtime", prepared, format!("{error}"))
                     })?;
                     Ok(response)
@@ -3132,15 +3163,202 @@ mod tests {
         assert_eq!(attempt_events[1]["terminal"], false);
     }
 
+    fn retry_test_request(name: &str) -> GenerateRequest {
+        generate_request(&PreparedTalent {
+            name: name.into(),
+            config: json!({"max_output_tokens":9216,"prompt":"document activity","json_schema":{"type":"object"}})
+                .as_object().unwrap().clone(),
+        }).unwrap()
+    }
+
+    #[test]
+    fn compact_retry_is_only_for_screen_length_and_stays_bounded() {
+        for name in ["screen", "activity"] {
+            for cause in [
+                "incomplete_json_length",
+                "schema_validation_failed",
+                "provider_quota_exceeded",
+                "success",
+            ] {
+                let mut request = retry_test_request(name);
+                request.system_instruction = Some("Existing instruction.".into());
+                let mut calls = Vec::new();
+                let mut events = Vec::new();
+                let outcome = execute_bounded_attempts(
+                    &request,
+                    Some(2),
+                    |_, attempt| {
+                        calls.push(attempt.clone());
+                        let response = match cause {
+                            "success" => {
+                                test_support::generated_response_value("{}", json!({"valid":true}))
+                            }
+                            "schema_validation_failed" => {
+                                test_support::generated_response_value("{}", json!({"valid":false}))
+                            }
+                            _ => test_support::refused_response_value(
+                                Some(cause),
+                                true,
+                                cause == "provider_quota_exceeded",
+                                "test",
+                                "refused",
+                            ),
+                        };
+                        Ok(
+                            solstone_core_generate::decode_one_shot_response(&response.to_string())
+                                .unwrap(),
+                        )
+                    },
+                    |event| events.push(event),
+                )
+                .unwrap();
+                assert_eq!(calls[0], request);
+                let retry = matches!(cause, "incomplete_json_length" | "schema_validation_failed");
+                assert_eq!(calls.len(), if retry { 2 } else { 1 });
+                if retry {
+                    let mut second = calls[1].clone();
+                    if name == "screen" && cause == "incomplete_json_length" {
+                        assert_ne!(second.system_instruction, request.system_instruction);
+                        assert!(
+                            second
+                                .system_instruction
+                                .as_ref()
+                                .unwrap()
+                                .starts_with("Existing instruction.")
+                        );
+                        second.system_instruction = request.system_instruction.clone();
+                    }
+                    assert_eq!(second, request);
+                }
+                assert_eq!(
+                    events.last().unwrap()["status"],
+                    if cause == "success" {
+                        "success"
+                    } else {
+                        "exhausted"
+                    }
+                );
+                assert_eq!(events.last().unwrap()["retry"], false);
+                assert_eq!(events.last().unwrap()["batch"], 2);
+                assert_eq!(
+                    matches!(outcome, GenerateResponse::Refused(_)),
+                    !matches!(cause, "success" | "schema_validation_failed")
+                );
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn screen_length_retry_changes_only_instruction() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ExecutionContext {
+            journal: root.path().join("journal"),
+        };
+        let mut prepared = PreparedTalent {
+            name: "screen".into(),
+            config: json!({
+                "max_output_tokens":9216,
+                "prompt":"Document the screen activity.",
+                "transcript":"10:00 opened src/main.rs; 10:01 fixed E0425; 10:02 tests passed.",
+                "json_schema":{"type":"object"}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let stub = test_support::sequenced_one_shot_stub(
+            root.path(),
+            &[
+                test_support::refused_response_value(
+                    Some("incomplete_json_length"),
+                    true,
+                    false,
+                    "test-provider",
+                    "incomplete output",
+                ),
+                test_support::generated_response_value(
+                    r#"{"narrative":"You fixed E0425; tests passed.","entities":[]}"#,
+                    json!({"valid":true}),
+                ),
+            ],
+        );
+        let mut output = Vec::new();
+        let response = generate_response(
+            &mut prepared,
+            &context,
+            &OneShotClient::at_path(&stub),
+            &mut output,
+        )
+        .unwrap();
+        assert!(response.0.contains("tests passed"));
+        let read_request = |ordinal| {
+            solstone_core_generate::decode_one_shot_request(
+                &fs::read_to_string(format!("{}.request_{ordinal}", stub.display())).unwrap(),
+            )
+            .unwrap()
+        };
+        let first = read_request(1);
+        let second = read_request(2);
+        assert_eq!(first, generate_request(&prepared).unwrap());
+        assert_ne!(second.system_instruction, first.system_instruction);
+        let mut restored = second;
+        restored.system_instruction = first.system_instruction.clone();
+        assert_eq!(
+            restored, first,
+            "retry must retain source, schema and output ceiling"
+        );
+        assert_eq!(stub_invocations(&stub), 2);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn exhausted_compact_screen_retry_preserves_the_published_output() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("screen.json");
+        let previous = br#"{"narrative":"Earlier complete output","entities":[]}"#;
+        fs::write(&path, previous).unwrap();
+        let mut prepared = PreparedTalent {
+            name: "screen".into(),
+            config: json!({"max_output_tokens":9216,"prompt":"screen activity",
+                "json_schema":{"type":"object"},"output":"json","output_path":path})
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let refused = test_support::refused_response_value(
+            Some("incomplete_json_length"),
+            true,
+            false,
+            "test",
+            "incomplete",
+        );
+        let stub = test_support::sequenced_one_shot_stub(root.path(), &[refused.clone(), refused]);
+        let mut events = Vec::new();
+        let outcome = generate_and_write(
+            &mut prepared,
+            &ExecutionContext {
+                journal: root.path().join("journal"),
+            },
+            &OneShotClient::at_path(&stub),
+            &mut events,
+            None,
+        );
+        assert!(matches!(outcome, RuntimeOutcome::GenerateRefused { .. }));
+        assert_eq!(stub_invocations(&stub), 2);
+        assert_eq!(fs::read(path).unwrap(), previous);
+        assert!(!root.path().join("journal/chronicle").exists());
+    }
+
     #[test]
     fn bounded_attempts_record_client_failure_at_either_ordinal() {
         for (fail_at, batch) in [(0, None), (1, Some(3))] {
             let mut calls = 0;
             let mut recorded = Vec::new();
             let outcome = execute_bounded_attempts(
-                true,
+                &retry_test_request("plain"),
                 batch,
-                |ordinal| {
+                |ordinal, _request| {
                     calls += 1;
                     if ordinal == fail_at {
                         Err(StageError::new(
@@ -3181,9 +3399,9 @@ mod tests {
         let mut calls = 0;
         let mut recorded = Vec::new();
         let response = execute_bounded_attempts(
-            true,
+            &retry_test_request("plain"),
             None,
-            |_| {
+            |_, _request| {
                 calls += 1;
                 Ok(GenerateResponse::Refused(RefusedResponse {
                     id: None,

@@ -152,7 +152,7 @@ class CliTests(unittest.TestCase):
             native.write_text(
                 "#!/bin/sh\n"
                 "case \"$1\" in\n"
-                "  --help) printf '%s\\n' 'solstone - journal access CLI' ;;\n"
+                "  --help) printf '%s\\n' 'solstone - your journal, from the command line' ;;\n"
                 "  --version) printf '%s\\n' 'solstone-test 3.1.4' ;;\n"
                 "  *) exit 8 ;;\n"
                 "esac\n",

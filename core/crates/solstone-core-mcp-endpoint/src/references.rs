@@ -71,6 +71,8 @@ pub(crate) struct SegmentReference {
     pub source_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement_ordinal: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

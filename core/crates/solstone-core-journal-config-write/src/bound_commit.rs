@@ -62,6 +62,8 @@ pub enum BoundConfigConfirmationRefusal {
 /// Independent facts after an actual retained-parent publication.
 #[derive(Debug)]
 pub struct BoundConfigPublication {
+    /// Fingerprint of the actual serialized candidate, including its final newline.
+    pub candidate_sha256: String,
     /// Metadata only. Configuration content is deliberately excluded.
     pub published_file: solstone_core_journal_io::FlatDirectoryEntry,
     pub durability_uncertainty: Option<io::Error>,
@@ -90,11 +92,43 @@ pub fn conditional_update_journal_config_at_root(
 ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
     #[cfg(unix)]
     {
-        unix::update(root, expected_sha256, update, options)
+        root.revalidate_canonical_binding()
+            .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        let directory = solstone_core_journal_io::media::MediaDirectory::open(
+            root.clone(),
+            std::path::Path::new("config"),
+        )
+        .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        conditional_update_journal_config_in_directory(
+            root,
+            &directory,
+            expected_sha256,
+            update,
+            options,
+        )
     }
     #[cfg(not(unix))]
     {
         let _ = (root, expected_sha256, update, options);
+        Err(BoundConfigRefusal::Unsupported)
+    }
+}
+
+/// Apply the same locked update through the originally admitted config parent.
+pub fn conditional_update_journal_config_in_directory(
+    root: &Arc<JournalRoot>,
+    directory: &solstone_core_journal_io::media::MediaDirectory,
+    expected_sha256: &str,
+    update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
+    options: LockOptions,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    #[cfg(unix)]
+    {
+        unix::update(root, directory, expected_sha256, update, options)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, directory, expected_sha256, update, options);
         Err(BoundConfigRefusal::Unsupported)
     }
 }
@@ -104,7 +138,9 @@ mod unix {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    use solstone_core_journal_config::{JournalConfigRead, read_journal_config_in_directory};
+    use solstone_core_journal_config::{
+        JournalConfigRead, fingerprint_journal_config_bytes, read_journal_config_in_directory,
+    };
     use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity};
     use solstone_core_journal_io::{
         BoundAtomicOutcome, FileObservation, FlatDirectory, acquire_existing_parent_lock_bound,
@@ -115,20 +151,22 @@ mod unix {
 
     pub(super) fn update(
         root: &Arc<JournalRoot>,
+        directory: &MediaDirectory,
         expected: &str,
         update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
         options: LockOptions,
     ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
         root.revalidate_canonical_binding().map_err(admission)?;
-        let directory =
-            MediaDirectory::open(root.clone(), Path::new("config")).map_err(admission)?;
+        directory.revalidate().map_err(admission)?;
+        run_hook(Checkpoint::BeforeParentOpen);
         let parent = FlatDirectory::open(root, Path::new("config")).map_err(admission)?;
-        validate(root, &directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let initial = read_journal_config_in_directory(&directory, MAX_BOUND_CONFIG_BYTES)
+        run_hook(Checkpoint::AfterParentOpen);
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        let initial = read_journal_config_in_directory(directory, MAX_BOUND_CONFIG_BYTES)
             .map_err(BoundConfigRefusal::Load)?;
         require_expected(&initial, expected)?;
         run_hook(Checkpoint::AfterInitialRead);
-        validate(root, &directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
         let _lock = acquire_existing_parent_lock_bound(
             &parent,
             OsStr::new("journal.json.lock"),
@@ -136,11 +174,11 @@ mod unix {
             options.poll_interval,
         )
         .map_err(BoundConfigRefusal::Lock)?;
-        validate(root, &directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let locked = read_journal_config_in_directory(&directory, MAX_BOUND_CONFIG_BYTES)
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        let locked = read_journal_config_in_directory(directory, MAX_BOUND_CONFIG_BYTES)
             .map_err(BoundConfigRefusal::Load)?;
         require_expected(&locked, expected)?;
-        validate(root, &directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
         let config = locked.config.as_ref().ok_or(BoundConfigRefusal::Missing)?;
         let Some(replacement) = update(config) else {
             return Ok(BoundConfigOutcome::Unchanged);
@@ -151,8 +189,9 @@ mod unix {
         if bytes.len() > MAX_BOUND_CONFIG_BYTES {
             return Err(BoundConfigRefusal::TooLarge);
         }
+        let candidate_sha256 = fingerprint_journal_config_bytes(&bytes);
         run_hook(Checkpoint::BeforePublication);
-        validate(root, &directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
         let outcome = atomic_replace_bound(&parent, OsStr::new("journal.json"), &bytes, 0o600)
             .map_err(BoundConfigRefusal::Write)?;
         let (observation, durability_uncertainty, observation_uncertainty) = match outcome {
@@ -168,8 +207,9 @@ mod unix {
             } => (observation, durability_source, Some(source)),
         };
         run_hook(Checkpoint::BeforeConfirmation);
-        let confirmation_refusal = confirm(root, &directory, &parent, &observation, &bytes).err();
+        let confirmation_refusal = confirm(root, directory, &parent, &observation, &bytes).err();
         Ok(BoundConfigOutcome::Published(BoundConfigPublication {
+            candidate_sha256,
             published_file: observation.entry,
             durability_uncertainty,
             observation_uncertainty,
@@ -240,6 +280,8 @@ mod unix {
 #[cfg(unix)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Checkpoint {
+    BeforeParentOpen,
+    AfterParentOpen,
     AfterInitialRead,
     BeforePublication,
     BeforeConfirmation,
@@ -281,7 +323,10 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use solstone_core_journal_config::{read_journal_config, read_journal_config_in_directory};
+    use solstone_core_journal_config::{
+        fingerprint_journal_config_bytes, read_journal_config, read_journal_config_in_directory,
+        read_journal_config_observed_in_directory,
+    };
     use solstone_core_journal_io::media::MediaDirectory;
     use solstone_core_journal_io::{
         BoundPublicationPrimitive, hold_lock, is_publication_candidate_name,
@@ -384,6 +429,10 @@ mod tests {
         assert!(receipt.confirmation_refusal.is_none());
         let bytes = fs::read(path(temporary.path())).unwrap();
         assert!(bytes.ends_with(b"\n"));
+        assert_eq!(
+            receipt.candidate_sha256,
+            fingerprint_journal_config_bytes(&bytes)
+        );
         assert!(bytes.starts_with(b"{\n  "));
         assert_eq!(
             serde_json::from_slice::<Value>(&bytes).unwrap(),
@@ -590,6 +639,166 @@ mod tests {
             )))
         ));
         assert_eq!(fs::read(path(temporary.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn supplied_original_parent_refuses_permanent_and_temporary_identical_substitution() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        for temporary_swap in [false, true] {
+            let (temp, root, sha) = fixture();
+            let directory = MediaDirectory::open(root.clone(), Path::new("config")).unwrap();
+            let original = temp.path().join("config");
+            let moved = temp.path().join("old-config");
+            let replacement_parent = temp.path().join("replacement-config");
+            let bytes = fs::read(path(temp.path())).unwrap();
+            let _lock = hold_lock(
+                path(temp.path()),
+                LockOptions {
+                    mode: Some(0o600),
+                    ..LockOptions::default()
+                },
+            )
+            .unwrap();
+            let lock_identity = fs::metadata(original.join("journal.json.lock"))
+                .unwrap()
+                .ino();
+            drop(_lock);
+            let fired = Rc::new(Cell::new(0));
+            let observed = fired.clone();
+            let swap = move || {
+                fs::rename(&original, &moved).unwrap();
+                fs::create_dir(&original).unwrap();
+                fs::write(original.join("journal.json"), bytes).unwrap();
+                observed.set(observed.get() + 1);
+                if temporary_swap {
+                    let hook = move || {
+                        fs::rename(&original, &replacement_parent).unwrap();
+                        fs::rename(&moved, &original).unwrap();
+                        observed.set(observed.get() + 1);
+                    };
+                    HOOK.with(|slot| {
+                        assert!(
+                            slot.replace(Some((Checkpoint::AfterParentOpen, Box::new(hook))))
+                                .is_none()
+                        )
+                    });
+                }
+            };
+            let result = if temporary_swap {
+                with_hook(Checkpoint::BeforeParentOpen, swap, || {
+                    conditional_update_journal_config_in_directory(
+                        &root,
+                        &directory,
+                        &sha,
+                        replacement,
+                        LockOptions::default(),
+                    )
+                })
+            } else {
+                swap();
+                conditional_update_journal_config_in_directory(
+                    &root,
+                    &directory,
+                    &sha,
+                    replacement,
+                    LockOptions::default(),
+                )
+            };
+            assert!(matches!(result, Err(BoundConfigRefusal::Admission(_))));
+            assert_eq!(fired.get(), if temporary_swap { 2 } else { 1 });
+            let original_parent = temp.path().join(if temporary_swap {
+                "config"
+            } else {
+                "old-config"
+            });
+            let replacement_parent = temp.path().join(if temporary_swap {
+                "replacement-config"
+            } else {
+                "config"
+            });
+            assert_eq!(
+                fs::metadata(original_parent.join("journal.json.lock"))
+                    .unwrap()
+                    .ino(),
+                lock_identity
+            );
+            assert_eq!(
+                fs::read(original_parent.join("journal.json")).unwrap(),
+                fs::read(replacement_parent.join("journal.json")).unwrap()
+            );
+            assert!(!replacement_parent.join("journal.json.lock").exists());
+            assert_eq!(fs::read_dir(replacement_parent).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn supplied_parent_uses_same_existing_sidecar_under_zero_timeout_contention() {
+        let (temp, root, sha) = fixture();
+        let directory = MediaDirectory::open(root.clone(), Path::new("config")).unwrap();
+        let before = fs::read(path(temp.path())).unwrap();
+        let _lock = hold_lock(
+            path(temp.path()),
+            LockOptions {
+                mode: Some(0o600),
+                ..LockOptions::default()
+            },
+        )
+        .unwrap();
+        let sidecar = temp.path().join("config/journal.json.lock");
+        let identity = fs::metadata(&sidecar).unwrap().ino();
+        let result = conditional_update_journal_config_in_directory(
+            &root,
+            &directory,
+            &sha,
+            |_| panic!("contended writer cannot transform"),
+            LockOptions {
+                timeout: Duration::ZERO,
+                ..LockOptions::default()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(BoundConfigRefusal::Lock(ExistingParentLockError::Timeout(
+                _
+            )))
+        ));
+        assert_eq!(fs::metadata(sidecar).unwrap().ino(), identity);
+        assert_eq!(fs::read(path(temp.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn observed_reader_returns_one_complete_buffer_and_refuses_native_late_mutation() {
+        use solstone_core_journal_io::media::{MediaIdentity, MediaPrimitive, run_with_media_hook};
+
+        let (temp, root, sha) = fixture();
+        let directory = MediaDirectory::open(root, Path::new("config")).unwrap();
+        let (read, entry) = read_journal_config_observed_in_directory(&directory, 1024).unwrap();
+        let entry = entry.unwrap();
+        let metadata = fs::metadata(path(temp.path())).unwrap();
+        assert_eq!(read.sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            entry.identity,
+            MediaIdentity::Unix {
+                device: metadata.dev(),
+                inode: metadata.ino()
+            }
+        );
+        let changed = path(temp.path());
+        let (result, fired) = run_with_media_hook(
+            MediaPrimitive::AfterPrefixRead,
+            move || fs::write(changed, b"{}"),
+            || read_journal_config_observed_in_directory(&directory, 1024),
+        );
+        assert!(fired);
+        assert!(result.is_err());
+        fs::remove_file(path(temp.path())).unwrap();
+        let (missing, entry) = read_journal_config_observed_in_directory(&directory, 1024).unwrap();
+        assert!(!missing.present);
+        assert!(entry.is_none());
+        fs::write(path(temp.path()), vec![b' '; 1025]).unwrap();
+        assert!(read_journal_config_observed_in_directory(&directory, 1024).is_err());
     }
 
     #[test]

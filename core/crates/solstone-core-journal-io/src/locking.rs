@@ -680,6 +680,8 @@ impl ExistingParentLock {
 pub struct BoundParentLock {
     #[cfg(unix)]
     _guard: Flock<File>,
+    #[cfg(unix)]
+    require_private_mode: bool,
     #[cfg(windows)]
     _guard: WindowsLockGuard,
     #[cfg(windows)]
@@ -688,7 +690,9 @@ pub struct BoundParentLock {
 
 #[cfg(unix)]
 impl BoundParentLock {
-    pub(crate) fn revalidate_bound(
+    /// Recheck the held persistent lock against its exact name in the retained
+    /// parent. The caller separately validates that parent's journal binding.
+    pub fn revalidate_bound(
         &self,
         parent: &impl AsFd,
         name: &OsStr,
@@ -704,7 +708,7 @@ impl BoundParentLock {
             &self._guard,
             None,
             &PathBuf::from(name.as_os_str()),
-            true,
+            self.require_private_mode,
         )?;
         Ok(())
     }
@@ -794,7 +798,10 @@ pub fn acquire_existing_parent_lock_bound(
         });
     }
     let guard = acquire_lock_in_parent(parent, &name, &path, timeout, poll_interval, true)?;
-    Ok(BoundParentLock { _guard: guard })
+    Ok(BoundParentLock {
+        _guard: guard,
+        require_private_mode: true,
+    })
 }
 
 /// Hold an existing persistent entry without creating it or its parent.
@@ -823,7 +830,10 @@ pub fn open_existing_parent_lock_bound(
         return Ok(None);
     }
     let guard = acquire_lock_in_parent(parent, &name, &path, timeout, poll_interval, false)?;
-    Ok(Some(BoundParentLock { _guard: guard }))
+    Ok(Some(BoundParentLock {
+        _guard: guard,
+        require_private_mode: false,
+    }))
 }
 
 #[cfg(unix)]

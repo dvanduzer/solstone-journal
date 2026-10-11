@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use super::*;
-use crate::activity::ActivityLease;
+use crate::activity::{ActivityLease, TeardownLease};
 
 /// Independent facts about preparation. Observations grant no cleanup authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,16 +27,90 @@ impl ActivityCarrierPreparationReceipt {
 }
 
 struct CarrierOwner {
-    activity: Arc<ActivityLease>,
+    activity: StageLease,
     stage: Option<MediaStage>,
 }
 
 impl CarrierOwner {
+    fn prepare(activity: StageLease) -> (Self, ActivityCarrierPreparationReceipt, io::Result<()>) {
+        let mut owner = CarrierOwner {
+            activity,
+            stage: None,
+        };
+        let mut receipt = ActivityCarrierPreparationReceipt {
+            stage_durability: Durability::Unproven,
+            root_durability: Durability::Unproven,
+            confirmation: Confirmation::Unverified,
+        };
+        let result = (|| {
+            owner
+                .activity
+                .revalidate()
+                .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+            let root = MediaDirectory::open(owner.activity.journal_root().clone(), Path::new(""))?;
+            match MediaStage::create_with_lease(root, owner.activity.clone()) {
+                Ok(stage) => owner.stage = Some(stage),
+                Err(failure) => {
+                    owner.stage = failure.owned;
+                    return Err(failure.error);
+                }
+            }
+            owner.revalidate_empty()?;
+            step(MediaPrimitive::CarrierStageSync)?;
+            owner.revalidate_empty()?;
+            owner
+                .stage
+                .as_ref()
+                .and_then(|stage| stage.directory.as_ref())
+                .expect("validated directory retained")
+                .inner
+                .sync()?;
+            receipt.stage_durability = Durability::Synced;
+            owner.revalidate_empty()?;
+            step(MediaPrimitive::CarrierRootSync)?;
+            owner.revalidate_empty()?;
+            owner
+                .stage
+                .as_ref()
+                .expect("validated stage retained")
+                .parent
+                .inner
+                .sync()?;
+            receipt.root_durability = Durability::Synced;
+            step(MediaPrimitive::CarrierConfirmation)?;
+            owner.revalidate_empty()?;
+            receipt.confirmation = Confirmation::Confirmed;
+            Ok(())
+        })();
+        (owner, receipt, result)
+    }
+
+    fn activity(&self) -> &Arc<ActivityLease> {
+        match &self.activity {
+            StageLease::Activity(lease) => lease,
+            StageLease::Teardown(_) => {
+                unreachable!("private activity wrapper retains activity role")
+            }
+        }
+    }
+
+    fn teardown(&self) -> &Arc<TeardownLease> {
+        match &self.activity {
+            StageLease::Teardown(lease) => lease,
+            StageLease::Activity(_) => {
+                unreachable!("private teardown wrapper retains teardown role")
+            }
+        }
+    }
+
     fn revalidate_empty(&self) -> io::Result<()> {
         self.activity
             .revalidate()
             .map_err(crate::activity::ActivityAdmissionError::into_io)?;
         let stage = self.stage.as_ref().ok_or_else(changed)?;
+        if stage.removed {
+            return Err(changed());
+        }
         stage.parent.revalidate()?;
         let directory = stage.directory.as_ref().ok_or_else(changed)?;
         directory.revalidate()?;
@@ -106,55 +180,7 @@ impl RootActivityCarrier {
     pub fn prepare(
         activity: Arc<ActivityLease>,
     ) -> Result<Self, ActivityCarrierPreparationFailure> {
-        let mut owner = CarrierOwner {
-            activity,
-            stage: None,
-        };
-        let mut receipt = ActivityCarrierPreparationReceipt {
-            stage_durability: Durability::Unproven,
-            root_durability: Durability::Unproven,
-            confirmation: Confirmation::Unverified,
-        };
-        let result = (|| {
-            owner
-                .activity
-                .revalidate()
-                .map_err(crate::activity::ActivityAdmissionError::into_io)?;
-            let root = MediaDirectory::open(owner.activity.journal_root().clone(), Path::new(""))?;
-            match MediaStage::create(root, owner.activity.clone()) {
-                Ok(stage) => owner.stage = Some(stage),
-                Err(failure) => {
-                    owner.stage = failure.owned;
-                    return Err(failure.error);
-                }
-            }
-            owner.revalidate_empty()?;
-            step(MediaPrimitive::CarrierStageSync)?;
-            owner.revalidate_empty()?;
-            owner
-                .stage
-                .as_ref()
-                .and_then(|stage| stage.directory.as_ref())
-                .expect("validated directory retained")
-                .inner
-                .sync()?;
-            receipt.stage_durability = Durability::Synced;
-            owner.revalidate_empty()?;
-            step(MediaPrimitive::CarrierRootSync)?;
-            owner.revalidate_empty()?;
-            owner
-                .stage
-                .as_ref()
-                .expect("validated stage retained")
-                .parent
-                .inner
-                .sync()?;
-            receipt.root_durability = Durability::Synced;
-            step(MediaPrimitive::CarrierConfirmation)?;
-            owner.revalidate_empty()?;
-            receipt.confirmation = Confirmation::Confirmed;
-            Ok(())
-        })();
+        let (owner, receipt, result) = CarrierOwner::prepare(StageLease::Activity(activity));
         match result {
             Ok(()) => Ok(Self {
                 owner,
@@ -169,7 +195,7 @@ impl RootActivityCarrier {
     }
 
     pub fn activity(&self) -> &Arc<ActivityLease> {
-        &self.owner.activity
+        self.owner.activity()
     }
 
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
@@ -190,6 +216,10 @@ impl RootActivityCarrier {
 
     pub fn revalidate(&self) -> io::Result<()> {
         self.owner.revalidate_empty()
+    }
+
+    pub fn observation(&self) -> RootCarrierObservation<'_> {
+        RootCarrierObservation { owner: &self.owner }
     }
 
     /// Requires actual settlement of every child and HTTP writer and qualified
@@ -224,7 +254,7 @@ impl ActivityCarrierPreparationFailure {
     }
 
     pub fn activity(&self) -> &Arc<ActivityLease> {
-        &self.owner.activity
+        self.owner.activity()
     }
 
     pub fn diagnostic_path(&self) -> Option<PathBuf> {
@@ -249,6 +279,143 @@ impl std::fmt::Debug for ActivityCarrierPreparationFailure {
             .field("error", &self.error)
             .field("receipt", &self.receipt)
             .finish_non_exhaustive()
+    }
+}
+
+/// Empty durable root reservation retaining the original teardown admission.
+/// It exposes no writable media stage. Drop closes only; it never retires.
+pub struct RootTeardownCarrier {
+    owner: CarrierOwner,
+    preparation: ActivityCarrierPreparationReceipt,
+}
+
+impl RootTeardownCarrier {
+    /// Existing obligations must be refused freshly under this original lease.
+    /// This leaf certifies no owning config, catalog or settlement policy.
+    pub fn prepare(
+        teardown: Arc<TeardownLease>,
+    ) -> Result<Self, TeardownCarrierPreparationFailure> {
+        let (owner, receipt, result) = CarrierOwner::prepare(StageLease::Teardown(teardown));
+        match result {
+            Ok(()) => Ok(Self {
+                owner,
+                preparation: receipt,
+            }),
+            Err(error) => Err(TeardownCarrierPreparationFailure {
+                error,
+                receipt,
+                owner,
+            }),
+        }
+    }
+
+    pub fn teardown(&self) -> &Arc<TeardownLease> {
+        self.owner.teardown()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.owner.activity.journal_root()
+    }
+    pub fn preparation(&self) -> &ActivityCarrierPreparationReceipt {
+        &self.preparation
+    }
+    pub fn diagnostic_path(&self) -> PathBuf {
+        self.owner
+            .stage
+            .as_ref()
+            .expect("prepared stage")
+            .diagnostic_path()
+    }
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.owner.revalidate_empty()
+    }
+    pub fn observation(&self) -> RootCarrierObservation<'_> {
+        RootCarrierObservation { owner: &self.owner }
+    }
+
+    /// Requires actual child/HTTP settlement and qualified namespace cooperation,
+    /// including the documented Unix final check-to-rmdir limitation. Unknown
+    /// cooperation holds this call; the receipt cannot establish it.
+    pub fn retire_after_settlement(mut self) -> ActivityCarrierRetirement<Self> {
+        let receipt = self.owner.retire();
+        ActivityCarrierRetirement {
+            owned: self,
+            receipt,
+        }
+    }
+}
+
+/// Retains original teardown ownership and every partial reservation on failure.
+pub struct TeardownCarrierPreparationFailure {
+    error: io::Error,
+    receipt: ActivityCarrierPreparationReceipt,
+    owner: CarrierOwner,
+}
+
+impl TeardownCarrierPreparationFailure {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+    pub fn receipt(&self) -> &ActivityCarrierPreparationReceipt {
+        &self.receipt
+    }
+    pub fn teardown(&self) -> &Arc<TeardownLease> {
+        self.owner.teardown()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.owner.activity.journal_root()
+    }
+    pub fn diagnostic_path(&self) -> Option<PathBuf> {
+        self.owner.stage.as_ref().map(MediaStage::diagnostic_path)
+    }
+
+    /// Same actual settlement/cooperation preconditions as the prepared carrier,
+    /// even for prelaunch failure. Unknown holds; Drop does not unlink.
+    pub fn retire_after_settlement(mut self) -> ActivityCarrierRetirement<Self> {
+        let receipt = self.owner.retire();
+        ActivityCarrierRetirement {
+            owned: self,
+            receipt,
+        }
+    }
+}
+
+impl std::fmt::Debug for TeardownCarrierPreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TeardownCarrierPreparationFailure")
+            .field("error", &self.error)
+            .field("receipt", &self.receipt)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Borrow of one actual prepared root carrier. No saved name or identity can
+/// construct it; the owner and original role remain borrowed throughout census.
+pub struct RootCarrierObservation<'a> {
+    owner: &'a CarrierOwner,
+}
+
+#[derive(Eq, PartialEq)]
+pub(crate) struct CarrierMatch {
+    pub(crate) name: OsString,
+    pub(crate) identity: MediaIdentity,
+}
+
+impl RootCarrierObservation<'_> {
+    pub(crate) fn validate(&self, root: &Arc<JournalRoot>) -> io::Result<CarrierMatch> {
+        if !Arc::ptr_eq(root, self.owner.activity.journal_root()) {
+            return Err(invalid("carrier belongs to another original root"));
+        }
+        self.owner.revalidate_empty()?;
+        let stage = self.owner.stage.as_ref().ok_or_else(changed)?;
+        if stage.parent.object_identity() != root.identity() {
+            return Err(invalid("carrier is not a root reservation"));
+        }
+        let matched = CarrierMatch {
+            name: stage.name.clone(),
+            identity: stage.directory.as_ref().ok_or_else(changed)?.identity(),
+        };
+        self.owner.revalidate_empty()?;
+        Ok(matched)
     }
 }
 
@@ -295,5 +462,5 @@ pub struct ActivityCarrierRetirement<T> {
     pub receipt: ActivityCarrierRetirementReceipt,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 mod tests;

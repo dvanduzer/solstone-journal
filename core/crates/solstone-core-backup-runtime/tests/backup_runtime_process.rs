@@ -317,15 +317,17 @@ impl JournalMaintenance for Maintenance {
 #[test]
 #[ignore = "requires an admitted copied package and synthetic direct S3 fixture"]
 fn packaged_owned_archive_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
     use solstone_core_backup::archive_admission::{
         AdmissionError, ArchiveBudget, ArchiveCancellation,
     };
     use solstone_core_backup::archive_readback::ReadbackError;
-    use solstone_core_backup_runtime::admit_archive_with_budget;
+    use solstone_core_backup_runtime::admit_prepared_archive;
     use solstone_core_journal_io::{
         JournalRoot,
         media::{Cleanup, MediaDirectory, MediaStage, digest_reader},
     };
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
     struct ProbeClock(Cell<i64>);
@@ -369,8 +371,6 @@ fn packaged_owned_archive_entry() {
         std::env::var_os("OWNED_ARCHIVE_PROBE_JSON").expect("explicit fixture required");
     let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
     let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
-    let activity =
-        solstone_core_journal_io::activity::ActivityLease::try_acquire(root.clone()).unwrap();
     let member =
         solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
             .unwrap();
@@ -393,11 +393,14 @@ fn packaged_owned_archive_entry() {
         journal_maintenance: &Maintenance,
     };
     let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
-    let mut archive = admit_archive_with_budget(root.clone(), &services, budget).unwrap();
-    assert_eq!(
-        archive.repository_id(),
-        input["repository_id"].as_str().unwrap()
-    );
+    let operation = PreparedArchiveOperation::prepare(root.clone(), budget, &clock).unwrap();
+    let carrier = operation.carrier().clone();
+    let activity = operation.activity().clone();
+    let carrier_identity = || {
+        let observed = fs::metadata(carrier.diagnostic_path()).unwrap();
+        (observed.dev(), observed.ino())
+    };
+    let original_carrier_identity = carrier_identity();
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let fresh = || {
         MediaStage::create(parent.clone(), activity.clone())
@@ -461,9 +464,21 @@ fn packaged_owned_archive_entry() {
     for flags in initial_fd_flags.iter().flatten() {
         assert_ne!(flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
     }
+    let mut archive = admit_prepared_archive(operation, &services).unwrap();
+    assert!(Arc::ptr_eq(archive.carrier(), &carrier));
+    archive.carrier().revalidate().unwrap();
+    assert_eq!(carrier_identity(), original_carrier_identity);
+    assert_eq!(
+        archive.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
     let snapshot = archive.archive_owned(&sources).unwrap();
     let duplicate_snapshot = archive.archive_owned(&duplicates).unwrap();
     let mut reader = archive.into_read_operation().unwrap();
+    assert!(Arc::ptr_eq(reader.carrier(), &carrier));
+    assert!(Arc::ptr_eq(reader.activity(), &activity));
+    reader.carrier().revalidate().unwrap();
+    assert_eq!(carrier_identity(), original_carrier_identity);
     let mut results = Vec::new();
     for source in &sources {
         let (exact, mut prepared) = reader
@@ -550,7 +565,9 @@ fn packaged_owned_archive_entry() {
         serde_json::json!({"snapshot_id":snapshot.snapshot_id,
         "duplicate_snapshot_id":duplicate_snapshot.snapshot_id, "repository_id":snapshot.repository_id,
         "files":results, "original_budget_exhausted":true, "original_stop_observed":true,
-        "duplicate_and_wrong_bytes_refused":true, "issued_target_cleanup":"refused"})
+        "duplicate_and_wrong_bytes_refused":true, "issued_target_cleanup":"refused",
+        "original_carrier_identity":{"device":original_carrier_identity.0,
+            "inode":original_carrier_identity.1},"same_physical_carrier":true})
     );
     drop(sources);
     drop(duplicates);
@@ -568,14 +585,14 @@ fn packaged_owned_archive_entry() {
 #[cfg(feature = "full-tests")]
 #[ignore = "requires an admitted copied package and synthetic direct S3 race fixture"]
 fn packaged_owned_archive_race_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
     use solstone_core_backup::archive_admission::{
         ARCHIVE_BACKUP_TIMEOUT_SECONDS, AdmissionError, ArchiveBudget, ArchiveCancellation,
     };
     use solstone_core_backup::archive_readback::ReadbackError;
-    use solstone_core_backup_runtime::admit_archive_with_budget;
+    use solstone_core_backup_runtime::admit_prepared_archive;
     use solstone_core_journal_io::{
         JournalRoot,
-        activity::ActivityLease,
         media::{Cleanup, MediaDigest, MediaDirectory, MediaStage, digest_reader},
     };
     use std::os::unix::fs::MetadataExt;
@@ -692,7 +709,9 @@ fn packaged_owned_archive_race_entry() {
     };
     let cancellation = ArchiveCancellation::new();
     let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
-    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
+    let operation = PreparedArchiveOperation::prepare(root.clone(), budget, &clock).unwrap();
+    let carrier = operation.carrier().clone();
+    let activity = operation.activity().clone();
     let member =
         solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
             .unwrap();
@@ -708,11 +727,6 @@ fn packaged_owned_archive_race_entry() {
         version: "2.0.40",
         journal_maintenance: &Maintenance,
     };
-    let mut archive = admit_archive_with_budget(root.clone(), &services, budget).unwrap();
-    assert_eq!(
-        archive.repository_id(),
-        input["repository_id"].as_str().unwrap()
-    );
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let file = &input["files"][0];
     let name = std::ffi::OsStr::new(file["name"].as_str().unwrap());
@@ -728,10 +742,18 @@ fn packaged_owned_archive_race_entry() {
         .copy_from(&parent, name, &digest)
         .unwrap();
     let source = copied.archive_source().unwrap();
+    let mut archive = admit_prepared_archive(operation, &services).unwrap();
+    assert!(Arc::ptr_eq(archive.carrier(), &carrier));
+    assert_eq!(
+        archive.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
     let snapshot = archive
         .archive_owned(std::slice::from_ref(&source))
         .unwrap();
     let mut reader = archive.into_read_operation().unwrap();
+    assert!(Arc::ptr_eq(reader.carrier(), &carrier));
+    assert!(Arc::ptr_eq(reader.activity(), &activity));
     let stage = MediaStage::create(parent, activity.clone()).unwrap();
     let target_path = stage.diagnostic_path().join("payload");
     let target = stage.create_target().unwrap();
@@ -1025,5 +1047,229 @@ fn non_directory_journal_roots_are_rejected_before_runtime_dependencies() {
     assert!(
         !sandbox.path().join("config").exists(),
         "a non-directory journal root must not create sibling config artifacts"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an admitted copied package and synthetic localhost HTTP fixtures"]
+fn packaged_controlled_http_entry() {
+    use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation};
+    use solstone_core_backup::owned_dns::{OwnedDnsFamily, resolve_owned_http_host};
+    use solstone_core_backup_runtime::{UreqHttpTransport, admit_archive_with_budget};
+    use solstone_core_journal_io::JournalRoot;
+    use std::io::Read;
+    use std::net::ToSocketAddrs;
+    use std::os::fd::FromRawFd;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    struct ProbeClock {
+        base: AtomicI64,
+        started: Instant,
+    }
+    impl Clock for ProbeClock {
+        fn now_unix(&self) -> i64 {
+            self.base.load(Ordering::SeqCst) + self.started.elapsed().as_secs() as i64
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    struct CountedRepositoryConfig(Cell<usize>);
+    impl ToolRunner for CountedRepositoryConfig {
+        fn run(&self, _: &ToolRequest<'_>) -> std::io::Result<ToolOutput> {
+            panic!("owning admission must preserve its controlled runner token")
+        }
+        fn run_cancellable(
+            &self,
+            request: &ToolRequest<'_>,
+            _: &ArchiveCancellation,
+        ) -> std::io::Result<ToolOutput> {
+            assert!(request.argv.iter().any(|arg| arg == "cat"));
+            assert!(request.argv.iter().any(|arg| arg == "config"));
+            self.0.set(self.0.get() + 1);
+            Ok(ToolOutput {
+                returncode: 0,
+                stdout: serde_json::to_vec(&serde_json::json!({"id":"a".repeat(64)})).unwrap(),
+                stderr: vec![],
+            })
+        }
+    }
+    struct BrokerHttp<'a> {
+        clock: &'a ProbeClock,
+        after_http: &'a str,
+        observed: RefCell<Option<String>>,
+    }
+    impl HttpTransport for BrokerHttp<'_> {
+        fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
+            panic!("ordinary HTTP must not be reached")
+        }
+        fn execute_cancellable(
+            &self,
+            request: &HttpRequest,
+            cancellation: &ArchiveCancellation,
+        ) -> Result<HttpResponse, HttpError> {
+            let result = UreqHttpTransport.execute_cancellable(request, cancellation);
+            *self.observed.borrow_mut() = Some(match &result {
+                Ok(response) => format!("status:{}", response.status),
+                Err(error) => format!("{error:?}"),
+            });
+            if self.after_http == "cancel" {
+                cancellation.cancel();
+            }
+            if self.after_http == "expire" {
+                self.clock.base.store(
+                    10_000
+                        + solstone_core_backup::archive_admission::ARCHIVE_BACKUP_TIMEOUT_SECONDS
+                            as i64,
+                    Ordering::SeqCst,
+                );
+            }
+            result
+        }
+    }
+    let input_path =
+        std::env::var_os("CONTROLLED_HTTP_PROBE_JSON").expect("explicit fixture required");
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let cancellation = ArchiveCancellation::new();
+    if input["pre_cancel"].as_bool().unwrap_or(false) {
+        cancellation.cancel();
+    }
+    let control_fd = input["control_fd"]
+        .as_i64()
+        .map(|fd| i32::try_from(fd).unwrap());
+    let started = Instant::now();
+    let result = thread::scope(|scope| {
+        let publisher = control_fd.map(|fd| {
+            // SAFETY: this isolated probe exclusively owns the explicitly inherited socket.
+            #[allow(unsafe_code)]
+            let mut control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            control
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let cancellation = cancellation.clone();
+            scope.spawn(move || {
+                let mut byte = [0];
+                control.read_exact(&mut byte).unwrap();
+                if byte == *b"c" {
+                    cancellation.cancel();
+                } else {
+                    assert_eq!(byte, *b"r");
+                }
+            })
+        });
+        let execute = || match input["kind"].as_str().unwrap() {
+            "dns" => {
+                let host = input["host"].as_str().unwrap();
+                let port = input["port"].as_u64().unwrap() as u16;
+                let result = resolve_owned_http_host(
+                    host,
+                    port,
+                    OwnedDnsFamily::Any,
+                    Instant::now() + Duration::from_secs(5),
+                    &cancellation,
+                );
+                match result {
+                    Ok(addresses) => {
+                        let native = format!("{host}:{port}")
+                            .to_socket_addrs()
+                            .unwrap()
+                            .take(16)
+                            .collect::<Vec<_>>();
+                        assert_eq!(addresses, native);
+                        serde_json::json!({"addresses":addresses.iter().map(ToString::to_string).collect::<Vec<_>>()})
+                    }
+                    Err(error) => serde_json::json!({"error":format!("{:?}",error.kind())}),
+                }
+            }
+            "http" => {
+                let request = HttpRequest {
+                    method: input["method"].as_str().unwrap().into(),
+                    url: input["url"].as_str().unwrap().into(),
+                    headers: input["headers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|pair| {
+                            (
+                                pair[0].as_str().unwrap().into(),
+                                pair[1].as_str().unwrap().into(),
+                            )
+                        })
+                        .collect(),
+                    body: input["body"].as_str().unwrap().as_bytes().to_vec(),
+                    timeout: Duration::from_millis(input["timeout_ms"].as_u64().unwrap()),
+                };
+                match UreqHttpTransport.execute_cancellable(&request, &cancellation) {
+                    Ok(response) => {
+                        serde_json::json!({"status":response.status,"headers":response.headers,"body":String::from_utf8(response.body).unwrap()})
+                    }
+                    Err(error) => serde_json::json!({"error":format!("{error:?}")}),
+                }
+            }
+            "broker" => {
+                let root = Arc::new(
+                    JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap(),
+                );
+
+                let runner = CountedRepositoryConfig(Cell::new(0));
+                let restic = solstone_core_installed_payload::resolve_current_member(
+                    "lib/solstone-restic/restic",
+                )
+                .unwrap();
+                let rclone = solstone_core_installed_payload::resolve_current_member(
+                    "lib/solstone-rclone/rclone",
+                )
+                .unwrap();
+                let clock = ProbeClock {
+                    base: AtomicI64::new(10_000),
+                    started: Instant::now(),
+                };
+                let http = BrokerHttp {
+                    clock: &clock,
+                    after_http: input["after_http"].as_str().unwrap_or(""),
+                    observed: RefCell::new(None),
+                };
+                let services = BackupServices {
+                    runner: &runner,
+                    http: &http,
+                    clock: &clock,
+                    restic_path: Some(restic.path()),
+                    rclone_path: Some(rclone.path()),
+                    version: "2.0.40",
+                    journal_maintenance: &Maintenance,
+                };
+                let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+                if let Some(remaining) = input["original_remaining_seconds"].as_i64() {
+                    clock.base.store(10_000 + solstone_core_backup::archive_admission::ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64 - remaining, Ordering::SeqCst);
+                }
+                let result = admit_archive_with_budget(root, &services, budget);
+                let outcome = match result {
+                    Ok(archive) => serde_json::json!({"repository_id":archive.repository_id()}),
+                    Err(error) => serde_json::json!({"error":format!("{error:?}")}),
+                };
+                serde_json::json!({"outcome":outcome,"controlled_http_result":http.observed.borrow().clone(),"repository_config_calls":runner.0.get(),"runner":"synthetic counted config only; no native launch"})
+            }
+            _ => panic!("unknown explicit probe fixture"),
+        };
+        let result = if input["nested_runtime"].as_bool().unwrap_or(false) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async { execute() })
+        } else {
+            execute()
+        };
+        if let Some(publisher) = publisher {
+            publisher.join().unwrap();
+        }
+        result
+    });
+    println!(
+        "CONTROLLED_HTTP_RESULT {}",
+        serde_json::json!({"elapsed_ms":started.elapsed().as_millis(),"cancelled":cancellation.is_cancelled(),"result":result})
     );
 }

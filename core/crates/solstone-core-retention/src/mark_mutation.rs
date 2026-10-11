@@ -73,12 +73,16 @@ pub struct RegisterUncertainty {
     pub durability: Option<io::Error>,
     pub observation: Option<io::Error>,
     pub bindings: Vec<ReviewRefusal>,
+    pub lock: Option<ExistingParentLockError>,
 }
 
 impl RegisterUncertainty {
     #[cfg(unix)]
     fn confirmed(&self) -> bool {
-        self.durability.is_none() && self.observation.is_none() && self.bindings.is_empty()
+        self.durability.is_none()
+            && self.observation.is_none()
+            && self.bindings.is_empty()
+            && self.lock.is_none()
     }
 }
 
@@ -295,6 +299,19 @@ fn begin_bound(
     root: &JournalRoot,
     health: &HealthDirectory,
 ) -> Result<(BoundParentLock, Register), BoundMutationRefusal> {
+    let (lock, register) = begin_bound_read(root, health)?;
+    if register.version != 1 {
+        return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+            StoreError::WriterHeld,
+        )));
+    }
+    Ok((lock, register))
+}
+
+fn begin_bound_read(
+    root: &JournalRoot,
+    health: &HealthDirectory,
+) -> Result<(BoundParentLock, Register), BoundMutationRefusal> {
     // Windows publication remains held pending the owning adapter's qualification.
     if cfg!(windows) {
         return Err(BoundMutationRefusal::Unsupported);
@@ -314,11 +331,9 @@ fn begin_bound(
             "the retained removal register disappeared",
         )))
     })?;
-    if register.version != 1 {
-        return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
-            StoreError::WriterHeld,
-        )));
-    }
+    #[cfg(unix)]
+    lock.revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
+        .map_err(BoundMutationRefusal::Lock)?;
     Ok((lock, register))
 }
 
@@ -339,10 +354,11 @@ fn publish_bound(
         )));
     }
     revalidate_health(root, health)?;
+    lock.revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
+        .map_err(BoundMutationRefusal::Lock)?;
     #[cfg(unix)]
     let mut uncertainty = {
         use solstone_core_journal_io::BoundAtomicOutcome;
-        let _lock = lock;
         match solstone_core_journal_io::atomic_replace_bound(
             health,
             OsStr::new("retention-marks.json"),
@@ -372,6 +388,9 @@ fn publish_bound(
     if let Err(error) = revalidate_health(root, health) {
         uncertainty.bindings.push(error);
     }
+    uncertainty.lock = lock
+        .revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
+        .err();
     Ok(if uncertainty.confirmed() {
         BoundMutationOutcome::Published(result)
     } else {
@@ -418,7 +437,141 @@ pub fn conditional_mutate_at_root(
         publish_bound(root, &health, &lock, result)
     } else {
         revalidate_health(root, &health)?;
+        #[cfg(unix)]
+        lock.revalidate_bound(&health, OsStr::new("retention-marks.json.lock"))
+            .map_err(BoundMutationRefusal::Lock)?;
         Ok(BoundMutationOutcome::Unchanged(result))
+    }
+}
+
+/// One short phase under the existing register protocol. Never spans bookkeeping.
+#[cfg(unix)]
+pub(crate) struct CheckedMarkGuard<'a, 'op> {
+    checked: &'a CheckedReviewContext,
+    lock: BoundParentLock,
+    archive: Option<&'a crate::archive_approval::ArchiveApprovalBatch<'op>>,
+}
+
+#[cfg(unix)]
+impl<'a, 'op> CheckedMarkGuard<'a, 'op> {
+    pub(crate) fn acquire(checked: &'a CheckedReviewContext) -> Result<Self, BoundMutationRefusal> {
+        let (lock, register) = begin_bound(checked.root(), checked.health())?;
+        check_marks(
+            &register,
+            checked.marks(),
+            &checked.root().identity().observation_id(),
+        )?;
+        Ok(Self {
+            checked,
+            lock,
+            archive: None,
+        })
+    }
+
+    pub(crate) fn acquire_archive(
+        checked: &'a CheckedReviewContext,
+        archive: &'a crate::archive_approval::ArchiveApprovalBatch<'op>,
+    ) -> Result<Self, BoundMutationRefusal> {
+        Self::check_archive(checked, archive)?;
+        let (lock, register) = begin_bound_read(checked.root(), checked.health())?;
+        check_marks(
+            &register,
+            checked.marks(),
+            &checked.root().identity().observation_id(),
+        )?;
+        Ok(Self {
+            checked,
+            lock,
+            archive: Some(archive),
+        })
+    }
+
+    fn check_archive(
+        checked: &CheckedReviewContext,
+        archive: &crate::archive_approval::ArchiveApprovalBatch<'_>,
+    ) -> Result<(), BoundMutationRefusal> {
+        if !std::sync::Arc::ptr_eq(checked.root_arc(), archive.journal_root())
+            || checked
+                .marks()
+                .iter()
+                .filter(|m| m.offload.is_some())
+                .ne(archive.expected_marks())
+            || archive.revalidate_admission().is_err()
+        {
+            return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+                invalid("archive approval no longer matches the checked selection"),
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<Register, BoundMutationRefusal> {
+        let root = self.checked.root();
+        let health = self.checked.health();
+        revalidate_health(root, health)?;
+        self.lock
+            .revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
+            .map_err(BoundMutationRefusal::Lock)?;
+        let register = read_at_health(health)?
+            .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
+        if let Some(archive) = self.archive {
+            Self::check_archive(self.checked, archive)?;
+        } else if register.version != 1 {
+            return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+                StoreError::WriterHeld,
+            )));
+        }
+        check_marks(
+            &register,
+            self.checked.marks(),
+            &root.identity().observation_id(),
+        )?;
+        revalidate_health(root, health)?;
+        self.lock
+            .revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
+            .map_err(BoundMutationRefusal::Lock)?;
+        Ok(register)
+    }
+
+    pub(crate) fn publish(
+        self,
+        plans: &[PlannedMarkMutation],
+    ) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
+        let mut register = self.revalidate()?;
+        let mut changed = false;
+        for plan in plans {
+            if !self.checked.marks().contains(plan.expected()) {
+                return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+                    invalid("mutation is outside the checked selection"),
+                )));
+            }
+            let status = apply(&mut register, plan)
+                .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+            if status != MutationStatus::Applied {
+                return Err(BoundMutationRefusal::Review(ReviewRefusal::Register(
+                    invalid("the selected mutation is no longer applicable"),
+                )));
+            }
+            changed = true;
+        }
+        let result = ConditionalResult {
+            status: if changed {
+                MutationStatus::Applied
+            } else {
+                MutationStatus::AlreadyApplied
+            },
+            register,
+        };
+        if changed {
+            publish_bound(
+                self.checked.root(),
+                self.checked.health(),
+                &self.lock,
+                result,
+            )
+        } else {
+            Ok(BoundMutationOutcome::Unchanged(result))
+        }
     }
 }
 
@@ -428,7 +581,7 @@ pub fn decline_reviewed(
 ) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
     let root = checked.root();
     let health = checked.health();
-    let (lock, mut register) = begin_bound(root, health)?;
+    let (lock, mut register) = begin_bound_read(root, health)?;
     check_marks(
         &register,
         checked.marks(),

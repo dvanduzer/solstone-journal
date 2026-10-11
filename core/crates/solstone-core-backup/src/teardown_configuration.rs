@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Exact retained observations for backup teardown. These authorize no effects.
+//! Retained backup configuration and its exact conditional clear.
 
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use solstone_core_journal_config_write::{
+    BoundConfigOutcome, BoundConfigPublication, BoundConfigRefusal,
+};
 use solstone_core_journal_io::JournalRoot;
 
 use crate::{BackupKeys, Destination, HostedBinding};
@@ -63,6 +66,40 @@ impl TeardownConfiguration {
         }
     }
 
+    /// Invoke the bound clear through this admission's original config parent.
+    pub fn clear_configuration(&self) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+        #[cfg(unix)]
+        {
+            solstone_core_journal_config_write::conditional_update_journal_config_in_directory(
+                &self.root,
+                &self.directory,
+                self.sha256(),
+                |config| crate::state::cleared_backup_configuration(config, self.backup()),
+                crate::state::mutation_lock_options(),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            Err(BoundConfigRefusal::Unsupported)
+        }
+    }
+
+    /// Observe an exact published candidate. Descriptive receipts confer no phase authority.
+    pub fn revalidate_published_clear(
+        &self,
+        publication: &BoundConfigPublication,
+    ) -> Result<(), TeardownConfigurationRefusal> {
+        #[cfg(unix)]
+        {
+            unix::revalidate_published_clear(self, publication)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = publication;
+            Err(TeardownConfigurationRefusal::Unsupported)
+        }
+    }
+
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
@@ -89,9 +126,12 @@ mod unix {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    use solstone_core_journal_config::read_journal_config_in_directory;
+    use solstone_core_journal_config::{
+        read_journal_config_in_directory, read_journal_config_observed_in_directory,
+    };
     use solstone_core_journal_config_write::MAX_BOUND_CONFIG_BYTES;
-    use solstone_core_journal_io::media::{MediaDirectory, MediaRead};
+    use solstone_core_journal_io::journal_root::JournalEntryKind;
+    use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity, MediaRead};
 
     use super::*;
     use TeardownConfigurationRefusal as Refusal;
@@ -167,6 +207,16 @@ mod unix {
     }
 
     pub(super) fn revalidate(captured: &TeardownConfiguration) -> Result<(), Refusal> {
+        revalidate_parents(captured)?;
+        let current = read_journal_config_in_directory(&captured.directory, MAX_BOUND_CONFIG_BYTES)
+            .map_err(|_| Refusal::ConfigurationUnavailable)?;
+        if current.sha256.as_deref() != Some(captured.sha256()) {
+            return Err(Refusal::ConfigurationChanged);
+        }
+        revalidate_binding_and_parents(captured)
+    }
+
+    fn revalidate_parents(captured: &TeardownConfiguration) -> Result<(), Refusal> {
         captured
             .root
             .revalidate_canonical_binding()
@@ -175,11 +225,34 @@ mod unix {
             .directory
             .revalidate()
             .map_err(|_| Refusal::ConfigurationChanged)?;
-        let current = read_journal_config_in_directory(&captured.directory, MAX_BOUND_CONFIG_BYTES)
-            .map_err(|_| Refusal::ConfigurationUnavailable)?;
-        if current.sha256.as_deref() != Some(captured.sha256()) {
+        Ok(())
+    }
+
+    pub(super) fn revalidate_published_clear(
+        captured: &TeardownConfiguration,
+        publication: &BoundConfigPublication,
+    ) -> Result<(), Refusal> {
+        revalidate_parents(captured)?;
+        let (current, entry) =
+            read_journal_config_observed_in_directory(&captured.directory, MAX_BOUND_CONFIG_BYTES)
+                .map_err(|_| Refusal::ConfigurationUnavailable)?;
+        let entry = entry.ok_or(Refusal::ConfigurationUnavailable)?;
+        if current.sha256.as_deref() != Some(publication.candidate_sha256.as_str())
+            || entry.name != OsStr::new("journal.json")
+            || entry.kind != JournalEntryKind::RegularFile
+            || entry.identity
+                != (MediaIdentity::Unix {
+                    device: publication.published_file.device,
+                    inode: publication.published_file.inode,
+                })
+            || entry.size != publication.published_file.size
+        {
             return Err(Refusal::ConfigurationChanged);
         }
+        revalidate_binding_and_parents(captured)
+    }
+
+    fn revalidate_binding_and_parents(captured: &TeardownConfiguration) -> Result<(), Refusal> {
         if let Some(binding) = &captured.binding_observation
             && read_binding(&binding.directory)? != binding.read
         {
