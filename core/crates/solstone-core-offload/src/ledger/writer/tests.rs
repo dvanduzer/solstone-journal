@@ -106,7 +106,8 @@ mod native {
     use super::*;
     use crate::ledger::append_offload_event;
     use solstone_core_retention::archive_catalog::{
-        OffloadFile, RestoreDisposition, RestoreFileV2, codec::Event, read_complete_catalog,
+        LegacyRestoreFileBinding, OffloadFile, RestoreDisposition, RestoreFileV2, codec::Event,
+        read_complete_catalog,
     };
 
     fn archive_event(proof: &OffloadProof) -> Event {
@@ -170,6 +171,345 @@ mod native {
             "{receipt:?}"
         );
         assert!(receipt.failures().is_empty());
+    }
+
+    fn legacy(fixture: &Fixture, day: &str, adoption: char) -> LegacyRestoreBinding {
+        raw_event(
+            fixture,
+            day,
+            &Event::Archive {
+                time: 1,
+                day: day.into(),
+                stream: "_default".into(),
+                segment: "010000_001".into(),
+                snapshot_id: "bbbbbbbb".into(),
+                files: ["audio.flac", "z.flac", "x.flac"]
+                    .into_iter()
+                    .map(|name| OffloadFile {
+                        name: name.into(),
+                        bytes: 7,
+                        sha256: "c".repeat(64),
+                    })
+                    .collect(),
+            },
+        );
+        let catalog = read_complete_catalog(&fixture.root).unwrap();
+        let manifest =
+            catalog.days.iter().find(|d| d.day == day).unwrap().segments[0].history[0].clone();
+        let mut binding = LegacyRestoreBinding {
+            adoption_id: adoption.to_string().repeat(64),
+            revision: String::new(),
+            target: Target {
+                day: day.into(),
+                stream: "_default".into(),
+                dir: "prefix-010000_001_suffix".into(),
+            },
+            layout: SegmentLayout::Direct,
+            repository_id: "a".repeat(64),
+            snapshot_id: "b".repeat(64),
+            files: manifest
+                .files
+                .iter()
+                .map(|w| LegacyRestoreFileBinding {
+                    witness_id: w.witness_id.clone(),
+                    name: w.file.name.clone(),
+                    bytes: w.file.bytes,
+                    sha256: w.file.sha256.clone(),
+                    archive_path: format!("/archive/{}", w.file.name),
+                })
+                .collect(),
+            legacy_manifest: manifest,
+        };
+        binding.revision = binding.canonical_revision().unwrap();
+        binding.validate().unwrap();
+        binding
+    }
+
+    fn legacy_binding_event(binding: &LegacyRestoreBinding) -> Event {
+        Event::RestoreBindingV1 {
+            schema_version: 1,
+            time: 2,
+            day: binding.target.day.clone(),
+            stream: binding.target.stream.clone(),
+            segment: "010000_001".into(),
+            binding: binding.clone(),
+        }
+    }
+
+    fn legacy_operation(binding: &LegacyRestoreBinding, id: &str) -> LegacyRestoreOperation {
+        LegacyRestoreOperation {
+            adoption_id: binding.adoption_id.clone(),
+            operation: RestoreOperation {
+                operation_id: id.into(),
+                files: binding
+                    .files
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| RestoreFileV2 {
+                        witness_id: f.witness_id.clone(),
+                        name: f.name.clone(),
+                        disposition: match i {
+                            0 => RestoreDisposition::Published,
+                            1 => RestoreDisposition::AlreadyPresent,
+                            _ => RestoreDisposition::Conflict,
+                        },
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn legacy_binding_and_ordered_event_are_durable_idempotent_and_generation_exact() {
+        let fixture = Fixture::new();
+        let binding = legacy(&fixture, "20260101", 'd');
+        let original = binding.legacy_manifest.clone();
+        let receipt = append_legacy_restore_binding(&fixture.root, &binding, 2).unwrap();
+        assert!(matches!(
+            receipt.effect(),
+            LedgerWriteEffect::Appended { .. }
+        ));
+        confirmed(&receipt);
+        let before = fs::read(fixture.path("20260101")).unwrap();
+        let receipt = append_legacy_restore_binding(&fixture.root, &binding, 99).unwrap();
+        assert_eq!(receipt.effect(), LedgerWriteEffect::AlreadyRecorded);
+        confirmed(&receipt);
+        assert_eq!(fs::read(fixture.path("20260101")).unwrap(), before);
+        let mut newer = fixture.proof("newer", SegmentLayout::Direct);
+        newer.files.truncate(1);
+        confirmed(&append_archive_witness(&fixture.root, &newer, 3).unwrap());
+        let operation = legacy_operation(&binding, "legacy-op");
+        confirmed(
+            &append_legacy_restore_operation(&fixture.root, &binding, &operation, 4).unwrap(),
+        );
+        let before = fs::read(fixture.path("20260101")).unwrap();
+        let receipt =
+            append_legacy_restore_operation(&fixture.root, &binding, &operation, 5).unwrap();
+        assert_eq!(receipt.effect(), LedgerWriteEffect::AlreadyRecorded);
+        confirmed(&receipt);
+        assert_eq!(fs::read(fixture.path("20260101")).unwrap(), before);
+        let catalog = read_complete_catalog(&fixture.root).unwrap();
+        let segment = &catalog.days[0].segments[0];
+        assert_eq!(segment.history[0], original);
+        assert!(
+            segment.history[0]
+                .files
+                .iter()
+                .all(|w| w.repository_id.is_none()
+                    && w.archive_path.is_none()
+                    && w.processing.is_none()
+                    && w.journal_id.is_none()
+                    && w.layout.is_none()
+                    && w.segment_dir.is_none())
+        );
+        assert_eq!(segment.legacy_restores, vec![operation]);
+        assert_eq!(segment.active.len(), 2);
+        assert!(
+            segment
+                .active
+                .iter()
+                .any(|w| w.witness_id == newer.files[0].witness_id)
+        );
+        assert!(segment.active.iter().any(|w| w.file.name == "x.flac"));
+    }
+
+    #[test]
+    fn legacy_binding_requires_exact_whole_original_and_binding_identity() {
+        for change in 0..7 {
+            let fixture = Fixture::new();
+            let binding = legacy(&fixture, "20260101", 'd');
+            confirmed(&append_legacy_restore_binding(&fixture.root, &binding, 2).unwrap());
+            let mut changed = binding.clone();
+            match change {
+                0 => {
+                    changed.legacy_manifest.files.pop();
+                    changed.files.pop();
+                }
+                1 => changed.files[0].archive_path = "/different/audio.flac".into(),
+                2 => changed.snapshot_id = format!("bbbbbbbb{}", "e".repeat(56)),
+                3 => changed.target.dir = "010000_001_other".into(),
+                4 => {
+                    changed.layout = SegmentLayout::Named;
+                    changed.target.stream = "camera".into();
+                }
+                5 => changed.files.swap(0, 1),
+                _ => changed.revision = "e".repeat(64),
+            }
+            if change != 6 {
+                changed.revision = changed.canonical_revision().unwrap();
+            }
+            let before = fs::read(fixture.path("20260101")).unwrap();
+            assert!(append_legacy_restore_binding(&fixture.root, &changed, 3).is_err());
+            assert_eq!(fs::read(fixture.path("20260101")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn legacy_binding_refuses_missing_or_changed_original_and_torn_history() {
+        for change in 0..3 {
+            let fixture = Fixture::new();
+            let binding = legacy(&fixture, "20260101", 'd');
+            let path = fixture.path("20260101");
+            match change {
+                0 => fs::write(&path, b"").unwrap(),
+                1 => {
+                    let bytes = fs::read_to_string(&path)
+                        .unwrap()
+                        .replace(&"c".repeat(64), &"e".repeat(64));
+                    fs::write(&path, bytes).unwrap();
+                }
+                _ => OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{torn")
+                    .unwrap(),
+            }
+            let before = fs::read(&path).unwrap();
+            assert!(append_legacy_restore_binding(&fixture.root, &binding, 2).is_err());
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn legacy_event_requires_exact_recorded_binding_and_wrapper_adoption() {
+        let fixture = Fixture::new();
+        let binding = legacy(&fixture, "20260101", 'd');
+        let operation = legacy_operation(&binding, "fresh-op");
+        let before = fs::read(fixture.path("20260101")).unwrap();
+        assert!(append_legacy_restore_operation(&fixture.root, &binding, &operation, 2).is_err());
+        assert_eq!(fs::read(fixture.path("20260101")).unwrap(), before);
+        confirmed(&append_legacy_restore_binding(&fixture.root, &binding, 3).unwrap());
+        let before = fs::read(fixture.path("20260101")).unwrap();
+        let mut wrong = operation.clone();
+        wrong.adoption_id = "e".repeat(64);
+        assert_eq!(
+            append_legacy_restore_operation(&fixture.root, &binding, &wrong, 4).unwrap_err(),
+            LedgerWriteRefusal::InvalidInput
+        );
+        let mut changed = binding.clone();
+        changed.files[0].archive_path = "/other/audio.flac".into();
+        changed.revision = changed.canonical_revision().unwrap();
+        assert!(append_legacy_restore_operation(&fixture.root, &changed, &operation, 4).is_err());
+        assert_eq!(fs::read(fixture.path("20260101")).unwrap(), before);
+        confirmed(
+            &append_legacy_restore_operation(&fixture.root, &binding, &operation, 5).unwrap(),
+        );
+    }
+
+    #[test]
+    fn legacy_duplicate_cross_day_adoptions_block_exact_local_replay() {
+        let fixture = Fixture::new();
+        let binding = legacy(&fixture, "20260101", 'd');
+        confirmed(&append_legacy_restore_binding(&fixture.root, &binding, 2).unwrap());
+        let other = legacy(&fixture, "20260102", 'd');
+        let second = fs::read(fixture.path("20260102")).unwrap();
+        assert_eq!(
+            append_legacy_restore_binding(&fixture.root, &other, 3).unwrap_err(),
+            LedgerWriteRefusal::Collision
+        );
+        assert_eq!(fs::read(fixture.path("20260102")).unwrap(), second);
+        raw_event(&fixture, "20260102", &legacy_binding_event(&other));
+        let catalog = read_complete_catalog(&fixture.root).unwrap();
+        assert!(catalog.days.iter().all(|d| !d.degraded()));
+        assert!(catalog.restore_binding(&binding.adoption_id).is_none());
+        let first = fs::read(fixture.path("20260101")).unwrap();
+        let second = fs::read(fixture.path("20260102")).unwrap();
+        assert_eq!(
+            append_legacy_restore_binding(&fixture.root, &binding, 3).unwrap_err(),
+            LedgerWriteRefusal::Collision
+        );
+        assert_eq!(fs::read(fixture.path("20260101")).unwrap(), first);
+        assert_eq!(fs::read(fixture.path("20260102")).unwrap(), second);
+    }
+
+    #[test]
+    fn legacy_operation_id_cannot_be_reused_for_another_binding_or_v2_event() {
+        for case in 0..3 {
+            let fixture = Fixture::new();
+            let binding = legacy(&fixture, "20260101", 'd');
+            confirmed(&append_legacy_restore_binding(&fixture.root, &binding, 2).unwrap());
+            let mut other = if case == 2 {
+                legacy(&fixture, "20260102", 'e')
+            } else {
+                binding.clone()
+            };
+            other.adoption_id = "e".repeat(64);
+            other.revision = other.canonical_revision().unwrap();
+            confirmed(&append_legacy_restore_binding(&fixture.root, &other, 3).unwrap());
+            let operation = legacy_operation(&binding, "shared-op");
+            if case == 1 {
+                let proof = fixture.proof("typed", SegmentLayout::Direct);
+                confirmed(&append_archive_witness(&fixture.root, &proof, 4).unwrap());
+                confirmed(
+                    &append_restore_operation(
+                        &fixture.root,
+                        &proof.target,
+                        proof.layout,
+                        &super::native::operation(&proof, "shared-op"),
+                        5,
+                    )
+                    .unwrap(),
+                );
+            } else {
+                confirmed(
+                    &append_legacy_restore_operation(&fixture.root, &binding, &operation, 4)
+                        .unwrap(),
+                );
+            }
+            let wrong = legacy_operation(&other, "shared-op");
+            let before = fs::read(fixture.path("20260101")).unwrap();
+            let other_before = fs::read(fixture.path(&other.target.day)).unwrap();
+            assert_eq!(
+                append_legacy_restore_operation(&fixture.root, &other, &wrong, 6).unwrap_err(),
+                LedgerWriteRefusal::Collision
+            );
+            assert_eq!(fs::read(fixture.path("20260101")).unwrap(), before);
+            assert_eq!(
+                fs::read(fixture.path(&other.target.day)).unwrap(),
+                other_before
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_complete_readable_lines_preserve_sync_uncertainty_facts() {
+        let fixture = Fixture::new();
+        let binding = legacy(&fixture, "20260101", 'd');
+        let mut fault = Faults {
+            sync: Some(SyncPoint::File),
+            ..Faults::default()
+        };
+        let receipt = unix::append_legacy_binding(&fixture.root, &binding, 2, &mut fault).unwrap();
+        assert!(matches!(
+            receipt.effect(),
+            LedgerWriteEffect::Appended { .. }
+        ));
+        assert_eq!(receipt.durability()[0], LedgerSync::Uncertain);
+        assert_eq!(receipt.confirmation(), LedgerConfirmation::Confirmed);
+        assert!(!receipt.failures().is_empty());
+        assert_eq!(
+            read_complete_catalog(&fixture.root)
+                .unwrap()
+                .restore_binding(&binding.adoption_id),
+            Some(&binding)
+        );
+        confirmed(&append_legacy_restore_binding(&fixture.root, &binding, 3).unwrap());
+        let operation = legacy_operation(&binding, "uncertain-op");
+        let receipt =
+            unix::append_legacy_restore(&fixture.root, &binding, &operation, 4, &mut fault)
+                .unwrap();
+        assert!(matches!(
+            receipt.effect(),
+            LedgerWriteEffect::Appended { .. }
+        ));
+        assert_eq!(receipt.durability()[0], LedgerSync::Uncertain);
+        assert_eq!(receipt.confirmation(), LedgerConfirmation::Confirmed);
+        assert!(!receipt.failures().is_empty());
+        assert_eq!(
+            read_complete_catalog(&fixture.root).unwrap().days[0].segments[0].legacy_restores,
+            vec![operation]
+        );
     }
 
     #[test]
