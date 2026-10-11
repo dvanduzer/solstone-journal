@@ -55,7 +55,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
     ToolEntry {
         tool_name: crate::jsonrpc::ToolName::SaveMemory,
         wire_name: "save_memory",
-        description: "save a note as this connection's agent memory, when the owner asks you to remember something. content is exact UTF-8, up to 32,768 bytes. retry with the same operation_id and content if the outcome is uncertain.",
+        description: "save a note in the owner's journal when they ask you to remember something. content is exact UTF-8, up to 32,768 bytes. retry with the same operation_id and content if the outcome is uncertain.",
         input_schema: save_memory_input_schema,
         requires: NOTHING,
         audit_name: solstone_core_mcp_audit::ToolName::SaveMemory,
