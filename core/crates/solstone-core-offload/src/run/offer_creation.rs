@@ -20,6 +20,16 @@ use solstone_core_retention::archive_offer::{
     OffloadOfferSelection, VerifiedOffloadOffers,
 };
 
+mod owned;
+#[cfg(all(test, unix, feature = "full-tests"))]
+pub(super) use owned::with_source_cleanup_fault;
+pub use owned::{
+    OffloadSourceCleanup, OffloadSourceCopyReport, OwnedOffloadCreation,
+    OwnedOffloadCreationFinish, OwnedOffloadCreationFinishRefusal, OwnedOffloadCreationHold,
+    OwnedOffloadCreationOwner, OwnedOffloadInputFailure, OwnedOffloadInputs,
+    SettledOffloadCreation, SettledOffloadCreationReport, create_owned_offload_offers,
+    prepare_owned_offload_inputs,
+};
 mod planner;
 #[cfg(all(test, unix, feature = "full-tests"))]
 pub(super) use planner::with_payload_capacity_fault;
@@ -111,6 +121,8 @@ pub enum OffloadLedgerWrite<'a> {
 #[derive(Default)]
 struct Resources {
     planning: Option<OffloadPlanning>,
+    refused_input_carrier:
+        Option<std::sync::Arc<solstone_core_journal_io::media::RootActivityCarrier>>,
     observed: Option<ObservedOffloadOffers>,
     copies: Vec<Vec<PreparedMedia>>,
     partial: Option<PartialCopy>,
@@ -188,44 +200,48 @@ impl<'clock> OffloadCreation<'clock> {
     }
 
     pub fn ledger_writes(&self) -> impl Iterator<Item = OffloadLedgerWrite<'_>> {
-        self.resources.ledger.iter().map(|result| match result {
-            Ok(receipt) => OffloadLedgerWrite::Recorded {
-                effect: match receipt.effect() {
-                    LedgerWriteEffect::AlreadyRecorded => OffloadLedgerEffect::AlreadyRecorded,
-                    LedgerWriteEffect::Appended { bytes } => {
-                        OffloadLedgerEffect::Appended { bytes }
-                    }
-                    LedgerWriteEffect::Attempted { written } => {
-                        OffloadLedgerEffect::Attempted { written }
-                    }
-                },
-                durability: receipt.durability().map(|sync| match sync {
-                    LedgerSync::Confirmed => OffloadLedgerSync::Confirmed,
-                    LedgerSync::Uncertain => OffloadLedgerSync::Uncertain,
-                }),
-                confirmation: match receipt.confirmation() {
-                    LedgerConfirmation::Confirmed => OffloadLedgerSync::Confirmed,
-                    LedgerConfirmation::Uncertain => OffloadLedgerSync::Uncertain,
-                },
-                failures: receipt.failures(),
-            },
-            Err(refusal) => {
-                let (reason, detail) = match refusal {
-                    LedgerWriteRefusal::InvalidInput => ("invalid_input", None),
-                    LedgerWriteRefusal::RootMismatch => ("root_mismatch", None),
-                    LedgerWriteRefusal::Busy => ("busy", None),
-                    LedgerWriteRefusal::HistoryUnavailable(detail) => {
-                        ("history_unavailable", Some(detail.as_str()))
-                    }
-                    LedgerWriteRefusal::Collision => ("collision", None),
-                    LedgerWriteRefusal::Changed => ("changed", None),
-                    LedgerWriteRefusal::Io(detail) => ("io", Some(detail.as_str())),
-                    LedgerWriteRefusal::Unsupported => ("unsupported", None),
-                };
-                OffloadLedgerWrite::Refused { reason, detail }
-            }
-        })
+        ledger_writes(&self.resources.ledger)
     }
+}
+
+fn ledger_writes(
+    results: &[Result<LedgerWriteReceipt, LedgerWriteRefusal>],
+) -> impl Iterator<Item = OffloadLedgerWrite<'_>> {
+    results.iter().map(|result| match result {
+        Ok(receipt) => OffloadLedgerWrite::Recorded {
+            effect: match receipt.effect() {
+                LedgerWriteEffect::AlreadyRecorded => OffloadLedgerEffect::AlreadyRecorded,
+                LedgerWriteEffect::Appended { bytes } => OffloadLedgerEffect::Appended { bytes },
+                LedgerWriteEffect::Attempted { written } => {
+                    OffloadLedgerEffect::Attempted { written }
+                }
+            },
+            durability: receipt.durability().map(|sync| match sync {
+                LedgerSync::Confirmed => OffloadLedgerSync::Confirmed,
+                LedgerSync::Uncertain => OffloadLedgerSync::Uncertain,
+            }),
+            confirmation: match receipt.confirmation() {
+                LedgerConfirmation::Confirmed => OffloadLedgerSync::Confirmed,
+                LedgerConfirmation::Uncertain => OffloadLedgerSync::Uncertain,
+            },
+            failures: receipt.failures(),
+        },
+        Err(refusal) => {
+            let (reason, detail) = match refusal {
+                LedgerWriteRefusal::InvalidInput => ("invalid_input", None),
+                LedgerWriteRefusal::RootMismatch => ("root_mismatch", None),
+                LedgerWriteRefusal::Busy => ("busy", None),
+                LedgerWriteRefusal::HistoryUnavailable(detail) => {
+                    ("history_unavailable", Some(detail.as_str()))
+                }
+                LedgerWriteRefusal::Collision => ("collision", None),
+                LedgerWriteRefusal::Changed => ("changed", None),
+                LedgerWriteRefusal::Io(detail) => ("io", Some(detail.as_str())),
+                LedgerWriteRefusal::Unsupported => ("unsupported", None),
+            };
+            OffloadLedgerWrite::Refused { reason, detail }
+        }
+    })
 }
 
 /// Create offers under one original admission. Production invocation still
@@ -282,7 +298,7 @@ mod unix {
     use super::*;
     use crate::ledger::writer::{append_archive_witness, confirm_archive_witness};
 
-    struct WitnessWrite {
+    pub(super) struct WitnessWrite {
         proof: OffloadProof,
         reused: bool,
     }
@@ -303,7 +319,7 @@ mod unix {
         OffloadCreationRefusal::Inputs(error)
     }
 
-    fn record_publication(
+    pub(super) fn record_publication(
         resources: &mut Resources,
         publication: &Result<BoundMutationOutcome, OffloadOfferRefusal>,
     ) {
@@ -766,17 +782,72 @@ mod unix {
         continue_creation(admitted, resources, catalog, today, now)
     }
 
-    pub(super) fn continue_creation<'clock>(
-        mut admitted: AdmittedArchive<'clock>,
-        mut resources: Resources,
-        catalog: JournalCatalog,
-        today: NaiveDate,
-        now: DateTime<Utc>,
-    ) -> OffloadCreation<'clock> {
+    pub(super) enum ArchiveBorrow<'borrow, 'clock> {
+        Generic(&'borrow mut AdmittedArchive<'clock>),
+        Owned(&'borrow mut solstone_core_backup_runtime::OwnedAdmittedArchive),
+    }
+    impl ArchiveBorrow<'_, '_> {
+        fn journal_root(&self) -> &Arc<JournalRoot> {
+            match self {
+                Self::Generic(archive) => archive.journal_root(),
+                Self::Owned(archive) => archive.journal_root(),
+            }
+        }
+        fn repository_id(&self) -> &str {
+            match self {
+                Self::Generic(archive) => archive.repository_id(),
+                Self::Owned(archive) => archive.repository_id(),
+            }
+        }
+        fn archive_owned(
+            &mut self,
+            sources: &[solstone_core_journal_io::media::ArchiveSource<'_>],
+        ) -> Result<ArchiveSnapshot, ArchiveFailure> {
+            match self {
+                Self::Generic(archive) => archive.archive_owned(sources),
+                Self::Owned(archive) => archive.archive_owned(sources),
+            }
+        }
+    }
+    pub(super) enum ReadBorrow<'borrow, 'clock> {
+        Generic(&'borrow mut ReadOperation<'clock>),
+        Owned(&'borrow mut solstone_core_backup::archive_readback::OwnedReadOperation),
+    }
+    impl ReadBorrow<'_, '_> {
+        fn journal_root(&self) -> &Arc<JournalRoot> {
+            match self {
+                Self::Generic(read) => read.journal_root(),
+                Self::Owned(read) => read.journal_root(),
+            }
+        }
+        fn discover_owned_snapshot(
+            &mut self,
+            snapshot: &str,
+            source: &solstone_core_journal_io::media::ArchiveSource<'_>,
+        ) -> Result<solstone_core_backup::archive_readback::ExactArchiveFile, ReadbackError>
+        {
+            match self {
+                Self::Generic(read) => read.discover_owned_snapshot(snapshot, source),
+                Self::Owned(read) => read.discover_owned_snapshot(snapshot, source),
+            }
+        }
+    }
+    pub(super) struct ArchivePlan {
+        proofs: Vec<Option<OffloadProof>>,
+        writes: Vec<Option<WitnessWrite>>,
+        snapshots: Vec<Option<ArchiveSnapshot>>,
+        used: BTreeSet<String>,
+    }
+
+    pub(super) fn archive_groups(
+        mut admitted: ArchiveBorrow<'_, '_>,
+        resources: &mut Resources,
+        catalog: &JournalCatalog,
+    ) -> Result<ArchivePlan, OffloadCreationRefusal> {
         let mut proofs = Vec::new();
         let mut writes = Vec::new();
         let mut snapshots = Vec::new();
-        let mut used: BTreeSet<String> = catalog
+        let used: BTreeSet<String> = catalog
             .days
             .iter()
             .flat_map(|day| &day.segments)
@@ -795,7 +866,7 @@ mod unix {
             .enumerate()
         {
             match reusable(
-                &catalog,
+                catalog,
                 group,
                 admitted.journal_root(),
                 admitted.repository_id(),
@@ -831,13 +902,152 @@ mod unix {
                             proofs.push(None);
                         }
                         Err(reason) => {
-                            return fail(Owner::Admitted(Box::new(admitted)), resources, reason);
+                            return Err(reason);
                         }
                     }
                 }
-                Err(reason) => return fail(Owner::Admitted(Box::new(admitted)), resources, reason),
+                Err(reason) => return Err(reason),
             }
         }
+        Ok(ArchivePlan {
+            proofs,
+            writes,
+            snapshots,
+            used,
+        })
+    }
+
+    pub(super) fn discover_proofs(
+        mut read: ReadBorrow<'_, '_>,
+        resources: &mut Resources,
+        plan: ArchivePlan,
+    ) -> Result<(Vec<OffloadProof>, Vec<WitnessWrite>), OffloadCreationRefusal> {
+        let ArchivePlan {
+            mut proofs,
+            mut writes,
+            snapshots,
+            mut used,
+        } = plan;
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+            let group = &resources
+                .observed
+                .as_ref()
+                .expect("captured inputs")
+                .groups()[index];
+            let mut files = Vec::new();
+            for (file, copy) in group.files().iter().zip(&mut resources.copies[index]) {
+                let source = copy
+                    .archive_source()
+                    .map_err(|error| inputs(error.into()))?;
+                let exact = read
+                    .discover_owned_snapshot(&snapshot.snapshot_id, &source)
+                    .map_err(OffloadCreationRefusal::Readback)?;
+                files.push(ArchiveFileProof {
+                    witness_id: identifier(&mut used)?,
+                    name: file.name().into(),
+                    bytes: file.observation().digest.size,
+                    sha256: file.observation().digest.sha256.clone(),
+                    archive_path: exact.archive_path,
+                    processing: file.processing().clone(),
+                });
+            }
+            let proof = OffloadProof {
+                journal_id: read.journal_root().identity().observation_id(),
+                manifest_id: identifier(&mut used)?,
+                target: group.selection().target.clone(),
+                layout: group.selection().layout,
+                repository_id: snapshot.repository_id.clone(),
+                snapshot_id: snapshot.snapshot_id.clone(),
+                files,
+            };
+            proof
+                .validate()
+                .map_err(|error| inputs(OffloadOfferRefusal::Proof(error)))?;
+            writes[index] = Some(WitnessWrite {
+                proof: proof.clone(),
+                reused: false,
+            });
+            proofs[index] = Some(proof);
+        }
+        let writes = writes
+            .into_iter()
+            .map(|write| write.expect("discovered witness"))
+            .collect::<Vec<_>>();
+        let proofs = proofs
+            .into_iter()
+            .map(|proof| proof.expect("discovered proof"))
+            .collect::<Vec<_>>();
+        bounded_metadata(&proofs, &writes)?;
+        Ok((proofs, writes))
+    }
+
+    pub(super) fn register_metadata(
+        root: &Arc<JournalRoot>,
+        marks: &[solstone_core_retention::marks::Mark],
+    ) -> Result<(), OffloadCreationRefusal> {
+        let mut register =
+            load_at_root(root).map_err(|error| inputs(OffloadOfferRefusal::Review(error)))?;
+        register.version = 2;
+        for mark in marks {
+            register.marks.insert(mark.id.clone(), mark.clone());
+        }
+        if serde_json::to_vec_pretty(&register)
+            .map_err(|_| OffloadCreationRefusal::Metadata)?
+            .len()
+            > MAX_REGISTER_BYTES
+        {
+            return Err(OffloadCreationRefusal::Metadata);
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_witnesses(
+        root: &Arc<JournalRoot>,
+        resources: &mut Resources,
+        writes: Vec<WitnessWrite>,
+        now: DateTime<Utc>,
+    ) -> Result<(), OffloadCreationRefusal> {
+        let time = match u64::try_from(now.timestamp()) {
+            Ok(time) => time,
+            Err(_) => {
+                return Err(OffloadCreationRefusal::Metadata);
+            }
+        };
+        for write in writes {
+            let result = if write.reused {
+                confirm_archive_witness(root, &write.proof, time)
+            } else {
+                append_archive_witness(root, &write.proof, time)
+            };
+            let accepted = result
+                .as_ref()
+                .is_ok_and(|receipt| durable(receipt, write.reused));
+            resources.ledger.push(result);
+            if !accepted {
+                return Err(OffloadCreationRefusal::Ledger);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn continue_creation<'clock>(
+        mut admitted: AdmittedArchive<'clock>,
+        mut resources: Resources,
+        catalog: JournalCatalog,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> OffloadCreation<'clock> {
+        let plan = match archive_groups(
+            ArchiveBorrow::Generic(&mut admitted),
+            &mut resources,
+            &catalog,
+        ) {
+            Ok(plan) => plan,
+            Err(reason) => return fail(Owner::Admitted(Box::new(admitted)), resources, reason),
+        };
         let mut read = match admitted.into_read_operation() {
             Ok(read) => read,
             Err(failure) => {
@@ -849,66 +1059,11 @@ mod unix {
                 );
             }
         };
-        let discovery = (|| {
-            for (index, snapshot) in snapshots.iter().enumerate() {
-                let Some(snapshot) = snapshot else {
-                    continue;
-                };
-                let group = &resources
-                    .observed
-                    .as_ref()
-                    .expect("captured inputs")
-                    .groups()[index];
-                let mut files = Vec::new();
-                for (file, copy) in group.files().iter().zip(&mut resources.copies[index]) {
-                    let source = copy
-                        .archive_source()
-                        .map_err(|error| inputs(error.into()))?;
-                    let exact = read
-                        .discover_owned_snapshot(&snapshot.snapshot_id, &source)
-                        .map_err(OffloadCreationRefusal::Readback)?;
-                    files.push(ArchiveFileProof {
-                        witness_id: identifier(&mut used)?,
-                        name: file.name().into(),
-                        bytes: file.observation().digest.size,
-                        sha256: file.observation().digest.sha256.clone(),
-                        archive_path: exact.archive_path,
-                        processing: file.processing().clone(),
-                    });
-                }
-                let proof = OffloadProof {
-                    journal_id: read.journal_root().identity().observation_id(),
-                    manifest_id: identifier(&mut used)?,
-                    target: group.selection().target.clone(),
-                    layout: group.selection().layout,
-                    repository_id: snapshot.repository_id.clone(),
-                    snapshot_id: snapshot.snapshot_id.clone(),
-                    files,
-                };
-                proof
-                    .validate()
-                    .map_err(|error| inputs(OffloadOfferRefusal::Proof(error)))?;
-                writes[index] = Some(WitnessWrite {
-                    proof: proof.clone(),
-                    reused: false,
-                });
-                proofs[index] = Some(proof);
-            }
-            let writes = writes
-                .into_iter()
-                .map(|write| write.expect("discovered witness"))
-                .collect::<Vec<_>>();
-            let proofs = proofs
-                .into_iter()
-                .map(|proof| proof.expect("discovered proof"))
-                .collect::<Vec<_>>();
-            bounded_metadata(&proofs, &writes)?;
-            Ok((proofs, writes))
-        })();
-        let (proofs, writes) = match discovery {
-            Ok(discovered) => discovered,
-            Err(reason) => return fail(Owner::Read(Box::new(read)), resources, reason),
-        };
+        let (proofs, writes) =
+            match discover_proofs(ReadBorrow::Generic(&mut read), &mut resources, plan) {
+                Ok(discovered) => discovered,
+                Err(reason) => return fail(Owner::Read(Box::new(read)), resources, reason),
+            };
         let observed = resources.observed.take().expect("captured inputs");
         let verified = match verify_offload_offers(read, observed, proofs, today, now) {
             Ok(verified) => verified,
@@ -920,52 +1075,11 @@ mod unix {
                 );
             }
         };
-        let metadata = (|| {
-            let mut register = load_at_root(verified.journal_root())
-                .map_err(|error| inputs(OffloadOfferRefusal::Review(error)))?;
-            register.version = 2;
-            for mark in verified.marks() {
-                register.marks.insert(mark.id.clone(), mark.clone());
-            }
-            if serde_json::to_vec_pretty(&register)
-                .map_err(|_| OffloadCreationRefusal::Metadata)?
-                .len()
-                > MAX_REGISTER_BYTES
-            {
-                return Err(OffloadCreationRefusal::Metadata);
-            }
-            Ok(())
-        })();
-        if let Err(reason) = metadata {
+        if let Err(reason) = register_metadata(verified.journal_root(), verified.marks()) {
             return fail(Owner::Verified(Box::new(verified)), resources, reason);
         }
-        let time = match u64::try_from(now.timestamp()) {
-            Ok(time) => time,
-            Err(_) => {
-                return fail(
-                    Owner::Verified(Box::new(verified)),
-                    resources,
-                    OffloadCreationRefusal::Metadata,
-                );
-            }
-        };
-        for write in writes {
-            let result = if write.reused {
-                confirm_archive_witness(verified.journal_root(), &write.proof, time)
-            } else {
-                append_archive_witness(verified.journal_root(), &write.proof, time)
-            };
-            let accepted = result
-                .as_ref()
-                .is_ok_and(|receipt| durable(receipt, write.reused));
-            resources.ledger.push(result);
-            if !accepted {
-                return fail(
-                    Owner::Verified(Box::new(verified)),
-                    resources,
-                    OffloadCreationRefusal::Ledger,
-                );
-            }
+        if let Err(reason) = write_witnesses(verified.journal_root(), &mut resources, writes, now) {
+            return fail(Owner::Verified(Box::new(verified)), resources, reason);
         }
         let outcome = publish_offload_offers(verified, today, now);
         record_publication(&mut resources, outcome.publication());

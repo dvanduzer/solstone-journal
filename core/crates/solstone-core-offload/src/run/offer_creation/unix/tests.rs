@@ -195,6 +195,51 @@ fn absent_or_overflow_floor_stops_before_copy_or_admission() {
 }
 
 #[test]
+fn owned_input_refusal_keeps_original_prepared_before_admission() {
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    for floor in [Value::Null, json!(u64::MAX)] {
+        let (_temp, root, selection) = fixture(floor, SegmentLayout::Named, &["audio.flac"]);
+        let original = OwnedPreparedArchiveOperation::prepare(
+            Arc::clone(&root),
+            ArchiveBudget::new(&FixedClock).unwrap(),
+            Arc::new(FixedClock),
+        )
+        .unwrap_or_else(|failure| panic!("preparation: {:?}", failure.reason()));
+        let (today, now) = time();
+        let failure = prepare_owned_offload_inputs(&original, &[selection], today, now)
+            .err()
+            .expect("invalid floor refused before admission");
+        assert!(matches!(
+            failure.reason(),
+            OffloadCreationRefusal::Inputs(OffloadOfferRefusal::Admission(_))
+        ));
+        assert!(Arc::ptr_eq(failure.carrier(), original.carrier()));
+        assert_eq!(
+            failure.observed().unwrap().groups()[0].files()[0]
+                .observation()
+                .digest
+                .size,
+            7
+        );
+        let original = original.into_owned_hold();
+        assert!(Arc::ptr_eq(failure.carrier(), original.carrier()));
+        let coverage = solstone_core_journal_io::activity_obligations::observe_with_carrier(
+            &root,
+            original.carrier().observation(),
+        )
+        .unwrap();
+        assert!(coverage.unresolved_entries().next().is_none());
+        assert!(
+            !root
+                .canonical_path()
+                .join("health/retention-marks.json")
+                .exists()
+        );
+        assert!(read_complete_catalog(&root).unwrap().days.is_empty());
+    }
+}
+
+#[test]
 fn actual_capacity_reserves_n_plus_m_and_keeps_named_copies_on_admission_refusal() {
     for layout in [SegmentLayout::Direct, SegmentLayout::Named] {
         let (_temp, root, selection) = fixture(json!(7), layout, &["a.flac", "b.flac"]);

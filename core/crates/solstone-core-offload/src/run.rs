@@ -42,13 +42,22 @@ mod offer_creation;
 pub use offer_creation::{
     OffloadCreation, OffloadCreationNative, OffloadCreationOwner, OffloadCreationRefusal,
     OffloadLedgerEffect, OffloadLedgerSync, OffloadLedgerWrite, OffloadPlanning,
-    OffloadPlanningPhase, OffloadPlanningRefusal, create_offload_offers,
-    create_planned_offload_offers,
+    OffloadPlanningPhase, OffloadPlanningRefusal, OffloadSourceCleanup, OffloadSourceCopyReport,
+    OwnedOffloadCreation, OwnedOffloadCreationFinish, OwnedOffloadCreationFinishRefusal,
+    OwnedOffloadCreationHold, OwnedOffloadCreationOwner, OwnedOffloadInputFailure,
+    OwnedOffloadInputs, SettledOffloadCreation, SettledOffloadCreationReport,
+    create_offload_offers, create_owned_offload_offers, create_planned_offload_offers,
+    prepare_owned_offload_inputs,
 };
 
 #[cfg(all(test, unix, feature = "full-tests"))]
 pub(crate) fn with_payload_capacity_fault<T>(run: impl FnOnce() -> T) -> (T, bool) {
     offer_creation::with_payload_capacity_fault(run)
+}
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+pub(crate) fn with_source_cleanup_fault<T>(index: usize, run: impl FnOnce() -> T) -> (T, bool) {
+    offer_creation::with_source_cleanup_fault(index, run)
 }
 
 pub const OFFLOAD_STALL_BACKUP_NOT_READY: &str = "backup_not_ready";

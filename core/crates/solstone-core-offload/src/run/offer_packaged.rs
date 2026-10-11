@@ -1353,3 +1353,610 @@ mod caller_qualification {
         }
     }
 }
+
+// This appendix qualifies only the actual owning creation/finish entrance.
+// Historical package adaptation and synthetic S3 are explicit driver evidence.
+mod owned_creation_qualification {
+    use super::*;
+    use crate::run::{
+        OffloadCreationRefusal, OffloadLedgerEffect, OffloadLedgerSync, OffloadLedgerWrite,
+        OwnedOffloadCreationFinish, OwnedOffloadCreationFinishRefusal, OwnedOffloadCreationOwner,
+        create_owned_offload_offers, prepare_owned_offload_inputs, with_source_cleanup_fault,
+    };
+    use chrono::Datelike;
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    use solstone_core_backup_runtime::{
+        DirectReadFinishState, OwnedDirectReadFinish,
+        admit_prepared_archive_owned_creator_installed,
+    };
+    use solstone_core_journal_io::activity::{ActivityLease, TeardownLease};
+    use solstone_core_journal_io::activity_obligations::NativeObligation;
+    use solstone_core_journal_io::atomic::{
+        BoundPublicationPrimitive, run_with_bound_publication_fault,
+    };
+    use solstone_core_journal_io::media::{
+        MediaDirectory, MediaIdentity, MediaStage, PreparedMedia,
+    };
+    use solstone_core_retention::archive_offer::SettledOffloadOfferReport;
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum OwnedCase {
+        #[serde(rename = "owned_creation_complete")]
+        Complete,
+        #[serde(rename = "owned_creation_publication_uncertain")]
+        PublicationUncertain,
+        #[serde(rename = "owned_creation_second_source_cleanup_pending")]
+        SecondCleanup,
+        #[serde(rename = "owned_creation_distinct_final_obligation")]
+        Obligation,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OwnedInput {
+        case: OwnedCase,
+        journal: PathBuf,
+        repository_id: String,
+        expected_restic_path: PathBuf,
+        control: PathBuf,
+    }
+    struct ActualClock;
+    impl Clock for ActualClock {
+        fn now_unix(&self) -> i64 {
+            Utc::now().timestamp()
+        }
+        fn iso_week(&self) -> u8 {
+            Utc::now().iso_week().week() as u8
+        }
+    }
+    fn prepared_cut(control: &mut UnixStream) -> TestResult {
+        control.write_all(b"prepared")?;
+        control.write_all(&std::process::id().to_be_bytes())?;
+        let mut ack = [0];
+        control.read_exact(&mut ack)?;
+        assert_eq!(ack, [b'a']);
+        Ok(())
+    }
+    fn directory_fact(path: &Path) -> TestResult<Value> {
+        let m = fs::symlink_metadata(path)?;
+        assert!(m.is_dir() && !m.file_type().is_symlink());
+        Ok(json!({"device":m.dev(),"inode":m.ino()}))
+    }
+    fn identity_matches(identity: MediaIdentity, path: &Path) -> io::Result<bool> {
+        let m = fs::symlink_metadata(path)?;
+        Ok(identity
+            == MediaIdentity::Unix {
+                device: m.dev(),
+                inode: m.ino(),
+            })
+    }
+    fn copies<'a>(
+        journal: &Path,
+        owned: impl Iterator<Item = &'a PreparedMedia>,
+    ) -> TestResult<Vec<Value>> {
+        let mut facts = Vec::new();
+        for media in owned {
+            let mut matches = Vec::new();
+            for stage in stages(journal)? {
+                for leaf in fs::read_dir(&stage)? {
+                    let leaf = leaf?.path();
+                    if identity_matches(media.identity(), &leaf)? {
+                        matches.push((stage.clone(), leaf));
+                    }
+                }
+            }
+            assert_eq!(matches.len(), 1);
+            let (stage, leaf) = &matches[0];
+            let fact = file_fact(leaf)?;
+            assert_eq!(fact["bytes"], media.digest().size);
+            assert_eq!(fact["sha256"], media.digest().sha256);
+            facts.push(json!({"name":leaf.file_name().unwrap().to_string_lossy(),"identity":media.identity(),
+                "digest":media.digest(),"stage":stage,"stage_identity":directory_fact(stage)?,"path":leaf,"fact":fact}));
+        }
+        Ok(facts)
+    }
+    fn ledger_facts<'a>(writes: impl Iterator<Item = OffloadLedgerWrite<'a>>) -> Vec<Value> {
+        writes.map(|write| match write {
+            OffloadLedgerWrite::Recorded { effect, durability, confirmation, failures } => {
+                assert!(matches!(effect, OffloadLedgerEffect::Appended { bytes } if bytes>0));
+                assert_eq!(durability, [OffloadLedgerSync::Confirmed;4]);
+                assert_eq!(confirmation, OffloadLedgerSync::Confirmed);
+                assert!(failures.is_empty());
+                json!({"effect":format!("{effect:?}"),"durability":durability.map(|v|format!("{v:?}")),
+                    "confirmation":format!("{confirmation:?}"),"failures":failures})
+            }
+            OffloadLedgerWrite::Refused { reason, detail } => panic!("actual witness refused: {reason} {detail:?}"),
+        }).collect()
+    }
+    fn settled_facts(report: &SettledOffloadOfferReport) -> Value {
+        let reads = report.archive_reads().iter().map(|r| {
+            assert_eq!(r.cleanup(), Some(Cleanup::Complete));
+            assert_eq!(r.file().bytes, r.digest().size);
+            assert_eq!(r.file().sha256, r.digest().sha256);
+            json!({"name":r.file().name,"repository":r.file().repository_id,"snapshot":r.file().snapshot_id,
+                "path":r.file().archive_path,"identity":r.target_identity(),"digest":r.digest(),"cleanup":r.cleanup()})
+        }).collect::<Vec<_>>();
+        json!({"publication":format!("{:?}",report.publication()),"marks":report.marks(),"reads":reads})
+    }
+    fn completed_facts(
+        finish: &OwnedDirectReadFinish,
+        clock: &Arc<dyn Clock + Send + Sync>,
+    ) -> Value {
+        assert_eq!(finish.state(), DirectReadFinishState::Completed);
+        assert!(finish.reason().is_none());
+        assert!(Arc::ptr_eq(finish.owned_clock(), clock));
+        let retired = finish.retirement().expect("actual retirement");
+        assert!(retired.receipt.failures().is_empty());
+        json!({"state":format!("{:?}",finish.state()),"root":finish.journal_root().identity().observation_id(),
+            "carrier":retired.owned.diagnostic_path(),"effect":format!("{:?}",retired.receipt.effect()),
+            "root_durability":format!("{:?}",retired.receipt.root_durability()),
+            "confirmation":format!("{:?}",retired.receipt.confirmation()),"failures":retired.receipt.failures().iter().map(|error|
+                json!({"error":error.to_string(),"kind":format!("{:?}",error.kind()),"raw_os_error":error.raw_os_error()})).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    #[ignore = "requires exact copied package and owning creator/finish S3/process fixture"]
+    fn packaged_owned_creation_finish_entry() -> TestResult {
+        let input: OwnedInput = serde_json::from_slice(&fs::read(
+            std::env::var_os("OFFLOAD_OWNED_CREATION_PROBE_JSON")
+                .ok_or_else(|| invalid("explicit owned creation input required"))?,
+        )?)?;
+        let names = if input.case == OwnedCase::SecondCleanup {
+            vec![
+                "file1.flac".to_owned(),
+                "file2.flac".to_owned(),
+                "file3.flac".to_owned(),
+            ]
+        } else {
+            vec!["file1.flac".to_owned(), "file2.flac".to_owned()]
+        };
+        let root = Arc::new(JournalRoot::open(&input.journal)?);
+        assert!(stages(&input.journal)?.is_empty());
+        let register_path = input.journal.join("health/retention-marks.json");
+        let ledger_path = input.journal.join("health/offload/20261009.jsonl");
+        assert!(!register_path.try_exists()? && !ledger_path.try_exists()?);
+        let selection = OffloadOfferSelection {
+            target: Target {
+                day: "20261009".into(),
+                stream: "_default".into(),
+                dir: "120000_60_fixture".into(),
+            },
+            layout: SegmentLayout::Direct,
+            names,
+        };
+        let raw_dir = input.journal.join("chronicle/20261009/120000_60_fixture");
+        let raw = selection
+            .names
+            .iter()
+            .map(|name| file_fact(&raw_dir.join(name)))
+            .collect::<TestResult<Vec<_>>>()?;
+        let headers = selection
+            .names
+            .iter()
+            .map(|name| fs::read(raw_dir.join(name).with_extension("jsonl")))
+            .collect::<io::Result<Vec<_>>>()?;
+        let config = fs::read(input.journal.join("config/journal.json"))?;
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(ActualClock);
+        let cancellation = ArchiveCancellation::new();
+        let budget = ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone())?;
+        let original = match OwnedPreparedArchiveOperation::prepare(
+            Arc::clone(&root),
+            budget,
+            Arc::clone(&clock),
+        ) {
+            Ok(original) => original,
+            Err(failure) => {
+                let reason = format!("{:?}", failure.reason());
+                std::hint::black_box(&failure);
+                panic!("original preparation refused: {reason}")
+            }
+        };
+        let carrier = Arc::clone(original.carrier());
+        let original_carrier = carrier.diagnostic_path();
+        let original_carrier_identity = directory_fact(&original_carrier)?;
+        let mut control = UnixStream::connect(&input.control)?;
+        prepared_cut(&mut control)?;
+        let today = NaiveDate::from_ymd_opt(2026, 10, 10).unwrap();
+        let now = Utc::now();
+        let inputs = match prepare_owned_offload_inputs(
+            &original,
+            std::slice::from_ref(&selection),
+            today,
+            now,
+        ) {
+            Ok(inputs) => inputs,
+            Err(failure) => {
+                let closed = original.into_owned_hold();
+                assert!(Arc::ptr_eq(closed.carrier(), failure.carrier()));
+                let reason = format!("{:?}", failure.reason());
+                std::hint::black_box(&(closed, failure));
+                panic!("pre-WAN capture refused before admission: {reason}")
+            }
+        };
+        assert!(Arc::ptr_eq(inputs.carrier(), &carrier));
+        assert_eq!(inputs.observed().groups().len(), 1);
+        assert_eq!(
+            inputs.observed().groups()[0].files().len(),
+            selection.names.len()
+        );
+        assert!(inputs.observed().groups()[0].expected_mark().is_none());
+        cut(&mut control, b"captured")?;
+        let installed = match admit_prepared_archive_owned_creator_installed(
+            original,
+            &input.expected_restic_path,
+        ) {
+            Ok(installed) => installed,
+            Err(failure) => {
+                let reason = format!("{:?}", failure.error());
+                std::hint::black_box(&failure);
+                panic!("actual creator admission refused: {reason}")
+            }
+        };
+        let (admitted, outside) = installed.into_parts();
+        assert!(Arc::ptr_eq(admitted.carrier(), &carrier));
+        assert!(Arc::ptr_eq(outside.carrier(), &carrier));
+        assert!(Arc::ptr_eq(outside.owned_clock(), &clock));
+        assert_eq!(admitted.repository_id(), input.repository_id);
+        cut(&mut control, b"admitted")?;
+        let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if input.case == OwnedCase::PublicationUncertain {
+                run_with_bound_publication_fault(
+                    BoundPublicationPrimitive::ParentSync,
+                    1,
+                    13,
+                    || create_owned_offload_offers(admitted, inputs, today, now),
+                )
+            } else {
+                (
+                    create_owned_offload_offers(admitted, inputs, today, now),
+                    false,
+                )
+            }
+        }));
+        let (creation, publication_fault) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                let unknown = outside.into_unknown();
+                assert_eq!(unknown.state(), DirectReadFinishState::Unknown);
+                std::hint::black_box(&unknown);
+                std::panic::resume_unwind(error)
+            }
+        };
+        assert_eq!(
+            publication_fault,
+            input.case == OwnedCase::PublicationUncertain
+        );
+        assert!(Arc::ptr_eq(creation.carrier(), &carrier));
+        assert!(creation.partial_copy().is_none());
+        let OwnedOffloadCreationOwner::Published(outcome) = creation.owner() else {
+            panic!("actual creation not Published: {:?}", creation.reason())
+        };
+        let verified = outcome.verified();
+        let marks = verified.marks().to_vec();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].proposal.names, selection.names);
+        assert_eq!(
+            marks[0].proposal.bytes,
+            2097162 * selection.names.len() as u64
+        );
+        let proof = &marks[0].offload.as_ref().expect("actual bound offer").proof;
+        assert_eq!(proof.repository_id, input.repository_id);
+        assert_eq!(proof.snapshot_id.len(), 64);
+        assert_eq!(proof.files.len(), selection.names.len());
+        let catalog = read_complete_catalog(&root).map_err(invalid)?;
+        for (index, file) in proof.files.iter().enumerate() {
+            assert!(catalog.active_witness(proof, file).is_some());
+            assert_eq!(file.name, selection.names[index]);
+            assert_eq!(file.bytes, raw[index]["bytes"]);
+            assert_eq!(file.sha256, raw[index]["sha256"]);
+        }
+        let reads=verified.archive_reads().map(|read| {
+            let ArchiveReadState::Prepared { file,target_identity,media,cleanup }=read else { panic!("missing original prepared read") };
+            assert_eq!(cleanup,Some(Cleanup::Complete)); assert_eq!(*target_identity,media.identity());
+            json!({"name":file.name,"repository":file.repository_id,"snapshot":file.snapshot_id,"path":file.archive_path,
+                "identity":target_identity,"digest":media.digest(),"cleanup":cleanup})
+        }).collect::<Vec<_>>();
+        assert_eq!(reads.len(), selection.names.len());
+        let ledger = ledger_facts(creation.ledger_writes());
+        assert_eq!(ledger.len(), 1);
+        let archives = creation
+            .archives()
+            .iter()
+            .map(|result| match result {
+                Ok(snapshot) => {
+                    json!({"repository":snapshot.repository_id,"snapshot":snapshot.snapshot_id})
+                }
+                Err(failure) => panic!("actual archive failed: {failure:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        let source_copies = copies(&input.journal, creation.source_copies())?;
+        assert_eq!(source_copies.len(), selection.names.len());
+        let publication = if input.case == OwnedCase::PublicationUncertain {
+            assert!(matches!(
+                creation.reason(),
+                Some(OffloadCreationRefusal::Publication)
+            ));
+            let Ok(BoundMutationOutcome::PublishedUncertain {
+                candidate,
+                uncertainty,
+            }) = outcome.publication()
+            else {
+                panic!("actual uncertainty absent")
+            };
+            assert_eq!(candidate.status, MutationStatus::Applied);
+            assert_eq!(
+                uncertainty
+                    .durability
+                    .as_ref()
+                    .and_then(io::Error::raw_os_error),
+                Some(13)
+            );
+            json!({"kind":"published_uncertain","candidate":candidate.register,"durability_os":13,"actual":format!("{uncertainty:?}")})
+        } else {
+            assert!(creation.reason().is_none());
+            let Ok(BoundMutationOutcome::Published(result)) = outcome.publication() else {
+                panic!("actual confirmed publication absent")
+            };
+            assert_eq!(result.status, MutationStatus::Applied);
+            json!({"kind":"published_applied","register":result.register})
+        };
+        let register_before_finish = fs::read(&register_path)?;
+        let ledger_before_finish = fs::read(&ledger_path)?;
+        cut(&mut control, b"created_")?;
+        let mut foreign_stage = None;
+        let mut foreign_fact = None;
+        if input.case == OwnedCase::Obligation {
+            let parent = MediaDirectory::open(Arc::clone(&root), Path::new(""))?;
+            let stage = match MediaStage::create(parent, Arc::clone(carrier.activity())) {
+                Ok(stage) => stage,
+                Err(failure) => {
+                    std::hint::black_box(&failure);
+                    panic!("actual different stage failed")
+                }
+            };
+            foreign_fact = Some(
+                json!({"path":stage.diagnostic_path(),"identity":directory_fact(&stage.diagnostic_path())?}),
+            );
+            foreign_stage = Some(stage);
+        }
+        let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if input.case == OwnedCase::SecondCleanup {
+                with_source_cleanup_fault(1, || creation.finish())
+            } else {
+                (creation.finish(), false)
+            }
+        }));
+        let (finished, cleanup_fault) = match finished {
+            Ok(result) => result,
+            Err(error) => {
+                let unknown = outside.into_unknown();
+                assert_eq!(unknown.state(), DirectReadFinishState::Unknown);
+                std::hint::black_box(&unknown);
+                std::panic::resume_unwind(error)
+            }
+        };
+        assert_eq!(cleanup_fault, input.case == OwnedCase::SecondCleanup);
+        let mut next = None;
+        let mut completion = None;
+        let mut held_custody = None;
+        let finish_facts = match finished {
+            OwnedOffloadCreationFinish::Settled(settled) => {
+                assert_eq!(input.case, OwnedCase::Complete);
+                let (read, report) = settled.into_parts();
+                assert!(Arc::ptr_eq(read.carrier(), &carrier));
+                assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+                assert_eq!(report.source_copies().len(), selection.names.len());
+                for (actual, before) in report.source_copies().iter().zip(&source_copies) {
+                    assert_eq!(actual.cleanup, Cleanup::Complete);
+                    assert_eq!(serde_json::to_value(actual.identity)?, before["identity"]);
+                    assert_eq!(serde_json::to_value(&actual.digest)?, before["digest"]);
+                    assert!(!Path::new(before["stage"].as_str().unwrap()).try_exists()?);
+                }
+                let facts = json!({"kind":"settled","report":settled_facts(report.offers()),
+                    "source_cleanups":report.source_copies().iter().enumerate().map(|(i,r)|json!({"index":i,"cleanup":r.cleanup,"identity":r.identity,"digest":r.digest})).collect::<Vec<_>>(),
+                    "ledger":ledger_facts(report.ledger_writes())});
+                check_carrier(&carrier)?;
+                cut(&mut control, b"finished")?;
+                drop(carrier);
+                let result = outside.finish_owned(read);
+                completion = Some(completed_facts(&result, &clock));
+                assert!(stages(&input.journal)?.is_empty());
+                drop(result); // Already explicitly retired; closes its activity handle.
+                cut(&mut control, b"retired_")?;
+                let budget =
+                    ArchiveBudget::new_cancellable(clock.as_ref(), ArchiveCancellation::new())?;
+                let original = match OwnedPreparedArchiveOperation::prepare(
+                    Arc::clone(&root),
+                    budget,
+                    Arc::clone(&clock),
+                ) {
+                    Ok(original) => original,
+                    Err(failure) => {
+                        std::hint::black_box(&failure);
+                        panic!("next actual original refused")
+                    }
+                };
+                let installed = match admit_prepared_archive_owned_creator_installed(
+                    original,
+                    &input.expected_restic_path,
+                ) {
+                    Ok(installed) => installed,
+                    Err(failure) => {
+                        std::hint::black_box(&failure);
+                        panic!("next actual installed admission refused")
+                    }
+                };
+                let (admitted, outside) = installed.into_parts();
+                let read = match admitted.into_read_operation() {
+                    Ok(read) => read,
+                    Err(failure) => {
+                        std::hint::black_box(&failure);
+                        panic!("next no-writer handoff refused")
+                    }
+                };
+                let settled = match read.settle_direct() {
+                    Ok(read) => read,
+                    Err(failure) => {
+                        std::hint::black_box(&failure);
+                        panic!("next actual no-writer settlement refused")
+                    }
+                };
+                let completed = outside.finish_owned(settled);
+                next = Some(completed_facts(&completed, &clock));
+                drop(completed); // Completed facts are retained; no reservation cleanup here.
+                let teardown = TeardownLease::try_acquire(Arc::clone(&root))?;
+                teardown.revalidate()?;
+                drop(teardown);
+                assert!(stages(&input.journal)?.is_empty());
+                cut(&mut control, b"nextdone")?;
+                std::hint::black_box(&report); // Resource-free actual report stays alive.
+                facts
+            }
+            OwnedOffloadCreationFinish::Held(held) => {
+                assert_ne!(input.case, OwnedCase::Complete);
+                assert!(Arc::ptr_eq(held.carrier(), &carrier));
+                assert_eq!(held.source_copies().count(), selection.names.len());
+                for (actual, before) in held.source_copies().zip(&source_copies) {
+                    assert_eq!(serde_json::to_value(actual.identity())?, before["identity"]);
+                    assert_eq!(serde_json::to_value(actual.digest())?, before["digest"]);
+                }
+                let cleanups = held
+                    .source_cleanups()
+                    .iter()
+                    .map(|r| json!({"index":r.index,"cleanup":r.cleanup}))
+                    .collect::<Vec<_>>();
+                match input.case {
+                    OwnedCase::PublicationUncertain => {
+                        assert!(matches!(
+                            held.finish_refusal(),
+                            Some(OwnedOffloadCreationFinishRefusal::IncompleteCreation)
+                        ));
+                        assert!(matches!(
+                            held.reason(),
+                            Some(OffloadCreationRefusal::Publication)
+                        ));
+                        assert!(held.source_cleanups().is_empty());
+                        let offers = held.offers().expect("actual whole offer hold");
+                        let Some(Ok(BoundMutationOutcome::PublishedUncertain {
+                            uncertainty, ..
+                        })) = offers.publication()
+                        else {
+                            panic!("actual uncertain candidate lost")
+                        };
+                        assert_eq!(
+                            uncertainty
+                                .durability
+                                .as_ref()
+                                .and_then(io::Error::raw_os_error),
+                            Some(13)
+                        );
+                        assert_eq!(copies(&input.journal, held.source_copies())?, source_copies);
+                    }
+                    OwnedCase::SecondCleanup => {
+                        assert!(matches!(
+                            held.finish_refusal(),
+                            Some(OwnedOffloadCreationFinishRefusal::Cleanup(Cleanup::Pending))
+                        ));
+                        assert!(held.read().is_some() && held.settled_offers().is_some());
+                        assert_eq!(
+                            held.source_cleanups()
+                                .iter()
+                                .map(|r| (r.index, r.cleanup))
+                                .collect::<Vec<_>>(),
+                            vec![(0, Cleanup::Complete), (1, Cleanup::Pending)]
+                        );
+                        assert!(
+                            !Path::new(source_copies[0]["stage"].as_str().unwrap()).try_exists()?
+                        );
+                        assert!(
+                            !Path::new(source_copies[1]["path"].as_str().unwrap()).try_exists()?
+                        );
+                        let second = Path::new(source_copies[1]["stage"].as_str().unwrap());
+                        assert_eq!(directory_fact(second)?, source_copies[1]["stage_identity"]);
+                        assert_eq!(fs::read_dir(second)?.count(), 0);
+                        let third = Path::new(source_copies[2]["path"].as_str().unwrap());
+                        assert_eq!(file_fact(third)?, source_copies[2]["fact"]);
+                        assert_eq!(
+                            directory_fact(third.parent().unwrap())?,
+                            source_copies[2]["stage_identity"]
+                        );
+                    }
+                    OwnedCase::Obligation => {
+                        assert!(held.read().is_some() && held.settled_offers().is_some());
+                        assert_eq!(
+                            held.source_cleanups()
+                                .iter()
+                                .map(|r| r.cleanup)
+                                .collect::<Vec<_>>(),
+                            vec![Cleanup::Complete; 2]
+                        );
+                        for copy in &source_copies {
+                            assert!(!Path::new(copy["stage"].as_str().unwrap()).try_exists()?);
+                        }
+                        let stage = foreign_stage.as_ref().expect("actual distinct stage");
+                        let Some(OwnedOffloadCreationFinishRefusal::Obligations(obligations)) =
+                            held.finish_refusal()
+                        else {
+                            panic!("final actual census gate absent")
+                        };
+                        let relative = stage
+                            .diagnostic_path()
+                            .strip_prefix(&input.journal)?
+                            .to_path_buf();
+                        assert!(obligations.iter().any(
+                            |v| matches!(v,NativeObligation::Stage{relative:r,..} if r==&relative)
+                        ));
+                        assert_eq!(
+                            directory_fact(&stage.diagnostic_path())?,
+                            foreign_fact.as_ref().unwrap()["identity"]
+                        );
+                    }
+                    OwnedCase::Complete => unreachable!(),
+                }
+                assert_eq!(
+                    directory_fact(&original_carrier)?,
+                    original_carrier_identity
+                );
+                assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_err());
+                assert!(TeardownLease::try_acquire(Arc::clone(&root)).is_err());
+                let facts = json!({"kind":"held","refusal":format!("{:?}",held.finish_refusal()),"reason":format!("{:?}",held.reason()),
+                    "source_cleanups":cleanups,"settled_report":held.settled_offers().map(settled_facts),"whole_offers":held.offers().map(|o|format!("{:?}",o.publication()))});
+                cut(&mut control, b"finished")?;
+                let (held, outside, stage) =
+                    std::thread::spawn(move || (held, outside, foreign_stage))
+                        .join()
+                        .expect("actual closed custody thread joined");
+                assert!(Arc::ptr_eq(held.carrier(), &carrier));
+                assert!(Arc::ptr_eq(outside.carrier(), &carrier));
+                assert!(Arc::ptr_eq(outside.owned_clock(), &clock));
+                held_custody = Some((held, outside, stage));
+                facts
+            }
+        };
+        for (index, name) in selection.names.iter().enumerate() {
+            assert_eq!(file_fact(&raw_dir.join(name))?, raw[index]);
+            assert_eq!(
+                fs::read(raw_dir.join(name).with_extension("jsonl"))?,
+                headers[index]
+            );
+        }
+        assert_eq!(fs::read(input.journal.join("config/journal.json"))?, config);
+        assert_eq!(fs::read(&register_path)?, register_before_finish);
+        assert_eq!(fs::read(&ledger_path)?, ledger_before_finish);
+        cut(&mut control, b"returned")?;
+        println!(
+            "OWNED_CREATION_PROBE_JSON={}",
+            serde_json::to_string(&json!({"case":input.case,"harness_pid":std::process::id(),
+            "carrier":original_carrier,"carrier_identity":original_carrier_identity,"original_clock":true,"raw":raw,"marks":marks,
+            "archives":archives,"ledger":ledger,"reads":reads,"source_copies":source_copies,"publication":publication,
+            "publication_fault":publication_fault,"cleanup_fault":cleanup_fault,"finish":finish_facts,"completion":completion,"next":next,
+            "foreign":foreign_fact,"closed_thread_joined":held_custody.is_some(),"stages":stages(&input.journal)?,
+            "limits":"exact historical-package-adapted synthetic local Linux owned creator/finish only; no activation/provider/route/recovery claim"}))?
+        );
+        std::hint::black_box(&held_custody);
+        std::hint::black_box(&cancellation);
+        Ok(())
+    }
+}
