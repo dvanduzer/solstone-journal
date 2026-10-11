@@ -314,6 +314,226 @@ impl JournalMaintenance for Maintenance {
     }
 }
 
+#[test]
+#[ignore = "requires an admitted copied package and synthetic direct S3 fixture"]
+fn packaged_owned_archive_entry() {
+    use solstone_core_backup::archive_admission::{
+        AdmissionError, ArchiveBudget, ArchiveCancellation,
+    };
+    use solstone_core_backup::archive_readback::ReadbackError;
+    use solstone_core_backup_runtime::admit_archive_with_budget;
+    use solstone_core_journal_io::{
+        JournalRoot,
+        media::{Cleanup, MediaDirectory, MediaStage, digest_reader},
+    };
+    use std::sync::Arc;
+
+    struct ProbeClock(Cell<i64>);
+    impl Clock for ProbeClock {
+        fn now_unix(&self) -> i64 {
+            self.0.get()
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    let input_path =
+        std::env::var_os("OWNED_ARCHIVE_PROBE_JSON").expect("explicit fixture required");
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let member =
+        solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
+            .unwrap();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let clock = ProbeClock(Cell::new(started));
+    let cancellation = ArchiveCancellation::new();
+    let http = RecordingHttp {
+        urls: RefCell::new(Vec::new()),
+    };
+    let services = BackupServices {
+        runner: &SystemToolRunner,
+        http: &http,
+        clock: &clock,
+        restic_path: Some(member.path()),
+        rclone_path: None,
+        version: "2.0.40",
+        journal_maintenance: &Maintenance,
+    };
+    let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+    let mut archive = admit_archive_with_budget(root.clone(), &services, budget).unwrap();
+    assert_eq!(
+        archive.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
+    let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
+    let fresh = || {
+        MediaStage::create(parent.clone())
+            .unwrap()
+            .create_target()
+            .unwrap()
+    };
+    let original_files = input["files"].as_array().unwrap();
+    let copy = |index: usize| {
+        let file = &original_files[index];
+        let name = std::ffi::OsStr::new(file["name"].as_str().unwrap());
+        let bytes = fs::read(root.canonical_path().join("media").join(name)).unwrap();
+        let digest = digest_reader(&mut bytes.as_slice()).unwrap();
+        assert_eq!(digest.sha256, file["sha256"].as_str().unwrap());
+        assert_eq!(digest.size, file["bytes"].as_u64().unwrap());
+        MediaStage::create(parent.clone())
+            .unwrap()
+            .create_named_target(name)
+            .unwrap()
+            .copy_from(&parent, name, &digest)
+            .unwrap()
+    };
+    assert_eq!(original_files.len(), 2);
+    let mut prepared_sources = vec![copy(0), copy(1)];
+    let mut duplicate_one = copy(0);
+    let mut duplicate_two = copy(0);
+    let mut wrong_content = {
+        let name = std::ffi::OsStr::new(original_files[0]["name"].as_str().unwrap());
+        let path = root.canonical_path().join("media").join(name);
+        let original = fs::read(&path).unwrap();
+        let mut wrong = original.clone();
+        wrong[0] ^= 1;
+        fs::write(&path, &wrong).unwrap();
+        let digest = digest_reader(&mut wrong.as_slice()).unwrap();
+        let prepared = MediaStage::create(parent.clone())
+            .unwrap()
+            .create_named_target(name)
+            .unwrap()
+            .copy_from(&parent, name, &digest)
+            .unwrap();
+        fs::write(&path, original).unwrap();
+        prepared
+    };
+    let sources = prepared_sources
+        .iter_mut()
+        .map(|p| p.archive_source().unwrap())
+        .collect::<Vec<_>>();
+    let duplicates = [
+        duplicate_one.archive_source().unwrap(),
+        duplicate_two.archive_source().unwrap(),
+    ];
+    let wrong_source = wrong_content.archive_source().unwrap();
+    let initial_fd_flags = sources
+        .iter()
+        .map(|source| {
+            source
+                .descriptor()
+                .map(|fd| nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap())
+        })
+        .collect::<Vec<_>>();
+    for flags in initial_fd_flags.iter().flatten() {
+        assert_ne!(flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
+    }
+    let snapshot = archive.archive_owned(&sources).unwrap();
+    let duplicate_snapshot = archive.archive_owned(&duplicates).unwrap();
+    let mut reader = archive.into_read_operation().unwrap();
+    let mut results = Vec::new();
+    for source in &sources {
+        let (exact, mut prepared) = reader
+            .read_owned_snapshot(&snapshot.snapshot_id, source, fresh())
+            .unwrap();
+        assert_eq!(prepared.digest(), source.digest());
+        assert_eq!(exact.name, source.name().to_str().unwrap());
+        assert_eq!(exact.sha256, source.digest().sha256);
+        assert_eq!(prepared.cleanup(), Cleanup::Complete);
+        results.push(
+            serde_json::json!({"name":exact.name, "archive_path":exact.archive_path,
+            "bytes":exact.bytes, "sha256":exact.sha256}),
+        );
+    }
+    let mut duplicate = reader
+        .read_owned_snapshot(&duplicate_snapshot.snapshot_id, &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(duplicate.reason(), ReadbackError::SnapshotNodeUnavailable);
+    assert_eq!(duplicate.cleanup(), Cleanup::Complete);
+    let mut wrong = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &wrong_source, fresh())
+        .err()
+        .unwrap();
+    assert_eq!(wrong.reason(), ReadbackError::NativeFailure);
+    assert_eq!(wrong.cleanup(), Cleanup::Complete);
+    let mut issued_target = fresh();
+    drop(issued_target.helper_transport().unwrap());
+    let mut issued = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &sources[0], issued_target)
+        .err()
+        .unwrap();
+    assert_eq!(issued.reason(), ReadbackError::NativeFailure);
+    assert_eq!(issued.cleanup(), Cleanup::Refused);
+    let mut invalid = reader
+        .read_owned_snapshot("latest", &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(invalid.reason(), ReadbackError::InvalidSelection);
+    assert_eq!(invalid.cleanup(), Cleanup::Complete);
+    let mut changed_bytes = fs::read(wrong_source.path()).unwrap();
+    changed_bytes[0] ^= 2;
+    fs::write(wrong_source.path(), changed_bytes).unwrap();
+    let mut changed = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &wrong_source, fresh())
+        .err()
+        .unwrap();
+    assert_eq!(changed.reason(), ReadbackError::NativeFailure);
+    assert_eq!(changed.cleanup(), Cleanup::Complete);
+    clock.0.set(
+        started + solstone_core_backup::archive_admission::ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64,
+    );
+    let mut exhausted = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(
+        exhausted.reason(),
+        ReadbackError::Admission(AdmissionError::DeadlineExceeded)
+    );
+    assert_eq!(exhausted.cleanup(), Cleanup::Complete);
+    cancellation.cancel();
+    let mut cancelled = reader
+        .read_owned_snapshot(&snapshot.snapshot_id, &sources[0], fresh())
+        .err()
+        .unwrap();
+    assert_eq!(
+        cancelled.reason(),
+        ReadbackError::Admission(AdmissionError::Cancelled)
+    );
+    assert_eq!(cancelled.cleanup(), Cleanup::Complete);
+    for (source, before) in sources.iter().zip(&initial_fd_flags) {
+        source.revalidate().unwrap();
+        assert_eq!(
+            source
+                .descriptor()
+                .map(|fd| nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap()),
+            *before
+        );
+    }
+    assert!(http.urls.borrow().is_empty());
+    println!(
+        "OWNED_ARCHIVE_RESULT {}",
+        serde_json::json!({"snapshot_id":snapshot.snapshot_id,
+        "duplicate_snapshot_id":duplicate_snapshot.snapshot_id, "repository_id":snapshot.repository_id,
+        "files":results, "original_budget_exhausted":true, "original_stop_observed":true,
+        "duplicate_and_wrong_bytes_refused":true, "issued_target_cleanup":"refused"})
+    );
+    drop(sources);
+    drop(duplicates);
+    drop(wrong_source);
+    for source in &mut prepared_sources {
+        assert_eq!(source.cleanup(), Cleanup::Complete);
+    }
+    assert_eq!(duplicate_one.cleanup(), Cleanup::Complete);
+    assert_eq!(duplicate_two.cleanup(), Cleanup::Complete);
+    // Deliberately mutated owned input remains subject to Native cleanup refusal.
+    let _ = wrong_content.cleanup();
+}
+
 fn configure_byo(journal: &Path) {
     let destination = solstone_core_backup::Destination {
         repository: "s3:repo".into(),
