@@ -62,6 +62,34 @@ impl OffloadReconciliation {
     pub fn groups(&self) -> &[OffloadReconciliationGroup] {
         &self.groups
     }
+
+    /// Consume the actual reconciliation facts without retaining its root handle.
+    pub fn into_report(self) -> OffloadReconciliationReport {
+        OffloadReconciliationReport {
+            root_observation: self.root.identity().observation_id(),
+            register: self.register,
+            groups: self.groups,
+        }
+    }
+}
+
+/// Actual reconciliation data; this report grants no mutation or finish authority.
+pub struct OffloadReconciliationReport {
+    root_observation: String,
+    register: Register,
+    groups: Vec<OffloadReconciliationGroup>,
+}
+
+impl OffloadReconciliationReport {
+    pub fn root_observation(&self) -> &str {
+        &self.root_observation
+    }
+    pub fn register(&self) -> &Register {
+        &self.register
+    }
+    pub fn groups(&self) -> &[OffloadReconciliationGroup] {
+        &self.groups
+    }
 }
 
 #[derive(Debug)]

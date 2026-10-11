@@ -127,6 +127,21 @@ fn reconciliation_shrinks_typed_kept_empty_only_and_preserves_pending_consent() 
             fs::read(root.canonical_path().join("health/retention-marks.json")).unwrap(),
             bytes
         );
+        let register = result.register().clone();
+        let expected = result.groups()[0].expected().to_vec();
+        let root_references = Arc::strong_count(&root);
+        let report = result.into_report();
+        fn require_send_static<T: Send + 'static>(_: &T) {}
+        require_send_static(&report);
+        assert_eq!(Arc::strong_count(&root), root_references - 1);
+        assert_eq!(report.root_observation(), root.identity().observation_id());
+        assert_eq!(report.register(), &register);
+        assert_eq!(report.groups()[0].expected(), expected);
+        assert_eq!(report.groups()[0].selection(), Some(&selected));
+        assert!(
+            matches!(report.groups()[0].disposition(), OffloadReconciliationDisposition::Publication { outcome, observation: None }
+                if matches!(outcome.as_ref(), crate::mark_mutation::BoundMutationOutcome::Published(_)))
+        );
     }
 }
 

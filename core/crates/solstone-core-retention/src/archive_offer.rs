@@ -31,7 +31,8 @@ pub use owned::{
 };
 pub use reconciliation::{
     OffloadReconciliation, OffloadReconciliationDisposition, OffloadReconciliationFailure,
-    OffloadReconciliationGroup, OffloadReconciliationStop, reconcile_offload_empty,
+    OffloadReconciliationGroup, OffloadReconciliationReport, OffloadReconciliationStop,
+    reconcile_offload_empty,
 };
 
 /// Requested coordinates only; the owning capture independently reads them.
