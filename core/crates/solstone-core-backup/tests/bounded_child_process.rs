@@ -17,7 +17,9 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use solstone_core_backup::archive_admission::ArchiveCancellation;
 use solstone_core_backup::bounded_child::{Request, run, run_cancellable};
 use solstone_core_journal_io::JournalRoot;
+use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity, MediaStage, digest_reader};
+use std::sync::Arc;
 
 fn cloexec(fd: impl AsFd) -> bool {
     let flags = fcntl(fd.as_fd(), FcntlArg::F_GETFD).unwrap();
@@ -90,9 +92,13 @@ fn descriptor_probe() {
 fn intended_child_receives_target_while_unrelated_exec_does_not() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("media")).unwrap();
-    let root = JournalRoot::open(directory.path()).unwrap();
-    let parent = MediaDirectory::open(root.into(), Path::new("media")).unwrap();
-    let mut target = MediaStage::create(parent).unwrap().create_target().unwrap();
+    let root = Arc::new(JournalRoot::open(directory.path()).unwrap());
+    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
+    let parent = MediaDirectory::open(root, Path::new("media")).unwrap();
+    let mut target = MediaStage::create(parent, activity.clone())
+        .unwrap()
+        .create_target()
+        .unwrap();
     let secret_path = directory.path().join("secret");
     fs::write(&secret_path, b"private test credential").unwrap();
     let secret = File::open(&secret_path).unwrap();
@@ -244,9 +250,13 @@ fn active_cancellation_reaps_the_root_and_retains_parent_descriptor_flags() {
     for cancel in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("media")).unwrap();
-        let root = JournalRoot::open(directory.path()).unwrap();
-        let parent = MediaDirectory::open(root.into(), Path::new("media")).unwrap();
-        let mut target = MediaStage::create(parent).unwrap().create_target().unwrap();
+        let root = Arc::new(JournalRoot::open(directory.path()).unwrap());
+        let activity = ActivityLease::try_acquire(root.clone()).unwrap();
+        let parent = MediaDirectory::open(root, Path::new("media")).unwrap();
+        let mut target = MediaStage::create(parent, activity.clone())
+            .unwrap()
+            .create_target()
+            .unwrap();
         let (mut ready_parent, ready_child) = UnixStream::pair().unwrap();
         let (mut control_parent, control_child) = UnixStream::pair().unwrap();
         ready_parent
@@ -350,6 +360,7 @@ fn packaged_readback_entry() {
     let root = std::sync::Arc::new(
         JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap(),
     );
+    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
     let configuration = ArchiveConfiguration::capture(&root).unwrap();
     let destination = configuration.destination().unwrap();
     let keys = configuration.keys().unwrap().unwrap();
@@ -405,7 +416,7 @@ fn packaged_readback_entry() {
     .unwrap();
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let fresh = || {
-        MediaStage::create(parent.clone())
+        MediaStage::create(parent.clone(), activity.clone())
             .unwrap()
             .create_target()
             .unwrap()
@@ -544,6 +555,7 @@ fn packaged_cancellation_entry() {
     let root = std::sync::Arc::new(
         JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap(),
     );
+    let activity = ActivityLease::try_acquire(root.clone()).unwrap();
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -570,7 +582,7 @@ fn packaged_cancellation_entry() {
     };
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let fresh = || {
-        MediaStage::create(parent.clone())
+        MediaStage::create(parent.clone(), activity.clone())
             .unwrap()
             .create_target()
             .unwrap()

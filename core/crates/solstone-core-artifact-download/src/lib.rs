@@ -637,6 +637,7 @@ pub fn make_executable(_path: &Path) -> Result<(), ArchiveError> {
 pub fn clear_macos_quarantine(path: &Path) -> Result<(), ArchiveError> {
     use std::process::Command;
     let status = Command::new("xattr")
+        .arg("-r")
         .arg("-d")
         .arg("com.apple.quarantine")
         .arg(path)

@@ -13,6 +13,8 @@ compile_error!(
 );
 
 #[cfg(any(unix, windows))]
+pub mod activity;
+#[cfg(any(unix, windows))]
 pub mod append;
 #[cfg(any(unix, windows))]
 pub mod atomic;
