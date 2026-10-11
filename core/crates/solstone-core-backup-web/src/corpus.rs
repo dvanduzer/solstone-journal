@@ -33,6 +33,11 @@ use std::{
 };
 use tower::ServiceExt;
 
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(not(windows))]
+#[path = "handoff_poll_owned_tests.rs"]
+mod owned_poll_tests;
+
 struct Captured {
     status: u16,
     headers: HeaderMap,
@@ -862,7 +867,8 @@ async fn settle_held_fixture(
         }
         // Approval publishes a successor worker before releasing its poll lease.
         // Observe that release before the final worker/helper snapshot.
-        let poll_settled = !deps.handoff_poll_lease.load(Ordering::Acquire);
+        let poll_settled = !deps.handoff_poll_lease.load(Ordering::Acquire)
+            && !crate::operation::handoff_poll_active(&deps.operations);
         let owner_settled = match deps.operations.try_lock() {
             Ok(mut guard) => {
                 if let Some(current) = guard.as_mut() {
@@ -1056,6 +1062,7 @@ struct HttpScript {
     responses: Mutex<VecDeque<Result<HttpResponse, HttpError>>>,
     poll_responses: Mutex<VecDeque<Result<HttpResponse, HttpError>>>,
     requests: Mutex<Vec<HttpRequest>>,
+    poll_cancellations: Mutex<Vec<solstone_core_backup::archive_admission::ArchiveCancellation>>,
     #[cfg(feature = "full-tests")]
     hold: Option<Arc<Hold>>,
     #[cfg(feature = "full-tests")]
@@ -1081,6 +1088,7 @@ impl HttpScript {
             responses: Mutex::new(VecDeque::from(responses)),
             poll_responses: Mutex::new(VecDeque::new()),
             requests: Mutex::new(vec![]),
+            poll_cancellations: Mutex::new(vec![]),
             #[cfg(feature = "full-tests")]
             hold: None,
             #[cfg(feature = "full-tests")]
@@ -1132,6 +1140,22 @@ impl HttpScript {
 }
 
 impl HttpTransport for HttpScript {
+    fn execute_cancellable(
+        &self,
+        request: &HttpRequest,
+        cancellation: &solstone_core_backup::archive_admission::ArchiveCancellation,
+    ) -> Result<HttpResponse, HttpError> {
+        self.poll_cancellations
+            .lock()
+            .unwrap()
+            .push(cancellation.clone());
+        if cancellation.is_cancelled() {
+            return Err(HttpError::Other);
+        }
+        // This fixture deliberately retains its Hold until released, even after stop.
+        self.execute(request)
+    }
+
     fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         self.requests.lock().unwrap().push(request.clone());
         let now = self.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -2941,6 +2965,7 @@ fn hosted_handoff_payload(nonce: &str) -> Value {
     })
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 fn hosted_needs_subscription_payload(nonce: &str) -> Value {
     let binding = crate::test_support::hosted_binding();
     json!({
@@ -2956,6 +2981,7 @@ fn hosted_needs_subscription_payload(nonce: &str) -> Value {
     })
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 fn portal_nonce(body: &Value) -> String {
     body["operation"]["portal_url"]
         .as_str()
@@ -3288,6 +3314,12 @@ async fn restore_prepare_arm_activate_and_cancel_enforce_the_lifecycle() {
     )
     .await;
     assert_eq!(status, 200);
+    assert!(matches!(
+        cancelled["operation"]["phase"].as_str(),
+        Some("cancelling" | "error")
+    ));
+    assert_eq!(cancelled["operation"]["reason_code"], "cancelled");
+    let cancelled = wait_terminal(&deps).await;
     assert_eq!(cancelled["operation"]["phase"], "error");
     assert_eq!(cancelled["operation"]["reason_code"], "cancelled");
     assert_handoff_state_cleared(&deps);
@@ -3394,6 +3426,7 @@ async fn restore_prepare_activated_lease_is_exempt_from_consent_window_expiry() 
     assert_ne!(body["operation"]["phase"], "error");
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 #[tokio::test]
 async fn restore_prepare_activated_lease_is_cleared_once_operation_terminates() {
     let root = crate::test_support::root("fresh");
@@ -3411,7 +3444,7 @@ async fn restore_prepare_activated_lease_is_cleared_once_operation_terminates() 
     let generation = crate::operation::generation_of(&deps.operations).unwrap();
     crate::operation::finish(&deps.operations, generation, "done", None, None);
 
-    let _ = get_status_json(&deps).await;
+    let _ = wait_terminal(&deps).await;
     let (status, body) = post_json(
         &deps,
         "/app/backup/restore-hosted/cancel",
@@ -3422,6 +3455,7 @@ async fn restore_prepare_activated_lease_is_cleared_once_operation_terminates() 
     assert_eq!(body["reason_code"], "restore_prepare_invalid_capability");
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 #[tokio::test]
 async fn restore_prepare_prepare_self_heals_a_terminated_activated_lease() {
     let root = crate::test_support::root("fresh");
@@ -3439,6 +3473,7 @@ async fn restore_prepare_prepare_self_heals_a_terminated_activated_lease() {
     let generation = crate::operation::generation_of(&deps.operations).unwrap();
     crate::operation::finish(&deps.operations, generation, "done", None, None);
 
+    let _ = wait_terminal(&deps).await;
     let (status, body) = post_json(&deps, "/app/backup/restore-hosted/prepare", None).await;
     assert_eq!(status, 200);
     assert!(body["capability"].as_str().is_some());
@@ -3848,6 +3883,7 @@ fn journal_contains(root: &Path, needle: &str) -> bool {
     walk(root, needle)
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 fn assert_json_hides_secrets(body: &Value, daily_key: Option<&str>) {
     let rendered = body.to_string();
     assert!(!rendered.contains("broker-token-secret"));
@@ -4004,6 +4040,7 @@ fn wrong_origin_poll_response() -> HttpResponse {
     }
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 fn hosted_handoff_payload_from(
     nonce: &str,
     binding: &solstone_core_backup::HostedBinding,
@@ -4738,10 +4775,13 @@ async fn hosted_poll_watchdog_expires_while_get_is_held() {
                 &deps.operations,
                 crate::operation::HANDOFF_TTL + Duration::from_secs(1),
             );
+            wait_watchdog_expired(&deps.operations).await;
+            assert!(crate::operation::is_busy(&deps.operations));
+            assert_eq!(http.active_executions(), 1);
+            hold.release().await;
             let done = wait_terminal(&deps).await;
             assert_eq!(done["operation"]["phase"], "error");
             assert_eq!(done["operation"]["reason_code"], "expired");
-            hold.release().await;
         },
     )
     .await;
@@ -4909,11 +4949,13 @@ async fn hosted_poll_stale_generation_cannot_persist_binding() {
                 &deps.operations,
                 crate::operation::HANDOFF_TTL + Duration::from_secs(1),
             );
+            wait_watchdog_expired(&deps.operations).await;
+            assert!(crate::operation::is_busy(&deps.operations));
+            hold.release().await;
+            wait_lease_released(&deps, &http).await;
             let expired = wait_terminal(&deps).await;
             assert_eq!(expired["operation"]["phase"], "error");
             assert_eq!(expired["operation"]["reason_code"], "expired");
-            hold.release().await;
-            wait_lease_released(&deps, &http).await;
             let (status, second) = post_json(&deps, "/app/backup/enable-hosted", None).await;
             assert_eq!(status, 200);
             assert_eq!(second["operation"]["kind"], "enable_hosted");
@@ -5214,7 +5256,7 @@ async fn wait_watchdog_expired(slot: &crate::operation::SharedOperationSlot) {
     loop {
         let expired = match slot.try_lock() {
             Ok(guard) => guard.as_ref().is_some_and(|current| {
-                current.view.phase == "error"
+                current.view.phase == "cancelling"
                     && current.view.reason_code.as_deref() == Some("expired")
             }),
             Err(TryLockError::WouldBlock) => false,
@@ -5233,7 +5275,10 @@ async fn wait_watchdog_expired(slot: &crate::operation::SharedOperationSlot) {
 async fn wait_lease_released(deps: &crate::BackupWebDeps, http: &HttpScript) {
     let deadline = tokio::time::Instant::now() + FIXTURE_WAIT;
     loop {
-        if http.active_executions() == 0 && !deps.handoff_poll_lease.load(Ordering::Acquire) {
+        if http.active_executions() == 0
+            && !deps.handoff_poll_lease.load(Ordering::Acquire)
+            && !crate::operation::handoff_poll_active(&deps.operations)
+        {
             return;
         }
         fixture_tick(deadline)
@@ -5321,9 +5366,9 @@ async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observati
                         slot.restore_key.is_some(),
                     )
                 };
-                assert_eq!(view.phase, "error");
+                assert_eq!(view.phase, "cancelling");
                 assert_eq!(view.reason_code.as_deref(), Some("expired"));
-                assert!(crate::operation::is_terminal(&view.phase));
+                assert!(!crate::operation::is_terminal(&view.phase));
                 assert!(view.portal_url.is_none());
                 assert!(!has_nonce);
                 assert!(!has_key);
@@ -5353,6 +5398,7 @@ async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observati
     .await;
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 #[tokio::test]
 async fn handoff_needs_subscription_missing_field_is_failed() {
     let root = crate::test_support::root("healthy");
@@ -5367,7 +5413,7 @@ async fn handoff_needs_subscription_missing_field_is_failed() {
     let (status, body) = post_json(&deps, "/app/backup/handoff", Some(payload)).await;
     assert_eq!(status, 400);
     assert_eq!(body["reason_code"], "missing_required_field");
-    let (_, done) = get_status_json(&deps).await;
+    let done = wait_terminal(&deps).await;
     assert_eq!(done["operation"]["phase"], "error");
     assert_eq!(done["operation"]["reason_code"], "failed");
     assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
@@ -5395,6 +5441,7 @@ async fn hosted_poll_approved_wrong_origin_is_failed() {
     assert_eq!(credentials_posts(&http), 0);
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 #[tokio::test]
 async fn handoff_approved_wrong_origin_is_rejected() {
     let root = crate::test_support::root("healthy");
@@ -5422,7 +5469,7 @@ async fn handoff_approved_wrong_origin_is_rejected() {
     assert_eq!(status, 400);
     assert_eq!(body["reason_code"], "invalid_request_value");
     assert_json_hides_secrets(&body, None);
-    let (_, done) = get_status_json(&deps).await;
+    let done = wait_terminal(&deps).await;
     assert_eq!(done["operation"]["phase"], "error");
     assert_eq!(done["operation"]["reason_code"], "failed");
     assert!(solstone_core_backup::load_hosted_binding(root.path()).is_none());
@@ -5528,6 +5575,7 @@ async fn hosted_poll_needs_subscription_rejects_userinfo_subscribe_url() {
     assert_eq!(done["operation"]["reason_code"], "failed");
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 #[tokio::test]
 async fn handoff_needs_subscription_rejects_non_https_subscribe_url() {
     let root = crate::test_support::root("healthy");
@@ -5542,7 +5590,7 @@ async fn handoff_needs_subscription_rejects_non_https_subscribe_url() {
     let (status, body) = post_json(&deps, "/app/backup/handoff", Some(payload)).await;
     assert_eq!(status, 400);
     assert_eq!(body["reason_code"], "invalid_request_value");
-    let (_, done) = get_status_json(&deps).await;
+    let done = wait_terminal(&deps).await;
     assert_eq!(done["operation"]["phase"], "error");
     assert_eq!(done["operation"]["reason_code"], "failed");
 }
@@ -5646,9 +5694,8 @@ async fn hosted_poll_second_get_is_resource_bounded_and_lease_releases_on_comple
             assert_eq!(http.request_count(), 2);
 
             let (status, second) = post_json(&deps, "/app/backup/enable-hosted", None).await;
-            assert_eq!(status, 200);
-            assert_eq!(second["operation"]["phase"], "error");
-            assert_eq!(second["operation"]["reason_code"], "failed");
+            assert_eq!(status, 400);
+            assert_eq!(second["reason_code"], "backup_busy");
             assert_eq!(http.active_executions(), 1);
             assert_eq!(http.max_concurrency(), 1);
             assert_eq!(http.request_count(), 2);
@@ -5658,8 +5705,8 @@ async fn hosted_poll_second_get_is_resource_bounded_and_lease_releases_on_comple
                     let slot = guard.as_ref().expect("slot");
                     (slot.view.clone(), slot.generation)
                 };
-                assert_eq!(view.phase, "error");
-                assert_eq!(view.reason_code.as_deref(), Some("failed"));
+                assert_eq!(view.phase, "cancelling");
+                assert_eq!(view.reason_code.as_deref(), Some("expired"));
                 generation
             };
 
@@ -5675,7 +5722,7 @@ async fn hosted_poll_second_get_is_resource_bounded_and_lease_releases_on_comple
                 };
                 assert_eq!(generation, second_generation);
                 assert_eq!(view.phase, "error");
-                assert_eq!(view.reason_code.as_deref(), Some("failed"));
+                assert_eq!(view.reason_code.as_deref(), Some("expired"));
             }
 
             let (status, third) = post_json(&deps, "/app/backup/enable-hosted", None).await;
@@ -5730,7 +5777,7 @@ async fn hosted_poll_binding_write_failure_matches_local_handoff_contract() {
                 Some(hosted_handoff_payload(&nonce)),
             )
             .await;
-            assert_eq!(status, 500);
+            assert_eq!(status, 200);
         }
         let done = wait_terminal(&deps).await;
         assert!(!crate::operation::is_busy(&deps.operations));

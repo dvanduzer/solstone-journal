@@ -45,6 +45,7 @@ pub(super) enum Hold {
     Marker,
     Ledger,
     Register,
+    Retirement,
 }
 
 enum Admission<'operation, 'clock> {
@@ -384,6 +385,7 @@ pub(super) struct TransactionOutcome<'operation, 'clock> {
     marker_ancestor_sync: Vec<std::io::Result<()>>,
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
     register: Option<Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    retirement: Option<retirement::RetirementFacts>,
     effects: AttemptEffects,
     hold: Option<Hold>,
 }
@@ -401,6 +403,7 @@ impl<'operation, 'clock> TransactionOutcome<'operation, 'clock> {
             marker_ancestor_sync: Vec::new(),
             ledger: None,
             register: None,
+            retirement: None,
             effects: AttemptEffects::default(),
             hold: None,
         }
@@ -821,3 +824,5 @@ fn replay_local<'operation, 'clock>(
 
 #[cfg(all(test, feature = "full-tests", unix))]
 mod tests;
+
+mod retirement;

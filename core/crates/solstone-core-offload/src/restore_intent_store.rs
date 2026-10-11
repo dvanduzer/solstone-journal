@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Private, uncalled intent persistence. Serialized evidence never becomes a
-//! native capability. Drop releases handles only; no record is retired here.
+//! Private intent persistence and transaction-owned retirement. Serialized
+//! evidence never becomes a native capability; Drop releases handles only.
 
 use std::sync::Arc;
 
@@ -182,7 +182,7 @@ mod unix {
 
     pub(super) struct Binding {
         flat: FlatDirectory,
-        media: Option<Arc<MediaDirectory>>,
+        pub(super) media: Option<Arc<MediaDirectory>>,
     }
 
     pub(super) enum NativePublication {
@@ -318,7 +318,7 @@ mod unix {
             Ok(())
         }
 
-        fn revalidate(&self) -> Result<(), StoreProblem> {
+        pub(super) fn revalidate(&self) -> Result<(), StoreProblem> {
             self.activity.revalidate().map_err(io_problem)?;
             if self.chain.len() != 3 {
                 return Err(StoreProblem::Changed);
@@ -339,7 +339,10 @@ mod unix {
             self.activity.revalidate().map_err(io_problem)
         }
 
-        fn sync_facts(&self, hooks: &mut impl Hooks) -> ([Durability; 4], Vec<StoreProblem>) {
+        pub(super) fn sync_facts(
+            &self,
+            hooks: &mut impl Hooks,
+        ) -> ([Durability; 4], Vec<StoreProblem>) {
             let mut facts = [Durability::Unproven; 4];
             let mut failures = Vec::new();
             for (index, binding) in self.chain.iter().rev().enumerate() {

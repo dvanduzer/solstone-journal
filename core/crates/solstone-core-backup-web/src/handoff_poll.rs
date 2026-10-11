@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use solstone_core_backup::HostedBinding;
+use solstone_core_backup::archive_admission::ArchiveCancellation;
 use solstone_core_backup_runtime::hosted_runtime::HttpError;
 use solstone_core_backup_runtime::{HttpRequest, HttpResponse};
 
@@ -60,47 +61,72 @@ impl Drop for PollLease {
 }
 
 pub(crate) fn spawn(deps: BackupWebDeps, nonce: String, generation: u64) {
-    if validation::require_configured_portal_base(&deps.portal_base).is_err() {
-        operation::finish(
-            &deps.operations,
-            generation,
-            "error",
-            Some("failed".into()),
-            None,
-        );
-        return;
-    }
     let Some(lease) = PollLease::try_acquire(&deps.handoff_poll_lease) else {
-        operation::finish(
-            &deps.operations,
-            generation,
-            "error",
-            Some("failed".into()),
-            None,
-        );
         return;
     };
+    let Some(cancellation) = operation::start_handoff_poll(&deps.operations, generation) else {
+        return;
+    };
+    if validation::require_configured_portal_base(&deps.portal_base).is_err() {
+        finish_error(&deps, &nonce, generation, "failed");
+        drop(lease);
+        operation::finish_handoff_poll(&deps.operations, generation);
+        return;
+    }
     let poll_deps = deps.clone();
-    let poll_nonce = nonce;
-    thread::spawn(move || {
-        let _lease = lease;
+    let failed_nonce = nonce.clone();
+    let poll_started = spawn_poll_thread(move || {
         let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
-            poll_loop(&poll_deps, &poll_nonce, generation);
+            poll_loop(&poll_deps, &nonce, generation, &cancellation);
         }));
         if panicked.is_err() {
-            operation::finish(
-                &poll_deps.operations,
-                generation,
-                "error",
-                Some("failed".into()),
-                None,
-            );
+            finish_error(&poll_deps, &nonce, generation, "failed");
         }
+        drop(lease);
+        operation::finish_handoff_poll(&poll_deps.operations, generation);
     });
-    thread::spawn(move || watchdog_loop(&deps.operations, generation));
+    if poll_started.is_err() {
+        finish_error(&deps, &failed_nonce, generation, "failed");
+        operation::finish_handoff_poll(&deps.operations, generation);
+        return;
+    }
+    let watchdog_slot = deps.operations.clone();
+    if thread::Builder::new()
+        .spawn(move || watchdog_loop(&watchdog_slot, generation))
+        .is_err()
+    {
+        finish_error(&deps, &failed_nonce, generation, "failed");
+    }
 }
 
-fn poll_loop(deps: &BackupWebDeps, nonce: &str, generation: u64) {
+#[cfg(all(test, feature = "full-tests"))]
+thread_local! {
+    static FAIL_POLL_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn fail_next_poll_start() {
+    FAIL_POLL_START.with(|fail| fail.set(true));
+}
+
+fn spawn_poll_thread(
+    work: impl FnOnce() + Send + 'static,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    #[cfg(all(test, feature = "full-tests"))]
+    if FAIL_POLL_START.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected hosted poll creation failure",
+        ));
+    }
+    thread::Builder::new().spawn(work)
+}
+
+fn poll_loop(
+    deps: &BackupWebDeps,
+    nonce: &str,
+    generation: u64,
+    cancellation: &ArchiveCancellation,
+) {
     loop {
         let remaining = match live_wait(&deps.operations, generation) {
             LiveWait::Gone => return,
@@ -123,18 +149,18 @@ fn poll_loop(deps: &BackupWebDeps, nonce: &str, generation: u64) {
             body: Vec::new(),
             timeout: HANDOFF_POLL_TIMEOUT.min(remaining),
         };
-        match deps.http.execute(&request) {
+        match deps.http.execute_cancellable(&request, cancellation) {
             Err(HttpError::Timeout) => {
                 if !sleep_retry(deps, generation) {
                     return;
                 }
             }
             Err(HttpError::Unreachable) => {
-                finish_error(deps, generation, "unreachable");
+                finish_error(deps, nonce, generation, "unreachable");
                 return;
             }
             Err(HttpError::Other) => {
-                finish_error(deps, generation, "failed");
+                finish_error(deps, nonce, generation, "failed");
                 return;
             }
             Ok(HttpResponse { status: 204, .. }) => {
@@ -143,7 +169,7 @@ fn poll_loop(deps: &BackupWebDeps, nonce: &str, generation: u64) {
                 }
             }
             Ok(HttpResponse { status: 410, .. }) => {
-                operation::mark_expired(&deps.operations, generation);
+                finish_error(deps, nonce, generation, "expired");
                 return;
             }
             Ok(HttpResponse {
@@ -162,12 +188,12 @@ fn poll_loop(deps: &BackupWebDeps, nonce: &str, generation: u64) {
                     return;
                 }
                 Err(()) => {
-                    finish_error(deps, generation, "failed");
+                    finish_error(deps, nonce, generation, "failed");
                     return;
                 }
             },
             Ok(_) => {
-                finish_error(deps, generation, "failed");
+                finish_error(deps, nonce, generation, "failed");
                 return;
             }
         }
@@ -226,14 +252,8 @@ fn sleep_retry(deps: &BackupWebDeps, generation: u64) -> bool {
     }
 }
 
-fn finish_error(deps: &BackupWebDeps, generation: u64, reason: &str) {
-    operation::finish(
-        &deps.operations,
-        generation,
-        "error",
-        Some(reason.to_owned()),
-        None,
-    );
+fn finish_error(deps: &BackupWebDeps, nonce: &str, generation: u64, reason: &str) {
+    operation::fail_handoff_poll(&deps.operations, generation, nonce, reason);
 }
 
 fn apply_approved(deps: &BackupWebDeps, nonce: &str, generation: u64, binding: HostedBinding) {
@@ -245,10 +265,10 @@ fn apply_approved(deps: &BackupWebDeps, nonce: &str, generation: u64, binding: H
         }
         LiveWait::Live { .. } => {}
     }
-    if let Ok(matched) = operation::match_handoff(&deps.operations, nonce) {
-        let _ = persist_and_consume_hosted(
+    if let Ok(matched) = operation::match_handoff(&deps.operations, nonce, Some(generation)) {
+        persist_and_consume_hosted(
             deps,
-            generation,
+            matched.generation,
             matched.kind,
             binding,
             matched.restore_key,
@@ -265,7 +285,7 @@ fn apply_needs_subscription(deps: &BackupWebDeps, nonce: &str, generation: u64) 
         }
         LiveWait::Live { .. } => {}
     }
-    if operation::match_handoff(&deps.operations, nonce).is_ok() {
+    if operation::match_handoff(&deps.operations, nonce, Some(generation)).is_ok() {
         operation::mark_needs_subscription(&deps.operations, generation);
     }
 }
@@ -279,7 +299,7 @@ fn apply_refused(deps: &BackupWebDeps, nonce: &str, generation: u64, reason: Ref
         }
         LiveWait::Live { .. } => {}
     }
-    if operation::match_handoff(&deps.operations, nonce).is_ok() {
+    if operation::match_handoff(&deps.operations, nonce, Some(generation)).is_ok() {
         operation::mark_refused(&deps.operations, generation, reason);
     }
 }

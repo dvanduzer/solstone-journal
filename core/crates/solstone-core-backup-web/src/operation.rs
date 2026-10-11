@@ -49,6 +49,8 @@ pub struct Slot {
     pub generation: u64,
     pub(crate) worker_active: bool,
     archive_cancellation: Option<ArchiveCancellation>,
+    handoff_poll: Option<ArchiveCancellation>,
+    pending_handoff_terminal: Option<Terminal>,
     #[cfg(windows)]
     pub(crate) cleanup: Option<PendingCleanup>,
 }
@@ -69,7 +71,7 @@ fn observe_cleanup(current: &mut Slot) {
             .all(|owner| matches!(owner.observe(), HelperCleanupStatus::Quiescent))
     });
     if settled && let Some(pending) = current.cleanup.take() {
-        apply_terminal(current, pending.terminal);
+        finish_or_defer(current, pending.terminal);
     }
 }
 
@@ -82,6 +84,24 @@ fn apply_terminal(current: &mut Slot, terminal: Terminal) {
     current.view.portal_url = None;
     current.nonce = None;
     current.restore_key = None;
+    current.pending_handoff_terminal = None;
+}
+
+fn finish_or_defer(current: &mut Slot, terminal: Terminal) {
+    if current.pending_handoff_terminal.is_some() {
+        return;
+    }
+    if let Some(cancellation) = &current.handoff_poll {
+        cancellation.cancel();
+        current.view.phase = "cancelling".into();
+        current.view.reason_code = terminal.reason_code.clone();
+        current.view.portal_url = None;
+        current.nonce = None;
+        current.restore_key = None;
+        current.pending_handoff_terminal = Some(terminal);
+    } else {
+        apply_terminal(current, terminal);
+    }
 }
 
 pub type SharedOperationSlot = Arc<Mutex<Option<Slot>>>;
@@ -127,14 +147,7 @@ fn expire_hosted_wait_in_place(slot: &mut Slot) {
     if !hosted_wait_expired(slot) {
         return;
     }
-    slot.view.phase = "error".into();
-    slot.view.reason_code = Some("expired".into());
-    slot.view.detail = None;
-    slot.view.guidance = None;
-    slot.view.recording_failure = None;
-    slot.view.portal_url = None;
-    slot.nonce = None;
-    slot.restore_key = None;
+    finish_or_defer(slot, Terminal::error("expired"));
 }
 
 fn observe(slot: &mut Option<Slot>) -> Option<&Slot> {
@@ -205,7 +218,10 @@ pub(crate) fn start_worker(slot: &SharedOperationSlot, generation: u64) -> bool 
     let Some(current) = guard.as_mut() else {
         return false;
     };
-    if current.generation != generation || is_terminal(&current.view.phase) || current.worker_active
+    if current.generation != generation
+        || is_terminal(&current.view.phase)
+        || current.worker_active
+        || current.pending_handoff_terminal.is_some()
     {
         return false;
     }
@@ -247,7 +263,7 @@ pub(crate) fn finish_worker(
         current.restore_key = None;
         current.cleanup = Some(PendingCleanup { owners, terminal });
     } else {
-        apply_terminal(current, terminal);
+        finish_or_defer(current, terminal);
     }
 }
 
@@ -261,7 +277,87 @@ pub(crate) fn finish_worker(slot: &SharedOperationSlot, generation: u64, termina
         return;
     }
     current.worker_active = false;
-    apply_terminal(current, terminal);
+    finish_or_defer(current, terminal);
+}
+
+pub(crate) fn start_handoff_poll(
+    slot: &SharedOperationSlot,
+    generation: u64,
+) -> Option<ArchiveCancellation> {
+    let mut guard = slot.lock().expect("operation slot lock");
+    let current = guard.as_mut()?;
+    if current.generation != generation {
+        return None;
+    }
+    expire_hosted_wait_in_place(current);
+    if is_terminal(&current.view.phase)
+        || current.worker_active
+        || current.handoff_poll.is_some()
+        || current.pending_handoff_terminal.is_some()
+        || current.nonce.is_none()
+        || !matches!(
+            current.view.kind.as_str(),
+            "enable_hosted" | "restore_hosted"
+        )
+    {
+        return None;
+    }
+    let cancellation = ArchiveCancellation::new();
+    current.handoff_poll = Some(cancellation.clone());
+    Some(cancellation)
+}
+
+pub(crate) fn finish_handoff_poll(slot: &SharedOperationSlot, generation: u64) {
+    let mut guard = slot.lock().expect("operation slot lock");
+    let Some(current) = guard.as_mut() else {
+        return;
+    };
+    if current.generation != generation || current.handoff_poll.take().is_none() {
+        return;
+    }
+    if current.worker_active {
+        return;
+    }
+    #[cfg(windows)]
+    if current.cleanup.is_some() {
+        return;
+    }
+    if let Some(terminal) = current.pending_handoff_terminal.take() {
+        apply_terminal(current, terminal);
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn handoff_poll_active(slot: &SharedOperationSlot) -> bool {
+    slot.try_lock()
+        .map(|guard| {
+            guard
+                .as_ref()
+                .is_some_and(|current| current.handoff_poll.is_some())
+        })
+        .unwrap_or(true)
+}
+
+/// Only the poll still owning this nonce may publish a response failure.
+pub(crate) fn fail_handoff_poll(
+    slot: &SharedOperationSlot,
+    generation: u64,
+    nonce: &str,
+    reason: &str,
+) {
+    let mut guard = slot.lock().expect("operation slot lock");
+    let Some(current) = guard.as_mut() else {
+        return;
+    };
+    if current.generation != generation
+        || current.handoff_poll.is_none()
+        || current.nonce.as_deref() != Some(nonce)
+        || current.worker_active
+        || current.pending_handoff_terminal.is_some()
+    {
+        return;
+    }
+    finish_or_defer(current, Terminal::error(reason));
 }
 
 #[cfg(any(not(windows), test))]
@@ -365,6 +461,8 @@ fn install_slot(
         generation,
         worker_active: false,
         archive_cancellation,
+        handoff_poll: None,
+        pending_handoff_terminal: None,
         #[cfg(windows)]
         cleanup: None,
     });
@@ -435,11 +533,14 @@ fn finish_terminal(slot: &SharedOperationSlot, generation: u64, terminal: Termin
     if current.worker_active {
         return false;
     }
+    if current.pending_handoff_terminal.is_some() {
+        return false;
+    }
     #[cfg(windows)]
     if current.cleanup.is_some() {
         return false;
     }
-    apply_terminal(current, terminal);
+    finish_or_defer(current, terminal);
     true
 }
 
@@ -549,6 +650,12 @@ fn spawn_thread(work: impl FnOnce() + Send + 'static) -> std::io::Result<thread:
     thread::Builder::new().spawn(work)
 }
 
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(not(windows))]
+pub(crate) fn fail_next_worker_start() {
+    FAIL_WORKER_START.with(|fail| fail.set(true));
+}
+
 #[allow(dead_code)]
 pub fn mint_hex() -> Result<String, getrandom::Error> {
     #[cfg(test)]
@@ -596,6 +703,7 @@ pub fn restore_portal_url(base: &str, nonce: &str) -> String {
 }
 
 pub struct HandoffMatch {
+    pub generation: u64,
     pub kind: String,
     pub restore_key: Option<String>,
 }
@@ -608,13 +716,17 @@ pub enum HandoffError {
 pub fn match_handoff(
     slot: &SharedOperationSlot,
     nonce: &str,
+    expected_generation: Option<u64>,
 ) -> Result<HandoffMatch, HandoffError> {
     let mut guard = slot.lock().expect("operation slot lock");
     let Some(current) = guard.as_mut() else {
         return Err(HandoffError::Invalid);
     };
+    if expected_generation.is_some_and(|generation| generation != current.generation) {
+        return Err(HandoffError::Invalid);
+    }
     expire_hosted_wait_in_place(current);
-    if is_terminal(&current.view.phase) {
+    if is_terminal(&current.view.phase) || current.pending_handoff_terminal.is_some() {
         return if matches!(
             current.view.reason_code.as_deref(),
             Some("expired") | Some("restore_prepare_expired")
@@ -632,7 +744,11 @@ pub fn match_handoff(
         return Err(HandoffError::Invalid);
     }
     let _ = current.nonce.take();
+    if let Some(cancellation) = &current.handoff_poll {
+        cancellation.cancel();
+    }
     Ok(HandoffMatch {
+        generation: current.generation,
         kind: current.view.kind.clone(),
         restore_key: current.restore_key.clone(),
     })
@@ -778,7 +894,7 @@ mod tests {
         ));
         mark_prepare_lease_expired(&slot, 1);
 
-        let result = match_handoff(&slot, "nonce-1");
+        let result = match_handoff(&slot, "nonce-1", None);
 
         assert!(matches!(result, Err(HandoffError::Expired)));
     }
@@ -821,6 +937,8 @@ mod terminal_tests {
             generation,
             worker_active: false,
             archive_cancellation: None,
+            handoff_poll: None,
+            pending_handoff_terminal: None,
             #[cfg(windows)]
             cleanup: None,
         }
@@ -1114,10 +1232,116 @@ mod worker_tests {
     }
 }
 
+#[cfg(test)]
+mod handoff_state_tests {
+    use super::terminal_tests::{admitted_slot, assert_failure, failure};
+    use super::*;
+
+    fn admitted_poll() -> SharedOperationSlot {
+        Arc::new(Mutex::new(Some(admitted_slot(
+            "restore_hosted",
+            2,
+            Some("portal".into()),
+            Some("nonce".into()),
+            Some("key".into()),
+        ))))
+    }
+
+    #[test]
+    fn pending_handoff_blocks_admission_and_preserves_original_stop() {
+        let slot = admitted_poll();
+        let flag = start_handoff_poll(&slot, 2).unwrap();
+        assert!(start_handoff_poll(&slot, 2).is_none());
+        assert!(start_handoff_poll(&slot, 1).is_none());
+        assert!(!flag.is_cancelled());
+        assert!(mark_cancelled(&slot, 2));
+        assert!(flag.is_cancelled());
+        assert!(!mark_cancelled(&slot, 2));
+        assert!(!start_worker(&slot, 2));
+        assert!(!is_terminal(&current(&slot).unwrap().phase));
+        assert!(slot.lock().unwrap().as_ref().unwrap().nonce.is_none());
+        fail_handoff_poll(&slot, 2, "nonce", "expired");
+        finish_handoff_poll(&slot, 1);
+        assert_eq!(current(&slot).unwrap().phase, "cancelling");
+        finish_handoff_poll(&slot, 2);
+        assert_eq!(
+            current(&slot).unwrap().reason_code.as_deref(),
+            Some("cancelled")
+        );
+        let next = 3;
+        *slot.lock().unwrap() = Some(admitted_slot("restore", next, None, None, None));
+        finish_handoff_poll(&slot, 2);
+        fail_handoff_poll(&slot, 2, "nonce", "failed");
+        assert_eq!(generation_of(&slot), Some(next));
+        assert!(!is_terminal(&current(&slot).unwrap().phase));
+    }
+
+    #[test]
+    fn poll_and_worker_settle_independently_with_complete_worker_facts() {
+        for poll_first in [false, true] {
+            let slot = admitted_poll();
+            let flag = start_handoff_poll(&slot, 2).unwrap();
+            let matched =
+                match_handoff(&slot, "nonce", Some(2)).unwrap_or_else(|_| panic!("match"));
+            assert_eq!(matched.generation, 2);
+            assert!(flag.is_cancelled());
+            assert!(start_worker(&slot, 2));
+            if poll_first {
+                finish_handoff_poll(&slot, 2);
+                assert!(!is_terminal(&current(&slot).unwrap().phase));
+            }
+            #[cfg(windows)]
+            finish_worker(&slot, 2, failure(), Vec::new());
+            #[cfg(not(windows))]
+            finish_worker(&slot, 2, failure());
+            if !poll_first {
+                assert!(!is_terminal(&current(&slot).unwrap().phase));
+                assert!(!mark_cancelled(&slot, 2));
+                fail_handoff_poll(&slot, 2, "nonce", "expired");
+                finish_handoff_poll(&slot, 2);
+            }
+            assert_failure(&slot);
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 mod cleanup_state_tests {
     use super::terminal_tests::admitted_slot;
     use super::*;
+
+    #[test]
+    fn poll_and_native_cleanup_each_hold_the_complete_terminal() {
+        for poll_first in [false, true] {
+            let slot = Arc::new(Mutex::new(Some(admitted_slot(
+                "restore_hosted",
+                2,
+                None,
+                Some("nonce".into()),
+                None,
+            ))));
+            start_handoff_poll(&slot, 2).unwrap();
+            match_handoff(&slot, "nonce", Some(2)).unwrap_or_else(|_| panic!("match"));
+            slot.lock().unwrap().as_mut().unwrap().cleanup = Some(PendingCleanup {
+                owners: Vec::new(),
+                terminal: super::terminal_tests::failure(),
+            });
+            if poll_first {
+                finish_handoff_poll(&slot, 2);
+            } else {
+                observe_cleanup(slot.lock().unwrap().as_mut().unwrap());
+                assert!(!is_terminal(
+                    &slot.lock().unwrap().as_ref().unwrap().view.phase
+                ));
+            }
+            if poll_first {
+                observe_cleanup(slot.lock().unwrap().as_mut().unwrap());
+            } else {
+                finish_handoff_poll(&slot, 2);
+            }
+            super::terminal_tests::assert_failure(&slot);
+        }
+    }
 
     #[test]
     fn archive_stop_preserves_worker_and_separate_cleanup_ownership() {
