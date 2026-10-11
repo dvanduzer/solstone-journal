@@ -1,0 +1,19 @@
+[package]
+name = "android-journal-runtime-spike"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+solstone-core-journal-io = { path = "../../../core/crates/solstone-core-journal-io", features = ["test-hooks"] }
+solstone-core-indexer-store = { path = "../../../core/crates/solstone-core-indexer-store" }
+solstone-core-indexer-query = { path = "../../../core/crates/solstone-core-indexer-query" }
+serde_json = "1"
+chrono = "0.4"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+libc = "0.2"

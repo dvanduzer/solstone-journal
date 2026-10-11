@@ -15,7 +15,15 @@ use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
 use super::backend::Backend;
 use super::{JournalEntryKind, JournalRootError, ObjectIdentity};
 
+#[cfg(not(target_os = "android"))]
 const DIRECTORY_FLAGS: OFlag = OFlag::O_RDONLY
+    .union(OFlag::O_DIRECTORY)
+    .union(OFlag::O_CLOEXEC)
+    .union(OFlag::O_NOFOLLOW);
+// Android permits lookup of app-private ancestors but not reading their directory entries.
+// Keep requested-root authority readable for directory synchronization.
+#[cfg(target_os = "android")]
+const DIRECTORY_FLAGS: OFlag = OFlag::O_PATH
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_CLOEXEC)
     .union(OFlag::O_NOFOLLOW);
