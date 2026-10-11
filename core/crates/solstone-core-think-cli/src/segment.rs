@@ -2770,7 +2770,6 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
             segment_name,
             stream,
             segment,
-            &talents,
             sense,
             &mut published,
         );
@@ -2895,7 +2894,6 @@ fn publish_segment_topics<W: std::io::Write>(
     segment_name: &str,
     stream: Option<&str>,
     segment_dir: &std::path::Path,
-    talents_dir: &std::path::Path,
     sense: &Map<String, Value>,
     published: &mut BTreeSet<std::path::PathBuf>,
 ) {
@@ -2934,7 +2932,7 @@ fn publish_segment_topics<W: std::io::Write>(
         ),
     );
 
-    let topics_path = talents_dir.join("topics.md");
+    let topics_path = segment_dir.join("talents").join("topics.md");
     let markdown = eval.markdown.as_deref();
     let file_exists = topics_path.exists();
 

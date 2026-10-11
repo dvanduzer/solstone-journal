@@ -1153,11 +1153,28 @@ fn topics_no_speech_fixtures_retain_topics_with_empty_quotes_section() {
         .unwrap();
 
     let non_speech_files = [
-        ("seg_imported_md", "imported.md", "# Imported document"),
-        ("seg_transcript_md", "event_transcript.md", "# Event notes"),
-        ("seg_workout_json", "workout.json", "{}"),
-        ("seg_note_txt", "note.txt", "Some note text"),
-        ("seg_screen_jsonl", "display_screen.jsonl", "{}\n"),
+        // Each file holds the quoted words, so only the speech-file selector can drop them.
+        (
+            "seg_imported_md",
+            "imported.md",
+            "# Imported document\nUnmatched quote words here\n",
+        ),
+        (
+            "seg_transcript_md",
+            "event_transcript.md",
+            "# Event notes\nUnmatched quote words here\n",
+        ),
+        (
+            "seg_workout_json",
+            "workout.json",
+            "{\"start\": \"00:00:01\", \"text\": \"Unmatched quote words here\"}",
+        ),
+        ("seg_note_txt", "note.txt", "Unmatched quote words here"),
+        (
+            "seg_screen_jsonl",
+            "display_screen.jsonl",
+            "{\"start\": \"00:00:01\", \"text\": \"Unmatched quote words here\"}\n",
+        ),
     ];
 
     for (seg_name, filename, file_content) in non_speech_files {

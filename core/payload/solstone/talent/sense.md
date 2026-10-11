@@ -99,11 +99,9 @@ How central the entity was to this segment — distinct from `role`. `role` is w
 Centrality is independent of `role`: an entity can be `role: mentioned` yet `level: high` (the whole segment was about it, though it wasn't present), or `role: attendee` yet `level: low` (present but barely involved). Judge centrality from what the segment was actually about, not from whether the entity was attending.
 
 ### topics
-
 What this segment was about, as short phrases someone would type to find it again later: the plans, problems, decisions under discussion, documents, events, places, purchases and numbers that came up, each with enough words to be specific ("Q3 pricing page", "flight to Barcelona in November", "index rebuild taking six hours"). Use the words the content itself uses. Name subjects, not outcomes: never write that something was decided, agreed, promised or done. Up to 12, most central first. A topic may include a name when the pairing matters ("Priya's launch deck"), but do not list names on their own: they belong in `entities`. Empty array when the segment is idle or has nothing to name.
 
 ### quotes
-
 Up to 8 short passages of spoken words from the transcript that someone would most want to find again: plans, agreements, requests, offers, dates, amounts and opinions. Copy each `text` exactly from the transcript, 3 to 30 words, without fixing, shortening, summarizing or completing it. Copy only the spoken words: leave out emotion labels, annotations in parentheses or asterisks, timestamps and speaker prefixes. Never quote screen text; what was on screen belongs in `topics`. `speaker` is the label the transcript gives that line ("Speaker 2", a name the transcript itself shows, or the role an AI conversation gives the line); write "unknown" when the line has no label. Never guess a name, and never write that the owner said it unless the transcript labels the line that way. Do not judge whether anything was done. Empty array when nothing was said, and always empty when the segment has no transcript.
 
 ### facets

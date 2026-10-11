@@ -73,7 +73,7 @@ fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map_or(false, |num| num != 0.0),
+        Value::Number(n) => n.as_f64().is_some_and(|num| num != 0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),
@@ -91,7 +91,7 @@ fn display_json_text(v: &Value) -> String {
 fn parse_speaker_label(record: &Map<String, Value>) -> Option<String> {
     match record.get("speaker") {
         Some(Value::Number(n)) => Some(format!("Speaker {n}")),
-        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
         _ => None,
     }
 }
@@ -148,8 +148,12 @@ fn match_quote_in_files(
         return None;
     }
     let quote_len = model_norm.len();
+    // The span shown comes from the first file that holds the words; its speaker
+    // is shown only when every occurrence, in every file, carries the same label.
+    let mut chosen: Option<(usize, usize, usize)> = None;
+    let mut all_spans: Vec<(usize, usize, usize)> = Vec::new();
 
-    for file_tokens in files_tokens {
+    for (file_idx, file_tokens) in files_tokens.iter().enumerate() {
         if file_tokens.len() < quote_len {
             continue;
         }
@@ -186,82 +190,78 @@ fn match_quote_in_files(
         if match_spans.is_empty() {
             continue;
         }
-
-        // Chosen span is the earliest span in this earliest file
-        let (chosen_start, chosen_end) = match_spans[0];
-        let chosen_tokens = &file_tokens[chosen_start..=chosen_end];
-
-        // Speaker resolution:
-        // Every record of the chosen span must have the same label, AND
-        // every other span of those normalized words in that file must have that same label.
-        let span_label = |tokens: &[TranscriptToken]| -> Option<String> {
-            let first_speaker = tokens[0].speaker.as_ref()?;
-            for tok in tokens {
-                if tok.speaker.as_ref() != Some(first_speaker) {
-                    return None;
-                }
-            }
-            Some(first_speaker.clone())
-        };
-
-        let chosen_speaker = span_label(chosen_tokens);
-        let final_speaker = if let Some(ref target_speaker) = chosen_speaker {
-            let all_agree = match_spans.iter().all(|&(s, e)| {
-                let span_tokens = &file_tokens[s..=e];
-                span_label(span_tokens).as_ref() == Some(target_speaker)
-            });
-            if all_agree {
-                Some(collapse_crlf(target_speaker).trim().to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let span_words = chosen_tokens
-            .iter()
-            .map(|t| t.word.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let cleaned_span = collapse_crlf(&span_words).trim().to_string();
-
-        return Some(MatchedQuote {
-            speaker: final_speaker,
-            span: cleaned_span,
-        });
+        if chosen.is_none() {
+            chosen = Some((file_idx, match_spans[0].0, match_spans[0].1));
+        }
+        all_spans.extend(
+            match_spans
+                .into_iter()
+                .map(|(start, end)| (file_idx, start, end)),
+        );
     }
 
-    None
+    let (chosen_file, chosen_start, chosen_end) = chosen?;
+    let span_label = |file_idx: usize, start: usize, end: usize| -> Option<String> {
+        let tokens = &files_tokens[file_idx][start..=end];
+        let first_speaker = tokens[0].speaker.as_ref()?;
+        tokens
+            .iter()
+            .all(|tok| tok.speaker.as_ref() == Some(first_speaker))
+            .then(|| first_speaker.clone())
+    };
+    let final_speaker = span_label(chosen_file, chosen_start, chosen_end).and_then(|label| {
+        all_spans
+            .iter()
+            .all(|&(file_idx, start, end)| {
+                span_label(file_idx, start, end).as_ref() == Some(&label)
+            })
+            .then(|| collapse_crlf(&label).trim().to_string())
+    });
+    let span_words = files_tokens[chosen_file][chosen_start..=chosen_end]
+        .iter()
+        .map(|t| t.word.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(MatchedQuote {
+        speaker: final_speaker,
+        span: collapse_crlf(&span_words).trim().to_string(),
+    })
 }
 
 pub(crate) fn evaluate_topics(segment_dir: &Path, sense: &Map<String, Value>) -> TopicsEvaluation {
     // 1. Collect speech files
     let mut speech_paths = Vec::new();
     let mut unreadable = Vec::new();
+    // Without quotes to check, no transcript is read and none can be reported unreadable.
+    let has_quotes = sense
+        .get("quotes")
+        .and_then(Value::as_array)
+        .is_some_and(|quotes| !quotes.is_empty());
 
-    match fs::read_dir(segment_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(err) => {
-                        unreadable.push((segment_dir.to_path_buf(), err.to_string()));
-                        break;
+    if has_quotes {
+        match fs::read_dir(segment_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(err) => {
+                            unreadable.push((segment_dir.to_path_buf(), err.to_string()));
+                            break;
+                        }
+                    };
+                    let path = entry.path();
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if name.ends_with("audio.jsonl") || name.ends_with("_transcript.jsonl") {
+                        speech_paths.push(path);
                     }
-                };
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if name.ends_with("audio.jsonl") || name.ends_with("_transcript.jsonl") {
-                    speech_paths.push(path);
                 }
+                speech_paths.sort();
             }
-            speech_paths.sort();
-        }
-        Err(err) => {
-            unreadable.push((segment_dir.to_path_buf(), err.to_string()));
+            Err(err) => {
+                unreadable.push((segment_dir.to_path_buf(), err.to_string()));
+            }
         }
     }
 
@@ -339,7 +339,7 @@ pub(crate) fn evaluate_topics(segment_dir: &Path, sense: &Map<String, Value>) ->
                 continue;
             }
 
-            if speech_incomplete {
+            if speech_incomplete || surviving_quotes.len() == 8 {
                 dropped_quotes += 1;
                 continue;
             }
@@ -756,6 +756,12 @@ mod tests {
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
+        // The 31-word run is in a transcript, so only the length bound can drop it.
+        fs::write(
+            dir.path().join("31_audio.jsonl"),
+            format!(r#"{{"start": 1.0, "text": "{words_31}"}}"#),
+        )
+        .unwrap();
         let sense_31 = json!({"quotes": [{"speaker": "x", "text": words_31}]});
         let eval_31 = evaluate_topics(dir.path(), sense_31.as_object().unwrap());
         assert_eq!(eval_31.kept_quotes, 0);
@@ -811,6 +817,60 @@ mod tests {
         assert!(!md.contains("- Topic number 12\n"));
         assert!(md.contains("quote number 7."));
         assert!(!md.contains("quote number 8."));
+    }
+
+    #[test]
+    fn invalid_topics_are_dropped_before_the_first_twelve_are_taken() {
+        let dir = tempdir().unwrap();
+        let mut topics = vec![json!("   "), json!("x".repeat(81))];
+        for i in 0..13 {
+            topics.push(json!(format!("Topic number {i}")));
+        }
+        let eval = evaluate_topics(dir.path(), json!({"topics": topics}).as_object().unwrap());
+        let md = eval.markdown.unwrap();
+        assert!(md.contains("- Topic number 0\n"));
+        assert!(md.contains("- Topic number 11\n"));
+        assert!(!md.contains("- Topic number 12\n"));
+        assert!(!md.contains(&"x".repeat(81)));
+    }
+
+    #[test]
+    fn same_words_under_different_labels_in_two_files_show_no_speaker() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("audio.jsonl"),
+            r#"{"start": "00:00:01", "speaker": 1, "text": "let us check the dashboard"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("imported_audio.jsonl"),
+            r#"{"start": "00:00:02", "speaker": 2, "text": "let us check the dashboard"}"#,
+        )
+        .unwrap();
+        let sense =
+            json!({"quotes": [{"speaker": "Speaker 1", "text": "let us check the dashboard"}]});
+        let eval = evaluate_topics(dir.path(), sense.as_object().unwrap());
+        assert_eq!(eval.kept_quotes, 1);
+        let md = eval.markdown.unwrap();
+        assert!(!md.contains("Speaker 1"), "{md}");
+        assert!(!md.contains("Speaker 2"), "{md}");
+        assert!(md.contains("let us check the dashboard"), "{md}");
+    }
+
+    #[test]
+    fn an_empty_speaker_label_shows_no_speaker() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("audio.jsonl"),
+            r#"{"start": "00:00:01", "speaker": "  ", "text": "we ship on monday"}"#,
+        )
+        .unwrap();
+        let sense = json!({"quotes": [{"speaker": "x", "text": "we ship on monday"}]});
+        let md = evaluate_topics(dir.path(), sense.as_object().unwrap())
+            .markdown
+            .unwrap();
+        assert!(md.contains("- we ship on monday"), "{md}");
+        assert!(!md.contains(": we ship"), "{md}");
     }
 
     #[test]
