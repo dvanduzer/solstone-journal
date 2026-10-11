@@ -101,6 +101,8 @@ fn accept(listener: &UnixListener, coordinator: &mut Coordinator) -> BufReader<U
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Darwin can inherit the listener's nonblocking mode.
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(TIMEOUT)).unwrap();
                 stream.set_write_timeout(Some(TIMEOUT)).unwrap();
                 return BufReader::new(stream);
