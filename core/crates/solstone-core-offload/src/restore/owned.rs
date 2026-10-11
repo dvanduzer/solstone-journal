@@ -28,7 +28,8 @@ use crate::restore_intent_store::transaction::{
 use crate::restore_prepared::PreparedRestore;
 
 pub(crate) mod read;
-use read::RestoreRead;
+use read::{RestoreRead, check_recovery};
+use solstone_core_backup_runtime::engine::QualifiedArchiveRecoveryBinding;
 
 #[cfg(unix)]
 pub enum IntentPublication<'a> {
@@ -198,6 +199,7 @@ impl FileRecord {
 pub struct RestoreExecution<R> {
     report: RestoreResult,
     _operation: R,
+    _binding: Option<QualifiedArchiveRecoveryBinding>,
     files: Vec<FileRecord>,
 }
 
@@ -236,11 +238,11 @@ pub fn restore_bound_day<'clock>(
     day: &str,
     time: u64,
 ) -> RestoreRunOutcome<'clock> {
-    run(operation, "day", Some(day), time)
+    run(operation, None, "day", Some(day), time)
 }
 
 pub fn restore_bound_all(operation: ReadOperation<'_>, time: u64) -> RestoreRunOutcome<'_> {
-    run(operation, "all", None, time)
+    run(operation, None, "all", None, time)
 }
 
 pub fn restore_owned_bound_day(
@@ -248,11 +250,29 @@ pub fn restore_owned_bound_day(
     day: &str,
     time: u64,
 ) -> OwnedRestoreRunOutcome {
-    run(operation, "day", Some(day), time)
+    run(operation, None, "day", Some(day), time)
 }
 
 pub fn restore_owned_bound_all(operation: OwnedReadOperation, time: u64) -> OwnedRestoreRunOutcome {
-    run(operation, "all", None, time)
+    run(operation, None, "all", None, time)
+}
+
+/// Retains the actual original recovery owner through execution and consuming finish.
+pub fn restore_owned_bound_day_with_recovery(
+    operation: OwnedReadOperation,
+    binding: QualifiedArchiveRecoveryBinding,
+    day: &str,
+    time: u64,
+) -> OwnedRestoreRunOutcome {
+    run(operation, Some(binding), "day", Some(day), time)
+}
+
+pub fn restore_owned_bound_all_with_recovery(
+    operation: OwnedReadOperation,
+    binding: QualifiedArchiveRecoveryBinding,
+    time: u64,
+) -> OwnedRestoreRunOutcome {
+    run(operation, Some(binding), "all", None, time)
 }
 
 fn metadata_allowance() -> Option<u64> {
@@ -267,16 +287,27 @@ fn metadata_allowance() -> Option<u64> {
 
 fn run<'clock, R: RestoreRead<'clock>>(
     operation: R,
+    binding: Option<QualifiedArchiveRecoveryBinding>,
     scope: &str,
     day: Option<&str>,
     time: u64,
 ) -> RestoreExecution<R> {
+    if let Err(error) = check_recovery(&operation, binding.as_ref()) {
+        return RestoreExecution {
+            report: base("refused", Some("restore_held"), scope, day)
+                .with_reason_detail(error.to_string()),
+            _operation: operation,
+            _binding: binding,
+            files: Vec::new(),
+        };
+    }
     let (mut report, mut files) = match select(operation.as_read().journal_root(), scope, day) {
         Ok(selected) => selected,
         Err(report) => {
             return RestoreExecution {
                 report: *report,
                 _operation: operation,
+                _binding: binding,
                 files: Vec::new(),
             };
         }
@@ -285,6 +316,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
         return RestoreExecution {
             report,
             _operation: operation,
+            _binding: binding,
             files,
         };
     }
@@ -293,6 +325,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
         return RestoreExecution {
             report,
             _operation: operation,
+            _binding: binding,
             files,
         };
     };
@@ -305,7 +338,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
                 .map_err(|error| error.to_string())
         });
     match required {
-        Ok(required) => execute(operation, report, files, time, required),
+        Ok(required) => execute(operation, binding, report, files, time, required),
         Err(error) => {
             for file in &mut files {
                 file.reason.get_or_insert("restore_held");
@@ -315,6 +348,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
             RestoreExecution {
                 report,
                 _operation: operation,
+                _binding: binding,
                 files,
             }
         }
@@ -499,6 +533,7 @@ fn summarize(report: &mut RestoreResult, files: &[FileRecord]) {
 // retained configuration. It is repeated on the actual stage before any WAN.
 fn execute<'clock, R: RestoreRead<'clock>>(
     mut operation: R,
+    binding: Option<QualifiedArchiveRecoveryBinding>,
     mut report: RestoreResult,
     mut files: Vec<FileRecord>,
     time: u64,
@@ -543,11 +578,12 @@ fn execute<'clock, R: RestoreRead<'clock>>(
                 continue;
             }
         };
-        match StagedRestore::read(
+        match StagedRestore::read_with_recovery(
             destination,
             &mut operation,
             file.witness.clone(),
             required_capacity,
+            binding.as_ref(),
         ) {
             Err(failure) => {
                 file.reason = Some("restore_held");
@@ -568,6 +604,7 @@ fn execute<'clock, R: RestoreRead<'clock>>(
     RestoreExecution {
         report,
         _operation: operation,
+        _binding: binding,
         files,
     }
 }

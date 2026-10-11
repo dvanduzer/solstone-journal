@@ -7,22 +7,32 @@ pub fn prepare_legacy_restore<'clock>(
     operation: ReadOperation<'clock>,
     selection: LegacyRestoreSelection,
 ) -> LegacyRestoreReviewOutcome<'clock> {
-    prepare(operation, selection)
+    prepare(operation, None, selection)
 }
 
 pub fn prepare_owned_legacy_restore(
     operation: OwnedReadOperation,
     selection: LegacyRestoreSelection,
 ) -> OwnedLegacyRestoreReviewOutcome {
-    prepare(operation, selection)
+    prepare(operation, None, selection)
+}
+
+pub fn prepare_owned_legacy_restore_with_recovery(
+    operation: OwnedReadOperation,
+    binding: QualifiedArchiveRecoveryBinding,
+    selection: LegacyRestoreSelection,
+) -> OwnedLegacyRestoreReviewOutcome {
+    prepare(operation, Some(binding), selection)
 }
 
 fn prepare<'clock, R: RestoreRead<'clock>>(
     operation: R,
+    recovery_binding: Option<QualifiedArchiveRecoveryBinding>,
     selection: LegacyRestoreSelection,
 ) -> LegacyRestoreReview<R> {
     let mut outcome = LegacyRestoreReview {
         operation,
+        recovery_binding,
         selection,
         destination: None,
         manifest: None,
@@ -145,10 +155,12 @@ impl<R> LegacyRestoreReview<R> {
                 sha256: &witness.file.sha256,
             })
             .collect();
+        self.qualification()?;
         let resolved = self
             .operation
             .discover_historical_snapshot(snapshot, &files)
             .map_err(read_refusal)?;
+        self.qualification()?;
         if resolved.files.len() != manifest.files.len() {
             return Err(refuse("legacy_resolution_changed"));
         }
@@ -219,10 +231,7 @@ impl<R> LegacyRestoreReview<R> {
         destination
             .revalidate()
             .map_err(|_| refuse("legacy_destination_changed"))?;
-        self.operation
-            .as_read()
-            .revalidate_admission()
-            .map_err(read_refusal)?;
+        self.qualification()?;
         self.probes.push(ProbeRecord {
             name: name.into(),
             capacity: None,
@@ -255,10 +264,7 @@ impl<R> LegacyRestoreReview<R> {
         destination
             .revalidate()
             .map_err(|_| refuse("legacy_destination_changed"))?;
-        self.operation
-            .as_read()
-            .revalidate_admission()
-            .map_err(read_refusal)
+        self.qualification()
     }
 
     fn verify_probe<'clock>(
@@ -268,6 +274,7 @@ impl<R> LegacyRestoreReview<R> {
     where
         R: RestoreRead<'clock>,
     {
+        self.qualification()?;
         let stage = match self.probe_owner.take() {
             Some(ProbeOwner::Stage(stage)) => stage,
             owner => {
@@ -282,41 +289,58 @@ impl<R> LegacyRestoreReview<R> {
                 return Err(refuse("legacy_target_unavailable"));
             }
         };
-        let mut media = match self.operation.read_exact(exact, target) {
+        if let Err(error) = self.qualification() {
+            self.probe_owner = Some(ProbeOwner::ReadyTarget(target));
+            return Err(error);
+        }
+        let media = match self.operation.read_exact(exact, target) {
             Ok(media) => media,
             Err(error) => {
                 self.probe_owner = Some(ProbeOwner::Readback(error));
                 return Err(refuse("legacy_verification_failed"));
             }
         };
-        let Some(record) = self.probes.last_mut() else {
-            self.probe_owner = Some(ProbeOwner::Prepared(media));
+        self.probe_owner = Some(ProbeOwner::Prepared(media));
+        let Some(ProbeOwner::Prepared(media)) = self.probe_owner.as_ref() else {
             return Err(refuse("legacy_probe_unavailable"));
         };
-        record.digest = Some(media.digest().clone());
-        let cleanup = media.cleanup();
-        record.cleanup = Some(cleanup);
+        self.probes
+            .last_mut()
+            .ok_or_else(|| refuse("legacy_probe_unavailable"))?
+            .digest = Some(media.digest().clone());
+        // Qualification after dump is required BEFORE cleanup, even for a verified file.
+        self.qualification()?;
+        let cleanup = match self.probe_owner.as_mut() {
+            Some(ProbeOwner::Prepared(media)) => media.cleanup(),
+            _ => return Err(refuse("legacy_probe_unavailable")),
+        };
+        self.probes
+            .last_mut()
+            .ok_or_else(|| refuse("legacy_probe_unavailable"))?
+            .cleanup = Some(cleanup);
+        self.qualification()?;
         if cleanup != Cleanup::Complete {
-            self.probe_owner = Some(ProbeOwner::Prepared(media));
             return Err(refuse("legacy_probe_cleanup_held"));
         }
         let destination = self
             .destination
             .as_ref()
             .ok_or_else(|| refuse("legacy_destination_unavailable"))?;
-        record.parent_sync = Some(destination.stage_parent().sync());
-        if !record.parent_sync.as_ref().is_some_and(Result::is_ok) {
-            self.probe_owner = Some(ProbeOwner::Prepared(media));
+        let sync = destination.stage_parent().sync();
+        let confirmed = sync.is_ok();
+        self.probes
+            .last_mut()
+            .ok_or_else(|| refuse("legacy_probe_unavailable"))?
+            .parent_sync = Some(sync);
+        if !confirmed {
             return Err(refuse("legacy_probe_sync_uncertain"));
         }
-        // Only actual cleanup+parent sync releases this probe before the next census.
-        drop(media);
         destination
             .revalidate()
             .map_err(|_| refuse("legacy_destination_changed"))?;
-        self.operation
-            .as_read()
-            .revalidate_admission()
-            .map_err(read_refusal)
+        self.qualification()?;
+        // Only confirmed cleanup/sync and the same live token allow releasing this probe.
+        self.probe_owner = None;
+        Ok(())
     }
 }

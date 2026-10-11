@@ -7,10 +7,16 @@ use solstone_core_backup::archive_readback::{
     ExactArchiveFile, HistoricalArchiveFile, HistoricalSnapshotFiles, OwnedReadOperation,
     ReadOperation, ReadbackError, ReadbackFailure,
 };
+use solstone_core_backup_runtime::engine::{
+    QualifiedArchiveRecoveryBinding, RecoveryBindingRefusal,
+};
 use solstone_core_journal_io::media::{OwnedMediaTarget, PreparedMedia};
 
 pub(crate) trait RestoreRead<'clock> {
     fn as_read(&self) -> &ReadOperation<'clock>;
+    fn as_owned(&self) -> Option<&OwnedReadOperation> {
+        None
+    }
     fn discover_historical_snapshot(
         &mut self,
         selector: &str,
@@ -43,6 +49,9 @@ impl<'clock> RestoreRead<'clock> for ReadOperation<'clock> {
     }
 }
 impl RestoreRead<'static> for OwnedReadOperation {
+    fn as_owned(&self) -> Option<&OwnedReadOperation> {
+        Some(self)
+    }
     fn as_read(&self) -> &ReadOperation<'static> {
         OwnedReadOperation::as_read(self)
     }
@@ -60,4 +69,18 @@ impl RestoreRead<'static> for OwnedReadOperation {
     ) -> Result<PreparedMedia, ReadbackFailure> {
         OwnedReadOperation::read_exact(self, file, target)
     }
+}
+
+/// Only the two original read types implement this private dispatch. DATA is never input.
+pub(crate) fn check_recovery<'clock>(
+    operation: &impl RestoreRead<'clock>,
+    binding: Option<&QualifiedArchiveRecoveryBinding>,
+) -> Result<(), RecoveryBindingRefusal> {
+    if let Some(binding) = binding {
+        let operation = operation
+            .as_owned()
+            .ok_or(RecoveryBindingRefusal::Pairing(ReadbackError::Unsupported))?;
+        binding.revalidate_for_read(operation)?;
+    }
+    Ok(())
 }

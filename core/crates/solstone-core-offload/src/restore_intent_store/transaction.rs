@@ -7,11 +7,13 @@
 use std::ffi::OsStr;
 use std::sync::Arc;
 
-use solstone_core_backup::archive_readback::{ExactArchiveFile, ReadOperation, ReadbackFailure};
+use solstone_core_backup::archive_readback::{
+    ExactArchiveFile, OwnedReadOperation, ReadOperation, ReadbackFailure,
+};
 use solstone_core_journal_io::activity_obligations::observe_with_carrier;
 use solstone_core_journal_io::media::{
     Cleanup, Confirmation, Durability, MediaObservation, MediaStage, OwnedMediaFailure,
-    PreparedMedia, PublicationEffect, PublicationReceipt, RootActivityCarrier,
+    OwnedMediaTarget, PreparedMedia, PublicationEffect, PublicationReceipt, RootActivityCarrier,
 };
 use solstone_core_journal_io::{JournalRoot, LockOptions};
 use solstone_core_retention::archive_catalog::{
@@ -34,6 +36,7 @@ use crate::ledger::writer::{
 use crate::restore::owned::RestoreRegisterRefusal;
 use crate::restore::owned::read::RestoreRead;
 use crate::restore_prepared::PreparedRestore;
+use solstone_core_backup_runtime::engine::QualifiedArchiveRecoveryBinding;
 use solstone_core_retention::restore_intent::{
     AttemptEffects, CurrentContent, Obligation, PublicationDecision, RecoveryDecision,
     RegisterDecision, RepairHold, RestoreIntent, StageEvidence, content_observation,
@@ -55,13 +58,72 @@ pub(super) enum Hold {
 
 enum Admission<'operation, 'clock> {
     Readback(&'operation ReadOperation<'clock>),
+    Recovery(
+        &'operation OwnedReadOperation,
+        &'operation QualifiedArchiveRecoveryBinding,
+    ),
     #[cfg(all(test, feature = "full-tests", unix))]
     LocalTest(&'operation std::cell::Cell<bool>),
 }
 
-impl Admission<'_, '_> {
+impl<'operation, 'clock> Admission<'operation, 'clock> {
+    fn for_read(
+        operation: &'operation impl RestoreRead<'clock>,
+        binding: Option<&'operation QualifiedArchiveRecoveryBinding>,
+    ) -> Self {
+        match (binding, operation.as_owned()) {
+            (Some(binding), Some(operation)) => Self::Recovery(operation, binding),
+            _ => Self::Readback(operation.as_read()),
+        }
+    }
+
+    fn operation(&self) -> Option<&ReadOperation<'_>> {
+        match self {
+            Self::Readback(operation) => Some(operation),
+            Self::Recovery(operation, _) => Some(operation.as_read()),
+            #[cfg(all(test, feature = "full-tests", unix))]
+            Self::LocalTest(_) => None,
+        }
+    }
+
+    fn attach(&self, intent: &mut RestoreIntent) -> Result<(), Hold> {
+        if let Self::Recovery(operation, binding) = self {
+            binding
+                .revalidate_for_read(operation)
+                .map_err(|error| Hold::Admission(error.to_string()))?;
+            // Only this fresh, unpersisted initial value reaches attachment.
+            if intent.recovery_binding.is_some()
+                || intent.outcome.is_some()
+                || intent.confirmed.is_some()
+                || intent.marker != Obligation::Pending
+                || intent.event_recorded != Obligation::Pending
+                || intent.cleanup != Obligation::Pending
+                || intent.event.files.len() != 1
+                || !intent
+                    .event
+                    .files
+                    .first()
+                    .is_some_and(|file| file.disposition == RestoreDisposition::Unattempted)
+            {
+                return Err(Hold::Repair(RepairHold::InvalidIntent));
+            }
+            intent.recovery_binding = Some(binding.data().clone());
+            intent.validate().map_err(Hold::Repair)?;
+        }
+        Ok(())
+    }
+
     fn check(&self) -> Result<(), Hold> {
         match self {
+            Self::Recovery(operation, binding) => {
+                binding
+                    .revalidate_for_read(operation)
+                    .map_err(|error| Hold::Admission(error.to_string()))?;
+                operation
+                    .as_read()
+                    .revalidate_admission()
+                    .map_err(|error| Hold::Admission(error.to_string()))
+            }
             Self::Readback(operation) => operation
                 .revalidate_admission()
                 .map_err(|error| Hold::Admission(error.to_string())),
@@ -89,7 +151,7 @@ impl Owner<'_, '_> {
         if !Arc::ptr_eq(self.root(), self.destination.journal_root()) {
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
-        if let Admission::Readback(operation) = &self.admission
+        if let Some(operation) = self.admission.operation()
             && (!Arc::ptr_eq(operation.journal_root(), self.root())
                 || !Arc::ptr_eq(operation.carrier(), &self.carrier))
         {
@@ -118,6 +180,8 @@ enum StagingEvidence {
     Target(OwnedMediaFailure<MediaStage>),
     Unconsumed(MediaStage),
     Readback(ReadbackFailure),
+    Prepared(PreparedMedia),
+    ReadyTarget(OwnedMediaTarget),
 }
 
 #[must_use]
@@ -267,7 +331,34 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         witness: ArchiveWitness,
         required_capacity: u64,
     ) -> Result<Self, Box<StagingFailure>> {
-        Self::read_source(destination, operation, witness, required_capacity, None)
+        Self::read_source(
+            destination,
+            operation,
+            witness,
+            required_capacity,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn read_with_recovery(
+        destination: PreparedRestore,
+        operation: &'operation mut impl RestoreRead<'clock>,
+        witness: ArchiveWitness,
+        required_capacity: u64,
+        recovery: Option<&'operation QualifiedArchiveRecoveryBinding>,
+    ) -> Result<Self, Box<StagingFailure>> {
+        if recovery.is_none() {
+            return Self::read(destination, operation, witness, required_capacity);
+        }
+        Self::read_source(
+            destination,
+            operation,
+            witness,
+            required_capacity,
+            None,
+            recovery,
+        )
     }
 
     pub(crate) fn read_legacy(
@@ -276,6 +367,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         witness: ArchiveWitness,
         required_capacity: u64,
         binding: LegacyRestoreBinding,
+        recovery: Option<&'operation QualifiedArchiveRecoveryBinding>,
     ) -> Result<Self, Box<StagingFailure>> {
         Self::read_source(
             destination,
@@ -283,6 +375,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             witness,
             required_capacity,
             Some(binding),
+            recovery,
         )
     }
 
@@ -292,15 +385,19 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         witness: ArchiveWitness,
         required_capacity: u64,
         legacy_binding: Option<LegacyRestoreBinding>,
+        recovery: Option<&'operation QualifiedArchiveRecoveryBinding>,
     ) -> Result<Self, Box<StagingFailure>> {
         let carrier = Arc::clone(operation.as_read().carrier());
         let owner = Owner {
             carrier,
             destination,
-            admission: Admission::Readback(operation.as_read()),
+            admission: Admission::for_read(operation, recovery),
             media: None,
         };
         let preflight = (|| {
+            if recovery.is_some() && operation.as_owned().is_none() {
+                return Err(Hold::Repair(RepairHold::UnboundWitness));
+            }
             if !Arc::ptr_eq(operation.as_read().journal_root(), owner.root()) {
                 return Err(Hold::Repair(RepairHold::UnboundWitness));
             }
@@ -403,6 +500,9 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 ));
             }
         };
+        if let Err(hold) = owner.native_check().and_then(|()| owner.admission.check()) {
+            return Err(fail(owner, hold, StagingEvidence::ReadyTarget(target)));
+        }
         // Release the immutable admission borrow only while the same operation
         // performs its owned dump; retain it again through every local effect.
         let Owner {
@@ -432,9 +532,19 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         let owner = Owner {
             carrier,
             destination,
-            admission: Admission::Readback(operation.as_read()),
+            admission: Admission::for_read(operation, recovery),
             media: Some(media),
         };
+        if let Err(hold) = owner.native_check().and_then(|()| owner.admission.check()) {
+            return Err(Box::new(StagingFailure {
+                carrier: owner.carrier,
+                destination: owner.destination,
+                evidence: owner
+                    .media
+                    .map_or(StagingEvidence::None, StagingEvidence::Prepared),
+                hold,
+            }));
+        }
         Ok(Self {
             owner,
             witness,
@@ -636,7 +746,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             {
                 return Err(Hold::Repair(RepairHold::MarkChanged));
             }
-            let intent = if let Some(binding) = legacy_binding {
+            let mut intent = if let Some(binding) = legacy_binding {
                 RestoreIntent::new_legacy(
                     binding,
                     witness,
@@ -654,6 +764,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 )
             }
             .map_err(Hold::Repair)?;
+            result.owner.admission.attach(&mut intent)?;
             #[cfg(all(test, feature = "full-tests", unix))]
             tests::checkpoint(tests::Point::AfterInitialMark);
             let claims = OutputClaims::acquire(
@@ -706,6 +817,8 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 writes: Vec::new(),
             });
             result.persist()?;
+            #[cfg(all(test, feature = "full-tests", unix))]
+            tests::checkpoint(tests::Point::AfterInitialIntent);
             result.effect_check(&commit)?;
             if result.inspect()?.publication == PublicationDecision::HistoricalOnly {
                 return Err(Hold::Repair(RepairHold::OperationCollision));
@@ -848,6 +961,17 @@ impl TransactionOutcome<'_, '_> {
                     Admission::Readback(read) => {
                         conditional_retire_restored(RestoredMarkMutation {
                             read,
+                            operation: &intent.event,
+                            confirmed: &confirmed_live,
+                            plan,
+                            claims,
+                            commit,
+                        })
+                        .map_err(RestoreRegisterRefusal::Restored)
+                    }
+                    Admission::Recovery(read, _) => {
+                        conditional_retire_restored(RestoredMarkMutation {
+                            read: read.as_read(),
                             operation: &intent.event,
                             confirmed: &confirmed_live,
                             plan,

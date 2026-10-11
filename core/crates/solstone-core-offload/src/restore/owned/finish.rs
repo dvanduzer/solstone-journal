@@ -68,6 +68,7 @@ enum OwnedRead {
 pub struct OwnedRestoreFinishHold {
     report: RestoreResult,
     files: Vec<FileRecord>,
+    _binding: Option<QualifiedArchiveRecoveryBinding>,
     read: OwnedRead,
 }
 
@@ -114,7 +115,9 @@ impl<'clock> RestoreRunOutcome<'clock> {
         mut self,
     ) -> Result<(SettledDirectRead<'clock>, SettledRestoreReport), Box<HeldRestoreFinish<'clock>>>
     {
-        if let Err(refusal) = qualify_native(&self.files, &self._operation) {
+        if let Err(refusal) = recovery_check(&self._operation, self._binding.as_ref())
+            .and_then(|()| qualify_native(&self.files, &self._operation))
+        {
             return Err(Box::new(HeldRestoreFinish {
                 owner: HeldOwner::Native {
                     outcome: Box::new(self),
@@ -122,7 +125,9 @@ impl<'clock> RestoreRunOutcome<'clock> {
                 },
             }));
         }
-        if let Err(refusal) = cleanup_native(&mut self.files, self._operation.carrier()) {
+        if let Err(refusal) =
+            cleanup_native(&mut self.files, &self._operation, self._binding.as_ref())
+        {
             return Err(Box::new(HeldRestoreFinish {
                 owner: HeldOwner::Native {
                     outcome: Box::new(self),
@@ -133,8 +138,10 @@ impl<'clock> RestoreRunOutcome<'clock> {
         let Self {
             report,
             _operation: operation,
+            _binding: binding,
             files,
         } = self;
+        drop(binding);
         match operation.settle_direct() {
             Err(read) => Err(Box::new(HeldRestoreFinish {
                 owner: HeldOwner::Lower {
@@ -230,11 +237,13 @@ impl<'clock> HeldRestoreFinish<'clock> {
                     report,
                     files,
                     _operation: operation,
+                    _binding: binding,
                 } = *outcome;
                 match operation.into_owned_hold() {
                     Ok(read) => Ok(OwnedRestoreFinishHold {
                         report,
                         files,
+                        _binding: binding,
                         read: OwnedRead::Native {
                             read: Box::new(read),
                             refusal,
@@ -246,6 +255,7 @@ impl<'clock> HeldRestoreFinish<'clock> {
                                 report,
                                 files,
                                 _operation: *operation,
+                                _binding: binding,
                             }),
                             refusal,
                         },
@@ -260,6 +270,7 @@ impl<'clock> HeldRestoreFinish<'clock> {
                 Ok(read) => Ok(OwnedRestoreFinishHold {
                     report,
                     files,
+                    _binding: None,
                     read: OwnedRead::Lower(read),
                 }),
                 Err(read) => Err(Box::new(Self {
@@ -319,12 +330,27 @@ impl SettledRestoreReport {
     }
 }
 
-fn cleanup_native(
-    files: &mut [FileRecord],
-    carrier: &Arc<RootActivityCarrier>,
+fn recovery_check<'clock>(
+    operation: &impl RestoreRead<'clock>,
+    binding: Option<&QualifiedArchiveRecoveryBinding>,
 ) -> Result<(), NativeRefusal> {
+    check_recovery(operation, binding).map_err(|_| NativeRefusal {
+        file: None,
+        failure: SettlementFailure::refused("settlement_recovery_binding_changed"),
+        readback: None,
+    })
+}
+
+fn cleanup_native<'clock>(
+    files: &mut [FileRecord],
+    operation: &impl RestoreRead<'clock>,
+    binding: Option<&QualifiedArchiveRecoveryBinding>,
+) -> Result<(), NativeRefusal> {
+    recovery_check(operation, binding)?;
+    let carrier = operation.as_read().carrier();
     // Inspect all files first; retain every earlier successful cleanup on a later refusal.
     for (index, file) in files.iter_mut().enumerate() {
+        recovery_check(operation, binding)?;
         if let FileOwner::Transaction(transaction) = &mut file.owner
             && let Err(failure) = transaction
                 .revalidate_settlement(carrier)
@@ -337,8 +363,10 @@ fn cleanup_native(
                 readback: None,
             });
         }
+        recovery_check(operation, binding)?;
     }
-    Ok(())
+    // Last original-token observation precedes release and lower settlement.
+    recovery_check(operation, binding)
 }
 
 fn settled_files(files: Vec<FileRecord>) -> Vec<SettledFile> {
@@ -382,13 +410,15 @@ impl OwnedRestoreRunOutcome {
     pub fn settle_direct(
         mut self,
     ) -> Result<(OwnedSettledDirectRead, SettledRestoreReport), Box<OwnedRestoreFinishHold>> {
-        let qualified = qualify_native(&self.files, self._operation.as_read());
-        if let Err(refusal) =
-            qualified.and_then(|()| cleanup_native(&mut self.files, self._operation.carrier()))
-        {
+        let qualified = recovery_check(&self._operation, self._binding.as_ref())
+            .and_then(|()| qualify_native(&self.files, self._operation.as_read()));
+        if let Err(refusal) = qualified.and_then(|()| {
+            cleanup_native(&mut self.files, &self._operation, self._binding.as_ref())
+        }) {
             return Err(Box::new(OwnedRestoreFinishHold {
                 report: self.report,
                 files: self.files,
+                _binding: self._binding,
                 read: OwnedRead::Native {
                     read: Box::new(self._operation.into_owned_hold()),
                     refusal,
@@ -399,11 +429,14 @@ impl OwnedRestoreRunOutcome {
             report,
             files,
             _operation,
+            _binding,
         } = self;
+        drop(_binding);
         match _operation.settle_direct() {
             Err(read) => Err(Box::new(OwnedRestoreFinishHold {
                 report,
                 files,
+                _binding: None,
                 read: OwnedRead::Lower(read),
             })),
             Ok(read) => Ok((
@@ -420,6 +453,7 @@ impl OwnedRestoreRunOutcome {
         OwnedRestoreFinishHold {
             report: self.report,
             files: self.files,
+            _binding: self._binding,
             read: OwnedRead::Native {
                 read: Box::new(self._operation.into_owned_hold()),
                 refusal: NativeRefusal {

@@ -394,7 +394,9 @@ fn finished_native_facts(
 #[test]
 #[ignore = "requires a copied current package and synthetic direct Native finish fixture"]
 fn packaged_native_restore_finish_entry() {
-    use crate::restore::owned::{RestoreFinishRefusal, restore_owned_bound_day};
+    use crate::restore::owned::{
+        RestoreFinishRefusal, restore_owned_bound_day, restore_owned_bound_day_with_recovery,
+    };
     use solstone_core_backup_runtime::{
         DirectReadFinishState, UreqHttpTransport, admit_prepared_archive_owned_read_installed,
     };
@@ -419,7 +421,7 @@ fn packaged_native_restore_finish_entry() {
     .unwrap();
     assert!(matches!(
         input.mode.as_str(),
-        "complete" | "late_destination"
+        "complete" | "late_destination" | "recovery_complete" | "recovery_drift"
     ));
     let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
     // Synthetic historical metadata backed by the fixture's actual snapshot,
@@ -473,7 +475,87 @@ fn packaged_native_restore_finish_entry() {
     assert!(Arc::ptr_eq(read.carrier(), finish.carrier()));
     assert!(Arc::ptr_eq(read.owned_clock(), &clock));
     assert!(Arc::ptr_eq(finish.owned_clock(), &clock));
-    let outcome = restore_owned_bound_day(read, &proof.target.day, 2);
+    let initial_checked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let outcome = if input.mode.starts_with("recovery_") {
+        let binding = finish
+            .observe_recovery_binding(&read)
+            .unwrap_or_else(|error| panic!("actual recovery observer refused: {error:?}"));
+        binding.revalidate_for_read(&read).unwrap();
+        let expected = binding.data().clone();
+        let check_root = input.journal.clone();
+        let checked = std::rc::Rc::clone(&initial_checked);
+        let drift = input.mode == "recovery_drift";
+        with_hook(
+            Point::AfterInitialIntent,
+            move || {
+                let directory = check_root.join("health/offload/restore-intents");
+                let paths: Vec<_> = fs::read_dir(directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                assert_eq!(paths.len(), 1);
+                let original = RestoreIntent::decode(Ok(&fs::read(&paths[0]).unwrap())).unwrap();
+                assert_eq!(original.recovery_binding.as_ref(), Some(&expected));
+                assert!(original.outcome.is_none());
+                assert_eq!(
+                    original.event.files[0].disposition,
+                    RestoreDisposition::Unattempted
+                );
+                assert!(
+                    !check_root
+                        .join("chronicle/20261009/120000_60_fixture/audio.flac")
+                        .exists()
+                );
+                checked.set(true);
+                if drift {
+                    fs::write(check_root.join("backup-activity.lock"), b"changed stamp").unwrap();
+                }
+            },
+            || restore_owned_bound_day_with_recovery(read, binding, &proof.target.day, 2),
+        )
+    } else {
+        restore_owned_bound_day(read, &proof.target.day, 2)
+    };
+    if input.mode == "recovery_drift" {
+        assert!(initial_checked.get());
+        assert_eq!(outcome.report().files_restored, 0);
+        assert_eq!(outcome.report().bytes_restored, 0);
+        assert!(!segment.join("audio.flac").exists());
+        let file = outcome.files().next().unwrap();
+        assert_eq!(file.disposition, RestoreDisposition::Unattempted);
+        let crate::restore::owned::FileEvidence::Transaction(facts) = file.evidence else {
+            panic!("durable intent evidence lost");
+        };
+        assert!(facts.publication.is_none());
+        assert!(
+            facts
+                .intent_writes
+                .iter()
+                .any(|write| write.named_read_confirmed)
+        );
+        assert!(facts.store_exclusion_retained && facts.retained_media && facts.hold.is_some());
+        let held = outcome.into_owned_hold();
+        let unknown = finish.into_unknown();
+        let custody = std::thread::spawn(move || (held, unknown)).join().unwrap();
+        assert!(std::ptr::eq(
+            Arc::as_ptr(custody.0.carrier()),
+            carrier.as_ptr()
+        ));
+        assert_eq!(custody.1.state(), DirectReadFinishState::Unknown);
+        assert!(custody.1.retirement().is_none());
+        assert!(lease.upgrade().is_some());
+        assert!(matches!(
+            ActivityLease::try_acquire(Arc::clone(&root)),
+            Err(ActivityAdmissionError::Busy)
+        ));
+        println!(
+            "NATIVE_FINISH_RESULT {}",
+            serde_json::json!({"mode":input.mode,"result":{
+            "state":"NativeHeld","initial_binding_confirmed":true,"published_bytes":0,
+            "closed_transfer":true,"same_original_carrier":true,"held_lease_busy":true,"runtime":"Unknown","retirement":false}})
+        );
+        return;
+    }
     assert_eq!(outcome.report().status, "ok", "{:?}", outcome.report());
     assert_eq!(outcome.report().files_restored, 1);
     assert_eq!(outcome.report().bytes_restored, input.bytes);
@@ -489,7 +571,7 @@ fn packaged_native_restore_finish_entry() {
         ),
         input.sha256
     );
-    let result = if input.mode == "complete" {
+    let result = if matches!(input.mode.as_str(), "complete" | "recovery_complete") {
         let (settled, report) = match outcome.settle_direct() {
             Ok(settled) => settled,
             Err(_) => panic!("genuine Native settlement remained held"),
@@ -556,7 +638,7 @@ fn packaged_native_restore_finish_entry() {
         assert_eq!(report.report().bytes_restored, input.bytes);
         serde_json::json!({"state":"Completed","facts":facts,"retirement":retirement,
             "held_lease_busy":true,"next_installed_admission":true,"next_completed":true,
-            "settled_report_retained":true})
+            "settled_report_retained":true,"initial_binding_confirmed":initial_checked.get()})
     } else {
         let tombstone = segment.join("tombstone.json");
         let (held, fired) = run_with_media_hook(

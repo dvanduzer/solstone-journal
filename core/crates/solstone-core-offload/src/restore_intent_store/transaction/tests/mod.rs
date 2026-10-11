@@ -23,6 +23,7 @@ mod settlement;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Point {
     AfterInitialMark,
+    AfterInitialIntent,
     AfterPublication,
     BeforeNoEffectPersist,
     BeforeRestoredCas,

@@ -321,6 +321,14 @@ impl StagingFailure {
                 StagingEvidence::Target(_)
                 | StagingEvidence::Unconsumed(_)
                 | StagingEvidence::Readback(_) => true,
+                StagingEvidence::ReadyTarget(target) => {
+                    let _ = target.journal_root();
+                    true
+                }
+                StagingEvidence::Prepared(media) => {
+                    let _ = media.identity();
+                    true
+                }
             },
             readback: match &self.evidence {
                 StagingEvidence::Readback(error) => Some(error),

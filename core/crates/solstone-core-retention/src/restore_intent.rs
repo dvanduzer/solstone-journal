@@ -320,6 +320,10 @@ pub struct RestoreIntent {
     pub witness: ArchiveWitness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_binding: Option<LegacyRestoreBinding>,
+    /// Original live-owner observations. Decoding these cannot recreate admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_binding:
+        Option<solstone_core_journal_io::archive_recovery::ArchiveRecoveryBinding>,
     pub destination: DestinationObservation,
     pub stage: StageEvidence,
     pub retirement: MarkRetirement,
@@ -413,6 +417,7 @@ impl RestoreIntent {
             locator,
             witness,
             legacy_binding,
+            recovery_binding: None,
             destination,
             stage,
             register: if matches!(retirement, MarkRetirement::Exact { .. }) {
@@ -449,6 +454,16 @@ impl RestoreIntent {
 
     pub fn validate(&self) -> Result<(), RepairHold> {
         self.locator.validate()?;
+        if let Some(binding) = &self.recovery_binding {
+            let repository = self
+                .legacy_binding
+                .as_ref()
+                .map(|binding| binding.repository_id.as_str())
+                .or(self.witness.repository_id.as_deref());
+            if repository != Some(binding.repository_id()) {
+                return Err(RepairHold::InvalidIntent);
+            }
+        }
         match (&self.legacy_binding, &self.retirement) {
             (None, MarkRetirement::NoMark | MarkRetirement::Exact { .. }) => {
                 validate_witness(&self.locator, &self.witness)?;
@@ -631,6 +646,7 @@ impl RestoreIntent {
             || self.locator != next.locator
             || self.witness != next.witness
             || self.legacy_binding != next.legacy_binding
+            || self.recovery_binding != next.recovery_binding
             || self.destination != next.destination
             || self.stage != next.stage
             || self.retirement != next.retirement
@@ -2085,3 +2101,7 @@ pub(super) mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod recovery_tests;

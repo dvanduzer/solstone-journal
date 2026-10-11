@@ -10,7 +10,9 @@ use crate::ledger::writer::{
 };
 use solstone_core_backup::archive_readback::{HistoricalArchiveFile, ReadbackError};
 use solstone_core_journal_io::activity_obligations::observe_with_carrier;
-use solstone_core_journal_io::media::{MediaDigest, MediaStage, OwnedMediaFailure, PreparedMedia};
+use solstone_core_journal_io::media::{
+    MediaDigest, MediaStage, OwnedMediaFailure, OwnedMediaTarget, PreparedMedia,
+};
 use solstone_core_journal_io::paths::SegmentLayout;
 use solstone_core_retention::archive_catalog::{
     ArchiveManifest, JournalCatalog, LegacyRestoreBinding, LegacyRestoreFileBinding,
@@ -20,7 +22,10 @@ use std::collections::BTreeSet;
 use std::io;
 
 mod preview;
-pub use preview::{prepare_legacy_restore, prepare_owned_legacy_restore};
+pub use preview::{
+    prepare_legacy_restore, prepare_owned_legacy_restore,
+    prepare_owned_legacy_restore_with_recovery,
+};
 mod finish;
 pub use finish::{
     HeldLegacyRestoreFinish, OwnedLegacyRestoreFinishHold, SettledLegacyRestoreReport,
@@ -88,6 +93,7 @@ enum ProbeOwner {
     Target(OwnedMediaFailure<MediaStage>),
     Readback(ReadbackFailure),
     Prepared(PreparedMedia),
+    ReadyTarget(OwnedMediaTarget),
 }
 impl ProbeOwner {
     fn source(&self) -> Option<&io::Error> {
@@ -96,6 +102,10 @@ impl ProbeOwner {
             Self::Target(error) => Some(&error.error),
             Self::Stage(stage) => {
                 let _ = stage.diagnostic_path();
+                None
+            }
+            Self::ReadyTarget(target) => {
+                let _ = target.journal_root();
                 None
             }
             Self::Prepared(media) => {
@@ -139,6 +149,7 @@ fn confirmed(write: &LedgerWriteReceipt) -> bool {
 #[must_use = "retain the original read, immutable review and all uncertain probe/write owners"]
 pub struct LegacyRestoreReview<R> {
     operation: R,
+    recovery_binding: Option<QualifiedArchiveRecoveryBinding>,
     selection: LegacyRestoreSelection,
     destination: Option<PreparedRestore>,
     manifest: Option<ArchiveManifest>,
@@ -216,6 +227,7 @@ impl<R> LegacyRestoreReview<R> {
                 return Err(refuse("legacy_review_changed"));
             }
             self.fresh(&self.selected)?;
+            self.qualification()?;
             self.binding_write = Some(append_legacy_restore_binding(
                 self.operation.as_read().journal_root(),
                 binding,
@@ -272,14 +284,23 @@ impl<R> LegacyRestoreReview<R> {
         Ok(catalog)
     }
 
+    fn qualification<'clock>(&self) -> Result<(), LegacyRestoreRefusal>
+    where
+        R: RestoreRead<'clock>,
+    {
+        check_recovery(&self.operation, self.recovery_binding.as_ref())
+            .map_err(|_| refuse("legacy_recovery_binding_changed"))?;
+        self.operation
+            .as_read()
+            .revalidate_admission()
+            .map_err(read_refusal)
+    }
+
     fn census<'clock>(&self) -> Result<(), LegacyRestoreRefusal>
     where
         R: RestoreRead<'clock>,
     {
-        self.operation
-            .as_read()
-            .revalidate_admission()
-            .map_err(read_refusal)?;
+        self.qualification()?;
         let coverage = observe_with_carrier(
             self.operation.as_read().journal_root(),
             self.operation.as_read().carrier().observation(),
@@ -288,7 +309,7 @@ impl<R> LegacyRestoreReview<R> {
         if coverage.unresolved_entries().next().is_some() {
             return Err(refuse("legacy_obligations_held"));
         }
-        Ok(())
+        self.qualification()
     }
 
     fn fresh<'clock>(&self, remaining: &[ArchiveWitness]) -> Result<(), LegacyRestoreRefusal>
@@ -323,10 +344,7 @@ impl<R> LegacyRestoreReview<R> {
                 return Err(refuse("legacy_mark_changed"));
             }
         }
-        self.operation
-            .as_read()
-            .revalidate_admission()
-            .map_err(read_refusal)?;
+        self.qualification()?;
         destination
             .revalidate()
             .map_err(|_| refuse("legacy_destination_changed"))
@@ -441,6 +459,7 @@ impl<R> LegacyRestoreReview<R> {
                 file.witness.clone(),
                 self.required_capacity,
                 binding.clone(),
+                self.recovery_binding.as_ref(),
             ) {
                 Err(failure) => {
                     file.reason = Some("restore_held");
@@ -467,6 +486,7 @@ impl<R> LegacyRestoreReview<R> {
             inner: RestoreExecution {
                 report,
                 _operation: self.operation,
+                _binding: self.recovery_binding,
                 files,
             },
             evidence: LegacyEvidence {
@@ -592,6 +612,7 @@ impl OwnedLegacyRestoreReviewOutcome {
     pub fn into_owned_hold(self) -> OwnedLegacyRestoreReviewHold {
         let Self {
             operation,
+            recovery_binding,
             selection,
             destination,
             manifest,
@@ -606,6 +627,7 @@ impl OwnedLegacyRestoreReviewOutcome {
         } = self;
         LegacyRestoreReview {
             operation: operation.into_owned_hold(),
+            recovery_binding,
             selection,
             destination,
             manifest,
