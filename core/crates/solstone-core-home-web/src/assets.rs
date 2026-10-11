@@ -163,6 +163,17 @@ mod tests {
             "failed.badge",
             "failed.body",
             "failed.finish",
+            "operation.submitting",
+            "operation.running",
+            "operation.stop_pending",
+            "operation.stopping",
+            "operation.stop",
+            "operation.held",
+            "operation.completed",
+            "operation.refused",
+            "operation.unknown",
+            "operation.unavailable",
+            "operation.record_unavailable",
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();
