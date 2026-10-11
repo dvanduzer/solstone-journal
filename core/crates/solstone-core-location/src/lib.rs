@@ -13,9 +13,12 @@
 //! `chronicle/<day>/location.md` and `chronicle/<day>/health/location.json`.
 //! The captured `location.jsonl` in each segment is never written here.
 
+pub mod accuracy;
 pub mod area;
 pub mod asset;
 pub mod day;
+pub mod install;
+pub mod pack;
 pub mod projection;
 pub mod record;
 
@@ -86,10 +89,12 @@ impl DeviceDirectory for JournalDirectory {
 /// Read one day with the journal's own device names and the owner's zone.
 pub fn read_journal_day(journal: &Path, day: &str) -> Result<DayLocation, area::AreaTierError> {
     let tier = area_tier()?;
+    let packs = accuracy::installed_packs(journal);
     Ok(read_day(
         journal,
         day,
         tier,
+        packs.as_deref(),
         &JournalDirectory::read(journal),
         solstone_core_journal_config::owner_zone(journal),
     ))
@@ -101,9 +106,11 @@ pub fn reconcile_journal(
     reconciler: &mut Reconciler,
 ) -> Result<projection::ReconcileReport, area::AreaTierError> {
     let tier = area_tier()?;
+    let packs = accuracy::installed_packs(journal);
     Ok(reconciler.reconcile(
         journal,
         tier,
+        packs.as_deref(),
         &JournalDirectory::read(journal),
         solstone_core_journal_config::owner_zone(journal),
     ))

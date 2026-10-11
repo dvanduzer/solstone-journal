@@ -116,13 +116,42 @@ pub struct AreaName {
     pub region: Option<String>,
     /// The country containing the point, when no town is near.
     pub country: Option<String>,
+    /// The neighbourhood and town boundaries from the location-accuracy
+    /// download that hold the reading's whole margin. Only then is "in" said.
+    pub within: Option<crate::accuracy::Within>,
 }
 
 impl AreaName {
+    /// The state or province, else the country, that qualifies a name.
+    fn qualifier(&self) -> Option<&str> {
+        match &self.town {
+            Some(town) => Some(town.region.as_deref().unwrap_or(town.country.as_str())),
+            None => self.region.as_deref().or(self.country.as_deref()),
+        }
+    }
+
     /// The short owner-facing label: "near Golden, Colorado". A point with no
     /// town nearby is labelled by the region it falls in, without a
-    /// preposition, and a point outside every boundary has no label.
+    /// preposition, and a point outside every boundary has no label. A
+    /// reading whose whole margin lies inside a neighbourhood or town
+    /// boundary is "in" it: "in Montmartre, Paris".
     pub fn label(&self) -> Option<String> {
+        if let Some(within) = &self.within {
+            let qualifier = self.qualifier();
+            let named = match (&within.neighbourhood, &within.locality) {
+                (Some(neighbourhood), Some(locality)) => {
+                    Some(format!("in {neighbourhood}, {locality}"))
+                }
+                (None, Some(place)) | (Some(place), None) => Some(match qualifier {
+                    Some(qualifier) if qualifier != place => format!("in {place}, {qualifier}"),
+                    _ => format!("in {place}"),
+                }),
+                (None, None) => None,
+            };
+            if named.is_some() {
+                return named;
+            }
+        }
         if let Some(town) = &self.town {
             let qualifier = match &town.region {
                 Some(region) if region != &town.name => region.as_str(),
@@ -150,6 +179,14 @@ impl AreaName {
                 words.push(value.to_owned());
             }
         };
+        if let Some(within) = &self.within {
+            for name in [&within.neighbourhood, &within.locality]
+                .into_iter()
+                .flatten()
+            {
+                push(name);
+            }
+        }
         if let Some(town) = &self.town {
             push(&town.name);
             if let Some(ascii) = &town.ascii_name {
@@ -611,6 +648,7 @@ impl AreaTier {
                 }),
                 region: None,
                 country: None,
+                within: None,
             };
         }
         let region = self
@@ -636,6 +674,7 @@ impl AreaTier {
             town: None,
             region: region.map(|region| region.name.clone()),
             country,
+            within: None,
         }
     }
 

@@ -42,7 +42,7 @@ function escapeHtml(value) {
 }
 
 function leafletRecorder() {
-  const calls = { polyline: [], circleMarker: [], circle: [], fitBounds: 0, tooltips: [] };
+  const calls = { polyline: [], polygon: [], circleMarker: [], circle: [], fitBounds: 0, tooltips: [] };
   const layer = (kind, args) => {
     const object = {
       kind,
@@ -62,6 +62,7 @@ function leafletRecorder() {
     polyline(points, style) { calls.polyline.push(points); return layer('polyline', [points, style]); },
     circleMarker(point, style) { calls.circleMarker.push(point); return layer('circleMarker', [point, style]); },
     circle(point, style) { calls.circle.push(point); return layer('circle', [point, style]); },
+    polygon(rings, style) { calls.polygon.push(rings); return layer('polygon', [rings, style]); },
     featureGroup() { return layer('group', []); },
   };
   return { L, calls };
@@ -192,6 +193,60 @@ test('the bare app opens the latest day with location, or says there is none', a
   assert.deepStrictEqual(none.replaced, []);
   assert.ok(none.elements['map-state-gate'].innerHTML.includes('<empty>'));
   assert.ok('data-map-empty' in none.elements['map-shell'].attributes);
+});
+
+const named = {
+  ...day,
+  entries: [
+    { kind: 'visit', device: 0,
+      area: { label: 'in Lower Downtown, Denver', town: 'Denver', town_km: 2, within: { neighbourhood: 'Lower Downtown', locality: 'Denver' } },
+      place: { margin_m: 40,
+        at: { name: 'Union Station', layer: 'building', class: 'train_station', inside: 'Wynkoop Plaza', outline: [[[39.75, -105.0], [39.76, -105.0], [39.76, -104.99]]] },
+        near: [{ name: 'Pigtrain <Coffee>', category: 'coffee shop', distance_m: 31 }] },
+      arrival: time('08:58'), departure: time('12:06'), point: [39.7527, -105.0003, 40],
+      segments: [{ url: '/app/transcripts/20261002?stream=s#085500_300', segment: '085500_300' }] },
+    { kind: 'visit', device: 0, area: { label: 'near Denver, Colorado', town: 'Denver', town_km: 2.1 },
+      place: { margin_m: 25, at: null, near: [{ name: 'Blue Bottle', category: 'coffee shop', distance_m: 12 }, { name: 'Tattered Cover', category: '', distance_m: 20 }] },
+      arrival: time('13:00'), departure: null, point: [39.75, -104.99, 10],
+      segments: [{ url: '/app/transcripts/20261002?stream=s#130000_300', segment: '130000_300' }] },
+  ],
+  accuracy: { offered: { version: 'v1', size_bytes: 1.4e9, files: ['venues.slpk', 'containment.slpk'] },
+    installed: { version: 'v1', size_bytes: 1.4e9, venues: true, containment: true }, current: true,
+    attributions: ['Places from Overture Maps Foundation'], job: { state: 'idle' } },
+};
+
+test('a stop named by the download says at and near, and why', async () => {
+  const { elements, calls } = await run({ pathname: '/app/map/20261002', responses: { '/app/map/api/day/20261002': named }, withLeaflet: true });
+  const markup = elements['map-view-root'].innerHTML;
+  assert.ok(markup.includes('<p class="map-row-title">at Union Station</p>'));
+  assert.ok(markup.includes('in Wynkoop Plaza · in Lower Downtown, Denver'));
+  assert.ok(markup.includes('near Pigtrain &lt;Coffee&gt;'), 'venue names are escaped');
+  assert.ok(markup.includes('your phone placed you within 40 m, and all of that is inside Union Station.'));
+  assert.ok(markup.includes('Pigtrain &lt;Coffee&gt; (coffee shop) is 31 m away; your phone placed you within 40 m.'));
+  assert.ok(markup.includes('<p class="map-row-title">near Blue Bottle and Tattered Cover</p>'));
+  assert.ok(markup.includes('Tattered Cover is 20 m away'), 'no empty category');
+  assert.strictEqual(calls.polygon.length, 1, 'the outline it was inside is drawn');
+  assert.ok(markup.includes('Overture Maps'), 'the download is credited');
+});
+
+test('the accuracy card offers, follows and removes the download', async () => {
+  const card = (accuracy) => {
+    const context = { ...day, accuracy };
+    return run({ pathname: '/app/map/20261002', responses: { '/app/map/api/day/20261002': context } })
+      .then(({ elements }) => elements['map-view-root'].innerHTML);
+  };
+  const offered = { version: 'v1', size_bytes: 1.4e9, files: ['venues.slpk'] };
+  const fresh = await card({ offered, installed: null, current: false, attributions: [], job: { state: 'idle' } });
+  assert.ok(fresh.includes('data-accuracy="download">download 1.4 GB</button>'));
+  assert.ok(!fresh.includes('building, park or campus'), 'no outlines promised without the outline file');
+  const running = await card({ offered, installed: null, current: false, attributions: [], job: { state: 'downloading', received: 4.12e8, total: 1.4e9 } });
+  assert.ok(running.includes('downloading location accuracy: 412 MB of 1.4 GB'));
+  const done = await card({ offered, installed: { version: 'v1', size_bytes: 1.4e9, venues: true, containment: false }, current: true, attributions: [], job: { state: 'idle' } });
+  assert.ok(done.includes('data-accuracy="remove">remove location accuracy</button>'));
+  const full = await card({ offered: null, installed: null, current: false, attributions: [], job: { state: 'idle' } });
+  assert.ok(!full.includes('aria-label="location accuracy"'), 'nothing to offer shows no card');
+  const failed = await card({ offered, installed: null, current: false, attributions: [], job: { state: 'failed', reason_code: 'not_enough_space' } });
+  assert.ok(failed.includes("there isn&#39;t enough free space"));
 });
 
 (async () => {

@@ -22,6 +22,7 @@ use chrono::{DateTime, FixedOffset, NaiveTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use solstone_core_journal_io::{DEFAULT_STREAM, PathOrDay, Segment, StreamLocation, iter_segments};
 
+use crate::accuracy::{Packs, StopWords};
 use crate::area::{AreaName, AreaTier};
 use crate::record::{Platform, Precision, SegmentFile, Visit, parse_segment_file};
 
@@ -155,6 +156,9 @@ pub enum Entry {
     Visit {
         device: usize,
         area: AreaName,
+        /// What the location-accuracy download says about this stop, when the
+        /// owner has it and the phone's margin is within the cap.
+        place: Option<StopWords>,
         arrival: Option<LocalTime>,
         departure: Option<LocalTime>,
         point: Point,
@@ -346,11 +350,13 @@ fn add_line(sources: &mut Vec<SourceRef>, located: &[LocatedSegment], source: us
     }
 }
 
-/// Assemble one day from its segments' location files.
+/// Assemble one day from its segments' location files, naming it from the
+/// area tier and, when the owner downloaded them, the location-accuracy packs.
 pub fn read_day(
     journal: &Path,
     day: &str,
     tier: &AreaTier,
+    packs: Option<&Packs>,
     directory: &dyn DeviceDirectory,
     owner: Tz,
 ) -> DayLocation {
@@ -370,7 +376,7 @@ pub fn read_day(
         located_segments.push(segment);
         files.push((file, context));
     }
-    assemble(day, located_segments, files, tier, directory, owner)
+    assemble(day, located_segments, files, tier, packs, directory, owner)
 }
 
 fn assemble(
@@ -378,6 +384,7 @@ fn assemble(
     located_segments: Vec<LocatedSegment>,
     files: Vec<(SegmentFile, SegmentContext)>,
     tier: &AreaTier,
+    packs: Option<&Packs>,
     directory: &dyn DeviceDirectory,
     owner: Tz,
 ) -> DayLocation {
@@ -521,7 +528,14 @@ fn assemble(
             device.first = Some(observation.time);
         }
         device.last = Some(observation.time);
-        let area = tier.name_point(observation.point.latitude, observation.point.longitude);
+        let mut area = tier.name_point(observation.point.latitude, observation.point.longitude);
+        area.within = packs.and_then(|packs| {
+            packs.within(
+                observation.point.latitude,
+                observation.point.longitude,
+                observation.point.accuracy_m,
+            )
+        });
         let run_key = format!(
             "{}|{}|{:?}",
             observation.device,
@@ -620,12 +634,22 @@ fn assemble(
                     observation.visit.line,
                 );
                 order.push(key);
+                let (latitude, longitude) =
+                    (observation.visit.latitude, observation.visit.longitude);
+                let mut area = tier.name_point(latitude, longitude);
+                let mut place = None;
+                if let Some((within, words)) = packs
+                    .and_then(|packs| packs.stop(latitude, longitude, observation.visit.accuracy_m))
+                {
+                    area.within = within;
+                    place = Some(words).filter(|words| !words.is_empty());
+                }
                 merged.insert(
                     key,
                     Entry::Visit {
                         device: observation.device,
-                        area: tier
-                            .name_point(observation.visit.latitude, observation.visit.longitude),
+                        area,
+                        place,
                         arrival: observation.arrival,
                         departure: observation.departure,
                         point: Point {
@@ -753,6 +777,7 @@ pub(crate) mod tests {
             root,
             "20261001",
             tier(),
+            None,
             &directory(),
             chrono_tz::America::Denver,
         )
@@ -1009,6 +1034,7 @@ pub(crate) mod tests {
             root.path(),
             "20261001",
             tier(),
+            None,
             &directory,
             chrono_tz::America::Denver,
         );

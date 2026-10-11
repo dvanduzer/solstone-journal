@@ -1,7 +1,7 @@
 # third-party notices
 
 this file records third-party materials used by solstone, including model
-weights and place names bundled with solstone, the map app's renderer, the
+weights and place names bundled with solstone, place data an owner may download for the map app, the map app's renderer, the
 restic, rclone, nvattest and CED components bundled in every package, provider artifacts downloaded at runtime into the
 journal provider cache, and test fixtures derived from permissively licensed
 sources.
@@ -78,6 +78,59 @@ https://www.naturalearthdata.com/about/terms-of-use/
 
 Changes: outlines simplified (state and province borders to 0.01 degrees,
 country borders to 0.02 degrees) and keyed by name and ISO country code.
+
+## downloaded place data (location accuracy)
+
+An owner who chooses "location accuracy" in the map app downloads
+`venues.slpk` (SHA-256
+`7bac3fd446c7d17c0c2811ccba04579b5210c69afccabaf046075437a901316e`, version
+`overture-2026-09-23.1-r2`) from the update origin into
+`cache/location/accuracy/` in their journal. The journal reads it on the
+owner's own computer to name the places within a stop's margin of error. It is
+built by `scripts/build_location_accuracy_packs.py` from Overture Maps release
+`2026-09-23.1`, and carries the notices below in its own header.
+
+### Overture Maps Places
+
+Attribution: Overture Maps Foundation, https://overturemaps.org; see
+https://docs.overturemaps.org/attribution/
+
+License notice: per source record, CDLA-Permissive-2.0
+(https://cdla.dev/permissive-2-0/), Apache-2.0
+(https://www.apache.org/licenses/LICENSE-2.0) or CC0-1.0
+(https://creativecommons.org/publicdomain/zero/1.0/).
+
+Changes: places are filtered (confidence of at least 0.5, not permanently
+closed, at least one source other than a business registry) and reduced to
+name, category, confidence and position, re-encoded into the file's compact
+form.
+
+The full texts of CDLA-Permissive-2.0 and Apache-2.0 are in
+`licenses/CDLA-Permissive-2.0.txt` and `licenses/Apache-2.0.txt`, and travel in
+the file's header.
+
+Foursquare's notice, in full:
+
+```text
+© 2025 Foursquare Labs, Inc. All rights reserved. 
+
+The Foursquare OS Places dataset (the “Data”) is licensed under the Apache License, Version 2.0 (the "License"). You may not use, modify, or distribute the Data except in compliance with the License. 
+ 
+As set forth more fully in the License, if you use, modify, or distribute the Data, you must:
+* provide recipients with a copy of the License.
+* if applicable, include prominent notices to the extent you’ve changed the Data.
+* preserve attribution to Foursquare, including preserving the full content of this NOTICE.txt file.
+ 
+To ensure appropriate attribution to Foursquare, we recommend the following:
+* if using/distributing the Data in flat file form as-is or after making changes/modifications: include this NOTICE.txt file, which may be modified to include an additional notice of your changes/modifications, if any. 
+* if using/distributing the Data in API form as-is or after making changes/modifications: include a copy of the content from this NOTICE.txt file prominently in your developer documentation for such API, which may be modified to include an additional notice of your changes/modifications, if any. 
+ 
+You may obtain a copy of the License at: http://www.apache.org/licenses/LICENSE-2.0. Unless required by applicable law or agreed to in writing, the Data distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+See the License for the specific language governing permissions and limitations under the License.
+
+We also encourage you to join our Placemaker community (https://opensource.foursquare.com/placemaker/)—where you can contribute and provide suggestions to improve the accuracy of the Data for future releases for yourself and others.
+```
 
 ## map renderer (Leaflet)
 

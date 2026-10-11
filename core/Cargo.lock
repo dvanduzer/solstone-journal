@@ -4851,9 +4851,13 @@ version = "2.0.41"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "lzma-rs",
+ "nix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solstone-core-artifact-download",
+ "solstone-core-assets",
  "solstone-core-callosum",
  "solstone-core-indexer-store",
  "solstone-core-journal-config",

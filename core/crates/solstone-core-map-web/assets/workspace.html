@@ -248,6 +248,65 @@
   color: var(--ink-soft);
   line-height: 1.5;
 }
+.map-row-where {
+  margin: var(--space-1) 0 0;
+  color: var(--ink);
+}
+
+.map-why {
+  margin-top: var(--space-1);
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.map-why summary {
+  cursor: pointer;
+  min-height: var(--touch-min);
+  display: inline-flex;
+  align-items: center;
+}
+
+.map-why ul {
+  margin: 0;
+  padding-left: var(--space-4);
+}
+
+.map-accuracy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.map-accuracy-actions button {
+  min-height: var(--touch-min);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.map-accuracy-actions button[data-accuracy="download"] {
+  background: var(--orange);
+  border-color: var(--orange);
+  color: var(--paper);
+}
+
+.map-accuracy-actions button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.map-accuracy progress {
+  width: 100%;
+  margin-top: var(--space-2);
+  accent-color: var(--orange);
+}
 </style>
 
 <div class="workspace-content map-shell" id="map-shell">
@@ -310,6 +369,26 @@
   function pieceTime(segment) {
     const match = /^(\d{2})(\d{2})\d{2}_/.exec(String(segment || ""));
     return match ? `${match[1]}:${match[2]}` : String(segment || "");
+  }
+
+  function bytes(value) {
+    const size = Number(value) || 0;
+    if (size >= 1e9) return `${(size / 1e9).toFixed(1)} GB`;
+    return `${Math.max(1, Math.round(size / 1e6))} MB`;
+  }
+
+  function listed(names) {
+    if (names.length <= 1) return names.join("");
+    return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  }
+
+  function nearNames(place) {
+    return listed(asArray(place?.near).map((near) => near.name));
+  }
+
+  function withinName(within) {
+    if (!within) return "";
+    return [within.neighbourhood, within.locality].filter(Boolean).join(", ");
   }
 
   function setGate(markup) {
@@ -404,7 +483,52 @@
         ? "a segment your journal couldn't read"
         : `${plural(entry.lines, "line", "lines")} your journal couldn't read`;
     }
+    const place = entry.kind === "visit" ? entry.place : null;
+    if (place?.at) return `at ${place.at.name}`;
+    if (asArray(place?.near).length) return `near ${nearNames(place)}`;
     return entry.area?.label || "no named town nearby";
+  }
+
+  // Under a visit named by the download: where it was, then what was near.
+  function entryWhere(entry) {
+    const place = entry.kind === "visit" ? entry.place : null;
+    if (!place) return [];
+    const lines = [];
+    if (place.at?.inside) lines.push(`in ${place.at.inside}`);
+    if (entry.area?.label) lines.push(entry.area.label);
+    const where = [lines.join(" · ")];
+    if (place.at && asArray(place.near).length) where.push(`near ${nearNames(place)}`);
+    return where.filter(Boolean);
+  }
+
+  // The reasons behind a record's words, from the map and the phone's own
+  // margin of error.
+  function entryWhy(entry, data) {
+    const reasons = [];
+    const place = entry.kind === "visit" ? entry.place : null;
+    const margin = place?.margin_m;
+    if (place?.at) {
+      reasons.push(`your phone placed you within ${margin} m, and all of that is inside ${place.at.name}.`);
+    }
+    asArray(place?.near).forEach((near) => {
+      const what = near.category ? ` (${near.category})` : "";
+      reasons.push(`${near.name}${what} is ${near.distance_m} m away; your phone placed you within ${margin} m.`);
+    });
+    const within = withinName(entry.area?.within);
+    if (within) {
+      reasons.push(margin
+        ? `that whole area is inside ${within}.`
+        : entry.kind === "readings"
+          ? `every reading here, with its margin of error, is inside ${within}.`
+          : `your phone's position, with its margin of error, is inside ${within}.`);
+    } else if (entry.area?.town && entry.kind !== "unreadable") {
+      reasons.push(`${entry.area.town} is the town that best stands for this area, ${entry.area.town_km} km away.`);
+    }
+    const accuracy = entry.kind === "visit" ? entry.point?.[2] : null;
+    if (entry.kind === "visit" && !place && data.accuracy?.installed && Number.isFinite(accuracy) && accuracy > 100) {
+      reasons.push(`your phone placed you within ${accuracy} m, too wide to name a building or the places nearby.`);
+    }
+    return reasons;
   }
 
   function entryTime(entry, day) {
@@ -465,11 +589,115 @@
   }
 
   function renderEntry(entry, index, data) {
+    const where = entryWhere(entry).map((line) => `<p class="map-row-where">${escapeHtml(line)}</p>`).join("");
+    const reasons = entryWhy(entry, data);
+    const why = reasons.length
+      ? `<details class="map-why"><summary>why these words</summary><ul>${reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul></details>`
+      : "";
     return `<li class="map-row" data-map-entry="${index}">
       <span class="map-row-time">${escapeHtml(entryTime(entry, data.day))}</span>
       <span class="map-row-mark ${markClass(entry)}" aria-hidden="true"></span>
-      <div><p class="map-row-title">${escapeHtml(entryTitle(entry))}</p>
-      <p class="map-muted">${escapeHtml(entryMeta(entry, data))}</p>${entryActions(entry, index)}</div></li>`;
+      <div><p class="map-row-title">${escapeHtml(entryTitle(entry))}</p>${where}
+      <p class="map-muted">${escapeHtml(entryMeta(entry, data))}</p>${why}${entryActions(entry, index)}</div></li>`;
+  }
+
+  function accuracyCard(status) {
+    if (!status) return "";
+    const offered = status.offered;
+    const installed = status.installed;
+    const job = status.job || {};
+    if (!offered && !installed) return "";
+    const outlines = asArray(offered?.files).includes("containment.slpk") || installed?.containment;
+    const what = outlines
+      ? "a visit your phone reports is named by the building, park or campus it was in, and by the places within your phone's margin of error: \"at Union Station\", \"near Blue Bottle Coffee\"."
+      : "a visit your phone reports is named by the places within your phone's margin of error: \"near Blue Bottle Coffee\".";
+    let body;
+    let actions = "";
+    if (job.state === "downloading") {
+      body = `<p>downloading location accuracy: ${escapeHtml(bytes(job.received))} of ${escapeHtml(bytes(job.total))}. you can keep using your journal while it downloads.</p>
+        <progress max="${Number(job.total) || 1}" value="${Number(job.received) || 0}"></progress>`;
+    } else if (installed && status.current) {
+      body = `<p>location accuracy is on. ${escapeHtml(what)}</p>`;
+      actions = `<button type="button" data-accuracy="remove">remove location accuracy</button>
+        <span class="map-muted">frees ${escapeHtml(bytes(installed.size_bytes))}; names go back to the nearby town.</span>`;
+    } else if (installed && offered) {
+      body = `<p>location accuracy is on. a newer download is ready: ${escapeHtml(bytes(offered.size_bytes))}.</p>`;
+      actions = `<button type="button" data-accuracy="download">update</button>
+        <button type="button" data-accuracy="remove">remove location accuracy</button>`;
+    } else if (installed) {
+      body = `<p>location accuracy is on.</p>`;
+      actions = `<button type="button" data-accuracy="remove">remove location accuracy</button>`;
+    } else {
+      body = `<p>with location accuracy, ${escapeHtml(what)} without it, a visit is named by the nearby town.</p>
+        <p class="map-muted">it's ${escapeHtml(bytes(offered.size_bytes))}, the same download for everyone, so getting it says nothing about where you've been. names are looked up on your computer.</p>`;
+      actions = `<button type="button" data-accuracy="download">download ${escapeHtml(bytes(offered.size_bytes))}</button>`;
+    }
+    const failures = {
+      not_enough_space: `there isn't enough free space: location accuracy needs ${bytes(offered?.size_bytes)} free, plus some room to spare.`,
+      download_failed: "location accuracy couldn't be downloaded. try again in a while.",
+      write_failed: "location accuracy couldn't be saved in your journal's folder.",
+      nothing_offered: "this version of your journal has no location accuracy download.",
+    };
+    const failed = job.state === "failed"
+      ? `<p class="map-muted" role="status">${escapeHtml(failures[job.reason_code] || failures.download_failed)}</p>`
+      : "";
+    const notices = asArray(status.notices);
+    const credits = asArray(status.attributions).map((text) => `<p class="map-muted">${escapeHtml(text)}</p>`).join("")
+      + (notices.length
+        ? `<details class="map-why"><summary>licences</summary>${notices.map((text) => `<p class="map-muted" style="white-space: pre-line">${escapeHtml(text)}</p>`).join("")}</details>`
+        : "");
+    return `<section class="map-card map-accuracy" aria-label="location accuracy" data-accuracy-card>
+      <h2>location accuracy</h2>${body}${failed}
+      ${actions ? `<div class="map-accuracy-actions">${actions}</div>` : ""}${credits}</section>`;
+  }
+
+  function accuracyDrawn(status) {
+    const installed = status?.installed;
+    if (!installed) return "";
+    if (installed.containment) {
+      return `<p>with location accuracy, a visit can say "at" a place when your phone's whole margin of error is inside its outline, and "near" the places within that margin. "in" means the whole margin is inside a larger outline, a neighbourhood or a town. every record says why it reads the way it does.</p>`;
+    }
+    return `<p>with location accuracy, a visit can say "near" the places within your phone's margin of error. every record says why it reads the way it does.</p>`;
+  }
+
+  let accuracyTimer = null;
+
+  async function accuracyAction(action, data) {
+    root.querySelectorAll("[data-accuracy]").forEach((button) => { button.disabled = true; });
+    try {
+      const status = await window.apiJson(`/app/map/api/accuracy/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      showAccuracy(status, data);
+    } catch (err) {
+      if (window.logError) window.logError(err, { context: "map:accuracy" });
+      const status = await window.apiJson("/app/map/api/accuracy").catch(() => null);
+      showAccuracy(status, data);
+    }
+  }
+
+  function showAccuracy(status, data) {
+    const card = root.querySelector("[data-accuracy-card]");
+    if (!card) return;
+    const before = data.accuracy;
+    data.accuracy = status;
+    card.outerHTML = accuracyCard(status) || "<div data-accuracy-card hidden></div>";
+    root.querySelectorAll("[data-accuracy]").forEach((button) => {
+      button.addEventListener("click", () => accuracyAction(button.getAttribute("data-accuracy"), data));
+    });
+    clearTimeout(accuracyTimer);
+    if (status?.job?.state === "downloading") {
+      accuracyTimer = setTimeout(async () => {
+        if (!root.isConnected) return;
+        const next = await window.apiJson("/app/map/api/accuracy").catch(() => null);
+        if (next) showAccuracy(next, data);
+      }, 2000);
+    } else if (before && JSON.stringify(before.installed) !== JSON.stringify(status?.installed)) {
+      // Names change with the download, so the day is read again.
+      loadDay(data.day);
+    }
   }
 
   function renderDay(data) {
@@ -480,9 +708,10 @@
       ? `<section class="map-card map-figure-card" aria-label="map">
           <div class="map-canvas" id="map-canvas" role="region" aria-label="map of the records listed here, with towns and borders"></div>
           <p class="map-muted">named features only; streets not shown.</p>
-          <p class="map-muted">towns from <a class="map-link" href="https://www.geonames.org/" rel="noopener noreferrer">GeoNames</a> (<a class="map-link" href="https://creativecommons.org/licenses/by/4.0/" rel="noopener noreferrer">CC BY 4.0</a>) · borders from Natural Earth</p>
+          <p class="map-muted">towns from <a class="map-link" href="https://www.geonames.org/" rel="noopener noreferrer">GeoNames</a> (<a class="map-link" href="https://creativecommons.org/licenses/by/4.0/" rel="noopener noreferrer">CC BY 4.0</a>) · borders from Natural Earth${data.accuracy?.installed ? ` · ${data.accuracy.installed.containment ? "places and outlines" : "places"} from <a class="map-link" href="https://docs.overturemaps.org/attribution/" rel="noopener noreferrer">Overture Maps</a>` : ""}</p>
         </section>`
       : "";
+    const accuracy = accuracyCard(data.accuracy) || "<div data-accuracy-card hidden></div>";
     reveal(`${devices.map((device) => renderDevice(device, data.day)).join("")}
       <div class="map-columns">
         <section class="map-card" aria-label="the day, in order">
@@ -492,10 +721,12 @@
         </section>
         ${mapCard}
       </div>
+      ${accuracy}
       <section class="map-card"><details class="map-details"><summary>how this is drawn</summary>
-        <p>your journal draws this from the readings your phone sent it, and the town and border names that came with your journal. no map service is asked for anything.</p>
+        <p>your journal draws this from the readings your phone sent it, and the names that came with your journal or that you downloaded. no map service is asked for anything.</p>
         <p>there's no street map. a street map is loaded piece by piece from a map service, and asking for the right piece tells that service where you were.</p>
-        <p>each reading is named after the town that best stands for its area, which isn't always the town you were in. that's why it says "near".</p>
+        <p>without location accuracy, each reading is named after the town that best stands for its area, which isn't always the town you were in. that's why it says "near".</p>
+        ${accuracyDrawn(data.accuracy)}
         <p>for readings, the times are the first and last reading in the row. they don't say how long you were anywhere.</p>
       </details></section>
       <section class="map-card"><h2>deleting any of this</h2>
@@ -504,6 +735,10 @@
     root.querySelectorAll("[data-map-show]").forEach((button) => {
       button.addEventListener("click", () => focusEntry(Number(button.getAttribute("data-map-show")), true));
     });
+    root.querySelectorAll("[data-accuracy]").forEach((button) => {
+      button.addEventListener("click", () => accuracyAction(button.getAttribute("data-accuracy"), data));
+    });
+    if (data.accuracy?.job?.state === "downloading") showAccuracy(data.accuracy, data);
     drawMap(data);
   }
 
@@ -540,6 +775,10 @@
     asArray(data.entries).forEach((entry, index) => {
       const group = L.featureGroup();
       const points = entry.kind === "readings" ? asArray(entry.points) : entry.kind === "visit" ? [entry.point] : [];
+      const outline = entry.kind === "visit" ? asArray(entry.place?.at?.outline) : [];
+      if (outline.length) {
+        L.polygon(outline, { color: orange, weight: 1.5, dashArray: "3 3", fillColor: orange, fillOpacity: 0.06, interactive: false }).addTo(group);
+      }
       points.forEach((point) => {
         const [lat, lon, accuracy] = point;
         if (Number.isFinite(accuracy) && accuracy > 25) {
@@ -610,7 +849,7 @@
     }
   }
 
-  window.__mapWorkspace = { start, renderDay, entryTitle, entryTime, entryMeta, moment };
+  window.__mapWorkspace = { start, renderDay, entryTitle, entryTime, entryMeta, entryWhere, entryWhy, accuracyCard, moment };
   start();
 })();
 </script>

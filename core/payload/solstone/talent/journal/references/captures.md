@@ -122,7 +122,7 @@ Pre-stream segments (created before stream identity was added) have no `stream.j
 
 A phone that sends location writes `location.jsonl` into its own segments: an iPhone or Watch file starts with a `solstone.location.segment/1` header, then `solstone.location.fix/1` readings and `solstone.location.visit/1` visits the iPhone reported; an Android file holds bare readings (`timestamp` in epoch milliseconds, `lat`, `lon`, `accuracy`). Times are UTC, and the readings' own times govern, not the segment key.
 
-The journal names each day's readings at area level from place names bundled with it, and writes the words to `location.md` in the day folder (for example "readings near Golden, Colorado, United States, 14:00 to 14:10"). That file is search content, rebuilt from the segments that survive whenever they change, and it never holds coordinates. The map app shows the day itself.
+The journal names each day's readings at area level from place names bundled with it, and writes the words to `location.md` in the day folder (for example "readings near Golden, Colorado, United States, 14:00 to 14:10"). When the owner has downloaded location accuracy, a visit is also named by what lies within its margin of error ("near Pigtrain Coffee Company (coffee shop)") and "at" an outline that holds the whole margin, and a visit or a reading is "in" a neighbourhood or town whose boundary holds the whole margin. "near" describes the map around a position, never what the owner did there. That file is search content, rebuilt from the segments that survive whenever they change, and it never holds coordinates. The map app shows the day itself.
 
 ## Layer 1: Original Media
 

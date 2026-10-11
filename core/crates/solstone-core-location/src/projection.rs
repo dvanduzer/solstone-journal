@@ -28,6 +28,7 @@ use solstone_core_journal_io::{
     iter_segments, read_health_marker,
 };
 
+use crate::accuracy::{Packs, StopWords};
 use crate::area::{AreaName, AreaTier};
 use crate::asset::AREA_TIER_SHA256;
 use crate::day::{DayLocation, DeviceDirectory, Entry, LOCATION_FILE, LocalTime, read_day};
@@ -39,7 +40,7 @@ pub const BUILD_RECORD: &str = "location.json";
 const RECORD_VERSION: u32 = 1;
 /// Bumped whenever [`render_day_document`] changes what it writes, so every
 /// day's document is rewritten once by the next pass.
-const DOCUMENT_VERSION: u32 = 1;
+const DOCUMENT_VERSION: u32 = 2;
 
 /// What a day's document was built from, and what it counted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +50,9 @@ pub struct BuildRecord {
     pub source: String,
     /// The area tier the names came from.
     pub area_tier: String,
+    /// The location-accuracy packs the names came from, empty without them.
+    #[serde(default)]
+    pub packs: String,
     /// The version of the document's wording.
     pub document: u32,
     pub readings: u64,
@@ -137,20 +141,84 @@ pub fn read_build_record(journal: &Path, day: &str) -> Option<BuildRecord> {
 
 fn long_name(area: &AreaName) -> Option<String> {
     let label = area.label()?;
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |value: &str| {
+        if !value.is_empty() && !parts.iter().any(|part| part == value) {
+            parts.push(value.to_owned());
+        }
+    };
+    let preposition = match &area.within {
+        Some(within) if !within.is_empty() => {
+            for name in [&within.neighbourhood, &within.locality]
+                .into_iter()
+                .flatten()
+            {
+                push(name);
+            }
+            "in"
+        }
+        _ => "near",
+    };
     let Some(town) = &area.town else {
+        if preposition == "in" {
+            for name in [&area.region, &area.country].into_iter().flatten() {
+                push(name);
+            }
+            return Some(format!("in {}", parts.join(", ")));
+        }
         return Some(format!("with no named town nearby ({label})"));
     };
-    let mut name = format!("near {}", town.name);
-    if let Some(ascii) = &town.ascii_name {
-        name.push_str(&format!(" ({ascii})"));
+    if preposition == "near" {
+        let mut name = town.name.clone();
+        if let Some(ascii) = &town.ascii_name {
+            name.push_str(&format!(" ({ascii})"));
+        }
+        push(&name);
     }
-    if let Some(region) = &town.region
-        && region != &town.name
-    {
-        name.push_str(&format!(", {region}"));
+    if let Some(region) = &town.region {
+        push(region);
     }
-    name.push_str(&format!(", {}", town.country));
-    Some(name)
+    push(&town.country);
+    Some(format!("{preposition} {}", parts.join(", ")))
+}
+
+/// A category as words: `coffee_shop` reads "coffee shop".
+pub fn category_words(category: &str) -> String {
+    category.replace('_', " ")
+}
+
+fn listed(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+fn place_words(place: &StopWords) -> String {
+    let mut words = String::new();
+    if let Some(at) = &place.at {
+        words.push_str(&format!("at {}", at.name));
+        if let Some(inside) = &at.inside {
+            words.push_str(&format!(" in {inside}"));
+        }
+    }
+    if !place.near.is_empty() {
+        if !words.is_empty() {
+            words.push_str("; ");
+        }
+        let names: Vec<String> = place
+            .near
+            .iter()
+            .map(|near| match near.category.as_str() {
+                "" => near.name.clone(),
+                category => format!("{} ({})", near.name, category_words(category)),
+            })
+            .collect();
+        words.push_str(&format!("near {}", listed(&names)));
+    }
+    words
 }
 
 fn moment(time: &LocalTime, day: &str) -> String {
@@ -209,13 +277,17 @@ pub fn render_day_document(day: &DayLocation) -> String {
             Entry::Visit {
                 device,
                 area,
+                place,
                 arrival,
                 departure,
                 ..
             } => {
-                let Some(name) = long_name(area) else {
+                let Some(mut name) = long_name(area) else {
                     continue;
                 };
+                if let Some(place) = place {
+                    name = format!("{}; {name}", place_words(place));
+                }
                 let arrived = arrival.as_ref().map_or_else(
                     || "arrival not known".to_owned(),
                     |time| format!("arrived {}", moment(time, &day.day)),
@@ -283,13 +355,14 @@ pub fn rebuild_day(
     journal: &Path,
     day: &str,
     tier: &AreaTier,
+    packs: Option<&Packs>,
     directory: &dyn DeviceDirectory,
     owner: Tz,
 ) -> Result<Rebuilt, ProjectionError> {
     // Read the marker before the segments: a removal that lands while this
     // build reads advances it, and the next pass rebuilds again.
     let source = source_token(journal, day);
-    let view = read_day(journal, day, tier, directory, owner);
+    let view = read_day(journal, day, tier, packs, directory, owner);
     let document = document_path(journal, day);
     let record = record_path(journal, day);
     if view.is_empty() {
@@ -309,6 +382,9 @@ pub fn rebuild_day(
         version: RECORD_VERSION,
         source,
         area_tier: AREA_TIER_SHA256.to_owned(),
+        packs: packs
+            .map(|packs| packs.identity().to_owned())
+            .unwrap_or_default(),
         document: DOCUMENT_VERSION,
         readings: view.readings() as u64,
         visits: view.visits() as u64,
@@ -350,6 +426,8 @@ pub struct ReconcileReport {
 #[derive(Debug, Default)]
 pub struct Reconciler {
     seen: HashMap<String, String>,
+    /// The packs the seen days were checked against.
+    packs: String,
 }
 
 impl Reconciler {
@@ -359,10 +437,19 @@ impl Reconciler {
         &mut self,
         journal: &Path,
         tier: &AreaTier,
+        packs: Option<&Packs>,
         directory: &dyn DeviceDirectory,
         owner: Tz,
     ) -> ReconcileReport {
         let mut report = ReconcileReport::default();
+        let identity = packs
+            .map(|packs| packs.identity().to_owned())
+            .unwrap_or_default();
+        if identity != self.packs {
+            // Downloading or removing the packs renames days once.
+            self.seen.clear();
+            self.packs.clone_from(&identity);
+        }
         let mut days: Vec<String> = day_dirs(journal)
             .map(|days| days.into_keys().collect())
             .unwrap_or_default();
@@ -377,6 +464,7 @@ impl Reconciler {
             let current = read_build_record(journal, &day).is_some_and(|record| {
                 record.source == token
                     && record.area_tier == AREA_TIER_SHA256
+                    && record.packs == identity
                     && record.document == DOCUMENT_VERSION
             });
             if current && document_path(journal, &day).is_file() {
@@ -389,7 +477,7 @@ impl Reconciler {
                 self.seen.insert(day, token);
                 continue;
             }
-            match rebuild_day(journal, &day, tier, directory, owner) {
+            match rebuild_day(journal, &day, tier, packs, directory, owner) {
                 Ok(Rebuilt::Written) => report.written += 1,
                 Ok(Rebuilt::Removed) => report.removed += 1,
                 Ok(Rebuilt::Unchanged | Rebuilt::Nothing) => {}
@@ -437,7 +525,15 @@ mod tests {
     }
 
     fn rebuild(root: &Path) -> Rebuilt {
-        rebuild_day(root, DAY, tier(), &directory(), chrono_tz::America::Denver).unwrap()
+        rebuild_day(
+            root,
+            DAY,
+            tier(),
+            None,
+            &directory(),
+            chrono_tz::America::Denver,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -468,6 +564,84 @@ mod tests {
             ),
             Ok(solstone_core_indexer_store::scan::RescanFileStatus::Indexed { .. })
         ));
+    }
+
+    #[test]
+    fn with_the_download_a_stop_is_at_and_near_and_a_reading_is_in() {
+        let root = tempfile::tempdir().unwrap();
+        let header = iphone_header("full", "full");
+        // The fixture's invented plaza is centred here; its coffee shop is
+        // 30 m east and its diner 45 m south.
+        write(
+            root.path(),
+            DAY,
+            "phone_mobile-segment",
+            "150000_300",
+            &format!(
+                "{header}\n{}\n{}\n",
+                r#"{"arrival":"2026-10-01T21:02:00Z","departure":"2026-10-01T22:40:00Z","h_acc":48,"lat":39.7527,"lon":-105.0003,"schema":"solstone.location.visit/1"}"#,
+                fix("2026-10-01T21:00:10Z", 39.7527, -105.0003, 8.0)
+            ),
+        );
+        let packs = crate::accuracy::tests::fixture_packs();
+        let built = rebuild_day(
+            root.path(),
+            DAY,
+            tier(),
+            Some(&packs),
+            &directory(),
+            chrono_tz::America::Denver,
+        )
+        .unwrap();
+        assert_eq!(built, Rebuilt::Written);
+        let text = fs::read_to_string(document_path(root.path(), DAY)).unwrap();
+        assert!(
+            text.contains("- readings in Lower Invented, Inventedville, Colorado, United States, at 15:00: 1 reading from your iphone."),
+            "{text}"
+        );
+        assert!(
+            text.contains("- a visit your iphone reported at Invented Plaza; near Invented Coffee (coffee shop) and Invented Diner (restaurant); in Lower Invented, Inventedville, Colorado, United States: arrived 15:02, left 16:40."),
+            "{text}"
+        );
+        let record = read_build_record(root.path(), DAY).unwrap();
+        assert_eq!(record.packs, "venues:fixture-1;containment:fixture-1");
+        // Without the download the same day is named from the area tier.
+        rebuild(root.path());
+        let text = fs::read_to_string(document_path(root.path(), DAY)).unwrap();
+        assert!(!text.contains("Invented"), "{text}");
+        assert!(
+            read_build_record(root.path(), DAY)
+                .unwrap()
+                .packs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn downloading_the_packs_renames_every_day_once() {
+        let root = tempfile::tempdir().unwrap();
+        seed(root.path());
+        let packs = crate::accuracy::tests::fixture_packs();
+        let mut reconciler = Reconciler::default();
+        let mut pass = |packs: Option<&Packs>| {
+            reconciler.reconcile(
+                root.path(),
+                tier(),
+                packs,
+                &directory(),
+                chrono_tz::America::Denver,
+            )
+        };
+        assert_eq!(pass(None).written, 1);
+        assert_eq!(pass(None).written, 0);
+        let renamed = pass(Some(&packs));
+        assert_eq!(
+            (renamed.written, renamed.failures.len()),
+            (1, 0),
+            "a new identity rewrites the day"
+        );
+        assert_eq!(pass(Some(&packs)).written, 0);
+        assert_eq!(pass(None).written, 1, "removing them renames it back");
     }
 
     #[test]
@@ -542,6 +716,7 @@ mod tests {
             reconciler.reconcile(
                 root.path(),
                 tier(),
+                None,
                 &directory(),
                 chrono_tz::America::Denver,
             )

@@ -60,22 +60,22 @@ impl std::error::Error for FetchSetError {}
 pub fn unit_id(unit: &str) -> Option<&'static str> {
     match unit {
         "llama-server" | "llama-server-vulkan" => Some("llama-server"),
-        "local-model" | "llama-server-cuda" | "parakeet-server" | "parakeet-model"
-        | "parakeet-coreml" | "ced-engine" | "ced-model" | "restic" | "rclone" | "nvattest" => {
-            Some(match unit {
-                "local-model" => "local-model",
-                "llama-server-cuda" => "llama-server-cuda",
-                "parakeet-server" => "parakeet-server",
-                "parakeet-model" => "parakeet-model",
-                "parakeet-coreml" => "parakeet-coreml",
-                "ced-engine" => "ced-engine",
-                "ced-model" => "ced-model",
-                "restic" => "restic",
-                "rclone" => "rclone",
-                "nvattest" => "nvattest",
-                _ => unreachable!(),
-            })
-        }
+        "local-model" | "location-accuracy" | "llama-server-cuda" | "parakeet-server"
+        | "parakeet-model" | "parakeet-coreml" | "ced-engine" | "ced-model" | "restic"
+        | "rclone" | "nvattest" => Some(match unit {
+            "local-model" => "local-model",
+            "location-accuracy" => "location-accuracy",
+            "llama-server-cuda" => "llama-server-cuda",
+            "parakeet-server" => "parakeet-server",
+            "parakeet-model" => "parakeet-model",
+            "parakeet-coreml" => "parakeet-coreml",
+            "ced-engine" => "ced-engine",
+            "ced-model" => "ced-model",
+            "restic" => "restic",
+            "rclone" => "rclone",
+            "nvattest" => "nvattest",
+            _ => unreachable!(),
+        }),
         _ => None,
     }
 }
@@ -592,6 +592,19 @@ fn candidates(target: &str) -> Result<Vec<RuntimeFetch>, FetchSetError> {
         _ => return Err(FetchSetError::UnknownTarget(target.to_owned())),
     }
 
+    // Location accuracy is the same data on every target.
+    rows.extend(
+        catalog()
+            .iter()
+            .filter(|row| row.unit == "location-accuracy")
+            .map(|row| RuntimeFetch {
+                unit: row.unit,
+                origin_key: row.origin_key,
+                sha256: row.sha256,
+                size_bytes: row.size_bytes,
+            }),
+    );
+
     Ok(rows)
 }
 
@@ -623,6 +636,7 @@ mod tests {
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-x64.tar.gz",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
         "assets/parakeet-model/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q8_0.gguf",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-cpu-x64.tar.gz",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-vulkan-x64.tar.gz",
@@ -633,6 +647,7 @@ mod tests {
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-arm64.tar.gz",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
         "assets/parakeet-model/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q8_0.gguf",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-cpu-arm64.tar.gz",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-vulkan-arm64.tar.gz",
@@ -643,6 +658,7 @@ mod tests {
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-macos-arm64.tar.gz",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
         "assets/parakeet-coreml/aed02740059203c4a87495924f685de3722ae9ce/Decoder.mlmodelc/analytics/coremldata.bin",
         "assets/parakeet-coreml/aed02740059203c4a87495924f685de3722ae9ce/Decoder.mlmodelc/coremldata.bin",
         "assets/parakeet-coreml/aed02740059203c4a87495924f685de3722ae9ce/Decoder.mlmodelc/metadata.json",
@@ -671,6 +687,7 @@ mod tests {
     const ORACLE_WINDOWS_X86_64: &[&str] = &[
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
     ];
 
     #[test]
@@ -746,14 +763,17 @@ mod tests {
         ];
         let backup_units = ["restic", "rclone"];
         let nvattest_units = ["nvattest"];
+        let location_units = ["location-accuracy"];
 
         let set1: BTreeSet<_> = local_units.into_iter().collect();
         let set2: BTreeSet<_> = backup_units.into_iter().collect();
         let set3: BTreeSet<_> = nvattest_units.into_iter().collect();
+        let set4: BTreeSet<_> = location_units.into_iter().collect();
 
         assert!(set1.is_disjoint(&set2));
         assert!(set1.is_disjoint(&set3));
         assert!(set2.is_disjoint(&set3));
+        assert!(set4.is_disjoint(&set1) && set4.is_disjoint(&set2) && set4.is_disjoint(&set3));
 
         for target in [
             "linux-x86_64",
@@ -765,7 +785,7 @@ mod tests {
             for item in set {
                 let u = item.unit();
                 assert!(
-                    set1.contains(u) || set2.contains(u) || set3.contains(u),
+                    set1.contains(u) || set2.contains(u) || set3.contains(u) || set4.contains(u),
                     "unexpected unit {u} in {target}"
                 );
             }

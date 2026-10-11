@@ -176,3 +176,33 @@ async fn a_deleted_segment_leaves_the_day_view_at_once() {
     let (_, _, day) = get(journal.path(), "/app/map/api/day/20261001").await;
     assert!(day["entries"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn the_accuracy_choice_is_offered_and_removal_is_safe_when_nothing_is_installed() {
+    let journal = location_only_journal();
+    let (status, _, accuracy) = get(journal.path(), "/app/map/api/accuracy").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accuracy["installed"], Value::Null);
+    assert_eq!(accuracy["current"], false);
+    assert!(accuracy["offered"]["size_bytes"].as_u64().unwrap() > 0);
+    assert!(
+        accuracy["offered"]["files"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("venues.slpk"))
+    );
+    let (_, _, day) = get(journal.path(), "/app/map/api/day/20261003").await;
+    assert_eq!(day["accuracy"]["offered"], accuracy["offered"]);
+    let response = app(journal.path().to_path_buf())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/map/api/accuracy/remove")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

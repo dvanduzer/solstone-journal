@@ -315,6 +315,23 @@ static ARTIFACTS: &[Artifact] = &[
         backend: None,
         extracted_binary_sha256: None,
     },
+    // Location accuracy: built by scripts/build_location_accuracy_packs.py from
+    // the Overture Maps release named in `version`, and fetched only when the
+    // owner chooses it in the map app. The containment file joins this unit
+    // once its publication is cleared.
+    Artifact {
+        unit: "location-accuracy",
+        version: "overture-2026-09-23.1-r2",
+        filename: "venues.slpk",
+        sha256: "7bac3fd446c7d17c0c2811ccba04579b5210c69afccabaf046075437a901316e",
+        size_bytes: 887002648,
+        upstream_url: "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/release/2026-09-23.1/",
+        origin_key: "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
+        artifact_key: None,
+        platform: None,
+        backend: None,
+        extracted_binary_sha256: None,
+    },
     Artifact {
         unit: "parakeet-coreml",
         version: "aed02740059203c4a87495924f685de3722ae9ce",

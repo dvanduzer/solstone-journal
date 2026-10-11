@@ -14,15 +14,18 @@ use axum::body::Body;
 use axum::extract::{Path as RoutePath, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use solstone_core_convey_http::envelope::error_envelope;
 use solstone_core_convey_http::owner_read::{OwnerReadRole, spawn_blocking_response};
+use solstone_core_location::accuracy::StopWords;
 use solstone_core_location::day::{Device, LocalTime, Point};
 use solstone_core_location::{
     AreaName, AreaTier, Boundary, Bounds, DayLocation, Entry, Reconciler, SourceRef, TownPoint,
 };
+
+mod accuracy;
 
 const WORKSPACE: &[u8] = include_bytes!("../assets/workspace.html");
 /// How often the background pass checks every day's marker.
@@ -43,6 +46,9 @@ pub fn router(journal_root: PathBuf, shared_shell: fn() -> Response) -> Router {
         .route("/app/map/api/index", get(index))
         .route("/app/map/api/stats/{month}", get(month_stats))
         .route("/app/map/api/day/{day}", get(day_view))
+        .route("/app/map/api/accuracy", get(accuracy::get))
+        .route("/app/map/api/accuracy/download", post(accuracy::download))
+        .route("/app/map/api/accuracy/remove", post(accuracy::remove))
         .with_state(Arc::new(AppState {
             journal_root,
             shared_shell,
@@ -222,7 +228,9 @@ async fn day_view(
             }
         };
         let days = solstone_core_location::list_location_days(&journal_root);
-        Json(day_payload(&view, tier, &days)).into_response()
+        let mut payload = day_payload(&view, tier, &days);
+        payload["accuracy"] = accuracy::status(&journal_root);
+        Json(payload).into_response()
     })
     .await
 }
@@ -265,6 +273,41 @@ fn area_json(area: &AreaName) -> Value {
         "label": area.label(),
         "words": area.words(),
         "town": area.town.as_ref().map(|town| town.name.clone()),
+        "town_km": area.town.as_ref().map(|town| (town.distance_m / 100.0).round() / 10.0),
+        "within": area.within,
+    })
+}
+
+fn outline_json(rings: &[Vec<[f64; 2]>]) -> Value {
+    Value::Array(
+        rings
+            .iter()
+            .map(|ring| {
+                json!(
+                    ring.iter()
+                        .map(|[x, y]| json!([round(*y), round(*x)]))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect(),
+    )
+}
+
+fn place_json(place: &StopWords) -> Value {
+    json!({
+        "margin_m": place.margin_m.round(),
+        "at": place.at.as_ref().map(|at| json!({
+            "name": at.name,
+            "layer": at.layer,
+            "class": at.class,
+            "inside": at.inside,
+            "outline": outline_json(&at.outline),
+        })),
+        "near": place.near.iter().map(|near| json!({
+            "name": near.name,
+            "category": solstone_core_location::projection::category_words(&near.category),
+            "distance_m": near.distance_m.round(),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -314,6 +357,7 @@ fn entry_json(entry: &Entry) -> Value {
         Entry::Visit {
             device,
             area,
+            place,
             arrival,
             departure,
             point,
@@ -322,6 +366,7 @@ fn entry_json(entry: &Entry) -> Value {
             "kind": "visit",
             "device": device,
             "area": area_json(area),
+            "place": place.as_ref().map(place_json),
             "arrival": arrival.as_ref().map(time_json),
             "departure": departure.as_ref().map(time_json),
             "point": point_json(point),

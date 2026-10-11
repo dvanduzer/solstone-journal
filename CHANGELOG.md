@@ -10,6 +10,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - searching your journal now finds a day by the towns your phone's location was near, and your journal's own thinking, and an agent that may see transcripts across your whole journal, can read those town names, never the coordinates.
 - a new map app shows the location your phone sends, a day at a time. each record is named after the town it was near, like "near Golden, Colorado". visits your iphone reported show when you arrived and left. a small map draws the towns and borders around them. the town and border names come with your journal, so no map service is asked for anything, and streets aren't shown. every record opens in transcripts, where you can delete the segments it came from.
+- the map app offers "location accuracy", a download you choose. with it, a visit your iphone reports is named by the places within its margin of error, like "near Pigtrain Coffee Company", and each record says why it reads the way it does. it's the same download for everyone, so getting it says nothing about where you've been, and names are looked up on your computer. search, and an agent that may see transcripts across your whole journal, finds those names too. you can remove it from the same place.
 
 ### Changed
 
