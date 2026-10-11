@@ -7,19 +7,19 @@
 use super::*;
 use solstone_core_journal_io::media::{MediaRead, MediaRemoval};
 
-pub(super) enum NativeRetirement {
+pub(in crate::restore_intent_store) enum NativeRetirement {
     None,
     StageFailure(OwnedMediaFailure<Option<MediaStage>>),
     Unconsumed(MediaStage),
     Removal(Box<MediaRemoval>),
 }
 
-pub(super) struct RetirementFacts {
-    pub(super) observed: MediaRead,
-    pub(super) native: NativeRetirement,
-    pub(super) ancestors: [Durability; 4],
-    pub(super) failures: Vec<StoreProblem>,
-    pub(super) retired: bool,
+pub(in crate::restore_intent_store) struct RetirementFacts {
+    pub(in crate::restore_intent_store) observed: MediaRead,
+    pub(in crate::restore_intent_store) native: NativeRetirement,
+    pub(in crate::restore_intent_store) ancestors: [Durability; 4],
+    pub(in crate::restore_intent_store) failures: Vec<StoreProblem>,
+    pub(in crate::restore_intent_store) retired: bool,
 }
 
 impl TransactionOutcome<'_, '_> {

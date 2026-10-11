@@ -399,3 +399,258 @@ fn packaged_native_recovered_register_entry() {
     assert_eq!(custody.reservation().read_current_record().unwrap(), named);
     println!("NATIVE_RECOVERY_RESULT {}", report);
 }
+
+#[test]
+#[ignore = "requires a fresh actual original completed intent after a disposable guest reboot"]
+fn packaged_native_recovered_retirement_entry() {
+    use crate::restore_intent_store::recovered::tests::{self as faults, Checkpoint};
+    use crate::restore_recovered::retirement::{
+        RecoveredRetirementState, retire_recovered_restore,
+    };
+    use solstone_core_journal_io::activity_obligations::observe_obligations;
+    use solstone_core_journal_io::media::{MediaPrimitive, RemovalEffect, run_with_media_hook};
+
+    let input: RecoveryInput = serde_json::from_slice(
+        &fs::read(std::env::var_os("NATIVE_RECOVERY_PROBE_JSON").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        input.mode.as_str(),
+        "retire_complete" | "retire_replace" | "retire_sync" | "retire_unrelated" | "retire_unwind"
+    ));
+    let checkpoint: serde_json::Value =
+        serde_json::from_slice(&fs::read(&input.checkpoint).unwrap()).unwrap();
+    let operation = checkpoint["operation_id"].as_str().unwrap();
+    let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
+    let directory = MediaDirectory::open(
+        Arc::clone(&root),
+        std::path::Path::new("health/offload/restore-intents"),
+    )
+    .unwrap();
+    let name = intent_filename(operation).unwrap();
+    let named = directory
+        .read_file_bounded(
+            &name,
+            solstone_core_journal_io::activity_obligations::MAX_INTENT_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&named.bytes)),
+        checkpoint["record_sha256"].as_str().unwrap()
+    );
+    let intent = RestoreIntent::decode(Ok(&named.bytes)).unwrap();
+    let raw_path = input
+        .journal
+        .join(intent.locator.relative_segment())
+        .join(selected_name(&intent));
+    let ledger_path = input
+        .journal
+        .join("health/offload")
+        .join(format!("{}.jsonl", intent.locator.target.day));
+    let raw_before = fs::read(&raw_path).unwrap();
+    let ledger_before = fs::read(&ledger_path).unwrap();
+    let reservation = RecoveredArchiveReservation::admit(
+        Arc::clone(&root),
+        operation,
+        intent.recovery_binding.clone().unwrap(),
+    )
+    .unwrap_or_else(|failure| panic!("actual recovered admission {:?}", failure.error()));
+    let carrier_path = input.journal.join(reservation.binding().reservation_name());
+    let prior = recover_restored_register(reservation, options());
+    assert_eq!(prior.state(), RecoveredRestoreState::RegisterConfirmed);
+    assert!(
+        matches!(prior.register(), Some(Ok(BoundMutationOutcome::Published(value))) if value.status == MutationStatus::Applied)
+    );
+    let register_after_applied =
+        fs::read(input.journal.join("health/retention-marks.json")).unwrap();
+    let (outcome, hook) = match input.mode.as_str() {
+        "retire_replace" => {
+            let path = input
+                .journal
+                .join("health/offload/restore-intents")
+                .join(&name);
+            let saved = input.journal.join("health/offload/saved-successor");
+            faults::with_hook(
+                Checkpoint::SuccessorReturned,
+                move || {
+                    let bytes = fs::read(&path).unwrap();
+                    fs::rename(&path, saved).unwrap();
+                    fs::write(&path, bytes).unwrap();
+                },
+                || retire_recovered_restore(prior, options()),
+            )
+        }
+        "retire_sync" => {
+            faults::with_hook(Checkpoint::AfterRemoval, faults::fail_next_sync, || {
+                retire_recovered_restore(prior, options())
+            })
+        }
+        "retire_unrelated" => {
+            let unrelated = input
+                .journal
+                .join(".tmp-offload-22222222222222222222222222222222");
+            faults::with_hook(
+                Checkpoint::AfterRemoval,
+                move || fs::create_dir(unrelated).unwrap(),
+                || retire_recovered_restore(prior, options()),
+            )
+        }
+        "retire_unwind" => run_with_media_hook(
+            MediaPrimitive::CarrierRetirementRootSync,
+            || panic!("injected INSIDE actual consumed root retirement AFTER native rmdir"),
+            || retire_recovered_restore(prior, options()),
+        ),
+        _ => (retire_recovered_restore(prior, options()), false),
+    };
+    eprintln!(
+        "NATIVE_RETIREMENT_DIAGNOSTIC mode={} state={:?} refusal={:?} repeated={:?} successor={} removal={:?} root_attempted={} root_returned={} store_failures={:?}",
+        input.mode,
+        outcome.state(),
+        outcome.refusal(),
+        outcome.register(),
+        outcome.successor_confirmation().is_some(),
+        outcome.metadata_removal().map(|removal| removal.receipt()),
+        outcome.root_retirement_attempted(),
+        outcome.root_retirement().is_some(),
+        outcome.store_io_failures().collect::<Vec<_>>()
+    );
+    assert_eq!(outcome.files_restored(), 0);
+    assert_eq!(outcome.bytes_restored(), 0);
+    assert_eq!(outcome.original_record(), &named);
+    assert!(
+        matches!(outcome.prior_register(), Some(Ok(BoundMutationOutcome::Published(value))) if value.status == MutationStatus::Applied)
+    );
+    assert!(
+        matches!(outcome.register(), Some(Ok(BoundMutationOutcome::Unchanged(value))) if value.status == MutationStatus::Missing)
+    );
+    assert_eq!(
+        outcome.successor_durability(),
+        Some(&[Some(Durability::Synced); 4])
+    );
+    assert_eq!(outcome.successor().unwrap().register, Obligation::Complete);
+    assert_eq!(outcome.successor().unwrap().cleanup, Obligation::Complete);
+    assert_eq!(fs::read(&raw_path).unwrap(), raw_before);
+    assert_eq!(fs::read(&ledger_path).unwrap(), ledger_before);
+    assert_eq!(
+        fs::read(input.journal.join("health/retention-marks.json")).unwrap(),
+        register_after_applied
+    );
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    match input.mode.as_str() {
+        "retire_complete" => {
+            assert_eq!(outcome.state(), RecoveredRetirementState::Finished);
+            assert_eq!(outcome.disposition(), RestoreDisposition::AlreadyPresent);
+            assert!(outcome.root_retirement().unwrap().is_complete());
+            assert!(
+                outcome
+                    .root_retirement()
+                    .unwrap()
+                    .final_census()
+                    .unwrap()
+                    .entries()
+                    .is_empty()
+            );
+            assert!(!carrier_path.exists());
+            assert_eq!(outcome.metadata_named_absence(), Some(true));
+            assert!(observe_obligations(&root).unwrap().entries().is_empty());
+        }
+        "retire_replace" => {
+            assert!(hook);
+            assert_eq!(outcome.state(), RecoveredRetirementState::Held);
+            let replacement = outcome.named_reads().last().unwrap();
+            assert_eq!(
+                replacement.bytes,
+                outcome.successor_confirmation().unwrap().bytes
+            );
+            assert_ne!(
+                replacement.entry,
+                outcome.successor_confirmation().unwrap().entry
+            );
+            assert!(outcome.metadata_removal().is_none());
+            assert!(!outcome.root_retirement_attempted());
+            assert!(carrier_path.is_dir());
+        }
+        "retire_sync" => {
+            assert!(hook);
+            assert_eq!(outcome.state(), RecoveredRetirementState::Held);
+            assert_eq!(
+                outcome.metadata_removal().unwrap().receipt().effect,
+                RemovalEffect::Deleted
+            );
+            assert_eq!(
+                outcome.metadata_removal().unwrap().receipt().cleanup,
+                Cleanup::Complete
+            );
+            assert_ne!(
+                outcome.metadata_ancestor_durability(),
+                Some(&[Durability::Synced; 4])
+            );
+            assert!(
+                outcome
+                    .store_io_failures()
+                    .any(|error| error.contains("injected recovered intent ancestor sync failure"))
+            );
+            assert!(!outcome.root_retirement_attempted());
+            assert!(carrier_path.is_dir());
+        }
+        "retire_unrelated" => {
+            assert!(hook);
+            assert_eq!(outcome.state(), RecoveredRetirementState::Held);
+            assert_eq!(
+                outcome.metadata_removal().unwrap().receipt().effect,
+                RemovalEffect::Deleted
+            );
+            assert_eq!(
+                outcome
+                    .walks()
+                    .last()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .unresolved
+                    .len(),
+                1
+            );
+            assert!(
+                input
+                    .journal
+                    .join(".tmp-offload-22222222222222222222222222222222")
+                    .is_dir()
+            );
+            assert!(!outcome.root_retirement_attempted());
+            assert!(carrier_path.is_dir());
+        }
+        "retire_unwind" => {
+            assert!(hook);
+            assert_eq!(outcome.state(), RecoveredRetirementState::Unknown);
+            assert_eq!(
+                outcome.metadata_removal().unwrap().receipt().effect,
+                RemovalEffect::Deleted
+            );
+            assert!(outcome.root_retirement_attempted());
+            assert!(outcome.root_retirement().is_none());
+            assert!(!carrier_path.exists());
+        }
+        _ => unreachable!(),
+    }
+    let report = serde_json::json!({"mode": input.mode, "state": format!("{:?}", outcome.state()),
+        "files_restored":0, "bytes_restored":0,"prior_applied_owned":true,"fresh_missing_paired":true,
+        "successor_confirmed":true,"original_raw_event_register_preserved":true,"lease_busy":true,
+        "metadata_deleted":outcome.metadata_removal().is_some_and(|removal| removal.receipt().effect == RemovalEffect::Deleted),
+        "root_attempted":outcome.root_retirement_attempted(),"root_returned":outcome.root_retirement().is_some(),"fault_hook":hook});
+    let mut custody = Some(std::thread::spawn(move || outcome).join().unwrap());
+    assert!(matches!(
+        ActivityLease::try_acquire(Arc::clone(&root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    if input.mode == "retire_complete" {
+        drop(custody.take());
+        let next = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+        next.revalidate().unwrap();
+    }
+    println!("NATIVE_RETIREMENT_RESULT {}", report);
+}
