@@ -288,6 +288,109 @@ mod tests {
     }
 
     #[test]
+    fn refused_probe_is_removed_by_identity_unless_its_writer_is_uncertain() {
+        use solstone_core_journal_io::activity::ActivityLease;
+        use solstone_core_journal_io::media::{MediaDigest, RootActivityCarrier};
+        use std::ffi::OsStr;
+        use std::fs;
+        let temp = tempfile::tempdir().unwrap();
+        let day = temp.path().join("chronicle/20261009");
+        fs::create_dir_all(day.join("120000_60_fixture")).unwrap();
+        fs::create_dir(temp.path().join("source")).unwrap();
+        fs::write(temp.path().join("source/raw.webm"), b"backup bytes").unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let segment = iter_segments(root.canonical_path(), PathOrDay::Day("20261009"))
+            .unwrap()
+            .remove(0);
+        let destination = PreparedRestore::admit(Arc::clone(&root), "20261009", &segment)
+            .unwrap_or_else(|error| panic!("{:?}", error.reason));
+        let carrier = Arc::new(
+            RootActivityCarrier::prepare(ActivityLease::try_acquire(Arc::clone(&root)).unwrap())
+                .unwrap_or_else(|error| panic!("{:?}", error.error())),
+        );
+        let source = MediaDirectory::open(Arc::clone(&root), Path::new("source")).unwrap();
+        let stage = || {
+            MediaStage::create(destination.stage_parent(), Arc::clone(carrier.activity()))
+                .unwrap_or_else(|failure| panic!("{}", failure.error))
+        };
+        let scratch = || {
+            fs::read_dir(&day)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".tmp-offload-")
+                })
+                .count()
+        };
+        let record = || ProbeRecord {
+            name: "raw.webm".into(),
+            capacity: None,
+            digest: None,
+            cleanup: None,
+            parent_sync: None,
+        };
+        let matching = MediaDigest {
+            size: 12,
+            sha256: format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(b"backup bytes")
+            ),
+        };
+        let mismatched = MediaDigest {
+            size: 12,
+            sha256: "0".repeat(64),
+        };
+
+        // Finished writes, matching or not, and an unlaunched stage leave nothing behind.
+        let mut owners = vec![ProbeOwner::Stage(stage())];
+        let Err(failure) = stage()
+            .create_target()
+            .unwrap_or_else(|failure| panic!("{}", failure.error))
+            .copy_from(&source, OsStr::new("raw.webm"), &mismatched)
+        else {
+            panic!("a copy that doesn't match its record is refused");
+        };
+        owners.push(ProbeOwner::ReadyTarget(failure.owned));
+        let prepared = stage()
+            .create_target()
+            .unwrap_or_else(|failure| panic!("{}", failure.error))
+            .copy_from(&source, OsStr::new("raw.webm"), &matching)
+            .unwrap_or_else(|failure| panic!("{}", failure.error));
+        owners.push(ProbeOwner::Prepared(prepared));
+        assert_eq!(scratch(), 3);
+        for probe in owners {
+            let mut owner = Some(probe);
+            let mut probes = vec![record()];
+            release_probe(&mut owner, &mut probes, Some(&destination));
+            assert!(owner.is_none());
+            assert_eq!(probes[0].cleanup, Some(Cleanup::Complete));
+            assert!(probes[0].parent_sync.as_ref().is_some_and(Result::is_ok));
+        }
+        assert_eq!(scratch(), 0);
+
+        // A target already handed to a writer is never removed here.
+        let mut target = stage()
+            .create_target()
+            .unwrap_or_else(|failure| panic!("{}", failure.error));
+        drop(target.helper_transport().unwrap());
+        let mut owner = Some(ProbeOwner::ReadyTarget(target));
+        let mut probes = vec![record()];
+        release_probe(&mut owner, &mut probes, Some(&destination));
+        assert!(owner.is_some());
+        assert_eq!(probes[0].cleanup, Some(Cleanup::Refused));
+        assert!(probes[0].parent_sync.is_none());
+        assert_eq!(scratch(), 1);
+        assert_eq!(
+            fs::read(temp.path().join("source/raw.webm")).unwrap(),
+            b"backup bytes"
+        );
+    }
+
+    #[test]
     fn owner_reasons_keep_a_small_vocabulary() {
         assert_eq!(
             owner_reason("legacy_insufficient_free_space"),

@@ -67,6 +67,21 @@ fn probes(review: &OwnedLegacyRestoreReviewOutcome) -> serde_json::Value {
     )
 }
 
+/// Hidden restore stages left beside the day's segments.
+fn scratch_residue(day: &Path) -> usize {
+    fs::read_dir(day)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-offload-")
+        })
+        .count()
+}
+
 #[test]
 #[ignore = "requires a copied current package and synthetic whole-manifest legacy repository"]
 fn packaged_legacy_restore_review_entry() {
@@ -190,7 +205,16 @@ fn packaged_legacy_restore_review_entry() {
             }
         );
         assert!(review.candidate().is_none());
-        assert!(review.retained_probe());
+        // Each refusal's writer is known finished, so its scratch probe is removed.
+        assert!(!review.retained_probe());
+        assert!(
+            review
+                .probes()
+                .last()
+                .is_some_and(|probe| probe.cleanup == Some(Cleanup::Complete)
+                    && probe.parent_sync.is_some_and(Result::is_ok))
+        );
+        assert_eq!(scratch_residue(segment.parent().unwrap()), 0);
         let held = review.into_owned_hold();
         let unknown = finish.into_unknown();
         let custody = std::thread::spawn(move || (held, unknown)).join().unwrap();
@@ -530,9 +554,22 @@ fn packaged_combined_restore_entry() {
                     && reason.is_some_and(|reason| expected.contains(&reason))
             }));
             assert_eq!(listing(&segment), before);
-            let held = outcome.into_owned_hold();
-            let unknown = finish.into_unknown();
-            drop(std::thread::spawn(move || (held, unknown)).join().unwrap());
+            // A refused manifest leaves no scratch copy and does not hold the read.
+            assert_eq!(scratch_residue(segment.parent().unwrap()), 0);
+            assert!(
+                outcome
+                    .files()
+                    .all(|file| !matches!(file.evidence, FileEvidence::LegacyReview(_)))
+            );
+            let (settled, _) = outcome
+                .settle_direct()
+                .unwrap_or_else(|_| panic!("refused manifest held the restore"));
+            assert_eq!(
+                finish.finish_owned(settled).state(),
+                DirectReadFinishState::Completed
+            );
+            assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+            assert_eq!(fs::read(&mark_path).unwrap(), original_mark);
         }
     }
     println!(

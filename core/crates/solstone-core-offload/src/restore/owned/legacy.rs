@@ -119,6 +119,51 @@ impl ProbeOwner {
     }
 }
 
+/// A refused review removes its own scratch probe by identity once no writer can
+/// still be using it: never launched, or a qualified dump that simply did not
+/// match the record. The probe is an unpublished copy of backup bytes, never
+/// owner media. An uncertain writer or a refused cleanup keeps it owned.
+fn release_probe(
+    owner: &mut Option<ProbeOwner>,
+    probes: &mut [ProbeRecord],
+    destination: Option<&PreparedRestore>,
+) {
+    let Some(mut probe) = owner.take() else {
+        return;
+    };
+    let cleanup = match &mut probe {
+        ProbeOwner::Creation(failure) => match failure.owned.as_mut() {
+            Some(stage) => stage.cleanup(),
+            None => Cleanup::Refused,
+        },
+        ProbeOwner::Stage(stage) => stage.cleanup(),
+        ProbeOwner::Target(failure) => failure.owned.cleanup(),
+        ProbeOwner::ReadyTarget(target) if !target.helper_transport_issued() => {
+            target.cleanup_after_helper_quiescence()
+        }
+        ProbeOwner::ReadyTarget(_) => Cleanup::Refused,
+        ProbeOwner::Readback(failure) => failure.cleanup(),
+        ProbeOwner::Prepared(media) => media.cleanup(),
+    };
+    let record = probes.last_mut();
+    if cleanup != Cleanup::Complete {
+        if let Some(record) = record {
+            record.cleanup = Some(cleanup);
+        }
+        *owner = Some(probe);
+        return;
+    }
+    let sync = destination.map(|destination| destination.stage_parent().sync());
+    let confirmed = sync.as_ref().is_some_and(Result::is_ok);
+    if let Some(record) = record {
+        record.cleanup = Some(cleanup);
+        record.parent_sync = sync;
+    }
+    if !confirmed {
+        *owner = Some(probe);
+    }
+}
+
 pub(super) struct LegacyEvidence {
     pub(super) binding: LegacyRestoreBinding,
     probes: Vec<ProbeRecord>,

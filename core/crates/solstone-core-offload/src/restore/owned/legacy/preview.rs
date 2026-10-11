@@ -47,6 +47,11 @@ pub(super) fn prepare<'clock, R: RestoreRead<'clock>>(
     };
     if let Err(error) = outcome.prepare() {
         outcome.refusal = Some(error);
+        release_probe(
+            &mut outcome.probe_owner,
+            &mut outcome.probes,
+            outcome.destination.as_ref(),
+        );
     }
     outcome
 }
