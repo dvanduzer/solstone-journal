@@ -536,4 +536,179 @@ mod tests {
         );
         assert!(!root.path().join("config/actions").exists());
     }
+
+    #[tokio::test]
+    async fn approval_receiving_routes_refuse_missing_stale_and_poisoned_owners_without_cache() {
+        use solstone_core_backup_web::{BackupWebDeps, archive_operation};
+        async fn receive(
+            router: axum::Router,
+            method: &str,
+            url: &str,
+            body: &str,
+        ) -> (StatusCode, Value) {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(url)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let status = response.status();
+            let value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            (status, value)
+        }
+        let root = journal();
+        let standalone = || {
+            solstone_core_home_web::routes(
+                root.path().to_path_buf(),
+                solstone_core_home_web::Clock::fixed(Utc::now()),
+                |_| false,
+            )
+        };
+        for (method, url, body) in [
+            ("GET", "/app/home/api/approve/1", ""),
+            ("POST", "/app/home/api/approve/1/cancel", "{}"),
+        ] {
+            let (status, value) = receive(standalone(), method, url, body).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(value["state"], "approve.unavailable");
+            assert!(value.get("removed_count").is_none());
+        }
+        let deps = BackupWebDeps::new(root.path().to_path_buf());
+        let (generation, budget) =
+            archive_operation::begin(&deps.operations, "other_archive", deps.clock.as_ref())
+                .unwrap()
+                .into_parts();
+        let router = || {
+            solstone_core_home_web::routes_with_backup_deps(
+                deps.clone(),
+                solstone_core_home_web::Clock::fixed(Utc::now()),
+                |_| false,
+            )
+        };
+        for body in ["", "[]", "null", "{", "{\"extra\":true}"] {
+            assert_eq!(
+                receive(
+                    router(),
+                    "POST",
+                    &format!("/app/home/api/approve/{generation}/cancel"),
+                    body
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+            assert!(!budget.cancellation().unwrap().is_cancelled());
+        }
+        let oversized = " ".repeat(1025);
+        assert_eq!(
+            receive(
+                router(),
+                "POST",
+                &format!("/app/home/api/approve/{generation}/cancel"),
+                &oversized
+            )
+            .await
+            .0,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        for id in [
+            generation.to_string(),
+            "01".into(),
+            "+1".into(),
+            "18446744073709551616".into(),
+        ] {
+            for (method, tail, body) in [("GET", "", ""), ("POST", "/cancel", "{}")] {
+                let (_, value) = receive(
+                    router(),
+                    method,
+                    &format!("/app/home/api/approve/{id}{tail}"),
+                    body,
+                )
+                .await;
+                assert_eq!(value["state"], "approve.stale");
+                assert!(value.get("cancellation_requested").is_none());
+                assert!(!budget.cancellation().unwrap().is_cancelled());
+            }
+        }
+        let slot = deps.operations.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = slot.lock().unwrap();
+                panic!("poison original receive mutex");
+            })
+            .join()
+            .is_err()
+        );
+        for (method, tail, body) in [("GET", "", ""), ("POST", "/cancel", "{}")] {
+            let (_, value) = receive(
+                router(),
+                method,
+                &format!("/app/home/api/approve/{generation}{tail}"),
+                body,
+            )
+            .await;
+            assert_eq!(value["state"], "approve.unavailable");
+            assert!(value.get("cancellation_requested").is_none());
+        }
+        assert!(!budget.cancellation().unwrap().is_cancelled());
+        assert!(archive_operation::begin(&deps.operations, "backup", deps.clock.as_ref()).is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_receiving_preserves_real_journal_session_gate() {
+        use solstone_core_backup_web::{BackupWebDeps, archive_operation};
+        for (config, expected) in [
+            (
+                br#"{"setup":{"completed_at":1700000000000}}"#.as_slice(),
+                StatusCode::CONFLICT,
+            ),
+            (b"{}".as_slice(), StatusCode::FOUND),
+            (b"{".as_slice(), StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let root = journal();
+            let deps = BackupWebDeps::new(root.path().to_path_buf());
+            let (generation, budget) =
+                archive_operation::begin(&deps.operations, "other_archive", deps.clock.as_ref())
+                    .unwrap()
+                    .into_parts();
+            let router = solstone_core_home_web::routes_with_backup_deps(
+                deps.clone(),
+                solstone_core_home_web::Clock::fixed(Utc::now()),
+                |_| false,
+            );
+            let router = solstone_core_convey_shell::session_gate::apply_layer(
+                router,
+                root.path().to_path_buf(),
+            );
+            fs::write(root.path().join("config/journal.json"), config).unwrap();
+            for (method, tail, body) in [("GET", "", ""), ("POST", "/cancel", "{}")] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(format!("/app/home/api/approve/{generation}{tail}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+                assert!(!budget.cancellation().unwrap().is_cancelled());
+                assert!(
+                    archive_operation::begin(&deps.operations, "backup", deps.clock.as_ref())
+                        .is_err()
+                );
+            }
+        }
+    }
 }

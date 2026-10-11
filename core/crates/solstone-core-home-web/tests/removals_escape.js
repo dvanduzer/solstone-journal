@@ -126,11 +126,15 @@ function escaped(value) {
 }
 
 async function boot(source, lists, responses) {
-  const root = new Element();
+  let root = new Element();
+  const timers = new Map();
+  let nextTimer = 0;
   const listResponses = Array.isArray(lists) ? lists : [lists];
   let listIndex = 0;
   const calls = [];
   const window = {
+    setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
+    clearTimeout(id) { timers.delete(id); },
     apiJson(url, options) {
       calls.push({ url, options: options || null });
       if (url === '/app/home/api/removals') {
@@ -143,7 +147,8 @@ async function boot(source, lists, responses) {
         listIndex += 1;
         return Promise.resolve(response);
       }
-      if (url === '/app/home/api/approve') return Promise.resolve(responses.approve);
+      if (url === '/app/home/api/approve') return Promise.resolve(typeof responses.approve === 'function' ? responses.approve() : responses.approve);
+      if (url.startsWith('/app/home/api/approve/')) return Promise.resolve(responses.receive(url, options));
       if (url === '/app/home/api/decline') return Promise.resolve(responses.decline);
       if (url === '/app/home/api/recover') return Promise.resolve(responses.recover);
       throw new Error(`unexpected URL: ${url}`);
@@ -153,6 +158,7 @@ async function boot(source, lists, responses) {
   const document = {
     readyState: 'complete',
     addEventListener(type, listener) { (listeners[type] = listeners[type] || []).push(listener); },
+    removeEventListener(type, listener) { listeners[type] = (listeners[type] || []).filter(item => item !== listener); },
     createElement() { return new Element(); },
     querySelector(selector) { return selector === '[data-home-root]' ? root : null; }
   };
@@ -160,13 +166,30 @@ async function boot(source, lists, responses) {
   window.location = { pathname: '/app/home' };
   class FixtureDate extends Date { constructor(...args) { super(...(args.length ? args : [2026, 8, 5])); } }
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../../solstone-core-convey-shell/assets/static/date_format.js'), 'utf8'), { window, Date: FixtureDate });
-  vm.runInNewContext(source, { document, Promise, setImmediate, window, Set }, { filename: 'removals.js' });
+  const load = () => vm.runInNewContext(source, { document, Promise, setImmediate, window, Set }, { filename: 'removals.js' });
+  load();
   // The shell mounts a workspace's scripts, then announces it; the card mounts on that event.
   for (const listener of listeners['workspace:mounted'] || []) listener({ detail: { appName: 'home' } });
   await settle();
   const card = root.children[0];
   assert(card, 'card mounted');
   card.calls = calls;
+  card.timerCount = () => timers.size;
+  card.tick = async function () {
+    const entry = timers.entries().next().value;
+    assert(entry, 'one observation timer exists');
+    timers.delete(entry[0]); entry[1](); await settle();
+  };
+  card.replace = async function (appName, replay) {
+    root = appName === 'home' ? new Element() : null;
+    window.location.pathname = '/app/' + appName;
+    if (replay) load();
+    for (const listener of (listeners['workspace:mounted'] || []).slice()) listener({ detail: { appName } });
+    await settle();
+    const next = root?.children[0];
+    if (next) { next.calls = calls; next.timerCount = card.timerCount; next.tick = card.tick; }
+    return next;
+  };
   card.refresh = async function () {
     for (const listener of listeners['workspace:mounted'] || []) listener({ detail: { appName: 'home' } });
     await settle();
@@ -820,6 +843,167 @@ async function main() {
   assert(!failedOnlyCard.innerHTML.includes('data-removals-note'), 'no shared note when nothing is marked');
   assert(failedOnlyCard.innerHTML.includes(copy['failed.body']), 'the unfinished row still explains itself');
   assert(!failedOnlyCard.innerHTML.includes(copy['card.empty']), 'unfinished is not the empty state');
+  await asyncReceiving(source);
+}
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+async function asyncReceiving(source) {
+  const copy = copyTable(source);
+  const gen = '9007199254740993';
+  const base = { state: 'list.ready', review_context: 'opaque-original', removals: [marked('typed', 'offload', 1, '_default'), marked('policy', 'policy', 1, '_default')] };
+  const effect = { outcome: { targets: [{ removed: ['chronicle/<raw>.flac'], not_removed: [{ entry: 'policy.flac', reason: '<unproven>' }] }], halted: null } };
+  const status = (state, settled, cancelled = false, report = null) => ({ generation: gen, state, worker_settled: settled, cancellation_requested: cancelled, actor_phase: 'done', report });
+  const submit = async card => { click(card, 'approve', 'typed'); click(card, 'confirm'); await settle(); };
+  const urls = card => card.calls.filter(call => call.url.startsWith('/app/home/api/approve/'));
+
+  // The first unresolved POST is already protected, including retained controls.
+  {
+    const start = deferred();
+    const card = await boot(source, base, { approve: () => start.promise });
+    click(card, 'approve', 'typed');
+    const retained = card.controls.find(control => control.dataset.removalAction === 'confirm');
+    retained.click(); retained.click(); await settle();
+    await card.refresh();
+    click(card, 'approve', 'typed');
+    assert.strictEqual(posts(card, '/app/home/api/approve').length, 1);
+    start.resolve({ state: 'approve.refused_before_start' }); await settle();
+    assert.strictEqual(posts(card, '/app/home/api/approve').length, 1);
+  }
+  // Initial resolve AND reject after replacement cannot touch the successor.
+  for (const reject of [false, true]) {
+    const start = deferred();
+    const card = await boot(source, base, { approve: () => start.promise });
+    await submit(card);
+    await card.replace('health', false);
+    const next = await card.replace('home', true);
+    const before = next.innerHTML;
+    const calls = card.calls.length;
+    if (reject) start.reject(Error('detached')); else start.resolve({ state: 'approve.started', generation: gen });
+    await settle();
+    assert.strictEqual(next.innerHTML, before);
+    assert.strictEqual(card.calls.length, calls);
+    assert.strictEqual(card.timerCount(), 0);
+  }
+  // A status sent before stop can arrive after the actual true acknowledgment.
+  {
+    const oldStatus = deferred(), stop = deferred();
+    let reads = 0;
+    const tail = { state: 'list.ready', review_context: 'same-ID-reoffer', removals: [base.removals[1], { id: 'failed', state: 'failed', day: '20260101', stream: '_default', count: 1 }] };
+    const card = await boot(source, [base, tail], {
+      approve: { state: 'approve.started', generation: gen },
+      receive(url) {
+        if (url.endsWith('/cancel')) return stop.promise;
+        reads += 1;
+        return reads === 1 ? status('running', false) : reads === 2 ? oldStatus.promise : status('held', true, true, effect);
+      }
+    });
+    await submit(card);
+    assert.strictEqual(card.timerCount(), 1);
+    await card.tick();
+    assert.strictEqual(card.timerCount(), 0, 'no second poll while status is in flight');
+    click(card, 'stop'); click(card, 'stop'); await settle();
+    assert.strictEqual(urls(card).filter(call => call.url.endsWith('/cancel')).length, 1);
+    stop.resolve(status('running', false, true)); await settle();
+    oldStatus.resolve(status('running', false, false)); await settle();
+    assert(card.innerHTML.includes(copy['operation.stopping']), 'old false cannot undo observed true');
+    assert.strictEqual(card.timerCount(), 1);
+    await card.tick();
+    assert(card.innerHTML.includes(copy['operation.held']));
+    assert(card.innerHTML.includes('chronicle/&lt;raw&gt;.flac'));
+    assert(card.innerHTML.includes('&lt;unproven&gt;'));
+    assert(!card.innerHTML.includes('chronicle/<raw>.flac'));
+    assert(card.innerHTML.includes('data-mark-id="policy"') && card.innerHTML.includes('data-mark-id="failed"'));
+    assert.strictEqual(card.timerCount(), 0);
+    click(card, 'approve', 'policy'); await settle();
+    assert.strictEqual(posts(card, '/app/home/api/approve').length, 1, 'Held stays blocked after context refresh');
+    for (const call of urls(card)) assert.strictEqual(call.options.cache, 'no-store');
+    assert(urls(card).every(call => call.url.includes(gen)), 'opaque generation never rounds');
+  }
+  // Older same-generation cancel snapshots AND errors cannot regress settlement.
+  for (const reject of [false, true]) {
+    const stop = deferred(); let reads = 0;
+    const card = await boot(source, base, {
+      approve: { state: 'approve.started', generation: gen },
+      receive(url) { if (url.endsWith('/cancel')) return stop.promise; return ++reads === 1 ? status('running', false) : status('completed', true, true, effect); }
+    });
+    await submit(card); click(card, 'stop'); await settle();
+    await card.tick();
+    const before = card.innerHTML;
+    if (reject) stop.reject(Error('late cancel')); else stop.resolve(status('running', false, false));
+    await settle();
+    assert.strictEqual(card.innerHTML, before, 'late cancel cannot downgrade settled report');
+    assert(card.innerHTML.includes(copy['operation.completed']));
+    assert.strictEqual(card.timerCount(), 0);
+  }
+  // Held/Unknown before closure settlement continues observation. Malformed
+  // transport and a failed terminal list refresh keep earlier actual facts.
+  {
+    let reads = 0;
+    const statuses = [status('held', false, false, effect), { state: 'approve.stale' }, status('unknown', true, false, null)];
+    const card = await boot(source, [base, { state: 'list.register_unavailable' }], {
+      approve: { state: 'approve.started', generation: gen }, receive() { return statuses[reads++]; }
+    });
+    await submit(card); assert.strictEqual(card.timerCount(), 1);
+    await card.tick(); assert(card.innerHTML.includes('chronicle/&lt;raw&gt;.flac'));
+    assert.strictEqual(card.timerCount(), 1);
+    await card.tick();
+    assert.strictEqual(card.timerCount(), 0);
+    assert(card.innerHTML.includes('data-removals-list-unavailable'));
+    assert(card.innerHTML.includes('chronicle/&lt;raw&gt;.flac'));
+    assert(card.innerHTML.includes(copy['operation.unknown']));
+  }
+  // Unknown initial transport never creates a generation or retries execution.
+  for (const response of [null, { state: 'approve.started', generation: '01' }, { state: 'unrecognized' }]) {
+    const card = await boot(source, base, { approve: response });
+    await submit(card); await card.refresh(); click(card, 'approve', 'typed'); await settle();
+    assert.strictEqual(posts(card, '/app/home/api/approve').length, 1);
+    assert.strictEqual(urls(card).length, 0);
+    assert(card.innerHTML.includes(copy['operation.unknown']));
+  }
+  // Delayed status/list/stop callbacks from a retired script cannot render or
+  // request anything on the successor. The real shell replay is checked in Chrome.
+  {
+    const pending = deferred(), stop = deferred(); let reads = 0;
+    const card = await boot(source, base, {
+      approve: { state: 'approve.started', generation: gen },
+      receive(url) { if (url.endsWith('/cancel')) return stop.promise; return ++reads === 1 ? status('running', false) : pending.promise; }
+    });
+    await submit(card); click(card, 'stop'); await settle(); await card.tick();
+    const retiredKeep = card.controls.find(control => control.dataset.removalAction === 'decline');
+    const beforeDetach = card.calls.length;
+    await card.replace('health', false);
+    retiredKeep.click(); await settle();
+    assert.strictEqual(card.calls.length, beforeDetach, 'retired controls cannot act between workspaces');
+    const next = await card.replace('home', true);
+    const before = next.innerHTML, calls = card.calls.length;
+    pending.resolve(status('completed', true, true, effect)); stop.resolve(status('running', false, true)); await settle();
+    assert.strictEqual(next.innerHTML, before); assert.strictEqual(card.calls.length, calls);
+    assert.strictEqual(card.timerCount(), 0);
+  }
+  // Immutable predecessor statuses are data only. The added Boolean below is
+  // an explicitly synthetic supplement, qualified by separate owning controls.
+  if (process.env.HOME_APPROVAL_STATUS_RECEIPT) {
+    const bytes = fs.readFileSync(process.env.HOME_APPROVAL_STATUS_RECEIPT);
+    const receipt = JSON.parse(bytes);
+    for (const mode of ['complete', 'cancel_before_finish']) {
+      const literal = receipt.cases.find(item => item.mode === mode).result.status;
+      const supplemented = { ...literal, cancellation_requested: false };
+      const card = await boot(source, base, {
+        approve: { state: 'approve.started', generation: literal.generation }, receive() { return supplemented; }
+      });
+      await submit(card);
+      assert(card.innerHTML.includes(copy[literal.state === 'completed' ? 'operation.completed' : 'operation.held']));
+      assert.strictEqual(card.timerCount(), 0);
+      assert.strictEqual(literal.actor_phase, 'done');
+    }
+    console.log(JSON.stringify({ predecessor_receipt_sha256: require('crypto').createHash('sha256').update(bytes).digest('hex'), supplement: 'synthetic cancellation_requested=false; original receipt untouched', modes: ['complete', 'cancel_before_finish'] }));
+  }
+  console.log('async approval receiving controls passed');
 }
 
 main().catch((error) => {
