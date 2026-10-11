@@ -12,6 +12,8 @@ use solstone_core_journal_io::activity_obligations::{
 };
 use solstone_core_journal_io::{JournalRoot, contained_path};
 
+use crate::segment_dir::STAGED_PREFIX;
+
 pub(crate) struct Cooperation {
     activity: Arc<ActivityLease>,
 }
@@ -68,10 +70,21 @@ impl Cooperation {
         {
             return Err(binding_hold());
         }
-        if relative
-            .components()
-            .any(|part| is_stage_namespace_name(part.as_os_str()))
-        {
+        if relative.components().any(|part| {
+            let mut name = part.as_os_str();
+            loop {
+                if is_stage_namespace_name(name) {
+                    return true;
+                }
+                let Some(original) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(STAGED_PREFIX))
+                else {
+                    return false;
+                };
+                name = std::ffi::OsStr::new(original);
+            }
+        }) {
             return Err(
                 "this location is reserved for a journal operation and cannot be changed"
                     .to_owned(),

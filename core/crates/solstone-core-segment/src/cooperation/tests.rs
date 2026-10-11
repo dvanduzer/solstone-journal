@@ -125,6 +125,76 @@ fn relocation_preserves_exact_direct_and_named_dot_locations() {
 }
 
 #[test]
+fn relocation_refuses_wrapped_reservations_with_empty_census() {
+    for reserved in [
+        ".removing_.tmp-offload-owned",
+        ".removing_.removing_.tmp-offload-owned",
+    ] {
+        for named_parent in [false, true] {
+            for reserved_source in [false, true] {
+                let root = TempDir::new();
+                let ordinary_source = end(root.path(), "20261010", None, "070000_17");
+                let ordinary_destination = end(root.path(), "20261011", None, "070000_17");
+                let reserved_end = end(
+                    root.path(),
+                    if reserved_source {
+                        "20261010"
+                    } else {
+                        "20261011"
+                    },
+                    named_parent.then_some(reserved),
+                    if named_parent { "070000_17" } else { reserved },
+                );
+                let (source, destination) = if reserved_source {
+                    (&reserved_end, &ordinary_destination)
+                } else {
+                    (&ordinary_source, &reserved_end)
+                };
+                seed(source);
+                let original = activity(root.path());
+                assert!(
+                    solstone_core_journal_io::activity_obligations::observe_obligations(
+                        original.journal_root()
+                    )
+                    .unwrap()
+                    .entries()
+                    .is_empty()
+                );
+                drop(original);
+                assert!(matches!(
+                    crate::relocate_segment(&request(root.path(), source, destination)),
+                    Err(RelocationRefusal::Failed(_))
+                ));
+                assert_eq!(fs::read(source.path.join("audio.flac")).unwrap(), b"raw");
+                assert!(!root.path().join("chronicle/20261011").exists());
+            }
+        }
+    }
+
+    let root = TempDir::new();
+    let source = end(
+        root.path(),
+        "20261010",
+        Some(".removing_.Audio"),
+        ".removing_.ordinary",
+    );
+    let destination = end(
+        root.path(),
+        "20261011",
+        Some(".removing_.Audio"),
+        ".removing_.ordinary",
+    );
+    seed(&source);
+    let outcome = crate::relocate_segment(&request(root.path(), &source, &destination)).unwrap();
+    assert!(!source.path.exists());
+    assert_eq!(
+        fs::read(destination.path.join("audio.flac")).unwrap(),
+        b"raw"
+    );
+    assert_eq!(outcome.events, Ok(1));
+}
+
+#[test]
 fn relocation_holds_busy_named_stage_reserved_and_disagreeing_paths() {
     let root = TempDir::new();
     let source = end(root.path(), "20261010", Some("audio"), "070000_17");
