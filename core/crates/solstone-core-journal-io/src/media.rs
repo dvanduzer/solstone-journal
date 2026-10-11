@@ -19,6 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::JournalRoot;
 
+mod observation;
+pub use observation::{MediaEntry, MediaRead};
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -44,6 +47,10 @@ pub enum MediaPrimitive {
     StageRemove,
     Completion,
     ArchiveAccessGap,
+    AfterFirstEnumeration,
+    BeforeEntryObservation,
+    BeforePrefixRead,
+    AfterPrefixRead,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]

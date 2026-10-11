@@ -5,6 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +15,8 @@ use nix::sys::stat::{Mode, SFlag, fstatat, mkdirat};
 use nix::sys::statvfs::fstatvfs;
 use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 
-use super::{JournalRoot, MediaIdentity, changed, invalid};
+use super::{JournalRoot, MediaEntry, MediaIdentity, MediaPrimitive, changed, invalid, step};
+use crate::journal_root::JournalEntryKind;
 
 const DIRECTORY: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
@@ -123,6 +125,10 @@ impl Directory {
         &self.path
     }
 
+    pub(super) fn stamp(&self) -> io::Result<Stamp> {
+        stamp(self.nodes.last().map_or(&self.root_file, |node| &node.file))
+    }
+
     pub(super) fn revalidate(&self) -> io::Result<()> {
         self.root
             .revalidate_canonical_binding()
@@ -167,6 +173,89 @@ impl Directory {
 
 pub(super) fn supported_mutation() -> io::Result<()> {
     Ok(())
+}
+
+pub(super) fn entries(
+    directory: &Directory,
+    maximum: usize,
+) -> io::Result<Option<Vec<MediaEntry>>> {
+    let mut cursor = nix::dir::Dir::openat(directory, ".", DIRECTORY, Mode::empty())?;
+    let mut result = Vec::new();
+    for record in cursor.iter() {
+        let record = record?;
+        let bytes = record.file_name().to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        if result.len() == maximum {
+            return Ok(None);
+        }
+        let name = OsString::from_vec(bytes.to_vec());
+        step(MediaPrimitive::BeforeEntryObservation)?;
+        let observed = entry(directory, &name)?.ok_or_else(changed)?;
+        let MediaIdentity::Unix { inode, device } = observed.identity else {
+            return Err(changed());
+        };
+        let MediaIdentity::Unix {
+            device: parent_device,
+            ..
+        } = directory.identity()
+        else {
+            return Err(changed());
+        };
+        verify_enumerated_inode(record.ino(), inode, device, parent_device)?;
+        result.push(observed);
+    }
+    result.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(Some(result))
+}
+
+fn verify_enumerated_inode(
+    enumerated: u64,
+    observed: u64,
+    device: u64,
+    parent_device: u64,
+) -> io::Result<()> {
+    if enumerated == 0 || enumerated != observed || device != parent_device {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+pub(super) fn entry(directory: &Directory, name: &OsStr) -> io::Result<Option<MediaEntry>> {
+    let stat = match fstatat(directory, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let size = u64::try_from(stat.st_size).map_err(|_| invalid("negative entry size"))?;
+    Ok(Some(MediaEntry {
+        name: name.to_owned(),
+        kind: JournalEntryKind::from_mode(SFlag::from_bits_truncate(stat.st_mode)),
+        identity: MediaIdentity::Unix {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+        },
+        size,
+        stamp: (
+            size,
+            stat.st_mtime,
+            stat.st_mtime_nsec,
+            stat.st_ctime,
+            stat.st_ctime_nsec,
+        ),
+    }))
+}
+
+pub(super) fn entry_from_file(name: &OsStr, file: &File) -> io::Result<MediaEntry> {
+    let stamp = stamp(file)?;
+    Ok(MediaEntry {
+        name: name.to_owned(),
+        kind: JournalEntryKind::RegularFile,
+        identity: identity(file)?,
+        size: stamp.0,
+        stamp,
+    })
 }
 
 pub(super) fn archive_path(directory: &Directory, name: &OsStr) -> io::Result<PathBuf> {
@@ -284,4 +373,16 @@ pub(super) fn remove_directory(
 ) -> io::Result<()> {
     check_leaf(parent, name, directory.identity())?;
     unlinkat(parent, name, UnlinkatFlags::RemoveDir).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod enumeration_tests {
+    #[test]
+    fn unavailable_or_truncated_enumeration_identity_never_matches() {
+        assert!(super::verify_enumerated_inode(0, 0, 1, 1).is_err());
+        assert!(super::verify_enumerated_inode(7, (1u64 << 32) | 7, 1, 1).is_err());
+        assert!(super::verify_enumerated_inode(7, 8, 1, 1).is_err());
+        assert!(super::verify_enumerated_inode(7, 7, 2, 1).is_err());
+        assert!(super::verify_enumerated_inode((1u64 << 32) | 7, (1u64 << 32) | 7, 1, 1).is_ok());
+    }
 }
