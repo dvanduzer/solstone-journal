@@ -71,11 +71,27 @@ pub struct ArchiveConfiguration {
     settings: Map<String, Value>,
     binding: Option<HostedBinding>,
     offload_floor: Option<Value>,
+    offload_enabled: Option<Value>,
+    offload_budget: Option<Value>,
 }
 
 const MAX_ARCHIVE_CONFIGURATION_BYTES: usize = 1024 * 1024;
 
 impl ArchiveConfiguration {
+    pub fn offload_enabled(&self) -> bool {
+        self.offload_enabled == Some(Value::Bool(true))
+    }
+
+    pub fn offload_budget_bytes(&self) -> Result<Option<u64>, AdmissionError> {
+        match self.offload_budget.as_ref() {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .map(Some)
+                .ok_or(AdmissionError::ConfigurationUnavailable),
+        }
+    }
+
     /// Required space from this operation's captured positive reserve and bounds.
     /// The caller must still query the retained target filesystem's capacity.
     pub fn offload_required_bytes(
@@ -150,11 +166,11 @@ impl ArchiveConfiguration {
         root.revalidate_canonical_binding()
             .map_err(|_| AdmissionError::JournalIdentityChanged)?;
         let raw = Self::read_object(root, Path::new("config/journal.json"))?;
-        let offload_floor = raw
-            .get("backup")
-            .and_then(|backup| backup.get("offload"))
-            .and_then(|offload| offload.get("floor_bytes"))
-            .cloned();
+        let offload = raw.get("backup").and_then(|backup| backup.get("offload"));
+        let offload_field = |key| offload.and_then(|offload| offload.get(key)).cloned();
+        let offload_floor = offload_field("floor_bytes");
+        let offload_enabled = offload_field("enabled");
+        let offload_budget = offload_field("budget_bytes");
         let config = crate::merge_backup_config(&raw);
         let binding = if config.get("mode") == Some(&Value::String("operated".into())) {
             let raw = Self::read_object(root, Path::new("backup/hosted/binding.json"))?;
@@ -198,6 +214,8 @@ impl ArchiveConfiguration {
             settings,
             binding,
             offload_floor,
+            offload_enabled,
+            offload_budget,
         })
     }
 
@@ -313,6 +331,8 @@ mod tests {
             settings: Map::new(),
             binding: None,
             offload_floor: floor,
+            offload_enabled: None,
+            offload_budget: None,
         };
         for floor in [
             None,
@@ -346,6 +366,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn offload_planning_getters_preserve_unset_and_refuse_malformed_budget() {
+        let configuration = |enabled, budget| ArchiveConfiguration {
+            settings: Map::new(),
+            binding: None,
+            offload_floor: None,
+            offload_enabled: enabled,
+            offload_budget: budget,
+        };
+        for (enabled, expected) in [
+            (None, false),
+            (Some(Value::Null), false),
+            (Some(serde_json::json!(false)), false),
+            (Some(serde_json::json!(true)), true),
+            (Some(serde_json::json!(1)), false),
+            (Some(serde_json::json!("true")), false),
+            (Some(serde_json::json!([])), false),
+            (Some(serde_json::json!({})), false),
+        ] {
+            assert_eq!(configuration(enabled, None).offload_enabled(), expected);
+        }
+        for (budget, expected) in [
+            (None, Ok(None)),
+            (Some(Value::Null), Ok(None)),
+            (Some(serde_json::json!(0)), Ok(Some(0))),
+            (Some(serde_json::json!(7)), Ok(Some(7))),
+            (Some(serde_json::json!(u64::MAX)), Ok(Some(u64::MAX))),
+            (
+                Some(serde_json::json!(-1)),
+                Err(AdmissionError::ConfigurationUnavailable),
+            ),
+            (
+                Some(serde_json::json!(1.5)),
+                Err(AdmissionError::ConfigurationUnavailable),
+            ),
+            (
+                Some(serde_json::json!(true)),
+                Err(AdmissionError::ConfigurationUnavailable),
+            ),
+            (
+                Some(serde_json::json!("7")),
+                Err(AdmissionError::ConfigurationUnavailable),
+            ),
+            (
+                Some(serde_json::json!([])),
+                Err(AdmissionError::ConfigurationUnavailable),
+            ),
+            (
+                Some(serde_json::json!({})),
+                Err(AdmissionError::ConfigurationUnavailable),
+            ),
+        ] {
+            assert_eq!(configuration(None, budget).offload_budget_bytes(), expected);
+        }
+    }
+
     #[cfg(feature = "full-tests")]
     #[test]
     fn offload_floor_capture_preserves_ordinary_admission_and_refuses_drift() {
@@ -362,6 +438,7 @@ mod tests {
             serde_json::json!({"backup":{"offload":{"floor_bytes":null}}}),
             serde_json::json!({"backup":{"offload":{"floor_bytes":"7"}}}),
             serde_json::json!({"backup":{"offload":{"floor_bytes":0}}}),
+            serde_json::json!({"backup":{"offload":{"enabled":"true","budget_bytes":"7"}}}),
         ] {
             write(&config);
             let captured = ArchiveConfiguration::capture(&root).unwrap();
@@ -370,20 +447,70 @@ mod tests {
                 captured.offload_required_bytes(10, 3),
                 Err(AdmissionError::ConfigurationUnavailable)
             );
+            if config["backup"]["offload"]["budget_bytes"].is_string() {
+                assert_eq!(
+                    captured.offload_budget_bytes(),
+                    Err(AdmissionError::ConfigurationUnavailable)
+                );
+            }
         }
-        let mut config = serde_json::json!({"backup":{"offload":{"floor_bytes":7}}});
+        let mut config = serde_json::json!({"backup":{"offload":{
+            "floor_bytes":7,"enabled":true,"budget_bytes":100
+        }}});
         write(&config);
         let captured = ArchiveConfiguration::capture(&root).unwrap();
         assert_eq!(captured.offload_required_bytes(10, 3), Ok(20));
+        assert!(captured.offload_enabled());
+        assert_eq!(captured.offload_budget_bytes(), Ok(Some(100)));
         config["backup"]["last_backup"] = serde_json::json!({"status":"ok"});
         write(&config);
         captured.revalidate(&root).unwrap();
+        for (key, replacement) in [
+            ("enabled", serde_json::json!(false)),
+            ("budget_bytes", serde_json::json!(101)),
+        ] {
+            let mut changed = config.clone();
+            changed["backup"]["offload"][key] = replacement;
+            write(&changed);
+            assert_eq!(
+                captured.revalidate(&root),
+                Err(AdmissionError::ConfigurationChanged)
+            );
+        }
         config["backup"]["offload"]["floor_bytes"] = serde_json::json!(8);
         write(&config);
         assert_eq!(
             captured.revalidate(&root),
             Err(AdmissionError::ConfigurationChanged)
         );
+        for (original_offload, changed_offload) in [
+            (serde_json::json!({}), serde_json::json!({"enabled":null})),
+            (serde_json::json!({}), serde_json::json!({"enabled":false})),
+            (
+                serde_json::json!({}),
+                serde_json::json!({"budget_bytes":null}),
+            ),
+            (
+                serde_json::json!({"budget_bytes":"7"}),
+                serde_json::json!({"budget_bytes":false}),
+            ),
+        ] {
+            write(&serde_json::json!({"backup":{"offload":original_offload}}));
+            let captured = ArchiveConfiguration::capture(&root).unwrap();
+            captured.revalidate(&root).unwrap();
+            write(&serde_json::json!({"backup":{"offload":changed_offload}}));
+            let changed = ArchiveConfiguration::capture(&root).unwrap();
+            changed.revalidate(&root).unwrap();
+            assert_eq!(captured.offload_enabled(), changed.offload_enabled());
+            assert_eq!(
+                captured.offload_budget_bytes(),
+                changed.offload_budget_bytes()
+            );
+            assert_eq!(
+                captured.revalidate(&root),
+                Err(AdmissionError::ConfigurationChanged)
+            );
+        }
         config["backup"]["offload"]["floor_bytes"] = Value::Null;
         write(&config);
         assert_eq!(
