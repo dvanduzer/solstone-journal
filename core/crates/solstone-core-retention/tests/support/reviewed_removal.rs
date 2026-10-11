@@ -161,6 +161,215 @@ fn now() -> DateTime<Utc> {
 }
 
 #[test]
+fn ordinary_finish_preserves_actual_receipts_and_releases_activity() {
+    use solstone_core_journal_io::activity::{ActivityLease, TeardownLease};
+    use solstone_core_journal_io::media::{
+        ActivityCarrierRetirementEffect, Confirmation, Durability,
+    };
+    fn send_static<T: Send + 'static>() {}
+    send_static::<ReviewedRemovalFinish>();
+    send_static::<OwnedReviewedRemoval>();
+    send_static::<ReviewedRemovalReport>();
+
+    for named in [false, true] {
+        let mut f = Fixture::new();
+        let target = f.target(named);
+        let raw = f.raw(&target, "audio.flac", false);
+        let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+        let result = f.run(f.checked(std::slice::from_ref(&mark)));
+        let original_identity = result.attempts()[0].native().receipt().claimed_identity;
+        let ReviewedRemovalFinish::Settled(report) = result.finish() else {
+            panic!("complete local removal must settle");
+        };
+        assert!(!raw.exists());
+        assert_eq!(report.selected_marks(), &[mark]);
+        assert_eq!(report.outcome().removed_paths().count(), 1);
+        assert_eq!(report.attempts().len(), 1);
+        let attempt = &report.attempts()[0];
+        assert_eq!(attempt.native().effect, RemovalEffect::Deleted);
+        assert_eq!(attempt.native().cleanup, Cleanup::Complete);
+        assert_eq!(attempt.native().claimed_identity, original_identity);
+        assert!(attempt.native().failures.is_empty());
+        assert!(attempt.append().unwrap().failures().is_empty());
+        assert!(attempt.marker().unwrap().is_ok());
+        assert!(attempt.binding_error().is_none());
+        assert!(matches!(
+            report.mutation(),
+            Some(Ok(BoundMutationOutcome::Published(_)))
+        ));
+        assert_eq!(
+            report.retirement().effect(),
+            ActivityCarrierRetirementEffect::Removed
+        );
+        assert_eq!(report.retirement().root_durability(), Durability::Synced);
+        assert_eq!(report.retirement().confirmation(), Confirmation::Confirmed);
+        assert!(report.retirement().failures().is_empty());
+        assert!(load_at_root(&f.root).unwrap().marks.is_empty());
+        assert!(
+            solstone_core_journal_io::activity_obligations::observe_obligations(&f.root)
+                .unwrap()
+                .entries()
+                .is_empty()
+        );
+        {
+            let next = ActivityLease::try_acquire(Arc::clone(&f.root)).unwrap();
+            next.revalidate().unwrap();
+        }
+        let next = TeardownLease::try_acquire(Arc::clone(&f.root)).unwrap();
+        next.revalidate().unwrap();
+        assert_eq!(report.attempts()[0].native().effect, RemovalEffect::Deleted);
+    }
+}
+
+#[test]
+fn ordinary_finish_kept_partial_and_direct_hold_preserve_owners() {
+    use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
+    for partial in [false, true] {
+        for direct_hold in [false, true] {
+            let mut f = Fixture::new();
+            let target = f.target(false);
+            let raw = f.raw(&target, "ordinary.flac", false);
+            let empty = partial.then(|| f.raw(&target, "empty.flac", true));
+            f.config(json!({"retention":{"raw_media":"keep"}}));
+            let names = if partial {
+                vec!["empty.flac", "ordinary.flac"]
+            } else {
+                vec!["ordinary.flac"]
+            };
+            let mark = f.mark(target, &names, RemovalClass::OffloadRawRelease);
+            let result = f.run(f.checked(std::slice::from_ref(&mark)));
+            let held = if direct_hold {
+                Box::new(result.into_owned_hold())
+            } else {
+                let ReviewedRemovalFinish::Held(held) = result.finish() else {
+                    panic!("incomplete local selection must remain held");
+                };
+                assert!(matches!(
+                    held.finish_refusal(),
+                    Some(ReviewedRemovalFinishRefusal::IncompleteSelection)
+                ));
+                held
+            };
+            assert_eq!(held.removal().selected_marks(), std::slice::from_ref(&mark));
+            assert_eq!(
+                held.removal().outcome().removed_paths().count(),
+                usize::from(partial)
+            );
+            assert_eq!(held.removal().attempts().len(), usize::from(partial));
+            if partial {
+                assert_eq!(
+                    held.removal().attempts()[0].native().receipt().effect,
+                    RemovalEffect::Deleted
+                );
+            }
+            assert!(held.retirement().is_none());
+            assert!(held.removal().carrier_preparation().is_some());
+            assert!(raw.exists());
+            assert!(empty.is_none_or(|path| !path.exists()));
+            assert_eq!(
+                load_at_root(&f.root).unwrap().marks.get(&mark.id),
+                Some(&mark)
+            );
+            assert!(matches!(
+                TeardownLease::try_acquire(Arc::clone(&f.root)),
+                Err(ActivityAdmissionError::Busy)
+            ));
+        }
+    }
+}
+
+#[test]
+fn ordinary_finish_late_obligation_keeps_completed_effects_and_exclusion() {
+    use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    let late = f.path(".tmp-offload-late");
+    fs::create_dir(&late).unwrap();
+    let ReviewedRemovalFinish::Held(held) = result.finish() else {
+        panic!("late obligation must remain held");
+    };
+    assert!(matches!(
+        held.finish_refusal(),
+        Some(ReviewedRemovalFinishRefusal::Native(
+            ReviewedArchiveFinishRefusal::Obligations(_)
+        ))
+    ));
+    assert!(!raw.exists());
+    assert!(late.exists());
+    assert_eq!(held.removal().selected_marks(), &[mark]);
+    assert_eq!(held.removal().outcome().removed_paths().count(), 1);
+    assert_eq!(
+        held.removal().attempts()[0].native().receipt().effect,
+        RemovalEffect::Deleted
+    );
+    assert_eq!(
+        held.removal().attempts()[0].native().receipt().cleanup,
+        Cleanup::Complete
+    );
+    assert!(load_at_root(&f.root).unwrap().marks.is_empty());
+    assert!(held.retirement().is_none());
+    assert!(held.removal().carrier_preparation().is_some());
+    assert!(matches!(
+        TeardownLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+}
+
+#[test]
+fn ordinary_finish_removed_but_unsynced_retirement_retains_os_error_and_owners() {
+    use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
+    use solstone_core_journal_io::media::{
+        ActivityCarrierRetirementEffect, Confirmation, Durability,
+    };
+    let mut f = Fixture::new();
+    let target = f.target(false);
+    let raw = f.raw(&target, "audio.flac", false);
+    let mark = f.mark(target, &["audio.flac"], RemovalClass::PolicyRawRelease);
+    let result = f.run(f.checked(std::slice::from_ref(&mark)));
+    let (finish, consumed) = run_with_media_hook(
+        MediaPrimitive::CarrierRetirementRootSync,
+        || Err(std::io::Error::from_raw_os_error(13)),
+        || result.finish(),
+    );
+    assert!(consumed);
+    let ReviewedRemovalFinish::Held(held) = finish else {
+        panic!("unsynced retirement must remain held");
+    };
+    assert!(matches!(
+        held.finish_refusal(),
+        Some(ReviewedRemovalFinishRefusal::Retirement)
+    ));
+    assert!(!raw.exists());
+    assert_eq!(held.removal().selected_marks(), &[mark]);
+    assert_eq!(
+        held.removal().attempts()[0].native().receipt().effect,
+        RemovalEffect::Deleted
+    );
+    assert_eq!(
+        held.removal().attempts()[0].native().receipt().cleanup,
+        Cleanup::Complete
+    );
+    assert!(load_at_root(&f.root).unwrap().marks.is_empty());
+    let retirement = held.retirement().unwrap();
+    assert_eq!(
+        retirement.effect(),
+        ActivityCarrierRetirementEffect::Removed
+    );
+    assert_eq!(retirement.root_durability(), Durability::Unproven);
+    assert_eq!(retirement.confirmation(), Confirmation::Confirmed);
+    assert_eq!(retirement.failures().len(), 1);
+    assert_eq!(retirement.failures()[0].raw_os_error(), Some(13));
+    assert!(held.removal().carrier_preparation().is_some());
+    assert!(matches!(
+        TeardownLease::try_acquire(Arc::clone(&f.root)),
+        Err(ActivityAdmissionError::Busy)
+    ));
+}
+
+#[test]
 fn current_config_age_groups_layouts_and_legacy_partial_govern() {
     for named in [false, true] {
         for (raw_rule, preserve, empty, expected) in [

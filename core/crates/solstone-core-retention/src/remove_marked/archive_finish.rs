@@ -178,6 +178,17 @@ pub struct ReviewedRemovalFileReport {
     binding: Option<std::io::Error>,
 }
 impl ReviewedRemovalFileReport {
+    #[cfg(unix)]
+    pub(super) fn from_actual(attempt: ReviewedFileRemoval) -> Self {
+        Self {
+            relative: attempt.relative,
+            class: attempt.class,
+            native: attempt.native.into_receipt(),
+            append: attempt.append,
+            marker: attempt.marker,
+            binding: attempt.binding,
+        }
+    }
     pub fn relative(&self) -> &str {
         &self.relative
     }
@@ -342,13 +353,20 @@ fn complete_selection(
     checked: &crate::review_context::CheckedReviewContext,
     execution: &ReviewedExecution,
 ) -> bool {
+    execution.carrier.is_none() && complete_selected_files(checked, execution)
+}
+
+#[cfg(unix)]
+pub(super) fn complete_selected_files(
+    checked: &crate::review_context::CheckedReviewContext,
+    execution: &ReviewedExecution,
+) -> bool {
     use crate::mark_mutation::{BoundMutationOutcome, MutationStatus};
     use solstone_core_journal_io::media::{Confirmation, OriginalName, RemovalEffect};
     use std::collections::BTreeSet;
     if checked.marks().is_empty()
         || execution.refusal.is_some()
         || !execution.stage_failures.is_empty()
-        || execution.carrier.is_some()
         || execution.carrier_failure.is_some()
         || execution.outcome.halted.is_some()
         || execution.outcome.targets.len() != checked.marks().len()
@@ -465,9 +483,9 @@ impl<'clock> ReviewedArchiveRemoval<'clock> {
 }
 
 #[cfg(unix)]
-fn finish_native(
+pub(super) fn finish_native(
     execution: &mut ReviewedExecution,
-    carrier: &std::sync::Arc<solstone_core_journal_io::media::RootActivityCarrier>,
+    carrier: &solstone_core_journal_io::media::RootActivityCarrier,
 ) -> Result<(), ReviewedArchiveFinishRefusal> {
     let validate = (|| {
         carrier.revalidate()?;
@@ -510,14 +528,7 @@ fn release_report(
     let attempts = execution
         .attempts
         .into_iter()
-        .map(|attempt| ReviewedRemovalFileReport {
-            relative: attempt.relative,
-            class: attempt.class,
-            native: attempt.native.into_receipt(),
-            append: attempt.append,
-            marker: attempt.marker,
-            binding: attempt.binding,
-        })
+        .map(ReviewedRemovalFileReport::from_actual)
         .collect();
     ReviewedArchiveReport {
         outcome: execution.outcome,

@@ -79,6 +79,10 @@ const CHILD_SOURCES: &[(&str, &str)] = &[
         "remove_marked::archive_finish",
         include_str!("../src/remove_marked/archive_finish.rs"),
     ),
+    (
+        "remove_marked::ordinary_finish",
+        include_str!("../src/remove_marked/ordinary_finish.rs"),
+    ),
 ];
 
 /// Primitives that remove or rename a directory entry.

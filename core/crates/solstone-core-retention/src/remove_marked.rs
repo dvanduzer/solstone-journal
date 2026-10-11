@@ -482,7 +482,7 @@ impl ReviewedExecution {
 }
 
 /// Owns the original review and every local effect through the caller's settlement.
-/// This additive entry does not retire its carrier or certify hold-free recovery.
+/// Its consuming finish retains uncertainty and reports actual local retirement.
 #[must_use]
 pub struct ReviewedRemoval {
     checked: crate::review_context::CheckedReviewContext,
@@ -529,6 +529,9 @@ impl ReviewedRemoval {
     pub fn journal_root(&self) -> &solstone_core_journal_io::JournalRoot {
         self.checked.root()
     }
+    pub fn selected_marks(&self) -> &[Mark] {
+        self.checked.marks()
+    }
 }
 
 /// Consume rendered ordinary actions beneath their original retained root.
@@ -567,6 +570,11 @@ pub use archive_finish::{
     OwnedSettledReviewedArchiveRemoval, ReviewedArchiveFinish, ReviewedArchiveFinishRefusal,
     ReviewedArchiveReadReport, ReviewedArchiveReport, ReviewedRemovalFileReport,
     SettledReviewedArchiveRemoval, remove_reviewed_with_owned_archive,
+};
+mod ordinary_finish;
+pub use ordinary_finish::{
+    OwnedReviewedRemoval, ReviewedRemovalFinish, ReviewedRemovalFinishRefusal,
+    ReviewedRemovalReport,
 };
 
 /// Retains exact archive confirmation and all effects through caller settlement.
