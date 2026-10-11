@@ -251,4 +251,100 @@ mod tests {
         assert!(!participation.text.contains("## Tmux change encoding"));
         assert!(participation.screen_cuts.is_empty());
     }
+
+    #[test]
+    fn participation_transcript_assembly_ignores_topics_md_and_sense_topics_quotes() {
+        let journal = TempDir::new().unwrap();
+        let segment = journal.path().join("chronicle/20260903/device/102159_300");
+        let talents_dir = segment.join("talents");
+        fs::create_dir_all(&talents_dir).unwrap();
+
+        fs::write(talents_dir.join("shape.json"), r#"{"sense.json":"Sense"}"#).unwrap();
+
+        let sense_base = json!({
+            "density": "steady",
+            "content_type": "meeting",
+            "activity_summary": "Original discussion summary.",
+            "entities": [],
+            "facets": [{"facet": "work", "activity": "Discussion", "level": "high"}],
+            "speculative_facet": null,
+            "meeting_detected": false,
+            "speakers": [],
+            "recommend": {"screen_record": false, "speaker_attribution": false},
+            "emotional_register": "neutral"
+        });
+        fs::write(
+            talents_dir.join("sense.json"),
+            serde_json::to_string_pretty(&sense_base).unwrap(),
+        )
+        .unwrap();
+
+        let request = json!({
+            "name": "participation",
+            "day": "20260903",
+            "segment": "102159_300",
+            "span": ["102159_300"],
+            "stream": "device",
+            "activity": {},
+            "sources": {
+                "talents": {
+                    "sense": true
+                }
+            }
+        });
+
+        let loaded_base = load_transcript(journal.path(), request.as_object().unwrap()).unwrap();
+        assert!(
+            loaded_base.text.contains("Original discussion summary."),
+            "base transcript should contain activity summary: {}",
+            loaded_base.text
+        );
+
+        // 1. Adding talents/topics.md does not alter participation transcript text
+        fs::write(
+            talents_dir.join("topics.md"),
+            "## Topics\n- budget review\n\n## Quotes\n- \"budget numbers\"\n",
+        )
+        .unwrap();
+        let loaded_with_topics_md =
+            load_transcript(journal.path(), request.as_object().unwrap()).unwrap();
+        assert_eq!(
+            loaded_base.text, loaded_with_topics_md.text,
+            "topics.md must not affect participation transcript assembly"
+        );
+
+        // 2. Adding topics and quotes to sense.json does not alter participation transcript text
+        let mut sense_with_keys = sense_base.clone();
+        sense_with_keys["topics"] = json!(["budget review"]);
+        sense_with_keys["quotes"] = json!([{"speaker": "Alice", "text": "budget numbers"}]);
+        fs::write(
+            talents_dir.join("sense.json"),
+            serde_json::to_string_pretty(&sense_with_keys).unwrap(),
+        )
+        .unwrap();
+        let loaded_with_keys =
+            load_transcript(journal.path(), request.as_object().unwrap()).unwrap();
+        assert_eq!(
+            loaded_base.text, loaded_with_keys.text,
+            "sense.json topics and quotes must not affect participation transcript assembly"
+        );
+
+        // Positive control: changing activity_summary does alter transcript text
+        let mut sense_changed = sense_with_keys.clone();
+        sense_changed["activity_summary"] = json!("Updated discussion summary.");
+        fs::write(
+            talents_dir.join("sense.json"),
+            serde_json::to_string_pretty(&sense_changed).unwrap(),
+        )
+        .unwrap();
+        let loaded_changed = load_transcript(journal.path(), request.as_object().unwrap()).unwrap();
+        assert_ne!(
+            loaded_base.text, loaded_changed.text,
+            "activity_summary modification should change transcript text"
+        );
+        assert!(
+            loaded_changed.text.contains("Updated discussion summary."),
+            "changed transcript should reflect new activity summary"
+        );
+    }
 }
