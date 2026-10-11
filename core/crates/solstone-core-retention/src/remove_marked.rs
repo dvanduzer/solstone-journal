@@ -5,13 +5,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::{LockOptions, hold_lock};
 
 use crate::class::partition_empty_audio;
 use crate::content::{ClosedHandlerSet, JournalMedia};
-use crate::door::release_raw;
+use crate::door::{
+    admit_legacy_raw_activity, release_raw_with_activity, require_legacy_raw_target,
+};
 use crate::eligibility::{Blocker, FoundContent, ProvenRaw};
 use crate::grouped::{DecisionPurpose, SideDecision};
 use crate::mark_mutation::{PlannedMarkMutation, conditional_mutate};
@@ -33,6 +37,8 @@ const NO_LONGER_ON_REMOVAL_LIST: &str =
     "this entry is no longer on the removal list, so nothing was removed";
 
 struct RemovalContext<'a> {
+    activity: &'a Arc<ActivityLease>,
+    halted: Option<String>,
     policy: &'a Policy,
     today: NaiveDate,
     now: DateTime<Utc>,
@@ -51,7 +57,20 @@ pub fn remove_marked(
     now: DateTime<Utc>,
     register_errors: &mut Vec<String>,
 ) -> Outcome {
+    if marks.as_slice().is_empty() {
+        return Outcome {
+            targets: Vec::new(),
+            halted: None,
+        };
+    }
+    let activity = match admit_legacy_raw_activity(journal) {
+        Ok(activity) => activity,
+        Err(reason) => return Outcome::halted_before_start(reason),
+    };
+    let journal = activity.journal_root().canonical_path();
     let mut context = RemovalContext {
+        activity: &activity,
+        halted: None,
         policy,
         today,
         now,
@@ -63,7 +82,13 @@ pub fn remove_marked(
     };
     for (index, (id, mark)) in marks.as_slice().iter().enumerate() {
         match remove_one(journal, id, mark, &mut context) {
-            Ok(row) => outcome.targets.push(row),
+            Ok(row) => {
+                outcome.targets.push(row);
+                if let Some(reason) = context.halted.take() {
+                    outcome.halted = Some(RunHalt { reason });
+                    break;
+                }
+            }
             Err(()) => {
                 let remaining = marks.as_slice().len().saturating_sub(index);
                 let reason = format!(
@@ -95,6 +120,10 @@ fn remove_one(
         ));
     }
     let live = crate::layout::segment_rel(&target.day, &target.stream, &target.dir);
+    if let Err(reason) = require_legacy_raw_target(context.activity, target) {
+        context.halted = Some(reason.clone());
+        return Ok(refused(mark, &reason));
+    }
     let _segment_lock = hold_lock(journal.join(&live), LockOptions::default()).map_err(|_| ())?;
     let (row, complete, staged) = {
         let register = match load_marks(journal) {
@@ -171,7 +200,8 @@ fn remove_one(
             .into_iter()
             .filter(|item| desired.contains(item.name()))
             .collect::<Vec<_>>();
-        let (partial, _) = release_raw(journal, &ready, raw_class, context.now);
+        let (partial, _) =
+            release_raw_with_activity(context.activity, None, &ready, raw_class, context.now);
         let mut row = partial.targets.into_iter().next().unwrap_or(TargetOutcome {
             target: target.clone(),
             removed: Vec::new(),
@@ -238,6 +268,16 @@ fn remove_one(
         (row, complete, staged)
     };
     // Segment lock, then register lock, always: marks owns the second lock internally.
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    crate::door::cooperation_tests::checkpoint(
+        crate::door::cooperation_tests::Phase::BeforeRawCas,
+        target,
+    );
+    if let Err(reason) = require_legacy_raw_target(context.activity, target) {
+        context.register_errors.push(reason.clone());
+        context.halted = Some(reason);
+        return Ok(row);
+    }
     let plan = if complete {
         Some(PlannedMarkMutation::resolve(mark))
     } else {

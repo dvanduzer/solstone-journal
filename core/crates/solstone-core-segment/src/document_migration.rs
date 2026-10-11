@@ -25,6 +25,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::cooperation::Cooperation;
 use serde_json::{Map, Value};
 use solstone_core_journal_io::{AtomicWriteOptions, remove_file, write_text};
 
@@ -115,9 +116,11 @@ impl PdfExtractionMigrationReport {
 pub fn migrate_pdf_extractions(
     journal: &Path,
 ) -> Result<PdfExtractionMigrationReport, PdfExtractionMigrationError> {
+    let guard = Cooperation::admit(journal).map_err(PdfExtractionMigrationError)?;
+    let journal = guard.journal();
     let mut report = PdfExtractionMigrationReport::default();
     for output in legacy_outputs(journal) {
-        migrate_one(journal, &output, &mut report)?;
+        migrate_one(journal, &output, &mut report, &guard)?;
     }
     Ok(report)
 }
@@ -134,6 +137,7 @@ fn migrate_one(
     journal: &Path,
     output: &LegacyOutput,
     report: &mut PdfExtractionMigrationReport,
+    guard: &Cooperation,
 ) -> Result<(), PdfExtractionMigrationError> {
     let Some(header) = read_header(&output.path) else {
         // A headerless file is only this migration's business when a raw PDF of
@@ -160,6 +164,9 @@ fn migrate_one(
             report.left_in_place.push(output.rel.clone());
             return Ok(());
         }
+        guard
+            .before_phase(&[&output.path])
+            .map_err(|reason| pdf_hold(report, reason, false))?;
         remove_legacy_output(journal, &output.rel)?;
         report.deleted_duplicates += 1;
         return Ok(());
@@ -186,13 +193,37 @@ fn migrate_one(
         None => file_stem(&output.name).to_owned(),
     };
     let transcript = output.directory.join(DOCUMENT_TRANSCRIPT_NAME);
+    guard
+        .before_phase(&[&output.path, &transcript])
+        .map_err(|reason| pdf_hold(report, reason, false))?;
     write_verified(
         &transcript,
         &render_document_markdown(&title, &text, &header),
     )?;
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    crate::cooperation::tests::checkpoint(crate::cooperation::tests::Phase::AfterTranscript);
+    guard
+        .before_phase(&[&output.path, &transcript])
+        .map_err(|reason| pdf_hold(report, reason, true))?;
     remove_legacy_output(journal, &output.rel)?;
     report.converted_documents += 1;
     Ok(())
+}
+
+fn pdf_hold(
+    report: &PdfExtractionMigrationReport,
+    reason: String,
+    transcript_written: bool,
+) -> PdfExtractionMigrationError {
+    let current = if transcript_written {
+        "; the current transcript was written and its source JSONL was kept"
+    } else {
+        ""
+    };
+    PdfExtractionMigrationError(format!(
+        "{reason}; {} documents converted and {} duplicate sources removed before this stop{current}",
+        report.converted_documents, report.deleted_duplicates
+    ))
 }
 
 /// List `chronicle/*/*/*/*.jsonl` in journal-path order.

@@ -21,6 +21,7 @@
 mod chronicle_migration;
 mod content_name;
 mod continuity;
+mod cooperation;
 mod device;
 mod document_migration;
 mod error;
@@ -109,6 +110,7 @@ mod architecture_tests {
     enum SourceFile {
         ChronicleMigration,
         ContentName,
+        Cooperation,
         Device,
         DocumentMigration,
         Error,
@@ -130,6 +132,7 @@ mod architecture_tests {
             include_str!("chronicle_migration.rs"),
         ),
         (SourceFile::ContentName, include_str!("content_name.rs")),
+        (SourceFile::Cooperation, include_str!("cooperation.rs")),
         (SourceFile::Device, include_str!("device.rs")),
         (
             SourceFile::DocumentMigration,
@@ -263,6 +266,7 @@ mod architecture_tests {
                     }
                 }
                 SourceFile::ContentName
+                | SourceFile::Cooperation
                 | SourceFile::Error
                 | SourceFile::Identity
                 | SourceFile::Manifest

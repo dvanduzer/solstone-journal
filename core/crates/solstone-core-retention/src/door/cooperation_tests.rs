@@ -20,7 +20,9 @@ use solstone_core_journal_io::media::{MediaDirectory, MediaStage};
 use super::*;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum Phase {
+pub(crate) enum Phase {
+    AfterRaw,
+    BeforeRawCas,
     AfterPivot,
     BeforeRestore,
     BeforeMarker,
@@ -31,7 +33,7 @@ thread_local! {
     static CHECKPOINT: RefCell<Option<Checkpoint>> = const { RefCell::new(None) };
 }
 
-pub(super) fn checkpoint(phase: Phase, target: &Target) {
+pub(crate) fn checkpoint(phase: Phase, target: &Target) {
     CHECKPOINT.with(|slot| {
         if let Some(callback) = slot.borrow_mut().as_mut() {
             callback(phase, target);
@@ -123,6 +125,256 @@ fn borrowed_remove(
         RemovalReason::OwnerSegmentDelete,
         "fixture",
     )
+}
+
+fn seed_proven(fixture: &Fixture, target: &Target, name: &str) -> ProvenRaw {
+    use crate::content::{ClosedHandlerSet, JournalMedia};
+    use crate::eligibility::{FileVerdict, resolve_file};
+    let directory = fixture.root.join(segment_rel(target));
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join(name), b"raw").unwrap();
+    let stem = name.rsplit_once('.').unwrap().0;
+    let header = serde_json::json!({"segment": target.dir, "_solstone_processing": {
+        "schema":"solstone.processing.v1", "state":"empty", "reason_code":"no_decodable_audio",
+        "handler":"transcribe", "attempted_at":"2026-10-11T00:00:00Z", "input_size":3
+    }});
+    fs::write(
+        directory.join(format!("{stem}.jsonl")),
+        format!("{header}\n"),
+    )
+    .unwrap();
+    let found = crate::scan::scan_segment(&directory, &ClosedHandlerSet, &JournalMedia);
+    let found = found
+        .iter()
+        .find(|item| item.name.as_str() == name)
+        .unwrap();
+    match resolve_file(
+        &ClosedHandlerSet,
+        &target.day,
+        &target.stream,
+        &target.dir,
+        &found.name,
+        found.size,
+        &found.sidecar,
+    ) {
+        FileVerdict::Releasable(proven) => proven,
+        FileVerdict::Held(reason) => panic!("actual processing fixture held: {reason:?}"),
+    }
+}
+
+#[test]
+fn raw_path_busy_and_same_activity_positive_preserve_sidecars_and_evidence() {
+    let fixture = Fixture::new();
+    let target = Fixture::target("audio", "070000_17");
+    let proven = seed_proven(&fixture, &target, "audio.flac");
+    let activity = fixture.activity();
+    let (held, tally) = release_raw(
+        &fixture.root,
+        std::slice::from_ref(&proven),
+        RawReleaseClass::Policy,
+        DateTime::UNIX_EPOCH,
+    );
+    assert!(held.targets[0].removed.is_empty());
+    assert_eq!(tally.on_record, 0);
+    assert!(fixture.root.join(proven.rel()).exists());
+    assert!(
+        !fixture
+            .root
+            .join(proven.segment_rel())
+            .join("events.jsonl")
+            .exists()
+    );
+    let (done, tally) = release_raw_with_activity(
+        &activity,
+        None,
+        std::slice::from_ref(&proven),
+        RawReleaseClass::Policy,
+        DateTime::UNIX_EPOCH,
+    );
+    assert_eq!(done.targets[0].removed.len(), 1);
+    assert_eq!(tally.on_record, 1);
+    assert!(
+        fixture
+            .root
+            .join(proven.segment_rel())
+            .join("audio.jsonl")
+            .exists()
+    );
+    assert!(
+        fs::read_to_string(fixture.root.join(proven.segment_rel()).join("events.jsonl"))
+            .unwrap()
+            .contains("original_deleted")
+    );
+}
+
+#[test]
+fn raw_reserved_proof_and_carrier_exemption_never_authorize_reserved_paths() {
+    let fixture = Fixture::new();
+    let target = Fixture::target(".tmp-offload-named", "070000_17");
+    let reserved = seed_proven(&fixture, &target, "audio.flac");
+    let (held, tally) = release_raw(
+        &fixture.root,
+        std::slice::from_ref(&reserved),
+        RawReleaseClass::Policy,
+        DateTime::UNIX_EPOCH,
+    );
+    assert!(held.targets[0].removed.is_empty());
+    assert_eq!(tally.on_record, 0);
+    assert!(fixture.root.join(reserved.rel()).exists());
+
+    let clean = Fixture::new();
+    let activity = clean.activity();
+    let carrier = RootActivityCarrier::prepare(Arc::clone(&activity)).unwrap();
+    let ancestor = Fixture::target("_default", "../..");
+    let ancestor_proof = seed_proven(&clean, &ancestor, "audio.flac");
+    assert!(
+        observe_with_carrier(activity.journal_root(), carrier.observation())
+            .unwrap()
+            .unresolved_entries()
+            .next()
+            .is_none()
+    );
+    let (held, _) = release_raw_with_activity(
+        &activity,
+        Some(&carrier),
+        std::slice::from_ref(&ancestor_proof),
+        RawReleaseClass::Policy,
+        DateTime::UNIX_EPOCH,
+    );
+    assert!(held.targets[0].removed.is_empty());
+    assert!(clean.root.join(ancestor_proof.rel()).exists());
+    let ordinary = Fixture::target("audio", "070000_17");
+    let ordinary_proof = seed_proven(&clean, &ordinary, "audio.flac");
+    let (done, _) = release_raw_with_activity(
+        &activity,
+        Some(&carrier),
+        &[ordinary_proof],
+        RawReleaseClass::Policy,
+        DateTime::UNIX_EPOCH,
+    );
+    assert_eq!(done.targets[0].removed.len(), 1);
+}
+
+#[test]
+fn raw_late_binding_refusal_retains_confirmed_first_deletion_and_tally() {
+    let fixture = Fixture::new();
+    let target = Fixture::target("audio", "070000_17");
+    let first = seed_proven(&fixture, &target, "a.flac");
+    let second = seed_proven(&fixture, &target, "b.flac");
+    let root = fixture.root.clone();
+    let displaced = root.with_extension("displaced");
+    let displaced_cleanup = displaced.clone();
+    let (outcome, tally) = with_checkpoint(
+        move |phase, _| {
+            if phase == Phase::AfterRaw {
+                fs::rename(&root, &displaced).unwrap();
+                fs::create_dir(&root).unwrap();
+            }
+        },
+        || {
+            release_raw(
+                &fixture.root,
+                &[first.clone(), second.clone()],
+                RawReleaseClass::Policy,
+                DateTime::UNIX_EPOCH,
+            )
+        },
+    );
+    assert_eq!(outcome.targets[0].removed.len(), 1);
+    assert_eq!(outcome.targets[0].not_removed.len(), 1);
+    assert!(outcome.targets[0].post_commit_failure.is_some());
+    assert_eq!(tally.on_record, 1);
+    assert!(!displaced_cleanup.join(first.rel()).exists());
+    assert!(displaced_cleanup.join(second.rel()).exists());
+    fs::remove_dir_all(displaced_cleanup).unwrap();
+}
+
+#[test]
+fn legacy_final_cas_fresh_census_keeps_current_effect_full_marks_and_later_raw() {
+    use crate::marks::{Proposal, RemovalClass, preflight, reconcile};
+    let fixture = Fixture::new();
+    let first = Fixture::target("audio", "070000_17");
+    let second = Fixture::target("audio", "080000_17");
+    seed_proven(&fixture, &first, "audio.flac");
+    seed_proven(&fixture, &second, "audio.flac");
+    let proposal = Proposal {
+        bytes: 3,
+        reason: "fixture".into(),
+        names: vec!["audio.flac".into()],
+    };
+    let register = reconcile(
+        &fixture.root,
+        RemovalClass::PolicyRawRelease,
+        &[(first, proposal.clone()), (second, proposal)],
+        crate::marks::mark_at("first"),
+    )
+    .unwrap();
+    let ids = register.marks.keys().cloned().collect::<Vec<_>>();
+    let marks = preflight(&fixture.root, &ids).unwrap();
+    let before = fs::read(fixture.root.join("health/retention-marks.json")).unwrap();
+    let mut errors = Vec::new();
+    let policy = crate::policy::policy_from_retention(
+        serde_json::json!({"raw_media":"keep"}).as_object().unwrap(),
+    );
+    let busy = fixture.activity();
+    let held = crate::remove_marked::remove_marked(
+        &fixture.root,
+        &marks,
+        &policy,
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap(),
+        DateTime::UNIX_EPOCH,
+        &mut errors,
+    );
+    assert!(held.targets.is_empty());
+    assert!(held.halted.is_some());
+    assert_eq!(
+        fs::read(fixture.root.join("health/retention-marks.json")).unwrap(),
+        before
+    );
+    for (_, mark) in marks.as_slice() {
+        assert!(
+            fixture
+                .root
+                .join(segment_rel(&mark.target))
+                .join("audio.flac")
+                .exists()
+        );
+    }
+    drop(busy);
+    let root = fixture.root.clone();
+    let outcome = with_checkpoint(
+        move |phase, _| {
+            if phase == Phase::BeforeRawCas {
+                fs::create_dir(root.join(".tmp-offload-new-before-cas")).unwrap();
+            }
+        },
+        || {
+            crate::remove_marked::remove_marked(
+                &fixture.root,
+                &marks,
+                &policy,
+                chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap(),
+                DateTime::UNIX_EPOCH,
+                &mut errors,
+            )
+        },
+    );
+    assert_eq!(outcome.targets.len(), 1);
+    assert_eq!(outcome.targets[0].removed.len(), 1);
+    assert!(outcome.halted.is_some());
+    assert!(!errors.is_empty());
+    assert_eq!(
+        fs::read(fixture.root.join("health/retention-marks.json")).unwrap(),
+        before
+    );
+    let later = &marks.as_slice()[1].1.target;
+    assert!(
+        fixture
+            .root
+            .join(segment_rel(later))
+            .join("audio.flac")
+            .exists()
+    );
 }
 
 fn actual_stage(activity: &Arc<ActivityLease>, relative: &str) -> MediaStage {

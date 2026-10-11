@@ -154,6 +154,46 @@ pub fn release_raw(
     class: RawReleaseClass,
     at: DateTime<Utc>,
 ) -> (Outcome, EvidenceTally) {
+    if proven.is_empty() {
+        return (
+            Outcome {
+                targets: Vec::new(),
+                halted: None,
+            },
+            EvidenceTally::default(),
+        );
+    }
+    match admit_whole_segment_activity(journal) {
+        Ok(activity) => release_raw_with_activity(&activity, None, proven, class, at),
+        Err(reason) => release_raw_guarded(None, Some(reason), proven, class, at),
+    }
+}
+
+/// Release a serialized raw batch under its caller's original admission.
+/// Same-lease creators must not interleave with this call.
+pub fn release_raw_with_activity(
+    activity: &Arc<ActivityLease>,
+    carrier: Option<&RootActivityCarrier>,
+    proven: &[ProvenRaw],
+    class: RawReleaseClass,
+    at: DateTime<Utc>,
+) -> (Outcome, EvidenceTally) {
+    let guard = WholeSegmentActivity { activity, carrier };
+    let refusal = if proven.is_empty() {
+        None
+    } else {
+        guard.population().err()
+    };
+    release_raw_guarded(Some(&guard), refusal, proven, class, at)
+}
+
+fn release_raw_guarded(
+    guard: Option<&WholeSegmentActivity<'_>>,
+    refusal: Option<String>,
+    proven: &[ProvenRaw],
+    class: RawReleaseClass,
+    at: DateTime<Utc>,
+) -> (Outcome, EvidenceTally) {
     let mut outcome = Outcome {
         targets: Vec::new(),
         halted: None,
@@ -191,13 +231,35 @@ pub fn release_raw(
         };
 
         let rel = item.rel();
+        if let Some(reason) = refusal
+            .clone()
+            .or_else(|| guard.and_then(|guard| guard.target(&row.target).err()))
+        {
+            row.not_removed.push(NotRemoved {
+                entry: rel,
+                reason,
+                staged: None,
+            });
+            continue;
+        }
+        let Some(guard) = guard else {
+            row.not_removed.push(NotRemoved {
+                entry: rel,
+                reason: WHOLE_BINDING_HOLD.to_owned(),
+                staged: None,
+            });
+            continue;
+        };
+        let journal = guard.journal();
         match remove_file(journal, &rel) {
             Ok(Removed::Unlinked) => {
                 // The directory entry is gone; make that durable before anything
                 // reports it. `fsync` on a file does not persist the entry naming
                 // it, and a record saying a removal happened at a given moment
                 // has to be true at that moment.
-                if let Err(error) = sync_dir(journal, &item.segment_rel()) {
+                if let Err(error) = guard.target(&row.target).and_then(|()| {
+                    sync_dir(journal, &item.segment_rel()).map_err(|error| error.to_string())
+                }) {
                     row.not_removed.push(NotRemoved {
                         entry: rel.clone(),
                         reason: format!(
@@ -208,9 +270,20 @@ pub fn release_raw(
                     continue;
                 }
                 row.removed.push(RemovedPath::confirmed(rel));
-                if dirty_removed_day(journal, row)
-                    && let Some(flag) = marker_failures.get_mut(index)
-                {
+                #[cfg(all(test, unix, feature = "full-tests"))]
+                cooperation_tests::checkpoint(cooperation_tests::Phase::AfterRaw, &row.target);
+                let marker_failed = match guard.target(&row.target) {
+                    Ok(()) => dirty_removed_day(journal, row),
+                    Err(reason) if row.post_commit_failure.is_none() => {
+                        row.post_commit_failure = Some(PostCommitFailure {
+                            entry: item.segment_rel(),
+                            reason,
+                        });
+                        true
+                    }
+                    Err(_) => false,
+                };
+                if marker_failed && let Some(flag) = marker_failures.get_mut(index) {
                     *flag = true;
                 }
                 match item.evidence() {
@@ -221,6 +294,7 @@ pub fn release_raw(
                 }
 
                 let record_result = (|| -> Result<(), ()> {
+                    guard.target(&row.target).map_err(|_| ())?;
                     let resolved_dir =
                         contained_path(journal, &item.segment_rel()).map_err(|_| ())?;
                     let mut extra = serde_json::Map::new();
@@ -637,6 +711,21 @@ fn admit_whole_segment_activity(journal: &Path) -> Result<Arc<ActivityLease>, St
         ActivityAdmissionError::Busy => WHOLE_ACTIVITY_HOLD.to_owned(),
         ActivityAdmissionError::Unavailable(_) => WHOLE_BINDING_HOLD.to_owned(),
     })
+}
+
+pub(crate) fn admit_legacy_raw_activity(journal: &Path) -> Result<Arc<ActivityLease>, String> {
+    admit_whole_segment_activity(journal)
+}
+
+pub(crate) fn require_legacy_raw_target(
+    activity: &Arc<ActivityLease>,
+    target: &Target,
+) -> Result<(), String> {
+    WholeSegmentActivity {
+        activity,
+        carrier: None,
+    }
+    .before_phase(target)
 }
 
 // A phase-local borrow, never a certificate or a substitute for creator exclusion.
@@ -1395,7 +1484,7 @@ pub fn confirmed_absent(journal: &Path, target: &Target) -> Outcome {
 
 #[cfg(all(test, unix, feature = "full-tests"))]
 #[path = "door/cooperation_tests.rs"]
-mod cooperation_tests;
+pub(crate) mod cooperation_tests;
 
 #[cfg(test)]
 #[allow(

@@ -26,6 +26,7 @@ use solstone_core_journal_io::{
     remove_dir_all, remove_file, rename_within, write_json,
 };
 
+use crate::cooperation::Cooperation;
 use crate::segment_dir::list_days;
 use crate::stream_repair::{MarkerTail, RepairOutcome, repair_stream_tail_from_markers};
 
@@ -83,7 +84,7 @@ pub struct Relocation<'a> {
     pub locks: LockOptions,
 }
 
-/// Why a relocation did not move the directory. Nothing was written.
+/// Why a relocation did not move the directory. A destination parent may exist.
 #[derive(Debug)]
 pub enum RelocationRefusal {
     /// The destination appeared between planning and the move.
@@ -126,7 +127,22 @@ pub fn available_segment_key(
 pub fn relocate_segment(
     relocation: &Relocation<'_>,
 ) -> Result<RelocationOutcome, RelocationRefusal> {
-    ensure_directory(&relocation.journal.join(&relocation.destination.parent_rel))
+    let guard = Cooperation::admit(relocation.journal)
+        .map_err(|error| RelocationRefusal::Failed(RelocationError(error)))?;
+    for end in [
+        Some(relocation.source),
+        Some(relocation.destination),
+        relocation.successor,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_end(&guard, end).map_err(RelocationRefusal::Failed)?;
+    }
+    guard
+        .before_phase(&[&relocation.source.path, &relocation.destination.path])
+        .map_err(|error| RelocationRefusal::Failed(RelocationError(error)))?;
+    ensure_directory(&guard.journal().join(&relocation.destination.parent_rel))
         .map_err(|error| RelocationRefusal::Failed(RelocationError(error.to_string())))?;
     let _live_locks = claim_pivots([
         relocation.source.path.clone(),
@@ -147,34 +163,71 @@ pub fn relocate_segment(
             )));
         }
     }
-    move_directory(relocation)?;
+    guard
+        .before_phase(&[&relocation.source.path, &relocation.destination.path])
+        .map_err(|error| RelocationRefusal::Failed(RelocationError(error)))?;
+    move_directory(relocation, &guard)?;
+    #[cfg(all(test, unix, feature = "full-tests"))]
+    crate::cooperation::tests::checkpoint(crate::cooperation::tests::Phase::AfterPivot);
     let destination = relocation.destination;
     let mut mutated_days = BTreeSet::from([relocation.source.day.clone(), destination.day.clone()]);
-    let events = rewrite_events(destination);
-    let successor = relocation
-        .successor
-        .map(|end| patch_successor(end, &destination.day, &destination.segment));
+    let events = guard
+        .before_phase(&[&destination.path])
+        .map_err(RelocationError)
+        .and_then(|()| rewrite_events(destination, &guard));
+    let successor = relocation.successor.map(|end| {
+        guard
+            .before_phase(&[&end.path])
+            .map_err(RelocationError)
+            .and_then(|()| patch_successor(end, &destination.day, &destination.segment, &guard))
+    });
     if successor.as_ref().is_some_and(Result::is_ok)
         && let Some(successor) = relocation.successor
     {
         mutated_days.insert(successor.day.clone());
     }
-    let tail = repair_stream_tail_from_markers(
-        relocation.journal,
-        relocation.stream,
-        &MarkerTail {
-            last_day: &destination.day,
-            last_segment: &destination.segment,
-            max_seq: relocation.sequence,
-        },
-        relocation.locks,
-    );
+    let tail = if guard.before_phase(&[&destination.path]).is_ok() {
+        repair_stream_tail_from_markers(
+            guard.journal(),
+            relocation.stream,
+            &MarkerTail {
+                last_day: &destination.day,
+                last_segment: &destination.segment,
+                max_seq: relocation.sequence,
+            },
+            relocation.locks,
+        )
+    } else {
+        RepairOutcome::WriteFailed
+    };
     Ok(RelocationOutcome {
         events,
         successor,
         tail,
         mutated_days,
     })
+}
+
+fn validate_end(guard: &Cooperation, end: &RelocationEnd) -> Result<(), RelocationError> {
+    guard.target(&end.path).map_err(RelocationError)?;
+    guard
+        .target(&guard.journal().join(&end.parent_rel))
+        .map_err(RelocationError)?;
+    let parts = end.disk_rel.split('/').collect::<Vec<_>>();
+    let day = solstone_core_journal_io::day_path(guard.journal(), &end.day, false)
+        .map_err(|error| RelocationError(error.to_string()))?;
+    if !matches!(parts.len(), 3 | 4)
+        || parts.first().copied() != Some("chronicle")
+        || parts.get(1).copied() != Some(end.day.as_str())
+        || end.path != guard.journal().join(&end.disk_rel)
+        || end.path.parent() != Some(guard.journal().join(&end.parent_rel).as_path())
+        || !end.path.starts_with(day)
+    {
+        return Err(RelocationError::new(
+            "the segment location does not match the planned move",
+        ));
+    }
+    Ok(())
 }
 
 // Existing agent-memory advancement holds current then predecessor. Pivots
@@ -200,11 +253,12 @@ fn claim_pivots(
         .collect()
 }
 
-fn move_directory(relocation: &Relocation<'_>) -> Result<(), RelocationRefusal> {
-    let journal = relocation.journal;
+fn move_directory(
+    relocation: &Relocation<'_>,
+    guard: &Cooperation,
+) -> Result<(), RelocationRefusal> {
+    let journal = guard.journal();
     let destination = relocation.destination;
-    ensure_directory(&journal.join(&destination.parent_rel))
-        .map_err(|error| RelocationRefusal::Failed(RelocationError(error.to_string())))?;
     // The caller's collision check can become stale while it reads markers and
     // the index. This narrows that window to check-to-syscall, but cannot
     // make rename atomic: rename(2) has no no-replace mode through this seam.
@@ -219,7 +273,10 @@ fn move_directory(relocation: &Relocation<'_>) -> Result<(), RelocationRefusal> 
 ///
 /// Non-object and unparsable lines survive byte-for-byte: a move must not be a
 /// silent opportunity to normalize content the mover does not understand.
-fn rewrite_events(destination: &RelocationEnd) -> Result<u64, RelocationError> {
+fn rewrite_events(
+    destination: &RelocationEnd,
+    guard: &Cooperation,
+) -> Result<u64, RelocationError> {
     let path = destination.path.join("events.jsonl");
     let text =
         read_text(&path, String::new()).map_err(|error| RelocationError(error.to_string()))?;
@@ -257,6 +314,9 @@ fn rewrite_events(destination: &RelocationEnd) -> Result<u64, RelocationError> {
     } else {
         format!("{}\n", rewritten.join("\n"))
     };
+    guard
+        .before_phase(&[&destination.path])
+        .map_err(RelocationError)?;
     atomic_replace(path, replacement.as_bytes(), AtomicWriteOptions::default())
         .map_err(|error| RelocationError(error.to_string()))?;
     Ok(count)
@@ -266,6 +326,7 @@ fn patch_successor(
     successor: &RelocationEnd,
     day: &str,
     segment: &str,
+    guard: &Cooperation,
 ) -> Result<(), RelocationError> {
     let path = successor.path.join("stream.json");
     let text = read_text(&path, String::new())
@@ -277,6 +338,9 @@ fn patch_successor(
         .ok_or_else(|| RelocationError::new("could not read marker"))?;
     object.insert("prev_day".to_owned(), Value::String(day.to_owned()));
     object.insert("prev_segment".to_owned(), Value::String(segment.to_owned()));
+    guard
+        .before_phase(&[&successor.path])
+        .map_err(RelocationError)?;
     write_json(path, &marker, JsonWriteOptions::default())
         .map_err(|error| RelocationError(error.to_string()))
 }
@@ -344,6 +408,12 @@ pub fn restructure_segments_by_stream(
     journal: &Path,
     dry_run: bool,
 ) -> Result<SegmentRestructureReport, RelocationError> {
+    let guard = if dry_run {
+        None
+    } else {
+        Some(Cooperation::admit(journal).map_err(RelocationError)?)
+    };
+    let journal = guard.as_ref().map_or(journal, Cooperation::journal);
     let mut report = SegmentRestructureReport {
         dry_run,
         ..SegmentRestructureReport::default()
@@ -391,9 +461,19 @@ pub fn restructure_segments_by_stream(
     for (segment, stream) in plan {
         let Some(stream) = stream else {
             if !dry_run {
+                if let Some(guard) = &guard {
+                    guard
+                        .before_phase(&[&segment])
+                        .map_err(|reason| restructure_hold(&report, reason))?;
+                }
                 let _live_locks = claim_pivots([segment.clone()])?;
                 if !is_empty_segment(&segment)? {
                     return Err(RelocationError::new("segment changed during restructure"));
+                }
+                if let Some(guard) = &guard {
+                    guard
+                        .before_phase(&[&segment])
+                        .map_err(|reason| restructure_hold(&report, reason))?;
                 }
                 remove_dir_all(journal, &relative(journal, &segment)?)
                     .map_err(|error| RelocationError(error.to_string()))?;
@@ -410,9 +490,14 @@ pub fn restructure_segments_by_stream(
             .ok_or_else(|| RelocationError::new("segment directory has no name"))?;
         streams.insert(stream.clone());
         if !dry_run {
+            let destination = parent.join(&stream).join(name);
+            if let Some(guard) = &guard {
+                guard
+                    .before_phase(&[&segment, &destination])
+                    .map_err(|reason| restructure_hold(&report, reason))?;
+            }
             ensure_directory(&parent.join(&stream))
                 .map_err(|error| RelocationError(error.to_string()))?;
-            let destination = parent.join(&stream).join(name);
             let _live_locks = claim_pivots([segment.clone(), destination.clone()])?;
             if crate::owner_deleted(&segment).map_err(|error| RelocationError(error.to_string()))?
                 || crate::owner_deleted(&destination)
@@ -423,6 +508,11 @@ pub fn restructure_segments_by_stream(
             // Python's `shutil.move` performs no destination pre-check here;
             // the restructure runs against a flat layout it has just proven
             // has no stream directory of this name holding this key.
+            if let Some(guard) = &guard {
+                guard
+                    .before_phase(&[&segment, &destination])
+                    .map_err(|reason| restructure_hold(&report, reason))?;
+            }
             rename_within(
                 journal,
                 &relative(journal, &segment)?,
@@ -453,6 +543,12 @@ pub fn migrate_agent_layout(
     dry_run: bool,
 ) -> Result<AgentLayoutMigrationReport, RelocationError> {
     let mut report = AgentLayoutMigrationReport::default();
+    let guard = if dry_run {
+        None
+    } else {
+        Some(Cooperation::admit(journal).map_err(RelocationError)?)
+    };
+    let journal = guard.as_ref().map_or(journal, Cooperation::journal);
     let facets = facet_names(journal)?;
     for (_, day_dir) in list_days(journal).map_err(|error| RelocationError(error.to_string()))? {
         let mut segments = iter_segments(journal, PathOrDay::Directory(&day_dir))
@@ -462,9 +558,23 @@ pub fn migrate_agent_layout(
             .collect::<Vec<_>>();
         segments.sort();
         for segment in segments {
-            migrate_segment_outputs(journal, &segment, &facets, dry_run, &mut report)?;
+            migrate_segment_outputs(
+                journal,
+                &segment,
+                &facets,
+                dry_run,
+                &mut report,
+                guard.as_ref(),
+            )?;
         }
-        migrate_daily_faceted_outputs(journal, &day_dir, &facets, dry_run, &mut report)?;
+        migrate_daily_faceted_outputs(
+            journal,
+            &day_dir,
+            &facets,
+            dry_run,
+            &mut report,
+            guard.as_ref(),
+        )?;
     }
     Ok(report)
 }
@@ -476,6 +586,7 @@ fn migrate_segment_outputs(
     facets: &BTreeSet<String>,
     dry_run: bool,
     report: &mut AgentLayoutMigrationReport,
+    guard: Option<&Cooperation>,
 ) -> Result<(), RelocationError> {
     let agents = segment.join("agents");
     let mut markdown = Vec::new();
@@ -501,6 +612,7 @@ fn migrate_segment_outputs(
             &agents.join(&name),
             dry_run,
             report,
+            guard,
         )?;
     }
     for name in json {
@@ -511,6 +623,7 @@ fn migrate_segment_outputs(
                 &agents.join(&name),
                 dry_run,
                 report,
+                guard,
             )?;
             continue;
         }
@@ -525,6 +638,7 @@ fn migrate_segment_outputs(
                 &agents.join(facet).join("activity_state.json"),
                 dry_run,
                 report,
+                guard,
             )?;
             continue;
         }
@@ -540,6 +654,7 @@ fn migrate_daily_faceted_outputs(
     facets: &BTreeSet<String>,
     dry_run: bool,
     report: &mut AgentLayoutMigrationReport,
+    guard: Option<&Cooperation>,
 ) -> Result<(), RelocationError> {
     let agents = day_dir.join("agents");
     if !agents.is_dir() {
@@ -577,6 +692,7 @@ fn migrate_daily_faceted_outputs(
             &agents.join(facet).join(format!("{topic}{extension}")),
             dry_run,
             report,
+            guard,
         )?;
     }
     Ok(())
@@ -596,7 +712,13 @@ fn move_file(
     destination: &Path,
     dry_run: bool,
     report: &mut AgentLayoutMigrationReport,
+    guard: Option<&Cooperation>,
 ) -> Result<(), RelocationError> {
+    if let Some(guard) = guard {
+        guard
+            .before_phase(&[source, destination])
+            .map_err(|reason| agent_hold(report, reason))?;
+    }
     if destination.exists() {
         let identical = match (fs::read(source), fs::read(destination)) {
             (Ok(left), Ok(right)) => left == right,
@@ -604,6 +726,11 @@ fn move_file(
         };
         if identical {
             if !dry_run {
+                if let Some(guard) = guard {
+                    guard
+                        .before_phase(&[source, destination])
+                        .map_err(|reason| agent_hold(report, reason))?;
+                }
                 remove_file(journal, &relative(journal, source)?)
                     .map_err(|error| RelocationError(error.to_string()))?;
             }
@@ -617,20 +744,32 @@ fn move_file(
         report.moved += 1;
         return Ok(());
     }
-    let outcome = destination
+    if let Some(guard) = guard {
+        guard
+            .before_phase(&[source, destination])
+            .map_err(|reason| agent_hold(report, reason))?;
+    }
+    let parent_result = destination
         .parent()
         .ok_or_else(|| RelocationError::new("destination has no parent"))
         .and_then(|parent| {
             ensure_directory(parent).map_err(|error| RelocationError(error.to_string()))
-        })
-        .and_then(|()| {
-            rename_within(
-                journal,
-                &relative(journal, source)?,
-                &relative(journal, destination)?,
-            )
-            .map_err(|error| RelocationError(error.to_string()))
         });
+    if parent_result.is_ok()
+        && let Some(guard) = guard
+    {
+        guard
+            .before_phase(&[source, destination])
+            .map_err(|reason| agent_hold(report, reason))?;
+    }
+    let outcome = parent_result.and_then(|()| {
+        rename_within(
+            journal,
+            &relative(journal, source)?,
+            &relative(journal, destination)?,
+        )
+        .map_err(|error| RelocationError(error.to_string()))
+    });
     // One unmovable file is counted and stepped over, exactly as the migration
     // being ported does; the rest of the journal still migrates.
     match outcome {
@@ -638,6 +777,20 @@ fn move_file(
         Err(_) => report.errors += 1,
     }
     Ok(())
+}
+
+fn restructure_hold(report: &SegmentRestructureReport, reason: String) -> RelocationError {
+    RelocationError(format!(
+        "{reason}; {} segments moved and {} empty folders removed before this stop",
+        report.moved, report.removed
+    ))
+}
+
+fn agent_hold(report: &AgentLayoutMigrationReport, reason: String) -> RelocationError {
+    RelocationError(format!(
+        "{reason}; {} files moved and {} duplicate sources removed before this stop",
+        report.moved, report.cleaned
+    ))
 }
 
 /// Every facet directory name, or none when the journal has no `facets/`.
