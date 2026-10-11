@@ -15,7 +15,8 @@ use solstone_core_journal_io::media::{
 };
 use solstone_core_journal_io::{JournalRoot, LockOptions};
 use solstone_core_retention::archive_catalog::{
-    ArchiveWitness, RestoreDisposition, SegmentCatalog, read_complete_catalog,
+    ArchiveWitness, LegacyRestoreBinding, RestoreDisposition, RestoreOperation, SegmentCatalog,
+    read_complete_catalog,
 };
 #[cfg(all(test, feature = "full-tests", unix))]
 use solstone_core_retention::mark_mutation::conditional_mutate_at_root;
@@ -28,7 +29,7 @@ use solstone_core_segment::output_attempt::{OutputClaims, SegmentCommit};
 use super::{RestoreIntentStore, StoreAdmissionFailure, StoreProblem, StoreWriteReceipt};
 use crate::ledger::writer::{
     LedgerConfirmation, LedgerSync, LedgerWriteReceipt, LedgerWriteRefusal,
-    append_restore_operation,
+    append_legacy_restore_operation, append_restore_operation,
 };
 use crate::restore::owned::RestoreRegisterRefusal;
 use crate::restore_intent::{
@@ -131,9 +132,14 @@ pub(crate) struct StagedRestore<'operation, 'clock> {
     owner: Owner<'operation, 'clock>,
     witness: ArchiveWitness,
     stage: StageEvidence,
+    legacy_binding: Option<LegacyRestoreBinding>,
 }
 
-fn catalog(owner: &Owner<'_, '_>) -> Result<SegmentCatalog, Hold> {
+fn catalog(
+    owner: &Owner<'_, '_>,
+    legacy_binding: Option<&LegacyRestoreBinding>,
+    operation: Option<&RestoreOperation>,
+) -> Result<SegmentCatalog, Hold> {
     owner.native_check()?;
     let catalog = read_complete_catalog(owner.root())
         .map_err(|_| Hold::Repair(RepairHold::DegradedCatalog))?;
@@ -141,6 +147,55 @@ fn catalog(owner: &Owner<'_, '_>) -> Result<SegmentCatalog, Hold> {
         return Err(Hold::Repair(RepairHold::DegradedCatalog));
     }
     let locator = owner.destination.locator();
+    if let Some(binding) = legacy_binding {
+        binding
+            .validate()
+            .map_err(|_| Hold::Repair(RepairHold::InvalidIntent))?;
+        if binding.target != locator.target
+            || binding.layout != locator.layout
+            || catalog.restore_binding(&binding.adoption_id) != Some(binding)
+        {
+            return Err(Hold::Repair(RepairHold::CatalogChanged));
+        }
+        let mut manifests = catalog
+            .days
+            .iter()
+            .flat_map(|day| &day.segments)
+            .flat_map(|segment| &segment.history)
+            .filter(|manifest| manifest.manifest_id == binding.legacy_manifest.manifest_id);
+        if manifests.next() != Some(&binding.legacy_manifest) || manifests.next().is_some() {
+            return Err(Hold::Repair(RepairHold::CatalogChanged));
+        }
+        for original in &binding.legacy_manifest.files {
+            let mut witnesses = catalog
+                .days
+                .iter()
+                .flat_map(|day| &day.segments)
+                .flat_map(|segment| &segment.history)
+                .flat_map(|manifest| &manifest.files)
+                .filter(|witness| witness.witness_id == original.witness_id);
+            if witnesses.next() != Some(original) || witnesses.next().is_some() {
+                return Err(Hold::Repair(RepairHold::CatalogChanged));
+            }
+        }
+        if let Some(expected) = operation {
+            let mut operations = catalog
+                .days
+                .iter()
+                .flat_map(|day| &day.segments)
+                .flat_map(|segment| segment.restores.iter().map(move |event| (segment, event)))
+                .filter(|(_, event)| event.operation_id == expected.operation_id);
+            if operations.next().is_some_and(|(segment, event)| {
+                event != expected
+                    || segment.day != locator.target.day
+                    || segment.stream != locator.target.stream
+                    || segment.segment != locator.segment
+            }) || operations.next().is_some()
+            {
+                return Err(Hold::Repair(RepairHold::OperationCollision));
+            }
+        }
+    }
     catalog
         .days
         .into_iter()
@@ -211,6 +266,32 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         witness: ArchiveWitness,
         required_capacity: u64,
     ) -> Result<Self, Box<StagingFailure>> {
+        Self::read_source(destination, operation, witness, required_capacity, None)
+    }
+
+    pub(crate) fn read_legacy(
+        destination: PreparedRestore,
+        operation: &'operation mut ReadOperation<'clock>,
+        witness: ArchiveWitness,
+        required_capacity: u64,
+        binding: LegacyRestoreBinding,
+    ) -> Result<Self, Box<StagingFailure>> {
+        Self::read_source(
+            destination,
+            operation,
+            witness,
+            required_capacity,
+            Some(binding),
+        )
+    }
+
+    fn read_source(
+        destination: PreparedRestore,
+        operation: &'operation mut ReadOperation<'clock>,
+        witness: ArchiveWitness,
+        required_capacity: u64,
+        legacy_binding: Option<LegacyRestoreBinding>,
+    ) -> Result<Self, Box<StagingFailure>> {
         let carrier = Arc::clone(operation.carrier());
         let owner = Owner {
             carrier,
@@ -219,8 +300,16 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             media: None,
         };
         let preflight = (|| {
-            if !Arc::ptr_eq(operation.journal_root(), owner.root())
-                || witness.repository_id.as_deref() != Some(operation.repository_id())
+            if !Arc::ptr_eq(operation.journal_root(), owner.root()) {
+                return Err(Hold::Repair(RepairHold::UnboundWitness));
+            }
+            if let Some(binding) = &legacy_binding {
+                if binding.repository_id != operation.repository_id()
+                    || !binding.legacy_manifest.files.contains(&witness)
+                {
+                    return Err(Hold::Repair(RepairHold::UnboundWitness));
+                }
+            } else if witness.repository_id.as_deref() != Some(operation.repository_id())
                 || witness.layout != Some(owner.destination.locator().layout)
                 || witness.segment_dir.as_ref() != Some(&owner.destination.locator().target.dir)
             {
@@ -228,7 +317,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             }
             owner.native_check()?;
             owner.admission.check()?;
-            let selection = catalog(&owner)?;
+            let selection = catalog(&owner, legacy_binding.as_ref(), None)?;
             if !selection.active.contains(&witness) {
                 return Err(Hold::Repair(RepairHold::CatalogChanged));
             }
@@ -237,7 +326,30 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             if coverage.unresolved_entries().next().is_some() {
                 return Err(Hold::Obligations);
             }
-            Ok(())
+            if let Some(binding) = &legacy_binding {
+                let file = binding
+                    .files
+                    .iter()
+                    .find(|file| file.witness_id == witness.witness_id)
+                    .ok_or(Hold::Repair(RepairHold::UnboundWitness))?;
+                Ok(ExactArchiveFile {
+                    repository_id: binding.repository_id.clone(),
+                    snapshot_id: binding.snapshot_id.clone(),
+                    name: file.name.clone(),
+                    archive_path: file.archive_path.clone(),
+                    bytes: file.bytes,
+                    sha256: file.sha256.clone(),
+                })
+            } else {
+                Ok(ExactArchiveFile {
+                    repository_id: witness.repository_id.clone().unwrap_or_default(),
+                    snapshot_id: witness.snapshot_id.clone(),
+                    name: witness.file.name.clone(),
+                    archive_path: witness.archive_path.clone().unwrap_or_default(),
+                    bytes: witness.file.bytes,
+                    sha256: witness.file.sha256.clone(),
+                })
+            }
         })();
         let fail = |owner: Owner<'_, '_>, hold, evidence| {
             Box::new(StagingFailure {
@@ -247,9 +359,10 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 hold,
             })
         };
-        if let Err(hold) = preflight {
-            return Err(fail(owner, hold, StagingEvidence::None));
-        }
+        let exact = match preflight {
+            Ok(exact) => exact,
+            Err(hold) => return Err(fail(owner, hold, StagingEvidence::None)),
+        };
         let stage = match MediaStage::create(
             owner.destination.stage_parent(),
             Arc::clone(owner.carrier.activity()),
@@ -296,14 +409,6 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             destination,
             ..
         } = owner;
-        let exact = ExactArchiveFile {
-            repository_id: witness.repository_id.clone().unwrap_or_default(),
-            snapshot_id: witness.snapshot_id.clone(),
-            name: witness.file.name.clone(),
-            archive_path: witness.archive_path.clone().unwrap_or_default(),
-            bytes: witness.file.bytes,
-            sha256: witness.file.sha256.clone(),
-        };
         let media = match operation.read_exact(&exact, target) {
             Ok(media) => media,
             Err(error) => {
@@ -333,6 +438,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             owner,
             witness,
             stage,
+            legacy_binding,
         })
     }
 }
@@ -460,7 +566,11 @@ impl<'operation, 'clock> TransactionOutcome<'operation, 'clock> {
 
     fn inspect(&self) -> Result<RecoveryDecision, Hold> {
         let intent = &self.record()?.intent;
-        let current = catalog(&self.owner)?;
+        let current = catalog(
+            &self.owner,
+            intent.legacy_binding.as_ref(),
+            Some(&intent.event),
+        )?;
         let marks = review_context::load_at_root(self.owner.root())
             .map_err(|error| Hold::Admission(format!("{error:?}")))?;
         let content = current_content(&self.owner, intent)?;
@@ -472,6 +582,15 @@ impl<'operation, 'clock> TransactionOutcome<'operation, 'clock> {
             content,
         )
         .map_err(Hold::Repair)
+    }
+
+    fn effect_check(&self, commit: &SegmentCommit<'_>) -> Result<(), Hold> {
+        self.owner.effect_check(commit)?;
+        if self.record()?.intent.legacy_binding.is_some() {
+            self.unchanged_mark()?;
+            self.inspect()?;
+        }
+        Ok(())
     }
 }
 
@@ -485,6 +604,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             owner,
             witness,
             stage,
+            legacy_binding,
         } = self;
         TransactionOutcome::new(owner).run(|result| {
             result.owner.native_check()?;
@@ -492,13 +612,23 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             let initial = review_context::load_at_root(result.owner.root())
                 .map_err(|error| Hold::Admission(format!("{error:?}")))?;
             let mark = current_mark(&result.owner, &witness, &initial)?.cloned();
-            let intent = RestoreIntent::new(
-                result.owner.destination.locator().clone(),
-                witness,
-                result.owner.destination.destination().clone(),
-                stage,
-                mark.as_ref(),
-            )
+            let intent = if let Some(binding) = legacy_binding {
+                RestoreIntent::new_legacy(
+                    binding,
+                    witness,
+                    result.owner.destination.destination().clone(),
+                    stage,
+                    mark.as_ref(),
+                )
+            } else {
+                RestoreIntent::new(
+                    result.owner.destination.locator().clone(),
+                    witness,
+                    result.owner.destination.destination().clone(),
+                    stage,
+                    mark.as_ref(),
+                )
+            }
             .map_err(Hold::Repair)?;
             #[cfg(all(test, feature = "full-tests", unix))]
             tests::checkpoint(tests::Point::AfterInitialMark);
@@ -523,7 +653,11 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             if current_mark(&result.owner, &intent.witness, &current)? != mark.as_ref() {
                 return Err(Hold::Repair(RepairHold::MarkChanged));
             }
-            let selection = catalog(&result.owner)?;
+            let selection = catalog(
+                &result.owner,
+                intent.legacy_binding.as_ref(),
+                Some(&intent.event),
+            )?;
             let content = current_content(&result.owner, &intent)?;
             inspect_recovery(
                 &intent,
@@ -548,11 +682,11 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 writes: Vec::new(),
             });
             result.persist()?;
-            result.owner.effect_check(&commit)?;
+            result.effect_check(&commit)?;
             if result.inspect()?.publication == PublicationDecision::HistoricalOnly {
                 return Err(Hold::Repair(RepairHold::OperationCollision));
             }
-            result.owner.effect_check(&commit)?;
+            result.effect_check(&commit)?;
             let name = result.record()?.intent.witness.file.name.clone();
             let publication = result
                 .owner
@@ -654,7 +788,7 @@ impl TransactionOutcome<'_, '_> {
         if successful {
             self.live_matches()?;
             if self.record()?.intent.marker != Obligation::Complete {
-                self.owner.effect_check(commit)?;
+                self.effect_check(commit)?;
                 self.bump_marker(options)?;
                 self.record_mut()?.intent.marker = Obligation::Complete;
                 self.persist()?;
@@ -663,7 +797,7 @@ impl TransactionOutcome<'_, '_> {
             return Err(Hold::Repair(RepairHold::PublishedContentMissing));
         }
         if self.record()?.intent.event_recorded != Obligation::Complete {
-            self.owner.effect_check(commit)?;
+            self.effect_check(commit)?;
             if !decision.event_recorded {
                 self.record_mut()?
                     .intent
@@ -677,7 +811,7 @@ impl TransactionOutcome<'_, '_> {
         match decision.register {
             RegisterDecision::Ready(_) | RegisterDecision::AlreadyApplied => {
                 let confirmed_live = self.live_matches()?;
-                self.owner.effect_check(commit)?;
+                self.effect_check(commit)?;
                 let intent = &self.record()?.intent;
                 let crate::restore_intent::MarkRetirement::Exact { plan } = &intent.retirement
                 else {
@@ -718,15 +852,21 @@ impl TransactionOutcome<'_, '_> {
     }
 
     fn record_event(&mut self, commit: &SegmentCommit<'_>, time: u64) -> Result<(), Hold> {
-        self.owner.effect_check(commit)?;
+        self.effect_check(commit)?;
         let intent = &self.record()?.intent;
-        let appended = append_restore_operation(
-            self.owner.root(),
-            &intent.locator.target,
-            intent.locator.layout,
-            &intent.event,
-            time,
-        );
+        let appended = match (&intent.legacy_binding, intent.legacy_operation()) {
+            (Some(binding), Some(operation)) => {
+                append_legacy_restore_operation(self.owner.root(), binding, &operation, time)
+            }
+            (None, None) => append_restore_operation(
+                self.owner.root(),
+                &intent.locator.target,
+                intent.locator.layout,
+                &intent.event,
+                time,
+            ),
+            _ => return Err(Hold::Repair(RepairHold::InvalidIntent)),
+        };
         let confirmed = appended.as_ref().is_ok_and(|receipt| {
             receipt.confirmation() == LedgerConfirmation::Confirmed
                 && receipt.durability() == [LedgerSync::Confirmed; 4]
@@ -771,7 +911,7 @@ impl TransactionOutcome<'_, '_> {
         {
             return Err(Hold::Retirement);
         }
-        self.owner.effect_check(commit)?;
+        self.effect_check(commit)?;
         self.unchanged_mark()?;
         // Inspect fresh history and current names, but keep the actual native
         // prospective event even if matching bytes appeared after the attempt.
@@ -783,7 +923,7 @@ impl TransactionOutcome<'_, '_> {
         if self.record()?.intent.event_recorded != Obligation::Complete {
             self.record_event(commit, time)?;
         }
-        self.owner.effect_check(commit)?;
+        self.effect_check(commit)?;
         self.unchanged_mark()?;
         if !self.inspect()?.event_recorded {
             return Err(Hold::Ledger);
@@ -807,7 +947,7 @@ impl TransactionOutcome<'_, '_> {
         }
         #[cfg(all(test, feature = "full-tests", unix))]
         tests::checkpoint(tests::Point::BeforeNoEffectPersist);
-        self.owner.effect_check(commit)?;
+        self.effect_check(commit)?;
         self.unchanged_mark()?;
         if !self.inspect()?.event_recorded {
             return Err(Hold::Ledger);
@@ -928,7 +1068,8 @@ fn replay_local<'operation, 'clock>(
         if intent.destination != *result.owner.destination.destination()
             || intent.locator != *result.owner.destination.locator()
             || matches!(result.owner.admission, Admission::Readback(operation)
-                    if intent.witness.repository_id.as_deref() != Some(operation.repository_id()))
+                    if intent.legacy_binding.as_ref().map(|binding| binding.repository_id.as_str())
+                        .or(intent.witness.repository_id.as_deref()) != Some(operation.repository_id()))
         {
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
@@ -947,7 +1088,7 @@ fn replay_local<'operation, 'clock>(
         {
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
-        result.owner.effect_check(&commit)?;
+        result.effect_check(&commit)?;
         result.finish(&claims, &commit, time, options, true)
     })
 }

@@ -139,7 +139,7 @@ impl TransactionOutcome<'_, '_> {
         {
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
-        self.owner.effect_check(&commit)?;
+        self.effect_check(&commit)?;
         if no_effect {
             self.unchanged_mark()?;
         } else {
@@ -208,7 +208,7 @@ impl TransactionOutcome<'_, '_> {
                 .and_then(|binding| binding.media.as_ref())
                 .ok_or(Hold::Retirement)?,
         );
-        self.owner.effect_check(&commit)?;
+        self.effect_check(&commit)?;
         let stage = match MediaStage::create(parent, Arc::clone(self.owner.carrier.activity())) {
             Ok(stage) => stage,
             Err(failure) => {
@@ -245,7 +245,7 @@ impl TransactionOutcome<'_, '_> {
             .ok_or(Hold::Retirement)?
             .revalidate()
             .map_err(Hold::Store)?;
-        self.owner.effect_check(&commit)?;
+        self.effect_check(&commit)?;
         let native = &mut self.retirement.as_mut().ok_or(Hold::Retirement)?.native;
         let NativeRetirement::Unconsumed(stage) = std::mem::replace(native, NativeRetirement::None)
         else {

@@ -17,6 +17,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod legacy;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Point {
     AfterInitialMark,
@@ -193,6 +195,7 @@ impl Fixture {
                 boot_id: None,
             },
             witness: self.witness.clone(),
+            legacy_binding: None,
             owner: Owner {
                 carrier,
                 destination,
