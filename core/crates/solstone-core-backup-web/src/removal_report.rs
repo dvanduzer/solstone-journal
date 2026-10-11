@@ -9,14 +9,16 @@ use std::io;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 use solstone_core_journal_io::media::{
-    ActivityCarrierPreparationReceipt, RemovalPhase, RemovalReceipt,
+    ActivityCarrierPreparationReceipt, ActivityCarrierRetirementEffect,
+    ActivityCarrierRetirementReceipt, RemovalPhase, RemovalReceipt,
 };
 use solstone_core_journal_io::{ExistingParentLockError, FlatDirectoryError};
 use solstone_core_retention::mark_mutation::{BoundMutationOutcome, BoundMutationRefusal};
 use solstone_core_retention::remove_marked::{
-    ArchiveReadState, OwnedReviewedArchiveRemoval, OwnedReviewedArchiveRun,
+    ArchiveReadState, OwnedReviewedArchiveRemoval, OwnedReviewedArchiveRun, OwnedReviewedRemoval,
     ReviewedArchiveFinishRefusal, ReviewedArchiveRemoval, ReviewedArchiveReport,
-    ReviewedFileRemoval, ReviewedRemoval, ReviewedRemovalFileReport, ReviewedRemovalRefusal,
+    ReviewedFileRemoval, ReviewedRemoval, ReviewedRemovalFileReport, ReviewedRemovalFinishRefusal,
+    ReviewedRemovalRefusal, ReviewedRemovalReport,
 };
 use solstone_core_retention::review_context::ReviewRefusal;
 
@@ -38,6 +40,42 @@ use solstone_core_retention::review_context::ReviewRefusal;
 /// ```
 pub fn ordinary(owner: &ReviewedRemoval) -> impl Serialize + '_ {
     OrdinaryView(owner)
+}
+
+/// Borrow a local hold and its independent finish and retirement observations.
+///
+/// ```
+/// use serde::Serialize;
+/// use solstone_core_backup_web::removal_report::held_ordinary;
+/// use solstone_core_retention::remove_marked::OwnedReviewedRemoval;
+/// fn view(owner: &OwnedReviewedRemoval) -> impl Serialize + '_ { held_ordinary(owner) }
+/// ```
+/// ```compile_fail,E0515
+/// use serde::Serialize;
+/// use solstone_core_backup_web::removal_report::held_ordinary;
+/// use solstone_core_retention::remove_marked::OwnedReviewedRemoval;
+/// fn escape<'a>(owner: OwnedReviewedRemoval) -> impl Serialize + 'a { held_ordinary(&owner) }
+/// ```
+pub fn held_ordinary(owner: &OwnedReviewedRemoval) -> impl Serialize + '_ {
+    HeldOrdinaryView(owner)
+}
+
+/// Borrow the actual local settlement receipts without constructing authority.
+///
+/// ```
+/// use serde::Serialize;
+/// use solstone_core_backup_web::removal_report::settled_ordinary;
+/// use solstone_core_retention::remove_marked::ReviewedRemovalReport;
+/// fn view(report: &ReviewedRemovalReport) -> impl Serialize + '_ { settled_ordinary(report) }
+/// ```
+/// ```compile_fail,E0515
+/// use serde::Serialize;
+/// use solstone_core_backup_web::removal_report::settled_ordinary;
+/// use solstone_core_retention::remove_marked::ReviewedRemovalReport;
+/// fn escape<'a>(report: ReviewedRemovalReport) -> impl Serialize + 'a { settled_ordinary(&report) }
+/// ```
+pub fn settled_ordinary(report: &ReviewedRemovalReport) -> impl Serialize + '_ {
+    SettledOrdinaryView(report)
 }
 
 /// Borrow the archive result and its original operation lifetime.
@@ -82,6 +120,8 @@ struct HeldArchiveView<'a>(&'a OwnedReviewedArchiveRemoval);
 struct SettledArchiveView<'a>(&'a ReviewedArchiveReport);
 
 struct OrdinaryView<'a>(&'a ReviewedRemoval);
+struct HeldOrdinaryView<'a>(&'a OwnedReviewedRemoval);
+struct SettledOrdinaryView<'a>(&'a ReviewedRemovalReport);
 struct ArchiveView<'a, 'op>(&'a ReviewedArchiveRemoval<'op>);
 
 #[derive(Serialize)]
@@ -144,6 +184,62 @@ impl Serialize for OrdinaryView<'_> {
                     "retained_stage": failure.diagnostic_path().is_some(),
                 })
             }),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for HeldOrdinaryView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct View<'a> {
+            #[serde(flatten)]
+            ordinary: OrdinaryView<'a>,
+            finish_refusal: Option<Value>,
+            retirement: Option<Value>,
+        }
+        let owner = self.0;
+        View {
+            ordinary: OrdinaryView(owner.removal()),
+            finish_refusal: owner.finish_refusal().map(|reason| match reason {
+                ReviewedRemovalFinishRefusal::IncompleteSelection => {
+                    json!({"kind":"incomplete_selection"})
+                }
+                ReviewedRemovalFinishRefusal::Native(reason) => {
+                    json!({"kind":"native", "detail":finish_refusal_facts(reason)})
+                }
+                ReviewedRemovalFinishRefusal::Retirement => json!({"kind":"retirement"}),
+            }),
+            retirement: owner.retirement().map(retirement_facts),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for SettledOrdinaryView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct View<'a> {
+            #[serde(flatten)]
+            common: Common<'a>,
+            finish_refusal: Option<Value>,
+            retirement: Value,
+        }
+        let report = self.0;
+        View {
+            common: Common {
+                outcome: report.outcome(),
+                refusal: None,
+                attempts: report
+                    .attempts()
+                    .iter()
+                    .map(settled_attempt_facts)
+                    .collect(),
+                stage_failures: Vec::new(),
+                mutation: report.mutation().map(mutation_facts),
+            },
+            finish_refusal: None,
+            retirement: retirement_facts(report.retirement()),
         }
         .serialize(serializer)
     }
@@ -265,6 +361,19 @@ fn carrier_facts(receipt: &ActivityCarrierPreparationReceipt) -> Value {
         "stage_durability":receipt.stage_durability(),
         "root_durability":receipt.root_durability(),
         "confirmation":receipt.confirmation(),
+    })
+}
+
+fn retirement_facts(receipt: &ActivityCarrierRetirementReceipt) -> Value {
+    json!({
+        "effect":match receipt.effect() {
+            ActivityCarrierRetirementEffect::NotAttempted => "not_attempted",
+            ActivityCarrierRetirementEffect::Attempted => "attempted",
+            ActivityCarrierRetirementEffect::Removed => "removed",
+        },
+        "root_durability":receipt.root_durability(),
+        "confirmation":receipt.confirmation(),
+        "failures":receipt.failures().iter().map(io_kind).collect::<Vec<_>>(),
     })
 }
 
