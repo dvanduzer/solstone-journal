@@ -20,7 +20,12 @@ const IDLE_EXPIRY: Duration = Duration::from_secs(30 * 60);
 
 /// Shared, process-local MCP session state.
 pub(crate) struct SessionTable {
-    sessions: Mutex<HashMap<String, SessionRecord>>,
+    sessions: Mutex<SessionState>,
+}
+
+struct SessionState {
+    sessions: HashMap<String, SessionRecord>,
+    next_admission_ordinal: u64,
 }
 
 struct SessionRecord {
@@ -46,12 +51,14 @@ struct SessionRecord {
     /// 3 exists to remove.
     advertised_generation: Option<Option<u64>>,
     generation: Option<u64>,
+    admission_ordinal: u64,
 }
 
 /// A reason session creation or ownership validation was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionError {
     Randomness,
+    #[allow(dead_code)]
     PrincipalLimit,
     GlobalLimit,
     NotFound,
@@ -76,7 +83,10 @@ impl fmt::Display for SessionError {
 impl SessionTable {
     pub(crate) fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(SessionState {
+                sessions: HashMap::new(),
+                next_admission_ordinal: 0,
+            }),
         }
     }
 
@@ -110,26 +120,41 @@ impl SessionTable {
     ) -> Result<String, SessionError> {
         let session_id = complete_session_id(random)?;
         let now = Instant::now();
-        let mut sessions = self
+        let mut state = self
             .sessions
             .lock()
             .map_err(|_| SessionError::Unavailable)?;
-        purge_expired(&mut sessions, now);
-        if sessions.len() >= MAX_SESSIONS {
-            return Err(SessionError::GlobalLimit);
-        }
-        if sessions
-            .values()
-            .filter(|session| session.token_id == token_id)
-            .count()
-            >= MAX_SESSIONS_PER_PRINCIPAL
-        {
-            return Err(SessionError::PrincipalLimit);
-        }
-        if sessions.contains_key(&session_id) {
+        purge_expired(&mut state.sessions, now);
+        if state.sessions.contains_key(&session_id) {
             return Err(SessionError::Randomness);
         }
-        sessions.insert(
+        if state.sessions.len() >= MAX_SESSIONS
+            || state
+                .sessions
+                .values()
+                .filter(|session| session.token_id == token_id)
+                .count()
+                >= MAX_SESSIONS_PER_PRINCIPAL
+        {
+            // 🔑 A bearer reclaims its own least-recently-used retained session;
+            // equal last_used breaks strictly by the admission ordinal assigned under
+            // this lock. Another bearer's row is never removed.
+            let victim_id = state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.token_id == token_id)
+                .min_by(|(_, a), (_, b)| {
+                    (a.last_used, a.admission_ordinal).cmp(&(b.last_used, b.admission_ordinal))
+                })
+                .map(|(id, _)| id.clone());
+            let Some(victim_id) = victim_id else {
+                return Err(SessionError::GlobalLimit);
+            };
+            state.sessions.remove(&victim_id);
+        }
+        let ordinal = state.next_admission_ordinal;
+        state.next_admission_ordinal += 1;
+        state.sessions.insert(
             session_id.clone(),
             SessionRecord {
                 token_id: token_id.to_owned(),
@@ -137,6 +162,7 @@ impl SessionTable {
                 last_used: now,
                 advertised_generation: None,
                 generation,
+                admission_ordinal: ordinal,
             },
         );
         Ok(session_id)
@@ -154,12 +180,15 @@ impl SessionTable {
         expected_generation: Option<u64>,
     ) -> Result<(), SessionError> {
         let now = Instant::now();
-        let mut sessions = self
+        let mut state = self
             .sessions
             .lock()
             .map_err(|_| SessionError::Unavailable)?;
-        purge_expired(&mut sessions, now);
-        let session = sessions.get_mut(session_id).ok_or(SessionError::NotFound)?;
+        purge_expired(&mut state.sessions, now);
+        let session = state
+            .sessions
+            .get_mut(session_id)
+            .ok_or(SessionError::NotFound)?;
         if session.token_id != token_id {
             return Err(SessionError::Foreign);
         }
@@ -176,8 +205,8 @@ impl SessionTable {
     /// Best effort: a session that has expired between the list and this call
     /// simply has nothing to remember.
     pub(crate) fn record_advertised_generation(&self, session_id: &str, generation: Option<u64>) {
-        if let Ok(mut sessions) = self.sessions.lock()
-            && let Some(session) = sessions.get_mut(session_id)
+        if let Ok(mut state) = self.sessions.lock()
+            && let Some(session) = state.sessions.get_mut(session_id)
         {
             session.advertised_generation = Some(generation);
         }
@@ -195,8 +224,9 @@ impl SessionTable {
         session_id: &str,
         live_generation: Option<u64>,
     ) -> bool {
-        let advertised = self.sessions.lock().ok().and_then(|sessions| {
-            sessions
+        let advertised = self.sessions.lock().ok().and_then(|state| {
+            state
+                .sessions
                 .get(session_id)
                 .map(|session| session.advertised_generation)
         });
@@ -206,30 +236,37 @@ impl SessionTable {
     /// Delete one session only after its bearer-token ownership is verified.
     pub(crate) fn delete(&self, session_id: &str, token_id: &str) -> Result<(), SessionError> {
         let now = Instant::now();
-        let mut sessions = self
+        let mut state = self
             .sessions
             .lock()
             .map_err(|_| SessionError::Unavailable)?;
-        purge_expired(&mut sessions, now);
-        let session = sessions.get(session_id).ok_or(SessionError::NotFound)?;
+        purge_expired(&mut state.sessions, now);
+        let session = state
+            .sessions
+            .get(session_id)
+            .ok_or(SessionError::NotFound)?;
         if session.token_id != token_id {
             return Err(SessionError::Foreign);
         }
-        sessions.remove(session_id);
+        state.sessions.remove(session_id);
         Ok(())
     }
 
     /// Clear all active sessions (e.g. on cutover).
     #[allow(dead_code)]
     pub(crate) fn clear(&self) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.clear();
+        if let Ok(mut state) = self.sessions.lock() {
+            state.sessions.clear();
         }
     }
 
     #[cfg(all(test, not(feature = "full-tests")))]
     fn len(&self) -> usize {
-        self.sessions.lock().expect("test session lock").len()
+        self.sessions
+            .lock()
+            .expect("test session lock")
+            .sessions
+            .len()
     }
 
     #[cfg(all(test, not(feature = "full-tests")))]
@@ -237,6 +274,7 @@ impl SessionTable {
         self.sessions
             .lock()
             .expect("test session lock")
+            .sessions
             .get(session_id)
             .map(|session| session.created_at)
     }
@@ -345,21 +383,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn caps_reject_without_eviction_and_idle_expiry_recovers_capacity() {
+    async fn caps_reclaim_same_bearer_and_idle_expiry_recovers_capacity() {
         let table = SessionTable::new();
         let random = SequentialRandom::new();
         let principal_sessions = (0..MAX_SESSIONS_PER_PRINCIPAL)
             .map(|_| table.create_with_random("principal", &random).unwrap())
             .collect::<Vec<_>>();
+        let seventeenth = table.create_with_random("principal", &random);
+        assert!(seventeenth.is_ok());
+        assert_eq!(table.len(), MAX_SESSIONS_PER_PRINCIPAL);
         assert_eq!(
-            table.create_with_random("principal", &random),
-            Err(SessionError::PrincipalLimit)
+            table.validate(&principal_sessions[0], "principal"),
+            Err(SessionError::NotFound)
         );
-        assert!(
-            principal_sessions
-                .iter()
-                .all(|id| table.validate(id, "principal").is_ok())
-        );
+        for id in &principal_sessions[1..] {
+            assert!(table.validate(id, "principal").is_ok());
+        }
 
         let global = SessionTable::new();
         for index in 0..MAX_SESSIONS {
@@ -376,6 +415,289 @@ mod tests {
         advance(Duration::from_secs(30 * 60)).await;
         assert!(global.create_with_random("recovered", &random).is_ok());
         assert_eq!(global.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sequential_admissions_for_one_bearer_reuse_slots_and_retain_newest_sixteen() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let mut ids = Vec::new();
+        for _ in 0..33 {
+            let id = table
+                .create_with_random("bearer", &random)
+                .expect("admission succeeds");
+            assert!(table.validate(&id, "bearer").is_ok());
+            assert!(table.len() <= MAX_SESSIONS_PER_PRINCIPAL);
+            ids.push(id);
+            let retain_count = ids.len().min(MAX_SESSIONS_PER_PRINCIPAL);
+            let cutoff = ids.len() - retain_count;
+            for older_id in &ids[..cutoff] {
+                assert_eq!(
+                    table.validate(older_id, "bearer"),
+                    Err(SessionError::NotFound)
+                );
+            }
+            assert!(table.validate(ids.last().unwrap(), "bearer").is_ok());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lru_eviction_follows_successful_validation_refresh() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let ids = (0..MAX_SESSIONS_PER_PRINCIPAL)
+            .map(|_| table.create_with_random("bearer", &random).unwrap())
+            .collect::<Vec<_>>();
+        advance(Duration::from_secs(60)).await;
+        assert!(table.validate(&ids[0], "bearer").is_ok());
+        let seventeenth = table.create_with_random("bearer", &random).unwrap();
+        assert!(table.validate(&ids[0], "bearer").is_ok());
+        assert_eq!(
+            table.validate(&ids[1], "bearer"),
+            Err(SessionError::NotFound)
+        );
+        assert!(table.validate(&seventeenth, "bearer").is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn equal_last_used_evicts_in_strict_admission_ordinal_order() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let ids = (0..MAX_SESSIONS_PER_PRINCIPAL)
+            .map(|_| table.create_with_random("bearer", &random).unwrap())
+            .collect::<Vec<_>>();
+        for id in ids.iter().rev() {
+            assert!(table.validate(id, "bearer").is_ok());
+        }
+        let seventeenth = table.create_with_random("bearer", &random).unwrap();
+        assert_eq!(
+            table.validate(&ids[0], "bearer"),
+            Err(SessionError::NotFound)
+        );
+        assert!(table.validate(&ids[1], "bearer").is_ok());
+        assert!(table.validate(&seventeenth, "bearer").is_ok());
+
+        let eighteenth = table.create_with_random("bearer", &random).unwrap();
+        assert_eq!(
+            table.validate(&ids[1], "bearer"),
+            Err(SessionError::NotFound)
+        );
+        assert!(table.validate(&ids[2], "bearer").is_ok());
+        assert!(table.validate(&eighteenth, "bearer").is_ok());
+    }
+
+    #[test]
+    fn concurrent_same_bearer_admissions_maintain_capacity_and_unique_ids() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let table = Arc::new(SessionTable::new());
+        let random = Arc::new(SequentialRandom::new());
+        let barrier = Arc::new(Barrier::new(32));
+        let results = Arc::new(Mutex::new(Vec::new()));
+
+        thread::scope(|scope| {
+            for _ in 0..32 {
+                let table = Arc::clone(&table);
+                let random = Arc::clone(&random);
+                let barrier = Arc::clone(&barrier);
+                let results = Arc::clone(&results);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let id = table
+                        .create_with_random("concurrent-bearer", &*random)
+                        .expect("admission succeeds");
+                    results.lock().unwrap().push(id);
+                });
+            }
+        });
+
+        let ids = results.lock().unwrap().clone();
+        assert_eq!(ids.len(), 32);
+        let unique = ids.into_iter().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), 32);
+        assert!(table.len() <= MAX_SESSIONS_PER_PRINCIPAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsuccessful_and_mismatched_generation_validations_do_not_refresh_lru() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let first_id = table
+            .create_with_random_and_generation("bearer", Some(10), &random)
+            .unwrap();
+        let mut ids = vec![first_id.clone()];
+        for _ in 1..MAX_SESSIONS_PER_PRINCIPAL {
+            ids.push(table.create_with_random("bearer", &random).unwrap());
+        }
+        advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            table.validate(&first_id, "different-bearer"),
+            Err(SessionError::Foreign)
+        );
+        assert_eq!(
+            table.validate_with_generation(&first_id, "bearer", Some(99)),
+            Err(SessionError::NotFound)
+        );
+        let seventeenth = table.create_with_random("bearer", &random).unwrap();
+        assert_eq!(
+            table.validate(&first_id, "bearer"),
+            Err(SessionError::NotFound)
+        );
+        assert!(table.validate(&ids[1], "bearer").is_ok());
+        assert!(table.validate(&seventeenth, "bearer").is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_reclamation_is_scoped_strictly_to_the_requesting_bearer() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let b_ids = (0..5)
+            .map(|_| table.create_with_random("bearer-b", &random).unwrap())
+            .collect::<Vec<_>>();
+        let a_ids = (0..MAX_SESSIONS_PER_PRINCIPAL)
+            .map(|_| table.create_with_random("bearer-a", &random).unwrap())
+            .collect::<Vec<_>>();
+        let a_extra = table.create_with_random("bearer-a", &random).unwrap();
+
+        for b_id in &b_ids {
+            assert!(table.validate(b_id, "bearer-b").is_ok());
+        }
+        assert_eq!(
+            table.validate(&b_ids[0], "bearer-a"),
+            Err(SessionError::Foreign)
+        );
+        assert_eq!(
+            table.delete(&b_ids[0], "bearer-a"),
+            Err(SessionError::Foreign)
+        );
+        assert!(table.validate(&b_ids[0], "bearer-b").is_ok());
+        assert!(table.validate(&a_ids[0], "bearer-a").is_err());
+        assert!(table.validate(&a_extra, "bearer-a").is_ok());
+    }
+
+    #[tokio::test]
+    async fn global_limit_reclaims_held_bearer_session_or_rejects_bearer_with_none() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let held_ids = (0..3)
+            .map(|_| table.create_with_random("held-bearer", &random).unwrap())
+            .collect::<Vec<_>>();
+        let other_ids = (0..(MAX_SESSIONS - 3))
+            .map(|index| {
+                table
+                    .create_with_random(&format!("other-{index}"), &random)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(table.len(), MAX_SESSIONS);
+
+        let reclaimed = table.create_with_random("held-bearer", &random).unwrap();
+        assert_eq!(table.len(), MAX_SESSIONS);
+        assert_eq!(
+            table.validate(&held_ids[0], "held-bearer"),
+            Err(SessionError::NotFound)
+        );
+        assert!(table.validate(&held_ids[1], "held-bearer").is_ok());
+        assert!(table.validate(&held_ids[2], "held-bearer").is_ok());
+        assert!(table.validate(&reclaimed, "held-bearer").is_ok());
+
+        for (index, id) in other_ids.iter().enumerate() {
+            assert!(table.validate(id, &format!("other-{index}")).is_ok());
+        }
+
+        assert_eq!(
+            table.create_with_random("empty-bearer", &random),
+            Err(SessionError::GlobalLimit)
+        );
+        assert_eq!(table.len(), MAX_SESSIONS);
+
+        assert!(table.validate(&held_ids[1], "held-bearer").is_ok());
+        assert!(table.validate(&held_ids[2], "held-bearer").is_ok());
+        assert!(table.validate(&reclaimed, "held-bearer").is_ok());
+        for (index, id) in other_ids.iter().enumerate() {
+            assert!(table.validate(id, &format!("other-{index}")).is_ok());
+        }
+    }
+
+    struct ReplayRandom(Vec<u8>);
+
+    impl RandomSource for ReplayRandom {
+        fn fill(&self, bytes: &mut [u8]) -> Result<usize, RandomSourceError> {
+            let len = self.0.len().min(bytes.len());
+            bytes[..len].copy_from_slice(&self.0[..len]);
+            Ok(len)
+        }
+    }
+
+    #[tokio::test]
+    async fn randomness_failure_or_victim_id_collision_aborts_without_eviction() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let ids = (0..MAX_SESSIONS_PER_PRINCIPAL)
+            .map(|_| table.create_with_random("bearer", &random).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            table.create_with_random("bearer", &ShortRandom),
+            Err(SessionError::Randomness)
+        );
+        for id in &ids {
+            assert!(table.validate(id, "bearer").is_ok());
+        }
+        assert_eq!(table.len(), MAX_SESSIONS_PER_PRINCIPAL);
+
+        let victim_bytes = URL_SAFE_NO_PAD.decode(&ids[0]).unwrap();
+        let replay = ReplayRandom(victim_bytes);
+        assert_eq!(
+            table.create_with_random("bearer", &replay),
+            Err(SessionError::Randomness)
+        );
+        for id in &ids {
+            assert!(table.validate(id, "bearer").is_ok());
+        }
+        assert_eq!(table.len(), MAX_SESSIONS_PER_PRINCIPAL);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reclaimed_session_resets_advertised_generation_and_adopts_new_generation() {
+        let table = SessionTable::new();
+        let random = SequentialRandom::new();
+        let first_id = table
+            .create_with_random_and_generation("bearer", Some(100), &random)
+            .unwrap();
+        table.record_advertised_generation(&first_id, Some(100));
+
+        let mut ids = vec![first_id.clone()];
+        for _ in 1..MAX_SESSIONS_PER_PRINCIPAL {
+            ids.push(table.create_with_random("bearer", &random).unwrap());
+        }
+
+        let new_id = table
+            .create_with_random_and_generation("bearer", Some(200), &random)
+            .unwrap();
+
+        assert_eq!(
+            table.validate(&first_id, "bearer"),
+            Err(SessionError::NotFound)
+        );
+
+        assert!(!table.tools_list_is_stale(&new_id, Some(200)));
+        assert!(!table.tools_list_is_stale(&new_id, Some(100)));
+
+        assert_eq!(
+            table.validate_with_generation(&new_id, "bearer", Some(999)),
+            Err(SessionError::NotFound)
+        );
+        assert!(
+            table
+                .validate_with_generation(&new_id, "bearer", Some(200))
+                .is_ok()
+        );
+
+        table.record_advertised_generation(&new_id, Some(200));
+        assert!(!table.tools_list_is_stale(&new_id, Some(200)));
+        assert!(table.tools_list_is_stale(&new_id, Some(300)));
     }
 
     #[tokio::test]

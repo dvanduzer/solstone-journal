@@ -12,27 +12,42 @@ if (!manifestDir) throw new Error('manifest directory required');
 let source = fs.readFileSync(path.join(manifestDir, 'assets/home.js'), 'utf8');
 source = source.replace(
   '  window.toggleBriefingCard = toggleBriefingCard;\n',
-  `  window.__vitals = { renderVitalsHtml };
+  `  window.__vitals = { renderVitalsHtml, homeHealthGlance, receiveSupervisorStatus, invalidateHeldWork, refreshVitals, refreshNarrative,
+    captureNarrative: () => { renderNarrative = data => { window.__narrative = data.narrative_content; }; },
+    seedPulse: data => { lastPulse=data; pulseObservedAt=Date.now(); pulseReadFailed=false; } };
   window.toggleBriefingCard = toggleBriefingCard;\n`,
 );
 
+let now = 1000;
+let expiry;
+class TestDate extends Date {
+  constructor(...args) { super(...(args.length ? args : [now])); }
+  static now() { return now; }
+}
 const location = { href: '' };
 const document = {
   readyState: 'loading',
   addEventListener() {},
   querySelector() { return null; },
+  getElementById() { return null; },
+  querySelectorAll() { return []; },
 };
 const window = {
   location,
   document,
   addEventListener() {},
+  apiJson() { return new Promise(() => {}); },
+  clearTimeout() {},
+  setTimeout(fn) { expiry=fn; return 1; },
 };
 window.window = window;
 document.defaultView = window;
 
-vm.runInNewContext(source, { window, document, console }, { filename: 'home.js' });
+vm.runInNewContext(source, { window, document, console, Date:TestDate }, { filename: 'home.js' });
 const { renderVitalsHtml } = window.__vitals;
 assert(renderVitalsHtml, 'renderVitalsHtml exported');
+const { homeHealthGlance, receiveSupervisorStatus, invalidateHeldWork, refreshVitals, seedPulse } = window.__vitals;
+receiveSupervisorStatus({event:'status'}); // authoritative empty queues for ordinary controls
 
 const css = fs.readFileSync(path.join(manifestDir, 'assets/workspace.html'), 'utf8');
 assert(css.includes('.pulse-vitals-dot.neutral'), 'missing .pulse-vitals-dot.neutral');
@@ -122,4 +137,78 @@ assert.strictEqual(calmNoted.includes('pulse-vitals-dot green'), false, calmNote
 assert.strictEqual(amber.includes('pulse-vitals-note'), false, amber);
 assert(css.includes('.pulse-vitals > a.pulse-vitals-note'), 'missing note row style');
 
-console.log('vitals render contract passed');
+
+async function issueReadCases() {
+  const ordinary={health_glance:{verdict:'ok',severity:'green',headline:'working',issues:[]},narrative_content:null,needs_you_items:[]};
+  seedPulse(ordinary);
+  invalidateHeldWork();
+  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'unavailable');
+  assert.strictEqual(homeHealthGlance(ordinary).glance.issues.length, 0);
+  const status={event:'status',queues:{daily:2,segment:1},held:[{partition:'daily',reasons:['root_live']}],tasks:[{partition:'segment'}]};
+  receiveSupervisorStatus(status);
+  let g=homeHealthGlance(ordinary).glance;
+  assert.strictEqual(g.verdict, 'attention');
+  assert.strictEqual(g.issues.length, 1);
+  assert.strictEqual(g.issues[0].href, '/app/health/#processingHolds');
+  receiveSupervisorStatus({...status,queue_hold:{reason:'records_unreadable'},held:[...status.held,{partition:'segment'}]});
+  assert.strictEqual(homeHealthGlance(ordinary).glance.issues.length, 3, 'retain global and partition scopes');
+  const diagnosed={...ordinary,health_glance:{verdict:'attention',severity:'red',headline:'known fault',issues:[{text:'known device fault',severity:'red',href:'/app/health/#registeredClientsCard'}],note:{text:'not yet',href:'/app/health/'}}};
+  const combined=homeHealthGlance(diagnosed).glance;
+  assert.strictEqual(combined.issues[0].text, 'known device fault');
+  assert.strictEqual(combined.severity, 'red');
+  assert.strictEqual(combined.note.text, 'not yet');
+  now += 30000;
+  g=homeHealthGlance(ordinary).glance;
+  assert.strictEqual(g.verdict, 'unavailable', 'clock expiry applies even before the timer is delivered');
+  assert.ok(g.issues.every(issue=>issue.text.startsWith('last known:')));
+  expiry();
+  receiveSupervisorStatus({event:'held',partition:'daily'});
+  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'unavailable', 'one-off held event is not an authority');
+  receiveSupervisorStatus(status);
+  receiveSupervisorStatus({event:'status-error'});
+  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'unavailable');
+  assert.ok(homeHealthGlance(ordinary).notes[0].text.includes('last check:'));
+  receiveSupervisorStatus({...status,queues:{}});
+  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'ok', 'empty holds stay quiet');
+  receiveSupervisorStatus({event:'status',queues:{daily:2}});
+  assert.strictEqual(homeHealthGlance(ordinary).glance.issues.length, 0, 'omitted optional fields clear the hold');
+  const progressing={...ordinary,health_glance:{verdict:'progressing',severity:'amber',headline:'processing',issues:[]}};
+  assert.strictEqual(homeHealthGlance(progressing).glance.verdict, 'progressing');
+  seedPulse(diagnosed);
+  window.apiJson=()=>Promise.reject(new Error('synthetic read failed'));
+  await refreshVitals();
+  g=homeHealthGlance(diagnosed).glance;
+  assert.strictEqual(g.verdict, 'unavailable');
+  assert.ok(g.issues[0].text.startsWith('last known:'));
+  assert.strictEqual(g.issues[0].href, '/app/health/#registeredClientsCard');
+  // A late older success cannot clear the failure from a newer read.
+  let older;
+  window.apiJson=()=>new Promise(resolve=>{older=resolve;});
+  const olderRead=refreshVitals();
+  window.apiJson=()=>Promise.reject(new Error('newer read failed'));
+  await refreshVitals();
+  older(ordinary);await olderRead;
+  assert.strictEqual(homeHealthGlance(diagnosed).glance.verdict, 'unavailable');
+  // A pending newer request must not starve a valid earlier completion.
+  let first, second;
+  window.apiJson=()=>new Promise(resolve=>{first=resolve;});
+  const firstRead=refreshVitals();
+  window.apiJson=()=>new Promise(resolve=>{second=resolve;});
+  const secondRead=refreshVitals();
+  first(ordinary);await firstRead;
+  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'ok');
+  second(diagnosed);await secondRead;
+  window.apiJson=()=>Promise.resolve(ordinary);
+  await refreshVitals();
+  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'ok');
+  window.__vitals.captureNarrative();
+  let narrativeResult;
+  window.apiJson=()=>new Promise(resolve=>{narrativeResult=resolve;});
+  const narrativeRead=window.__vitals.refreshNarrative();
+  window.apiJson=()=>Promise.resolve(ordinary);
+  await refreshVitals();
+  narrativeResult({...ordinary,narrative_content:'new narrative'});await narrativeRead;
+  assert.strictEqual(window.__narrative, 'new narrative', 'a newer vitals read cannot discard the narrative refresh');
+  console.log('vitals render and issue-read contracts passed');
+}
+issueReadCases().catch(error=>{console.error(error);process.exitCode=1;});

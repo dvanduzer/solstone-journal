@@ -21,6 +21,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- home now names devices with rejected uploads, even when another source is still arriving, and shows queued work held for a safety check. both link to their details in health. when status is unavailable, the last known issues stay labeled as such.
+
 - health shows queued work held for a safety check, with the affected work, technical details and a way to get help. if live status becomes unavailable, the last check stays visible.
 - the backup page and the backup offload status command now count all original media on this device, including files proposed for removal. when a media total can't be checked completely, they show the amount counted so far separately.
 - when a backup action fails, the backup page now shows any guidance the tool gave on what to do next.
