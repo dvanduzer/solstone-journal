@@ -1844,3 +1844,258 @@ fn packaged_historical_archive_read_entry() {
         serde_json::json!({"result":result,"custody":closed,"same_original_owner":true,"same_original_clock":true,"cancelled":cancellation.is_cancelled(),"limit":"discovery/read only; no publication, retirement, restart or consuming keeper credit"})
     );
 }
+
+#[cfg(all(target_os = "linux", feature = "full-tests"))]
+#[test]
+#[ignore = "requires a copied current package and synthetic owned-read fixture"]
+fn packaged_total_owned_read_finish_entry() {
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
+    use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation};
+    use solstone_core_backup::archive_readback::{ExactArchiveFile, ReadbackError};
+    use solstone_core_backup_runtime::{
+        DirectReadFinishState, UreqHttpTransport,
+        admit_prepared_archive_owned_current_read_installed,
+        admit_prepared_archive_owned_read_installed,
+    };
+    use solstone_core_journal_io::JournalRoot;
+    use solstone_core_journal_io::media::{Cleanup, MediaDirectory, MediaStage};
+    use std::sync::Arc;
+
+    struct OwnedClock(Instant);
+    impl Clock for OwnedClock {
+        fn now_unix(&self) -> i64 {
+            10_000 + self.0.elapsed().as_secs() as i64
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    let input_path = std::env::var_os("TOTAL_OWNED_READ_PROBE_JSON").unwrap();
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let mode = input["mode"].as_str().unwrap();
+    assert!(["complete", "sticky", "mismatch"].contains(&mode));
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
+    let clock_weak = Arc::downgrade(&clock);
+    let cancellation = ArchiveCancellation::new();
+    let budget = ArchiveBudget::new_cancellable(clock.as_ref(), cancellation).unwrap();
+    let original =
+        match OwnedPreparedArchiveOperation::prepare(Arc::clone(&root), budget, Arc::clone(&clock))
+        {
+            Ok(original) => original,
+            Err(failure) => panic!("owned preparation: {}", failure.reason()),
+        };
+    assert!(Arc::ptr_eq(original.owned_clock(), &clock));
+    let lease = Arc::downgrade(original.activity());
+    let carrier = Arc::downgrade(original.carrier());
+    let path = Path::new(input["restic_path"].as_str().unwrap());
+    let repository = input["repository_id"].as_str().unwrap();
+    let admitted = if mode == "complete" {
+        admit_prepared_archive_owned_current_read_installed(
+            original,
+            path,
+            "2.0.40",
+            &UreqHttpTransport,
+        )
+    } else {
+        admit_prepared_archive_owned_read_installed(
+            original,
+            repository.into(),
+            path,
+            "2.0.40",
+            &UreqHttpTransport,
+        )
+    };
+    let installed = match admitted {
+        Ok(installed) => installed,
+        Err(failure) => panic!("owned admission: {}", failure.error()),
+    };
+    let (mut read, finish) = installed.into_parts();
+    assert_eq!(read.repository_id(), repository);
+    assert!(Arc::ptr_eq(read.carrier(), finish.carrier()));
+    assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+    assert!(Arc::ptr_eq(finish.owned_clock(), &clock));
+    assert!(Arc::ptr_eq(read.as_read().owned_clock().unwrap(), &clock));
+    let parent = MediaDirectory::open(Arc::clone(&root), Path::new("media")).unwrap();
+    let file = ExactArchiveFile {
+        repository_id: repository.into(),
+        snapshot_id: input["snapshot_id"].as_str().unwrap().into(),
+        name: input["name"].as_str().unwrap().into(),
+        archive_path: input["archive_path"].as_str().unwrap().into(),
+        bytes: input["bytes"].as_u64().unwrap(),
+        sha256: input["sha256"].as_str().unwrap().into(),
+    };
+    if mode == "sticky" {
+        let bad = ExactArchiveFile {
+            repository_id: file.repository_id.clone(),
+            snapshot_id: "f".repeat(64),
+            name: file.name.clone(),
+            archive_path: file.archive_path.clone(),
+            bytes: file.bytes,
+            sha256: file.sha256.clone(),
+        };
+        assert_ne!(bad.snapshot_id, file.snapshot_id);
+        let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+            .unwrap()
+            .create_target()
+            .unwrap();
+        let mut failed = match read.read_exact(&bad, target) {
+            Err(failed) => failed,
+            Ok(_) => panic!("actual absent snapshot must fail"),
+        };
+        assert_eq!(failed.reason(), ReadbackError::ToolFailed);
+        assert_eq!(failed.cleanup(), Cleanup::Complete);
+        drop(failed);
+    }
+    let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+        .unwrap()
+        .create_target()
+        .unwrap();
+    let mut prepared = read.read_exact(&file, target).unwrap();
+    assert_eq!(prepared.digest().sha256, file.sha256);
+    assert_eq!(prepared.digest().size, file.bytes);
+    assert_eq!(prepared.cleanup(), Cleanup::Complete);
+    drop(prepared);
+    drop(parent);
+    let result = if mode == "sticky" {
+        let held = match read.settle_direct() {
+            Err(held) => held,
+            Ok(_) => panic!("later valid read cannot clear original failed query"),
+        };
+        assert_eq!(held.reason(), ReadbackError::ToolFailed);
+        assert!(Arc::ptr_eq(held.carrier(), finish.carrier()));
+        assert!(Arc::ptr_eq(held.owned_clock(), &clock));
+        let custody = thread::spawn(move || (held, finish)).join().unwrap();
+        assert!(carrier.upgrade().is_some() && lease.upgrade().is_some());
+        let next = OwnedPreparedArchiveOperation::prepare(
+            Arc::clone(&root),
+            ArchiveBudget::new(clock.as_ref()).unwrap(),
+            Arc::clone(&clock),
+        );
+        assert!(next.is_err());
+        drop(next);
+        assert!(Arc::ptr_eq(custody.0.owned_clock(), &clock));
+        serde_json::json!({"state":"Held","reason":"ToolFailed","later_read_succeeded":true,
+            "same_original_owner":true,"same_original_clock":true,"replacement_refused":true,
+            "retirement":false,"total_closed_return":true})
+    } else {
+        let settled = match read.settle_direct() {
+            Ok(settled) => settled,
+            Err(held) => panic!("actual owned read held: {}", held.reason()),
+        };
+        let settled = thread::spawn(move || settled).join().unwrap();
+        assert!(Arc::ptr_eq(settled.owned_clock(), &clock));
+        if mode == "mismatch" {
+            let other_root = Arc::new(
+                JournalRoot::open(Path::new(input["other_journal"].as_str().unwrap())).unwrap(),
+            );
+            let other_clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
+            assert!(!Arc::ptr_eq(&clock, &other_clock));
+            let other = match OwnedPreparedArchiveOperation::prepare(
+                Arc::clone(&other_root),
+                ArchiveBudget::new(other_clock.as_ref()).unwrap(),
+                Arc::clone(&other_clock),
+            ) {
+                Ok(other) => other,
+                Err(failure) => panic!("other preparation: {}", failure.reason()),
+            };
+            let other = match admit_prepared_archive_owned_read_installed(
+                other,
+                repository.into(),
+                path,
+                "2.0.40",
+                &UreqHttpTransport,
+            ) {
+                Ok(other) => other,
+                Err(failure) => panic!("other admission: {}", failure.error()),
+            };
+            let (other_read, wrong_finish) = other.into_parts();
+            assert!(!Arc::ptr_eq(settled.carrier(), wrong_finish.carrier()));
+            let other_hold = other_read.into_owned_hold();
+            let held = wrong_finish.finish_owned(settled);
+            assert_eq!(held.state(), DirectReadFinishState::Held);
+            assert_eq!(held.reason(), Some(ReadbackError::NativeFailure));
+            assert!(held.retirement().is_none());
+            // After the original outside owner/clock are gone, ONLY the retained
+            // actual pre-release read keeps its original carrier and clock alive.
+            drop(finish);
+            drop(clock);
+            let custody = thread::spawn(move || (held, other_hold)).join().unwrap();
+            assert!(carrier.upgrade().is_some() && lease.upgrade().is_some());
+            let original_clock = clock_weak.upgrade().unwrap();
+            assert!(Arc::ptr_eq(custody.0.owned_clock(), &other_clock));
+            assert!(Arc::ptr_eq(
+                carrier.upgrade().unwrap().journal_root(),
+                &root
+            ));
+            let next = OwnedPreparedArchiveOperation::prepare(
+                Arc::clone(&root),
+                ArchiveBudget::new(original_clock.as_ref()).unwrap(),
+                original_clock,
+            );
+            assert!(next.is_err());
+            drop(next);
+            serde_json::json!({"state":"Held","reason":"NativeFailure","actual_read_succeeded":true,
+                "same_original_owner":true,"same_original_clock":true,"replacement_refused":true,
+                "retirement":false,"total_closed_return":true,"different_real_owner":true,
+                "different_real_clock":true,"read_survives_outside_owner_drop":true})
+        } else {
+            let completed = finish.finish_owned(settled);
+            let completed = thread::spawn(move || completed).join().unwrap();
+            assert_eq!(completed.state(), DirectReadFinishState::Completed);
+            assert!(Arc::ptr_eq(completed.owned_clock(), &clock));
+            let receipt = completed.retirement().unwrap();
+            assert!(receipt.receipt.failures().is_empty());
+            let retirement = format!(
+                "{:?}/{:?}/{:?}",
+                receipt.receipt.effect(),
+                receipt.receipt.root_durability(),
+                receipt.receipt.confirmation()
+            );
+            let before_release = OwnedPreparedArchiveOperation::prepare(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock),
+            );
+            assert!(before_release.is_err());
+            drop(before_release);
+            drop(completed);
+            assert!(lease.upgrade().is_none());
+            let next = match OwnedPreparedArchiveOperation::prepare(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock),
+            ) {
+                Ok(next) => next,
+                Err(failure) => panic!("second preparation: {}", failure.reason()),
+            };
+            let second = match admit_prepared_archive_owned_read_installed(
+                next,
+                repository.into(),
+                path,
+                "2.0.40",
+                &UreqHttpTransport,
+            ) {
+                Ok(second) => second,
+                Err(failure) => panic!("second admission: {}", failure.error()),
+            };
+            let (second_read, second_finish) = second.into_parts();
+            let second_settled = match second_read.settle_direct() {
+                Ok(settled) => settled,
+                Err(held) => panic!("second settlement: {}", held.reason()),
+            };
+            let second = second_finish.finish_owned(second_settled);
+            assert_eq!(second.state(), DirectReadFinishState::Completed);
+            drop(second);
+            serde_json::json!({"state":"Completed","same_original_owner":true,"same_original_clock":true,
+                "retirement":retirement,"held_lease_refused_next":true,"second_installed_admission":true,
+                "second_completed":true,"target_cleanup":"Complete","total_closed_return":true,
+                "current_repository_capture":true})
+        }
+    };
+    println!(
+        "TOTAL_OWNED_READ_RESULT {}",
+        serde_json::json!({"mode":mode,"result":result,
+        "limit":"lower typed direct only; no Native/Proof actor, Consumer keeper, early unwind or forced writer grant"})
+    );
+}

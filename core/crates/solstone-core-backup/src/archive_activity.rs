@@ -157,6 +157,15 @@ impl OwnedPreparedArchiveHold {
     pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
         &self.clock
     }
+    #[cfg(unix)]
+    pub(crate) fn revalidate(&self) -> Result<(), AdmissionError> {
+        revalidate_original(
+            &self.activity,
+            &self._configuration,
+            &self._budget,
+            self.clock.as_ref(),
+        )
+    }
 }
 
 #[must_use]
@@ -367,12 +376,26 @@ impl<'a> PreparedArchiveOperation<'a> {
         self.budget.cap_credential_expiry(expiry);
     }
     pub fn revalidate(&self) -> Result<(), AdmissionError> {
-        self.budget.remaining(self.clock())?;
-        self.activity
-            .revalidate()
-            .map_err(|_| AdmissionError::JournalIdentityChanged)?;
-        self.configuration.revalidate(self.journal_root())
+        revalidate_original(
+            &self.activity,
+            &self.configuration,
+            &self.budget,
+            self.clock(),
+        )
     }
+}
+
+fn revalidate_original(
+    activity: &ArchiveActivity,
+    configuration: &ArchiveConfiguration,
+    budget: &ArchiveBudget,
+    clock: &dyn Clock,
+) -> Result<(), AdmissionError> {
+    budget.remaining(clock)?;
+    activity
+        .revalidate()
+        .map_err(|_| AdmissionError::JournalIdentityChanged)?;
+    configuration.revalidate(activity.journal_root())
 }
 
 impl PreparedArchiveOperation<'static> {
@@ -383,5 +406,107 @@ impl PreparedArchiveOperation<'static> {
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Result<Self, ArchiveOperationPreparationFailure<'static>> {
         Self::prepare_with(root, budget, ArchiveOperationClock::Owned(clock))
+    }
+}
+
+/// An original operation whose clock ownership was captured at preparation.
+#[must_use = "Move this original operation into admission or closed custody"]
+pub struct OwnedPreparedArchiveOperation {
+    operation: PreparedArchiveOperation<'static>,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+
+impl OwnedPreparedArchiveOperation {
+    pub fn prepare(
+        root: Arc<JournalRoot>,
+        budget: ArchiveBudget,
+        clock: Arc<dyn Clock + Send + Sync>,
+    ) -> Result<Self, OwnedArchivePreparationFailure> {
+        match PreparedArchiveOperation::prepare_owned(root, budget, Arc::clone(&clock)) {
+            Ok(operation) => Ok(Self { operation, clock }),
+            Err(failure) => {
+                let ArchiveOperationPreparationFailureInner {
+                    reason,
+                    root,
+                    activity,
+                    preparation,
+                    _budget,
+                    _clock,
+                } = *failure.inner;
+                drop(_clock);
+                Err(OwnedArchivePreparationFailure {
+                    reason,
+                    root,
+                    activity,
+                    preparation,
+                    _budget,
+                    clock,
+                })
+            }
+        }
+    }
+
+    pub fn as_prepared(&self) -> &PreparedArchiveOperation<'static> {
+        &self.operation
+    }
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.operation.carrier()
+    }
+    pub fn activity(&self) -> &Arc<ActivityLease> {
+        self.operation.activity()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.operation.journal_root()
+    }
+    pub fn configuration(&self) -> &ArchiveConfiguration {
+        self.operation.configuration()
+    }
+    pub fn budget(&self) -> &ArchiveBudget {
+        self.operation.budget()
+    }
+    pub fn clock(&self) -> &dyn Clock {
+        self.clock.as_ref()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+    pub fn revalidate(&self) -> Result<(), AdmissionError> {
+        self.operation.revalidate()
+    }
+    pub fn cap_credential_expiry(&mut self, expiry: i64) {
+        self.operation.cap_credential_expiry(expiry);
+    }
+    pub fn into_owned_hold(self) -> OwnedPreparedArchiveHold {
+        let Self { operation, clock } = self;
+        close_owned_prepared(operation, clock)
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PreparedArchiveOperation<'static>,
+        Arc<dyn Clock + Send + Sync>,
+    ) {
+        (self.operation, self.clock)
+    }
+}
+
+// Only the owned preparation/read wrappers supply their captured clock here.
+pub(crate) fn close_owned_prepared(
+    operation: PreparedArchiveOperation<'static>,
+    clock: Arc<dyn Clock + Send + Sync>,
+) -> OwnedPreparedArchiveHold {
+    let PreparedArchiveOperation {
+        activity,
+        configuration,
+        budget,
+        clock: original_clock,
+    } = operation;
+    drop(original_clock);
+    OwnedPreparedArchiveHold {
+        activity,
+        _configuration: configuration,
+        _budget: budget,
+        clock,
     }
 }

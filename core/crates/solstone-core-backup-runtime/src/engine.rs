@@ -27,15 +27,16 @@ use crate::runner::{ToolRunner, reason_for_returncode, run_restic, select_summar
 pub const ARCHIVE_TAG: &str = "solstone-archive";
 use solstone_core_backup::archive_activity::{
     ArchiveOperationPreparationFailure, OwnedArchivePreparationFailure, OwnedPreparedArchiveHold,
-    PreparedArchiveOperation,
+    OwnedPreparedArchiveOperation, PreparedArchiveOperation,
 };
 pub use solstone_core_backup::archive_admission::{
     ARCHIVE_BACKUP_TIMEOUT_SECONDS, ARCHIVE_LS_TIMEOUT_SECONDS, Clock,
 };
 use solstone_core_backup::archive_admission::{AdmissionError, ArchiveBudget, ArchiveCancellation};
 use solstone_core_backup::archive_readback::{
-    DirectReadCompletion, OwnedDirectReadHold, OwnedReadbackAdmissionError, ReadAdmission,
-    ReadOperation, ReadbackAdmissionError, ReadbackError, SettledDirectRead,
+    DirectReadCompletion, OwnedDirectReadHold, OwnedReadOperation, OwnedReadbackAdmissionError,
+    OwnedSettledDirectRead, ReadAdmission, ReadOperation, ReadbackAdmissionError, ReadbackError,
+    SettledDirectRead,
 };
 // Repository contention is coordinated by Restic, within each operation’s deadline.
 const REPOSITORY_RETRY_LOCK: &str = "30m";
@@ -1889,6 +1890,16 @@ impl OwnedArchiveAdmissionFailure {
             ClosedArchiveAdmissionOwner::Readback(readback) => Some(readback.carrier()),
         }
     }
+    pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
+        match &self.inner.owned {
+            ClosedArchiveAdmissionOwner::BeforePreparation(_) => None,
+            ClosedArchiveAdmissionOwner::Prepared(operation) => Some(operation.owned_clock()),
+            ClosedArchiveAdmissionOwner::Preparation(preparation) => {
+                Some(preparation.owned_clock())
+            }
+            ClosedArchiveAdmissionOwner::Readback(readback) => Some(readback.owned_clock()),
+        }
+    }
 }
 
 /// Prepare one original activity before admitting paired archive transports.
@@ -2067,6 +2078,67 @@ pub fn admit_prepared_archive_read<'a>(
     )
 }
 
+struct CapturedArchiveRead {
+    restic_path: PathBuf,
+    destination: Destination,
+    password: String,
+    credential_expiry: Option<i64>,
+}
+
+fn capture_archive_read(
+    operation: &PreparedArchiveOperation<'_>,
+    expected_repository_id: Option<&str>,
+    http: &dyn HttpTransport,
+    restic_path: Option<&Path>,
+    version: &str,
+    effects: &mut ArchiveAdmissionEffects,
+) -> Result<CapturedArchiveRead, ArchiveError> {
+    if expected_repository_id.is_some_and(|id| !full_archive_id(id)) {
+        return Err(ArchiveError::RepositoryIdentityInvalid);
+    }
+    operation.revalidate()?;
+    let config = operation.configuration();
+    if !config.enabled() {
+        return Err(ArchiveError::NotConfigured);
+    }
+    let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
+    let restic_path = restic_path
+        .ok_or(ArchiveError::ToolUnavailable)?
+        .to_path_buf();
+    let (destination, credential_expiry) = if let Some(binding) = config.binding() {
+        let http = ArchiveAdmissionHttp {
+            inner: http,
+            operation,
+        };
+        effects.broker_requested = true;
+        let credentials = fetch_hosted_credentials(&http, binding, "operated", version);
+        operation.revalidate()?;
+        let credentials = credentials.map_err(|error| ArchiveError::CredentialsUnavailable {
+            reason: error.reason_code,
+        })?;
+        let expiry = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
+            .map_err(|_| ArchiveError::InvalidCredentialExpiry)?
+            .timestamp();
+        let session = hosted_session(binding, &credentials)
+            .map_err(|_| ArchiveError::ConfigurationUnavailable)?;
+        (session.destination, Some(expiry))
+    } else {
+        if config.mode() != Some("byo") {
+            return Err(ArchiveError::NotConfigured);
+        }
+        (
+            config.destination().ok_or(ArchiveError::NotConfigured)?,
+            None,
+        )
+    };
+    Ok(CapturedArchiveRead {
+        restic_path,
+        destination,
+        password: keys.daily_key,
+        credential_expiry,
+    })
+}
+
 fn admit_prepared_archive_read_with<'a>(
     mut operation: PreparedArchiveOperation<'a>,
     expected_repository_id: Option<String>,
@@ -2075,52 +2147,23 @@ fn admit_prepared_archive_read_with<'a>(
     version: &str,
 ) -> Result<ReadOperation<'a>, ArchiveAdmissionFailure<'a>> {
     let mut effects = ArchiveAdmissionEffects::default();
-    let admission = (|| {
-        if expected_repository_id
-            .as_ref()
-            .is_some_and(|id| !full_archive_id(id))
-        {
-            return Err(ArchiveError::RepositoryIdentityInvalid);
-        }
-        operation.revalidate()?;
-        let config = operation.configuration();
-        if !config.enabled() {
-            return Err(ArchiveError::NotConfigured);
-        }
-        let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
-        let restic_path = restic_path
-            .ok_or(ArchiveError::ToolUnavailable)?
-            .to_path_buf();
-        let destination = if let Some(binding) = config.binding() {
-            let http = ArchiveAdmissionHttp {
-                inner: http,
-                operation: &operation,
-            };
-            effects.broker_requested = true;
-            let credentials = fetch_hosted_credentials(&http, binding, "operated", version);
-            operation.revalidate()?;
-            let credentials =
-                credentials.map_err(|error| ArchiveError::CredentialsUnavailable {
-                    reason: error.reason_code,
-                })?;
-            let expiry = chrono::DateTime::parse_from_rfc3339(&credentials.expires_at)
-                .map_err(|_| ArchiveError::InvalidCredentialExpiry)?
-                .timestamp();
-            let session = hosted_session(binding, &credentials)
-                .map_err(|_| ArchiveError::ConfigurationUnavailable)?;
+    let admission = capture_archive_read(
+        &operation,
+        expected_repository_id.as_deref(),
+        http,
+        restic_path,
+        version,
+        &mut effects,
+    )
+    .and_then(|captured| {
+        if let Some(expiry) = captured.credential_expiry {
             operation.cap_credential_expiry(expiry);
             operation.revalidate()?;
-            session.destination
-        } else {
-            if config.mode() != Some("byo") {
-                return Err(ArchiveError::NotConfigured);
-            }
-            config.destination().ok_or(ArchiveError::NotConfigured)?
-        };
-        Ok((restic_path, destination, keys.daily_key))
-    })();
-    let (restic_path, destination, password) = match admission {
-        Ok(admitted) => admitted,
+        }
+        Ok(captured)
+    });
+    let captured = match admission {
+        Ok(captured) => captured,
         Err(error) => {
             return Err(ArchiveAdmissionFailure {
                 inner: Box::new(ArchiveAdmissionFailureInner {
@@ -2132,8 +2175,19 @@ fn admit_prepared_archive_read_with<'a>(
         }
     };
     let input = match expected_repository_id {
-        Some(id) => ReadAdmission::bind(operation, destination, password, id, restic_path),
-        None => ReadAdmission::capture_current(operation, destination, password, restic_path),
+        Some(id) => ReadAdmission::bind(
+            operation,
+            captured.destination,
+            captured.password,
+            id,
+            captured.restic_path,
+        ),
+        None => ReadAdmission::capture_current(
+            operation,
+            captured.destination,
+            captured.password,
+            captured.restic_path,
+        ),
     };
     effects.read_repository_requested = true;
     ReadOperation::admit(input).map_err(|readback| ArchiveAdmissionFailure {
@@ -2223,6 +2277,122 @@ impl<'a> InstalledArchiveRead<'a> {
     }
 }
 
+pub fn admit_prepared_archive_owned_read_installed(
+    operation: OwnedPreparedArchiveOperation,
+    expected_repository_id: String,
+    restic_path: &Path,
+    version: &str,
+    http: &UreqHttpTransport,
+) -> Result<OwnedInstalledArchiveRead, OwnedArchiveAdmissionFailure> {
+    admit_prepared_archive_owned_read_installed_with(
+        operation,
+        Some(expected_repository_id),
+        restic_path,
+        version,
+        http,
+    )
+}
+
+pub fn admit_prepared_archive_owned_current_read_installed(
+    operation: OwnedPreparedArchiveOperation,
+    restic_path: &Path,
+    version: &str,
+    http: &UreqHttpTransport,
+) -> Result<OwnedInstalledArchiveRead, OwnedArchiveAdmissionFailure> {
+    admit_prepared_archive_owned_read_installed_with(operation, None, restic_path, version, http)
+}
+
+fn admit_prepared_archive_owned_read_installed_with(
+    mut operation: OwnedPreparedArchiveOperation,
+    expected_repository_id: Option<String>,
+    restic_path: &Path,
+    version: &str,
+    http: &UreqHttpTransport,
+) -> Result<OwnedInstalledArchiveRead, OwnedArchiveAdmissionFailure> {
+    let clock = Arc::clone(operation.owned_clock());
+    let carrier = Arc::clone(operation.carrier());
+    let operated = operation.configuration().binding().is_some();
+    let mut effects = ArchiveAdmissionEffects::default();
+    let admission = capture_archive_read(
+        operation.as_prepared(),
+        expected_repository_id.as_deref(),
+        http,
+        Some(restic_path),
+        version,
+        &mut effects,
+    )
+    .and_then(|captured| {
+        if let Some(expiry) = captured.credential_expiry {
+            operation.cap_credential_expiry(expiry);
+            operation.revalidate()?;
+        }
+        Ok(captured)
+    });
+    let captured = match admission {
+        Ok(captured) => captured,
+        Err(error) => {
+            return Err(OwnedArchiveAdmissionFailure {
+                inner: Box::new(OwnedArchiveAdmissionFailureInner {
+                    error,
+                    effects,
+                    owned: ClosedArchiveAdmissionOwner::Prepared(Box::new(
+                        operation.into_owned_hold(),
+                    )),
+                }),
+            });
+        }
+    };
+    let input = match expected_repository_id {
+        Some(id) => operation.bind_read(
+            captured.destination,
+            captured.password,
+            id,
+            captured.restic_path,
+        ),
+        None => operation.capture_current_read(
+            captured.destination,
+            captured.password,
+            captured.restic_path,
+        ),
+    };
+    effects.read_repository_requested = true;
+    let read = input
+        .admit()
+        .map_err(|readback| OwnedArchiveAdmissionFailure {
+            inner: Box::new(OwnedArchiveAdmissionFailureInner {
+                error: ArchiveError::Readback(readback.reason()),
+                effects,
+                owned: ClosedArchiveAdmissionOwner::Readback(Box::new(readback)),
+            }),
+        })?;
+    Ok(OwnedInstalledArchiveRead {
+        read,
+        finish: DirectReadFinishOwner {
+            carrier,
+            clock,
+            broker: if operated {
+                DirectBrokerCompletion::JoinedOperated
+            } else {
+                DirectBrokerCompletion::CapturedByo
+            },
+        },
+    })
+}
+
+#[must_use = "Keep the original finish owner outside the consuming actor"]
+pub struct OwnedInstalledArchiveRead {
+    read: OwnedReadOperation,
+    finish: DirectReadFinishOwner,
+}
+impl OwnedInstalledArchiveRead {
+    pub fn into_parts(self) -> (OwnedReadOperation, DirectReadFinishOwner) {
+        (self.read, self.finish)
+    }
+    pub fn into_owned_hold(self) -> (OwnedDirectReadHold, DirectReadFinishOwner) {
+        (self.read.into_owned_hold(), self.finish)
+    }
+}
+
 enum DirectBrokerCompletion {
     CapturedByo,
     JoinedOperated,
@@ -2253,17 +2423,23 @@ impl DirectReadFinishOwner {
         }
     }
 
+    fn validate_identity(
+        &self,
+        carrier: &Arc<solstone_core_journal_io::media::RootActivityCarrier>,
+        clock: Option<&Arc<dyn Clock + Send + Sync>>,
+    ) -> Result<(), ReadbackError> {
+        if !Arc::ptr_eq(&self.carrier, carrier)
+            || !clock.is_some_and(|clock| Arc::ptr_eq(&self.clock, clock))
+        {
+            return Err(ReadbackError::NativeFailure);
+        }
+        Ok(())
+    }
+
     pub fn finish<'a>(self, settled: SettledDirectRead<'a>) -> DirectReadFinish<'a> {
-        let validation = (|| {
-            if !Arc::ptr_eq(&self.carrier, settled.carrier())
-                || !settled
-                    .owned_clock()
-                    .is_some_and(|clock| Arc::ptr_eq(&self.clock, clock))
-            {
-                return Err(ReadbackError::NativeFailure);
-            }
-            settled.revalidate()
-        })();
+        let validation = self
+            .validate_identity(settled.carrier(), settled.owned_clock())
+            .and_then(|()| settled.revalidate());
         if let Err(reason) = validation {
             return DirectReadFinish {
                 inner: Box::new(DirectReadFinishInner::BeforeRelease {
@@ -2273,16 +2449,37 @@ impl DirectReadFinishOwner {
                 }),
             };
         }
-        let completion = settled.release();
+        DirectReadFinish {
+            inner: Box::new(DirectReadFinishInner::Owned(
+                self.finish_released(settled.release()),
+            )),
+        }
+    }
+
+    pub fn finish_owned(self, settled: OwnedSettledDirectRead) -> OwnedDirectReadFinish {
+        let validation = self
+            .validate_identity(settled.carrier(), Some(settled.owned_clock()))
+            .and_then(|()| settled.revalidate());
+        if let Err(reason) = validation {
+            return OwnedDirectReadFinish {
+                inner: Box::new(OwnedDirectReadFinishInner::BeforeRelease {
+                    owner: self,
+                    _read: Box::new(settled.into_owned_hold()),
+                    reason,
+                }),
+            };
+        }
+        self.finish_released(settled.release())
+    }
+
+    fn finish_released(self, completion: DirectReadCompletion) -> OwnedDirectReadFinish {
         if let Err(reason) = completion.revalidate() {
-            return DirectReadFinish {
-                inner: Box::new(DirectReadFinishInner::Owned(OwnedDirectReadFinish {
-                    inner: Box::new(OwnedDirectReadFinishInner::Shared {
-                        owner: self,
-                        _completion: completion,
-                        reason,
-                    }),
-                })),
+            return OwnedDirectReadFinish {
+                inner: Box::new(OwnedDirectReadFinishInner::Shared {
+                    owner: self,
+                    _completion: completion,
+                    reason,
+                }),
             };
         }
         let Self {
@@ -2312,10 +2509,8 @@ impl DirectReadFinishOwner {
                 }
             }
         };
-        DirectReadFinish {
-            inner: Box::new(DirectReadFinishInner::Owned(OwnedDirectReadFinish {
-                inner: Box::new(inner),
-            })),
+        OwnedDirectReadFinish {
+            inner: Box::new(inner),
         }
     }
 }
@@ -2829,6 +3024,7 @@ mod tests {
         check::<OwnedDirectReadHold>();
         check::<OwnedReadbackAdmissionError>();
         check::<solstone_core_backup::archive_readback::OwnedHeldDirectRead>();
+        check::<OwnedSettledDirectRead>();
     }
 
     static CURRENT_DIRECTORY: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -3152,6 +3348,92 @@ mod tests {
             write_backup_section(journal.path(), valid_backup_section(valid_destination()));
             let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
             (journal, root)
+        }
+
+        #[test]
+        fn typed_owned_preparation_and_admission_refusals_close_original_lifetime() {
+            struct OwnedClock(std::sync::atomic::AtomicI64);
+            impl Clock for OwnedClock {
+                fn now_unix(&self) -> i64 {
+                    self.0.load(std::sync::atomic::Ordering::Relaxed)
+                }
+                fn iso_week(&self) -> u8 {
+                    7
+                }
+            }
+            for cancelled in [false, true] {
+                let (_journal, root) = fixture();
+                let actual_clock = Arc::new(OwnedClock(std::sync::atomic::AtomicI64::new(50)));
+                let clock: Arc<dyn Clock + Send + Sync> = actual_clock.clone();
+                let cancellation = ArchiveCancellation::new();
+                let budget =
+                    ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone()).unwrap();
+                let original = match OwnedPreparedArchiveOperation::prepare(
+                    Arc::clone(&root),
+                    budget,
+                    Arc::clone(&clock),
+                ) {
+                    Ok(original) => original,
+                    Err(failure) => panic!("preparation refused: {}", failure.reason()),
+                };
+                let weak = Arc::downgrade(original.carrier());
+                if cancelled {
+                    cancellation.cancel();
+                } else {
+                    actual_clock.0.store(
+                        51 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                let refusal = match admit_prepared_archive_owned_read_installed(
+                    original,
+                    REPOSITORY_ID.into(),
+                    Path::new("/absent/restic"),
+                    "fixture",
+                    &UreqHttpTransport,
+                ) {
+                    Err(refusal) => refusal,
+                    Ok(_) => panic!("original stopped lifetime must refuse"),
+                };
+                assert_eq!(
+                    refusal.error(),
+                    if cancelled {
+                        ArchiveError::Cancelled
+                    } else {
+                        ArchiveError::DeadlineExceeded
+                    }
+                );
+                assert_eq!(*refusal.effects(), ArchiveAdmissionEffects::default());
+                let refusal = std::thread::spawn(move || refusal).join().unwrap();
+                assert!(Arc::ptr_eq(refusal.journal_root(), &root));
+                assert!(Arc::ptr_eq(refusal.owned_clock().unwrap(), &clock));
+                assert!(Arc::ptr_eq(
+                    refusal.carrier().unwrap(),
+                    &weak.upgrade().unwrap()
+                ));
+                drop(refusal);
+                assert!(weak.upgrade().is_none());
+            }
+
+            let (_journal, root) = fixture();
+            let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+            let cancellation = ArchiveCancellation::new();
+            let budget =
+                ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone()).unwrap();
+            cancellation.cancel();
+            let failure = match OwnedPreparedArchiveOperation::prepare(
+                Arc::clone(&root),
+                budget,
+                Arc::clone(&clock),
+            ) {
+                Err(failure) => failure,
+                Ok(_) => panic!("stopped preparation must refuse"),
+            };
+            let failure = std::thread::spawn(move || failure).join().unwrap();
+            assert_eq!(failure.reason(), AdmissionError::Cancelled);
+            assert!(Arc::ptr_eq(failure.journal_root(), &root));
+            assert!(Arc::ptr_eq(failure.owned_clock(), &clock));
+            assert!(failure.carrier().is_none());
         }
 
         #[test]

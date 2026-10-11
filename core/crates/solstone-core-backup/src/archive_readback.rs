@@ -21,7 +21,8 @@ use solstone_core_journal_io::media::{ArchiveSource, Cleanup, OwnedMediaTarget, 
 
 use crate::Destination;
 use crate::archive_activity::{
-    ArchiveOperationClock, OwnedPreparedArchiveHold, PreparedArchiveOperation,
+    ArchiveOperationClock, OwnedPreparedArchiveHold, OwnedPreparedArchiveOperation,
+    PreparedArchiveOperation, close_owned_prepared,
 };
 #[cfg(unix)]
 use crate::archive_admission::ARCHIVE_LS_TIMEOUT_SECONDS;
@@ -317,7 +318,10 @@ impl HeldDirectRead<'_> {
     pub fn into_owned_hold(self) -> Result<OwnedHeldDirectRead, Box<Self>> {
         let Self { reason, read } = self;
         read.into_owned_hold()
-            .map(|read| OwnedHeldDirectRead { reason, read })
+            .map(|read| OwnedHeldDirectRead {
+                reason,
+                read: Box::new(read),
+            })
             .map_err(|read| {
                 Box::new(Self {
                     reason,
@@ -353,7 +357,7 @@ impl OwnedDirectReadHold {
 #[must_use]
 pub struct OwnedHeldDirectRead {
     reason: ReadbackError,
-    read: OwnedDirectReadHold,
+    read: Box<OwnedDirectReadHold>,
 }
 impl OwnedHeldDirectRead {
     pub fn reason(&self) -> ReadbackError {
@@ -361,6 +365,9 @@ impl OwnedHeldDirectRead {
     }
     pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
         self.read.carrier()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        self.read.owned_clock()
     }
 }
 
@@ -392,6 +399,12 @@ impl OwnedReadbackAdmissionError {
     }
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
         self.carrier().journal_root()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        match &self.owned {
+            ClosedAdmissionOwner::Input(input) => input.operation.owned_clock(),
+            ClosedAdmissionOwner::Admitted(read) => read.owned_clock(),
+        }
     }
 }
 impl ReadbackAdmissionError<'_> {
@@ -450,6 +463,256 @@ pub struct ReadOperation<'a> {
     env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     repository: RepositoryBinding,
     execution: std::cell::RefCell<DirectExecution>,
+}
+
+/// Captured owned inputs, consumed once by the same installed read admission.
+#[must_use]
+pub struct OwnedReadAdmission {
+    input: ReadAdmission<'static>,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+impl OwnedPreparedArchiveOperation {
+    pub fn bind_read(
+        self,
+        destination: Destination,
+        password: String,
+        repository_id: String,
+        expected_restic_path: PathBuf,
+    ) -> OwnedReadAdmission {
+        let (operation, clock) = self.into_parts();
+        OwnedReadAdmission {
+            input: ReadAdmission::bind(
+                operation,
+                destination,
+                password,
+                repository_id,
+                expected_restic_path,
+            ),
+            clock,
+        }
+    }
+
+    pub fn capture_current_read(
+        self,
+        destination: Destination,
+        password: String,
+        expected_restic_path: PathBuf,
+    ) -> OwnedReadAdmission {
+        let (operation, clock) = self.into_parts();
+        OwnedReadAdmission {
+            input: ReadAdmission::capture_current(
+                operation,
+                destination,
+                password,
+                expected_restic_path,
+            ),
+            clock,
+        }
+    }
+}
+impl OwnedReadAdmission {
+    pub fn admit(self) -> Result<OwnedReadOperation, OwnedReadbackAdmissionError> {
+        let Self { input, clock } = self;
+        match ReadOperation::admit(input) {
+            Ok(read) => Ok(OwnedReadOperation { read, clock }),
+            Err(failure) => Err(close_owned_admission(failure, clock)),
+        }
+    }
+    pub fn refuse(self, reason: ReadbackError) -> OwnedReadbackAdmissionError {
+        close_owned_admission(self.input.refuse(reason), self.clock)
+    }
+}
+
+/// An active read whose original owned clock cannot be replaced or extracted.
+#[must_use = "Consume this original read into settlement or closed custody"]
+pub struct OwnedReadOperation {
+    read: ReadOperation<'static>,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+impl OwnedReadOperation {
+    pub fn as_read(&self) -> &ReadOperation<'static> {
+        &self.read
+    }
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.read.carrier()
+    }
+    pub fn activity(&self) -> &Arc<ActivityLease> {
+        self.read.activity()
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        self.read.journal_root()
+    }
+    pub fn repository_id(&self) -> &str {
+        self.read.repository_id()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+    pub fn revalidate_admission(&self) -> Result<(), ReadbackError> {
+        self.read.revalidate_admission()
+    }
+    pub fn offload_required_bytes(
+        &self,
+        max_payload: u64,
+        metadata: u64,
+    ) -> Result<u64, ReadbackError> {
+        self.read.offload_required_bytes(max_payload, metadata)
+    }
+    pub fn discover_owned_snapshot(
+        &mut self,
+        snapshot_id: &str,
+        source: &ArchiveSource<'_>,
+    ) -> Result<ExactArchiveFile, ReadbackError> {
+        self.read.discover_owned_snapshot(snapshot_id, source)
+    }
+    pub fn discover_historical_snapshot(
+        &mut self,
+        snapshot_selector: &str,
+        files: &[HistoricalArchiveFile<'_>],
+    ) -> Result<HistoricalSnapshotFiles, ReadbackError> {
+        self.read
+            .discover_historical_snapshot(snapshot_selector, files)
+    }
+    pub fn read_owned_snapshot(
+        &mut self,
+        snapshot_id: &str,
+        source: &ArchiveSource<'_>,
+        target: OwnedMediaTarget,
+    ) -> Result<(ExactArchiveFile, PreparedMedia), ReadbackFailure> {
+        self.read.read_owned_snapshot(snapshot_id, source, target)
+    }
+    pub fn read_exact(
+        &mut self,
+        file: &ExactArchiveFile,
+        target: OwnedMediaTarget,
+    ) -> Result<PreparedMedia, ReadbackFailure> {
+        self.read.read_exact(file, target)
+    }
+    pub fn into_owned_hold(self) -> OwnedDirectReadHold {
+        close_owned_read(self.read, self.clock)
+    }
+    pub fn settle_direct(self) -> Result<OwnedSettledDirectRead, OwnedHeldDirectRead> {
+        let Self { read, clock } = self;
+        match read.settle_direct() {
+            Ok(settled) => Ok(OwnedSettledDirectRead {
+                read: close_owned_read(settled.read, clock),
+            }),
+            Err(held) => {
+                let HeldDirectRead { reason, read } = *held;
+                Err(OwnedHeldDirectRead {
+                    reason,
+                    read: Box::new(close_owned_read(read, clock)),
+                })
+            }
+        }
+    }
+}
+
+/// Genuine qualification of an owned read, with a total consuming close.
+#[must_use]
+pub struct OwnedSettledDirectRead {
+    read: OwnedDirectReadHold,
+}
+impl OwnedSettledDirectRead {
+    pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
+        self.read.carrier()
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        self.read.owned_clock()
+    }
+    pub fn revalidate(&self) -> Result<(), ReadbackError> {
+        #[cfg(unix)]
+        {
+            self.read.operation.revalidate()?;
+            revalidate_member(&self.read._member)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(ReadbackError::Unsupported)
+        }
+    }
+    pub fn into_owned_hold(self) -> OwnedDirectReadHold {
+        self.read
+    }
+    pub fn release(self) -> DirectReadCompletion {
+        let OwnedDirectReadHold {
+            operation,
+            _root: root,
+            _execution: execution,
+            ..
+        } = self.read;
+        let OwnedPreparedArchiveHold {
+            activity,
+            _configuration: configuration,
+            _budget: budget,
+            clock,
+        } = operation;
+        drop(activity);
+        DirectReadCompletion {
+            _execution: execution,
+            root,
+            configuration,
+            budget,
+            clock,
+        }
+    }
+}
+
+fn close_owned_read(
+    read: ReadOperation<'static>,
+    clock: Arc<dyn Clock + Send + Sync>,
+) -> OwnedDirectReadHold {
+    let ReadOperation {
+        operation,
+        root,
+        #[cfg(all(unix, feature = "full-tests"))]
+            source_observations: _,
+        #[cfg(unix)]
+        member,
+        #[cfg(unix)]
+        env,
+        repository,
+        execution,
+    } = read;
+    OwnedDirectReadHold {
+        operation: close_owned_prepared(operation, clock),
+        _root: root,
+        #[cfg(unix)]
+        _member: member,
+        #[cfg(unix)]
+        _env: env,
+        _repository: repository,
+        _execution: execution.into_inner(),
+    }
+}
+
+fn close_owned_admission(
+    failure: ReadbackAdmissionError<'static>,
+    clock: Arc<dyn Clock + Send + Sync>,
+) -> OwnedReadbackAdmissionError {
+    let ReadbackAdmissionError { reason, owned } = failure;
+    let owned = match owned {
+        AdmissionOwner::Input(input) => {
+            let ReadAdmission {
+                operation,
+                destination,
+                password,
+                repository,
+                expected_restic_path,
+            } = *input;
+            ClosedAdmissionOwner::Input(Box::new(OwnedReadInput {
+                operation: close_owned_prepared(operation, clock),
+                _destination: destination,
+                _password: password,
+                _repository: repository,
+                _expected_restic_path: expected_restic_path,
+            }))
+        }
+        AdmissionOwner::Admitted(read) => {
+            ClosedAdmissionOwner::Admitted(Box::new(close_owned_read(*read, clock)))
+        }
+    };
+    OwnedReadbackAdmissionError { reason, owned }
 }
 
 #[derive(Clone, Copy)]
@@ -866,11 +1129,7 @@ impl<'a> ReadOperation<'a> {
     #[cfg(unix)]
     fn revalidate_local(&self) -> Result<(), ReadbackError> {
         self.operation.revalidate()?;
-        #[cfg(unix)]
-        self.member
-            .revalidate()
-            .map_err(|_| ReadbackError::ToolChanged)?;
-        Ok(())
+        revalidate_member(&self.member)
     }
 
     #[cfg(unix)]
@@ -1246,6 +1505,11 @@ impl<'a> ReadOperation<'a> {
             Ok(prepared)
         }
     }
+}
+
+#[cfg(unix)]
+fn revalidate_member(member: &CurrentInstalledMember) -> Result<(), ReadbackError> {
+    member.revalidate().map_err(|_| ReadbackError::ToolChanged)
 }
 
 #[cfg(any(unix, test))]
