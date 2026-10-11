@@ -96,12 +96,14 @@ fn published_mutation_keeps_uncertainty_without_register_payload() {
 fn actual_owner_preserves_success_post_commit_failure_and_stale_refusal() {
     use chrono::{NaiveDate, TimeZone, Utc};
     use solstone_core_journal_io::JournalRoot;
+    use solstone_core_journal_io::activity::{ActivityAdmissionError, TeardownLease};
+    use solstone_core_journal_io::media::{MediaPrimitive, run_with_media_hook};
     use solstone_core_retention::marks::{Mark, MarkId, MarkState, Proposal, RemovalClass};
-    use solstone_core_retention::remove_marked::remove_reviewed;
+    use solstone_core_retention::remove_marked::{ReviewedRemovalFinish, remove_reviewed};
     use solstone_core_retention::review_context::{check_review_context, read_review_context};
     use std::{fs, sync::Arc};
 
-    for scenario in 0..3 {
+    for scenario in 0..6 {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("config")).unwrap();
         fs::create_dir(temp.path().join("health")).unwrap();
@@ -207,6 +209,109 @@ fn actual_owner_preserves_success_post_commit_failure_and_stale_refusal() {
                 assert_eq!(facts["mutation"]["publication"], "published");
                 assert!(facts["outcome"]["targets"][0]["post_commit_failure"].is_null());
             }
+        }
+        drop(view);
+        if scenario == 3 {
+            fs::create_dir(temp.path().join(".tmp-offload-late")).unwrap();
+        }
+        let (final_facts, held) = if scenario == 5 {
+            let held = owner.into_owned_hold();
+            let final_facts = serde_json::to_value(held_ordinary(&held)).unwrap();
+            assert!(final_facts["finish_refusal"].is_null());
+            assert!(final_facts["retirement"].is_null());
+            (final_facts, Some(held))
+        } else {
+            let finished = if scenario == 4 {
+                let (finished, fired) = run_with_media_hook(
+                    MediaPrimitive::CarrierRetirementRootSync,
+                    || Err(io::Error::from_raw_os_error(13)),
+                    || owner.finish(),
+                );
+                assert!(fired);
+                finished
+            } else {
+                owner.finish()
+            };
+            match finished {
+                ReviewedRemovalFinish::Settled(report) => {
+                    assert_eq!(scenario, 0);
+                    let final_facts = serde_json::to_value(settled_ordinary(&report)).unwrap();
+                    assert!(final_facts["finish_refusal"].is_null());
+                    assert_eq!(
+                        final_facts["retirement"],
+                        json!({
+                            "effect":"removed", "root_durability":"synced",
+                            "confirmation":"confirmed", "failures":[],
+                        })
+                    );
+                    assert!(final_facts.get("carrier_preparation").is_none());
+                    (final_facts, None)
+                }
+                ReviewedRemovalFinish::Held(held) => {
+                    assert_ne!(scenario, 0);
+                    let final_facts = serde_json::to_value(held_ordinary(&held)).unwrap();
+                    if scenario == 3 {
+                        assert_eq!(final_facts["finish_refusal"]["kind"], "native");
+                        assert_eq!(
+                            final_facts["finish_refusal"]["detail"]["kind"],
+                            "obligations"
+                        );
+                        assert!(
+                            final_facts["finish_refusal"]["detail"]["count"]
+                                .as_u64()
+                                .unwrap()
+                                > 0
+                        );
+                        assert!(final_facts["retirement"].is_null());
+                    } else if scenario == 4 {
+                        assert_eq!(final_facts["finish_refusal"]["kind"], "retirement");
+                        assert_eq!(
+                            final_facts["retirement"],
+                            json!({
+                                "effect":"removed", "root_durability":"unproven",
+                                "confirmation":"confirmed",
+                                "failures":[io::ErrorKind::PermissionDenied.to_string()],
+                            })
+                        );
+                    } else {
+                        assert_eq!(
+                            final_facts["finish_refusal"]["kind"],
+                            "incomplete_selection"
+                        );
+                        assert!(final_facts["retirement"].is_null());
+                    }
+                    (final_facts, Some(*held))
+                }
+            }
+        };
+        assert_eq!(final_facts["outcome"], facts["outcome"]);
+        assert_eq!(final_facts["mutation"], facts["mutation"]);
+        assert_eq!(final_facts["refusal"], facts["refusal"]);
+        assert_eq!(
+            final_facts["attempts"].as_array().unwrap().len(),
+            facts["attempts"].as_array().unwrap().len()
+        );
+        if scenario != 2 {
+            assert_eq!(final_facts["attempts"][0]["native"]["effect"], "deleted");
+            assert_eq!(
+                final_facts["attempts"][0]["append"],
+                facts["attempts"][0]["append"]
+            );
+            assert_eq!(
+                final_facts["attempts"][0]["marker"],
+                facts["attempts"][0]["marker"]
+            );
+        }
+        assert!(!final_facts.to_string().contains("private proposal value"));
+        assert!(final_facts.get("selected_marks").is_none());
+        assert!(final_facts.get("register").is_none());
+        if held.is_some() {
+            assert!(matches!(
+                TeardownLease::try_acquire(Arc::clone(&root)),
+                Err(ActivityAdmissionError::Busy)
+            ));
+        } else {
+            assert!(TeardownLease::try_acquire(Arc::clone(&root)).is_ok());
         }
     }
 }
