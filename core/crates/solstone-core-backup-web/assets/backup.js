@@ -1414,9 +1414,8 @@
     showMessage('[data-teardown-status]', '');
   }
 
-  // /app/backup/teardown remains unguarded server-side exactly as shipped today;
-  // this owner-authenticated local app keeps the gate as a page-level honesty
-  // surface and does not change the server contract.
+  // These metadata totals explain the confirmation. The server owns teardown
+  // admission and fresh checks; this page does not grant deletion authority.
   async function openTeardownGate() {
     try {
       await refreshOffloadStatus();

@@ -418,7 +418,8 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// Delete only objects whose returned key remains inside `prefix`; batches are max 1000.
-pub fn wipe_prefix(
+#[cfg(test)]
+fn wipe_prefix(
     transport: &dyn HttpTransport,
     credentials: &S3Credentials,
     bucket: &str,

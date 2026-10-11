@@ -4,7 +4,6 @@
 #[cfg(not(windows))]
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard};
-#[cfg(not(windows))]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -705,9 +704,11 @@ thread_local! {
     static FAIL_WORKER_START: Cell<bool> = const { Cell::new(false) };
 }
 
-#[cfg(not(windows))]
-fn spawn_thread(work: impl FnOnce() + Send + 'static) -> std::io::Result<thread::JoinHandle<()>> {
+pub(crate) fn spawn_thread(
+    work: impl FnOnce() + Send + 'static,
+) -> std::io::Result<thread::JoinHandle<()>> {
     #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(not(windows))]
     if FAIL_WORKER_START.with(|fail| fail.replace(false)) {
         return Err(std::io::Error::other(
             "injected backup worker creation failure",

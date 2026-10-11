@@ -347,6 +347,10 @@ fn restored_mutation_error(error: &RestoredMarkRefusal) -> Value {
         RestoredMarkRefusal::Bound(error) => {
             json!({"kind":"bound", "detail":mutation_error(error)})
         }
+        RestoredMarkRefusal::Intent(_) => json!({"kind":"intent", "detail":unavailable_detail()}),
+        RestoredMarkRefusal::Recovery(_) => {
+            json!({"kind":"recovery", "detail":unavailable_detail()})
+        }
     }
 }
 

@@ -95,8 +95,7 @@ pub use runner::{
     PassedHandle, ResticResult, SystemToolRunner, ToolOutput, ToolRequest, ToolRunner,
     reason_for_returncode, run_restic, select_summary,
 };
-pub use s3_wipe::{DELETE_OBJECT_BATCH_SIZE, S3Credentials, WipeResult, wipe_prefix};
-pub use teardown::{TeardownResult, teardown_backup};
+pub use s3_wipe::{DELETE_OBJECT_BATCH_SIZE, S3Credentials, WipeResult};
 pub use teardown_admission::{
     CarrierTeardownAdmission, ClearedTeardownAdmission, TeardownAdmission,
     TeardownAdmissionRefusal, TeardownCarrierFailure, TeardownCarrierRefusal, TeardownClearFailure,

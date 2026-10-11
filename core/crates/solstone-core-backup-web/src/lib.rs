@@ -32,7 +32,7 @@ use solstone_core_backup_runtime::{
     RestoreRecorder, SystemToolRunner, ToolRunner, UreqHttpTransport, init_repository,
     log_key_label_outcome, neutralize_key_labels, operated_destination, publish_restore_outcome,
     reason_for_returncode, resolve_operational_tools, restore_journal, rotate_recovery_key,
-    teardown_backup, validate_destination,
+    validate_destination,
 };
 use solstone_core_offload::{restore_all_offload, restore_offload_day};
 
@@ -53,6 +53,7 @@ mod response;
 mod restore_prepare;
 pub mod restore_report;
 mod status;
+mod teardown_report;
 mod validation;
 
 pub use validation::{HandoffFieldError, require_https_portal_url};
@@ -271,6 +272,9 @@ pub fn routes_with_deps(deps: BackupWebDeps) -> Router {
 
 fn status_response(deps: &BackupWebDeps) -> axum::response::Response {
     restore_prepare::reconcile(&deps.restore_prepare, &deps.operations);
+    if let Some(response) = archive_worker::teardown::response(deps) {
+        return response;
+    }
     status::status(&deps.journal_root, &deps.operations)
         .map(response::success)
         .unwrap_or_else(|_| internal_error())
@@ -903,25 +907,10 @@ async fn rotate_key(deps: BackupWebDeps) -> axum::response::Response {
 }
 
 async fn teardown_route(deps: BackupWebDeps) -> axum::response::Response {
-    let started = match operation::begin(&deps.operations, "teardown", None, None, None) {
-        Ok(started) => started,
+    match archive_worker::teardown::spawn(&deps) {
+        Ok(handle) => drop(handle),
         Err(error) => return error,
-    };
-    spawn_backup_worker(deps.clone(), started.generation, move |worker| {
-        let tools = match resolve_tools(&worker) {
-            Ok(tools) => tools,
-            Err(error) => return Terminal::tool_error(error),
-        };
-        let result = teardown_backup(&worker.journal_root, &services(&worker, &tools));
-        match result.status.as_str() {
-            "cleared_superseded" => Terminal::phase("done", result.reason_code.clone()),
-            "ok" | "skipped" => Terminal::done(),
-            _ => Terminal::phase(
-                "error",
-                result.reason_code.or_else(|| Some("failed".into())),
-            ),
-        }
-    });
+    }
     status_response(&deps)
 }
 

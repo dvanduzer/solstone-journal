@@ -7,6 +7,7 @@
 pub mod offload;
 pub mod removal;
 pub mod restore;
+pub(crate) mod teardown;
 
 use std::{
     io,
@@ -285,11 +286,12 @@ pub(crate) struct ArchiveCustody {
     reservation: Option<Arc<Reservation>>,
     // Never replace a retained return, even after a rejected/stale handoff.
     retained: Vec<RejectedArchiveReturn>,
+    teardown: teardown::Custody,
 }
 
 impl ArchiveCustody {
     pub(crate) fn is_busy(&self) -> bool {
-        self.reservation.is_some() || !self.retained.is_empty()
+        self.reservation.is_some() || !self.retained.is_empty() || self.teardown.is_busy()
     }
 
     pub(crate) fn retained(&self) -> impl Iterator<Item = &RejectedArchiveReturn> {

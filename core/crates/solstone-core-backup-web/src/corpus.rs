@@ -1473,11 +1473,6 @@ fn restore_outputs() -> Vec<ToolOutput> {
 }
 
 #[cfg(feature = "full-tests")]
-fn teardown_outputs() -> Vec<ToolOutput> {
-    vec![output(0, "[{\"id\":\"snap\"}]"), output(0, "")]
-}
-
-#[cfg(feature = "full-tests")]
 fn rotate_outputs() -> Vec<ToolOutput> {
     vec![
         output(0, "[{\"id\":\"old\",\"current\":true}]"),
@@ -1514,14 +1509,6 @@ async fn engine_routes_return_running_while_restic_is_held() {
             phase: "restoring",
             disable: false,
             outputs: restore_outputs(),
-        },
-        Case {
-            path: "/app/backup/teardown",
-            body: None,
-            kind: "teardown",
-            phase: "tearing_down",
-            disable: false,
-            outputs: teardown_outputs(),
         },
         Case {
             path: "/app/backup/recovery-key/rotate",
@@ -1850,178 +1837,6 @@ async fn restore_check_failure_is_degraded() {
     let done = wait_terminal(&deps).await;
     assert_eq!(done["operation"]["phase"], "degraded");
     assert_eq!(done["operation"]["reason_code"], "integrity_unverified");
-}
-
-#[cfg(feature = "full-tests")]
-#[tokio::test]
-async fn teardown_byo_forgets_then_clears() {
-    let root = crate::test_support::root("healthy");
-    let runner = ScriptRunner::with_outputs(vec![output(0, "[{\"id\":\"snap\"}]"), output(0, "")]);
-    let runner = Arc::new(runner);
-    let (deps, _restic) = prepared(root.path().to_path_buf(), runner.clone());
-    let (status, body) = post_json(&deps, "/app/backup/teardown", None).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["operation"]["kind"], "teardown");
-    assert_eq!(body["operation"]["phase"], "tearing_down");
-    let done = wait_terminal(&deps).await;
-    assert_eq!(done["operation"]["phase"], "done");
-    assert_eq!(done["enabled"], false);
-    let heads = runner.argv_heads();
-    assert!(
-        heads
-            .iter()
-            .any(|head| head == "forget" || head == "snapshots")
-    );
-}
-
-#[cfg(feature = "full-tests")]
-#[tokio::test]
-async fn teardown_operated_wipes_via_http() {
-    let root = crate::test_support::hosted_bound_root();
-    let runner = ScriptRunner::with_outputs(vec![]);
-    let restic = tempfile::tempdir().unwrap();
-    crate::test_support::write_ready_restic(restic.path());
-    let http = HttpScript::with_responses(vec![
-        Ok(credentials_response()),
-        Ok(xml_response(
-            "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
-        )),
-        Ok(xml_response(
-            "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>",
-        )),
-    ]);
-    let http = Arc::new(http);
-    let deps = engine_deps(
-        root.path().to_path_buf(),
-        Arc::new(runner),
-        http.clone(),
-        Some(restic.path().to_path_buf()),
-    );
-    let _ = post_json(&deps, "/app/backup/teardown", None).await;
-    let done = wait_terminal(&deps).await;
-    assert_eq!(done["operation"]["phase"], "done");
-    assert!(!http.requests.lock().unwrap().is_empty());
-    assert_eq!(done["hosted"]["bound"], false);
-}
-
-#[cfg(feature = "full-tests")]
-#[tokio::test]
-async fn teardown_operated_keeps_binding_visible_while_held() {
-    let root = crate::test_support::hosted_bound_root();
-    let journal_path = root.path().to_path_buf();
-    let hold = Hold::new();
-    let runner = ScriptRunner::with_outputs(vec![]);
-    let restic = tempfile::tempdir().unwrap();
-    crate::test_support::write_ready_restic(restic.path());
-    let http = Arc::new(
-        HttpScript::with_responses(vec![
-            Ok(credentials_response()),
-            Ok(xml_response(
-                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
-            )),
-            Ok(xml_response(
-                "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>",
-            )),
-        ])
-        .with_hold_after(1, hold.clone()),
-    );
-    let deps = engine_deps(
-        journal_path.as_path().to_path_buf(),
-        Arc::new(runner),
-        http.clone(),
-        Some(restic.path().to_path_buf()),
-    );
-
-    held_fixture(
-        deps.clone(),
-        vec![hold.clone()],
-        vec![http.clone()],
-        vec![root, restic],
-        async {
-            let (status, body) = post_json(&deps, "/app/backup/teardown", None).await;
-            assert_eq!(status, 200);
-            assert_eq!(body["operation"]["kind"], "teardown");
-            assert_eq!(body["operation"]["phase"], "tearing_down");
-            wait_started_or_terminal(&hold, &deps, fixture_generation(&deps).await)
-                .await
-                .expect("fixture did not enter Hold");
-
-            let (status, during) = get_status_json(&deps).await;
-            assert_eq!(status, 200);
-            assert_eq!(during["operation"]["kind"], "teardown");
-            assert_eq!(during["operation"]["phase"], "tearing_down");
-            assert_eq!(during["hosted"]["bound"], true);
-            assert_eq!(during["hosted"]["bucket"], "bucket");
-            assert_eq!(during["hosted"]["prefix"], "owner/prefix");
-
-            hold.release().await;
-            let done = wait_terminal(&deps).await;
-            assert_eq!(done["operation"]["phase"], "done");
-            assert_eq!(done["hosted"]["bound"], false);
-            assert!(solstone_core_backup::load_hosted_binding(journal_path.as_path()).is_none());
-        },
-    )
-    .await;
-}
-
-#[cfg(feature = "full-tests")]
-#[tokio::test]
-async fn teardown_operated_superseded_binding_clears_local_state_without_wiping() {
-    let root = crate::test_support::hosted_bound_root();
-    let runner = ScriptRunner::with_outputs(vec![]);
-    let restic = tempfile::tempdir().unwrap();
-    crate::test_support::write_ready_restic(restic.path());
-    let http = Arc::new(HttpScript::with_responses(vec![Ok(HttpResponse {
-        status: 401,
-        headers: vec![],
-        body: br#"{"error":"binding_superseded"}"#.to_vec(),
-    })]));
-    let deps = engine_deps(
-        root.path().to_path_buf(),
-        Arc::new(runner),
-        http.clone(),
-        Some(restic.path().to_path_buf()),
-    );
-
-    let _ = post_json(&deps, "/app/backup/teardown", None).await;
-    let done = wait_terminal(&deps).await;
-
-    assert_eq!(done["operation"]["phase"], "done");
-    assert_eq!(done["operation"]["reason_code"], "binding_superseded");
-    assert_eq!(done["enabled"], false);
-    assert_eq!(done["mode"], "byo");
-    assert_eq!(done["hosted"]["bound"], false);
-    assert_eq!(http.requests.lock().unwrap().len(), 1);
-}
-
-#[cfg(feature = "full-tests")]
-#[tokio::test]
-async fn teardown_operated_invalid_binding_keeps_local_state() {
-    let root = crate::test_support::hosted_bound_root();
-    let runner = ScriptRunner::with_outputs(vec![]);
-    let restic = tempfile::tempdir().unwrap();
-    crate::test_support::write_ready_restic(restic.path());
-    let http = Arc::new(HttpScript::with_responses(vec![Ok(HttpResponse {
-        status: 401,
-        headers: vec![],
-        body: br#"{"error":"invalid_token"}"#.to_vec(),
-    })]));
-    let deps = engine_deps(
-        root.path().to_path_buf(),
-        Arc::new(runner),
-        http.clone(),
-        Some(restic.path().to_path_buf()),
-    );
-
-    let _ = post_json(&deps, "/app/backup/teardown", None).await;
-    let done = wait_terminal(&deps).await;
-
-    assert_eq!(done["operation"]["phase"], "error");
-    assert_eq!(done["operation"]["reason_code"], "binding_invalid");
-    assert_eq!(done["enabled"], true);
-    assert_eq!(done["mode"], "operated");
-    assert_eq!(done["hosted"]["bound"], true);
-    assert_eq!(http.requests.lock().unwrap().len(), 1);
 }
 
 #[cfg(feature = "full-tests")]

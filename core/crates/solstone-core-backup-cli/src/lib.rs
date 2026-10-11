@@ -20,10 +20,10 @@ use solstone_core_backup_runtime::restore::{
 use solstone_core_backup_runtime::{
     BackupResult, BackupServices, Clock, ClosedToolError, HttpTransport, NativeJournalMaintenance,
     NativeRestoreRecorder, PruneResult, ResticKeyError, RestoreDraft, RestoreOutcome,
-    RestoreRecorder, RotationResult, SystemToolRunner, TeardownResult, ToolRunner,
-    UnreadableSources, UreqHttpTransport, prepare, publish_restore_outcome,
-    resolve_operational_tools, resolve_restic_member, resolve_tools, restore_journal,
-    rotate_recovery_key, run_prune, teardown_backup, validate_destination,
+    RestoreRecorder, RotationResult, SystemToolRunner, ToolRunner, UnreadableSources,
+    UreqHttpTransport, prepare, publish_restore_outcome, resolve_operational_tools,
+    resolve_restic_member, resolve_tools, restore_journal, rotate_recovery_key, run_prune,
+    validate_destination,
 };
 use solstone_core_offload::cli_run::{OwnedOffloadCliRun, run_cli_offload};
 use solstone_core_offload::{
@@ -34,6 +34,9 @@ use solstone_core_offload::{
     measurement::{device_free_bytes, device_total_bytes, suggest_offload_defaults},
     status::build_checked_offload_status,
 };
+
+mod owned_teardown;
+pub use owned_teardown::OwnedTeardownCliRun;
 
 pub const USAGE: &str = "usage: solstone journal backup <command> [options]\n";
 pub const DESTINATION_USAGE: &str =
@@ -65,12 +68,14 @@ impl std::fmt::Debug for CliRun {
 pub enum CliOutcome {
     Rendered(CliRun),
     Offload(Box<OwnedOffloadCliRun>),
+    Teardown(Box<OwnedTeardownCliRun>),
 }
 impl CliOutcome {
     pub fn output(&self) -> (&str, &str, i32) {
         match self {
             Self::Rendered(run) => (&run.stdout, &run.stderr, run.exit_code),
             Self::Offload(run) => run.output(),
+            Self::Teardown(run) => run.output(),
         }
     }
 }
@@ -83,7 +88,22 @@ pub fn run_cli(args: &[String], journal: &Path) -> CliOutcome {
             dry_run,
         )));
     }
+    if owned_teardown_options(args) {
+        return CliOutcome::Teardown(Box::new(owned_teardown::run(journal)));
+    }
     CliOutcome::Rendered(run_rendered_cli(args, journal))
+}
+
+fn owned_teardown_options(args: &[String]) -> bool {
+    let args = normalize_global_flags(args);
+    if has_help(&args) {
+        return false;
+    }
+    let Some(options) = args.strip_prefix(&["off".into()]) else {
+        return false;
+    };
+    let (flags, positionals) = split_terminator(options);
+    positionals.is_empty() && !flags.is_empty() && flags.iter().all(|flag| flag == "--yes")
 }
 
 fn owned_offload_options(args: &[String]) -> Option<bool> {
@@ -271,10 +291,6 @@ fn format_resolution_error(
             recovery_key: None,
             recovery_key_display: None,
         }),
-        Some("off") => teardown_result(TeardownResult {
-            status: "error".into(),
-            reason_code: Some(reason),
-        }),
         Some("offload") => match args.get(1).map(String::as_str) {
             Some("run") => offload_run_result(OffloadResult {
                 status: "stalled".into(),
@@ -340,16 +356,7 @@ fn classify_tool_resolution(args: &[String]) -> Option<bool> {
                 _ => None,
             }
         }
-        "off" => {
-            let (options, positionals) = split_terminator(rest);
-            if !positionals.is_empty() || options.iter().any(|argument| argument != "--yes") {
-                return None;
-            }
-            options
-                .iter()
-                .any(|argument| argument == "--yes")
-                .then_some(false)
-        }
+        "off" => None,
         "offload" => {
             let (subcommand, _options) = rest.split_first()?;
             match subcommand.as_str() {
@@ -1547,26 +1554,14 @@ fn recovery_key_rotate_result(result: RotationResult) -> CliRun {
     }
 }
 
-fn turn_off(confirmed: bool, journal: &Path, services: &BackupServices<'_>) -> CliRun {
+fn turn_off(confirmed: bool, _journal: &Path, _services: &BackupServices<'_>) -> CliRun {
     if !confirmed {
         return runtime_error(
             "Refusing to tear down backup without --yes. This forgets all snapshots.".into(),
         );
     }
-    teardown_result(teardown_backup(journal, services))
-}
-
-fn teardown_result(result: TeardownResult) -> CliRun {
-    match result.status.as_str() {
-        "cleared_superseded" => success(
-            "Backup was claimed by another device; this device's local backup settings were cleared. Run `solstone journal backup enable` to set up a new backup here.\n".into(),
-        ),
-        "ok" | "skipped" => success("Backup turned off.\n".into()),
-        _ => runtime_error(format!(
-            "Teardown failed: {}.",
-            backup_failure_reason(result.reason_code.as_deref().unwrap_or("failed"))
-        )),
-    }
+    // Borrowed injected services cannot replace the original owning admission.
+    runtime_error(owned_teardown::PRELAUNCH_HELD.into())
 }
 
 fn set_hosted(journal: &Path) -> CliRun {
@@ -2262,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn three_subcommands_reach_their_unconfigured_runtime_bodies() {
+    fn two_subcommands_reach_their_unconfigured_runtime_bodies() {
         let journal = tempfile::tempdir().unwrap();
         let runner = UnusedRunner;
         let http = UnusedHttp;
@@ -2279,38 +2274,10 @@ mod tests {
                 vec!["recovery-key".into(), "rotate".into()],
                 "Recovery key rotation skipped (backup not configured).\n",
             ),
-            (vec!["off".into(), "--yes".into()], "Backup turned off.\n"),
         ] {
             let output = run_cli_with(&args, journal.path(), &services);
             assert_eq!(output.stdout, expected);
         }
-    }
-
-    #[test]
-    fn teardown_result_branches_use_owner_output() {
-        for status in ["ok", "skipped"] {
-            let output = teardown_result(TeardownResult {
-                status: status.into(),
-                reason_code: None,
-            });
-            assert_eq!(output.stdout, "Backup turned off.\n");
-        }
-        let cleared = teardown_result(TeardownResult {
-            status: "cleared_superseded".into(),
-            reason_code: Some("binding_superseded".into()),
-        });
-        assert_eq!(
-            cleared.stdout,
-            "Backup was claimed by another device; this device's local backup settings were cleared. Run `solstone journal backup enable` to set up a new backup here.\n"
-        );
-        let error = teardown_result(TeardownResult {
-            status: "error".into(),
-            reason_code: Some("timeout".into()),
-        });
-        assert_eq!(
-            error.stderr,
-            "Error: Teardown failed: it ran too long and stopped.\n"
-        );
     }
 
     #[test]
@@ -2622,7 +2589,6 @@ mod tests {
         let maintenance = UnusedMaintenance;
         let services = unconfigured_services(&runner, &http, &clock, &maintenance);
         for args in [
-            vec!["off".into(), "--yes".into(), "--yes".into()],
             vec![
                 "offload".into(),
                 "status".into(),
@@ -2644,7 +2610,11 @@ mod tests {
                 "--json".into(),
             ],
         ] {
-            assert_eq!(run_cli_with(&args, journal.path(), &services).exit_code, 0);
+            assert_ne!(
+                run_cli_with(&args, journal.path(), &services).exit_code,
+                2,
+                "valid repeated flags: {args:?}"
+            );
         }
     }
 
@@ -4722,11 +4692,7 @@ mod resolution_tests {
         let expected = package_dir.path().join("lib/solstone-restic/restic");
         let decoy = decoy_dir.path().join("restic");
         fs::write(&decoy, b"decoy").unwrap();
-        for argv in [
-            args(&["prune"]),
-            args(&["recovery-key", "rotate"]),
-            args(&["off", "--yes"]),
-        ] {
+        for argv in [args(&["prune"]), args(&["recovery-key", "rotate"])] {
             let journal = byo_journal();
             let runner = RecordingRunner::new();
             run_cli_with_deps(&argv, journal.path(), &runner, &UnusedHttp, &exe);
@@ -4734,6 +4700,14 @@ mod resolution_tests {
         }
 
         let journal = byo_journal();
+        let runner = RecordingRunner::new();
+        let off = args(&["off", "--yes", "--yes"]);
+        assert_eq!(classify_tool_resolution(&off), None);
+        let held = run_cli_with_deps(&off, journal.path(), &runner, &UnusedHttp, &exe);
+        assert_ne!(held.exit_code, 0);
+        assert!(held.stderr.contains(owned_teardown::PRELAUNCH_HELD));
+        assert!(runner.programs.borrow().is_empty());
+
         configure_offload(journal.path());
         for argv in [
             args(&["offload", "run"]),
