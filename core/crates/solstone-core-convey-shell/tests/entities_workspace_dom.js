@@ -147,7 +147,7 @@ function findById(root, id) {
   return null;
 }
 
-function main() {
+async function main() {
   const manifestDir = process.argv[2];
   if (!manifestDir) throw new Error('manifest directory required');
   const workspace = fs.readFileSync(path.join(manifestDir, 'assets/entities/workspace.html'), 'utf8');
@@ -166,7 +166,7 @@ function main() {
   check(errorStart !== -1 && errorEnd !== -1, 'workspace exposes the entities error-message helper');
   const errorContext = {
     window: {SurfaceState: {serverMessageFrom: (err) => err?.serverMessage || ''}},
-    ENT_COPY: {ENT_TRUST_REPAIR_REQUIRED: '{detail} {remediation}'},
+    ENT_COPY: {},
   };
   vm.runInNewContext(
     `${workspace.slice(errorStart, errorEnd)}\nwindow.entityErrorMessage = entityErrorMessage;`,
@@ -182,6 +182,69 @@ function main() {
     entityErrorMessage({status: 500, serverMessage: 'Entity request refused', rawDetail: 'No such file or directory (os error 2)'}, 'fallback') === 'fallback',
     'a server failure shows the fallback, not its engineering detail',
   );
+  // Failed is also returned after a successful rollback, so its partial-state
+  // envelope is not a reason to disable the recovery-aware retry path.
+  const mergeFailure = {
+    status: 500,
+    serverMessage: 'Entity request refused',
+    rawDetail: 'entity merge failed during audit: injected failure',
+    payload: {
+      error: 'Entity request refused', reason_code: 'entity_operation_failed',
+      detail: 'entity merge failed during audit: injected failure',
+      operation_state: 'partially_applied', mutation_applied: true,
+      failed_phase: 'audit', source_id: 'source', target_id: 'target',
+      source_state: {id: 'source'}, target_state: {id: 'target'},
+      safe_remediation: 'Contact an operator to repair this merge.',
+    },
+  };
+  const mergeStart = workspace.indexOf('async function commitJournalEntityMerge(');
+  const mergeEnd = workspace.indexOf('function showJournalMergeDone(', mergeStart);
+  let calls = 0;
+  let shownError;
+  const mergeContext = {
+    ...errorContext,
+    currentDetailEntity: {name: 'source'},
+    ENT_COPY: {ENT_TRUST_ACTION_FAILED: 'failure fallback'},
+    window: {
+      ...errorContext.window,
+      confirm: () => true,
+      apiJson: async () => { calls += 1; throw mergeFailure; },
+    },
+    showInlineError: (_id, message) => { shownError = message; },
+  };
+  vm.runInNewContext(workspace.slice(errorStart, errorEnd) + workspace.slice(mergeStart, mergeEnd), mergeContext);
+  const mergeButton = {disabled: false};
+  await mergeContext.commitJournalEntityMerge('source', 'target', 'target', mergeButton);
+  check(!mergeButton.disabled, 'a failed entity merge leaves its confirm button retryable');
+  check(shownError === mergeContext.ENT_COPY.ENT_TRUST_ACTION_FAILED, 'a failed merge shows the fallback rather than diagnostics or operator advice');
+  await mergeContext.commitJournalEntityMerge('source', 'target', 'target', mergeButton);
+  check(calls === 2 && !mergeButton.disabled, 'a repeat confirmation reaches the recovery-aware merge route');
+
+  const curation = fs.readFileSync(path.join(manifestDir, '../solstone-core-facets-web/assets/curation/workspace.html'), 'utf8');
+  const curationStart = curation.indexOf('  function repairRequired(');
+  const curationEnd = curation.indexOf('  function postJson(', curationStart);
+  const curationContext = {
+    window: {SurfaceState: {serverMessageFrom: (err) => err.serverMessage}},
+    CUR_COPY: {CUR_REPAIR_REQUIRED: '{detail} {remediation}'},
+    copyFormat: (text, values) => text.replace(/\{(\w+)\}/g, (_, key) => values[key]),
+    setBusy: (control, busy) => { control.disabled = busy; },
+    showError: (_item, message) => { shownError = message; },
+  };
+  vm.runInNewContext(curation.slice(curationStart, curationEnd), curationContext);
+  const curationButton = {disabled: true};
+  const siblingControl = {disabled: false};
+  const item = {querySelectorAll: () => [curationButton, siblingControl]};
+  // Curation returns an ordinary per-item error for EntityMergeError::Failed.
+  curationContext.showMutationError(item, curationButton, {
+    serverMessage: mergeFailure.rawDetail,
+    payload: {status: 'error', kind: 'entity_merge', error: mergeFailure.rawDetail},
+  }, 'fallback');
+  check(!curationButton.disabled && !siblingControl.disabled, 'curation also permits a repeat entity merge');
+  curationContext.showMutationError(item, curationButton, {
+    payload: {operation_state: 'repair_required', safe_remediation: 'speaker remedy'},
+  }, 'fallback');
+  check(curationButton.disabled && siblingControl.disabled, 'speaker repair still disables curation mutations');
+
   const helperBody = workspace.slice(errorStart, errorEnd);
   const outsideHelper = workspace.replace(helperBody, '');
   check(!outsideHelper.includes('SurfaceState.serverMessageFrom('), 'every entities error surface reads through entityErrorMessage');
@@ -349,9 +412,7 @@ function main() {
   console.log(`DOM CASES: ${cases} passed`);
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   console.error(error.stack || error);
   process.exitCode = 1;
-}
+});

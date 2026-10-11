@@ -1022,6 +1022,8 @@ window.CUR_COPY = CUR_COPY;
     }
   }
 
+  // Speaker identification can require repair. Entity merges instead settle
+  // recovery before a repeat commit, so a failed merge remains retryable.
   function repairRequired(err) {
     return err?.payload?.operation_state === 'repair_required';
   }
