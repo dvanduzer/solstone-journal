@@ -51,7 +51,11 @@ pub fn content_rel(day: &str, stream: &str, dir: &str, name: &str) -> String {
 
 /// A canonical operational-log leaf inside one Chronicle day health directory.
 pub fn oplog_rel(day: &str, leaf: &str) -> String {
-    format!("chronicle/{day}/health/{leaf}")
+    format!("{}/{leaf}", day_health_rel(day))
+}
+
+pub(crate) fn day_health_rel(day: &str) -> String {
+    format!("chronicle/{day}/health")
 }
 
 /// The stream name for a segment found directly under a day directory.
