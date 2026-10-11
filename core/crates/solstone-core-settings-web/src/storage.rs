@@ -12,10 +12,6 @@ use solstone_core_retention::policy::{policy_from_journal_config, policy_would_r
 
 use crate::http::json_response;
 
-mod backup_copy {
-    include!(concat!(env!("OUT_DIR"), "/backup_copy.rs"));
-}
-
 pub async fn get(journal_root: PathBuf) -> Response {
     match tokio::task::spawn_blocking(move || {
         let summary = solstone_core_retention::compute_storage_summary(&journal_root)
@@ -147,46 +143,6 @@ fn storage_warnings(
             warnings.push(json!({"level": "warning", "type": "raw_media_gb", "message": message, "current": current, "threshold": threshold}));
         }
     }
-    let backup = config.get("backup").and_then(Value::as_object);
-    let offload = backup
-        .and_then(|backup| backup.get("offload"))
-        .and_then(Value::as_object);
-    let last_offload = backup
-        .and_then(|backup| backup.get("last_offload"))
-        .and_then(Value::as_object);
-    if offload
-        .and_then(|offload| offload.get("enabled"))
-        .and_then(Value::as_bool)
-        == Some(true)
-        && last_offload
-            .and_then(|offload| offload.get("status"))
-            .and_then(Value::as_str)
-            == Some("stalled")
-    {
-        let reason = last_offload
-            .and_then(|offload| offload.get("reason"))
-            .and_then(Value::as_str);
-        let labels = backup_constants()
-            .remove("OFFLOAD_STALL_REASON_LABELS")
-            .and_then(|value| value.as_object().cloned())
-            .expect("generated offload stall labels");
-        let message = [
-            backup_constants()
-                .remove("OFFLOAD_STALLED_LEAD")
-                .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                .expect("generated offload stalled lead"),
-            reason
-                .and_then(|reason| labels.get(reason))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .unwrap_or_default(),
-        ]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-        warnings.push(json!({"level": "warning", "type": "offload_stalled", "message": message, "current": null, "threshold": null}));
-    }
     warnings
 }
 
@@ -212,10 +168,6 @@ fn disk_percent(_journal_root: &std::path::Path) -> Option<f64> {
 fn round(value: f64, places: i32) -> f64 {
     let scale = 10_f64.powi(places);
     (value * scale).round() / scale
-}
-
-fn backup_constants() -> Map<String, Value> {
-    serde_json::from_str(backup_copy::COPY_JSON).expect("generated backup copy constants")
 }
 
 #[cfg(test)]
@@ -353,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_warnings_cover_disk_raw_media_and_stalled_offload() {
+    fn storage_warnings_cover_current_disk_and_media_without_replaying_offload_history() {
         let summary = solstone_core_retention::StorageSummary {
             raw_media_bytes: 1024_u64.pow(3),
             ..Default::default()
@@ -369,15 +321,30 @@ mod tests {
             &config,
             Some(87.3),
         );
-        assert_eq!(warnings.len(), 3);
+        assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[0]["type"], "disk_percent");
         assert_eq!(warnings[1]["type"], "raw_media_gb");
         assert_eq!(warnings[1]["current"], 1.0);
         assert_eq!(warnings[1]["threshold"], 1.0);
         assert!(warnings[1]["message"].as_str().unwrap().contains("1 GiB"));
-        assert_eq!(warnings[2]["type"], "offload_stalled");
-        assert_eq!(warnings[2]["current"], Value::Null);
-        assert_eq!(warnings[2]["threshold"], Value::Null);
+        let history_only = storage_warnings(
+            &summary,
+            config.get("retention").and_then(Value::as_object),
+            &config,
+            Some(10.0),
+        );
+        assert_eq!(history_only.len(), 1);
+        assert_eq!(history_only[0]["type"], "raw_media_gb");
+        let below_threshold = solstone_core_retention::StorageSummary::default();
+        assert!(
+            storage_warnings(
+                &below_threshold,
+                config.get("retention").and_then(Value::as_object),
+                &config,
+                Some(10.0),
+            )
+            .is_empty()
+        );
     }
 
     #[test]

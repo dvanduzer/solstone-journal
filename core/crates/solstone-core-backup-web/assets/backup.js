@@ -1644,16 +1644,11 @@
     renderWorkingProof('[data-offload-last-verify]', '[data-offload-verify-history]', payload.last_verification, workingVerificationReasonLabel);
     setTextWithTitle('[data-offload-last-restore]', formatRestoreResultDisplay(payload.last_restore));
 
-    const stalled = payload.last_offload && payload.last_offload.status === 'stalled';
+    // Historical summaries do not describe the current owning operation.
     const stallElement = root.querySelector('[data-offload-stall-reason]');
     if (stallElement) {
-      stallElement.hidden = !(ready && !unavailable && stalled);
-      if (!stallElement.hidden) {
-        stallElement.textContent = [
-          offloadCopy.stalled_lead || '',
-          offloadStallReasonLabel(payload.last_offload.reason),
-        ].filter(Boolean).join(' ');
-      } else stallElement.textContent = '';
+      stallElement.hidden = true;
+      stallElement.textContent = '';
     }
 
     renderOffloadDays(showProof ? payload.days : []);

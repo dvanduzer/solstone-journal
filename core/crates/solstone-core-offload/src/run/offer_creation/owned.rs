@@ -37,6 +37,13 @@ impl OwnedOffloadInputs {
     pub fn observed(&self) -> &ObservedOffloadOffers {
         self.resources.observed.as_ref().expect("captured inputs")
     }
+    pub(super) fn refuse(mut self, reason: OffloadCreationRefusal) -> OwnedOffloadInputFailure {
+        self.resources.reason = Some(reason);
+        OwnedOffloadInputFailure {
+            carrier: self.carrier,
+            resources: Box::new(self.resources),
+        }
+    }
 }
 
 /// The caller retains this failure with the same closed prepared owner, without
@@ -66,7 +73,29 @@ pub fn prepare_owned_offload_inputs(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> Result<OwnedOffloadInputs, OwnedOffloadInputFailure> {
-    let carrier = Arc::clone(original.carrier());
+    let inputs = capture_inputs(
+        original.as_prepared(),
+        Arc::clone(original.carrier()),
+        selections,
+        today,
+        now,
+    )?;
+    #[cfg(unix)]
+    if let Err(reason) = unix::capacity(original.as_prepared(), inputs.observed()) {
+        return Err(inputs.refuse(reason));
+    }
+    Ok(inputs)
+}
+
+// Both exact creation and the planner use this one capture. The planner performs
+// its payload reserve only after inspecting actual current pending relief.
+pub(super) fn capture_inputs(
+    operation: &PreparedArchiveOperation<'_>,
+    carrier: Arc<RootActivityCarrier>,
+    selections: &[OffloadOfferSelection],
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<OwnedOffloadInputs, OwnedOffloadInputFailure> {
     let mut resources = Resources::default();
     #[cfg(unix)]
     let result = (|| {
@@ -74,7 +103,6 @@ pub fn prepare_owned_offload_inputs(
             archive_catalog::read_complete_catalog, archive_offer::capture_offload_offers,
             review_context::load_at_root,
         };
-        let operation = original.as_prepared();
         operation
             .revalidate()
             .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
@@ -85,15 +113,11 @@ pub fn prepare_owned_offload_inputs(
         let selections = unix::partition(&catalog, &register, selections)?;
         resources.observed =
             Some(capture_offload_offers(operation, &selections, today, now).map_err(unix::inputs)?);
-        let _parent = unix::capacity(
-            operation,
-            resources.observed.as_ref().expect("captured inputs"),
-        )?;
         Ok(catalog)
     })();
     #[cfg(not(unix))]
     let result: Result<JournalCatalog, OffloadCreationRefusal> = {
-        let _parameters = (selections, today, now);
+        let _parameters = (operation, selections, today, now);
         Err(OffloadCreationRefusal::Inputs(
             OffloadOfferRefusal::Unsupported,
         ))

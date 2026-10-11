@@ -35,19 +35,23 @@ use solstone_core_retention::archive_catalog::OffloadFile;
 
 pub use current::{
     CurrentFileIdentity, CurrentOffloadAvailability, CurrentOffloadDecision, CurrentOffloadRefusal,
-    CurrentOffloadRefusalReason, EligibleOffloadFile, inspect_current_offload,
+    CurrentOffloadRefusalReason, CurrentOffloadReport, EligibleOffloadFile,
+    inspect_current_offload, inspect_owned_current_offload,
 };
 
 mod offer_creation;
 pub use offer_creation::{
     OffloadCreation, OffloadCreationNative, OffloadCreationOwner, OffloadCreationRefusal,
     OffloadLedgerEffect, OffloadLedgerSync, OffloadLedgerWrite, OffloadPlanning,
-    OffloadPlanningPhase, OffloadPlanningRefusal, OffloadSourceCleanup, OffloadSourceCopyReport,
-    OwnedOffloadCreation, OwnedOffloadCreationFinish, OwnedOffloadCreationFinishRefusal,
-    OwnedOffloadCreationHold, OwnedOffloadCreationOwner, OwnedOffloadInputFailure,
-    OwnedOffloadInputs, SettledOffloadCreation, SettledOffloadCreationReport,
-    create_offload_offers, create_owned_offload_offers, create_planned_offload_offers,
-    prepare_owned_offload_inputs,
+    OffloadPlanningPhase, OffloadPlanningRefusal, OffloadPlanningReport, OffloadSourceCleanup,
+    OffloadSourceCopyReport, OwnedOffloadCreation, OwnedOffloadCreationFinish,
+    OwnedOffloadCreationFinishRefusal, OwnedOffloadCreationHold, OwnedOffloadCreationOwner,
+    OwnedOffloadInputFailure, OwnedOffloadInputs, OwnedOffloadPlan, OwnedOffloadPlanFinish,
+    OwnedOffloadPlanFinishRefusal, OwnedOffloadPlanHold, OwnedOffloadPlanInputFailure,
+    OwnedOffloadPlanInputs, OwnedOffloadPlanOwner, SettledOffloadCreation,
+    SettledOffloadCreationReport, SettledOffloadPlan, SettledOffloadPlanReport,
+    create_offload_offers, create_owned_offload_offers, create_owned_planned_offload_offers,
+    create_planned_offload_offers, prepare_owned_offload_inputs, prepare_owned_offload_plan,
 };
 
 #[cfg(all(test, unix, feature = "full-tests"))]
@@ -863,7 +867,7 @@ mod current {
 
     use chrono::{DateTime, FixedOffset, Utc};
     use serde_json::{Map, Value};
-    use solstone_core_backup_runtime::AdmittedArchive;
+    use solstone_core_backup_runtime::{AdmittedArchive, ArchiveError, OwnedAdmittedArchive};
     use solstone_core_journal_io::journal_root::JournalRoot;
     use solstone_core_journal_io::locking::LockOptions;
     use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity, MediaObservation};
@@ -879,6 +883,38 @@ mod current {
     use solstone_core_segment::output_attempt::OutputClaims;
 
     use solstone_core_retention::archive_catalog::read_complete_catalog;
+
+    #[derive(Clone, Copy)]
+    pub(super) enum CurrentArchive<'borrow, 'clock> {
+        Generic(&'borrow AdmittedArchive<'clock>),
+        Owned(&'borrow OwnedAdmittedArchive),
+    }
+    impl CurrentArchive<'_, '_> {
+        pub(super) fn journal_root(&self) -> &Arc<JournalRoot> {
+            match self {
+                Self::Generic(operation) => operation.journal_root(),
+                Self::Owned(operation) => operation.journal_root(),
+            }
+        }
+        pub(super) fn repository_id(&self) -> &str {
+            match self {
+                Self::Generic(operation) => operation.repository_id(),
+                Self::Owned(operation) => operation.repository_id(),
+            }
+        }
+        pub(super) fn current_time(&self) -> Result<i64, ArchiveError> {
+            match self {
+                Self::Generic(operation) => operation.current_time(),
+                Self::Owned(operation) => operation.current_time(),
+            }
+        }
+        pub(super) fn revalidate(&self) -> Result<(), ArchiveError> {
+            match self {
+                Self::Generic(operation) => operation.revalidate(),
+                Self::Owned(operation) => operation.revalidate_local(),
+            }
+        }
+    }
 
     pub(super) const MAX_CURRENT_ENTRIES: usize = 100_000;
     const MAX_CURRENT_CONFIG_BYTES: usize = 1024 * 1024;
@@ -1030,6 +1066,14 @@ mod current {
         pub fn root_observation(&self) -> String {
             self.root.identity().observation_id()
         }
+        pub(super) fn into_report(self) -> CurrentOffloadReport {
+            CurrentOffloadReport {
+                root_observation: self.root.identity().observation_id(),
+                availability: self.availability,
+                eligible: self.eligible,
+                refusals: self.refusals,
+            }
+        }
         fn refuse(&mut self, mark: Option<&Mark>, reason: CurrentOffloadRefusalReason) {
             self.refusals.push(CurrentOffloadRefusal {
                 mark_id: mark.map(|mark| mark.id.clone()),
@@ -1040,6 +1084,28 @@ mod current {
             self.availability = CurrentOffloadAvailability::Unavailable;
             self.eligible.clear();
             self.refuse(None, reason);
+        }
+    }
+
+    /// Original batch data without a retained journal handle or P authority.
+    pub struct CurrentOffloadReport {
+        root_observation: String,
+        availability: CurrentOffloadAvailability,
+        eligible: Vec<EligibleOffloadFile>,
+        refusals: Vec<CurrentOffloadRefusal>,
+    }
+    impl CurrentOffloadReport {
+        pub fn root_observation(&self) -> &str {
+            &self.root_observation
+        }
+        pub fn availability(&self) -> CurrentOffloadAvailability {
+            self.availability
+        }
+        pub fn eligible(&self) -> impl Iterator<Item = &EligibleOffloadFile> {
+            self.eligible.iter()
+        }
+        pub fn refusals(&self) -> &[CurrentOffloadRefusal] {
+            &self.refusals
         }
     }
 
@@ -1152,7 +1218,7 @@ mod current {
 
         pub(super) fn revalidate(
             &self,
-            operation: &AdmittedArchive<'_>,
+            operation: CurrentArchive<'_, '_>,
         ) -> Result<(), CurrentOffloadRefusalReason> {
             let now = operation
                 .current_time()
@@ -1211,6 +1277,22 @@ mod current {
     /// clock's future; prerequisites are checked against that actual clock.
     pub fn inspect_current_offload(
         operation: &mut AdmittedArchive<'_>,
+        expected: &[Mark],
+        at: DateTime<FixedOffset>,
+    ) -> CurrentOffloadDecision {
+        inspect(CurrentArchive::Generic(operation), expected, at)
+    }
+
+    pub fn inspect_owned_current_offload(
+        operation: &mut OwnedAdmittedArchive,
+        expected: &[Mark],
+        at: DateTime<FixedOffset>,
+    ) -> CurrentOffloadDecision {
+        inspect(CurrentArchive::Owned(operation), expected, at)
+    }
+
+    pub(super) fn inspect(
+        operation: CurrentArchive<'_, '_>,
         expected: &[Mark],
         at: DateTime<FixedOffset>,
     ) -> CurrentOffloadDecision {
@@ -1352,7 +1434,7 @@ mod current {
         reason = "explicit current batch admission and observations"
     )]
     fn inspect_group(
-        operation: &AdmittedArchive<'_>,
+        operation: CurrentArchive<'_, '_>,
         observation: &CurrentPolicyObservation,
         policy: &Policy,
         root: &Arc<JournalRoot>,
@@ -1546,7 +1628,7 @@ mod current {
     }
 
     fn recheck_group(
-        operation: &AdmittedArchive<'_>,
+        operation: CurrentArchive<'_, '_>,
         observation: &CurrentPolicyObservation,
         root: &Arc<JournalRoot>,
         group: CurrentGroupObservation,
