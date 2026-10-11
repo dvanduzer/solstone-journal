@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use crate::JournalRoot;
 
 mod activity_carrier;
+#[cfg(target_os = "linux")]
+pub(crate) use activity_carrier::retire_recovered;
 pub use activity_carrier::{
     ActivityCarrierPreparationFailure, ActivityCarrierPreparationReceipt,
     ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,

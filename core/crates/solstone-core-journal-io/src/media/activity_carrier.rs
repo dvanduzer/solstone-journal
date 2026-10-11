@@ -526,6 +526,15 @@ pub struct ActivityCarrierRetirementReceipt {
 }
 
 impl ActivityCarrierRetirementReceipt {
+    pub(crate) fn not_attempted() -> Self {
+        Self {
+            effect: ActivityCarrierRetirementEffect::NotAttempted,
+            root_durability: Durability::Unproven,
+            confirmation: Confirmation::Unverified,
+            failures: Vec::new(),
+        }
+    }
+
     pub fn effect(&self) -> ActivityCarrierRetirementEffect {
         self.effect
     }
@@ -541,6 +550,46 @@ impl ActivityCarrierRetirementReceipt {
     pub fn failures(&self) -> &[io::Error] {
         &self.failures
     }
+}
+
+// Finite adapter for the already physically retained recovered owner. No saved
+// name/identity or public MediaDirectory method can enter this mutation.
+#[cfg(target_os = "linux")]
+pub(crate) fn retire_recovered(
+    owner: &crate::archive_recovery::RecoveredArchiveReservation,
+) -> ActivityCarrierRetirementReceipt {
+    let mut receipt = ActivityCarrierRetirementReceipt::not_attempted();
+    if let Err(error) = owner.revalidate() {
+        receipt.failures.push(io::Error::other(error));
+        return receipt;
+    }
+    let (parent, directory, name) = owner.retirement_directories();
+    receipt.effect = ActivityCarrierRetirementEffect::Attempted;
+    if let Err(error) = platform::remove_directory(&parent.inner, name, &directory.inner) {
+        receipt.failures.push(error);
+        return receipt;
+    }
+    receipt.effect = ActivityCarrierRetirementEffect::Removed;
+    let flush = (|| {
+        step(MediaPrimitive::CarrierRetirementRootSync)?;
+        owner.revalidate_after_removal().map_err(io::Error::other)?;
+        parent.inner.sync()
+    })();
+    match flush {
+        Ok(()) => receipt.root_durability = Durability::Synced,
+        Err(error) => receipt.failures.push(error),
+    }
+    let confirmation = (|| {
+        step(MediaPrimitive::CarrierRetirementConfirmation)?;
+        owner.revalidate_after_removal().map_err(io::Error::other)?;
+        platform::ensure_absent(&parent.inner, name)?;
+        owner.revalidate_after_removal().map_err(io::Error::other)
+    })();
+    match confirmation {
+        Ok(()) => receipt.confirmation = Confirmation::Confirmed,
+        Err(error) => receipt.failures.push(error),
+    }
+    receipt
 }
 
 /// Keeps the original capability and lease even after a known removal.

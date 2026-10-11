@@ -14,6 +14,9 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::Arc;
 
+mod retirement;
+pub use retirement::RecoveredArchiveRetirement;
+
 /// Physical refusal only. Intent semantics remain the consuming domain's work.
 #[derive(Debug)]
 pub enum RecoveryAdmissionError {
@@ -116,6 +119,15 @@ impl Resources {
 
     #[cfg(target_os = "linux")]
     fn revalidate(&self) -> Result<(), RecoveryAdmissionError> {
+        self.revalidate_guards()?;
+        self.revalidate_directories()?;
+        self.activity()
+            .revalidate()
+            .map_err(RecoveryAdmissionError::Activity)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn revalidate_guards(&self) -> Result<(), RecoveryAdmissionError> {
         self.activity()
             .revalidate()
             .map_err(RecoveryAdmissionError::Activity)?;
@@ -131,10 +143,7 @@ impl Resources {
         if current != self.binding.0.activity_lock {
             return Err(RecoveryAdmissionError::LockChanged { current });
         }
-        self.revalidate_directories()?;
-        self.activity()
-            .revalidate()
-            .map_err(RecoveryAdmissionError::Activity)
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -144,14 +153,7 @@ impl Resources {
 
     #[cfg(target_os = "linux")]
     fn revalidate_directories(&self) -> Result<(), RecoveryAdmissionError> {
-        let root = self
-            .root_directory
-            .as_ref()
-            .expect("retained root directory");
-        root.revalidate().map_err(RecoveryAdmissionError::Native)?;
-        if root.object_identity() != self.root.identity() {
-            return Err(Self::native("reservation parent is not the original root"));
-        }
+        self.revalidate_root_directory()?;
         let directory = self
             .reservation
             .as_ref()
@@ -167,12 +169,34 @@ impl Resources {
         {
             return Err(Self::native("recorded reservation changed or is not empty"));
         }
+        self.revalidate_record_chain()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn revalidate_root_directory(&self) -> Result<(), RecoveryAdmissionError> {
+        let root = self
+            .root_directory
+            .as_ref()
+            .expect("retained root directory");
+        root.revalidate().map_err(RecoveryAdmissionError::Native)?;
+        if root.object_identity() != self.root.identity() {
+            return Err(Self::native("reservation parent is not the original root"));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn revalidate_record_chain(&self) -> Result<(), RecoveryAdmissionError> {
         for directory in &self.record_chain {
             directory
                 .revalidate()
                 .map_err(RecoveryAdmissionError::Native)?;
         }
-        root.revalidate().map_err(RecoveryAdmissionError::Native)
+        self.root_directory
+            .as_ref()
+            .expect("retained root directory")
+            .revalidate()
+            .map_err(RecoveryAdmissionError::Native)
     }
 
     fn read_record(&self) -> Result<MediaRead, RecoveryAdmissionError> {
@@ -365,7 +389,8 @@ impl Resources {
 }
 
 /// Existing physical reservation and actual named bytes. This owner grants no
-/// restore, CAS, settlement, cleanup or retirement operation. Drop closes only.
+/// restore, CAS or settlement authority. Explicit retirement requires the
+/// caller's actual settlement/cooperation premises. Drop closes only.
 pub struct RecoveredArchiveReservation {
     resources: Resources,
 }
