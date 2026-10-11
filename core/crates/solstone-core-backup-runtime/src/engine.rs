@@ -1930,6 +1930,42 @@ impl OwnedArchiveAdmissionFailure {
             ClosedArchiveAdmissionOwner::Admitted(admitted) => Some(admitted.owned_clock()),
         }
     }
+    /// End a refused admission that leaves nothing running or written. Its
+    /// broker request already returned; a read whose children are not all
+    /// known reaped, or a captured archive of unknown outcome, still holds.
+    pub fn release(self) -> Result<(), Box<Self>> {
+        let OwnedArchiveAdmissionFailureInner {
+            error,
+            effects,
+            owned,
+        } = *self.inner;
+        let held = |owned| {
+            Box::new(Self {
+                inner: Box::new(OwnedArchiveAdmissionFailureInner {
+                    error,
+                    effects,
+                    owned,
+                }),
+            })
+        };
+        match owned {
+            ClosedArchiveAdmissionOwner::BeforePreparation(_) => Ok(()),
+            ClosedArchiveAdmissionOwner::Prepared(operation) => {
+                operation.release_unused();
+                Ok(())
+            }
+            ClosedArchiveAdmissionOwner::Preparation(preparation) => {
+                preparation.release();
+                Ok(())
+            }
+            ClosedArchiveAdmissionOwner::Readback(readback) => readback
+                .release()
+                .map_err(|readback| held(ClosedArchiveAdmissionOwner::Readback(readback))),
+            ClosedArchiveAdmissionOwner::Admitted(admitted) => admitted
+                .release_unused()
+                .map_err(|admitted| held(ClosedArchiveAdmissionOwner::Admitted(admitted))),
+        }
+    }
 }
 
 /// Prepare one original activity before admitting paired archive transports.
@@ -2639,6 +2675,15 @@ impl DirectReadFinishOwner {
         }
     }
 
+    /// After its operation was released with nothing outstanding, retire the
+    /// carrier if no other owner shares it. Anything left is retired by the
+    /// next admission.
+    pub fn release_unused(self) {
+        if let Ok(carrier) = Arc::try_unwrap(self.carrier) {
+            drop(carrier.retire_after_settlement());
+        }
+    }
+
     /// Retire the empty carrier left by a refused read whose children were all
     /// reaped. The caller has removed its own stages. This never completes.
     pub fn finish_refused(self, read: RefusedDirectRead) -> OwnedDirectReadFinish {
@@ -2923,6 +2968,23 @@ impl OwnedAdmittedArchiveHold {
         match &*self.inner {
             OwnedAdmittedArchiveHoldInner::Captured(capture) => capture.operation.owned_clock(),
             OwnedAdmittedArchiveHoldInner::Direct(read) => read.owned_clock(),
+        }
+    }
+    /// End an admitted creator that never submitted an archive writer and whose
+    /// every child was reaped. A captured runner archive holds: its children
+    /// carry no reap evidence.
+    pub fn release_unused(self) -> Result<(), Box<Self>> {
+        match *self.inner {
+            OwnedAdmittedArchiveHoldInner::Direct(read) => {
+                (*read).release_unused().map_err(|read| {
+                    Box::new(Self {
+                        inner: Box::new(OwnedAdmittedArchiveHoldInner::Direct(read)),
+                    })
+                })
+            }
+            inner => Err(Box::new(Self {
+                inner: Box::new(inner),
+            })),
         }
     }
 }

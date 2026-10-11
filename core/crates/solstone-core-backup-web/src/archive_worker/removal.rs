@@ -288,16 +288,21 @@ fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
         now,
         ..
     } = input;
+    let generation = begin.generation();
     match prepare_read(slot, begin, repository, &restic) {
         Some(worker) => remove(slot, worker, checked, today, now),
         None => {
-            // Preparation already parked its real whole failure. Keep the
-            // selected context beside it rather than manufacturing a retry.
-            slot.lock()
-                .unwrap_or_else(|error| error.into_inner())
+            // A parked whole failure keeps the selected context beside it rather
+            // than manufacturing a retry; a released one leaves nothing to keep.
+            let mut state = slot.lock().unwrap_or_else(|error| error.into_inner());
+            if state
                 .archive
-                .approval
-                .refused_selection = Some(checked);
+                .retained
+                .iter()
+                .any(|returned| returned.generation() == generation)
+            {
+                state.archive.approval.refused_selection = Some(checked);
+            }
         }
     }
 }

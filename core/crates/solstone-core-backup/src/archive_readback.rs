@@ -271,10 +271,15 @@ impl DirectExecution {
     fn fail(&mut self, reason: ReadbackError) {
         self.failure.get_or_insert(reason);
     }
-    /// Every child this read launched was reaped. This is not readback success.
+    /// Every child this read launched was reaped and no archive writer was ever
+    /// submitted. This is not readback success.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn quiescent(&self) -> bool {
-        self.predecessor.is_none() && self.pending == 0
+        self.pending == 0
+            && self
+                .predecessor
+                .as_ref()
+                .is_none_or(ArchivePredecessorCustody::unwritten)
     }
     #[cfg(unix)]
     fn attempt(&mut self) {
@@ -452,6 +457,16 @@ impl OwnedDirectReadHold {
         })
     }
 
+    /// End a refused read with no outside finish owner, under the same
+    /// conditions as `release_refused`. Its unshared carrier retires.
+    pub fn release_unused(self) -> Result<(), Box<Self>> {
+        if self.qualify_release().is_err() {
+            return Err(Box::new(self));
+        }
+        self.operation.release_unused();
+        Ok(())
+    }
+
     fn qualify_release(&self) -> Result<(), ReadbackError> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -559,6 +574,30 @@ impl OwnedReadbackAdmissionError {
         match &self.owned {
             ClosedAdmissionOwner::Input(input) => input.operation.owned_clock(),
             ClosedAdmissionOwner::Admitted(read) => read.owned_clock(),
+        }
+    }
+    /// End a refused admission that leaves nothing running: unlaunched input,
+    /// or an admitted read whose every child was reaped. A retained earlier
+    /// archive of unknown outcome always holds.
+    pub fn release(self) -> Result<(), Box<Self>> {
+        let Self { reason, owned } = self;
+        match owned {
+            ClosedAdmissionOwner::Input(input)
+                if input
+                    ._predecessor
+                    .as_ref()
+                    .is_none_or(ArchivePredecessorCustody::unwritten) =>
+            {
+                input.operation.release_unused();
+                Ok(())
+            }
+            ClosedAdmissionOwner::Admitted(read) => (*read).release_unused().map_err(|read| {
+                Box::new(Self {
+                    reason,
+                    owned: ClosedAdmissionOwner::Admitted(read),
+                })
+            }),
+            owned => Err(Box::new(Self { reason, owned })),
         }
     }
 }
@@ -1333,12 +1372,13 @@ impl<'a> ReadOperation<'a> {
         revalidate_member(&self.member)
     }
 
+    /// A failure reports whether nothing of the run is still alive.
     #[cfg(unix)]
     fn run_child(
         &self,
         request: &Request<'_>,
         capture_limit: usize,
-    ) -> Result<CompletedChild, ReadbackError> {
+    ) -> Result<CompletedChild, (ReadbackError, bool)> {
         let creator = self
             .execution
             .borrow()
@@ -1359,9 +1399,18 @@ impl<'a> ReadOperation<'a> {
                 self.operation.budget().cancellation(),
             )
         };
-        let completed = completed.map_err(|_| self.execution_error())?;
-        self.execution.borrow_mut().reaped();
-        Ok(completed)
+        match completed {
+            Ok(completed) => {
+                self.execution.borrow_mut().reaped();
+                Ok(completed)
+            }
+            Err(failure) => {
+                if failure.settled() {
+                    self.execution.borrow_mut().reaped();
+                }
+                Err((self.execution_error(), failure.settled()))
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1377,16 +1426,18 @@ impl<'a> ReadOperation<'a> {
             .budget()
             .remaining(self.operation.clock())?
             .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
-        let output = self.run_child(
-            &Request {
-                program: self.member.path().as_os_str().to_owned(),
-                argv,
-                env: self.env.clone(),
-                timeout: Some(timeout),
-                pass_fds: vec![],
-            },
-            MAX_QUERY_BYTES,
-        )?;
+        let output = self
+            .run_child(
+                &Request {
+                    program: self.member.path().as_os_str().to_owned(),
+                    argv,
+                    env: self.env.clone(),
+                    timeout: Some(timeout),
+                    pass_fds: vec![],
+                },
+                MAX_QUERY_BYTES,
+            )
+            .map_err(|(reason, _)| reason)?;
         self.revalidate_local()?;
         if !output.successful() {
             return Err(ReadbackError::ToolFailed);
@@ -1679,7 +1730,17 @@ impl<'a> ReadOperation<'a> {
                     pass_fds: vec![transport.descriptor],
                 };
                 writer = WriterState::Unknown;
-                let completed = self.run_child(&request, MAX_QUERY_BYTES)?;
+                let completed = match self.run_child(&request, MAX_QUERY_BYTES) {
+                    Ok(completed) => completed,
+                    Err((reason, settled)) => {
+                        // A cancelled or refused run that was reaped, or never
+                        // spawned, leaves no writer either.
+                        if settled && self.member.revalidate().is_ok() {
+                            writer = WriterState::QualifiedCompletion;
+                        }
+                        return Err(reason);
+                    }
+                };
                 self.member
                     .revalidate()
                     .map_err(|_| ReadbackError::ToolChanged)?;

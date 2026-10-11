@@ -135,6 +135,16 @@ struct Resources {
     reason: Option<OffloadCreationRefusal>,
 }
 
+impl Resources {
+    /// Nothing was copied, archived or recorded; only observations were made.
+    pub(super) fn unstaged(&self) -> bool {
+        self.copies.iter().all(Vec::is_empty)
+            && self.partial.is_none()
+            && self.archives.is_empty()
+            && self.ledger.is_empty()
+    }
+}
+
 /// Retains the entire original admission, copies and independent write facts.
 #[must_use = "Retain all original resources until their owning work settles"]
 pub struct OffloadCreation<'clock> {

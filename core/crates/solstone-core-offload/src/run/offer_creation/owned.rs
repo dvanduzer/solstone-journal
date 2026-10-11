@@ -37,6 +37,10 @@ impl OwnedOffloadInputs {
     pub fn observed(&self) -> &ObservedOffloadOffers {
         self.resources.observed.as_ref().expect("captured inputs")
     }
+    /// Nothing was copied, archived or recorded from these inputs.
+    pub fn unstaged(&self) -> bool {
+        self.resources.unstaged()
+    }
     pub(super) fn refuse(mut self, reason: OffloadCreationRefusal) -> OwnedOffloadInputFailure {
         self.resources.reason = Some(reason);
         OwnedOffloadInputFailure {
@@ -63,6 +67,10 @@ impl OwnedOffloadInputFailure {
     }
     pub fn reason(&self) -> &OffloadCreationRefusal {
         self.resources.reason.as_ref().expect("refused preparation")
+    }
+    /// Nothing was copied, archived or recorded before this refusal.
+    pub fn unstaged(&self) -> bool {
+        self.resources.unstaged()
     }
 }
 
