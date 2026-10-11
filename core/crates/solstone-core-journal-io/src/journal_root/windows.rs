@@ -656,7 +656,8 @@ fn validate_path(root: &Path) -> Result<ValidatedPath, JournalRootError> {
     for component in root.components() {
         match component {
             Component::Prefix(prefix) => match prefix.kind() {
-                Prefix::Disk(letter) => disk = Some(letter),
+                Prefix::Disk(letter) => disk = Some((letter, false)),
+                Prefix::VerbatimDisk(letter) => disk = Some((letter, true)),
                 _ => {
                     return Err(invalid(
                         root,
@@ -666,7 +667,17 @@ fn validate_path(root: &Path) -> Result<ValidatedPath, JournalRootError> {
                 }
             },
             Component::RootDir => saw_root = true,
-            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::Normal(name) => {
+                // Verbatim paths treat an interior slash as a normal character.
+                if name.encode_wide().any(|unit| unit == u16::from(b'/')) {
+                    return Err(invalid(
+                        root,
+                        "journal root must be lexically canonical",
+                        WindowsRefusalCategory::NonCanonicalPath,
+                    ));
+                }
+                components.push(name.to_os_string());
+            }
             Component::CurDir | Component::ParentDir => {
                 return Err(invalid(
                     root,
@@ -683,7 +694,8 @@ fn validate_path(root: &Path) -> Result<ValidatedPath, JournalRootError> {
             WindowsRefusalCategory::NonAbsolutePath,
         ));
     }
-    let reconstructed = reconstruct_path(disk.expect("disk prefix present"), &components);
+    let (letter, verbatim) = disk.expect("disk prefix present");
+    let reconstructed = reconstruct_path(letter, verbatim, &components);
     let original: Vec<u16> = root.as_os_str().encode_wide().collect();
     if original != reconstructed[..reconstructed.len() - 1] {
         return Err(invalid(
@@ -722,8 +734,13 @@ fn validate_path(root: &Path) -> Result<ValidatedPath, JournalRootError> {
     })
 }
 
-fn reconstruct_path(disk: u8, components: &[OsString]) -> Vec<u16> {
-    let mut wide = vec![u16::from(disk), b':' as u16, b'\\' as u16];
+fn reconstruct_path(disk: u8, verbatim: bool, components: &[OsString]) -> Vec<u16> {
+    let mut wide = if verbatim {
+        vec![b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]
+    } else {
+        Vec::new()
+    };
+    wide.extend([u16::from(disk), b':' as u16, b'\\' as u16]);
     for (index, component) in components.iter().enumerate() {
         if index > 0 {
             wide.push(b'\\' as u16);
@@ -822,7 +839,15 @@ fn verify_root_self_open(
 }
 
 fn root_drive_prefix(wide: &[u16]) -> Vec<u16> {
-    vec![wide[0], wide[1], wide[2], 0]
+    // Only exact reconstructed Disk/VerbatimDisk spellings reach this helper.
+    let count = if wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+        7
+    } else {
+        3
+    };
+    let mut prefix = wide[..count].to_vec();
+    prefix.push(0);
+    prefix
 }
 
 fn append_component(path: &mut Vec<u16>, component: &OsString) {
@@ -1300,11 +1325,40 @@ mod tests {
             "\\\\server\\share\\journal",
             WindowsRefusalCategory::NonFullyQualifiedNamespace,
         );
-        rejection(
-            "\\\\?\\C:\\journal",
-            WindowsRefusalCategory::NonFullyQualifiedNamespace,
-        );
+        for path in [
+            r"\\?\UNC\server\share\journal",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\journal",
+            r"\\.\C:\journal",
+        ] {
+            rejection(path, WindowsRefusalCategory::NonFullyQualifiedNamespace);
+        }
+        for path in [
+            r"\\?\C:\outer/escape\journal",
+            r"\\?\C:\outer\..\journal",
+            r"\\?\C:\outer\.\journal",
+            r"\\?\C:\\journal",
+            "\\\\?\\C:\\journal\0hidden",
+        ] {
+            rejection(path, WindowsRefusalCategory::NonCanonicalPath);
+        }
         rejection("C:\\CON", WindowsRefusalCategory::InvalidJournalName);
+    }
+
+    #[test]
+    fn drive_root_spellings_are_preserved_exactly() {
+        for (path, expected) in [
+            (r"C:\outer\journal", vec![67, 58, 92, 0]),
+            (r"\\?\C:\outer\journal", vec![92, 92, 63, 92, 67, 58, 92, 0]),
+        ] {
+            let (result, outcome) = trace_scenario(None, None, || validate_path(Path::new(path)));
+            let validated = result.unwrap();
+            let mut exact: Vec<u16> = path.encode_utf16().collect();
+            exact.push(0);
+            assert_eq!(validated.wide, exact);
+            assert_eq!(validated.canonical, Path::new(path));
+            assert_eq!(root_drive_prefix(&validated.wide), expected);
+            assert!(outcome.attempted.is_empty());
+        }
     }
 
     #[test]
@@ -1320,6 +1374,37 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn canonicalized_local_drive_root_preserves_native_binding() {
+        let temporary = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let plain = temporary.path().join("outer").join("journal");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("marker"), b"owner bytes").unwrap();
+        let canonical = fs::canonicalize(&plain).unwrap();
+        assert!(matches!(
+            plain.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+        ));
+        assert!(matches!(
+            canonical.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        ));
+        let original = JournalRoot::open(&plain).expect("plain local drive root admits");
+        let retained =
+            JournalRoot::open(&canonical).expect("canonicalized local drive root admits");
+        assert_eq!(retained.canonical_path(), canonical);
+        assert_eq!(original.identity(), retained.identity());
+        original.revalidate().unwrap();
+        original.revalidate_canonical_binding().unwrap();
+        retained.revalidate().unwrap();
+        retained.revalidate_canonical_binding().unwrap();
+        assert_eq!(fs::read(plain.join("marker")).unwrap(), b"owner bytes");
     }
 
     #[test]

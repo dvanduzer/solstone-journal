@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use solstone_core_journal_io::{
-    BoundParentLock, JournalRoot, LockOptions, ObjectIdentity, acquire_existing_parent_lock_bound,
-    open_existing_parent_lock_bound,
+    BoundParentLock, ExistingParentLockError, JournalRoot, LockOptions, ObjectIdentity,
+    acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
 };
 use solstone_core_processing_record::media::is_media_extension;
 
@@ -25,6 +25,15 @@ pub type Result<T> = std::result::Result<T, io::Error>;
 
 fn refusal(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
+}
+
+fn lock_refusal(error: ExistingParentLockError) -> io::Error {
+    let kind = if matches!(error, ExistingParentLockError::Timeout(_)) {
+        io::ErrorKind::WouldBlock
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, error)
 }
 
 fn lock_name(path: &Path) -> Result<OsString> {
@@ -95,12 +104,12 @@ fn acquire_bound(
 ) -> Result<BoundParentLock> {
     if let Some(lock) =
         open_existing_parent_lock_bound(root, name, options.timeout, options.poll_interval)
-            .map_err(|error| refusal(error.to_string()))?
+            .map_err(lock_refusal)?
     {
         return Ok(lock);
     }
     acquire_existing_parent_lock_bound(root, name, options.timeout, options.poll_interval)
-        .map_err(|error| refusal(error.to_string()))
+        .map_err(lock_refusal)
 }
 
 /// Names observed before acquiring a segment-wide collection of attempts.
@@ -551,6 +560,49 @@ mod tests {
         assert!(solstone_core_journal_io::hold_lock(&segment, no_wait()).is_err());
         assert!(OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).is_err());
         commit.revalidate().unwrap();
+    }
+
+    #[test]
+    fn typed_lock_timeouts_remain_distinct_from_unsafe_entries() {
+        let (_root, segment, raw) = fixture();
+        let output = raw.with_extension("jsonl");
+        let holder = OutputClaims::acquire([output.clone()], no_wait()).unwrap();
+        let error = OutputClaims::discover(&segment, no_wait()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<ExistingParentLockError>(),
+            Some(ExistingParentLockError::Timeout(_))
+        ));
+        drop(holder);
+        let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
+        let segment_holder = solstone_core_journal_io::hold_lock(&segment, no_wait()).unwrap();
+        let error = claims.commit(&segment).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<ExistingParentLockError>(),
+            Some(ExistingParentLockError::Timeout(_))
+        ));
+        drop(segment_holder);
+        drop(claims.commit(&segment).unwrap());
+        drop(claims);
+        let lock = raw.with_extension("jsonl.lock");
+        fs::remove_file(&lock).unwrap();
+        fs::create_dir(&lock).unwrap();
+        let error = OutputClaims::acquire([output], no_wait()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<ExistingParentLockError>(),
+            Some(ExistingParentLockError::UnsafeLockEntry { .. })
+        ));
     }
 
     #[test]
