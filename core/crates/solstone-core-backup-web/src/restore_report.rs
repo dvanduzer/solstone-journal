@@ -15,8 +15,8 @@ use solstone_core_offload::restore::RestoreResult;
 #[cfg(unix)]
 use solstone_core_offload::restore::owned::IntentPublication;
 use solstone_core_offload::restore::owned::{
-    FileEvidence, LedgerEffect, RestoreFileFacts, RestoreRegisterRefusal, RestoreRunOutcome,
-    TransactionFacts,
+    FileEvidence, LedgerEffect, OwnedRestoreFinishHold, OwnedRestoreRunOutcome, RestoreFileFacts,
+    RestoreRegisterRefusal, RestoreRunOutcome, SettledRestoreReport, TransactionFacts,
 };
 use solstone_core_retention::mark_mutation::{
     BoundMutationOutcome, BoundMutationRefusal, RestoredMarkRefusal,
@@ -49,18 +49,29 @@ struct View<'a, 'clock>(&'a RestoreRunOutcome<'clock>);
 
 impl Serialize for View<'_, '_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Report {
-            #[serde(flatten)]
-            summary: Value,
-            files: Vec<Value>,
-        }
-        Report {
-            summary: summary(self.0.report()),
-            files: self.0.files().map(file_facts).collect(),
-        }
-        .serialize(serializer)
+        complete(self.0.report(), self.0.files()).serialize(serializer)
     }
+}
+
+pub(crate) fn active(owner: &OwnedRestoreRunOutcome) -> Value {
+    complete(owner.report(), owner.files())
+}
+
+pub(crate) fn held(owner: &OwnedRestoreFinishHold) -> Value {
+    complete(owner.report(), owner.files())
+}
+
+pub(crate) fn settled(owner: &SettledRestoreReport) -> Value {
+    complete(owner.report(), owner.files())
+}
+
+fn complete<'a>(
+    result: &RestoreResult,
+    files: impl Iterator<Item = RestoreFileFacts<'a>>,
+) -> Value {
+    let mut report = summary(result);
+    report["files"] = Value::Array(files.map(file_facts).collect());
+    report
 }
 
 pub(crate) fn summary(result: &RestoreResult) -> Value {

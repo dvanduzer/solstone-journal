@@ -2,7 +2,9 @@
 // Copyright (c) 2026 sol pbc
 
 //! Keep concrete archive owners independently of the displayed operation.
-//! This module neither executes an actor nor converts a borrowed actor owner.
+//! Actor execution consumes the original admitted read in its owning worker.
+
+pub mod restore;
 
 use std::sync::Arc;
 
@@ -10,6 +12,7 @@ use solstone_core_backup::archive_activity::{
     OwnedArchivePreparationFailure, OwnedPreparedArchiveHold,
 };
 use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation, Clock};
+use solstone_core_backup::archive_readback::OwnedDirectReadHold;
 use solstone_core_backup_runtime::{
     DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
     OwnedDirectReadFinish,
@@ -115,6 +118,10 @@ pub enum ArchivePayload {
     Prepared(Box<OwnedPreparedArchiveHold>),
     PreparationFailure(Box<OwnedArchivePreparationFailure>),
     AdmissionFailure(OwnedArchiveAdmissionFailure),
+    ReadHeld {
+        read: Box<OwnedDirectReadHold>,
+        outside: DirectReadFinishOwner,
+    },
     NativeHeld {
         native: Box<OwnedRestoreFinishHold>,
         outside: DirectReadFinishOwner,
@@ -140,6 +147,15 @@ impl ArchivePayload {
             Self::Prepared(owner) => (owner.journal_root(), Some(owner.owned_clock())),
             Self::PreparationFailure(owner) => (owner.journal_root(), Some(owner.owned_clock())),
             Self::AdmissionFailure(owner) => (owner.journal_root(), None),
+            Self::ReadHeld { read, outside } => {
+                if !Arc::ptr_eq(read.carrier(), outside.carrier())
+                    || !Arc::ptr_eq(read.journal_root(), outside.journal_root())
+                    || !Arc::ptr_eq(read.owned_clock(), outside.owned_clock())
+                {
+                    return false;
+                }
+                (outside.journal_root(), Some(outside.owned_clock()))
+            }
             Self::NativeHeld { native, outside } => {
                 if !Arc::ptr_eq(native.carrier(), outside.carrier()) {
                     return false;

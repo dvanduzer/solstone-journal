@@ -53,4 +53,4 @@ name = "backup_web_callosum_transport"
 path = "tests/backup_web_callosum_transport.rs"
 
 [features]
-full-tests = ["solstone-core-sol-link/test-hooks"]
+full-tests = ["solstone-core-sol-link/test-hooks", "solstone-core-journal-io/test-hooks"]
