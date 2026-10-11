@@ -22,6 +22,7 @@ pub(super) enum Point {
     AfterInitialMark,
     AfterPublication,
     BeforeNoEffectPersist,
+    BeforeRestoredCas,
 }
 
 type Hook = (Point, Box<dyn FnOnce()>);
@@ -667,11 +668,25 @@ fn subset_remainder_is_persisted_before_publication_and_typed_writer_hold_is_tru
     assert_eq!(plan.replacement().unwrap().proposal.bytes, 7);
     assert_eq!(record.intent.event_recorded, Obligation::Complete);
     assert_eq!(record.intent.register, Obligation::Pending);
+    assert!(matches!(
+        result.register,
+        Some(Err(RestoreRegisterRefusal::Bound(
+            solstone_core_retention::mark_mutation::BoundMutationRefusal::Review(
+                solstone_core_retention::review_context::ReviewRefusal::Register(
+                    solstone_core_retention::marks::StoreError::WriterHeld
+                )
+            )
+        )))
+    ));
     assert_eq!(
         fs::read(f.temp.path().join("health/retention-marks.json")).unwrap(),
         original
     );
 }
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
+mod packaged;
 
 #[test]
 fn missing_recorded_publication_never_advances_replay_marker_or_cas() {

@@ -10,15 +10,17 @@ use std::sync::Arc;
 use solstone_core_backup::archive_readback::{ExactArchiveFile, ReadOperation, ReadbackFailure};
 use solstone_core_journal_io::activity_obligations::observe_with_carrier;
 use solstone_core_journal_io::media::{
-    Cleanup, Confirmation, Durability, MediaStage, OwnedMediaFailure, PreparedMedia,
-    PublicationEffect, PublicationReceipt, RootActivityCarrier,
+    Cleanup, Confirmation, Durability, MediaObservation, MediaStage, OwnedMediaFailure,
+    PreparedMedia, PublicationEffect, PublicationReceipt, RootActivityCarrier,
 };
 use solstone_core_journal_io::{JournalRoot, LockOptions};
 use solstone_core_retention::archive_catalog::{
     ArchiveWitness, RestoreDisposition, SegmentCatalog, read_complete_catalog,
 };
+#[cfg(all(test, feature = "full-tests", unix))]
+use solstone_core_retention::mark_mutation::conditional_mutate_at_root;
 use solstone_core_retention::mark_mutation::{
-    BoundMutationOutcome, BoundMutationRefusal, MutationStatus, conditional_mutate_at_root,
+    BoundMutationOutcome, MutationStatus, RestoredMarkMutation, conditional_retire_restored,
 };
 use solstone_core_retention::{Mark, Register, RemovalClass, review_context};
 use solstone_core_segment::output_attempt::{OutputClaims, SegmentCommit};
@@ -28,6 +30,7 @@ use crate::ledger::writer::{
     LedgerConfirmation, LedgerSync, LedgerWriteReceipt, LedgerWriteRefusal,
     append_restore_operation,
 };
+use crate::restore::owned::RestoreRegisterRefusal;
 use crate::restore_intent::{
     AttemptEffects, CurrentContent, Obligation, PublicationDecision, RecoveryDecision,
     RegisterDecision, RepairHold, RestoreIntent, StageEvidence, content_observation,
@@ -403,7 +406,7 @@ pub(crate) struct TransactionOutcome<'operation, 'clock> {
     #[cfg(unix)]
     marker_ancestor_sync: Vec<std::io::Result<()>>,
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
-    register: Option<Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    register: Option<Result<BoundMutationOutcome, RestoreRegisterRefusal>>,
     no_effect_cleanup: Option<NoEffectCleanup>,
     retirement: Option<retirement::RetirementFacts>,
     effects: AttemptEffects,
@@ -573,13 +576,13 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             // Preserve the native receipt/effect even when successor validation fails.
             recorded?;
             result.persist()?;
-            result.finish(&commit, time, options, false)
+            result.finish(&claims, &commit, time, options, false)
         })
     }
 }
 
 impl TransactionOutcome<'_, '_> {
-    fn live_matches(&self) -> Result<(), Hold> {
+    fn live_matches(&self) -> Result<MediaObservation, Hold> {
         let intent = &self.record()?.intent;
         let Some(expected) = &intent.confirmed else {
             return Err(Hold::Repair(RepairHold::UncertainContent));
@@ -593,7 +596,7 @@ impl TransactionOutcome<'_, '_> {
             Ok(Some(current))
                 if current.identity == expected.identity && current.digest == expected.digest =>
             {
-                Ok(())
+                Ok(current)
             }
             _ => Err(Hold::Repair(RepairHold::UncertainContent)),
         }
@@ -601,6 +604,7 @@ impl TransactionOutcome<'_, '_> {
 
     fn finish(
         &mut self,
+        claims: &OutputClaims,
         commit: &SegmentCommit<'_>,
         time: u64,
         options: LockOptions,
@@ -671,10 +675,32 @@ impl TransactionOutcome<'_, '_> {
         }
         let decision = self.inspect()?;
         match decision.register {
-            RegisterDecision::Ready(plan) => {
-                self.live_matches()?;
+            RegisterDecision::Ready(_) | RegisterDecision::AlreadyApplied => {
+                let confirmed_live = self.live_matches()?;
                 self.owner.effect_check(commit)?;
-                let outcome = conditional_mutate_at_root(self.owner.root(), &plan);
+                let intent = &self.record()?.intent;
+                let crate::restore_intent::MarkRetirement::Exact { plan } = &intent.retirement
+                else {
+                    return Err(Hold::Register);
+                };
+                #[cfg(all(test, feature = "full-tests", unix))]
+                tests::checkpoint(tests::Point::BeforeRestoredCas);
+                let outcome = match &self.owner.admission {
+                    Admission::Readback(read) => {
+                        conditional_retire_restored(RestoredMarkMutation {
+                            read,
+                            operation: &intent.event,
+                            confirmed: &confirmed_live,
+                            plan,
+                            claims,
+                            commit,
+                        })
+                        .map_err(RestoreRegisterRefusal::Restored)
+                    }
+                    #[cfg(all(test, feature = "full-tests", unix))]
+                    Admission::LocalTest(_) => conditional_mutate_at_root(self.owner.root(), plan)
+                        .map_err(RestoreRegisterRefusal::Bound),
+                };
                 let confirmed = matches!(&outcome,
                     Ok(BoundMutationOutcome::Published(result) | BoundMutationOutcome::Unchanged(result))
                         if matches!(result.status, MutationStatus::Applied | MutationStatus::AlreadyApplied));
@@ -682,12 +708,6 @@ impl TransactionOutcome<'_, '_> {
                 if !confirmed {
                     return Err(Hold::Register);
                 }
-                self.record_mut()?.intent.register = Obligation::Complete;
-                self.persist()?;
-            }
-            RegisterDecision::AlreadyApplied => {
-                self.live_matches()?;
-                self.owner.effect_check(commit)?;
                 self.record_mut()?.intent.register = Obligation::Complete;
                 self.persist()?;
             }
@@ -928,7 +948,7 @@ fn replay_local<'operation, 'clock>(
             return Err(Hold::Repair(RepairHold::DestinationChanged));
         }
         result.owner.effect_check(&commit)?;
-        result.finish(&commit, time, options, true)
+        result.finish(&claims, &commit, time, options, true)
     })
 }
 
