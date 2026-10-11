@@ -329,13 +329,17 @@ pub fn link_serve(ctx: CommandContext<'_>) -> Result<ResidentCommand<'_>, Comman
             words
         ),
     };
-    Ok(ResidentCommand::new(
-        startup,
-        move |shutdown| match session.serve(shutdown) {
+    Ok(ResidentCommand::new(startup, move |shutdown| {
+        eprintln!(
+            "warning: development use on trusted systems only.\n\
+                 this bridge gives local callers the paired owner's full journal API authority.\n\
+                 run it only where you trust all software running on this system."
+        );
+        match session.serve(shutdown) {
             Ok(()) => CommandOutput::success(""),
             Err(error) => CommandOutput::failure(format!("{}\n", serve_error_text(error)), 1),
-        },
-    ))
+        }
+    }))
 }
 
 pub fn link_status(ctx: CommandContext<'_>) -> CommandOutput {

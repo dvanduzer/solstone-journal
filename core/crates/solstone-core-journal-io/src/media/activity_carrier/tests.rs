@@ -15,6 +15,218 @@ fn fixture() -> (tempfile::TempDir, Arc<ActivityLease>) {
     (temp, activity)
 }
 
+fn teardown_fixture() -> (tempfile::TempDir, Arc<TeardownLease>) {
+    let temp = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+        Some(root) => tempfile::tempdir_in(root).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+    let lease = TeardownLease::try_acquire(root).unwrap();
+    (temp, lease)
+}
+
+#[cfg(unix)]
+#[test]
+fn teardown_carrier_keeps_original_role_through_census_and_confirmed_retirement() {
+    let (_temp, teardown) = teardown_fixture();
+    let root = teardown.journal_root().clone();
+    let carrier = RootTeardownCarrier::prepare(teardown.clone()).unwrap();
+    assert!(Arc::ptr_eq(carrier.teardown(), &teardown));
+    assert!(Arc::ptr_eq(carrier.journal_root(), &root));
+    assert_eq!(carrier.preparation().stage_durability(), Durability::Synced);
+    assert_eq!(carrier.preparation().root_durability(), Durability::Synced);
+    assert_eq!(
+        carrier.preparation().confirmation(),
+        Confirmation::Confirmed
+    );
+    {
+        let raw = crate::activity_obligations::observe_obligations(&root).unwrap();
+        assert_eq!(raw.entries().len(), 1);
+        let recognized =
+            crate::activity_obligations::observe_with_carrier(&root, carrier.observation())
+                .unwrap();
+        assert_eq!(recognized.entries(), raw.entries());
+        assert_eq!(recognized.unresolved_entries().count(), 0);
+    }
+    let path = carrier.diagnostic_path();
+    drop(teardown);
+    let result = carrier.retire_after_settlement();
+    assert_eq!(
+        result.receipt.effect(),
+        ActivityCarrierRetirementEffect::Removed
+    );
+    assert_eq!(result.receipt.root_durability(), Durability::Synced);
+    assert_eq!(result.receipt.confirmation(), Confirmation::Confirmed);
+    assert!(result.receipt.failures().is_empty());
+    assert!(!path.exists());
+    assert!(matches!(
+        ActivityLease::try_acquire(root.clone()),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    assert!(matches!(
+        TeardownLease::try_acquire(root.clone()),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    assert!(
+        crate::activity_obligations::observe_with_carrier(&root, result.owned.observation())
+            .is_err()
+    );
+    drop(result);
+    TeardownLease::try_acquire(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn teardown_preparation_faults_preserve_original_owner_reservation_and_sync_facts() {
+    for (cut, stage, root_sync) in [
+        (
+            MediaPrimitive::StageCreated,
+            Durability::Unproven,
+            Durability::Unproven,
+        ),
+        (
+            MediaPrimitive::CarrierStageSync,
+            Durability::Unproven,
+            Durability::Unproven,
+        ),
+        (
+            MediaPrimitive::CarrierRootSync,
+            Durability::Synced,
+            Durability::Unproven,
+        ),
+        (
+            MediaPrimitive::CarrierConfirmation,
+            Durability::Synced,
+            Durability::Synced,
+        ),
+    ] {
+        let (_temp, teardown) = teardown_fixture();
+        let root = teardown.journal_root().clone();
+        let (result, fired) = run_with_media_hook(
+            cut,
+            || Err(io::Error::other("cut")),
+            || RootTeardownCarrier::prepare(teardown.clone()),
+        );
+        assert!(fired);
+        let failed = result.err().unwrap();
+        assert!(Arc::ptr_eq(failed.teardown(), &teardown));
+        assert!(Arc::ptr_eq(failed.journal_root(), &root));
+        assert_eq!(failed.receipt().stage_durability(), stage);
+        assert_eq!(failed.receipt().root_durability(), root_sync);
+        assert_eq!(failed.receipt().confirmation(), Confirmation::Unverified);
+        let path = failed.diagnostic_path().unwrap();
+        assert!(path.is_dir());
+        drop(teardown);
+        assert!(matches!(
+            ActivityLease::try_acquire(root.clone()),
+            Err(ActivityAdmissionError::Busy)
+        ));
+        assert!(matches!(
+            TeardownLease::try_acquire(root.clone()),
+            Err(ActivityAdmissionError::Busy)
+        ));
+        drop(failed); // Unknown cooperation holds cleanup, including prelaunch failure.
+        assert!(path.is_dir());
+        TeardownLease::try_acquire(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn teardown_failure_and_uncertain_retirement_keep_original_role_and_independent_facts() {
+    let (_temp, teardown) = teardown_fixture();
+    let root = teardown.journal_root().clone();
+    let (result, fired) = run_with_media_hook(
+        MediaPrimitive::CarrierRootSync,
+        || Err(io::Error::other("preparation")),
+        || RootTeardownCarrier::prepare(teardown.clone()),
+    );
+    assert!(fired);
+    let failed = result.err().unwrap();
+    let (retired, fired) = run_with_media_hook(
+        MediaPrimitive::CarrierRetirementRootSync,
+        || Err(io::Error::other("retirement")),
+        || failed.retire_after_settlement(),
+    );
+    assert!(fired);
+    assert!(Arc::ptr_eq(retired.owned.teardown(), &teardown));
+    assert_eq!(retired.owned.error().to_string(), "preparation");
+    assert_eq!(
+        retired.owned.receipt().root_durability(),
+        Durability::Unproven
+    );
+    assert_eq!(
+        retired.receipt.effect(),
+        ActivityCarrierRetirementEffect::Removed
+    );
+    assert_eq!(retired.receipt.root_durability(), Durability::Unproven);
+    assert_eq!(retired.receipt.confirmation(), Confirmation::Confirmed);
+    assert_eq!(retired.receipt.failures().len(), 1);
+    drop(teardown);
+    assert!(matches!(
+        ActivityLease::try_acquire(root.clone()),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    drop(retired);
+    ActivityLease::try_acquire(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn replaced_lock_splits_exclusion_but_old_teardown_recognition_and_retirement_refuse() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, teardown) = teardown_fixture();
+    let root = teardown.journal_root().clone();
+    let carrier = RootTeardownCarrier::prepare(teardown.clone()).unwrap();
+    let path = carrier.diagnostic_path();
+    let entry = temp.path().join("backup-activity.lock");
+    let old = temp.path().join("old.lock");
+    fs::rename(&entry, &old).unwrap();
+    fs::write(&entry, b"replacement").unwrap();
+    fs::set_permissions(&entry, fs::Permissions::from_mode(0o600)).unwrap();
+    let new = ActivityLease::try_acquire(root.clone()).unwrap();
+    new.revalidate().unwrap();
+    assert!(
+        crate::activity_obligations::observe_with_carrier(&root, carrier.observation()).is_err()
+    );
+    let result = carrier.retire_after_settlement();
+    assert!(Arc::ptr_eq(result.owned.teardown(), &teardown));
+    assert_eq!(
+        result.receipt.effect(),
+        ActivityCarrierRetirementEffect::NotAttempted
+    );
+    assert!(!result.receipt.failures().is_empty());
+    assert!(path.is_dir());
+    assert_eq!(fs::read(old).unwrap(), b"");
+    assert_eq!(fs::read(entry).unwrap(), b"replacement");
+    new.revalidate().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_teardown_directory_durability_refusal_keeps_original_role_and_stage() {
+    let (_temp, teardown) = teardown_fixture();
+    let root = teardown.journal_root().clone();
+    let failed = RootTeardownCarrier::prepare(teardown.clone())
+        .err()
+        .unwrap();
+    assert!(Arc::ptr_eq(failed.teardown(), &teardown));
+    assert_eq!(failed.error().kind(), io::ErrorKind::Unsupported);
+    assert_eq!(failed.receipt().stage_durability(), Durability::Unproven);
+    assert_eq!(failed.receipt().root_durability(), Durability::Unproven);
+    assert_eq!(failed.receipt().confirmation(), Confirmation::Unverified);
+    let path = failed.diagnostic_path().unwrap();
+    drop(teardown);
+    assert!(matches!(
+        ActivityLease::try_acquire(root.clone()),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    assert!(path.is_dir());
+    drop(failed);
+    assert!(path.is_dir());
+    TeardownLease::try_acquire(root).unwrap();
+}
+
 fn failure(
     result: Result<RootActivityCarrier, ActivityCarrierPreparationFailure>,
 ) -> ActivityCarrierPreparationFailure {
