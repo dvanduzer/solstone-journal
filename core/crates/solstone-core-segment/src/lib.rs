@@ -67,8 +67,8 @@ pub use relocate::{
     relocate_segment, restructure_segments_by_stream,
 };
 pub use segment_dir::{
-    OwnerDeletionState, SegmentDir, is_safe_stream_component, list_days, list_segments,
-    list_segments_in, list_stream_segments, owner_deleted, owner_deletion_state,
+    OwnerDeletionState, RetainedOwnerDeletion, SegmentDir, is_safe_stream_component, list_days,
+    list_segments, list_segments_in, list_stream_segments, owner_deleted, owner_deletion_state,
 };
 pub use solstone_core_journal_io::{
     DEFAULT_STREAM, DirEntryKind, LockOptions, PathOrDay, RecordIdentity, Segment,
