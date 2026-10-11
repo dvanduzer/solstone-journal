@@ -25,7 +25,8 @@ use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation
 use solstone_core_backup::archive_readback::{OwnedDirectReadHold, OwnedReadOperation};
 use solstone_core_backup_runtime::{
     DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
-    OwnedDirectReadFinish, UreqHttpTransport, admit_prepared_archive_owned_read_installed,
+    OwnedDirectReadFinish, UreqHttpTransport, admit_prepared_archive_owned_current_read_installed,
+    admit_prepared_archive_owned_read_installed,
 };
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::journal_root::JournalRoot;
@@ -703,6 +704,17 @@ pub fn prepare_read(
     repository_id: String,
     restic_path: &Path,
 ) -> Option<PreparedArchiveWorker> {
+    prepare_read_in(slot, begin, Some(repository_id), restic_path)
+}
+
+/// Without an expected identity, the read binds to the configured repository
+/// as observed at admission.
+pub(crate) fn prepare_read_in(
+    slot: &SharedOperationSlot,
+    begin: OwnedArchiveBegin,
+    repository_id: Option<String>,
+    restic_path: &Path,
+) -> Option<PreparedArchiveWorker> {
     if !start_owned_worker(slot, &begin.ticket) {
         let ticket = ArchiveTicket(Arc::clone(&begin.ticket.0));
         return_owned(
@@ -746,13 +758,21 @@ pub fn prepare_read(
             ArchivePayload::PreparationFailure(Box::new(failure))
         })?;
         phase = "admission";
-        admit_prepared_archive_owned_read_installed(
-            prepared,
-            repository_id,
-            restic_path,
-            env!("CARGO_PKG_VERSION"),
-            &UreqHttpTransport,
-        )
+        match repository_id {
+            Some(repository_id) => admit_prepared_archive_owned_read_installed(
+                prepared,
+                repository_id,
+                restic_path,
+                env!("CARGO_PKG_VERSION"),
+                &UreqHttpTransport,
+            ),
+            None => admit_prepared_archive_owned_current_read_installed(
+                prepared,
+                restic_path,
+                env!("CARGO_PKG_VERSION"),
+                &UreqHttpTransport,
+            ),
+        }
         .map_err(|failure| {
             terminal.report = Some(
                 json!({"admission":{"state":"refused","reason":failure.error().to_string(),

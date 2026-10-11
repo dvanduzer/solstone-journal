@@ -2622,7 +2622,9 @@ mod held_restore_tests {
                 let before = snapshot(root.path());
                 let (status, value) =
                     post_json(&deps, "/app/backup/offload/restore", Some(request)).await;
-                if bound && cfg!(target_os = "linux") {
+                // Historical files without a recorded repository are reviewed
+                // inside the same admitted restore, so neither kind refuses early.
+                if cfg!(target_os = "linux") {
                     assert_eq!(status, 200);
                     let terminal = wait_terminal(&deps).await;
                     assert_eq!(terminal["operation"]["kind"], "offload_restore");
@@ -2633,14 +2635,7 @@ mod held_restore_tests {
                     assert!(!crate::operation::is_busy(&deps.operations));
                 } else {
                     assert_eq!(status, 400);
-                    assert_eq!(
-                        value["reason_code"],
-                        if cfg!(target_os = "linux") {
-                            "archive_unbound"
-                        } else {
-                            "restore_held"
-                        }
-                    );
+                    assert_eq!(value["reason_code"], "restore_held");
                     assert!(!crate::operation::is_busy(&deps.operations));
                 }
                 assert!(runner.calls.lock().unwrap().is_empty());

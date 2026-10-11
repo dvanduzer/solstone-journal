@@ -25,7 +25,7 @@ use crate::restore_report;
 
 #[cfg(target_os = "linux")]
 use {
-    super::{ArchiveTicket, OwnedArchiveBegin, begin_owned_locked, prepare_read},
+    super::{ArchiveTicket, OwnedArchiveBegin, begin_owned_locked, prepare_read_in},
     crate::{BackupWebDeps, operation::OperationState},
     solstone_core_backup::archive_admission::AdmissionError,
     solstone_core_backup_runtime::ClosedToolError,
@@ -38,7 +38,7 @@ use {
 #[cfg(target_os = "linux")]
 struct Input {
     begin: OwnedArchiveBegin,
-    repository: String,
+    repository: Option<String>,
     day: Option<String>,
     time: u64,
     executable: PathBuf,
@@ -117,10 +117,13 @@ fn refuse(reason: &str) -> axum::response::Response {
     )
 }
 
+/// The repository bound files name, or `None` when only historical files without
+/// one are selected; those are reviewed against the configured repository.
 #[cfg(target_os = "linux")]
-fn repository(root: &Arc<JournalRoot>, day: Option<&str>) -> Result<String, &'static str> {
+fn repository(root: &Arc<JournalRoot>, day: Option<&str>) -> Result<Option<String>, &'static str> {
     let catalog = read_complete_catalog(root).map_err(|_| "ledger_degraded")?;
     let mut selected = None;
+    let mut unbound = false;
     for witness in catalog
         .days
         .iter()
@@ -128,17 +131,23 @@ fn repository(root: &Arc<JournalRoot>, day: Option<&str>) -> Result<String, &'st
         .flat_map(|entry| &entry.segments)
         .flat_map(|segment| &segment.active)
     {
-        let candidate = witness
-            .repository_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .ok_or("archive_unbound")?;
+        let Some(candidate) = witness.repository_id.as_deref() else {
+            unbound = true;
+            continue;
+        };
+        if candidate.is_empty() {
+            return Err("archive_unbound");
+        }
         if selected.is_some_and(|id| id != candidate) {
             return Err("repository_mismatch");
         }
         selected = Some(candidate);
     }
-    selected.map(str::to_owned).ok_or("nothing_to_restore")
+    match selected {
+        Some(id) => Ok(Some(id.to_owned())),
+        None if unbound => Ok(None),
+        None => Err("nothing_to_restore"),
+    }
 }
 
 /// Reserve the original input before an installed restore worker can start.
@@ -275,7 +284,7 @@ fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
         time,
         ..
     } = input;
-    if let Some(worker) = prepare_read(slot, begin, repository, &restic) {
+    if let Some(worker) = prepare_read_in(slot, begin, repository, &restic) {
         match selection {
             Some(selection) => day(slot, worker, &selection, time),
             None => all(slot, worker, time),
@@ -404,8 +413,8 @@ fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&s
     let mut terminal = Terminal::error("failed");
     let actor = catch_unwind(AssertUnwindSafe(|| {
         let native = match day {
-            Some(day) => owned::restore_owned_bound_day(read, day, now),
-            None => owned::restore_owned_bound_all(read, now),
+            Some(day) => owned::restore_owned_day(read, day, now),
+            None => owned::restore_owned_all(read, now),
         };
         // This snapshot remains available outside the closure if consuming
         // cleanup unwinds before a final held/settled projection returns.
