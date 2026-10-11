@@ -3,6 +3,13 @@
 
 //! Exact archive bytes in an owned target. These values never authorize release.
 
+mod creator;
+use creator::ArchivePredecessorCustody;
+pub use creator::{
+    ArchiveEndpointCapture, ArchivePredecessorCapture, ArchiveWriterObservation,
+    ArchiveWriterSourceObservation, DirectArchiveEffects, DirectArchiveFailure,
+    DirectArchiveSnapshot, OwnedArchiveCreator, OwnedArchiveCreatorAdmission,
+};
 mod historical;
 pub use historical::{HistoricalArchiveFile, HistoricalSnapshotFiles};
 
@@ -49,6 +56,7 @@ pub struct ReadAdmission<'a> {
     password: String,
     repository: RepositoryBinding,
     expected_restic_path: PathBuf,
+    predecessor: Option<ArchivePredecessorCustody>,
 }
 impl<'a> ReadAdmission<'a> {
     pub fn bind(
@@ -64,6 +72,7 @@ impl<'a> ReadAdmission<'a> {
             password,
             repository: RepositoryBinding::Expected(repository_id),
             expected_restic_path,
+            predecessor: None,
         }
     }
     pub fn capture_current(
@@ -78,7 +87,12 @@ impl<'a> ReadAdmission<'a> {
             password,
             repository: RepositoryBinding::CaptureCurrent,
             expected_restic_path,
+            predecessor: None,
         }
+    }
+    pub fn retain_unqualified_archive(mut self, capture: ArchivePredecessorCapture) -> Self {
+        self.predecessor = Some(ArchivePredecessorCustody::unknown(capture));
+        self
     }
     pub fn refuse(self, reason: ReadbackError) -> ReadbackAdmissionError<'a> {
         ReadbackAdmissionError {
@@ -196,6 +210,7 @@ impl ReadbackAdmissionError<'_> {
 
 #[derive(Default)]
 struct DirectExecution {
+    predecessor: Option<ArchivePredecessorCustody>,
     #[cfg(unix)]
     pending: u64,
     #[cfg(unix)]
@@ -377,6 +392,7 @@ struct OwnedReadInput {
     _password: String,
     _repository: RepositoryBinding,
     _expected_restic_path: PathBuf,
+    _predecessor: Option<ArchivePredecessorCustody>,
 }
 enum ClosedAdmissionOwner {
     Input(Box<OwnedReadInput>),
@@ -431,6 +447,7 @@ impl ReadbackAdmissionError<'_> {
                     password,
                     repository,
                     expected_restic_path,
+                    predecessor,
                 } = *input;
                 let operation = operation
                     .into_owned_hold()
@@ -442,6 +459,7 @@ impl ReadbackAdmissionError<'_> {
                     _password: password,
                     _repository: repository,
                     _expected_restic_path: expected_restic_path,
+                    _predecessor: predecessor,
                 }))
             }
             AdmissionOwner::Admitted(read) => ClosedAdmissionOwner::Admitted(Box::new(
@@ -699,6 +717,7 @@ fn close_owned_admission(
                 password,
                 repository,
                 expected_restic_path,
+                predecessor,
             } = *input;
             ClosedAdmissionOwner::Input(Box::new(OwnedReadInput {
                 operation: close_owned_prepared(operation, clock),
@@ -706,6 +725,7 @@ fn close_owned_admission(
                 _password: password,
                 _repository: repository,
                 _expected_restic_path: expected_restic_path,
+                _predecessor: predecessor,
             }))
         }
         AdmissionOwner::Admitted(read) => {
@@ -967,6 +987,9 @@ impl<'a> ReadOperation<'a> {
                     return Err(ReadbackError::UnsupportedToolVersion);
                 }
                 let execution = self.execution.borrow();
+                if let Some(predecessor) = &execution.predecessor {
+                    predecessor.qualify_settlement()?;
+                }
                 if let Some(reason) = execution.failure {
                     return Err(reason);
                 }
@@ -1023,11 +1046,17 @@ impl<'a> ReadOperation<'a> {
                 {
                     return Err(ReadbackError::InvalidRepositoryIdentity);
                 }
+                if let Some(predecessor) = &input.predecessor {
+                    predecessor.validate_input(&input)?;
+                }
                 let env = direct_environment(&input.destination, &input.password)?;
                 let member = solstone_core_installed_payload::resolve_current_member(RESTIC_MEMBER)
                     .map_err(|_| ReadbackError::ToolUnavailable)?;
                 if member.path() != input.expected_restic_path {
                     return Err(ReadbackError::ToolChanged);
+                }
+                if let Some(predecessor) = &input.predecessor {
+                    predecessor.validate_member(&member)?;
                 }
                 Ok((env, member))
             })();
@@ -1048,7 +1077,10 @@ impl<'a> ReadOperation<'a> {
                 member,
                 env,
                 repository: input.repository,
-                execution: std::cell::RefCell::new(DirectExecution::default()),
+                execution: std::cell::RefCell::new(DirectExecution {
+                    predecessor: input.predecessor,
+                    ..DirectExecution::default()
+                }),
             };
             let qualification = (|| {
                 let version_child = admitted.query(vec!["version".into()])?;
@@ -1133,6 +1165,34 @@ impl<'a> ReadOperation<'a> {
     }
 
     #[cfg(unix)]
+    fn run_child(
+        &self,
+        request: &Request<'_>,
+        capture_limit: usize,
+    ) -> Result<CompletedChild, ReadbackError> {
+        let creator = self
+            .execution
+            .borrow()
+            .predecessor
+            .as_ref()
+            .is_some_and(ArchivePredecessorCustody::creator_executor);
+        let completed = if creator {
+            bounded_child::run_owned_archive_creator(
+                request,
+                Some(capture_limit),
+                self.operation.budget().cancellation(),
+            )
+        } else {
+            bounded_child::run_owned(
+                request,
+                Some(capture_limit),
+                self.operation.budget().cancellation(),
+            )
+        };
+        completed.map_err(|_| self.execution_error())
+    }
+
+    #[cfg(unix)]
     fn query(&self, argv: Vec<std::ffi::OsString>) -> Result<CompletedChild, ReadbackError> {
         self.execution.borrow_mut().attempt();
         self.query_inner(argv)
@@ -1146,7 +1206,7 @@ impl<'a> ReadOperation<'a> {
             .budget()
             .remaining(self.operation.clock())?
             .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
-        let output = bounded_child::run_owned(
+        let output = self.run_child(
             &Request {
                 program: self.member.path().as_os_str().to_owned(),
                 argv,
@@ -1154,10 +1214,8 @@ impl<'a> ReadOperation<'a> {
                 timeout: Some(timeout),
                 pass_fds: vec![],
             },
-            Some(MAX_QUERY_BYTES),
-            self.operation.budget().cancellation(),
-        )
-        .map_err(|_| self.execution_error())?;
+            MAX_QUERY_BYTES,
+        )?;
         self.revalidate_local()?;
         if !output.successful() {
             return Err(ReadbackError::ToolFailed);
@@ -1175,6 +1233,9 @@ impl<'a> ReadOperation<'a> {
 
     #[cfg(unix)]
     fn confirm_repository(&mut self) -> Result<(), ReadbackError> {
+        if let Some(predecessor) = self.execution.borrow_mut().predecessor.as_mut() {
+            predecessor.mark_read_config();
+        }
         let result = self.query(vec!["cat".into(), "config".into(), "--no-cache".into()])?;
         let parsed: Value = serde_json::from_slice(&result.output().stdout)
             .map_err(|_| ReadbackError::InvalidRepositoryIdentity)?;
@@ -1188,6 +1249,9 @@ impl<'a> ReadOperation<'a> {
         }
         self.revalidate_local()?;
         self.repository = RepositoryBinding::Confirmed(id.to_owned());
+        if let Some(predecessor) = self.execution.borrow_mut().predecessor.as_mut() {
+            predecessor.confirm_read_config(id);
+        }
         self.execution
             .borrow_mut()
             .accept(DirectInvocation::Config, result);
@@ -1445,12 +1509,7 @@ impl<'a> ReadOperation<'a> {
                 };
                 writer = WriterState::Unknown;
                 self.execution.borrow_mut().attempt();
-                let completed = bounded_child::run_owned(
-                    &request,
-                    Some(MAX_QUERY_BYTES),
-                    self.operation.budget().cancellation(),
-                )
-                .map_err(|_| self.execution_error())?;
+                let completed = self.run_child(&request, MAX_QUERY_BYTES)?;
                 self.operation.budget().remaining(self.operation.clock())?;
                 if !completed.successful() {
                     return Err(ReadbackError::ToolFailed);

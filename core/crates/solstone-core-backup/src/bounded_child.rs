@@ -95,6 +95,24 @@ pub(crate) fn run_owned(
     execute(request, capture_limit, cancellation).map_err(ChildFailure::new)
 }
 
+/// Fixed creator requests retain the same private completion and owned joins.
+pub(crate) fn run_owned_archive_creator(
+    request: &Request<'_>,
+    capture_limit: Option<usize>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<CompletedChild, ChildFailure> {
+    execute_request(request, capture_limit, cancellation, ChildSetup::Creator)
+        .map_err(ChildFailure::new)
+}
+
+#[derive(Clone, Copy)]
+enum ChildSetup {
+    Ordinary,
+    #[cfg(target_os = "linux")]
+    Dns(Instant),
+    Creator,
+}
+
 /// The DNS leaf supplies only an admitted executable, fixed DNS arguments and
 /// the original absolute end. No ambient environment or descriptors are passed.
 #[cfg(target_os = "linux")]
@@ -116,7 +134,7 @@ pub(crate) fn run_owned_dns(
         &request,
         Some(capture_limit),
         Some(cancellation),
-        Some(deadline),
+        ChildSetup::Dns(deadline),
     )
 }
 
@@ -458,15 +476,27 @@ fn execute(
     capture_limit: Option<usize>,
     cancellation: Option<&ArchiveCancellation>,
 ) -> io::Result<CompletedChild> {
-    execute_request(request, capture_limit, cancellation, None)
+    execute_request(request, capture_limit, cancellation, ChildSetup::Ordinary)
 }
 
 fn execute_request(
     request: &Request<'_>,
     capture_limit: Option<usize>,
     cancellation: Option<&ArchiveCancellation>,
-    dns_deadline: Option<Instant>,
+    setup: ChildSetup,
 ) -> io::Result<CompletedChild> {
+    let dns_deadline = match setup {
+        #[cfg(target_os = "linux")]
+        ChildSetup::Dns(deadline) => Some(deadline),
+        _ => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    if matches!(setup, ChildSetup::Creator) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "archive creator containment is unavailable",
+        ));
+    }
     let start = Instant::now();
     let timeout = dns_deadline
         .map(|deadline| deadline.saturating_duration_since(start))
@@ -491,10 +521,27 @@ fn execute_request(
         .stderr(Stdio::from(stderr_w.try_clone()?));
     command.process_group(0);
     #[cfg(target_os = "linux")]
-    if dns_deadline.is_some() {
-        prepare_dns_child(&mut command);
-    } else {
-        inherit_in_child(&mut command, &request.pass_fds)?;
+    match setup {
+        ChildSetup::Dns(_) => prepare_dns_child(&mut command),
+        ChildSetup::Creator => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut allowed = Vec::new();
+            for descriptor in &request.pass_fds {
+                if descriptor.as_raw_fd() < 3 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid archive descriptor",
+                    ));
+                }
+                if seen.insert(descriptor.as_raw_fd()) {
+                    allowed.push(*descriptor);
+                }
+            }
+            // Scrub every extra descriptor first, then allow only retained capabilities.
+            prepare_dns_child(&mut command);
+            inherit_in_child(&mut command, &allowed)?;
+        }
+        ChildSetup::Ordinary => inherit_in_child(&mut command, &request.pass_fds)?,
     }
     #[cfg(not(target_os = "linux"))]
     inherit_in_child(&mut command, &request.pass_fds)?;

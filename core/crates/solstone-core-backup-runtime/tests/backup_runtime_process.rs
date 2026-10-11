@@ -2099,3 +2099,374 @@ fn packaged_total_owned_read_finish_entry() {
         "limit":"lower typed direct only; no Native/Proof actor, Consumer keeper, early unwind or forced writer grant"})
     );
 }
+#[cfg(all(target_os = "linux", feature = "full-tests"))]
+#[test]
+#[ignore = "requires a copied current package and synthetic direct creator fixture"]
+fn packaged_owned_archive_creator_entry() {
+    use solstone_core_backup::archive_activity::{
+        OwnedPreparedArchiveOperation, PreparedArchiveOperation,
+    };
+    use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation};
+    use solstone_core_backup::archive_readback::{ExactArchiveFile, ReadbackError};
+    use solstone_core_backup_runtime::{
+        ArchiveRemoteEffects, DirectReadFinishState, admit_prepared_archive,
+        admit_prepared_archive_owned_creator_installed,
+    };
+    use solstone_core_journal_io::{
+        JournalRoot,
+        activity::ActivityLease,
+        media::{Cleanup, MediaDirectory, MediaStage, PreparedMedia, digest_reader},
+    };
+    use std::sync::Arc;
+
+    struct OwnedClock(Instant);
+    impl Clock for OwnedClock {
+        fn now_unix(&self) -> i64 {
+            10_000 + self.0.elapsed().as_secs() as i64
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    fn copy_native(
+        parent: &Arc<MediaDirectory>,
+        activity: Arc<ActivityLease>,
+        input: &serde_json::Value,
+    ) -> PreparedMedia {
+        let name = std::ffi::OsStr::new(input["name"].as_str().unwrap());
+        let bytes = fs::read(input["path"].as_str().unwrap()).unwrap();
+        let digest = digest_reader(&mut bytes.as_slice()).unwrap();
+        assert_eq!(digest.size, input["bytes"].as_u64().unwrap());
+        assert_eq!(digest.sha256, input["sha256"].as_str().unwrap());
+        MediaStage::create(Arc::clone(parent), activity)
+            .unwrap()
+            .create_named_target(name)
+            .unwrap()
+            .copy_from(parent, name, &digest)
+            .unwrap()
+    }
+    let input_path = std::env::var_os("OWNED_CREATOR_PROBE_JSON").unwrap();
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let mode = input["mode"].as_str().unwrap();
+    assert!(
+        [
+            "complete",
+            "active-error",
+            "no-writer",
+            "unknown-zero",
+            "unknown-output",
+            "pre-refusal"
+        ]
+        .contains(&mode)
+    );
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
+    let cancellation = ArchiveCancellation::new();
+    let budget = ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone()).unwrap();
+    let path = Path::new(input["restic_path"].as_str().unwrap());
+    let repository = input["repository_id"].as_str().unwrap();
+    let m = &input["existing"];
+    let file = ExactArchiveFile {
+        repository_id: repository.into(),
+        snapshot_id: m["snapshot_id"].as_str().unwrap().into(),
+        name: m["name"].as_str().unwrap().into(),
+        archive_path: m["archive_path"].as_str().unwrap().into(),
+        bytes: m["bytes"].as_u64().unwrap(),
+        sha256: m["sha256"].as_str().unwrap().into(),
+    };
+    let parent = MediaDirectory::open(Arc::clone(&root), Path::new("media")).unwrap();
+
+    if mode.starts_with("unknown-") {
+        let original =
+            PreparedArchiveOperation::prepare_owned(Arc::clone(&root), budget, Arc::clone(&clock))
+                .unwrap();
+        let carrier = Arc::clone(original.carrier());
+        let http = RecordingHttp {
+            urls: RefCell::new(Vec::new()),
+        };
+        let services = BackupServices {
+            runner: &SystemToolRunner,
+            http: &http,
+            clock: clock.as_ref(),
+            restic_path: Some(path),
+            rclone_path: None,
+            version: "fixture",
+            journal_maintenance: &Maintenance,
+        };
+        let mut admitted = admit_prepared_archive(original, &services).unwrap();
+        assert!(Arc::ptr_eq(
+            admitted.prepared_operation().carrier(),
+            &carrier
+        ));
+        let mut copied = if mode == "unknown-output" {
+            Some(copy_native(
+                &parent,
+                Arc::clone(admitted.activity()),
+                &input["native"],
+            ))
+        } else {
+            None
+        };
+        let snapshot = copied.as_mut().map(|copied| {
+            admitted
+                .archive_owned(&[copied.archive_source().unwrap()])
+                .unwrap()
+        });
+        let mut read = admitted.into_read_operation().unwrap();
+        assert!(Arc::ptr_eq(read.carrier(), &carrier));
+        assert!(Arc::ptr_eq(read.owned_clock().unwrap(), &clock));
+        if let (Some(snapshot), Some(copied)) = (snapshot.as_ref(), copied.as_mut()) {
+            let source = copied.archive_source().unwrap();
+            let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+                .unwrap()
+                .create_target()
+                .unwrap();
+            let (exact, mut restored) = read
+                .read_owned_snapshot(&snapshot.snapshot_id, &source, target)
+                .unwrap();
+            assert_eq!(exact.sha256, source.digest().sha256);
+            assert_eq!(restored.cleanup(), Cleanup::Complete);
+        }
+        let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+            .unwrap()
+            .create_target()
+            .unwrap();
+        let mut restored = read.read_exact(&file, target).unwrap();
+        assert_eq!(restored.digest().sha256, file.sha256);
+        assert_eq!(restored.cleanup(), Cleanup::Complete);
+        drop(restored);
+        if let Some(copied) = copied.as_mut() {
+            assert_eq!(copied.cleanup(), Cleanup::Complete);
+        }
+        drop(copied);
+        drop(parent);
+        let held = match read.settle_direct() {
+            Err(held) => held,
+            Ok(_) => panic!("generic output cannot qualify creator"),
+        };
+        assert_eq!(held.reason(), ReadbackError::ToolFailed);
+        let held = match held.into_owned_hold() {
+            Ok(held) => held,
+            Err(_) => panic!("original owned clock must close"),
+        };
+        let custody = thread::spawn(move || held).join().unwrap();
+        assert!(Arc::ptr_eq(custody.carrier(), &carrier));
+        assert!(Arc::ptr_eq(custody.owned_clock(), &clock));
+        assert!(http.urls.borrow().is_empty());
+        println!(
+            "OWNED_CREATOR_RESULT {}",
+            serde_json::json!({"mode":mode,"state":"Held","reason":"ToolFailed",
+            "same_original_owner":true,"same_original_clock":true,"good_read":true,"generic_writer":snapshot.is_some(),
+            "retirement":false,"closed_thread_hop":true})
+        );
+        return;
+    }
+
+    let original =
+        match OwnedPreparedArchiveOperation::prepare(Arc::clone(&root), budget, Arc::clone(&clock))
+        {
+            Ok(original) => original,
+            Err(failure) => panic!("original preparation: {}", failure.reason()),
+        };
+    let weak_lease = Arc::downgrade(original.activity());
+    let original_carrier = Arc::downgrade(original.carrier());
+    let installed = match admit_prepared_archive_owned_creator_installed(original, path) {
+        Ok(installed) => installed,
+        Err(failure) => panic!("creator admission: {}", failure.error()),
+    };
+    let (mut admitted, finish) = installed.into_parts();
+    assert_eq!(admitted.repository_id(), repository);
+    assert!(Arc::ptr_eq(admitted.carrier(), finish.carrier()));
+    assert!(Arc::ptr_eq(
+        admitted.prepared_operation().owned_clock().unwrap(),
+        &clock
+    ));
+    assert!(Arc::ptr_eq(finish.owned_clock(), &clock));
+    let mut copied = if ["complete", "active-error"].contains(&mode) {
+        Some(copy_native(
+            &parent,
+            Arc::clone(admitted.activity()),
+            &input["native"],
+        ))
+    } else {
+        None
+    };
+    let sentinel = fs::File::open(input["sentinel"].as_str().unwrap()).unwrap();
+    nix::fcntl::fcntl(
+        &sentinel,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+    )
+    .unwrap();
+    let sentinel_flags = nix::fcntl::fcntl(&sentinel, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+    assert_eq!(sentinel_flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
+    let mut writer_failure = None;
+    let snapshot = if let Some(copied) = copied.as_mut() {
+        let sources = [copied.archive_source().unwrap()];
+        let descriptor = sources[0].descriptor().unwrap();
+        let before = nix::fcntl::fcntl(descriptor, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_ne!(before & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
+        eprintln!(
+            "OWNED_CREATOR_PENDING_INPUT {}",
+            serde_json::json!({"pid":std::process::id(),
+            "source_fd":descriptor.as_raw_fd(),"source_path":sources[0].path(),"source_parent_fd_flags":before,
+            "sentinel_fd":sentinel.as_raw_fd(),"sentinel_path":input["sentinel"],"sentinel_flags":sentinel_flags})
+        );
+        let result = admitted.archive_owned(&sources);
+        assert_eq!(
+            nix::fcntl::fcntl(descriptor, nix::fcntl::FcntlArg::F_GETFD).unwrap(),
+            before
+        );
+        admitted.revalidate_local().unwrap();
+        assert!(!cancellation.is_cancelled());
+        match result {
+            Ok(snapshot) => {
+                assert_eq!(mode, "complete");
+                Some(snapshot)
+            }
+            Err(failure) => {
+                assert_eq!(mode, "active-error");
+                assert_eq!(
+                    failure.error,
+                    solstone_core_backup_runtime::ArchiveError::Readback(ReadbackError::ToolFailed)
+                );
+                assert!(matches!(
+                    failure.remote_effects,
+                    ArchiveRemoteEffects::Attempted { .. }
+                ));
+                eprintln!(
+                    "OWNED_CREATOR_WRITER_REFUSAL {:?} {:?}",
+                    failure.error, failure.remote_effects
+                );
+                writer_failure = Some(format!("{:?}", failure.remote_effects));
+                None
+            }
+        }
+    } else if mode == "pre-refusal" {
+        let failure = admitted.archive_owned(&[]).unwrap_err();
+        assert_eq!(
+            failure.error,
+            solstone_core_backup_runtime::ArchiveError::InvalidSelection
+        );
+        assert_eq!(failure.remote_effects, ArchiveRemoteEffects::NotAttempted);
+        writer_failure = Some("NotAttempted".into());
+        None
+    } else {
+        None
+    };
+    assert_eq!(
+        nix::fcntl::fcntl(&sentinel, nix::fcntl::FcntlArg::F_GETFD).unwrap(),
+        sentinel_flags
+    );
+    drop(sentinel);
+    let mut read = match admitted.into_read_operation() {
+        Ok(read) => read,
+        Err(failure) => panic!("same owner handoff: {}", failure.error()),
+    };
+    assert!(Arc::ptr_eq(read.carrier(), finish.carrier()));
+    assert!(Arc::ptr_eq(read.owned_clock(), &clock));
+    if let (Some(snapshot), Some(copied)) = (snapshot.as_ref(), copied.as_mut()) {
+        let source = copied.archive_source().unwrap();
+        let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+            .unwrap()
+            .create_target()
+            .unwrap();
+        let (exact, mut restored) = read
+            .read_owned_snapshot(&snapshot.snapshot_id, &source, target)
+            .unwrap();
+        assert_eq!(exact.name, input["native"]["name"].as_str().unwrap());
+        assert_eq!(restored.digest(), source.digest());
+        assert_eq!(restored.cleanup(), Cleanup::Complete);
+    }
+    if mode != "no-writer" {
+        let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+            .unwrap()
+            .create_target()
+            .unwrap();
+        let mut restored = read.read_exact(&file, target).unwrap();
+        assert_eq!(restored.digest().size, file.bytes);
+        assert_eq!(restored.digest().sha256, file.sha256);
+        assert_eq!(restored.cleanup(), Cleanup::Complete);
+    }
+    if let Some(copied) = copied.as_mut() {
+        assert_eq!(copied.cleanup(), Cleanup::Complete);
+    }
+    drop(copied);
+    drop(parent);
+    let result = if ["active-error", "pre-refusal"].contains(&mode) {
+        let held = match read.settle_direct() {
+            Err(held) => held,
+            Ok(_) => panic!("later read must not clear writer failure"),
+        };
+        let expected = if mode == "active-error" {
+            ReadbackError::ToolFailed
+        } else {
+            ReadbackError::InvalidSelection
+        };
+        assert_eq!(held.reason(), expected);
+        assert!(Arc::ptr_eq(held.carrier(), finish.carrier()));
+        let custody = thread::spawn(move || (held, finish)).join().unwrap();
+        assert!(Arc::ptr_eq(custody.0.owned_clock(), &clock));
+        assert!(original_carrier.upgrade().is_some() && weak_lease.upgrade().is_some());
+        let next = OwnedPreparedArchiveOperation::prepare(
+            Arc::clone(&root),
+            ArchiveBudget::new(clock.as_ref()).unwrap(),
+            Arc::clone(&clock),
+        );
+        assert!(next.is_err());
+        drop(next);
+        serde_json::json!({"state":"Held","reason":format!("{expected:?}"),"good_read":true,"writer_failure":writer_failure,
+            "same_original_owner":true,"same_original_clock":true,"retirement":false,"next_refused":true,"closed_thread_hop":true})
+    } else {
+        let settled = match read.settle_direct() {
+            Ok(settled) => settled,
+            Err(held) => panic!("genuine creator settlement: {}", held.reason()),
+        };
+        let settled = thread::spawn(move || settled).join().unwrap();
+        let completed = finish.finish_owned(settled);
+        assert_eq!(completed.state(), DirectReadFinishState::Completed);
+        let receipt = completed.retirement().unwrap();
+        assert!(receipt.receipt.failures().is_empty());
+        let retirement = format!(
+            "{:?}/{:?}/{:?}",
+            receipt.receipt.effect(),
+            receipt.receipt.root_durability(),
+            receipt.receipt.confirmation()
+        );
+        assert_eq!(retirement, "Removed/Synced/Confirmed");
+        drop(completed);
+        assert!(weak_lease.upgrade().is_none());
+        let next = match OwnedPreparedArchiveOperation::prepare(
+            Arc::clone(&root),
+            ArchiveBudget::new(clock.as_ref()).unwrap(),
+            Arc::clone(&clock),
+        ) {
+            Ok(next) => next,
+            Err(failure) => panic!("next preparation: {}", failure.reason()),
+        };
+        let next = match admit_prepared_archive_owned_creator_installed(next, path) {
+            Ok(next) => next,
+            Err(failure) => panic!("next creator admission: {}", failure.error()),
+        };
+        let (next_read, next_finish) = next.into_parts();
+        let next_read = match next_read.into_read_operation() {
+            Ok(read) => read,
+            Err(failure) => panic!("next handoff: {}", failure.error()),
+        };
+        let next_settled = match next_read.settle_direct() {
+            Ok(settled) => settled,
+            Err(held) => panic!("next no-writer settlement: {}", held.reason()),
+        };
+        let next_completed = next_finish.finish_owned(next_settled);
+        assert_eq!(next_completed.state(), DirectReadFinishState::Completed);
+        drop(next_completed);
+        serde_json::json!({"state":"Completed","good_read":mode=="complete","same_original_owner":true,
+            "same_original_clock":true,"retirement":retirement,"next_admission":true,"next_completed":true,
+            "closed_thread_hop":true,"snapshot_id":snapshot.as_ref().map(|snapshot| &snapshot.snapshot_id),
+            "no_writer":mode=="no-writer"})
+    };
+    println!(
+        "OWNED_CREATOR_RESULT {}",
+        serde_json::json!({"mode":mode,"result":result,
+        "limits":"lower offline Linux direct creator only; no Proof/Native actor, keeper, early unwind, restart or activation"})
+    );
+}
