@@ -1251,7 +1251,7 @@ fn emit_outcome(writer: &mut impl Write, outcome: RuntimeOutcome) {
         ),
         RuntimeOutcome::SchemaValidationFailed { talent, validation } => emit(
             writer,
-            json!({"event":"error", "terminal":true, "name":talent, "error":"talent output failed schema validation", "schema_validation":validation, "reason_code":"schema_validation_failed"}),
+            json!({"event":"error", "terminal":true, "name":talent, "error":"talent output failed schema validation", "schema_validation":validation, "reason_code":"schema_validation_failed", "retryable":false}),
         ),
         RuntimeOutcome::PrepareFailed(error) => emit(
             writer,

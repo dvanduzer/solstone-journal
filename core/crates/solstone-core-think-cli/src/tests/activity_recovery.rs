@@ -510,6 +510,32 @@ fn explicit_nonretryable_failure_parks_but_connection_failure_never_exhausts() {
 }
 
 #[test]
+fn a_story_that_keeps_failing_validation_parks_until_its_input_changes() {
+    let (_journal, _roots, context, recorder) = fixture();
+    fail_first(&context, &recorder);
+    // The runtime's own terminal event for a run whose schema retry is spent.
+    let mut use_log = b"{\"event\":\"start\",\"use_id\":\"use-1\"}\n".to_vec();
+    solstone_core_talent_runtime::emit_outcome_for_test(
+        &mut use_log,
+        solstone_core_talent_runtime::RuntimeOutcome::SchemaValidationFailed {
+            talent: "participation".to_owned(),
+            validation: serde_json::json!({"valid": false}),
+        },
+    );
+    fs::write(
+        context.journal.join("talents/participation/use-1.jsonl"),
+        use_log,
+    )
+    .unwrap();
+    assert!(replay(&context, &["090000_300", "090500_300"], true).is_err());
+    assert!(
+        due_activity_retries(&context.journal, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn repeated_connection_interruptions_remain_due_after_many_attempts() {
     let (_journal, _roots, context, recorder) = fixture();
     fail_first(&context, &recorder);
