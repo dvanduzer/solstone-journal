@@ -302,25 +302,74 @@ fn backlog_issues(source: &BacklogSource, now: DateTime<Utc>) -> Vec<Value> {
 fn unknown_backlog() -> Value {
     json!({"text":solstone_core_system_health::VERDICT_UNCLEAR_NOW,"severity":"amber","href":"/app/health"})
 }
-fn capture_issue(capture: &Value) -> Option<Value> {
-    match capture.get("status").and_then(Value::as_str) {
-        Some("degraded") => Some(json!({
-            "text": format_degraded_capture_line(capture).expect("degraded"),
-            "severity": "red",
-            "href": "/app/health",
-        })),
+fn rejected_sources(client: &Value) -> Vec<&str> {
+    client
+        .get("source_delivery")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, row)| row.get("state").and_then(Value::as_str) == Some("needs_attention"))
+        .map(|(source, _)| crate::needs_you::source_display_name(source))
+        .collect()
+}
 
-        _ => {
-            let sources = crate::needs_you::named_attention_sources(capture)?;
-            Some(json!({
-                "text": format!(
-                    "the solstone app on one of your devices is having trouble adding {sources} to your journal."
-                ),
-                "severity": "amber",
-                "href": "/app/health",
-            }))
-        }
+fn capture_issue(capture: &Value) -> Option<Value> {
+    // The same authority as Health: an explicit source refusal survives a
+    // sibling source succeeding. Count devices, not their source rows.
+    let mut affected = capture
+        .get("clients")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|client| client["failing"] == true || !rejected_sources(client).is_empty())
+        .collect::<Vec<_>>();
+    if affected.is_empty() {
+        return format_degraded_capture_line(capture).map(|text| {
+            json!({
+                "text": text, "severity": "red", "href": "/app/health"
+            })
+        });
     }
+    affected.sort_by_key(|client| {
+        std::cmp::Reverse(
+            client
+                .get("capture_elapsed_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1),
+        )
+    });
+    let labels = affected
+        .iter()
+        .map(|client| {
+            let name = client
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("an unnamed device");
+            let sources = rejected_sources(client);
+            if sources.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name} ({})", sources.join(", "))
+            }
+        })
+        .collect::<Vec<_>>();
+    let text = if affected.len() == 1 {
+        format!("your journal couldn't accept uploads from {}.", labels[0])
+    } else {
+        format!(
+            "your journal couldn't accept uploads from {} devices: {}.",
+            affected.len(),
+            labels.join(", ")
+        )
+    };
+    let severity = if affected.iter().any(|client| client["failing"] == true) {
+        "red"
+    } else {
+        "amber"
+    };
+    Some(json!({"text":text, "severity":severity, "href":"/app/health/#registeredClientsCard"}))
 }
 /// Health's `describeRegisteredClient` and its `HEALTH_GLANCE_DEVICE*_SILENT`
 /// strings are the single source for this sentence; home echoes them, in
@@ -511,6 +560,48 @@ mod tests {
         at: DateTime<Utc>,
     ) -> Value {
         build_health_glance(capture, last_observe, &fresh_backlog(), brain, at, None)
+    }
+
+    #[test]
+    fn source_refusal_counts_devices_and_clears_only_with_authoritative_evidence() {
+        let mut capture = json!({"status":"active", "registry":"registry_complete", "clients":[
+            {"name":"phone", "failing":false, "source_delivery":{
+                "audio":{"state":"needs_attention"}, "location":{"state":"current"}}},
+            {"name":"laptop", "failing":false, "source_delivery":{"screen":{"state":"current"}}}
+        ]});
+        let g = glance(&capture);
+        assert_eq!(g["verdict"], "attention");
+        assert_eq!(g["issues"].as_array().unwrap().len(), 1);
+        assert!(
+            g["issues"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("phone (audio)")
+        );
+        assert_eq!(g["issues"][0]["href"], "/app/health/#registeredClientsCard");
+        capture["clients"][0]["source_delivery"]
+            .as_object_mut()
+            .unwrap()
+            .remove("location");
+        assert_eq!(
+            glance(&capture)["verdict"],
+            "attention",
+            "one source is enough"
+        );
+        capture["clients"][1]["source_delivery"]["screen"]["state"] = json!("needs_attention");
+        capture["clients"][1]["source_delivery"]["audio"] = json!({"state":"needs_attention"});
+        assert!(
+            glance(&capture)["issues"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("2 devices")
+        );
+        capture["clients"][0]["source_delivery"]["audio"]["state"] = json!("current");
+        capture["clients"][1]["source_delivery"] = json!({"screen":{"state":"current"}});
+        assert_eq!(glance(&capture)["verdict"], "ok");
+        let unknown = glance(&json!({"status":"unknown", "clients":[]}));
+        assert_ne!(unknown["verdict"], "ok");
+        assert!(unknown["issues"].as_array().unwrap().is_empty());
     }
 
     fn unassessed(name: &str, reason: &str, reach: &str) -> Value {
@@ -836,7 +927,7 @@ mod tests {
         // X-02: the red device line names the device, the way health's banner
         // does. "one of your devices" was the only one of the three writers
         // that hid it.
-        assert_eq!(degraded_text, "rej isn't reaching your journal.");
+        assert!(degraded_text.contains("rej"));
 
         let missing_backlog = BacklogSource {
             backlog: None,
@@ -998,14 +1089,16 @@ mod tests {
         let g = glance(&capture);
         assert_eq!(g["verdict"], "attention");
         assert_eq!(g["severity"], "amber");
-        assert_eq!(
-            g["issues"][0]["text"],
-            "the solstone app on one of your devices is having trouble adding location to your journal."
+        assert!(
+            g["issues"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("phone (location)")
         );
     }
 
     #[test]
-    fn single_source_active_rollup_does_not_invent_a_source_issue() {
+    fn single_source_active_rollup_surfaces_an_explicit_refusal() {
         for source_delivery in [
             json!({"audio": {"state": "needs_attention"}}),
             json!({"": {"state": "needs_attention"}}),
@@ -1022,8 +1115,8 @@ mod tests {
                 "registry": "registry_complete",
             });
             let g = glance(&capture);
-            assert_eq!(g["verdict"], "ok", "{capture}");
-            assert_eq!(g["issues"].as_array().unwrap().len(), 0);
+            assert_eq!(g["verdict"], "attention", "{capture}");
+            assert_eq!(g["issues"].as_array().unwrap().len(), 1);
         }
     }
 
@@ -1045,9 +1138,11 @@ mod tests {
         });
         let g = glance(&capture);
         assert_eq!(g["verdict"], "attention");
-        assert_eq!(
-            g["issues"][0]["text"],
-            "the solstone app on one of your devices is having trouble adding default to your journal."
+        assert!(
+            g["issues"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("phone (default)")
         );
     }
 
