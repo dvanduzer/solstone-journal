@@ -17,6 +17,8 @@
 //! use solstone_core_backup_runtime::backup_journal_resolved_hook_armed;
 //! ```
 
+#[cfg(target_os = "linux")]
+mod controlled_http;
 pub mod destination;
 pub mod destination_admission;
 pub mod engine;
@@ -88,7 +90,8 @@ pub use runner::{
 pub use s3_wipe::{DELETE_OBJECT_BATCH_SIZE, S3Credentials, WipeResult, wipe_prefix};
 pub use teardown::{TeardownResult, teardown_backup};
 pub use teardown_admission::{
-    TeardownAdmission, TeardownAdmissionRefusal, TeardownReaderRefusal, admit_teardown,
+    ClearedTeardownAdmission, TeardownAdmission, TeardownAdmissionRefusal, TeardownClearFailure,
+    TeardownClearRefusal, TeardownReaderRefusal, admit_teardown,
 };
 
 #[cfg(feature = "test-support")]

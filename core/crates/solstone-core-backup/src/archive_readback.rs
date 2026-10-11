@@ -394,6 +394,20 @@ impl<'a> ReadOperation<'a> {
         self.source_observations.get()
     }
 
+    /// Recheck retained local admission under the original budget and cancellation.
+    /// This does not query the repository or establish readback or release authority.
+    /// Callers still check canonical binding and current proof at their effects.
+    pub fn revalidate_admission(&self) -> Result<(), ReadbackError> {
+        #[cfg(unix)]
+        {
+            self.revalidate_local()
+        }
+        #[cfg(not(unix))]
+        {
+            Err(ReadbackError::Unsupported)
+        }
+    }
+
     #[cfg(unix)]
     fn revalidate_local(&self) -> Result<(), ReadbackError> {
         self.budget.remaining(self.clock)?;

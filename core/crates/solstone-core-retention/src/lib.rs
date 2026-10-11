@@ -50,6 +50,7 @@
 )]
 
 pub mod age;
+pub mod archive_catalog;
 pub mod archive_proof;
 pub mod class;
 pub mod content;

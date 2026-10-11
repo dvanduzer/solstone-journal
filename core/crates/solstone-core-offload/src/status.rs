@@ -6,10 +6,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::ledger::{ArchiveWitness, JournalCatalog, catalog_journal};
+use crate::ledger::catalog_journal;
 use crate::measurement::{RawMediaPopulation, measure_local_media};
 use serde_json::{Value, json};
 use solstone_core_backup::get_backup_config;
+use solstone_core_retention::archive_catalog::{ArchiveWitness, JournalCatalog};
 
 /// Advisory metadata presence, never hash equality or restore/release authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,9 +274,9 @@ fn checked_media_value(
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
-    use crate::ledger::{DayCatalog, OffloadFile, SegmentCatalog};
     use crate::measurement::{LocalMediaFile, LocalMediaKey};
     use solstone_core_journal_io::paths::SegmentLayout;
+    use solstone_core_retention::archive_catalog::{DayCatalog, OffloadFile, SegmentCatalog};
 
     fn fixture() -> (JournalCatalog, RawMediaPopulation) {
         let witness = ArchiveWitness {
@@ -461,10 +462,12 @@ mod catalog_tests {
         other_name.file.bytes = 5;
         let segment = &mut catalog.days[0].segments[0];
         segment.active.extend([named, other_name]);
-        segment.history.push(crate::ledger::ArchiveManifest {
-            manifest_id: "inactive".into(),
-            files: vec![first],
-        });
+        segment
+            .history
+            .push(solstone_core_retention::archive_catalog::ArchiveManifest {
+                manifest_id: "inactive".into(),
+                files: vec![first],
+            });
         let local = RawMediaPopulation::default();
         let value = checked_media_value(&catalog, &local).unwrap();
         assert_eq!(value["backup_only"]["total_bytes"], 25);
@@ -532,7 +535,8 @@ mod catalog_tests {
 #[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use super::*;
-    use crate::ledger::{OffloadFile, append_offload_event};
+    use crate::ledger::append_offload_event;
+    use solstone_core_retention::archive_catalog::OffloadFile;
     use std::fs;
 
     #[test]

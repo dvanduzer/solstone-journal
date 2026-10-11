@@ -36,6 +36,7 @@ use solstone_core_backup_runtime::{
 };
 use solstone_core_offload::{restore_all_offload, restore_offload_day};
 
+pub mod archive_operation;
 mod assets;
 mod callosum;
 #[cfg(windows)]

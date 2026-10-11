@@ -1725,7 +1725,7 @@ mod tests {
             "_default",
             "010000_001",
             "snapshot-a",
-            &[solstone_core_offload::OffloadFile {
+            &[solstone_core_retention::archive_catalog::OffloadFile {
                 name: "pending.webm".into(),
                 bytes: 3,
                 sha256: "a".repeat(64),
@@ -1739,7 +1739,7 @@ mod tests {
             "_default",
             "020000_001",
             "snapshot-b",
-            &[solstone_core_offload::OffloadFile {
+            &[solstone_core_retention::archive_catalog::OffloadFile {
                 name: "backup.webm".into(),
                 bytes: 7,
                 sha256: "b".repeat(64),
@@ -4692,7 +4692,7 @@ mod resolution_tests {
             "_default",
             "010000_001",
             "legacy-snapshot",
-            &[solstone_core_offload::OffloadFile {
+            &[solstone_core_retention::archive_catalog::OffloadFile {
                 name: "raw.webm".into(),
                 bytes: 3,
                 sha256: "a".repeat(64),

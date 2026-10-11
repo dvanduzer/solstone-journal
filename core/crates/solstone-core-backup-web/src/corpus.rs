@@ -2544,7 +2544,7 @@ async fn offload_status_preserves_checked_coverage_across_distinct_ledgers() {
         "_default",
         "030000_001",
         "snapshot-c",
-        &[solstone_core_offload::OffloadFile {
+        &[solstone_core_retention::archive_catalog::OffloadFile {
             name: "only.webm".into(),
             bytes: 21,
             sha256: "c".repeat(64),
@@ -2652,7 +2652,7 @@ mod held_restore_tests {
                 "_default",
                 directory,
                 "legacy-snapshot",
-                &[solstone_core_offload::OffloadFile {
+                &[solstone_core_retention::archive_catalog::OffloadFile {
                     name: "new.webm".into(),
                     bytes: 8,
                     sha256: "a".repeat(64),

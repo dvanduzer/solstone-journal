@@ -26,6 +26,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- when a connected agent searches for a person's or project's full name, the results can now include a short description and notes from the facets you shared with it. for names such as "Project Juniper", the search also finds entries that call the project "Juniper".
+- starting the same connected agent repeatedly for short tasks no longer stops it with "MCP bearer session limit reached". your journal makes room by closing that connection's least recently used session. a quiet agent whose session was closed may have to reconnect.
 - on mac, installing local thinking or transcription now also clears quarantine, macos's marker for downloaded files, inside the downloaded folder.
 
 - a connected agent can now read transcripts of imported audio, and reads imported AI conversations and imported text transcripts as plain text with their times. before, imported audio couldn't be opened, and the others came back as raw data.

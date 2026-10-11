@@ -1208,7 +1208,8 @@ areas = ["retention"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+features = ["full-tests"]
+default_full = true
 runtime = "none"
 
 [[package_suites]]
