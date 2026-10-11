@@ -26,6 +26,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+use super::removal::ClaimFailure;
 use super::{JournalRoot, MediaEntry, MediaIdentity, MediaPrimitive, changed, invalid, step};
 use crate::journal_root::JournalEntryKind;
 use crate::windows_identity::{WindowsFileIdentity, file_identity};
@@ -465,6 +466,7 @@ fn open_file(
     directory: &Directory,
     name: &OsStr,
     exclude_writes: bool,
+    delete: bool,
 ) -> io::Result<Option<File>> {
     // Classify before opening for media reads, and refuse all reparse/non-files.
     let admission = match nt_create_relative(
@@ -488,7 +490,7 @@ fn open_file(
     let file = File::from(open(
         directory.handle(),
         name,
-        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | if delete { DELETE } else { 0 },
         FILE_OPEN,
         OPTIONS | FILE_NON_DIRECTORY_FILE,
     )?);
@@ -500,10 +502,32 @@ fn open_file(
 }
 
 pub(super) fn open_plain(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
-    open_file(directory, name, false)
+    open_file(directory, name, false, false)
 }
 pub(super) fn open_source(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
-    open_file(directory, name, true)
+    open_file(directory, name, true, false)
+}
+
+pub(super) fn open_removal(directory: &Directory, name: &OsStr) -> io::Result<Option<File>> {
+    open_file(directory, name, true, true)
+}
+
+pub(super) fn claim(
+    source: &Directory,
+    source_name: &OsStr,
+    file: &File,
+    destination: &Directory,
+    name: &OsStr,
+) -> Result<(), ClaimFailure> {
+    step(MediaPrimitive::NativeClaimCut)?;
+    publish(source, source_name, file, destination, name).map_err(ClaimFailure::native)?;
+    step(MediaPrimitive::ClaimAppliedError)?;
+    Ok(())
+}
+
+pub(super) fn delete_claim(_directory: &Directory, _name: &OsStr, file: &File) -> io::Result<()> {
+    mark_delete(file)?;
+    step(MediaPrimitive::DeleteAppliedError)
 }
 
 pub(super) fn create_directory(parent: &Directory, name: &OsStr) -> io::Result<Directory> {

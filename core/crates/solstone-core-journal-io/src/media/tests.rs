@@ -1327,3 +1327,659 @@ mod windows_native {
         drop(destination);
     }
 }
+
+#[cfg(all(test, feature = "full-tests"))]
+mod removal {
+    use super::*;
+    use std::fs;
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        parent: Arc<MediaDirectory>,
+        source: Arc<MediaDirectory>,
+        raw: PathBuf,
+        expected: MediaObservation,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let temp = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
+                Some(root) => tempfile::tempdir_in(root).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            fs::create_dir(temp.path().join("parent")).unwrap();
+            fs::create_dir(temp.path().join("parent/segment")).unwrap();
+            let raw = temp.path().join("parent/segment/raw.flac");
+            fs::write(&raw, b"abc").unwrap();
+            let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let parent = MediaDirectory::open(root, Path::new("parent")).unwrap();
+            let source = parent.open_child(OsStr::new("segment")).unwrap().unwrap();
+            let expected = source
+                .observe_file(OsStr::new("raw.flac"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(expected.digest.size, 3);
+            assert_eq!(
+                expected.digest.sha256,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+            Self {
+                _temp: temp,
+                parent,
+                source,
+                raw,
+                expected,
+            }
+        }
+        fn stage(&self) -> MediaStage {
+            MediaStage::create(Arc::clone(&self.parent)).unwrap()
+        }
+        fn remove(&self, stage: MediaStage) -> MediaRemoval {
+            self.source
+                .remove_observed(OsStr::new("raw.flac"), &self.expected, stage)
+        }
+    }
+    fn fault() -> io::Result<()> {
+        Err(io::Error::other("injected native removal cut"))
+    }
+
+    #[test]
+    fn exact_observed_removal_reports_independent_facts_and_strict_stage_observation() {
+        let f = Fixture::new();
+        let stage = f.stage();
+        let path = stage.diagnostic_path();
+        let observation = stage.observation().unwrap();
+        assert_eq!(observation.parent_relative, ["parent"]);
+        assert_eq!(observation.parent_identity, f.parent.identity());
+        let encoded = serde_json::to_value(&observation).unwrap();
+        assert_eq!(
+            serde_json::from_value::<StageObservation>(encoded.clone()).unwrap(),
+            observation
+        );
+        let mut unknown = encoded;
+        unknown["cleanup_authority"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StageObservation>(unknown).is_err());
+        let removed = f.remove(stage);
+        let receipt = removed.receipt();
+        assert_eq!(receipt.effect, RemovalEffect::Deleted, "{receipt:?}");
+        assert_eq!(receipt.original_name, OriginalName::Absent);
+        assert_eq!(receipt.claim_confirmation, Confirmation::Confirmed);
+        assert_eq!(receipt.claimed_identity, Some(f.expected.identity));
+        assert!(!receipt.restoration_attempted);
+        assert_eq!(receipt.cleanup, Cleanup::Complete, "{receipt:?}");
+        assert_eq!(removed.stage_observation(), Some(&observation));
+        assert!(!f.raw.exists());
+        assert!(!path.exists());
+        #[cfg(unix)]
+        {
+            assert_eq!(receipt.file_durability, Durability::Synced);
+            assert_eq!(receipt.source_durability, Durability::Synced);
+            assert_eq!(receipt.claim_durability, Durability::Synced);
+            assert_eq!(receipt.stage_parent_durability, Durability::Synced);
+            assert!(receipt.failures.is_empty(), "{receipt:?}");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(receipt.file_durability, Durability::Unproven);
+            assert_eq!(receipt.source_durability, Durability::Unproven);
+            assert_eq!(receipt.claim_durability, Durability::Unproven);
+            assert_eq!(receipt.stage_parent_durability, Durability::Unproven);
+        }
+    }
+
+    #[test]
+    fn absent_changed_content_and_distinct_identity_never_claim() {
+        for case in 0..3 {
+            let f = Fixture::new();
+            match case {
+                0 => fs::remove_file(&f.raw).unwrap(),
+                1 => fs::write(&f.raw, b"xyz").unwrap(),
+                _ => {
+                    fs::rename(&f.raw, f.raw.with_extension("saved")).unwrap();
+                    fs::write(&f.raw, b"abc").unwrap();
+                }
+            }
+            let removed = f.remove(f.stage());
+            assert_eq!(removed.receipt().effect, RemovalEffect::NotClaimed);
+            assert_eq!(removed.receipt().cleanup, Cleanup::Complete);
+            if case != 0 {
+                assert_eq!(
+                    fs::read(&f.raw).unwrap(),
+                    if case == 1 { b"xyz" } else { b"abc" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_names_nonfiles_and_wrong_stage_parent_preserve_contents() {
+        let f = Fixture::new();
+        fs::write(f.parent.diagnostic_path().join("sentinel"), b"outside").unwrap();
+        for name in ["../sentinel", "/sentinel", "", ".", "CON", "raw\\escape"] {
+            let result = f
+                .source
+                .remove_observed(OsStr::new(name), &f.expected, f.stage());
+            assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
+        }
+        fs::create_dir(f.raw.with_file_name("directory")).unwrap();
+        let result = f
+            .source
+            .remove_observed(OsStr::new("directory"), &f.expected, f.stage());
+        assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
+        fs::create_dir(f.parent.diagnostic_path().join("other")).unwrap();
+        let other = f.parent.open_child(OsStr::new("other")).unwrap().unwrap();
+        let result = f.remove(MediaStage::create(other).unwrap());
+        assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
+        assert_eq!(fs::read(&f.raw).unwrap(), b"abc");
+        assert_eq!(
+            fs::read(f.parent.diagnostic_path().join("sentinel")).unwrap(),
+            b"outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_source_never_follows_or_claims_target() {
+        let f = Fixture::new();
+        let target = f.raw.with_file_name("target");
+        fs::write(&target, b"abc").unwrap();
+        fs::remove_file(&f.raw).unwrap();
+        std::os::unix::fs::symlink(&target, &f.raw).unwrap();
+        let result = f.remove(f.stage());
+        assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
+        assert!(
+            fs::symlink_metadata(&f.raw)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn occupied_stage_and_late_claim_occupation_never_replace() {
+        for late in [false, true] {
+            let f = Fixture::new();
+            let stage = f.stage();
+            let path = stage.diagnostic_path();
+            let claim = path.join("raw.flac");
+            let mut result = if late {
+                let competitor = claim.clone();
+                let (result, hit) = run_with_media_hook(
+                    MediaPrimitive::NativeClaimCut,
+                    move || fs::write(competitor, b"competitor"),
+                    || f.remove(stage),
+                );
+                assert!(hit);
+                result
+            } else {
+                fs::write(&claim, b"competitor").unwrap();
+                f.remove(stage)
+            };
+            assert_eq!(
+                result.receipt().effect,
+                RemovalEffect::NotClaimed,
+                "{:?}",
+                result.receipt()
+            );
+            assert_eq!(result.cleanup(), Cleanup::Refused);
+            drop(result);
+            assert_eq!(fs::read(&claim).unwrap(), b"competitor");
+            assert_eq!(fs::read(&f.raw).unwrap(), b"abc");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_swap_in_native_claim_gap_preserves_wrong_claim_and_original_object() {
+        let f = Fixture::new();
+        let stage = f.stage();
+        let claim = stage.diagnostic_path().join("raw.flac");
+        let raw = f.raw.clone();
+        let old = raw.with_extension("saved");
+        let saved = old.clone();
+        let (mut result, hit) = run_with_media_hook(
+            MediaPrimitive::NativeClaimCut,
+            move || {
+                fs::rename(&raw, saved)?;
+                fs::write(raw, b"new")
+            },
+            || f.remove(stage),
+        );
+        assert!(hit);
+        assert_eq!(result.receipt().effect, RemovalEffect::Claimed);
+        assert_ne!(result.receipt().claimed_identity, Some(f.expected.identity));
+        assert_eq!(
+            result.receipt().claim_confirmation,
+            Confirmation::Unverified
+        );
+        assert_eq!(result.cleanup(), Cleanup::Refused);
+        drop(result);
+        assert_eq!(fs::read(&claim).unwrap(), b"new");
+        assert_eq!(fs::read(&old).unwrap(), b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_identity_mutation_and_new_original_after_claim_are_preserved() {
+        let f = Fixture::new();
+        let stage = f.stage();
+        let claim = stage.diagnostic_path().join("raw.flac");
+        let changed_claim = claim.clone();
+        let raw = f.raw.clone();
+        let (mut result, hit) = run_with_media_hook(
+            MediaPrimitive::BeforeClaimDelete,
+            move || {
+                fs::write(changed_claim, b"xyz")?;
+                fs::write(raw, b"new")
+            },
+            || f.remove(stage),
+        );
+        assert!(hit);
+        assert_eq!(result.receipt().effect, RemovalEffect::Claimed);
+        assert_eq!(result.receipt().claimed_identity, Some(f.expected.identity));
+        assert_eq!(
+            result.receipt().claim_confirmation,
+            Confirmation::Unverified
+        );
+        assert_eq!(result.receipt().original_name, OriginalName::Occupied);
+        assert_eq!(result.cleanup(), Cleanup::Refused);
+        drop(result);
+        assert_eq!(fs::read(claim).unwrap(), b"xyz");
+        assert_eq!(fs::read(&f.raw).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_private_claim_is_never_deleted_by_cleanup_or_drop() {
+        let f = Fixture::new();
+        let stage = f.stage();
+        let claim = stage.diagnostic_path().join("raw.flac");
+        let saved = claim.with_extension("saved");
+        let changed_claim = claim.clone();
+        let old = saved.clone();
+        let (mut result, hit) = run_with_media_hook(
+            MediaPrimitive::BeforeClaimDelete,
+            move || {
+                fs::rename(&changed_claim, old)?;
+                fs::write(changed_claim, b"foreign")
+            },
+            || f.remove(stage),
+        );
+        assert!(hit);
+        assert_eq!(result.receipt().effect, RemovalEffect::Claimed);
+        assert_eq!(result.cleanup(), Cleanup::Refused);
+        drop(result);
+        assert_eq!(fs::read(claim).unwrap(), b"foreign");
+        assert_eq!(fs::read(saved).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn postclaim_faults_retain_raw_and_forbid_every_cleanup_route() {
+        for cut in [
+            MediaPrimitive::AfterRemovalClaim,
+            MediaPrimitive::BeforeClaimRead,
+            MediaPrimitive::BeforeClaimDelete,
+        ] {
+            let f = Fixture::new();
+            let stage = f.stage();
+            let claim = stage.diagnostic_path().join("raw.flac");
+            let (mut result, hit) = run_with_media_hook(cut, fault, || f.remove(stage));
+            assert!(hit);
+            assert_eq!(result.receipt().effect, RemovalEffect::Claimed);
+            assert_eq!(result.cleanup(), Cleanup::Refused);
+            assert_eq!(result.cleanup(), Cleanup::Refused);
+            drop(result);
+            assert_eq!(fs::read(claim).unwrap(), b"abc");
+            assert!(!f.raw.exists());
+        }
+    }
+
+    #[test]
+    fn applied_but_error_never_earns_deletion_or_empty_stage_cleanup() {
+        for (cut, effect) in [
+            (
+                MediaPrimitive::ClaimAppliedError,
+                RemovalEffect::ClaimUncertain,
+            ),
+            (
+                MediaPrimitive::DeleteAppliedError,
+                RemovalEffect::DeletionUncertain,
+            ),
+            (
+                MediaPrimitive::AfterClaimDelete,
+                RemovalEffect::DeletePending,
+            ),
+        ] {
+            let f = Fixture::new();
+            let stage = f.stage();
+            let path = stage.diagnostic_path();
+            let (mut result, hit) = run_with_media_hook(
+                cut,
+                || Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+                || f.remove(stage),
+            );
+            assert!(hit);
+            assert_eq!(result.receipt().effect, effect, "{:?}", result.receipt());
+            assert_eq!(
+                result.receipt().claim_confirmation,
+                Confirmation::Unverified
+            );
+            assert_eq!(result.cleanup(), Cleanup::Refused);
+            drop(result);
+            assert!(path.is_dir());
+            assert!(!f.raw.exists());
+            if effect == RemovalEffect::ClaimUncertain {
+                assert_eq!(fs::read(path.join("raw.flac")).unwrap(), b"abc");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failures_are_independent_of_known_deletion() {
+        for cut in [
+            MediaPrimitive::RemovalSourceSync,
+            MediaPrimitive::RemovalClaimSync,
+            MediaPrimitive::RemovalParentSync,
+        ] {
+            let f = Fixture::new();
+            let (result, hit) = run_with_media_hook(cut, fault, || f.remove(f.stage()));
+            assert!(hit);
+            let receipt = result.receipt();
+            assert_eq!(receipt.effect, RemovalEffect::Deleted);
+            assert_eq!(receipt.claim_confirmation, Confirmation::Confirmed);
+            assert_eq!(receipt.cleanup, Cleanup::Complete);
+            assert_eq!(
+                receipt.source_durability,
+                if cut == MediaPrimitive::RemovalSourceSync {
+                    Durability::Unproven
+                } else {
+                    Durability::Synced
+                }
+            );
+            assert_eq!(
+                receipt.claim_durability,
+                if cut == MediaPrimitive::RemovalClaimSync {
+                    Durability::Unproven
+                } else {
+                    Durability::Synced
+                }
+            );
+            assert_eq!(
+                receipt.stage_parent_durability,
+                if cut == MediaPrimitive::RemovalParentSync {
+                    Durability::Unproven
+                } else {
+                    Durability::Synced
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_empty_stage_cleanup_retries_without_redeleting() {
+        let f = Fixture::new();
+        let stage = f.stage();
+        let path = stage.diagnostic_path();
+        let (mut result, hit) =
+            run_with_media_hook(MediaPrimitive::StageRemove, fault, || f.remove(stage));
+        assert!(hit);
+        assert_eq!(result.receipt().effect, RemovalEffect::Deleted);
+        assert_eq!(result.receipt().cleanup, Cleanup::Pending);
+        assert!(path.is_dir());
+        fs::write(&f.raw, b"new").unwrap();
+        assert_eq!(result.cleanup(), Cleanup::Complete);
+        assert_eq!(
+            result.receipt().stage_parent_durability,
+            Durability::Unproven
+        );
+        assert_eq!(fs::read(&f.raw).unwrap(), b"new");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stage_recreation_after_cleanup_invalidates_confirmation_and_preserves_competitor() {
+        let f = Fixture::new();
+        let stage = f.stage();
+        let path = stage.diagnostic_path();
+        let recreated = path.clone();
+        let raw = f.raw.clone();
+        let (mut result, hit) = run_with_media_hook(
+            MediaPrimitive::RemovalParentSync,
+            move || {
+                fs::create_dir(&recreated)?;
+                fs::write(recreated.join("raw.flac"), b"foreign")?;
+                fs::write(raw, b"new")
+            },
+            || f.remove(stage),
+        );
+        assert!(hit);
+        assert_eq!(result.receipt().effect, RemovalEffect::Deleted);
+        assert_eq!(
+            result.receipt().claim_confirmation,
+            Confirmation::Unverified
+        );
+        assert_eq!(result.receipt().original_name, OriginalName::Occupied);
+        assert_eq!(result.receipt().cleanup, Cleanup::Refused);
+        assert_eq!(result.cleanup(), Cleanup::Refused);
+        drop(result);
+        assert_eq!(fs::read(path.join("raw.flac")).unwrap(), b"foreign");
+        assert_eq!(fs::read(&f.raw).unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_removal_handle_excludes_write_delete_rename_until_release() {
+        let f = Fixture::new();
+        let raw = f.raw.clone();
+        let renamed = raw.with_extension("renamed");
+        let (result, hit) = run_with_media_hook(
+            MediaPrimitive::BeforeRemovalClaim,
+            move || {
+                assert!(fs::write(&raw, b"xyz").is_err());
+                assert!(fs::remove_file(&raw).is_err());
+                assert!(fs::rename(&raw, renamed).is_err());
+                fault()
+            },
+            || f.remove(f.stage()),
+        );
+        assert!(hit);
+        assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
+        drop(result);
+        fs::write(&f.raw, b"xyz").unwrap();
+        fs::rename(&f.raw, f.raw.with_extension("renamed")).unwrap();
+        fs::remove_file(f.raw.with_extension("renamed")).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn foreign_reader_keeps_accepted_deletion_pending_without_cleanup_authority() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let f = Fixture::new();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&f.raw)
+            .unwrap();
+        let stage = f.stage();
+        let path = stage.diagnostic_path();
+        let mut result = f.remove(stage);
+        assert_eq!(
+            result.receipt().effect,
+            RemovalEffect::DeletePending,
+            "{:?}",
+            result.receipt()
+        );
+        assert_eq!(result.cleanup(), Cleanup::Refused);
+        assert!(path.is_dir());
+        drop(reader);
+        assert_eq!(result.cleanup(), Cleanup::Refused);
+        drop(result);
+        assert!(path.is_dir());
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
+mod removal_rebinding {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn changed_source_or_stage_parent_after_mutation_preserves_actual_effects() {
+        for (cut, replace_parent) in [
+            (MediaPrimitive::AfterRemovalClaim, false),
+            (MediaPrimitive::AfterRemovalClaim, true),
+            (MediaPrimitive::RemovalCompletion, false),
+            (MediaPrimitive::RemovalCompletion, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir_all(temp.path().join("parent/segment")).unwrap();
+            fs::write(temp.path().join("parent/segment/raw.flac"), b"abc").unwrap();
+            let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let parent = MediaDirectory::open(root, Path::new("parent")).unwrap();
+            let source = parent.open_child(OsStr::new("segment")).unwrap().unwrap();
+            let expected = source
+                .observe_file(OsStr::new("raw.flac"))
+                .unwrap()
+                .unwrap();
+            let stage = MediaStage::create(Arc::clone(&parent)).unwrap();
+            let stage_name = stage.name.clone();
+            let target = if replace_parent {
+                temp.path().join("parent")
+            } else {
+                temp.path().join("parent/segment")
+            };
+            let saved = target.with_extension("saved");
+            let target_hook = target.clone();
+            let saved_hook = saved.clone();
+            let (mut result, hit) = run_with_media_hook(
+                cut,
+                move || {
+                    fs::rename(&target_hook, saved_hook)?;
+                    fs::create_dir(&target_hook)?;
+                    fs::write(target_hook.join("sentinel"), b"competitor")
+                },
+                || source.remove_observed(OsStr::new("raw.flac"), &expected, stage),
+            );
+            assert!(hit);
+            assert_eq!(
+                result.receipt().effect,
+                if cut == MediaPrimitive::AfterRemovalClaim {
+                    RemovalEffect::Claimed
+                } else {
+                    RemovalEffect::DeletePending
+                }
+            );
+            assert_eq!(
+                result.receipt().claim_confirmation,
+                Confirmation::Unverified
+            );
+            assert_eq!(result.cleanup(), Cleanup::Refused);
+            assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"competitor");
+            let retained_stage = if replace_parent {
+                saved.join(&stage_name)
+            } else {
+                temp.path().join("parent").join(&stage_name)
+            };
+            drop(result);
+            assert!(retained_stage.is_dir());
+            if cut == MediaPrimitive::AfterRemovalClaim {
+                assert_eq!(fs::read(retained_stage.join("raw.flac")).unwrap(), b"abc");
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_stage_and_preclaim_source_are_preserved() {
+        for cut in [
+            MediaPrimitive::BeforeRemovalClaim,
+            MediaPrimitive::AfterRemovalClaim,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir_all(temp.path().join("parent/segment")).unwrap();
+            fs::write(temp.path().join("parent/segment/raw.flac"), b"abc").unwrap();
+            let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let parent = MediaDirectory::open(root, Path::new("parent")).unwrap();
+            let source = parent.open_child(OsStr::new("segment")).unwrap().unwrap();
+            let expected = source
+                .observe_file(OsStr::new("raw.flac"))
+                .unwrap()
+                .unwrap();
+            let stage = MediaStage::create(parent).unwrap();
+            let target = if cut == MediaPrimitive::BeforeRemovalClaim {
+                source.diagnostic_path().to_owned()
+            } else {
+                stage.diagnostic_path()
+            };
+            let old = target.with_extension("saved");
+            let target_hook = target.clone();
+            let old_hook = old.clone();
+            let (mut result, hit) = run_with_media_hook(
+                cut,
+                move || {
+                    fs::rename(&target_hook, old_hook)?;
+                    fs::create_dir(&target_hook)?;
+                    fs::write(target_hook.join("raw.flac"), b"foreign")
+                },
+                || source.remove_observed(OsStr::new("raw.flac"), &expected, stage),
+            );
+            assert!(hit);
+            assert_eq!(
+                result.receipt().effect,
+                if cut == MediaPrimitive::BeforeRemovalClaim {
+                    RemovalEffect::NotClaimed
+                } else {
+                    RemovalEffect::Claimed
+                }
+            );
+            if cut == MediaPrimitive::AfterRemovalClaim {
+                assert_eq!(result.cleanup(), Cleanup::Refused);
+            }
+            drop(result);
+            assert_eq!(fs::read(target.join("raw.flac")).unwrap(), b"foreign");
+            assert_eq!(fs::read(old.join("raw.flac")).unwrap(), b"abc");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(windows)]
+mod removal_other_volume {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    #[ignore = "requires SOLSTONE_MEDIA_OTHER_ROOT on a separate Windows volume"]
+    fn cross_volume_stage_refuses_without_copy_or_source_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("parent/segment")).unwrap();
+        fs::write(temp.path().join("parent/segment/raw.flac"), b"abc").unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let source = MediaDirectory::open(root, Path::new("parent/segment")).unwrap();
+        let expected = source
+            .observe_file(OsStr::new("raw.flac"))
+            .unwrap()
+            .unwrap();
+        let other =
+            tempfile::tempdir_in(std::env::var_os("SOLSTONE_MEDIA_OTHER_ROOT").unwrap()).unwrap();
+        let other_root = Arc::new(JournalRoot::open(other.path()).unwrap());
+        let parent = MediaDirectory::open(other_root, Path::new("")).unwrap();
+        assert!(!source.identity().same_volume(parent.identity()));
+        let mut result = source.remove_observed(
+            OsStr::new("raw.flac"),
+            &expected,
+            MediaStage::create(parent).unwrap(),
+        );
+        assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
+        assert_eq!(result.cleanup(), Cleanup::Complete);
+        assert_eq!(
+            fs::read(temp.path().join("parent/segment/raw.flac")).unwrap(),
+            b"abc"
+        );
+        assert!(fs::read_dir(other.path()).unwrap().next().is_none());
+    }
+}
