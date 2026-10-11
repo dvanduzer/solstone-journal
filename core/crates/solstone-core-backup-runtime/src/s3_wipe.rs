@@ -39,6 +39,11 @@ pub struct WipeResult {
     pub status: String,
     pub reason_code: Option<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardedWipeResult {
+    pub result: WipeResult,
+    pub deletion_attempted: bool,
+}
 fn failure(reason: impl Into<String>) -> WipeResult {
     WipeResult {
         status: "error".into(),
@@ -394,35 +399,72 @@ pub fn wipe_prefix(
     prefix: &str,
     amz_date: &str,
 ) -> WipeResult {
-    if amz_date.len() != 16 {
-        return failure("failed");
-    }
-    let client = Client {
+    wipe_prefix_guarded(
         transport,
         credentials,
-        amz_date: amz_date.into(),
-    };
-    let keys = match client.list_objects(bucket, prefix) {
-        Ok(keys) => keys,
-        Err(result) => return result,
-    };
-    for batch in keys.chunks(DELETE_OBJECT_BATCH_SIZE) {
-        if let Err(result) = client.delete(bucket, batch) {
-            return result;
+        bucket,
+        prefix,
+        amz_date,
+        &mut || Ok(()),
+    )
+    .result
+}
+
+/// Check freshly before each delete batch and upload abort.
+/// Guard errors must be stable reason codes without sensitive diagnostics.
+/// An attempted deletion may have effects even if its transport returns an error.
+pub fn wipe_prefix_guarded(
+    transport: &dyn HttpTransport,
+    credentials: &S3Credentials,
+    bucket: &str,
+    prefix: &str,
+    amz_date: &str,
+    before_delete: &mut dyn FnMut() -> Result<(), String>,
+) -> GuardedWipeResult {
+    let mut deletion_attempted = false;
+    let result = (|| {
+        if amz_date.len() != 16 {
+            return failure("failed");
         }
-    }
-    let uploads = match client.uploads(bucket, prefix) {
-        Ok(uploads) => uploads,
-        Err(result) => return result,
-    };
-    for (key, upload_id) in uploads {
-        if let Err(result) = client.abort(bucket, &key, &upload_id) {
-            return result;
+        let client = Client {
+            transport,
+            credentials,
+            amz_date: amz_date.into(),
+        };
+        let keys = match client.list_objects(bucket, prefix) {
+            Ok(keys) => keys,
+            Err(result) => return result,
+        };
+        for batch in keys.chunks(DELETE_OBJECT_BATCH_SIZE) {
+            if let Err(reason) = before_delete() {
+                return failure(reason);
+            }
+            deletion_attempted = true;
+            if let Err(result) = client.delete(bucket, batch) {
+                return result;
+            }
         }
-    }
-    WipeResult {
-        status: "ok".into(),
-        reason_code: None,
+        let uploads = match client.uploads(bucket, prefix) {
+            Ok(uploads) => uploads,
+            Err(result) => return result,
+        };
+        for (key, upload_id) in uploads {
+            if let Err(reason) = before_delete() {
+                return failure(reason);
+            }
+            deletion_attempted = true;
+            if let Err(result) = client.abort(bucket, &key, &upload_id) {
+                return result;
+            }
+        }
+        WipeResult {
+            status: "ok".into(),
+            reason_code: None,
+        }
+    })();
+    GuardedWipeResult {
+        result,
+        deletion_attempted,
     }
 }
 
@@ -615,6 +657,294 @@ mod tests {
         );
         assert_eq!(fixture.requests.borrow().len(), 1);
     }
+
+    const NO_OBJECTS: &str =
+        "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+    const NO_UPLOADS: &str =
+        "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
+
+    fn fixture(responses: Vec<Result<crate::hosted_runtime::HttpResponse, HttpError>>) -> Fixture {
+        Fixture {
+            responses: RefCell::new(responses.into()),
+            requests: RefCell::new(vec![]),
+        }
+    }
+
+    #[test]
+    fn guarded_delete_checks_after_complete_listing_and_before_each_batch() {
+        let mut first_page = String::from("<ListBucketResult>");
+        for index in 0..1000 {
+            first_page.push_str(&format!("<Contents><Key>a/b/{index}</Key></Contents>"));
+        }
+        first_page.push_str("<IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>");
+        let second_page = "<ListBucketResult><Contents><Key>a/b/1000</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>";
+        for refuse_at in [Some(1), Some(2), None] {
+            let fixture = fixture(vec![
+                response(&first_page),
+                response(second_page),
+                response("<DeleteResult/>"),
+                response("<DeleteResult/>"),
+                response(NO_UPLOADS),
+            ]);
+            let mut checks = 0;
+            let result = wipe_prefix_guarded(
+                &fixture,
+                &credentials(),
+                "bucket",
+                "a/b/",
+                "20150830T123600Z",
+                &mut || {
+                    checks += 1;
+                    let requests = fixture.requests.borrow();
+                    assert_eq!(requests.len(), 2 + checks - 1);
+                    assert!(requests[1].url.contains("continuation-token=next"));
+                    assert_eq!(
+                        requests.last().unwrap().method,
+                        if checks == 1 { "GET" } else { "POST" }
+                    );
+                    if refuse_at == Some(checks) {
+                        Err(format!("guard_refusal_{checks}"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(checks, refuse_at.unwrap_or(2));
+            assert_eq!(result.deletion_attempted, refuse_at != Some(1));
+            let requests = fixture.requests.borrow();
+            let deletes: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+            let expected_deletes = refuse_at.map_or(2, |check| check - 1);
+            assert_eq!(deletes.len(), expected_deletes);
+            assert_eq!(
+                requests.len(),
+                if refuse_at.is_none() {
+                    5
+                } else {
+                    2 + expected_deletes
+                }
+            );
+            for (request, count) in deletes.iter().zip([1000, 1]) {
+                assert_eq!(
+                    String::from_utf8_lossy(&request.body)
+                        .matches("<Object><Key>")
+                        .count(),
+                    count
+                );
+            }
+            match refuse_at {
+                Some(check) => {
+                    assert_eq!(result.result.status, "error");
+                    assert_eq!(
+                        result.result.reason_code,
+                        Some(format!("guard_refusal_{check}"))
+                    );
+                }
+                None => assert_eq!(
+                    result.result,
+                    WipeResult {
+                        status: "ok".into(),
+                        reason_code: None
+                    }
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_abort_checks_after_complete_listing_and_before_each_upload() {
+        let first_page = "<ListMultipartUploadsResult><Upload><Key>a/b/one</Key><UploadId>upload-one</UploadId></Upload><IsTruncated>true</IsTruncated><NextKeyMarker>a/b/one</NextKeyMarker><NextUploadIdMarker>upload-one</NextUploadIdMarker></ListMultipartUploadsResult>";
+        let second_page = "<ListMultipartUploadsResult><Upload><Key>a/b/two</Key><UploadId>upload-two</UploadId></Upload><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
+        for refuse_at in [Some(1), Some(2), None] {
+            let fixture = fixture(vec![
+                response(NO_OBJECTS),
+                response(first_page),
+                response(second_page),
+                response(""),
+                response(""),
+            ]);
+            let mut checks = 0;
+            let result = wipe_prefix_guarded(
+                &fixture,
+                &credentials(),
+                "bucket",
+                "a/b/",
+                "20150830T123600Z",
+                &mut || {
+                    checks += 1;
+                    let requests = fixture.requests.borrow();
+                    assert_eq!(requests.len(), 3 + checks - 1);
+                    assert!(requests[2].url.contains("key-marker=a%2Fb%2Fone"));
+                    assert!(requests[2].url.contains("upload-id-marker=upload-one"));
+                    assert_eq!(
+                        requests.last().unwrap().method,
+                        if checks == 1 { "GET" } else { "DELETE" }
+                    );
+                    if refuse_at == Some(checks) {
+                        Err(format!("upload_refusal_{checks}"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(checks, refuse_at.unwrap_or(2));
+            assert_eq!(result.deletion_attempted, refuse_at != Some(1));
+            let requests = fixture.requests.borrow();
+            let aborts: Vec<_> = requests.iter().filter(|r| r.method == "DELETE").collect();
+            let expected_aborts = refuse_at.map_or(2, |check| check - 1);
+            assert_eq!(aborts.len(), expected_aborts);
+            assert_eq!(requests.len(), 3 + expected_aborts);
+            for (request, name) in aborts.iter().zip(["one", "two"]) {
+                assert!(request.url.contains(&format!("/bucket/a/b/{name}?")));
+                assert!(request.url.contains(&format!("uploadId=upload-{name}")));
+            }
+            match refuse_at {
+                Some(check) => {
+                    assert_eq!(result.result.status, "error");
+                    assert_eq!(
+                        result.result.reason_code,
+                        Some(format!("upload_refusal_{check}"))
+                    );
+                }
+                None => assert_eq!(
+                    result.result,
+                    WipeResult {
+                        status: "ok".into(),
+                        reason_code: None
+                    }
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_wipe_keeps_attempt_fact_on_destructive_transport_failure() {
+        for abort in [false, true] {
+            let fixture = if abort {
+                fixture(vec![
+                    response(NO_OBJECTS),
+                    response(
+                        "<ListMultipartUploadsResult><Upload><Key>a/b/one</Key><UploadId>upload-one</UploadId></Upload><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>",
+                    ),
+                    Err(HttpError::Timeout),
+                ])
+            } else {
+                fixture(vec![
+                    response(
+                        "<ListBucketResult><Contents><Key>a/b/one</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>",
+                    ),
+                    Err(HttpError::Timeout),
+                ])
+            };
+            let mut checks = 0;
+            let result = wipe_prefix_guarded(
+                &fixture,
+                &credentials(),
+                "bucket",
+                "a/b/",
+                "20150830T123600Z",
+                &mut || {
+                    checks += 1;
+                    Ok(())
+                },
+            );
+            assert_eq!(checks, 1);
+            assert!(result.deletion_attempted);
+            assert_eq!(result.result, failure("timeout"));
+            let requests = fixture.requests.borrow();
+            assert_eq!(requests.len(), if abort { 3 } else { 2 });
+            assert_eq!(
+                requests.last().unwrap().method,
+                if abort { "DELETE" } else { "POST" }
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_wipe_retains_prior_delete_when_upload_listing_or_guard_fails() {
+        for list_failure in [true, false] {
+            let fixture = fixture(vec![
+                response(
+                    "<ListBucketResult><Contents><Key>a/b/one</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>",
+                ),
+                response("<DeleteResult/>"),
+                if list_failure {
+                    Err(HttpError::Timeout)
+                } else {
+                    response(
+                        "<ListMultipartUploadsResult><Upload><Key>a/b/one</Key><UploadId>upload-one</UploadId></Upload><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>",
+                    )
+                },
+            ]);
+            let mut checks = 0;
+            let result = wipe_prefix_guarded(
+                &fixture,
+                &credentials(),
+                "bucket",
+                "a/b/",
+                "20150830T123600Z",
+                &mut || {
+                    checks += 1;
+                    if checks == 2 {
+                        Err("later_hold".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(checks, if list_failure { 1 } else { 2 });
+            assert!(result.deletion_attempted);
+            assert_eq!(
+                result.result,
+                failure(if list_failure {
+                    "timeout"
+                } else {
+                    "later_hold"
+                })
+            );
+            assert_eq!(
+                fixture
+                    .requests
+                    .borrow()
+                    .iter()
+                    .map(|r| r.method.as_str())
+                    .collect::<Vec<_>>(),
+                ["GET", "POST", "GET"]
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_wipe_does_not_claim_attempts_for_empty_or_failed_listing() {
+        for list_failure in [true, false] {
+            let fixture = if list_failure {
+                fixture(vec![Err(HttpError::Unreachable)])
+            } else {
+                fixture(vec![response(NO_OBJECTS), response(NO_UPLOADS)])
+            };
+            let result = wipe_prefix_guarded(
+                &fixture,
+                &credentials(),
+                "bucket",
+                "a/b/",
+                "20150830T123600Z",
+                &mut || panic!("no destructive boundary"),
+            );
+            assert!(!result.deletion_attempted);
+            if list_failure {
+                assert_eq!(result.result, failure("unreachable"));
+            } else {
+                assert_eq!(
+                    result.result,
+                    WipeResult {
+                        status: "ok".into(),
+                        reason_code: None
+                    }
+                );
+            }
+            assert!(fixture.requests.borrow().iter().all(|r| r.method == "GET"));
+        }
+    }
+
     #[test]
     fn debug_redacts_s3_values() {
         let text = format!("{:?}", credentials());

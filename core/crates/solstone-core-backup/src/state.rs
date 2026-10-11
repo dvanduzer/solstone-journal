@@ -6,7 +6,8 @@ use std::path::Path;
 use serde_json::{Map, Value};
 use solstone_core_journal_config::read_journal_config;
 use solstone_core_journal_config_write::{
-    JournalConfigMutation, LockOptions, mutate_journal_config,
+    CommitConfigError, ConfigExpectation, ConfigMutationError, JournalConfigMutation, LockOptions,
+    commit_journal_config, mutate_journal_config,
 };
 
 use crate::{
@@ -172,6 +173,40 @@ pub fn clear_backup_config(journal: &Path) -> Result<(), BackupError> {
         *backup = defaults;
         Ok((changed, ()))
     })
+}
+
+/// Clear an observed backup section while preserving unrelated configuration.
+/// Missing or conflicting state returns false; read/write failures return errors.
+/// This enforces local consistency, not teardown authorization.
+pub fn clear_backup_config_if_unchanged(
+    journal: &Path,
+    expected: &Map<String, Value>,
+) -> Result<bool, BackupError> {
+    let read = read_journal_config(journal).map_err(BackupError::ConfigLoad)?;
+    let (Some(mut config), Some(fingerprint)) = (read.config, read.sha256) else {
+        return Ok(false);
+    };
+    if merge_backup_config(&config) != *expected {
+        return Ok(false);
+    }
+    config.insert("backup".into(), Value::Object(backup_defaults()));
+    run_mutation_hook();
+    match commit_journal_config(
+        journal,
+        ConfigExpectation::Sha256(fingerprint),
+        &config,
+        mutation_lock_options(),
+    ) {
+        Ok(()) => Ok(true),
+        Err(CommitConfigError::Conflict(_)) => Ok(false),
+        Err(CommitConfigError::Load(error)) => Err(BackupError::ConfigLoad(error)),
+        Err(CommitConfigError::Lock(error)) => Err(BackupError::ConfigMutation(
+            ConfigMutationError::Lock(error),
+        )),
+        Err(CommitConfigError::Write(error)) => Err(BackupError::ConfigMutation(
+            ConfigMutationError::Write(error),
+        )),
+    }
 }
 
 pub fn record_backup_result(
@@ -1143,5 +1178,136 @@ mod tests {
         symlink(&sentinel, journal.path().join("config/journal.json.lock")).unwrap();
         assert!(set_enabled(journal.path(), true).is_err());
         assert_eq!(fs::read(&config).unwrap(), before);
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod conditional_clear_tests {
+    use super::*;
+    use serde_json::json;
+    use std::{fs, rc::Rc};
+
+    fn initial() -> Value {
+        json!({
+            "backup": {
+                "enabled":true,
+                "daily_key":"original-key",
+                "destination":{"repository":"s3:bucket/repo","credentials":{"secret":"original-secret"}},
+                "future":{"nested":11}
+            },
+            "retention":{"raw_media":"keep"},
+            "other":{"before":1}
+        })
+    }
+
+    fn write(root: &Path, value: &Value) -> Vec<u8> {
+        fs::create_dir_all(root.join("config")).unwrap();
+        let bytes = serde_json::to_vec(value).unwrap();
+        fs::write(root.join("config/journal.json"), &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn conditional_clear_matches_merged_legacy_and_preserves_unrelated_config() {
+        let root = tempfile::tempdir().unwrap();
+        let mut value = initial();
+        write(root.path(), &value);
+        let expected = get_backup_config(root.path()).unwrap();
+        assert_eq!(expected["daily_key"], "original-key");
+        assert_eq!(expected["future"]["nested"], 11);
+        assert_eq!(expected["retention"]["hourly"], 24);
+        assert!(expected["destination"]["backend"].is_null());
+        value["other"]["after"] = json!(2);
+        write(root.path(), &value);
+
+        assert!(clear_backup_config_if_unchanged(root.path(), &expected).unwrap());
+        value["backup"] = Value::Object(backup_defaults());
+        let actual: Value =
+            serde_json::from_slice(&fs::read(root.path().join("config/journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(actual, value);
+    }
+
+    #[test]
+    fn conditional_clear_refuses_each_changed_key_credential_and_unknown_field() {
+        for (pointer, changed) in [
+            ("/backup/daily_key", json!("new-key")),
+            (
+                "/backup/destination/credentials/secret",
+                json!("new-secret"),
+            ),
+            ("/backup/future/nested", json!(12)),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut value = initial();
+            write(root.path(), &value);
+            let expected = get_backup_config(root.path()).unwrap();
+            *value.pointer_mut(pointer).unwrap() = changed;
+            let before = write(root.path(), &value);
+
+            assert!(!clear_backup_config_if_unchanged(root.path(), &expected).unwrap());
+            assert_eq!(
+                fs::read(root.path().join("config/journal.json")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_clear_leaves_missing_directory_and_corrupt_config_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!clear_backup_config_if_unchanged(root.path(), &backup_defaults()).unwrap());
+        assert!(!root.path().join("config").exists());
+        assert!(!root.path().join("config/journal.json.lock").exists());
+
+        fs::create_dir(root.path().join("config")).unwrap();
+        let path = root.path().join("config/journal.json");
+        fs::write(&path, b"{broken").unwrap();
+        assert!(matches!(
+            clear_backup_config_if_unchanged(root.path(), &backup_defaults()),
+            Err(BackupError::ConfigLoad(_))
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"{broken");
+        assert!(!root.path().join("config/journal.json.lock").exists());
+    }
+
+    #[test]
+    fn conditional_clear_cas_preserves_newer_disappeared_and_malformed_state() {
+        for change in ["backup", "unrelated", "disappeared", "malformed"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut value = initial();
+            write(root.path(), &value);
+            let expected = get_backup_config(root.path()).unwrap();
+            let replacement = match change {
+                "backup" => {
+                    value["backup"]["daily_key"] = json!("replacement-key");
+                    Some(serde_json::to_vec(&value).unwrap())
+                }
+                "unrelated" => {
+                    value["other"]["after"] = json!(2);
+                    Some(serde_json::to_vec(&value).unwrap())
+                }
+                "malformed" => Some(b"{replacement-broken".to_vec()),
+                _ => None,
+            };
+            let path = root.path().join("config/journal.json");
+            let hook_path = path.clone();
+            let hook_replacement = replacement.clone();
+            let _hook = install_mutation_hook(Rc::new(move || match &hook_replacement {
+                Some(bytes) => fs::write(&hook_path, bytes).unwrap(),
+                None => fs::remove_file(&hook_path).unwrap(),
+            }));
+
+            let result = clear_backup_config_if_unchanged(root.path(), &expected);
+            if change == "malformed" {
+                assert!(matches!(result, Err(BackupError::ConfigLoad(_))));
+            } else {
+                assert!(!result.unwrap());
+            }
+            match replacement {
+                Some(bytes) => assert_eq!(fs::read(path).unwrap(), bytes),
+                None => assert!(!path.exists(), "refusal must not materialize config"),
+            }
+        }
     }
 }

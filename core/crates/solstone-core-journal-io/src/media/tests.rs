@@ -60,7 +60,8 @@ fn full_identity_is_lossless_and_strict() {
     assert!(checked_length(u64::MAX, 1).is_err());
 }
 
-#[cfg(all(unix, feature = "full-tests"))]
+#[cfg(unix)]
+#[cfg(all(test, feature = "full-tests"))]
 mod native {
     use super::*;
     use std::fs;
@@ -205,6 +206,7 @@ mod native {
         let f = Fixture::new();
         let mut target = f.target();
         let path = target.stage.diagnostic_path().join("payload");
+        assert!(!target.helper_transport_issued());
         let transport = target.helper_transport().unwrap();
         #[cfg(target_os = "linux")]
         assert_eq!(
@@ -221,6 +223,7 @@ mod native {
         );
         let owned = transport.descriptor.try_clone_to_owned().unwrap();
         drop(transport);
+        assert!(target.helper_transport_issued());
         assert!(target.helper_transport().is_err());
         fs::rename(&path, path.with_extension("moved")).unwrap();
         fs::write(&path, b"competitor").unwrap();
@@ -380,7 +383,7 @@ mod native {
     }
 }
 
-#[cfg(feature = "full-tests")]
+#[cfg(all(test, feature = "full-tests"))]
 mod archive_input {
     use super::*;
     use std::fs;
@@ -588,7 +591,8 @@ mod archive_input {
     }
 }
 
-#[cfg(all(windows, feature = "full-tests"))]
+#[cfg(windows)]
+#[cfg(all(test, feature = "full-tests"))]
 mod windows_native {
     use super::*;
     use std::fs::{self, OpenOptions};
