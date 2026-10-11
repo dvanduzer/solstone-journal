@@ -431,6 +431,9 @@ impl OwnedOffloadCliRun {
                     "a read-only offload preview is unavailable. no offload work was started."
                 }
                 "platform_unavailable" => "offload execution is unavailable on this platform.",
+                "namespace_cooperation_held" => {
+                    "media offload is paused in this version. no offload work was started."
+                }
                 "installed_tool_unavailable" => {
                     "use the installed solstone command with its packaged backup tool."
                 }

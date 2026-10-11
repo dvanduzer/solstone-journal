@@ -111,37 +111,6 @@ mod owned_offload_tests {
     use super::*;
 
     #[test]
-    fn production_offload_dispatch_retains_the_same_executor_root_refusal() {
-        let temp = tempfile::tempdir().unwrap();
-        let missing = temp.path().join("missing-journal");
-        for args in [
-            vec!["run".into(), "backup:offload".into()],
-            vec!["--verbose".into(), "run".into(), "backup:offload".into()],
-            vec!["run".into(), "backup:offload".into(), "--".into()],
-        ] {
-            let outcome = run_cli(&args, &missing);
-            let CliOutcome::Offload(run) = &outcome else {
-                panic!("whole offload outcome required")
-            };
-            use solstone_core_offload::cli_run::{CliPrelaunchRefusal, CliRunPhase};
-            assert_eq!(run.phase(), CliRunPhase::Prelaunch);
-            assert!(
-                matches!(run.prelaunch_refusal(), Some(CliPrelaunchRefusal::Root(_)))
-                    && cfg!(target_os = "linux")
-                    || matches!(
-                        run.prelaunch_refusal(),
-                        Some(CliPrelaunchRefusal::UnsupportedPlatform)
-                    ) && !cfg!(target_os = "linux")
-            );
-            assert!(run.preparation_custody().is_none());
-            assert!(run.observed().planning_phase.is_none());
-            assert!(run.runtime().is_none());
-            assert_ne!(outcome.output().2, 0);
-            assert!(!missing.exists());
-        }
-    }
-
-    #[test]
     fn valid_dry_run_retains_finite_prelaunch_outcome_without_resolution() {
         for args in [
             vec!["run".into(), "backup:offload".into(), "--dry-run".into()],

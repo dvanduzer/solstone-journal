@@ -1423,8 +1423,12 @@ fn native_backup_grammar_never_reaches_a_poisoned_interpreter() {
         );
         if argv == ["offload", "run"] {
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains("offload did not finish."),
-                "empty configuration must retain the actual offload refusal"
+                String::from_utf8_lossy(&output.stderr).contains(if cfg!(target_os = "linux") {
+                    "media offload is paused in this version."
+                } else {
+                    "offload execution is unavailable on this platform."
+                }),
+                "offload must refuse before any work while it is paused"
             );
         }
         if argv == ["off", "--yes"] {
