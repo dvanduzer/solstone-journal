@@ -150,7 +150,11 @@ impl Fixture {
         self.temp.path().join("health/offload/20261009.jsonl")
     }
     fn marker(&self) -> PathBuf {
-        self.temp.path().join("health/20261009/stream.updated")
+        solstone_core_journal_io::health_marker::health_marker_path(
+            self.temp.path(),
+            &self.locator.target.day,
+            solstone_core_journal_io::health_marker::HealthMarkerKind::Stream,
+        )
     }
 
     fn staged<'a>(&self, allowed: &'a Cell<bool>) -> StagedRestore<'a, 'static> {
@@ -209,7 +213,21 @@ impl Fixture {
 
 #[test]
 fn actual_publish_records_intent_marker_and_exact_event_without_recount_on_replay() {
+    use solstone_core_journal_io::health_marker::{
+        DayMarkerPairStatus, HealthMarkerKind, HealthMarkerState, day_marker_pair_status,
+        read_health_marker,
+    };
+
     let f = Fixture::new(false);
+    let day = &f.locator.target.day;
+    assert_eq!(
+        read_health_marker(f.temp.path(), day, HealthMarkerKind::Stream).unwrap(),
+        HealthMarkerState::Absent
+    );
+    assert_eq!(
+        day_marker_pair_status(f.temp.path(), day).unwrap(),
+        DayMarkerPairStatus::Complete
+    );
     let allowed = Cell::new(true);
     let result = f.staged(&allowed).commit(2, options());
     assert!(result.hold.is_none(), "{:?}", result.hold);
@@ -220,7 +238,34 @@ fn actual_publish_records_intent_marker_and_exact_event_without_recount_on_repla
     assert_eq!(record.intent.event_recorded, Obligation::Complete);
     assert_eq!(record.intent.cleanup, Obligation::Complete);
     assert!(record.writes.iter().all(StoreWriteReceipt::fully_confirmed));
-    assert!(f.marker().exists());
+    let HealthMarkerState::Versioned { marker, .. } =
+        read_health_marker(f.temp.path(), day, HealthMarkerKind::Stream).unwrap()
+    else {
+        panic!("restore must publish the canonical stream marker");
+    };
+    assert_eq!(marker.generation, 1);
+    assert_eq!(
+        result
+            .marker
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .generation(),
+        marker.generation
+    );
+    assert_eq!(
+        day_marker_pair_status(f.temp.path(), day).unwrap(),
+        DayMarkerPairStatus::Dirty
+    );
+    assert!(
+        !f.temp
+            .path()
+            .join("health/20261009/stream.updated")
+            .exists()
+    );
+    assert_eq!(result.marker_ancestor_sync.len(), 3);
+    assert!(result.marker_ancestor_sync.iter().all(Result::is_ok));
     let id = record.intent.event.operation_id.clone();
     let before = fs::read(f.ledger()).unwrap();
     let owner = result.owner;
@@ -229,6 +274,12 @@ fn actual_publish_records_intent_marker_and_exact_event_without_recount_on_repla
     assert!(replayed.hold.is_none(), "{:?}", replayed.hold);
     assert_eq!(replayed.effects, AttemptEffects::default());
     assert_eq!(fs::read(f.ledger()).unwrap(), before);
+    let HealthMarkerState::Versioned { marker: after, .. } =
+        read_health_marker(f.temp.path(), day, HealthMarkerKind::Stream).unwrap()
+    else {
+        panic!("replay must preserve the canonical stream marker");
+    };
+    assert_eq!(after, marker);
 }
 
 #[test]

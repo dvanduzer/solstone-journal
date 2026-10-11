@@ -362,7 +362,7 @@ fn finished_native_facts(
         write.named_read_confirmed && write.durability == [Some(Durability::Synced); 4]
     }));
     assert!(facts.marker.as_ref().unwrap().is_ok());
-    assert_eq!(facts.marker_ancestor_sync.len(), 2);
+    assert_eq!(facts.marker_ancestor_sync.len(), 3);
     assert!(facts.marker_ancestor_sync.iter().all(Result::is_ok));
     let ledger = facts.ledger.unwrap();
     assert!(ledger.confirmed && ledger.durability == [true; 4]);

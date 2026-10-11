@@ -990,23 +990,40 @@ impl TransactionOutcome<'_, '_> {
         use solstone_core_journal_io::media::MediaDirectory;
         use solstone_core_journal_io::{FlatDirectory, create_or_open_flat_directory_bound};
         let root = Arc::clone(self.owner.root());
-        let health = FlatDirectory::open(&root, std::path::Path::new("health"))
-            .map_err(|error| Hold::Admission(error.to_string()))?;
         let day = &self.record()?.intent.locator.target.day;
+        let chronicle_relative = std::path::Path::new("chronicle");
+        let day_relative = chronicle_relative.join(day);
+        let chronicle = FlatDirectory::open(&root, chronicle_relative)
+            .map_err(|error| Hold::Admission(error.to_string()))?;
+        let day_parent = FlatDirectory::open(&root, &day_relative)
+            .map_err(|error| Hold::Admission(error.to_string()))?;
+        let chronicle_guard = MediaDirectory::open(Arc::clone(&root), chronicle_relative)
+            .map_err(|error| Hold::Admission(error.to_string()))?;
+        let day_guard = MediaDirectory::open(Arc::clone(&root), &day_relative)
+            .map_err(|error| Hold::Admission(error.to_string()))?;
+        if chronicle.identity() != chronicle_guard.object_identity()
+            || day_parent.identity() != day_guard.object_identity()
+        {
+            return Err(Hold::Marker);
+        }
+        self.owner.native_check()?;
+        chronicle_guard.revalidate().map_err(|_| Hold::Marker)?;
+        day_guard.revalidate().map_err(|_| Hold::Marker)?;
         let day_health = create_or_open_flat_directory_bound(
-            &health,
-            OsStr::new(day),
+            &day_parent,
+            OsStr::new("health"),
             0o700,
-            &root.canonical_path().join("health"),
+            &root.canonical_path().join(&day_relative),
         )
         .map_err(|error| Hold::Admission(error.to_string()))?;
-        let named =
-            MediaDirectory::open(Arc::clone(&root), &std::path::Path::new("health").join(day))
-                .map_err(|error| Hold::Admission(error.to_string()))?;
+        let named = MediaDirectory::open(Arc::clone(&root), &day_relative.join("health"))
+            .map_err(|error| Hold::Admission(error.to_string()))?;
         if day_health.identity() != named.object_identity() {
             return Err(Hold::Marker);
         }
         self.owner.native_check()?;
+        chronicle_guard.revalidate().map_err(|_| Hold::Marker)?;
+        day_guard.revalidate().map_err(|_| Hold::Marker)?;
         named.revalidate().map_err(|_| Hold::Marker)?;
         let publication = bump_stream_marker_bound(&day_health, options);
         let confirmed = publication.as_ref().is_ok_and(|receipt| {
@@ -1015,13 +1032,17 @@ impl TransactionOutcome<'_, '_> {
                 && receipt.lock_error().is_none()
         });
         self.marker = Some(publication);
-        // The marker's atomic leaf syncs its own parent. The caller created the
-        // day-health entry and owes the remaining ancestors independently.
+        // The atomic leaf syncs health. Keep actual day/chronicle/root sync
+        // facts separate from the canonical parent/name checks below.
         self.marker_ancestor_sync
-            .push(nix::unistd::fsync(&health).map_err(std::io::Error::from));
+            .push(nix::unistd::fsync(&day_parent).map_err(std::io::Error::from));
+        self.marker_ancestor_sync
+            .push(nix::unistd::fsync(&chronicle).map_err(std::io::Error::from));
         self.marker_ancestor_sync
             .push(nix::unistd::fsync(root.as_ref()).map_err(std::io::Error::from));
         let bound = named.revalidate().is_ok()
+            && day_guard.revalidate().is_ok()
+            && chronicle_guard.revalidate().is_ok()
             && day_health.revalidate().is_ok()
             && self.owner.native_check().is_ok();
         if !confirmed || !bound || self.marker_ancestor_sync.iter().any(Result::is_err) {

@@ -170,7 +170,7 @@ impl DetachedTransaction {
                         solstone_core_journal_io::atomic::BoundAtomicOutcome::Published { .. }
                     ) || marker.binding_error().is_some()
                         || marker.lock_error().is_some()
-                        || receipts.marker_ancestor_sync.len() != 2
+                        || receipts.marker_ancestor_sync.len() != 3
                         || !receipts.marker_ancestor_sync.iter().all(Result::is_ok)
                     {
                         return Err(refusal());
