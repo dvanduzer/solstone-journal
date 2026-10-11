@@ -104,6 +104,40 @@ fn exclusive_roles_are_non_reentrant_and_entry_survives_release() {
     assert_eq!(fs::read(f.temp.path().join(ENTRY)).unwrap(), b"");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn existing_only_admission_retains_guard_after_final_validation_failure_and_never_creates() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let missing = ActivityLease::try_acquire_existing(f.root.clone())
+        .err()
+        .unwrap();
+    assert!(missing.lease.is_none());
+    assert!(!f.temp.path().join(ENTRY).exists());
+    drop(ActivityLease::try_acquire(f.root.clone()).unwrap());
+    let path = f.temp.path().to_owned();
+    let refused = ActivityLease::acquire_existing_with(f.root.clone(), |_| {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    })
+    .err()
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(refused.lease.is_some());
+    assert!(matches!(
+        refused.error,
+        ActivityAdmissionError::Unavailable(_)
+    ));
+    busy(ActivityLease::try_acquire(f.root.clone()));
+    let refused = std::thread::spawn(move || refused).join().unwrap();
+    busy(ActivityLease::try_acquire(f.root.clone()));
+    drop(refused);
+    ActivityLease::try_acquire_existing(f.root.clone())
+        .ok()
+        .unwrap()
+        .revalidate()
+        .unwrap();
+}
+
 #[test]
 #[ignore = "invoked only by the owning two-process control"]
 fn child_admission_probe() {

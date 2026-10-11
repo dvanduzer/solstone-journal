@@ -283,7 +283,9 @@ impl RootActivityCarrier {
     }
 
     pub fn observation(&self) -> RootCarrierObservation<'_> {
-        RootCarrierObservation { owner: &self.owner }
+        RootCarrierObservation {
+            owner: ObservationOwner::Live(&self.owner),
+        }
     }
 
     /// Requires actual settlement of every child and HTTP writer and qualified
@@ -393,7 +395,9 @@ impl RootTeardownCarrier {
         self.owner.revalidate_empty()
     }
     pub fn observation(&self) -> RootCarrierObservation<'_> {
-        RootCarrierObservation { owner: &self.owner }
+        RootCarrierObservation {
+            owner: ObservationOwner::Live(&self.owner),
+        }
     }
 
     /// Requires actual child/HTTP settlement and qualified namespace cooperation,
@@ -455,7 +459,12 @@ impl std::fmt::Debug for TeardownCarrierPreparationFailure {
 /// Borrow of one actual prepared root carrier. No saved name or identity can
 /// construct it; the owner and original role remain borrowed throughout census.
 pub struct RootCarrierObservation<'a> {
-    owner: &'a CarrierOwner,
+    owner: ObservationOwner<'a>,
+}
+
+enum ObservationOwner<'a> {
+    Live(&'a CarrierOwner),
+    Recovered(&'a crate::archive_recovery::RecoveredArchiveReservation),
 }
 
 #[derive(Eq, PartialEq)]
@@ -465,12 +474,27 @@ pub(crate) struct CarrierMatch {
 }
 
 impl RootCarrierObservation<'_> {
+    pub(crate) fn recovered(
+        owner: &crate::archive_recovery::RecoveredArchiveReservation,
+    ) -> RootCarrierObservation<'_> {
+        RootCarrierObservation {
+            owner: ObservationOwner::Recovered(owner),
+        }
+    }
+
     pub(crate) fn validate(&self, root: &Arc<JournalRoot>) -> io::Result<CarrierMatch> {
-        if !Arc::ptr_eq(root, self.owner.activity.journal_root()) {
+        let owner = match self.owner {
+            ObservationOwner::Recovered(owner) => {
+                let (name, identity) = owner.match_root(root)?;
+                return Ok(CarrierMatch { name, identity });
+            }
+            ObservationOwner::Live(owner) => owner,
+        };
+        if !Arc::ptr_eq(root, owner.activity.journal_root()) {
             return Err(invalid("carrier belongs to another original root"));
         }
-        self.owner.revalidate_empty()?;
-        let stage = self.owner.stage.as_ref().ok_or_else(changed)?;
+        owner.revalidate_empty()?;
+        let stage = owner.stage.as_ref().ok_or_else(changed)?;
         if stage.parent.object_identity() != root.identity() {
             return Err(invalid("carrier is not a root reservation"));
         }
@@ -478,7 +502,7 @@ impl RootCarrierObservation<'_> {
             name: stage.name.clone(),
             identity: stage.directory.as_ref().ok_or_else(changed)?.identity(),
         };
-        self.owner.revalidate_empty()?;
+        owner.revalidate_empty()?;
         Ok(matched)
     }
 }

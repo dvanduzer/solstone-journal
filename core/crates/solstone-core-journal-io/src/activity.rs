@@ -127,7 +127,74 @@ pub struct ActivityLease {
     inner: Admission,
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) struct ExistingActivityFailure {
+    pub(crate) lease: Option<Arc<ActivityLease>>,
+    pub(crate) error: ActivityAdmissionError,
+}
+
 impl ActivityLease {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn try_acquire_existing(
+        root: Arc<JournalRoot>,
+    ) -> Result<Arc<Self>, ExistingActivityFailure> {
+        Self::acquire_existing_with(root, |_| {})
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acquire_existing_with(
+        root: Arc<JournalRoot>,
+        after_acquisition: impl FnOnce(&ActivityLease),
+    ) -> Result<Arc<Self>, ExistingActivityFailure> {
+        let failure = |error| ExistingActivityFailure { lease: None, error };
+        root.revalidate_canonical_binding().map_err(|error| {
+            failure(ActivityAdmissionError::Unavailable(
+                ActivityUnavailable::Root(error),
+            ))
+        })?;
+        let guard = match crate::locking::open_existing_parent_lock_retained(
+            root.as_ref(),
+            OsStr::new(ENTRY),
+            Duration::ZERO,
+            Duration::ZERO,
+        ) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                return Err(failure(entry_error(
+                    ExistingParentLockError::NamespaceChanged { path: ENTRY.into() },
+                )));
+            }
+            Err(refused) => {
+                let lease = refused.guard.map(|guard| {
+                    Arc::new(Self {
+                        inner: Admission {
+                            root,
+                            guard: Mutex::new(guard),
+                        },
+                    })
+                });
+                return Err(ExistingActivityFailure {
+                    lease,
+                    error: entry_error(refused.error),
+                });
+            }
+        };
+        let lease = Arc::new(Self {
+            inner: Admission {
+                root,
+                guard: Mutex::new(guard),
+            },
+        });
+        after_acquisition(&lease);
+        if let Err(error) = lease.revalidate() {
+            return Err(ExistingActivityFailure {
+                lease: Some(lease),
+                error,
+            });
+        }
+        Ok(lease)
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn recovery_lock_observation(
         &self,

@@ -84,6 +84,41 @@ pub struct NativeObligations {
     entries: Vec<NativeObligation>,
 }
 
+/// Available evidence from an incomplete sole walk. It is never a census.
+pub struct IncompleteRecoveryObservation {
+    root: Arc<JournalRoot>,
+    entries: Vec<NativeObligation>,
+    encountered: Option<(PathBuf, MediaEntry)>,
+    error: RecoveryObservationError,
+}
+
+impl fmt::Debug for IncompleteRecoveryObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IncompleteRecoveryObservation")
+            .field("entries", &self.entries)
+            .field("encountered", &self.encountered)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IncompleteRecoveryObservation {
+    pub fn root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+    pub fn entries(&self) -> &[NativeObligation] {
+        &self.entries
+    }
+    pub fn encountered(&self) -> Option<(&Path, &MediaEntry)> {
+        self.encountered
+            .as_ref()
+            .map(|(path, entry)| (path.as_path(), entry))
+    }
+    pub fn error(&self) -> &RecoveryObservationError {
+        &self.error
+    }
+}
+
 impl NativeObligations {
     pub fn entries(&self) -> &[NativeObligation] {
         &self.entries
@@ -229,6 +264,7 @@ struct Reader<F> {
     limits: Limits,
     budget: Budget,
     obligations: Vec<NativeObligation>,
+    encountered: Option<(PathBuf, MediaEntry)>,
     checkpoint: F,
 }
 
@@ -310,19 +346,53 @@ fn observe_with(
     limits: Limits,
     checkpoint: impl FnMut(Checkpoint, &Path),
 ) -> Result<NativeObligations, RecoveryObservationError> {
+    observe_retained_with(root, limits, checkpoint).map_err(|failure| failure.error)
+}
+
+pub(crate) fn observe_retained(
+    root: &Arc<JournalRoot>,
+) -> Result<NativeObligations, Box<IncompleteRecoveryObservation>> {
+    observe_retained_with(root, Limits::default(), |_, _| {})
+}
+
+fn observe_retained_with(
+    root: &Arc<JournalRoot>,
+    limits: Limits,
+    checkpoint: impl FnMut(Checkpoint, &Path),
+) -> Result<NativeObligations, Box<IncompleteRecoveryObservation>> {
+    let early = |error| {
+        Box::new(IncompleteRecoveryObservation {
+            root: Arc::clone(root),
+            entries: Vec::new(),
+            encountered: None,
+            error,
+        })
+    };
     root.revalidate_canonical_binding()
-        .map_err(|source| io_error(Path::new(""), io::Error::other(source)))?;
+        .map_err(|source| early(io_error(Path::new(""), io::Error::other(source))))?;
     let directory = MediaDirectory::open(Arc::clone(root), Path::new(""))
-        .map_err(|source| io_error(Path::new(""), source))?;
+        .map_err(|source| early(io_error(Path::new(""), source)))?;
     let mut reader = Reader {
         limits,
         budget: Budget::default(),
         obligations: Vec::new(),
+        encountered: None,
         checkpoint,
     };
-    reader.walk(&directory, Path::new(""), Role::Root)?;
-    root.revalidate_canonical_binding()
-        .map_err(|source| io_error(Path::new(""), io::Error::other(source)))?;
+    let result = reader
+        .walk(&directory, Path::new(""), Role::Root)
+        .and_then(|()| {
+            root.revalidate_canonical_binding()
+                .map_err(|source| io_error(Path::new(""), io::Error::other(source)))
+        });
+    if let Err(error) = result {
+        return Err(Box::new(IncompleteRecoveryObservation {
+            root: Arc::clone(root),
+            entries: reader.obligations,
+            encountered: reader.encountered,
+            error,
+        }));
+    }
     Ok(NativeObligations {
         entries: reader.obligations,
     })
@@ -377,6 +447,7 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
         role: Role,
     ) -> Result<(), RecoveryObservationError> {
         let relative = relative.join(&entry.name);
+        self.encountered = Some((relative.clone(), entry.clone()));
         if entry.kind != JournalEntryKind::Directory {
             return Err(error(RecoveryObservationFailure::NotDirectory, &relative));
         }
@@ -387,7 +458,9 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
         if child.identity() != entry.identity {
             return Err(error(RecoveryObservationFailure::Changed, &relative));
         }
-        self.walk(&child, &relative, role)
+        self.walk(&child, &relative, role)?;
+        self.encountered = None;
+        Ok(())
     }
 
     fn frontier(
@@ -422,6 +495,7 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
         relative: &Path,
     ) -> Result<(), RecoveryObservationError> {
         let relative = relative.join(&entry.name);
+        self.encountered = Some((relative.clone(), entry.clone()));
         let contents = match operation_from_name(&entry.name) {
             None => IntentRead::UnknownEntry,
             Some(_) if entry.kind != JournalEntryKind::RegularFile => IntentRead::NotPlainFile,
@@ -455,7 +529,9 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
                 contents,
             },
             &relative,
-        )
+        )?;
+        self.encountered = None;
+        Ok(())
     }
 
     fn walk(
@@ -483,6 +559,7 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
                 .is_some_and(|name| name.starts_with(".tmp-offload-"))
             {
                 let stage_relative = relative.join(&entry.name);
+                self.encountered = Some((stage_relative.clone(), entry.clone()));
                 self.add(
                     NativeObligation::Stage {
                         relative: stage_relative.clone(),
@@ -490,6 +567,7 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
                     },
                     &stage_relative,
                 )?;
+                self.encountered = None;
             } else if let Role::Chronicle(depth @ 0..=1) = role {
                 match entry.kind {
                     JournalEntryKind::Directory => {
@@ -658,6 +736,51 @@ mod tests {
             self.directory("health/offload/restore-intents");
             self.path("health/offload/restore-intents")
         }
+    }
+
+    #[test]
+    fn incomplete_walk_retains_prior_stage_and_listed_intent_before_read_or_budget_failure() {
+        let f = Fixture::new();
+        f.directory(".tmp-offload-prior");
+        let name = format!("{}.json", "a".repeat(32));
+        let intent = f.intents().join(&name);
+        fs::write(&intent, b"saved bytes").unwrap();
+        let relative = Path::new("health/offload/restore-intents").join(&name);
+        let before = observe_obligations(&f.root).unwrap().into_entries();
+        let failure = observe_retained_with(&f.root, Limits::default(), |point, path| {
+            if point == Checkpoint::Listed && path == Path::new("health/offload/restore-intents") {
+                fs::remove_file(&intent).unwrap();
+            }
+        })
+        .unwrap_err();
+        assert_eq!(failure.entries(), &before[..1]);
+        let (path, entry) = failure.encountered().unwrap();
+        assert_eq!(path, relative);
+        let NativeObligation::Intent {
+            entry: expected, ..
+        } = &before[1]
+        else {
+            panic!()
+        };
+        assert_eq!(entry, expected);
+        assert_eq!(failure.error().relative, relative);
+        assert_eq!(failure.error().failure, RecoveryObservationFailure::Changed);
+        fs::write(&intent, b"saved bytes").unwrap();
+        let failure = observe_retained_with(
+            &f.root,
+            Limits {
+                intent_bytes: 0,
+                ..Limits::default()
+            },
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert_eq!(failure.entries().len(), 1);
+        assert_eq!(failure.encountered().unwrap().0, relative);
+        assert_eq!(
+            failure.error().failure,
+            RecoveryObservationFailure::Budget(RecoveryBudget::IntentBytes)
+        );
     }
 
     #[cfg(unix)]
