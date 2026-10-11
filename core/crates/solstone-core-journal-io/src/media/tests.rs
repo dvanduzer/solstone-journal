@@ -383,6 +383,7 @@ mod native {
     use std::os::unix::fs::symlink;
 
     struct Fixture {
+        activity: Arc<crate::activity::ActivityLease>,
         temp: tempfile::TempDir,
         parent: Arc<MediaDirectory>,
         destination: Arc<MediaDirectory>,
@@ -394,10 +395,12 @@ mod native {
             fs::create_dir_all(temp.path().join("day/segment")).unwrap();
             fs::write(temp.path().join("day/input"), b"source media").unwrap();
             let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let activity = crate::activity::ActivityLease::try_acquire(root.clone()).unwrap();
             let parent = MediaDirectory::open(root.clone(), Path::new("day")).unwrap();
             let destination = MediaDirectory::open(root, Path::new("day/segment")).unwrap();
             let digest = digest_reader(&mut &b"source media"[..]).unwrap();
             Self {
+                activity,
                 temp,
                 parent,
                 destination,
@@ -405,7 +408,7 @@ mod native {
             }
         }
         fn target(&self) -> OwnedMediaTarget {
-            MediaStage::create(self.parent.clone())
+            MediaStage::create(self.parent.clone(), self.activity.clone())
                 .unwrap()
                 .create_target()
                 .unwrap()
@@ -722,13 +725,14 @@ mod archive_input {
         )
         .unwrap();
         let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let activity = crate::activity::ActivityLease::try_acquire(root.clone()).unwrap();
         let parent = MediaDirectory::open(root.clone(), Path::new("day")).unwrap();
         let destination = MediaDirectory::open(root, Path::new("day/segment")).unwrap();
         let expected = MediaDigest {
             size: 26,
             sha256: "75120243cd13919b80d6f64ae1b1fa974cdf99b8c7d95c7f02d3e5d943d182d3".into(),
         };
-        let mut prepared = MediaStage::create(parent.clone())
+        let mut prepared = MediaStage::create(parent.clone(), activity.clone())
             .unwrap()
             .create_named_target(OsStr::new("audio.flac"))
             .unwrap()
@@ -848,11 +852,12 @@ mod archive_input {
         fs::create_dir(temp.path().join("day")).unwrap();
         fs::write(temp.path().join("day/input"), b"abc").unwrap();
         let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let activity = crate::activity::ActivityLease::try_acquire(root.clone()).unwrap();
         let root_directory = MediaDirectory::open(root.clone(), Path::new("")).unwrap();
         assert_eq!(root_directory.object_identity(), root.identity());
         let parent = MediaDirectory::open(root.clone(), Path::new("day")).unwrap();
         for invalid in ["", "..", "../audio.flac", "CON", "x:y", "x\\y"] {
-            let mut failed = MediaStage::create(parent.clone())
+            let mut failed = MediaStage::create(parent.clone(), activity.clone())
                 .unwrap()
                 .create_named_target(OsStr::new(invalid))
                 .err()
@@ -870,7 +875,7 @@ mod archive_input {
             size: 3,
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
         };
-        let target = MediaStage::create(parent.clone())
+        let target = MediaStage::create(parent.clone(), activity.clone())
             .unwrap()
             .create_named_target(OsStr::new("audio.flac"))
             .unwrap();
@@ -917,6 +922,7 @@ mod windows_native {
     };
 
     struct Fixture {
+        activity: Arc<crate::activity::ActivityLease>,
         parent: Arc<MediaDirectory>,
         destination: Arc<MediaDirectory>,
         digest: MediaDigest,
@@ -931,10 +937,12 @@ mod windows_native {
             fs::create_dir_all(temp.path().join("day/segment")).unwrap();
             fs::write(temp.path().join("day/input"), b"source media").unwrap();
             let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let activity = crate::activity::ActivityLease::try_acquire(root.clone()).unwrap();
             let parent = MediaDirectory::open(root.clone(), Path::new("day")).unwrap();
             let destination = MediaDirectory::open(root, Path::new("day/segment")).unwrap();
             let digest = digest_reader(&mut &b"source media"[..]).unwrap();
             Self {
+                activity,
                 parent,
                 destination,
                 digest,
@@ -942,7 +950,7 @@ mod windows_native {
             }
         }
         fn target(&self) -> OwnedMediaTarget {
-            MediaStage::create(self.parent.clone())
+            MediaStage::create(self.parent.clone(), self.activity.clone())
                 .unwrap()
                 .create_target()
                 .unwrap()
@@ -1075,7 +1083,7 @@ mod windows_native {
         fs::remove_file(payload.with_extension("moved")).unwrap();
         fs::rename(&stage, stage.with_extension("moved")).unwrap();
         fs::remove_dir(stage.with_extension("moved")).unwrap();
-        let stage = MediaStage::create(f.parent.clone()).unwrap();
+        let stage = MediaStage::create(f.parent.clone(), f.activity.clone()).unwrap();
         let stage_path = stage.diagnostic_path();
         drop(stage);
         fs::rename(&stage_path, stage_path.with_extension("moved")).unwrap();
@@ -1083,6 +1091,7 @@ mod windows_native {
         let root_path = f.temp.path().to_path_buf();
         drop(f.destination);
         drop(f.parent);
+        drop(f.activity);
         fs::rename(root_path.join("day/segment"), root_path.join("day/moved")).unwrap();
         fs::rename(root_path.join("day"), root_path.join("moved")).unwrap();
         let renamed = root_path.with_extension("moved");
@@ -1334,6 +1343,7 @@ mod removal {
     use std::fs;
 
     struct Fixture {
+        activity: Arc<crate::activity::ActivityLease>,
         _temp: tempfile::TempDir,
         parent: Arc<MediaDirectory>,
         source: Arc<MediaDirectory>,
@@ -1351,6 +1361,7 @@ mod removal {
             let raw = temp.path().join("parent/segment/raw.flac");
             fs::write(&raw, b"abc").unwrap();
             let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let activity = crate::activity::ActivityLease::try_acquire(root.clone()).unwrap();
             let parent = MediaDirectory::open(root, Path::new("parent")).unwrap();
             let source = parent.open_child(OsStr::new("segment")).unwrap().unwrap();
             let expected = source
@@ -1363,6 +1374,7 @@ mod removal {
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
             );
             Self {
+                activity,
                 _temp: temp,
                 parent,
                 source,
@@ -1371,7 +1383,7 @@ mod removal {
             }
         }
         fn stage(&self) -> MediaStage {
-            MediaStage::create(Arc::clone(&self.parent)).unwrap()
+            MediaStage::create(Arc::clone(&self.parent), self.activity.clone()).unwrap()
         }
         fn remove(&self, stage: MediaStage) -> MediaRemoval {
             self.source
@@ -1467,7 +1479,7 @@ mod removal {
         assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
         fs::create_dir(f.parent.diagnostic_path().join("other")).unwrap();
         let other = f.parent.open_child(OsStr::new("other")).unwrap().unwrap();
-        let result = f.remove(MediaStage::create(other).unwrap());
+        let result = f.remove(MediaStage::create(other, f.activity.clone()).unwrap());
         assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
         assert_eq!(fs::read(&f.raw).unwrap(), b"abc");
         assert_eq!(
@@ -1840,13 +1852,14 @@ mod removal_rebinding {
             fs::create_dir_all(temp.path().join("parent/segment")).unwrap();
             fs::write(temp.path().join("parent/segment/raw.flac"), b"abc").unwrap();
             let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let activity = crate::activity::ActivityLease::try_acquire(root.clone()).unwrap();
             let parent = MediaDirectory::open(root, Path::new("parent")).unwrap();
             let source = parent.open_child(OsStr::new("segment")).unwrap().unwrap();
             let expected = source
                 .observe_file(OsStr::new("raw.flac"))
                 .unwrap()
                 .unwrap();
-            let stage = MediaStage::create(Arc::clone(&parent)).unwrap();
+            let stage = MediaStage::create(Arc::clone(&parent), activity.clone()).unwrap();
             let stage_name = stage.name.clone();
             let target = if replace_parent {
                 temp.path().join("parent")
@@ -1903,13 +1916,14 @@ mod removal_rebinding {
             fs::create_dir_all(temp.path().join("parent/segment")).unwrap();
             fs::write(temp.path().join("parent/segment/raw.flac"), b"abc").unwrap();
             let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+            let activity = crate::activity::ActivityLease::try_acquire(root.clone()).unwrap();
             let parent = MediaDirectory::open(root, Path::new("parent")).unwrap();
             let source = parent.open_child(OsStr::new("segment")).unwrap().unwrap();
             let expected = source
                 .observe_file(OsStr::new("raw.flac"))
                 .unwrap()
                 .unwrap();
-            let stage = MediaStage::create(parent).unwrap();
+            let stage = MediaStage::create(parent, activity.clone()).unwrap();
             let target = if cut == MediaPrimitive::BeforeRemovalClaim {
                 source.diagnostic_path().to_owned()
             } else {
@@ -1967,12 +1981,14 @@ mod removal_other_volume {
         let other =
             tempfile::tempdir_in(std::env::var_os("SOLSTONE_MEDIA_OTHER_ROOT").unwrap()).unwrap();
         let other_root = Arc::new(JournalRoot::open(other.path()).unwrap());
+        let other_activity =
+            crate::activity::ActivityLease::try_acquire(other_root.clone()).unwrap();
         let parent = MediaDirectory::open(other_root, Path::new("")).unwrap();
         assert!(!source.identity().same_volume(parent.identity()));
         let mut result = source.remove_observed(
             OsStr::new("raw.flac"),
             &expected,
-            MediaStage::create(parent).unwrap(),
+            MediaStage::create(parent, other_activity).unwrap(),
         );
         assert_eq!(result.receipt().effect, RemovalEffect::NotClaimed);
         assert_eq!(result.cleanup(), Cleanup::Complete);
@@ -1980,6 +1996,12 @@ mod removal_other_volume {
             fs::read(temp.path().join("parent/segment/raw.flac")).unwrap(),
             b"abc"
         );
-        assert!(fs::read_dir(other.path()).unwrap().next().is_none());
+        assert_eq!(
+            fs::read_dir(other.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![OsString::from("backup-activity.lock")]
+        );
     }
 }

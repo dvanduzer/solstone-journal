@@ -28,24 +28,23 @@ pub fn get_backup_config(journal: &Path) -> Result<Map<String, Value>, BackupErr
 }
 
 pub fn get_destination(journal: &Path) -> Result<Option<Destination>, BackupError> {
-    let destination = get_backup_config(journal)?
-        .remove("destination")
-        .and_then(|value| value.as_object().cloned());
-    let Some(destination) = destination else {
-        return Ok(None);
-    };
+    Ok(destination_from_config(&get_backup_config(journal)?))
+}
+
+pub(crate) fn destination_from_config(config: &Map<String, Value>) -> Option<Destination> {
+    let destination = config.get("destination")?.as_object()?;
     let (Some(repository), Some(backend), Some(credentials)) = (
         destination.get("repository").and_then(Value::as_str),
         destination.get("backend").and_then(Value::as_str),
         destination.get("credentials").and_then(Value::as_object),
     ) else {
-        return Ok(None);
+        return None;
     };
-    Ok(Some(Destination {
+    Some(Destination {
         repository: repository.to_owned(),
         backend: backend.to_owned(),
         credentials: credentials.clone(),
-    }))
+    })
 }
 
 pub fn get_keys(journal: &Path) -> Result<Option<BackupKeys>, BackupError> {
@@ -469,7 +468,7 @@ pub fn status_view(journal: &Path) -> Result<Map<String, Value>, BackupError> {
     ]))
 }
 
-fn build_keys(
+pub(crate) fn build_keys(
     daily: Option<&Value>,
     recovery: Option<&Value>,
 ) -> Result<Option<BackupKeys>, BackupError> {

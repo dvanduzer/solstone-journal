@@ -3,6 +3,10 @@
 
 //! Real tool acceptance using disposable journals and a loopback S3 server.
 
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "backup_native/activity_carrier.rs"]
+mod activity_carrier;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;

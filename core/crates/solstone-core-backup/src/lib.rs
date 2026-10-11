@@ -17,6 +17,7 @@ mod hosted;
 mod keys;
 mod merge;
 mod state;
+pub mod teardown_configuration;
 
 pub use defaults::backup_defaults;
 pub use destination::assemble_backend_env;

@@ -111,6 +111,8 @@ pub type ReadbackAdmissionError = ReadbackError;
 
 pub struct ReadOperation<'a> {
     root: Arc<JournalRoot>,
+    #[cfg(all(unix, feature = "full-tests"))]
+    source_observations: std::cell::Cell<(usize, usize)>,
     #[cfg(unix)]
     configuration: ArchiveConfiguration,
     #[cfg(unix)]
@@ -164,6 +166,24 @@ impl std::error::Error for ReadbackFailure {}
 impl ReadbackFailure {
     pub fn reason(&self) -> ReadbackError {
         self.reason
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[doc(hidden)]
+    pub fn prepared_digest_for_test(&self) -> Option<&MediaDigest> {
+        match self.owned.as_ref() {
+            OwnedReadback::Prepared(prepared) => Some(prepared.digest()),
+            OwnedReadback::Target(_) => None,
+        }
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[doc(hidden)]
+    pub fn target_transport_issued_for_test(&self) -> Option<bool> {
+        match self.owned.as_ref() {
+            OwnedReadback::Target(target) => Some(target.helper_transport_issued()),
+            OwnedReadback::Prepared(_) => None,
+        }
     }
 
     /// Unknown writer lifetime never grants cleanup, including on Drop.
@@ -340,6 +360,8 @@ impl<'a> ReadOperation<'a> {
             }
             let admitted = Self {
                 root: input.root,
+                #[cfg(feature = "full-tests")]
+                source_observations: std::cell::Cell::new((0, 0)),
                 configuration: input.configuration,
                 budget: input.budget,
                 clock: input.clock,
@@ -364,6 +386,12 @@ impl<'a> ReadOperation<'a> {
     }
     pub fn repository_id(&self) -> &str {
         &self.repository_id
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[doc(hidden)]
+    pub fn source_observations_for_test(&self) -> (usize, usize) {
+        self.source_observations.get()
     }
 
     #[cfg(unix)]
@@ -446,6 +474,12 @@ impl<'a> ReadOperation<'a> {
     fn revalidate_source(&self, source: &ArchiveSource<'_>) -> Result<(), ReadbackError> {
         self.revalidate_local()?;
         let result = source.revalidate();
+        #[cfg(feature = "full-tests")]
+        {
+            let (observed, failed) = self.source_observations.get();
+            self.source_observations
+                .set((observed + 1, failed + usize::from(result.is_err())));
+        }
         self.revalidate_local()?;
         result.map_err(|_| ReadbackError::NativeFailure)
     }
