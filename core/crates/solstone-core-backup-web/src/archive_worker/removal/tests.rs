@@ -565,6 +565,20 @@ fn packaged_owned_removal_worker() {
             .binding_error()
             .map(|error| error.kind().to_string())
             .into();
+        if mode == Cut::LateLockLoss {
+            let current = guard.current.as_ref().unwrap();
+            assert_eq!(current.view.phase, "error");
+            assert_eq!(current.view.reason_code.as_deref(), Some("failed"));
+            assert!(!current.worker_active);
+            assert_eq!(current.view.report, retained.terminal().report);
+            assert_eq!(current.view.detail, retained.terminal().detail);
+            assert_eq!(current.view.guidance, retained.terminal().guidance);
+            assert_eq!(
+                current.view.recording_failure,
+                retained.terminal().recording_failure
+            );
+            assert_eq!(retained.terminal().phase, "done");
+        }
         drop(guard);
         if mode == Cut::LateLockLoss {
             assert!(operation::is_busy(&slot));

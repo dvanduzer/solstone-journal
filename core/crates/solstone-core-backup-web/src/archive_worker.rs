@@ -421,7 +421,32 @@ pub fn handoff(
 
 /// Retention alone may recover a poisoned mutex. It never applies success.
 pub fn park_rejected(slot: &SharedOperationSlot, rejected: Box<RejectedArchiveReturn>) {
-    let mut state = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+    let (mut state, poisoned) = match slot.lock() {
+        Ok(state) => (state, false),
+        Err(poison) => (poison.into_inner(), true),
+    };
+    if !poisoned
+        && rejected.reason == Some(ArchiveHandoffRefusal::BindingChanged)
+        && state.archive.matches(&rejected.ticket)
+        && let Some(current) = state.current.as_mut()
+        && current.generation == rejected.generation()
+        && current.worker_active
+        && !operation::is_terminal(&current.view.phase)
+        && current.handoff_poll.is_none()
+        && current.pending_handoff_terminal.is_none()
+    {
+        #[cfg(windows)]
+        let can_project = current.cleanup.is_none();
+        #[cfg(not(windows))]
+        let can_project = true;
+        if can_project {
+            let mut visible = rejected.terminal.clone();
+            visible.phase = "error".into();
+            visible.reason_code = Some("failed".into());
+            current.worker_active = false;
+            operation::apply_terminal(current, visible);
+        }
+    }
     state.archive.retained.push(*rejected);
 }
 

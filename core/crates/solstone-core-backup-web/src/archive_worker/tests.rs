@@ -64,6 +64,163 @@ fn blocked(slot: &SharedOperationSlot, root: &Arc<JournalRoot>, clock: &OwnedClo
 }
 
 #[test]
+fn binding_rejected_projection_preserves_facts_and_other_handoff_views() {
+    for case in [
+        "current",
+        "reservation",
+        "stale",
+        "missing",
+        "inactive",
+        "terminal",
+        "poll",
+        "pending",
+        "poison",
+        "other_refusal",
+    ] {
+        let (_dir, root, clock, slot) = fixture();
+        let begin = begin_owned(
+            &slot,
+            "offload_restore",
+            Arc::clone(&root),
+            Arc::clone(&clock),
+        )
+        .unwrap();
+        assert!(start_owned_worker(&slot, &begin.ticket));
+        let (ticket, custody, payload) = closed(begin);
+        let ArchivePayload::Prepared(owner) = &payload else {
+            unreachable!()
+        };
+        let carrier = Arc::downgrade(owner.carrier());
+        let poll = ArchiveCancellation::new();
+        {
+            let mut state = slot.lock().unwrap();
+            match case {
+                "reservation" => {
+                    state.archive.reservation = Some(Arc::new(Reservation {
+                        generation: ticket.generation(),
+                        root: Arc::clone(&root),
+                        clock: Arc::clone(&clock),
+                    }));
+                }
+                "missing" => state.current = None,
+                "stale" => state.current.as_mut().unwrap().generation += 1,
+                "inactive" => state.current.as_mut().unwrap().worker_active = false,
+                "terminal" => state.current.as_mut().unwrap().view.phase = "done".into(),
+                "poll" => {
+                    state.current.as_mut().unwrap().handoff_poll = Some(poll.clone());
+                }
+                "pending" => {
+                    state.current.as_mut().unwrap().pending_handoff_terminal = Some(terminal());
+                }
+                _ => {}
+            }
+        }
+        if case == "poison" {
+            let poison = Arc::clone(&slot);
+            assert!(
+                thread::spawn(move || {
+                    let _guard = poison.lock().unwrap();
+                    panic!("projection poison control");
+                })
+                .join()
+                .is_err()
+            );
+        }
+        let before = {
+            let state = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+            state.current.as_ref().map(|current| {
+                (
+                    current.view.clone(),
+                    current.worker_active,
+                    current.generation,
+                    current.nonce.clone(),
+                    current.restore_key.clone(),
+                    current.started,
+                    current.handoff_poll.is_some(),
+                    current.pending_handoff_terminal.clone(),
+                )
+            })
+        };
+        let reason = if case == "other_refusal" {
+            ArchiveHandoffRefusal::OwnerChanged
+        } else {
+            ArchiveHandoffRefusal::BindingChanged
+        };
+        // Only the private display envelope is synthetic. The whole Prepared
+        // owner is real; genuine Completed/binding-loss credit is installed.
+        let rejected = Box::new(RejectedArchiveReturn {
+            ticket,
+            payload,
+            custody: Some(custody),
+            binding_error: Some(io::Error::other("display envelope control")),
+            terminal: terminal(),
+            reason: Some(reason),
+        });
+        let worker_slot = Arc::clone(&slot);
+        thread::spawn(move || park_rejected(&worker_slot, rejected))
+            .join()
+            .unwrap();
+        blocked(&slot, &root, &clock);
+        assert!(carrier.upgrade().is_some());
+        assert!(matches!(
+            ActivityLease::try_acquire(Arc::clone(&root)),
+            Err(ActivityAdmissionError::Busy)
+        ));
+        let state = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(state.archive.retained.len(), 1, "{case}");
+        let retained = &state.archive.retained[0];
+        assert_eq!(retained.reason(), Some(reason));
+        assert_eq!(retained.terminal(), &terminal());
+        assert!(retained.custody().is_some());
+        assert_eq!(
+            retained.binding_error().unwrap().kind(),
+            io::ErrorKind::Other
+        );
+        let ArchivePayload::Prepared(owner) = retained.payload() else {
+            panic!("whole actual Prepared owner");
+        };
+        assert!(Arc::ptr_eq(owner.carrier(), &carrier.upgrade().unwrap()));
+        let after = state.current.as_ref().map(|current| {
+            (
+                current.view.clone(),
+                current.worker_active,
+                current.generation,
+                current.nonce.clone(),
+                current.restore_key.clone(),
+                current.started,
+                current.handoff_poll.is_some(),
+                current.pending_handoff_terminal.clone(),
+            )
+        });
+        if case == "current" {
+            let mut expected = before.unwrap();
+            expected.0.phase = "error".into();
+            expected.0.reason_code = Some("failed".into());
+            expected.0.detail = terminal().detail;
+            expected.0.guidance = terminal().guidance;
+            expected.0.recording_failure = terminal().recording_failure;
+            expected.0.report = terminal().report;
+            expected.1 = false;
+            assert_eq!(after, Some(expected));
+        } else {
+            assert_eq!(after, before, "{case}");
+        }
+        if case == "poll" {
+            state
+                .current
+                .as_ref()
+                .unwrap()
+                .handoff_poll
+                .as_ref()
+                .unwrap()
+                .cancel();
+            assert!(poll.is_cancelled());
+        }
+        assert_eq!(slot.is_poisoned(), case == "poison");
+    }
+}
+
+#[test]
 fn real_worker_retains_closed_owner_after_matching_and_rejected_handoffs() {
     for reason in [
         None,
