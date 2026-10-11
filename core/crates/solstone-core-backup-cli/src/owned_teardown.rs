@@ -16,10 +16,11 @@ use solstone_core_offload::teardown::{
 use super::{CliRun, ProductionClock};
 
 pub(super) const PRELAUNCH_HELD: &str =
-    "backup teardown is temporarily unavailable. no backup changes were made.";
-pub(super) const BACKUP_ONLY_HELD: &str = "your backup holds the only copy of some of your media. no backup changes were made. restore it with `solstone journal backup offload restore --all`, then try again.";
-pub(super) const DESTINATION_UNSUPPORTED: &str = "turning off backup here only works for encrypted backup from sol pbc. no backup changes were made.";
-pub(super) const NOT_STARTED: &str = "backup teardown couldn't start. no backup changes were made.";
+    "turning off and deleting your backup isn't available here. no backup changes were made.";
+pub(super) const BACKUP_ONLY_HELD: &str = "your backup holds the only copy of some of your media, so no backup changes were made. restore everything from the backup page first, then try again.";
+pub(super) const DESTINATION_UNSUPPORTED: &str = "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made.";
+pub(super) const NOT_STARTED: &str =
+    "turning off and deleting your backup couldn't start. no backup changes were made.";
 
 /// The complete native outcome remains alive while output is borrowed.
 #[must_use = "Retain the whole teardown result through printing and exit"]

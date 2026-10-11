@@ -298,6 +298,29 @@ fn owner_configured_destination_is_refused_after_admission_without_effects() {
 }
 
 #[test]
+fn operated_destination_without_a_binding_is_not_called_unsupported() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = br#"{"backup":{"enabled":true,"mode":"operated"}}"#;
+    fs::write(temp.path().join("config/journal.json"), config).unwrap();
+    let result = run_owned_teardown(
+        temp.path(),
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+    assert!(!matches!(
+        result.refusal(),
+        Some(TeardownRunRefusal::UnsupportedDestination)
+    ));
+    assert!(result.refused_before_effects());
+    assert_eq!(
+        fs::read(temp.path().join("config/journal.json")).unwrap(),
+        config
+    );
+}
+
+#[test]
 #[ignore = "requires the copied installed package with the actual owned DNS member"]
 #[cfg(all(test, feature = "full-tests"))]
 fn packaged_owned_teardown_boundaries() {

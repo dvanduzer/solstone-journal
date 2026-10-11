@@ -466,19 +466,26 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
         }
     };
     outside.lease = Some(admitted.teardown_lease().clone());
-    if admitted.configuration().binding().is_none()
-        || admitted
-            .configuration()
-            .backup()
-            .get("mode")
-            .and_then(serde_json::Value::as_str)
-            != Some("operated")
+    if admitted
+        .configuration()
+        .backup()
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("operated")
     {
         return held(
             outside,
             Some(PhaseOwner::Admission(Box::new(admitted))),
             TeardownRunPhase::Admission,
             TeardownRunRefusal::UnsupportedDestination,
+        );
+    }
+    if admitted.configuration().binding().is_none() {
+        return held(
+            outside,
+            Some(PhaseOwner::Admission(Box::new(admitted))),
+            TeardownRunPhase::Admission,
+            TeardownRunRefusal::Binding,
         );
     }
     if let Err(refusal) = outside.remaining() {

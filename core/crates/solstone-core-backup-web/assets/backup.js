@@ -302,8 +302,8 @@
       "broker_unreachable": "encrypted backup couldn't be reached. check your connection, then try again.",
       "broker_error": "encrypted backup didn't return usable settings. try again shortly.",
       "hosted_entitlement_inactive": "turn on encrypted backup in the services portal, then try again.",
-      "backup_only_held": "your backup holds the only copy of some of your media. no backup changes were made. restore everything first, then try again.",
-      "destination_unsupported": "turning off backup here only works for encrypted backup from sol pbc. no backup changes were made."
+      "backup_only_held": "your backup holds the only copy of some of your media, so no backup changes were made. restore everything first, then try again.",
+      "destination_unsupported": "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made."
     },
     "action_labels": {
       "finish_cleanup": "finish stopping backup",
