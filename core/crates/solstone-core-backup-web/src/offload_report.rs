@@ -184,7 +184,6 @@ pub(crate) fn plan_settled(report: &SettledOffloadPlanReport) -> Value {
 fn groups(groups: &[OffloadReconciliationGroup]) -> Value {
     json!(groups.iter().map(|group| json!({"selection":group.selection().map(selection),"expected":group.expected(),"disposition":match group.disposition() {
         OffloadReconciliationDisposition::Unchanged => json!({"state":"unchanged"}),
-        OffloadReconciliationDisposition::Unbound => json!({"state":"unbound"}),
         OffloadReconciliationDisposition::Busy => json!({"state":"busy"}),
         OffloadReconciliationDisposition::Refused(error) => json!({"state":"refused","reason":offer_reason(error)}),
         OffloadReconciliationDisposition::WriteRefused(_) => json!({"state":"write_refused","detail_available":true}),

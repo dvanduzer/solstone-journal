@@ -111,7 +111,6 @@ fn reconciliation(groups: &[OffloadReconciliationGroup]) -> Vec<CliReconciliatio
         .map(|group| {
             let (disposition, mutation, followup_refusal) = match group.disposition() {
                 OffloadReconciliationDisposition::Unchanged => ("unchanged", None, false),
-                OffloadReconciliationDisposition::Unbound => ("unbound", None, false),
                 OffloadReconciliationDisposition::Busy => ("busy", None, false),
                 OffloadReconciliationDisposition::Refused(_) => ("refused", None, false),
                 OffloadReconciliationDisposition::WriteRefused(_) => ("write_refused", None, false),
