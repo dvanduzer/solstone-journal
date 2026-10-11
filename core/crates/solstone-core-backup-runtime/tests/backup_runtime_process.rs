@@ -106,6 +106,92 @@ fn real_fixture_process_observes_whitelisted_environment() {
 }
 
 #[test]
+fn controlled_runner_probe() {
+    if std::env::var("CONTROLLED_RUNNER_PROBE").as_deref() != Ok("active") {
+        return;
+    }
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let descriptor = |name| std::env::var(name).unwrap().parse::<i32>().unwrap();
+    // SAFETY: this child exclusively owns its explicitly inherited descriptors.
+    #[allow(unsafe_code)]
+    let (mut ready, mut control) = unsafe {
+        (
+            fs::File::from_raw_fd(descriptor("READY_FD")),
+            fs::File::from_raw_fd(descriptor("CONTROL_FD")),
+        )
+    };
+    ready.write_all(&std::process::id().to_le_bytes()).unwrap();
+    let mut release = [0];
+    control.read_exact(&mut release).unwrap();
+    println!("controlled runner finished");
+}
+
+#[test]
+fn controlled_system_runner_cancels_and_reaps_its_actual_root() {
+    use solstone_core_backup::archive_admission::ArchiveCancellation;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    for cancelled in [false, true] {
+        let (mut ready_parent, ready_child) = UnixStream::pair().unwrap();
+        ready_parent
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (mut control_parent, control_child) = UnixStream::pair().unwrap();
+        let request = ToolRequest {
+            program: std::env::current_exe().unwrap().into_os_string(),
+            argv: vec![
+                "--exact".into(),
+                "controlled_runner_probe".into(),
+                "--nocapture".into(),
+            ],
+            env: std::collections::BTreeMap::from([
+                ("CONTROLLED_RUNNER_PROBE".into(), "active".into()),
+                (
+                    "READY_FD".into(),
+                    ready_child.as_raw_fd().to_string().into(),
+                ),
+                (
+                    "CONTROL_FD".into(),
+                    control_child.as_raw_fd().to_string().into(),
+                ),
+            ]),
+            timeout: Some(Duration::from_secs(5)),
+            pass_fds: vec![ready_child.as_fd(), control_child.as_fd()],
+            stdin: None,
+        };
+        let cancellation = ArchiveCancellation::new();
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| SystemToolRunner.run_cancellable(&request, &cancellation));
+            let mut pid = [0; 4];
+            ready_parent.read_exact(&mut pid).unwrap();
+            let pid = Pid::from_raw(u32::from_le_bytes(pid) as i32);
+            if cancelled {
+                cancellation.cancel();
+            } else {
+                control_parent.write_all(b"r").unwrap();
+            }
+            let result = worker.join().unwrap();
+            if cancelled {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+            } else {
+                let output = result.unwrap();
+                assert_eq!(output.returncode, 0);
+                assert!(
+                    String::from_utf8(output.stdout)
+                        .unwrap()
+                        .contains("controlled runner finished")
+                );
+            }
+            assert_eq!(
+                nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+                Err(Errno::ECHILD)
+            );
+        });
+    }
+}
+
+#[test]
 fn timeout_scrubs_partial_output_and_passes_live_key_fd() {
     run_bounded(|| {
         #[cfg(target_os = "macos")]

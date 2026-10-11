@@ -215,7 +215,7 @@ pub fn issue_server_certificate(
     let mut params = CertificateParams::default();
     params.distinguished_name = common_name(&format!("solstone link ({home_label})"));
     // No SAN: spl-transport's pinned verifier validates the CA fingerprint,
-    // not a DNS name. `mtls_config` also performs no certificate-validity check.
+    // not a DNS name, and checks the leaf's validity dates and server-auth usage.
     params.subject_alt_names.clear();
     params.is_ca = IsCa::ExplicitNoCa;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];

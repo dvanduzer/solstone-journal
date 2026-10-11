@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
+use solstone_core_backup::archive_admission::ArchiveCancellation;
 #[cfg(windows)]
 use solstone_core_distribution::windows_payload::{WINDOWS_RCLONE_WORKER, WINDOWS_RESTIC_WORKER};
 use thiserror::Error;
@@ -74,6 +75,17 @@ impl fmt::Debug for ToolOutput {
 
 pub trait ToolRunner {
     fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput>;
+
+    fn run_cancellable(
+        &self,
+        _request: &ToolRequest<'_>,
+        _cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cancellable tool execution is unsupported",
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -103,27 +115,47 @@ fn spawn_argv(argv: &[OsString]) -> Vec<OsString> {
 #[cfg(unix)]
 impl ToolRunner for SystemToolRunner {
     fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-        if request.stdin.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stdin not supported on unix tool runner",
-            ));
-        }
-        let output = solstone_core_backup::bounded_child::run(
-            &solstone_core_backup::bounded_child::Request {
-                program: request.program.clone(),
-                argv: spawn_argv(&request.argv),
-                env: request.env.clone(),
-                timeout: request.timeout,
-                pass_fds: request.pass_fds.clone(),
-            },
-        )?;
-        Ok(ToolOutput {
-            returncode: output.returncode,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        run_unix_tool(request, None)
     }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        run_unix_tool(request, Some(cancellation))
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_tool(
+    request: &ToolRequest<'_>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> io::Result<ToolOutput> {
+    if request.stdin.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stdin not supported on unix tool runner",
+        ));
+    }
+    let request = solstone_core_backup::bounded_child::Request {
+        program: request.program.clone(),
+        argv: spawn_argv(&request.argv),
+        env: request.env.clone(),
+        timeout: request.timeout,
+        pass_fds: request.pass_fds.clone(),
+    };
+    let output = match cancellation {
+        Some(cancellation) => {
+            solstone_core_backup::bounded_child::run_cancellable(&request, cancellation)
+        }
+        None => solstone_core_backup::bounded_child::run(&request),
+    }?;
+    Ok(ToolOutput {
+        returncode: output.returncode,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 #[cfg(windows)]

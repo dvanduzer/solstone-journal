@@ -16,7 +16,7 @@ use solstone_core_backup::{
     delete_hosted_binding, format_recovery_key_display, get_backup_config, record_backup_result,
     record_prune_result, record_restore_result, record_verification_result,
 };
-use solstone_core_journal_io::JournalRoot;
+use solstone_core_journal_io::{JournalRoot, media::ArchiveSource};
 
 use crate::hosted_runtime::{
     HttpTransport, RuntimeResolution, fetch_hosted_credentials, hosted_append_only_session,
@@ -1565,6 +1565,7 @@ pub enum ArchiveError {
     RepositoryIdentityChanged,
     ToolFailed { reason: &'static str },
     InvalidSelection,
+    SourceUnavailable,
     SnapshotIdentityInvalid,
 }
 
@@ -1587,6 +1588,7 @@ impl fmt::Display for ArchiveError {
             Self::InvalidSelection => {
                 "archive sources must be a nonempty selection of absolute paths"
             }
+            Self::SourceUnavailable => "the prepared archive files could not be confirmed",
             Self::SnapshotIdentityInvalid => "the archive did not return a full snapshot identity",
         };
         formatter.write_str(reason)
@@ -1659,7 +1661,39 @@ impl HttpTransport for ArchiveAdmissionHttp<'_> {
             .map_err(|_| crate::hosted_runtime::HttpError::Timeout)?;
         let mut request = request.clone();
         request.timeout = request.timeout.min(remaining);
+        if self.budget.cancellation().is_some() {
+            // Operated cancellation requires an explicit controlled HTTP transport.
+            return Err(crate::hosted_runtime::HttpError::Other);
+        }
         self.inner.execute(&request)
+    }
+}
+
+struct ArchiveRunner<'a> {
+    inner: &'a dyn ToolRunner,
+    clock: &'a dyn Clock,
+    budget: &'a ArchiveBudget,
+}
+
+impl ToolRunner for ArchiveRunner<'_> {
+    fn run(
+        &self,
+        request: &crate::runner::ToolRequest<'_>,
+    ) -> std::io::Result<crate::runner::ToolOutput> {
+        let remaining = self
+            .budget
+            .remaining(self.clock)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Interrupted, error))?;
+        let mut request = request.clone();
+        request.timeout = Some(
+            request
+                .timeout
+                .map_or(remaining, |timeout| timeout.min(remaining)),
+        );
+        match self.budget.cancellation() {
+            Some(cancellation) => self.inner.run_cancellable(&request, cancellation),
+            None => self.inner.run(&request),
+        }
     }
 }
 
@@ -1691,7 +1725,17 @@ pub fn admit_archive<'a>(
     root: Arc<JournalRoot>,
     services: &BackupServices<'a>,
 ) -> Result<AdmittedArchive<'a>, ArchiveError> {
-    let mut budget = ArchiveBudget::new(services.clock)?;
+    let budget = ArchiveBudget::new(services.clock)?;
+    admit_archive_with_budget(root, services, budget)
+}
+
+/// Admit paired transports using the original operation lifetime and stop signal.
+pub fn admit_archive_with_budget<'a>(
+    root: Arc<JournalRoot>,
+    services: &BackupServices<'a>,
+    mut budget: ArchiveBudget,
+) -> Result<AdmittedArchive<'a>, ArchiveError> {
+    budget.remaining(services.clock)?;
     let config = ArchiveConfiguration::capture(&root)?;
     if !config.enabled() {
         return Err(ArchiveError::NotConfigured);
@@ -1837,8 +1881,13 @@ impl<'a> AdmittedArchive<'a> {
             .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
         let mut args = runtime.global_options.clone();
         args.extend(["cat".into(), "config".into(), "--no-cache".into()]);
+        let runner = ArchiveRunner {
+            inner: self.runner,
+            clock: self.clock,
+            budget: &self.budget,
+        };
         let output = run_restic(
-            self.runner,
+            &runner,
             &args,
             &runtime.destination.repository,
             &runtime.password,
@@ -1848,9 +1897,9 @@ impl<'a> AdmittedArchive<'a> {
             None,
             Some(timeout),
             &[],
-        )
-        .map_err(|_| ArchiveError::ToolFailed { reason: "failed" })?;
+        );
         self.revalidate_local()?;
+        let output = output.map_err(|_| ArchiveError::ToolFailed { reason: "failed" })?;
         if output.returncode != 0 {
             return Err(ArchiveError::ToolFailed {
                 reason: reason_for_returncode(output.returncode),
@@ -1881,14 +1930,77 @@ impl<'a> AdmittedArchive<'a> {
     /// Archive caller-owned staged paths with forced source rereading. This does
     /// not establish source immutability or verify recoverable file contents.
     pub fn archive(&mut self, paths: &[PathBuf]) -> Result<ArchiveSnapshot, ArchiveFailure> {
+        if paths.is_empty() || paths.iter().any(|path| !path.is_absolute()) {
+            return Err(ArchiveFailure {
+                error: ArchiveError::InvalidSelection,
+                remote_effects: ArchiveRemoteEffects::NotAttempted,
+            });
+        }
+        let paths: Vec<_> = paths
+            .iter()
+            .map(|path| crate::restic_filesystem_path(path))
+            .collect();
+        self.archive_paths(&paths, &[], &[])
+    }
+
+    /// Force an archive of retained prepared inputs using their exact native
+    /// transport. The caller keeps every prepared file and stage on refusal.
+    /// Success still requires exact snapshot content readback before proof use.
+    pub fn archive_owned(
+        &mut self,
+        sources: &[ArchiveSource<'_>],
+    ) -> Result<ArchiveSnapshot, ArchiveFailure> {
+        if sources.is_empty()
+            || sources.iter().any(|source| {
+                !source.path().is_absolute()
+                    || source.path().to_str().is_none()
+                    || source.path().file_name() != Some(source.name())
+            })
+        {
+            return Err(ArchiveFailure {
+                error: ArchiveError::InvalidSelection,
+                remote_effects: ArchiveRemoteEffects::NotAttempted,
+            });
+        }
+        let paths: Vec<_> = sources
+            .iter()
+            .map(|source| source.path().to_str().expect("checked UTF-8").to_owned())
+            .collect();
+        #[cfg(unix)]
+        let descriptors: Vec<_> = sources
+            .iter()
+            .filter_map(ArchiveSource::descriptor)
+            .collect();
+        #[cfg(not(unix))]
+        let descriptors = vec![];
+        self.archive_paths(&paths, &descriptors, sources)
+    }
+
+    fn revalidate_sources(&self, sources: &[ArchiveSource<'_>]) -> Result<(), ArchiveError> {
+        self.revalidate_local()?;
+        let result = sources.iter().try_for_each(|source| {
+            source
+                .revalidate()
+                .map_err(|_| ArchiveError::SourceUnavailable)
+        });
+        // A stop arriving during a native observation retains its exact reason.
+        self.revalidate_local()?;
+        result
+    }
+
+    fn archive_paths(
+        &mut self,
+        paths: &[String],
+        descriptors: &[crate::runner::PassedHandle<'_>],
+        sources: &[ArchiveSource<'_>],
+    ) -> Result<ArchiveSnapshot, ArchiveFailure> {
         let before = |error| ArchiveFailure {
             error,
             remote_effects: ArchiveRemoteEffects::NotAttempted,
         };
-        if paths.is_empty() || paths.iter().any(|path| !path.is_absolute()) {
-            return Err(before(ArchiveError::InvalidSelection));
-        }
+        self.revalidate_sources(sources).map_err(before)?;
         self.revalidate().map_err(before)?;
+        self.revalidate_sources(sources).map_err(before)?;
         let timeout = self
             .budget
             .remaining(self.clock)
@@ -1902,9 +2014,14 @@ impl<'a> AdmittedArchive<'a> {
             "--retry-lock".into(),
             REPOSITORY_RETRY_LOCK.into(),
         ]);
-        args.extend(paths.iter().map(|path| crate::restic_filesystem_path(path)));
+        args.extend(paths.iter().cloned());
+        let runner = ArchiveRunner {
+            inner: self.runner,
+            clock: self.clock,
+            budget: &self.budget,
+        };
         let output = run_restic(
-            self.runner,
+            &runner,
             &args,
             &self.write.destination.repository,
             &self.write.password,
@@ -1913,7 +2030,7 @@ impl<'a> AdmittedArchive<'a> {
             true,
             None,
             Some(timeout),
-            &[],
+            descriptors,
         );
         let (returncode, observed_snapshot_id) = match &output {
             Ok(output) => (
@@ -1930,8 +2047,10 @@ impl<'a> AdmittedArchive<'a> {
             error,
             remote_effects: effects.clone(),
         };
+        self.revalidate_sources(sources).map_err(after)?;
         let output = output.map_err(|_| after(ArchiveError::ToolFailed { reason: "failed" }))?;
         self.revalidate().map_err(after)?;
+        self.revalidate_sources(sources).map_err(after)?;
         if output.returncode != 0 {
             return Err(after(ArchiveError::ToolFailed {
                 reason: reason_for_returncode(output.returncode),
@@ -2321,6 +2440,7 @@ mod tests {
 
     mod archive_admission {
         use super::*;
+        use solstone_core_backup::archive_admission::ArchiveCancellation;
 
         const REPOSITORY_ID: &str =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2365,6 +2485,18 @@ mod tests {
                     .borrow_mut()
                     .pop_front()
                     .expect("script exhausted")
+            }
+
+            fn run_cancellable(
+                &self,
+                request: &ToolRequest<'_>,
+                cancellation: &ArchiveCancellation,
+            ) -> io::Result<ToolOutput> {
+                assert!(
+                    !cancellation.is_cancelled(),
+                    "owner must refuse before launch"
+                );
+                self.run(request)
             }
         }
 
@@ -2421,6 +2553,398 @@ mod tests {
             ScriptedHttp {
                 responses: RefCell::new(VecDeque::from([Ok(response)])),
                 requests: RefCell::new(vec![]),
+            }
+        }
+
+        #[cfg(all(test, feature = "full-tests", unix))]
+        mod owned_sources {
+            use super::*;
+            use solstone_core_journal_io::media::{
+                Cleanup, MediaDirectory, MediaStage, PreparedMedia,
+            };
+            use std::ffi::OsStr;
+            use std::os::fd::AsRawFd;
+
+            fn prepared(root: &Arc<JournalRoot>, journal: &Path) -> (PreparedMedia, PathBuf) {
+                let parent_path = journal.join("owned");
+                fs::create_dir(&parent_path).unwrap();
+                fs::write(
+                    parent_path.join("audio.flac"),
+                    b"archive original basename\n",
+                )
+                .unwrap();
+                let parent = MediaDirectory::open(root.clone(), Path::new("owned")).unwrap();
+                let digest = parent
+                    .observe_file(OsStr::new("audio.flac"))
+                    .unwrap()
+                    .unwrap()
+                    .digest;
+                let stage = MediaStage::create(parent.clone()).unwrap();
+                let path = stage.diagnostic_path();
+                let media = stage
+                    .create_named_target(OsStr::new("audio.flac"))
+                    .unwrap()
+                    .copy_from(&parent, OsStr::new("audio.flac"), &digest)
+                    .unwrap();
+                (media, path)
+            }
+
+            fn archive_script() -> ArchiveScript {
+                script(vec![
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    snapshot(0, SNAPSHOT_ID),
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                ])
+            }
+
+            fn invalidate(path: &Path, substitute: bool) {
+                use std::os::unix::fs::MetadataExt;
+                let path = path.join("audio.flac");
+                let before = fs::metadata(&path).unwrap();
+                if substitute {
+                    fs::rename(&path, path.with_file_name("retained-original")).unwrap();
+                }
+                fs::write(&path, b"different original bytes!\n").unwrap();
+                let after = fs::metadata(path).unwrap();
+                assert_eq!(after.len(), before.len());
+                if !substitute {
+                    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                }
+            }
+
+            #[test]
+            fn exact_named_source_transport_is_only_passed_to_forced_backup() {
+                let (journal, root) = fixture();
+                let (mut media, stage) = prepared(&root, journal.path());
+                let source = media.archive_source().unwrap();
+                let exact_path = source.path().to_str().unwrap().to_owned();
+                let descriptor = source.descriptor().map(|fd| fd.as_raw_fd());
+                let original_flags = source
+                    .descriptor()
+                    .map(|fd| nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap());
+                let expected = exact_path.clone();
+                let mut runner = archive_script();
+                runner.hook = Some(Box::new(move |request| {
+                    if request.argv.iter().any(|arg| arg == "backup") {
+                        assert!(request.argv.iter().any(|arg| arg == OsStr::new(&expected)));
+                        assert!(request.argv.iter().any(|arg| arg == "--force"));
+                        assert_eq!(
+                            request
+                                .pass_fds
+                                .iter()
+                                .map(|fd| fd.as_raw_fd())
+                                .collect::<Vec<_>>(),
+                            descriptor.into_iter().collect::<Vec<_>>()
+                        );
+                        assert_eq!(fs::read(&expected).unwrap(), b"archive original basename\n");
+                    } else {
+                        assert!(request.pass_fds.is_empty());
+                    }
+                }));
+                let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                let mut admitted = admit_archive(root, &services).unwrap();
+                assert_eq!(
+                    admitted
+                        .archive_owned(std::slice::from_ref(&source))
+                        .unwrap(),
+                    ArchiveSnapshot {
+                        repository_id: REPOSITORY_ID.into(),
+                        snapshot_id: SNAPSHOT_ID.into()
+                    }
+                );
+                assert_eq!(source.name(), OsStr::new("audio.flac"));
+                source.revalidate().unwrap();
+                assert_eq!(
+                    source.descriptor().map(|fd| nix::fcntl::fcntl(
+                        fd,
+                        nix::fcntl::FcntlArg::F_GETFD
+                    )
+                    .unwrap()),
+                    original_flags
+                );
+                assert!(stage.exists());
+                assert_eq!(runner.requests.borrow().len(), 7);
+                drop(source);
+                assert_eq!(media.cleanup(), Cleanup::Complete);
+            }
+
+            #[test]
+            fn changed_or_substituted_source_refuses_before_any_archive_query() {
+                for substitute in [false, true] {
+                    let (journal, root) = fixture();
+                    let (mut media, stage) = prepared(&root, journal.path());
+                    let source = media.archive_source().unwrap();
+                    let runner = archive_script();
+                    let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                    let mut admitted = admit_archive(root, &services).unwrap();
+                    invalidate(&stage, substitute);
+                    assert_eq!(
+                        admitted.archive_owned(&[source]).unwrap_err(),
+                        ArchiveFailure {
+                            error: ArchiveError::SourceUnavailable,
+                            remote_effects: ArchiveRemoteEffects::NotAttempted
+                        }
+                    );
+                    assert_eq!(runner.requests.borrow().len(), 2);
+                    assert!(stage.exists());
+                }
+            }
+
+            #[test]
+            fn source_changes_during_either_pair_or_final_query_refuse_with_exact_effects() {
+                for cut in [2, 3, 5, 6] {
+                    for substitute in [false, true] {
+                        let (journal, root) = fixture();
+                        let (mut media, stage) = prepared(&root, journal.path());
+                        let source = media.archive_source().unwrap();
+                        let hook_path = stage.clone();
+                        let count = Cell::new(0);
+                        let mut runner = archive_script();
+                        runner.hook = Some(Box::new(move |_| {
+                            let index = count.get();
+                            count.set(index + 1);
+                            if index == cut {
+                                invalidate(&hook_path, substitute);
+                            }
+                        }));
+                        let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                        let mut admitted = admit_archive(root, &services).unwrap();
+                        assert_eq!(
+                            admitted.archive_owned(&[source]).unwrap_err(),
+                            ArchiveFailure {
+                                error: ArchiveError::SourceUnavailable,
+                                remote_effects: if cut < 4 {
+                                    ArchiveRemoteEffects::NotAttempted
+                                } else {
+                                    ArchiveRemoteEffects::Attempted {
+                                        returncode: Some(0),
+                                        observed_snapshot_id: Some(SNAPSHOT_ID.into()),
+                                    }
+                                }
+                            }
+                        );
+                        assert_eq!(runner.requests.borrow().len(), if cut < 4 { 4 } else { 7 });
+                        assert!(stage.exists());
+                    }
+                }
+            }
+
+            #[test]
+            fn backup_source_failure_preserves_nonzero_or_unknown_effects_and_exact_cancel() {
+                for code in [Some(0), Some(3), None] {
+                    for cancelled in [false, true] {
+                        let (journal, root) = fixture();
+                        let (mut media, stage) = prepared(&root, journal.path());
+                        let source = media.archive_source().unwrap();
+                        let cancellation = ArchiveCancellation::new();
+                        let stop = cancellation.clone();
+                        let hook_path = stage.clone();
+                        let mut runner = archive_script();
+                        runner.outputs.borrow_mut()[4] = match code {
+                            Some(code) => Ok(snapshot(code, SNAPSHOT_ID)),
+                            None => Err(io::Error::other("unknown backup completion")),
+                        };
+                        runner.hook = Some(Box::new(move |request| {
+                            if request.argv.iter().any(|arg| arg == "backup") {
+                                invalidate(&hook_path, false);
+                                if cancelled {
+                                    stop.cancel();
+                                }
+                            }
+                        }));
+                        let budget =
+                            ArchiveBudget::new_cancellable(&FixedClock, cancellation).unwrap();
+                        let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                        let mut admitted =
+                            admit_archive_with_budget(root, &services, budget).unwrap();
+                        assert_eq!(
+                            admitted.archive_owned(&[source]).unwrap_err(),
+                            ArchiveFailure {
+                                error: if cancelled {
+                                    ArchiveError::Cancelled
+                                } else {
+                                    ArchiveError::SourceUnavailable
+                                },
+                                remote_effects: ArchiveRemoteEffects::Attempted {
+                                    returncode: code,
+                                    observed_snapshot_id: code.map(|_| SNAPSHOT_ID.into())
+                                }
+                            }
+                        );
+                        assert_eq!(runner.requests.borrow().len(), 5);
+                        assert!(stage.exists());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn inherited_budget_keeps_elapsed_time_expiry_and_cancellation_through_readback() {
+            for capped in [false, true] {
+                let (_journal, root) = fixture();
+                let runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                let now = Rc::new(Cell::new(50));
+                let clock = MutableClock(Rc::clone(&now));
+                let cancellation = ArchiveCancellation::new();
+                let mut budget =
+                    ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+                let deadline = 50 + ARCHIVE_BACKUP_TIMEOUT_SECONDS as i64;
+                if capped {
+                    budget.cap_credential_expiry(deadline - 2);
+                }
+                now.set(deadline - 5);
+                let services = services(&runner, &PanicHttp, &clock, &Maintenance);
+                let admitted = admit_archive_with_budget(root, &services, budget).unwrap();
+                let seconds = if capped { 3 } else { 5 };
+                assert!(
+                    runner
+                        .requests
+                        .borrow()
+                        .iter()
+                        .all(|r| r.timeout == Some(Duration::from_secs(seconds)))
+                );
+                let transferred = admitted.into_read_admission().unwrap();
+                assert_eq!(
+                    transferred.budget.remaining(&clock).unwrap(),
+                    Duration::from_secs(seconds)
+                );
+                now.set(if capped { deadline - 2 } else { deadline });
+                assert_eq!(
+                    transferred.budget.remaining(&clock),
+                    Err(if capped {
+                        AdmissionError::CredentialsExpired
+                    } else {
+                        AdmissionError::DeadlineExceeded
+                    })
+                );
+                cancellation.cancel();
+                assert!(transferred.budget.cancellation().unwrap().is_cancelled());
+                assert_eq!(
+                    transferred.budget.remaining(&clock),
+                    Err(AdmissionError::Cancelled)
+                );
+            }
+        }
+
+        #[test]
+        fn inherited_cancelled_or_poisoned_budget_refuses_before_any_transport() {
+            for cancelled in [false, true] {
+                let (_journal, root) = fixture();
+                let now = Rc::new(Cell::new(50));
+                let clock = MutableClock(Rc::clone(&now));
+                let cancellation = ArchiveCancellation::new();
+                let budget = ArchiveBudget::new_cancellable(&clock, cancellation.clone()).unwrap();
+                let expected = if cancelled {
+                    cancellation.cancel();
+                    ArchiveError::Cancelled
+                } else {
+                    now.set(49);
+                    assert_eq!(budget.remaining(&clock), Err(AdmissionError::ClockChanged));
+                    now.set(51);
+                    ArchiveError::ClockChanged
+                };
+                let services = services(&PanicRunner, &PanicHttp, &clock, &Maintenance);
+                assert_eq!(
+                    refusal(admit_archive_with_budget(root, &services, budget)),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn cancellation_on_either_pairing_leg_refuses_exactly_without_next_query() {
+            for leg in [0, 1] {
+                for fails in [false, true] {
+                    let (_journal, root) = fixture();
+                    let cancellation = ArchiveCancellation::new();
+                    let mut runner = script(vec![repo(REPOSITORY_ID), repo(REPOSITORY_ID)]);
+                    let count = Rc::new(Cell::new(0));
+                    let observed = count.clone();
+                    let stop = cancellation.clone();
+                    runner.hook = Some(Box::new(move |_| {
+                        let index = observed.get();
+                        observed.set(index + 1);
+                        if index == leg {
+                            stop.cancel();
+                        }
+                    }));
+                    if fails {
+                        runner.outputs.borrow_mut()[leg] =
+                            Err(io::Error::other("interrupted tool"));
+                    }
+                    let budget = ArchiveBudget::new_cancellable(&FixedClock, cancellation).unwrap();
+                    let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                    assert_eq!(
+                        refusal(admit_archive_with_budget(root, &services, budget)),
+                        ArchiveError::Cancelled
+                    );
+                    assert_eq!(count.get(), leg + 1);
+                }
+            }
+        }
+
+        #[test]
+        fn unsupported_cancellable_runner_and_http_never_fall_back_to_ordinary_execution() {
+            let (journal, root) = fixture();
+            let budget =
+                ArchiveBudget::new_cancellable(&FixedClock, ArchiveCancellation::new()).unwrap();
+            let services = services(&PanicRunner, &PanicHttp, &FixedClock, &Maintenance);
+            assert_eq!(
+                refusal(admit_archive_with_budget(root.clone(), &services, budget)),
+                ArchiveError::ToolFailed { reason: "failed" }
+            );
+            let _ = hosted(journal.path(), "1970-01-01T00:02:00Z");
+            let budget =
+                ArchiveBudget::new_cancellable(&FixedClock, ArchiveCancellation::new()).unwrap();
+            assert!(matches!(
+                refusal(admit_archive_with_budget(root, &services, budget)),
+                ArchiveError::CredentialsUnavailable { .. }
+            ));
+        }
+
+        #[test]
+        fn cancelled_archive_preserves_actual_output_or_unknown_attempt_before_refusal() {
+            for code in [Some(0), Some(3), None] {
+                let (journal, root) = fixture();
+                let cancellation = ArchiveCancellation::new();
+                let mut runner = script(vec![
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    repo(REPOSITORY_ID),
+                    snapshot(code.unwrap_or(0), SNAPSHOT_ID),
+                ]);
+                if code.is_none() {
+                    runner.outputs.borrow_mut()[4] = Err(io::Error::other("interrupted backup"));
+                }
+                let stop = cancellation.clone();
+                runner.hook = Some(Box::new(move |request| {
+                    if request.argv.iter().any(|arg| arg == "backup") {
+                        stop.cancel();
+                    }
+                }));
+                let budget = ArchiveBudget::new_cancellable(&FixedClock, cancellation).unwrap();
+                let services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
+                let mut admitted = admit_archive_with_budget(root, &services, budget).unwrap();
+                assert_eq!(
+                    admitted.archive(&source(journal.path())).unwrap_err(),
+                    ArchiveFailure {
+                        error: ArchiveError::Cancelled,
+                        remote_effects: ArchiveRemoteEffects::Attempted {
+                            returncode: code,
+                            observed_snapshot_id: code.map(|_| SNAPSHOT_ID.to_owned())
+                        }
+                    }
+                );
+                assert_eq!(runner.requests.borrow().len(), 5);
+                assert!(matches!(
+                    admitted.into_read_operation(),
+                    Err(ReadbackAdmissionError::Admission(AdmissionError::Cancelled))
+                ));
             }
         }
 

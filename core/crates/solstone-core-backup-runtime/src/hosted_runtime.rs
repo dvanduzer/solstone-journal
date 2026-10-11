@@ -4,9 +4,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use solstone_core_backup::archive_admission::ArchiveCancellation;
 use solstone_core_backup::{
     Destination, HostedBinding, assemble_backend_env, get_backup_config, get_destination, get_keys,
     load_hosted_binding,
@@ -24,6 +25,7 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
     pub timeout: Duration,
 }
+
 impl fmt::Debug for HttpRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -60,11 +62,31 @@ pub enum HttpError {
 }
 pub trait HttpTransport {
     fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError>;
+
+    fn execute_cancellable(
+        &self,
+        _request: &HttpRequest,
+        _cancellation: &ArchiveCancellation,
+    ) -> Result<HttpResponse, HttpError> {
+        Err(HttpError::Other)
+    }
 }
 #[derive(Debug, Default)]
 pub struct UreqHttpTransport;
 impl HttpTransport for UreqHttpTransport {
     fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let deadline = Instant::now()
+            .checked_add(request.timeout)
+            .ok_or(HttpError::Other)?;
+        let remaining = || {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                Err(HttpError::Timeout)
+            } else {
+                Ok(remaining)
+            }
+        };
+        remaining()?;
         let response = match request.method.as_str() {
             "POST" | "PUT" => {
                 let mut builder = if request.method == "POST" {
@@ -77,7 +99,7 @@ impl HttpTransport for UreqHttpTransport {
                 }
                 builder
                     .config()
-                    .timeout_global(Some(request.timeout))
+                    .timeout_global(Some(remaining()?))
                     .http_status_as_error(false)
                     .build()
                     .send(&request.body)
@@ -89,13 +111,14 @@ impl HttpTransport for UreqHttpTransport {
                 }
                 builder
                     .config()
-                    .timeout_global(Some(request.timeout))
+                    .timeout_global(Some(remaining()?))
                     .http_status_as_error(false)
                     .build()
                     .call()
             }
-        }
-        .map_err(|error| {
+        };
+        remaining()?;
+        let response = response.map_err(|error| {
             if error.to_string().contains("timeout") {
                 HttpError::Timeout
             } else {
@@ -115,11 +138,20 @@ impl HttpTransport for UreqHttpTransport {
             .collect();
         let mut body = Vec::new();
         use std::io::Read;
-        response
-            .into_body()
-            .into_reader()
-            .read_to_end(&mut body)
-            .map_err(|_| HttpError::Other)?;
+        let mut reader = response.into_body().into_reader();
+        let mut buffer = [0; 1024];
+        loop {
+            remaining()?;
+            let read = reader.read(&mut buffer);
+            remaining()?;
+            match read {
+                Ok(0) => break,
+                Ok(length) => body.extend_from_slice(&buffer[..length]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(HttpError::Other),
+            }
+        }
+        remaining()?;
         Ok(HttpResponse {
             status,
             headers,
@@ -407,6 +439,36 @@ mod tests {
         fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
             self.0.clone()
         }
+    }
+    #[test]
+    fn cancellable_default_refuses_without_ordinary_execution() {
+        struct CountingTransport(std::cell::Cell<usize>);
+        impl HttpTransport for CountingTransport {
+            fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
+                self.0.set(self.0.get() + 1);
+                Err(HttpError::Unreachable)
+            }
+        }
+        let transport = CountingTransport(std::cell::Cell::new(0));
+        let request = HttpRequest {
+            method: "POST".into(),
+            url: "http://example.invalid".into(),
+            headers: vec![],
+            body: vec![],
+            timeout: Duration::from_secs(1),
+        };
+        let cancellation = ArchiveCancellation::new();
+        let dynamic: &dyn HttpTransport = &transport;
+        assert_eq!(
+            dynamic.execute_cancellable(&request, &cancellation),
+            Err(HttpError::Other)
+        );
+        cancellation.clone().cancel();
+        assert_eq!(
+            dynamic.execute_cancellable(&request, &cancellation),
+            Err(HttpError::Other)
+        );
+        assert_eq!(transport.0.get(), 0);
     }
     fn binding() -> HostedBinding {
         HostedBinding {
@@ -757,5 +819,269 @@ mod tests {
         } else {
             assert_eq!(platform_rclone_no_config(), "/dev/null");
         }
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod body_deadline_tests {
+    use super::*;
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::{self, JoinHandle};
+
+    struct ResponsePlan {
+        status: u16,
+        body: Vec<u8>,
+        declared_length: Option<usize>,
+        header_delay: Duration,
+        body_delay: Duration,
+        chunk_size: usize,
+        chunk_delay: Duration,
+    }
+
+    impl ResponsePlan {
+        fn body(body: Vec<u8>) -> Self {
+            Self {
+                status: 200,
+                body,
+                declared_length: None,
+                header_delay: Duration::ZERO,
+                body_delay: Duration::ZERO,
+                chunk_size: usize::MAX,
+                chunk_delay: Duration::ZERO,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObservedRequest {
+        method: String,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    struct Server(Option<JoinHandle<io::Result<ObservedRequest>>>);
+
+    impl Server {
+        fn finish(mut self) -> ObservedRequest {
+            self.0.take().unwrap().join().unwrap().unwrap()
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> io::Result<ObservedRequest> {
+        let mut raw = Vec::new();
+        while !raw.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte)?;
+            raw.push(byte[0]);
+            if raw.len() > 16 * 1024 {
+                return Err(io::Error::other("synthetic request headers too large"));
+            }
+        }
+        let text = String::from_utf8(raw).map_err(io::Error::other)?;
+        let mut lines = text.lines();
+        let method = lines
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .ok_or_else(|| io::Error::other("synthetic request method missing"))?
+            .to_owned();
+        let headers: BTreeMap<_, _> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        let length = headers
+            .get("content-length")
+            .map(|value| value.parse::<usize>().map_err(io::Error::other))
+            .transpose()?
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body)?;
+        Ok(ObservedRequest {
+            method,
+            headers,
+            body,
+        })
+    }
+
+    fn exchange(
+        method: &str,
+        request_body: Vec<u8>,
+        timeout: Duration,
+        plan: ResponsePlan,
+    ) -> (Result<HttpResponse, HttpError>, ObservedRequest) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = Server(Some(thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= accept_deadline {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "no test request"));
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let observed = read_request(&mut stream)?;
+            thread::sleep(plan.header_delay);
+            let header = format!(
+                "HTTP/1.1 {} Control\r\nContent-Length: {}\r\nX-Body-Control: exact\r\nConnection: close\r\n\r\n",
+                plan.status,
+                plan.declared_length.unwrap_or(plan.body.len())
+            );
+            stream.write_all(header.as_bytes())?;
+            thread::sleep(plan.body_delay);
+            let chunks = plan.body.chunks(plan.chunk_size);
+            let count = chunks.len();
+            for (index, chunk) in chunks.enumerate() {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                if index + 1 < count {
+                    thread::sleep(plan.chunk_delay);
+                }
+            }
+            Ok(observed)
+        })));
+        let request = HttpRequest {
+            method: method.into(),
+            url: format!("http://{address}/body-control"),
+            headers: vec![
+                ("X-Request-Control".into(), "selected".into()),
+                ("Authorization".into(), "Bearer synthetic-token".into()),
+                ("Connection".into(), "close".into()),
+            ],
+            body: request_body,
+            timeout,
+        };
+        let started = Instant::now();
+        let response = UreqHttpTransport.execute(&request);
+        let elapsed = started.elapsed();
+        let observed = server.finish();
+        eprintln!("body control {method}: budget {timeout:?}, elapsed {elapsed:?}, {response:?}");
+        (response, observed)
+    }
+
+    fn nonuniform_body(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| ((index * 37) % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn exact_multiread_body_and_request_fields_survive_get_and_post() {
+        let body = nonuniform_body(5_123);
+        for method in ["GET", "POST"] {
+            let sent = if method == "POST" {
+                nonuniform_body(1_319)
+            } else {
+                vec![]
+            };
+            let (response, observed) = exchange(
+                method,
+                sent.clone(),
+                Duration::from_secs(2),
+                ResponsePlan::body(body.clone()),
+            );
+            assert_eq!(observed.method, method);
+            assert_eq!(observed.body, sent);
+            assert_eq!(observed.headers["x-request-control"], "selected");
+            assert_eq!(observed.headers["authorization"], "Bearer synthetic-token");
+            let response = response.unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, body);
+            assert!(
+                response
+                    .headers
+                    .contains(&("x-body-control".into(), "exact".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_unauthorized_responses_keep_http_semantics() {
+        for (status, body) in [(204, vec![]), (401, b"denied".to_vec())] {
+            let mut plan = ResponsePlan::body(body.clone());
+            plan.status = status;
+            let (response, observed) = exchange("GET", vec![], Duration::from_secs(2), plan);
+            assert_eq!(observed.method, "GET");
+            let response = response.unwrap();
+            assert_eq!(response.status, status);
+            assert_eq!(response.body, body);
+        }
+    }
+
+    #[test]
+    fn stalled_body_is_timeout() {
+        let mut plan = ResponsePlan::body(vec![1]);
+        plan.body_delay = Duration::from_millis(350);
+        let (response, _) = exchange("POST", vec![], Duration::from_millis(120), plan);
+        assert_eq!(response, Err(HttpError::Timeout));
+    }
+
+    #[test]
+    fn continuing_body_cannot_succeed_after_deadline() {
+        let mut plan = ResponsePlan::body(nonuniform_body(2_048));
+        plan.chunk_size = 64;
+        plan.chunk_delay = Duration::from_millis(10);
+        let (response, _) = exchange("POST", vec![], Duration::from_millis(120), plan);
+        assert_eq!(response, Err(HttpError::Timeout));
+    }
+
+    #[test]
+    fn prompt_truncation_is_other_without_partial_success() {
+        let mut plan = ResponsePlan::body(vec![1, 2, 3, 4]);
+        plan.declared_length = Some(128);
+        let (response, _) = exchange("GET", vec![], Duration::from_secs(2), plan);
+        assert_eq!(response, Err(HttpError::Other));
+    }
+
+    #[test]
+    fn header_and_body_share_entry_budget() {
+        let body = nonuniform_body(2_048);
+        let mut prompt = ResponsePlan::body(body.clone());
+        prompt.chunk_size = 128;
+        prompt.chunk_delay = Duration::from_millis(20);
+        let (response, _) = exchange("GET", vec![], Duration::from_millis(500), prompt);
+        assert_eq!(response.unwrap().body, body);
+
+        let mut delayed = ResponsePlan::body(body);
+        delayed.chunk_size = 128;
+        delayed.chunk_delay = Duration::from_millis(20);
+        delayed.header_delay = Duration::from_millis(300);
+        let (response, _) = exchange("GET", vec![], Duration::from_millis(500), delayed);
+        assert_eq!(response, Err(HttpError::Timeout));
+    }
+
+    #[test]
+    fn zero_budget_issues_no_http_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let request = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{}/zero", listener.local_addr().unwrap()),
+            headers: vec![],
+            body: vec![],
+            timeout: Duration::ZERO,
+        };
+        assert_eq!(UreqHttpTransport.execute(&request), Err(HttpError::Timeout));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 }

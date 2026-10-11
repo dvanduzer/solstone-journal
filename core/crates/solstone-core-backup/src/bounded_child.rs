@@ -531,7 +531,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     fn live_test_session() -> SpawnedChild {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 60"]).process_group(0);
