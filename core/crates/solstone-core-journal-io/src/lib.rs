@@ -17,6 +17,7 @@ pub mod activity;
 pub mod activity_obligations;
 #[cfg(any(unix, windows))]
 pub mod append;
+pub mod archive_origin;
 #[cfg(any(unix, windows))]
 pub mod atomic;
 pub mod bounded_read;
