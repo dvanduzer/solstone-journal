@@ -33,8 +33,12 @@ pub use generate::{
     prepare_bundled_request, prepare_exact_text_request, prepare_local_schema,
     serialized_message_text,
 };
+pub use install::apple_memory::{
+    APPLE_SILICON_TOTAL_MEMORY_MIN_BYTES, AppleTotalMemoryVerdict, apple_physical_memory_bytes,
+    apple_total_memory_verdict,
+};
 pub use install::{
-    DispatchError as InstallDispatchError, InstallEnvelope, InstallVerb, WindowsGpuAdmission,
+    DispatchError as InstallDispatchError, InstallEnvelope, InstallVerb, LocalHardwareAdmission,
     dispatch as dispatch_install, run_local_with_gpu_admission,
 };
 pub use nvidia::{

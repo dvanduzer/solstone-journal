@@ -251,6 +251,9 @@ async function main() {
     localSetupRefusals,
     localSetupRefusal,
     localInstallAfterStart,
+    pollLocalInstallUntilTerminal,
+    applyLocalInstallStatus,
+    refreshInstallStatus,
     showLocalSetupFailure,
     api,
     renderMainLanes,
@@ -1703,6 +1706,7 @@ async function main() {
   const localCopyPayload = {
     local_install: {
       gpu_memory_insufficient: 'local thinking needs at least 6 GB of graphics memory on this computer.',
+      memory_failed: 'local thinking needs at least 16 GB of unified memory on Apple Silicon.',
       unidentified_failed: "local setup couldn't finish. try checking again in a moment.",
       retry: 'try again',
       cancel: 'cancel',
@@ -1733,6 +1737,41 @@ async function main() {
   );
   assert.strictEqual(nodes.get('localBootstrap').hidden, false, 'retry control is present');
   assert.strictEqual(nodes.get('localCancel').hidden, false, 'cancel control is present');
+
+  thinking.state.install = {
+    install_state: 'failed',
+    error_code: 'memory_insufficient',
+    install_error: '<img src=x onerror=alert(1)>',
+  };
+  thinking.renderLocal();
+  assert.strictEqual(
+    noticeNode.textContent,
+    localCopyPayload.local_install.memory_failed,
+    'failed status with memory_insufficient renders the memory_failed payload value',
+  );
+  assert.strictEqual(nodes.get('localBootstrap').hidden, false, 'retry control is present for memory_failed class');
+  assert.strictEqual(nodes.get('localCancel').hidden, false, 'cancel control is present for memory_failed class');
+
+  thinking.state.install = {
+    install_state: 'idle',
+    admission_warning: 'fixture memory admission warning',
+  };
+  thinking.state.localAvailability = {
+    available: false,
+    reason_code: 'binary_missing',
+    reason: 'local runtime is not installed',
+  };
+  thinking.renderLocal();
+  assert.strictEqual(
+    noticeNode.textContent.includes('fixture memory admission warning'),
+    true,
+    'fixture warning text appears on the card',
+  );
+  assert.strictEqual(
+    nodes.get('localBootstrap').hidden,
+    false,
+    'install action remains available when admission warning is present',
+  );
 
   thinking.state.install = {
     install_state: 'failed',
@@ -1785,6 +1824,38 @@ async function main() {
       assert.strictEqual(nodes.get('localNotice').textContent.includes('<img'), false, 'raw diagnostics are absent');
       assert.strictEqual(nodes.get('localBootstrap').hidden, false, 'retry remains available');
     }
+    thinking.state.install = null;
+    const savedModels = thinking.state.localModels;
+    thinking.state.localModels = [{name: 'local/qwen3.5-4b'}];
+    for (const receipt of receipts.warnings || []) {
+      thinking.state.localAvailability = receipt.availability;
+      thinking.state.install = {install_state: 'idle'};
+      thinking.renderLocal();
+      assert.strictEqual(nodes.get('localBootstrap').hidden, false, 'unreadable memory leaves the install action available');
+      thinking.applyLocalInstallStatus(receipt.initial);
+      const warning = receipt.initial.admission_warning;
+      assert.strictEqual(typeof warning, 'string');
+      const pending = [receipt.progress, receipt.terminal];
+      await thinking.pollLocalInstallUntilTerminal({
+        fetchStatus: () => Promise.resolve(pending.shift()),
+        sleepFn: () => Promise.resolve(),
+        applyStatus: (status) => {
+          thinking.applyLocalInstallStatus(status);
+          assert.strictEqual(nodes.get('localNotice').textContent.includes(warning), true, 'persisted warning survives each poll');
+        },
+        isCurrent: () => true,
+        intervalMs: 0,
+        initialStatus: receipt.initial,
+      });
+      thinking.state.install = null;
+      localResponses.push(() => Promise.resolve(receipt.terminal));
+      await thinking.refreshInstallStatus();
+      assert.strictEqual(nodes.get('localNotice').textContent.includes(warning), true, 'persisted warning survives page refresh');
+      localResponses.push(() => Promise.resolve(receipt.cleared));
+      await thinking.refreshInstallStatus();
+      assert.strictEqual(nodes.get('localNotice').textContent.includes(warning), false, 'a later eligible attempt clears the warning');
+    }
+    thinking.state.localModels = savedModels;
     thinking.state.install = null;
     const beforeProviders = thinking.state.providers;
     for (const [reason, expected] of [

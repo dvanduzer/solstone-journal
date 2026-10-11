@@ -183,8 +183,9 @@ pub enum LocalProviderReadiness {
     Ready,
     /// The host can run the local model, but another check blocks the bootstrap for now.
     BootstrapBlocked,
-    /// The platform or GPU gate refuses the local model, or GPU readiness is unknown.
-    /// Setup leaves the thinking provider unchosen rather than defaulting to local.
+    /// The platform or GPU gate refuses the local model, GPU readiness is unknown,
+    /// or the Mac memory row is blocked. Setup leaves the thinking provider
+    /// unchosen rather than defaulting to local.
     Unavailable,
 }
 
@@ -204,16 +205,16 @@ impl CheckReportBuilder for NativeCheckReportBuilder {
 
 /// Classify a `journal check` report for the local provider.
 ///
-/// The `platform` and `gpu` rows are the host gate (`gpu` is where
-/// `select_device` decides). An `Unknown` GPU row counts as unavailable: it is
-/// what a probe that could not complete produces, and the runtime refuses the
-/// local model on that same observation. Other blocked rows, such as too
-/// little free disk, block only the bootstrap.
+/// A new setup leaves thinking unchosen when the GPU row is blocked or unknown
+/// and when the Mac memory row is blocked, and the installer allows an
+/// unreadable Mac or Linux memory attempt and warns. Other blocked rows, such as
+/// too little free disk, block only the bootstrap.
 #[must_use]
 pub fn local_provider_readiness(report: &CheckReport) -> LocalProviderReadiness {
     if report.checks.iter().any(|check| {
-        matches!(check.name, "platform" | "gpu")
-            && matches!(check.severity, Severity::Blocked | Severity::Unknown)
+        (matches!(check.name, "platform" | "gpu")
+            && matches!(check.severity, Severity::Blocked | Severity::Unknown))
+            || (check.name == "memory" && check.severity == Severity::Blocked)
     }) {
         LocalProviderReadiness::Unavailable
     } else if report.overall == Severity::Blocked {
@@ -3466,6 +3467,187 @@ mod tests {
         fn local_provider_readiness(&self, _journal: &Path) -> LocalProviderReadiness {
             self.0
         }
+    }
+
+    struct DynamicCheck(CheckReport);
+    impl CheckReportBuilder for DynamicCheck {
+        fn local_provider_readiness(&self, _journal: &Path) -> LocalProviderReadiness {
+            local_provider_readiness(&self.0)
+        }
+    }
+
+    fn darwin_arm64_check_report(
+        total_bytes: Option<u64>,
+        available_bytes: Option<u64>,
+        free_gib: u64,
+    ) -> CheckReport {
+        let gib = 1024 * 1024 * 1024;
+        let inputs = serde_json::from_value(json!({
+            "platform": {"os": "Darwin", "os_version": "x", "arch": "arm64"},
+            "memory": {
+                "total_bytes": total_bytes,
+                "available_bytes": available_bytes,
+            },
+            "disk": {"kind": "ok", "free_bytes": free_gib * gib},
+            "journal_path": "/journal",
+            "nvidia": {"detected": false, "vram_mib": null, "tiering_memory_mib": null, "memory_source": "unavailable"},
+            "vulkan": {"probe_ok": true, "devices": []},
+            "render_nodes_present_but_inaccessible": false,
+            "gpu_evaluation_error": null,
+            "version": "x"
+        }))
+        .expect("darwin check inputs");
+        solstone_core_check::build_check_report(&inputs)
+    }
+
+    #[test]
+    fn setup_leaves_provider_unchosen_on_below_bar_apple_silicon_mac() {
+        let gib = 1024 * 1024 * 1024;
+        let report = darwin_arm64_check_report(Some(16 * gib - 1), Some(16 * gib - 1), 100);
+        assert_eq!(
+            local_provider_readiness(&report),
+            LocalProviderReadiness::Unavailable
+        );
+
+        let dynamic_check = DynamicCheck(report);
+        let (args, resolved, root, home) = fixture("brain-below-bar-mac", &[]);
+        let mut runner = FakeRunner::new(Vec::new());
+        let mut prompt = Prompt(false);
+        let mut setup = context(
+            &args,
+            &resolved,
+            &root,
+            &home,
+            &mut runner,
+            &mut prompt,
+            None,
+        );
+        setup.check_report_builder = &dynamic_check;
+        let result = step_brain(&mut setup).unwrap();
+        assert_eq!(result.status, StepStatus::Skipped);
+        let config_path = get_journal_config_path(&resolved.journal_path);
+        let active = fs::read(&config_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|config| config.pointer("/providers/active").cloned());
+        assert_eq!(active, None, "no provider is chosen for below-bar Mac");
+        assert!(runner.requests.is_empty(), "bootstrap must not run");
+    }
+
+    #[test]
+    fn setup_keeps_local_provider_on_eligible_or_unknown_total_memory_mac() {
+        let gib = 1024 * 1024 * 1024;
+        // Exactly 16 GiB with available at/above 13 GiB warning floor: Ready
+        let report_16g = darwin_arm64_check_report(Some(16 * gib), Some(14 * gib), 100);
+        assert_eq!(
+            local_provider_readiness(&report_16g),
+            LocalProviderReadiness::Ready
+        );
+
+        // Free-memory Warning (total >= 16 GiB, available < 13 GiB): Ready
+        let report_warning = darwin_arm64_check_report(Some(16 * gib), Some(8 * gib), 100);
+        assert_eq!(
+            local_provider_readiness(&report_warning),
+            LocalProviderReadiness::Ready
+        );
+
+        // total_bytes: None: Ready
+        let report_unknown = darwin_arm64_check_report(None, None, 100);
+        assert_eq!(
+            local_provider_readiness(&report_unknown),
+            LocalProviderReadiness::Ready
+        );
+
+        // Test step_brain selects local when Ready
+        let dynamic_check = DynamicCheck(report_16g);
+        let (args, resolved, root, home) = fixture("brain-eligible-mac", &[]);
+        let mut runner = FakeRunner::new(Vec::new());
+        let mut prompt = Prompt(false);
+        let mut setup = context(
+            &args,
+            &resolved,
+            &root,
+            &home,
+            &mut runner,
+            &mut prompt,
+            None,
+        );
+        setup.check_report_builder = &dynamic_check;
+        let result = step_brain(&mut setup).unwrap();
+        assert_eq!(result.status, StepStatus::Skipped);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(SkipReason::JournalNotCreatedYet.as_str())
+        );
+        let config_path = get_journal_config_path(&resolved.journal_path);
+        let active = fs::read(&config_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|config| config.pointer("/providers/active").cloned());
+        assert_eq!(
+            active,
+            Some(json!({"provider": "local", "model": LOCAL_MODEL}))
+        );
+
+        // Existing local selection on a below-bar Mac stays selected and does not bootstrap:
+        let report_below_bar = darwin_arm64_check_report(Some(16 * gib - 1), Some(8 * gib), 100);
+        let below_bar_check = DynamicCheck(report_below_bar);
+        let (args, resolved, root, home) = fixture("brain-owner-below-bar-mac", &[]);
+        let config_path = get_journal_config_path(&resolved.journal_path);
+        let owner = json!({"providers":{"active":{"provider":"local","model":LOCAL_MODEL}}});
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, serde_json::to_vec(&owner).unwrap()).unwrap();
+        let mut runner = FakeRunner::new(Vec::new());
+        let mut prompt = Prompt(false);
+        let mut setup = context(
+            &args,
+            &resolved,
+            &root,
+            &home,
+            &mut runner,
+            &mut prompt,
+            None,
+        );
+        setup.check_report_builder = &below_bar_check;
+        let result = step_brain(&mut setup).unwrap();
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(SkipReason::LocalProviderUnavailable.as_str())
+        );
+        let config: Value = serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(config["providers"]["active"], owner["providers"]["active"]);
+        assert!(runner.requests.is_empty(), "bootstrap must not run");
+
+        // A different provider stays:
+        let (args, resolved, root, home) = fixture("brain-owner-remote-mac", &[]);
+        let config_path = get_journal_config_path(&resolved.journal_path);
+        let owner_remote = json!({"providers":{"active":{"provider":"remote"}}});
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, serde_json::to_vec(&owner_remote).unwrap()).unwrap();
+        let mut runner = FakeRunner::new(Vec::new());
+        let mut prompt = Prompt(false);
+        let mut setup = context(
+            &args,
+            &resolved,
+            &root,
+            &home,
+            &mut runner,
+            &mut prompt,
+            None,
+        );
+        setup.check_report_builder = &below_bar_check;
+        let result = step_brain(&mut setup).unwrap();
+        assert_eq!(result.status, StepStatus::Skipped);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(SkipReason::ProviderAlreadyConfigured.as_str())
+        );
+        let config: Value = serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["providers"]["active"],
+            owner_remote["providers"]["active"]
+        );
+        assert!(runner.requests.is_empty());
     }
 
     #[test]

@@ -58,6 +58,8 @@ pub struct InstallStatus {
     pub revision: u64,
     pub install_state: String,
     pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_warning: Option<String>,
     pub target_fingerprint_json: Option<String>,
     pub target_fingerprint_sha256: Option<String>,
     pub started_at: Option<String>,
@@ -91,6 +93,7 @@ pub fn idle_status(provider: &str) -> InstallStatus {
         revision: 0,
         install_state: "idle".to_owned(),
         attempt_id: None,
+        admission_warning: None,
         target_fingerprint_json: None,
         target_fingerprint_sha256: None,
         started_at: None,
@@ -193,6 +196,7 @@ pub fn begin(
     fingerprint_sha256: String,
     owner: Option<Value>,
     state: &str,
+    admission_warning: Option<String>,
 ) -> Result<InstallStatus, StatusError> {
     if !is_in_flight(state) {
         return Err(StatusError::Malformed(
@@ -204,6 +208,7 @@ pub fn begin(
     next.target_fingerprint_sha256 = Some(fingerprint_sha256);
     next.attempt_id = Some(new_attempt_id());
     next.owner = owner;
+    next.admission_warning = admission_warning;
     write_status(journal, transition(next, state, None, None)?)
 }
 
@@ -474,6 +479,7 @@ pub fn transition(
     current.install_state = state.to_owned();
     if state == "idle" {
         current.attempt_id = None;
+        current.admission_warning = None;
     }
     if was_terminal && is_in_flight(state) {
         current.started_at = Some(timestamp.clone());
@@ -497,6 +503,7 @@ pub fn begin_or_replace(
     fingerprint_sha256: String,
     owner: Option<Value>,
     state: &str,
+    admission_warning: Option<String>,
 ) -> Result<InstallStatus, StatusError> {
     let current = read_status(journal, provider)?;
     let mut next = current;
@@ -512,6 +519,7 @@ pub fn begin_or_replace(
     next.target_fingerprint_json = Some(fingerprint_json);
     next.target_fingerprint_sha256 = Some(fingerprint_sha256);
     next.owner = owner;
+    next.admission_warning = admission_warning;
     next.attempt_id = Some(new_attempt_id());
     next = transition(next, state, None, None)?;
     write_status(journal, next)
@@ -589,6 +597,7 @@ pub(crate) fn record_terminal_refusal_with_lease(
     }
     current.attempt_id = Some(new_attempt_id());
     current.owner = None;
+    current.admission_warning = None;
     current.target_fingerprint_json = None;
     current.target_fingerprint_sha256 = None;
     current.started_at = Some(now());

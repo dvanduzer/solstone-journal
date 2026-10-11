@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- on a mac or linux computer, a local thinking install now stops before downloading when that computer is known to be below the memory bar or has no usable GPU. when that memory cannot be read, the install still starts and the thinking page keeps a warning for that attempt.
+
 ## [2.0.41] - 2026-10-11
 
 ### Added

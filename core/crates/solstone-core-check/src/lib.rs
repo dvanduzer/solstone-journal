@@ -20,14 +20,14 @@ use solstone_core_local::install::rfdetr_readiness::{
     RFDETR_READY_DETAIL, RfdetrDegradedCause, RfdetrReadiness, evaluate_rfdetr_readiness,
 };
 use solstone_core_local::{
-    GPU_DEVICE_LOCAL_MIN_BYTES, GpuDeviceLocalVerdict, VulkanDevice, cpu_placement_suffix,
+    APPLE_SILICON_TOTAL_MEMORY_MIN_BYTES, AppleTotalMemoryVerdict, GPU_DEVICE_LOCAL_MIN_BYTES,
+    GpuDeviceLocalVerdict, VulkanDevice, apple_total_memory_verdict, cpu_placement_suffix,
     discrete_hardware_gpu_count, gpu_device_local_verdict, is_discrete, select_device,
 };
 use solstone_core_system::provider_runtime::decide_parakeet_auto_placement;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const DISK_MIN: u64 = 20 * GIB;
-const MAC_MEMORY_MIN: u64 = 16 * GIB;
 const MAC_AVAILABLE_MIN: u64 = 13 * GIB;
 const LINUX_RAM_WARN: u64 = 8 * GIB;
 const FEEDBACK_URL: &str = "https://github.com/solpbc/solstone-journal";
@@ -656,48 +656,54 @@ fn rfdetr_check(inputs: &CheckInputs) -> Option<Check> {
     }
 }
 fn mac_memory(memory: &MemoryInput) -> Check {
-    match memory.total_bytes {
-        None => check(
+    match apple_total_memory_verdict(memory.total_bytes) {
+        AppleTotalMemoryVerdict::Unreadable => check(
             "memory",
             Severity::Unknown,
             "available memory could not be verified",
-            Some(MAC_MEMORY_MIN),
+            Some(APPLE_SILICON_TOTAL_MEMORY_MIN_BYTES),
             None,
         ),
-        Some(total) if total < MAC_MEMORY_MIN => check(
-            "memory",
-            Severity::Blocked,
-            format!(
-                "Apple Silicon needs at least 16 GB of memory for the bundled local models (this Mac has {} GB)",
-                label(total)
-            ),
-            Some(MAC_MEMORY_MIN),
-            Some(total),
-        ),
-        Some(_total)
-            if memory
-                .available_bytes
-                .is_some_and(|available| available < MAC_AVAILABLE_MIN) =>
-        {
-            let available = memory.available_bytes.unwrap();
+        AppleTotalMemoryVerdict::BelowBar => {
+            let total = memory.total_bytes.unwrap_or(0);
             check(
                 "memory",
-                Severity::Warning,
+                Severity::Blocked,
                 format!(
-                    "enough total memory, but only {} GB is free right now — close some apps before the local models load",
-                    label(available)
+                    "Apple Silicon needs at least 16 GB of memory for the bundled local models (this Mac has {} GB)",
+                    label(total)
                 ),
-                Some(MAC_AVAILABLE_MIN),
-                Some(available),
+                Some(APPLE_SILICON_TOTAL_MEMORY_MIN_BYTES),
+                Some(total),
             )
         }
-        Some(total) => check(
-            "memory",
-            Severity::Ok,
-            format!("{} GB of memory meets the 16 GB minimum", label(total)),
-            Some(MAC_MEMORY_MIN),
-            Some(total),
-        ),
+        AppleTotalMemoryVerdict::Eligible => {
+            let total = memory.total_bytes.unwrap_or(0);
+            if memory
+                .available_bytes
+                .is_some_and(|available| available < MAC_AVAILABLE_MIN)
+            {
+                let available = memory.available_bytes.unwrap();
+                check(
+                    "memory",
+                    Severity::Warning,
+                    format!(
+                        "enough total memory, but only {} GB is free right now — close some apps before the local models load",
+                        label(available)
+                    ),
+                    Some(MAC_AVAILABLE_MIN),
+                    Some(available),
+                )
+            } else {
+                check(
+                    "memory",
+                    Severity::Ok,
+                    format!("{} GB of memory meets the 16 GB minimum", label(total)),
+                    Some(APPLE_SILICON_TOTAL_MEMORY_MIN_BYTES),
+                    Some(total),
+                )
+            }
+        }
     }
 }
 fn gpu(inputs: &CheckInputs) -> Check {
@@ -1622,5 +1628,47 @@ mod tests {
         assert_eq!(gpu_linux.severity, Severity::Unknown);
         assert_eq!(gpu_linux.required_bytes, None);
         assert_eq!(gpu_linux.available_bytes, None);
+    }
+
+    #[test]
+    fn mac_memory_evaluates_against_shared_local_bar() {
+        let mac_inputs = |total: Option<u64>, available: Option<u64>| -> CheckInputs {
+            let mut inputs = check_inputs(Some(CapabilityStatus::Ready), RfdetrCheckInput::Ready);
+            inputs.platform.os = "Darwin".into();
+            inputs.platform.arch = "arm64".into();
+            inputs.memory.total_bytes = total;
+            inputs.memory.available_bytes = available;
+            inputs
+        };
+
+        let report_below = build_check_report(&mac_inputs(
+            Some(APPLE_SILICON_TOTAL_MEMORY_MIN_BYTES - 1),
+            Some(14 * GIB),
+        ));
+        let mem_below = report_below
+            .checks
+            .iter()
+            .find(|c| c.name == "memory")
+            .expect("memory check");
+        assert_eq!(mem_below.severity, Severity::Blocked);
+
+        let report_ok = build_check_report(&mac_inputs(
+            Some(APPLE_SILICON_TOTAL_MEMORY_MIN_BYTES),
+            Some(14 * GIB),
+        ));
+        let mem_ok = report_ok
+            .checks
+            .iter()
+            .find(|c| c.name == "memory")
+            .expect("memory check");
+        assert_eq!(mem_ok.severity, Severity::Ok);
+
+        let report_unknown = build_check_report(&mac_inputs(None, None));
+        let mem_unknown = report_unknown
+            .checks
+            .iter()
+            .find(|c| c.name == "memory")
+            .expect("memory check");
+        assert_eq!(mem_unknown.severity, Severity::Unknown);
     }
 }

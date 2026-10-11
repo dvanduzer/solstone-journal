@@ -3686,7 +3686,11 @@
     } else {
       setMessage('localSetupMessage', local.message, local.tone === 'bad' ? 'error' : '');
     }
-    setText('localNotice', local.notice);
+    let notice = local.notice;
+    if (state.install && typeof state.install.admission_warning === 'string' && state.install.admission_warning.length > 0) {
+      notice = notice ? `${notice} ${state.install.admission_warning}` : state.install.admission_warning;
+    }
+    setText('localNotice', notice);
     setText(
       'localOverrideNoticeText',
       state.providers?.active_lane?.lane === 'confidential'

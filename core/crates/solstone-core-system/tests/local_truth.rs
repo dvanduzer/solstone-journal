@@ -637,6 +637,7 @@ fn old_test_status() -> solstone_core_local::install::status::InstallStatus {
         install_error: Some("old failure".into()),
         error_code: Some("download_failed".into()),
         owner: None,
+        admission_warning: None,
     }
 }
 

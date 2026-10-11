@@ -139,13 +139,17 @@ where
     J: FnOnce() -> Result<PathBuf, ()>,
     R: FnOnce(&Path) -> Value,
     P: FnOnce(&Path, lease::InstallLease) -> Result<Value, Box<DispatchError>>,
-    L: FnOnce(&Path, solstone_core_local::WindowsGpuAdmission) -> Result<Value, Box<DispatchError>>,
+    L: FnOnce(
+        &Path,
+        solstone_core_local::LocalHardwareAdmission,
+    ) -> Result<Value, Box<DispatchError>>,
 {
     let (os_name, arch) = canonical_host_pair(std::env::consts::OS, std::env::consts::ARCH);
     run_inner_with(
         options,
         journal_resolver,
         readiness_provider,
+        None,
         None,
         parakeet_executor,
         local_executor,
@@ -160,6 +164,7 @@ fn run_inner_with<J, R, P, L>(
     journal_resolver: J,
     readiness_provider: R,
     report_override: Option<fit_report::FitReport>,
+    admission_override: Option<solstone_core_local::LocalHardwareAdmission>,
     parakeet_executor: P,
     local_executor: L,
     os_name: &str,
@@ -169,7 +174,10 @@ where
     J: FnOnce() -> Result<PathBuf, ()>,
     R: FnOnce(&Path) -> Value,
     P: FnOnce(&Path, lease::InstallLease) -> Result<Value, Box<DispatchError>>,
-    L: FnOnce(&Path, solstone_core_local::WindowsGpuAdmission) -> Result<Value, Box<DispatchError>>,
+    L: FnOnce(
+        &Path,
+        solstone_core_local::LocalHardwareAdmission,
+    ) -> Result<Value, Box<DispatchError>>,
 {
     match options.name.as_str() {
         "parakeet" => {}
@@ -178,6 +186,7 @@ where
                 journal_resolver,
                 readiness_provider,
                 report_override,
+                admission_override,
                 local_executor,
                 os_name,
                 arch,
@@ -310,7 +319,7 @@ fn install_parakeet(
 
 fn install_local(
     journal: &Path,
-    admission: solstone_core_local::WindowsGpuAdmission,
+    admission: solstone_core_local::LocalHardwareAdmission,
 ) -> Result<Value, Box<DispatchError>> {
     let owner = match solstone_core_system::process::current_process_identity() {
         Some(instance) if instance.birth.is_verifiable() => json!(instance),
@@ -351,6 +360,7 @@ fn run_local_inner_with_platform<J, R, L>(
     journal_resolver: J,
     readiness_provider: R,
     report_override: Option<fit_report::FitReport>,
+    admission_override: Option<solstone_core_local::LocalHardwareAdmission>,
     install_executor: L,
     os_name: &str,
     arch: &str,
@@ -358,12 +368,16 @@ fn run_local_inner_with_platform<J, R, L>(
 where
     J: FnOnce() -> Result<PathBuf, ()>,
     R: FnOnce(&Path) -> Value,
-    L: FnOnce(&Path, solstone_core_local::WindowsGpuAdmission) -> Result<Value, Box<DispatchError>>,
+    L: FnOnce(
+        &Path,
+        solstone_core_local::LocalHardwareAdmission,
+    ) -> Result<Value, Box<DispatchError>>,
 {
     run_local_inner_with_platform_and_target_sha(
         journal_resolver,
         readiness_provider,
         report_override,
+        admission_override,
         install_executor,
         local_target_sha,
         os_name,
@@ -371,10 +385,12 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit platform injection is a testable host-boundary seam.
 fn run_local_inner_with_platform_and_target_sha<J, R, L, T>(
     journal_resolver: J,
     readiness_provider: R,
     report_override: Option<fit_report::FitReport>,
+    admission_override: Option<solstone_core_local::LocalHardwareAdmission>,
     install_executor: L,
     target_sha_provider: T,
     os_name: &str,
@@ -383,7 +399,10 @@ fn run_local_inner_with_platform_and_target_sha<J, R, L, T>(
 where
     J: FnOnce() -> Result<PathBuf, ()>,
     R: FnOnce(&Path) -> Value,
-    L: FnOnce(&Path, solstone_core_local::WindowsGpuAdmission) -> Result<Value, Box<DispatchError>>,
+    L: FnOnce(
+        &Path,
+        solstone_core_local::LocalHardwareAdmission,
+    ) -> Result<Value, Box<DispatchError>>,
     T: Fn(&Path) -> Result<String, String>,
 {
     let journal = match journal_resolver() {
@@ -454,16 +473,35 @@ where
             };
         }
     }
-    let (report, admission) = match report_override {
-        Some(report) => {
-            let admission = if os_name.eq_ignore_ascii_case("windows") {
-                solstone_core_local::WindowsGpuAdmission::Unobserved
-            } else {
-                solstone_core_local::WindowsGpuAdmission::NotWindows
+    let (report, admission) = match (admission_override, report_override) {
+        (Some(admission), Some(report)) => (report, admission),
+        (Some(admission), None) => {
+            let report = fit_report::FitReport {
+                artifact: "local provider artifacts".to_string(),
+                checks: vec![fit_report::FitCheck {
+                    name: "platform",
+                    severity: fit_report::FitSeverity::Ok,
+                    detail: format!("injected hardware admission for {os_name}-{arch}"),
+                }],
             };
             (report, admission)
         }
-        None => match build_platform_report(&journal, os_name, arch) {
+        (None, Some(report)) => {
+            if os_name.eq_ignore_ascii_case("windows") {
+                (
+                    report,
+                    solstone_core_local::LocalHardwareAdmission::WindowsUnobserved,
+                )
+            } else {
+                stderr.push("hardware admission required when report is supplied".to_string());
+                return InstallProviderOutcome {
+                    exit_code: 1,
+                    stdout: Vec::new(),
+                    stderr,
+                };
+            }
+        }
+        (None, None) => match build_platform_report(&journal, os_name, arch) {
             Ok((report, admission)) => (report, admission),
             Err(error) => {
                 if let Err(persistence_error) =
@@ -516,7 +554,7 @@ fn build_platform_report(
 ) -> Result<
     (
         fit_report::FitReport,
-        solstone_core_local::WindowsGpuAdmission,
+        solstone_core_local::LocalHardwareAdmission,
     ),
     String,
 > {
@@ -530,7 +568,7 @@ fn build_local_report(
 ) -> Result<
     (
         fit_report::FitReport,
-        solstone_core_local::WindowsGpuAdmission,
+        solstone_core_local::LocalHardwareAdmission,
     ),
     String,
 > {
@@ -540,25 +578,28 @@ fn build_local_report(
         arch,
         probe_nvidia_gpu,
         solstone_core_system::vulkan_observe::observe_vulkan_devices,
+        solstone_core_local::apple_physical_memory_bytes,
     )
 }
 
-fn build_local_report_with<N, V>(
+fn build_local_report_with<N, V, A>(
     journal: &Path,
     os_name: &str,
     arch: &str,
     nvidia_probe_fn: N,
     vulkan_observe_fn: V,
+    apple_total_bytes: A,
 ) -> Result<
     (
         fit_report::FitReport,
-        solstone_core_local::WindowsGpuAdmission,
+        solstone_core_local::LocalHardwareAdmission,
     ),
     String,
 >
 where
     N: FnOnce() -> solstone_core_local::nvidia::NvidiaProbe,
     V: FnOnce() -> solstone_core_system::vulkan_observe::VulkanObservation,
+    A: FnOnce() -> Option<u64>,
 {
     let is_windows = os_name.eq_ignore_ascii_case("windows");
     let nvidia_probe = if is_windows {
@@ -603,13 +644,30 @@ where
         force_cpu,
     );
     let admission = if is_windows {
-        solstone_core_local::WindowsGpuAdmission::Observed {
+        solstone_core_local::LocalHardwareAdmission::WindowsObserved {
             probe_ok: vulkan_obs.succeeded,
             devices,
             override_index,
         }
+    } else if os_name.eq_ignore_ascii_case("darwin") {
+        if arch.eq_ignore_ascii_case("aarch64") || arch.eq_ignore_ascii_case("arm64") {
+            solstone_core_local::LocalHardwareAdmission::AppleSilicon {
+                total_bytes: apple_total_bytes(),
+            }
+        } else {
+            solstone_core_local::LocalHardwareAdmission::UnsupportedDarwin
+        }
     } else {
-        solstone_core_local::WindowsGpuAdmission::NotWindows
+        solstone_core_local::LocalHardwareAdmission::GpuHost {
+            nvidia_detected: nvidia_probe.detected,
+            nvidia_memory_bytes: nvidia_probe
+                .vram_mib
+                .or(nvidia_probe.unified_memory_mib)
+                .map(|m| m.saturating_mul(1024 * 1024)),
+            probe_ok: vulkan_obs.succeeded,
+            devices,
+            override_index,
+        }
     };
     Ok((report, admission))
 }
@@ -652,36 +710,7 @@ fn local_override_and_brain_lane(
 }
 
 fn local_vulkan_device_index(value: &Value) -> Option<u32> {
-    match value {
-        Value::Bool(value) => Some(u32::from(*value)),
-        Value::String(value) => value
-            .trim()
-            .parse::<i64>()
-            .ok()
-            .and_then(|index| u64::try_from(index).ok())
-            .map(saturating_vulkan_device_index),
-        Value::Number(value) => {
-            if let Some(index) = value.as_i64() {
-                return u64::try_from(index)
-                    .ok()
-                    .map(saturating_vulkan_device_index);
-            }
-            if let Some(index) = value.as_u64() {
-                return Some(saturating_vulkan_device_index(index));
-            }
-            let index = value.as_f64()?.trunc();
-            if !index.is_finite() || index < 0.0 {
-                return None;
-            }
-            Some(saturating_vulkan_device_index(index as u64))
-        }
-        _ => None,
-    }
-}
-
-fn saturating_vulkan_device_index(index: u64) -> u32 {
-    // No real device index is u32::MAX, so this preserves an explicit nonmatching override.
-    u32::try_from(index).unwrap_or(u32::MAX)
+    solstone_core_local::vulkan::local_vulkan_device_index(value)
 }
 
 fn available_memory_bytes() -> Option<u64> {
@@ -967,11 +996,36 @@ mod tests {
         // Exercise the real installer entry, stopping at the OS lease before
         // package checks or downloads. The Unix-only PID inspector used to
         // refuse Windows here before the dispatcher could observe this lease.
-        let error = install_local(
-            journal.path(),
-            solstone_core_local::WindowsGpuAdmission::NotWindows,
-        )
-        .unwrap_err();
+        let admission = if cfg!(target_os = "windows") {
+            solstone_core_local::LocalHardwareAdmission::WindowsObserved {
+                probe_ok: true,
+                devices: vec![solstone_core_local::VulkanDevice {
+                    index: 0,
+                    name: "GPU".into(),
+                    device_type: Some(2),
+                    vram_mib: 6144,
+                }],
+                override_index: None,
+            }
+        } else if cfg!(target_os = "macos") {
+            solstone_core_local::LocalHardwareAdmission::AppleSilicon {
+                total_bytes: Some(16 * 1024 * 1024 * 1024),
+            }
+        } else {
+            solstone_core_local::LocalHardwareAdmission::GpuHost {
+                nvidia_detected: false,
+                nvidia_memory_bytes: None,
+                probe_ok: true,
+                devices: vec![solstone_core_local::VulkanDevice {
+                    index: 0,
+                    name: "GPU".into(),
+                    device_type: Some(2),
+                    vram_mib: 6144,
+                }],
+                override_index: None,
+            }
+        };
+        let error = install_local(journal.path(), admission).unwrap_err();
         assert_eq!(error.exit_code, lease::BUSY_EXIT_CODE);
         assert_eq!(error.envelope.error.unwrap().reason_code, "install_busy");
         assert!(lease::is_held(journal.path(), "local").unwrap());
@@ -1069,6 +1123,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| panic!("darwin platform must refuse before the executor"),
             |_, _| panic!("local must not install"),
             "darwin",
@@ -1082,6 +1137,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| panic!("windows has nothing to inspect"),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| panic!("windows platform must not reach the executor"),
             |_, _| panic!("local must not install"),
             "windows",
@@ -1095,6 +1151,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| Ok(json!({"status": status_value("installed")})),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1123,6 +1180,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             None,
+            None,
             |_, _| Ok(json!({"status": status_value("installed")})),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1144,6 +1202,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Blocked)),
+            None,
             |_, _| panic!("blocked must not install"),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1162,6 +1221,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Warning)),
+            None,
             |_, _| Ok(json!({"status": status_value("installed")})),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1184,6 +1244,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| Ok(json!({"status": status_value("downloading")})),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1228,6 +1289,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| Ok(json!({"status": status_value("failed")})),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1312,6 +1374,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             move |path, _| {
                 assert_eq!(
                     status::read_status(path, "parakeet").unwrap().attempt_id,
@@ -1346,6 +1409,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| json!({"status": "ready"}),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| panic!("ready must not install"),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1378,6 +1442,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Blocked)),
+            None,
             |_, _| panic!("blocked report proves non-ready reached install path"),
             |_, _| panic!("local must not install"),
             "linux",
@@ -1403,6 +1468,7 @@ mod tests {
                 || Ok(journal.path().to_path_buf()),
                 |_| json!({"status":state,"reason_code":reason}),
                 Some(report(fit_report::FitSeverity::Ok)),
+                None,
                 move |_, _| {
                     called.store(true, Ordering::SeqCst);
                     panic!("unavailable must not install")
@@ -1446,6 +1512,7 @@ mod tests {
                 || Ok(journal.path().to_path_buf()),
                 |_| json!({"status": state, "reason_code": reason}),
                 Some(report(fit_report::FitSeverity::Ok)),
+                None,
                 |_, _| panic!("parakeet must not install"),
                 move |_, _| {
                     called.store(true, Ordering::SeqCst);
@@ -1477,6 +1544,7 @@ mod tests {
                 || Ok(journal.path().to_path_buf()),
                 |_| json!({"status": state, "reason_code": reason}),
                 Some(report(fit_report::FitSeverity::Ok)),
+                None,
                 |_, _| panic!("parakeet must not install"),
                 |_, _| panic!("local must not install"),
                 "linux",
@@ -1501,6 +1569,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| json!({"status":"host-ineligible","reason_code":"binary_exit"}),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| panic!("parakeet must not install"),
             |_, _| panic!("local must not install"),
             "windows",
@@ -1537,6 +1606,18 @@ mod tests {
                     detail: "too small".to_owned(),
                 }],
             }),
+            Some(solstone_core_local::LocalHardwareAdmission::GpuHost {
+                nvidia_detected: false,
+                nvidia_memory_bytes: None,
+                probe_ok: true,
+                devices: vec![solstone_core_local::VulkanDevice {
+                    index: 0,
+                    name: "GPU".into(),
+                    device_type: Some(2),
+                    vram_mib: 6144,
+                }],
+                override_index: None,
+            }),
             |_, _| panic!("parakeet executor must not run"),
             move |_, _| {
                 called.store(true, Ordering::SeqCst);
@@ -1556,11 +1637,24 @@ mod tests {
     #[test]
     fn local_failure_reads_persisted_status_or_names_local_status_error() {
         let journal = tempfile::tempdir().unwrap();
+        let eligible = solstone_core_local::LocalHardwareAdmission::GpuHost {
+            nvidia_detected: false,
+            nvidia_memory_bytes: None,
+            probe_ok: true,
+            devices: vec![solstone_core_local::VulkanDevice {
+                index: 0,
+                name: "GPU".into(),
+                device_type: Some(2),
+                vram_mib: 6144,
+            }],
+            override_index: None,
+        };
         let persisted = run_inner_with(
             options("local"),
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            Some(eligible.clone()),
             |_, _| panic!("parakeet executor must not run"),
             |_, _| Err(dispatch_error("download failed")),
             "linux",
@@ -1590,6 +1684,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            Some(eligible),
             |_, _| panic!("parakeet executor must not run"),
             |_, _| Err(dispatch_error("download failed")),
             "linux",
@@ -1614,6 +1709,18 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             None,
+            Some(
+                solstone_core_local::LocalHardwareAdmission::WindowsObserved {
+                    probe_ok: true,
+                    devices: vec![solstone_core_local::VulkanDevice {
+                        index: 0,
+                        name: "GPU".into(),
+                        device_type: Some(2),
+                        vram_mib: 6144,
+                    }],
+                    override_index: None,
+                },
+            ),
             |_, _| {
                 entered.set(true);
                 Ok(json!({"status": status_value("installed")}))
@@ -1634,6 +1741,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| panic!("another writer owns the lease"),
             |_| Err("observer fingerprint unavailable".to_owned()),
             "windows",
@@ -1718,6 +1826,9 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            Some(solstone_core_local::LocalHardwareAdmission::AppleSilicon {
+                total_bytes: Some(16 * 1024 * 1024 * 1024),
+            }),
             |_, _| {
                 installed.set(true);
                 Ok(json!({"status": {"install_state": "installed"}}))
@@ -1909,7 +2020,7 @@ mod tests {
         // Darwin now installs the same native llama.cpp runtime family as the
         // other local backends, so the owner-facing disclosure must be present.
         let journal = tempfile::tempdir().unwrap();
-        let executor = |_: &Path, _: solstone_core_local::WindowsGpuAdmission| {
+        let executor = |_: &Path, _: solstone_core_local::LocalHardwareAdmission| {
             Ok(json!({"status": {"install_state": "installed"}}))
         };
 
@@ -1917,6 +2028,9 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             None,
+            Some(solstone_core_local::LocalHardwareAdmission::AppleSilicon {
+                total_bytes: Some(16 * 1024 * 1024 * 1024),
+            }),
             executor,
             "darwin",
             "arm64",
@@ -1936,6 +2050,18 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             None,
+            Some(solstone_core_local::LocalHardwareAdmission::GpuHost {
+                nvidia_detected: false,
+                nvidia_memory_bytes: None,
+                probe_ok: true,
+                devices: vec![solstone_core_local::VulkanDevice {
+                    index: 0,
+                    name: "GPU".into(),
+                    device_type: Some(2),
+                    vram_mib: 6144,
+                }],
+                override_index: None,
+            }),
             executor,
             "linux",
             "x86_64",
@@ -1984,6 +2110,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| Err(dispatch_error("download failed")),
             |_, _| panic!("local must not install"),
             "linux",
@@ -2007,6 +2134,7 @@ mod tests {
             || Ok(journal.path().to_path_buf()),
             |_| missing_readiness(),
             Some(report(fit_report::FitSeverity::Ok)),
+            None,
             |_, _| Err(dispatch_error("download failed")),
             |_, _| panic!("local must not install"),
             "linux",
@@ -2120,6 +2248,7 @@ mod tests {
                     vulkan_calls += 1;
                     obs
                 },
+                || None,
             )
             .expect("local fit report on windows");
 
@@ -2187,6 +2316,7 @@ mod tests {
                     vulkan_calls += 1;
                     obs
                 },
+                || None,
             )
             .expect("local fit report on windows");
 
@@ -2209,5 +2339,358 @@ mod tests {
             assert_eq!(gpu_check.severity, expected_gpu_severity);
         }
         solstone_core_local::install::windows_engine::set_test_windows_llama_package(None);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn install_provider_hardware_admission_composed_lifecycle() {
+        use solstone_core_local::install::{
+            AcquisitionTestGuard, TEST_ACQUIRE_MINT_COUNT, TEST_FETCH_RUNTIME_MEMBER_COUNT,
+            TEST_INSTALL_MODEL_COUNT,
+        };
+
+        let _guard = AcquisitionTestGuard::new(true);
+
+        // 1. Below-bar AppleSilicon on ("darwin", "aarch64"):
+        let journal = tempfile::tempdir().unwrap();
+        let below_bar_apple = solstone_core_local::LocalHardwareAdmission::AppleSilicon {
+            total_bytes: Some(8 * 1024 * 1024 * 1024),
+        };
+        let outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            None,
+            Some(below_bar_apple),
+            install_local,
+            "darwin",
+            "aarch64",
+        );
+        assert_ne!(outcome.exit_code, 0);
+        assert!(
+            outcome
+                .stderr
+                .iter()
+                .any(|line| line == "memory_insufficient")
+        );
+        assert_eq!(TEST_ACQUIRE_MINT_COUNT.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+
+        // Below-bar GpuHost on ("linux", "x86_64"):
+        let journal = tempfile::tempdir().unwrap();
+        let below_bar_gpu = solstone_core_local::LocalHardwareAdmission::GpuHost {
+            nvidia_detected: false,
+            nvidia_memory_bytes: None,
+            probe_ok: true,
+            devices: vec![solstone_core_local::VulkanDevice {
+                index: 0,
+                name: "dev0".into(),
+                device_type: Some(2),
+                vram_mib: 4096,
+            }],
+            override_index: None,
+        };
+        let outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            None,
+            Some(below_bar_gpu),
+            install_local,
+            "linux",
+            "x86_64",
+        );
+        assert_ne!(outcome.exit_code, 0);
+        assert!(
+            outcome
+                .stderr
+                .iter()
+                .any(|line| line == "gpu_memory_insufficient")
+        );
+        assert_eq!(TEST_ACQUIRE_MINT_COUNT.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+
+        // 2. Eligible and non-Windows unreadable: counters increase.
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let eligible_apple = solstone_core_local::LocalHardwareAdmission::AppleSilicon {
+            total_bytes: Some(16 * 1024 * 1024 * 1024),
+        };
+        let _outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            None,
+            Some(eligible_apple),
+            install_local,
+            "darwin",
+            "aarch64",
+        );
+        assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let unreadable_apple =
+            solstone_core_local::LocalHardwareAdmission::AppleSilicon { total_bytes: None };
+        let _outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            None,
+            Some(unreadable_apple),
+            install_local,
+            "darwin",
+            "aarch64",
+        );
+        assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let eligible_gpu = solstone_core_local::LocalHardwareAdmission::GpuHost {
+            nvidia_detected: false,
+            nvidia_memory_bytes: None,
+            probe_ok: true,
+            devices: vec![solstone_core_local::VulkanDevice {
+                index: 0,
+                name: "dev0".into(),
+                device_type: Some(2),
+                vram_mib: 6144,
+            }],
+            override_index: None,
+        };
+        let _outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            None,
+            Some(eligible_gpu),
+            install_local,
+            "linux",
+            "x86_64",
+        );
+        assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+        // build_local_report_with on failed probe returns Ok and reaches executor:
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let (report, admission) = build_local_report_with(
+            journal.path(),
+            "linux",
+            "x86_64",
+            solstone_core_local::nvidia::NvidiaProbe::absent,
+            || solstone_core_system::vulkan_observe::VulkanObservation {
+                devices: Vec::new(),
+                succeeded: false,
+            },
+            || None,
+        )
+        .expect("failed probe build_local_report_with returns Ok");
+        let _outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            Some(report),
+            Some(admission),
+            install_local,
+            "linux",
+            "x86_64",
+        );
+        assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+        // build_local_report_with on NVIDIA with both memory fields empty returns Ok and reaches executor:
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let nvd_empty = solstone_core_local::nvidia::NvidiaProbe {
+            schema: "solstone-nvidia-probe-v1".into(),
+            detected: true,
+            gpu_index: Some(0),
+            gpu_name: Some("NVIDIA".into()),
+            compute_cap: Some("8.9".into()),
+            arch: Some("sm_89".into()),
+            driver_cuda_major: Some(13),
+            vram_mib: None,
+            unified_memory_mib: None,
+            probe_error: None,
+        };
+        let (report, admission) = build_local_report_with(
+            journal.path(),
+            "linux",
+            "x86_64",
+            || nvd_empty,
+            || solstone_core_system::vulkan_observe::VulkanObservation {
+                devices: Vec::new(),
+                succeeded: true,
+            },
+            || None,
+        )
+        .expect("empty nvidia memory build_local_report_with returns Ok");
+        let _outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            Some(report),
+            Some(admission),
+            install_local,
+            "linux",
+            "x86_64",
+        );
+        assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+        // 3. IntegrityBlocked returns before the executor:
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let cuda_key = "x86_64-unknown-linux-gnu";
+        let digest = "a9d8c0a4ece9f9dce7d8e634dd55f943ba39b93b339462dd645202db34aafbbd";
+        let install_dir = solstone_core_local::install::pins::cache_root(journal.path())
+            .join("cuda")
+            .join(cuda_key)
+            .join(digest);
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("llama-server"), b"corrupted launcher").unwrap();
+        fs::write(install_dir.join("libggml-cuda.so"), b"corrupted twin").unwrap();
+        let probe = solstone_core_local::nvidia::NvidiaProbe {
+            schema: "solstone-nvidia-probe-v1".into(),
+            detected: true,
+            gpu_index: Some(0),
+            gpu_name: Some("NVIDIA GeForce RTX 4090".into()),
+            compute_cap: Some("8.9".into()),
+            arch: Some("sm_89".into()),
+            driver_cuda_major: Some(13),
+            vram_mib: Some(24_576),
+            unified_memory_mib: None,
+            probe_error: None,
+        };
+        let report_res = build_local_report_with(
+            journal.path(),
+            "linux",
+            "x86_64",
+            || probe,
+            || solstone_core_system::vulkan_observe::VulkanObservation {
+                devices: Vec::new(),
+                succeeded: true,
+            },
+            || None,
+        );
+        assert_eq!(report_res.unwrap_err(), "cuda runtime integrity failure");
+        assert_eq!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+            0
+        );
+
+        // 4. Journal providers.local.vulkan_device_index:
+        // Override from a below-bar device to a 6144 MiB device reaches acquisition:
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let config_dir = journal.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("journal.json"),
+            json!({
+                "providers": {
+                    "local": {
+                        "vulkan_device_index": 1
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let devices = vec![
+            solstone_core_local::VulkanDevice {
+                index: 0,
+                name: "dev0".into(),
+                device_type: Some(2),
+                vram_mib: 4096,
+            },
+            solstone_core_local::VulkanDevice {
+                index: 1,
+                name: "dev1".into(),
+                device_type: Some(2),
+                vram_mib: 6144,
+            },
+        ];
+        let (report, admission) = build_local_report_with(
+            journal.path(),
+            "linux",
+            "x86_64",
+            solstone_core_local::nvidia::NvidiaProbe::absent,
+            || solstone_core_system::vulkan_observe::VulkanObservation {
+                devices,
+                succeeded: true,
+            },
+            || None,
+        )
+        .unwrap();
+        let _outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            Some(report),
+            Some(admission),
+            install_local,
+            "linux",
+            "x86_64",
+        );
+        assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+        // Override that misses hardware refuses gpu_unavailable:
+        let _g = AcquisitionTestGuard::new(true);
+        let journal = tempfile::tempdir().unwrap();
+        let config_dir = journal.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("journal.json"),
+            json!({
+                "providers": {
+                    "local": {
+                        "vulkan_device_index": 99
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let devices = vec![
+            solstone_core_local::VulkanDevice {
+                index: 0,
+                name: "dev0".into(),
+                device_type: Some(2),
+                vram_mib: 4096,
+            },
+            solstone_core_local::VulkanDevice {
+                index: 1,
+                name: "dev1".into(),
+                device_type: Some(2),
+                vram_mib: 6144,
+            },
+        ];
+        let (report, admission) = build_local_report_with(
+            journal.path(),
+            "linux",
+            "x86_64",
+            solstone_core_local::nvidia::NvidiaProbe::absent,
+            || solstone_core_system::vulkan_observe::VulkanObservation {
+                devices,
+                succeeded: true,
+            },
+            || None,
+        )
+        .unwrap();
+        let outcome = run_local_inner_with_platform(
+            || Ok(journal.path().to_path_buf()),
+            |_| missing_readiness(),
+            Some(report),
+            Some(admission),
+            install_local,
+            "linux",
+            "x86_64",
+        );
+        assert_ne!(outcome.exit_code, 0);
+        assert!(outcome.stderr.iter().any(|line| line == "gpu_unavailable"));
+        assert_eq!(TEST_ACQUIRE_MINT_COUNT.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+            0
+        );
     }
 }

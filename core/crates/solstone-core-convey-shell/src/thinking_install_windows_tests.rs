@@ -143,6 +143,7 @@ mod native {
                 "target".into(),
                 Some(serde_json::json!(current_process_identity().unwrap())),
                 "downloading",
+                None,
             )
             .unwrap();
         }
@@ -325,6 +326,7 @@ mod native {
             "target".into(),
             Some(serde_json::json!(instance)),
             "downloading",
+            None,
         )
         .unwrap();
         OWNERS.lock().unwrap().push(Arc::clone(&owner));

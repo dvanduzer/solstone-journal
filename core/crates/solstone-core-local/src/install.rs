@@ -11,6 +11,7 @@
 //! and a human-readable `message`.  The `run` verbs return exit code 75 for a
 //! held lease so callers can distinguish busy from an internal failure.
 
+pub mod apple_memory;
 pub mod archive;
 pub mod capability_status;
 pub mod ced_readiness;
@@ -573,15 +574,28 @@ impl RunKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WindowsGpuAdmission {
-    Observed {
+pub enum LocalHardwareAdmission {
+    WindowsUnobserved,
+    WindowsObserved {
         probe_ok: bool,
         devices: Vec<crate::VulkanDevice>,
         override_index: Option<u32>,
     },
-    Unobserved,
-    NotWindows,
+    AppleSilicon {
+        total_bytes: Option<u64>,
+    },
+    UnsupportedDarwin,
+    GpuHost {
+        nvidia_detected: bool,
+        nvidia_memory_bytes: Option<u64>,
+        probe_ok: bool,
+        devices: Vec<crate::VulkanDevice>,
+        override_index: Option<u32>,
+    },
 }
+
+const UNREADABLE_MEMORY_ADMISSION_WARNING: &str =
+    "memory couldn't be checked before this installation";
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
@@ -589,6 +603,31 @@ thread_local! {
     pub static TEST_INSTALL_MODEL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static TEST_ACQUIRE_MINT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub static TEST_ACQUIRER_SHORT_CIRCUIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static TEST_LOCAL_HARDWARE_ADMISSION: std::cell::RefCell<Option<LocalHardwareAdmission>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A thread-scoped hardware admission override for tests and test-hooks.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct LocalHardwareAdmissionTestGuard {
+    previous: Option<LocalHardwareAdmission>,
+    thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl LocalHardwareAdmissionTestGuard {
+    pub fn new(admission: LocalHardwareAdmission) -> Self {
+        Self {
+            previous: TEST_LOCAL_HARDWARE_ADMISSION.with(|slot| slot.replace(Some(admission))),
+            thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for LocalHardwareAdmissionTestGuard {
+    fn drop(&mut self) {
+        TEST_LOCAL_HARDWARE_ADMISSION.with(|slot| slot.replace(self.previous.take()));
+    }
 }
 
 /// A thread-scoped acquisition receipt. No production build exposes this seam.
@@ -630,34 +669,108 @@ impl Drop for AcquisitionTestGuard {
 
 pub fn run_local_with_gpu_admission(
     object: &Map<String, Value>,
-    admission: WindowsGpuAdmission,
+    admission: LocalHardwareAdmission,
 ) -> Result<Value, DispatchError> {
     let journal = journal(object)?;
 
-    let refusal = match admission {
-        WindowsGpuAdmission::NotWindows => None,
-        WindowsGpuAdmission::Observed {
+    let (refusal, admission_warning) = match admission {
+        LocalHardwareAdmission::WindowsUnobserved => (
+            Some((
+                "gpu_memory_unknown",
+                "Vulkan GPU observation required on Windows".to_owned(),
+            )),
+            None,
+        ),
+        LocalHardwareAdmission::WindowsObserved {
             probe_ok,
             devices,
             override_index,
-        } => match crate::vulkan::gpu_device_local_verdict(probe_ok, &devices, override_index) {
-            crate::vulkan::GpuDeviceLocalVerdict::Eligible { .. } => None,
-            crate::vulkan::GpuDeviceLocalVerdict::BelowBar { available_bytes } => Some((
-                "gpu_memory_insufficient",
-                format!("device-local VRAM below 6 GiB minimum: {available_bytes} bytes"),
-            )),
-            crate::vulkan::GpuDeviceLocalVerdict::Unknown => Some((
-                "gpu_memory_unknown",
-                "Vulkan probe failed to report memory".to_owned(),
-            )),
-            crate::vulkan::GpuDeviceLocalVerdict::NoHardwareDevice => {
-                Some(("gpu_unavailable", "no hardware Vulkan GPU found".to_owned()))
+        } => {
+            let refusal =
+                match crate::vulkan::gpu_device_local_verdict(probe_ok, &devices, override_index) {
+                    crate::vulkan::GpuDeviceLocalVerdict::Eligible { .. } => None,
+                    crate::vulkan::GpuDeviceLocalVerdict::BelowBar { available_bytes } => Some((
+                        "gpu_memory_insufficient",
+                        format!("device-local VRAM below 6 GiB minimum: {available_bytes} bytes"),
+                    )),
+                    crate::vulkan::GpuDeviceLocalVerdict::Unknown => Some((
+                        "gpu_memory_unknown",
+                        "Vulkan probe failed to report memory".to_owned(),
+                    )),
+                    crate::vulkan::GpuDeviceLocalVerdict::NoHardwareDevice => {
+                        Some(("gpu_unavailable", "no hardware Vulkan GPU found".to_owned()))
+                    }
+                };
+            (refusal, None)
+        }
+        LocalHardwareAdmission::AppleSilicon { total_bytes } => {
+            match apple_memory::apple_total_memory_verdict(total_bytes) {
+                apple_memory::AppleTotalMemoryVerdict::Eligible => (None, None),
+                apple_memory::AppleTotalMemoryVerdict::BelowBar => (
+                    Some((
+                        "memory_insufficient",
+                        "local thinking needs at least 16 GiB of memory".to_owned(),
+                    )),
+                    None,
+                ),
+                apple_memory::AppleTotalMemoryVerdict::Unreadable => {
+                    (None, Some(UNREADABLE_MEMORY_ADMISSION_WARNING.to_owned()))
+                }
             }
-        },
-        WindowsGpuAdmission::Unobserved => Some((
-            "gpu_memory_unknown",
-            "Vulkan GPU observation required on Windows".to_owned(),
-        )),
+        }
+        LocalHardwareAdmission::UnsupportedDarwin => (None, None),
+        LocalHardwareAdmission::GpuHost {
+            nvidia_detected,
+            nvidia_memory_bytes,
+            probe_ok,
+            devices,
+            override_index,
+        } => {
+            if nvidia_detected {
+                if let Some(bytes) = nvidia_memory_bytes {
+                    match crate::vulkan::device_local_capacity_verdict(bytes) {
+                        crate::vulkan::GpuDeviceLocalVerdict::Eligible { .. } => (None, None),
+                        crate::vulkan::GpuDeviceLocalVerdict::BelowBar { available_bytes } => (
+                            Some((
+                                "gpu_memory_insufficient",
+                                format!(
+                                    "device-local VRAM below 6 GiB minimum: {available_bytes} bytes"
+                                ),
+                            )),
+                            None,
+                        ),
+                        crate::vulkan::GpuDeviceLocalVerdict::Unknown => {
+                            (None, Some(UNREADABLE_MEMORY_ADMISSION_WARNING.to_owned()))
+                        }
+                        crate::vulkan::GpuDeviceLocalVerdict::NoHardwareDevice => {
+                            (None, Some(UNREADABLE_MEMORY_ADMISSION_WARNING.to_owned()))
+                        }
+                    }
+                } else {
+                    (None, Some(UNREADABLE_MEMORY_ADMISSION_WARNING.to_owned()))
+                }
+            } else {
+                match crate::vulkan::gpu_device_local_verdict(probe_ok, &devices, override_index) {
+                    crate::vulkan::GpuDeviceLocalVerdict::Eligible { .. } => (None, None),
+                    crate::vulkan::GpuDeviceLocalVerdict::BelowBar { available_bytes } => (
+                        Some((
+                            "gpu_memory_insufficient",
+                            format!(
+                                "device-local VRAM below 6 GiB minimum: {available_bytes} bytes"
+                            ),
+                        )),
+                        None,
+                    ),
+                    crate::vulkan::GpuDeviceLocalVerdict::NoHardwareDevice => (
+                        Some(("gpu_unavailable", "no hardware Vulkan GPU found".to_owned())),
+                        None,
+                    ),
+                    crate::vulkan::GpuDeviceLocalVerdict::Unknown => {
+                        (None, Some(UNREADABLE_MEMORY_ADMISSION_WARNING.to_owned()))
+                    }
+                }
+            }
+        }
     };
     if let Some((reason_code, message)) = refusal {
         status::record_terminal_refusal(&journal, "local", reason_code, &message)
@@ -676,16 +789,65 @@ pub fn run_local_with_gpu_admission(
             lease::BUSY_EXIT_CODE,
         ));
     };
-    run_with_lease(object, RunKind::Local, journal, lease, None)
+    run_with_lease(
+        object,
+        RunKind::Local,
+        journal,
+        lease,
+        None,
+        admission_warning,
+    )
 }
 
 fn run_local(object: &Map<String, Value>) -> Result<Value, DispatchError> {
-    let admission = if pins::platform_key() == "x86_64-windows" {
-        WindowsGpuAdmission::Unobserved
-    } else {
-        WindowsGpuAdmission::NotWindows
-    };
+    let mut admission = observe_local_hardware_admission();
+    if let LocalHardwareAdmission::GpuHost { override_index, .. } = &mut admission {
+        let journal = journal(object)?;
+        let config = solstone_core_journal_config::read_journal_config(&journal)
+            .map_err(|error| failure("state", "config_unreadable", error, 74))?
+            .config
+            .unwrap_or_default();
+        *override_index = config
+            .get("providers")
+            .and_then(Value::as_object)
+            .and_then(|providers| providers.get("local"))
+            .and_then(Value::as_object)
+            .and_then(|local| local.get("vulkan_device_index"))
+            .and_then(crate::vulkan::local_vulkan_device_index);
+    }
     run_local_with_gpu_admission(object, admission)
+}
+
+fn observe_local_hardware_admission() -> LocalHardwareAdmission {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(admission) = TEST_LOCAL_HARDWARE_ADMISSION.with(|slot| slot.borrow().clone()) {
+        return admission;
+    }
+
+    let key = pins::platform_key();
+    if key == "x86_64-windows" {
+        LocalHardwareAdmission::WindowsUnobserved
+    } else if key == "aarch64-apple-darwin" {
+        LocalHardwareAdmission::AppleSilicon {
+            total_bytes: apple_memory::apple_physical_memory_bytes(),
+        }
+    } else if key.ends_with("-apple-darwin") {
+        LocalHardwareAdmission::UnsupportedDarwin
+    } else {
+        let probe = crate::nvidia::probe_nvidia_gpu();
+        let (devices, probe_ok) = crate::vulkan::vulkan_probe_snapshot();
+        let nvidia_memory_bytes = probe
+            .vram_mib
+            .or(probe.unified_memory_mib)
+            .map(|mib| mib.saturating_mul(1024 * 1024));
+        LocalHardwareAdmission::GpuHost {
+            nvidia_detected: probe.detected,
+            nvidia_memory_bytes,
+            probe_ok,
+            devices,
+            override_index: None,
+        }
+    }
 }
 fn run_parakeet(object: &Map<String, Value>) -> Result<Value, DispatchError> {
     run(object, RunKind::Parakeet)
@@ -708,6 +870,7 @@ pub fn install_parakeet_with_lease(
         journal.to_path_buf(),
         lease,
         Some((os_name, arch)),
+        None,
     )
 }
 
@@ -724,7 +887,7 @@ fn run(object: &Map<String, Value>, kind: RunKind) -> Result<Value, DispatchErro
             lease::BUSY_EXIT_CODE,
         ));
     };
-    run_with_lease(object, kind, journal, lease, None)
+    run_with_lease(object, kind, journal, lease, None, None)
 }
 
 fn run_with_lease(
@@ -733,6 +896,7 @@ fn run_with_lease(
     journal: PathBuf,
     lease: lease::InstallLease,
     parakeet_platform: Option<(&str, &str)>,
+    admission_warning: Option<String>,
 ) -> Result<Value, DispatchError> {
     let provider = kind.status_provider();
     let resolved = (|| {
@@ -786,6 +950,7 @@ fn run_with_lease(
         fingerprint_sha256,
         owner,
         "resolving",
+        admission_warning,
     )
     .map_err(|error| failure("state", "begin_failed", error, 74))?;
     let start = Instant::now();

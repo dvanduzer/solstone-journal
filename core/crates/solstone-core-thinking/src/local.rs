@@ -166,7 +166,8 @@ pub fn bootstrap_status(journal: &Path, _model: &str) -> Value {
                 "progress_bytes_received": if is_in_flight(&status.install_state) { status.progress_bytes_received } else { None },
                 "progress_bytes_total": if is_in_flight(&status.install_state) { status.progress_bytes_total } else { None },
                 "install_error": status.install_error,
-                "error_code": status.error_code
+                "error_code": status.error_code,
+                "admission_warning": status.admission_warning
             })
         }
         Err(solstone_core_local::install::status::StatusError::Io(err))
@@ -181,11 +182,12 @@ pub fn bootstrap_status(journal: &Path, _model: &str) -> Value {
 fn unavailable_bootstrap_status(reason: &str) -> Value {
     json!({"name":"local", "install_state":"unavailable", "reason_code":reason,
         "attempt_id":null, "last_transition_at":null, "last_progress_at":null,
-        "progress_bytes_received":null, "progress_bytes_total":null, "install_error":reason})
+        "progress_bytes_received":null, "progress_bytes_total":null, "install_error":reason,
+        "admission_warning":null})
 }
 
 fn idle_bootstrap_status() -> Value {
-    json!({"name":"local","revision":0,"install_state":"idle","attempt_id":null,"last_transition_at":null,"last_progress_at":null,"progress_bytes_received":null,"progress_bytes_total":null,"install_error":null,"error_code":null})
+    json!({"name":"local","revision":0,"install_state":"idle","attempt_id":null,"last_transition_at":null,"last_progress_at":null,"progress_bytes_received":null,"progress_bytes_total":null,"install_error":null,"error_code":null,"admission_warning":null})
 }
 
 pub fn runtime(journal: &Path) -> Value {
@@ -309,6 +311,7 @@ fn classify_bootstrap(journal: &Path, readiness: &Value) -> BootstrapResponse {
         Err(error) => return BootstrapResponse::Unavailable(error.to_string()),
     };
     let readiness_status = readiness["status"].as_str().unwrap_or("");
+    let readiness_reason = readiness["reason_code"].as_str().unwrap_or("");
     if readiness_status == "host-ineligible" {
         let reason_code = readiness["reason_code"]
             .as_str()
@@ -323,10 +326,18 @@ fn classify_bootstrap(journal: &Path, readiness: &Value) -> BootstrapResponse {
         }
         return BootstrapResponse::HostIneligible(reason_code.to_owned());
     }
-    if readiness_status == "proof-unavailable" {
-        let reason_code = readiness["reason_code"]
-            .as_str()
-            .unwrap_or("proof_unavailable");
+    if readiness_status == "proof-unavailable"
+        || readiness_status == "gpu_probe_failed"
+        || readiness_reason == "gpu_probe_failed"
+    {
+        let reason_code =
+            if readiness_status == "gpu_probe_failed" || readiness_reason == "gpu_probe_failed" {
+                "gpu_probe_failed"
+            } else {
+                readiness["reason_code"]
+                    .as_str()
+                    .unwrap_or("proof_unavailable")
+            };
         if let Err(error) = solstone_core_local::install::status::record_terminal_refusal(
             journal,
             "local",
@@ -714,6 +725,7 @@ mod tests {
             "legacy".into(),
             None,
             "downloading",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -803,5 +815,224 @@ mod tests {
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["phase"], "ready");
         let _ = fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn availability_payload_with_artifacts_and_non_failure_readiness_is_available() {
+        let payload = super::availability_payload(
+            default_model(),
+            json!({
+                "ready": true,
+                "status": "ready",
+                "host": { "platform_supported": true },
+                "artifacts": {
+                    "binary_installed": true,
+                    "model_installed": true,
+                }
+            }),
+        );
+        assert_eq!(payload["available"], true);
+        assert_eq!(payload["reason_code"], "");
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "full-tests"))]
+    fn classify_bootstrap_contract() {
+        let journal = temporary_journal("classify-start");
+        let response = classify_bootstrap(
+            &journal,
+            &json!({
+                "ready": false,
+                "status": "missing-artifacts",
+            }),
+        );
+        assert_eq!(response, BootstrapResponse::Start);
+        let _ = fs::remove_dir_all(&journal);
+
+        let journal = temporary_journal("classify-proof-unavail");
+        let response = classify_bootstrap(
+            &journal,
+            &json!({
+                "ready": false,
+                "status": "proof-unavailable",
+                "reason_code": "readiness_unavailable",
+            }),
+        );
+        assert_eq!(
+            response,
+            BootstrapResponse::Unavailable("readiness_unavailable".to_owned())
+        );
+        let _ = fs::remove_dir_all(&journal);
+
+        let journal = temporary_journal("classify-corrupt-status");
+        let status_path = solstone_core_local::install::status::status_path(&journal, "local");
+        fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+        fs::write(&status_path, "not json").unwrap();
+        let response = classify_bootstrap(
+            &journal,
+            &json!({
+                "ready": false,
+                "status": "missing-artifacts",
+            }),
+        );
+        assert!(matches!(response, BootstrapResponse::Unavailable(_)));
+        let _ = fs::remove_dir_all(&journal);
+
+        let journal = temporary_journal("classify-gpu-probe-failed");
+        let response = classify_bootstrap(
+            &journal,
+            &json!({
+                "ready": false,
+                "status": "missing-artifacts",
+                "reason_code": "gpu_probe_failed",
+            }),
+        );
+        assert_eq!(
+            response,
+            BootstrapResponse::Unavailable("gpu_probe_failed".to_owned())
+        );
+        let _ = fs::remove_dir_all(&journal);
+
+        let journal = temporary_journal("classify-host-ineligible");
+        let response = classify_bootstrap(
+            &journal,
+            &json!({
+                "ready": false,
+                "status": "host-ineligible",
+                "reason_code": "gpu_unavailable",
+            }),
+        );
+        assert_eq!(
+            response,
+            BootstrapResponse::HostIneligible("gpu_unavailable".to_owned())
+        );
+        let _ = fs::remove_dir_all(&journal);
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "full-tests"))]
+    fn admission_warning_lifecycle_on_bootstrap_status() {
+        let journal = temporary_journal("warning-lifecycle");
+        let input = serde_json::from_value(json!({"journal":journal})).unwrap();
+        let inspected = solstone_core_local::install::metal_candidate::inspect_present_with(
+            &input,
+            "aarch64-apple-darwin",
+        )
+        .unwrap();
+        let target = &inspected["target"];
+        let fingerprint = target["target_fingerprint_json"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let fingerprint_hash = target["target_fingerprint_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let lease = solstone_core_local::install::lease::acquire(&journal, "local")
+            .unwrap()
+            .unwrap();
+
+        solstone_core_local::install::status::begin(
+            &journal,
+            fingerprint.clone(),
+            fingerprint_hash.clone(),
+            None,
+            "downloading",
+            Some("warning detail".into()),
+        )
+        .unwrap();
+        let status = super::bootstrap_status(&journal, default_model());
+        assert_eq!(status["install_state"], "downloading");
+        assert!(status["admission_warning"].as_str().is_some());
+
+        let cur = solstone_core_local::install::status::read_status(&journal, "local").unwrap();
+        let updated =
+            solstone_core_local::install::status::transition(cur, "downloading", None, None)
+                .unwrap();
+        solstone_core_local::install::status::write_status(&journal, updated).unwrap();
+        let status = super::bootstrap_status(&journal, default_model());
+        assert!(status["admission_warning"].as_str().is_some());
+
+        drop(lease);
+        let status = super::bootstrap_status(&journal, default_model());
+        assert_eq!(status["install_state"], "failed");
+        assert_eq!(status["install_error"], "install_interrupted");
+        assert!(status["admission_warning"].as_str().is_some());
+
+        let cur = solstone_core_local::install::status::read_status(&journal, "local").unwrap();
+        let terminal = solstone_core_local::install::status::transition(
+            cur,
+            "failed",
+            Some("hardware_blocked".into()),
+            Some("hardware_blocked".into()),
+        )
+        .unwrap();
+        solstone_core_local::install::status::write_status(&journal, terminal).unwrap();
+        let status = super::bootstrap_status(&journal, default_model());
+        assert_eq!(status["install_state"], "failed");
+        assert!(status["admission_warning"].as_str().is_some());
+
+        solstone_core_local::install::status::begin_or_replace(
+            &journal,
+            "local",
+            fingerprint,
+            fingerprint_hash,
+            None,
+            "downloading",
+            None,
+        )
+        .unwrap();
+        let status = super::bootstrap_status(&journal, default_model());
+        assert!(status["admission_warning"].as_str().is_none());
+
+        let _ = fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    #[cfg(feature = "full-tests")]
+    fn unreadable_hardware_readiness_keeps_bootstrap_available() {
+        for (detected, observation) in [
+            (true, json!({"devices":[], "succeeded":true})),
+            (false, json!({"devices":[], "succeeded":false})),
+            (
+                false,
+                json!({"devices":[{"index":0,"name":"hardware","device_type":2,"vram_mib":0}], "succeeded":true}),
+            ),
+        ] {
+            let journal = temporary_journal("unreadable-readiness");
+            let mut probe = solstone_core_local::NvidiaProbe::absent();
+            probe.detected = detected;
+            let input = serde_json::from_value(json!({
+                "journal": journal,
+                "artifact_key":"x86_64-unknown-linux-gnu",
+                "nvidia_probe": probe,
+                "vulkan_observation": observation,
+            }))
+            .unwrap();
+            let readiness = solstone_core_local::install::readiness::inspect_local_present(input);
+            let availability = super::availability_payload(default_model(), readiness.clone());
+            assert_eq!(availability["reason_code"], "binary_missing");
+            assert_eq!(
+                classify_bootstrap(&journal, &readiness),
+                BootstrapResponse::Start
+            );
+            fs::remove_dir_all(journal).unwrap();
+        }
+        let journal = temporary_journal("unreadable-metal-readiness");
+        let input =
+            serde_json::from_value(json!({"journal": journal, "metal_unified_memory_mib":null}))
+                .unwrap();
+        let readiness = solstone_core_local::install::metal_candidate::inspect_present_with(
+            &input,
+            "aarch64-apple-darwin",
+        )
+        .unwrap();
+        let availability = super::availability_payload(default_model(), readiness.clone());
+        assert_eq!(availability["reason_code"], "binary_missing");
+        assert_eq!(
+            classify_bootstrap(&journal, &readiness),
+            BootstrapResponse::Start
+        );
+        fs::remove_dir_all(journal).unwrap();
     }
 }

@@ -227,7 +227,7 @@ fn metal_runtime_requires_the_supported_platform_without_ready_state() {
         json!({"journal": root, "backend": "metal"})
             .as_object()
             .unwrap(),
-        crate::WindowsGpuAdmission::NotWindows,
+        crate::LocalHardwareAdmission::UnsupportedDarwin,
     )
     .unwrap_err();
     assert_eq!(error.exit_code, 65);
@@ -375,6 +375,7 @@ fn metal_candidate_inspect_is_pure_and_reports_component_reasons_and_fit() {
         "legacy-mlx".to_owned(),
         None,
         "downloading",
+        None,
     )
     .unwrap();
     let ignores_legacy_status =
@@ -389,6 +390,7 @@ fn metal_candidate_inspect_is_pure_and_reports_component_reasons_and_fit() {
         "stale-native-4b".to_owned(),
         None,
         "downloading",
+        None,
     )
     .unwrap();
     let ignores_stale_native_status =
@@ -419,6 +421,7 @@ fn metal_candidate_inspect_is_pure_and_reports_component_reasons_and_fit() {
             .to_owned(),
         None,
         "downloading",
+        None,
     )
     .unwrap();
     let installer = lease::acquire(&root, "local").unwrap().unwrap();
@@ -892,6 +895,7 @@ fn replay_status_special_cases(
                     fingerprint::sha256(&other),
                     None,
                     "resolving",
+                    None,
                 )
             }
             "transition_to_failed_carries_error" => {
@@ -950,6 +954,7 @@ fn replay_status_special_cases(
                     fingerprint::sha256(&other),
                     None,
                     "resolving",
+                    None,
                 );
                 status::transition(stale, "installed", None, None)
                     .and_then(|value| status::write_status(&root, value))
@@ -964,6 +969,7 @@ fn replay_status_special_cases(
                     fingerprint::sha256(&other),
                     None,
                     "resolving",
+                    None,
                 );
                 status::assert_current(&root, &stale)
             }
@@ -1032,6 +1038,7 @@ fn begin_for_test_result(
         fingerprint::sha256(&canonical),
         None,
         "resolving",
+        None,
     )
 }
 
@@ -1363,6 +1370,7 @@ fn an_install_whose_installer_is_gone_reads_interrupted_not_in_progress() {
         "target".to_owned(),
         None,
         "downloading",
+        None,
     )
     .unwrap();
 
@@ -3140,6 +3148,7 @@ fn upgrade_prepublish_failures_keep_an_admitted_incumbent() {
         "target_fp".to_owned(),
         Some(json!({"pid": 12345})),
         "downloading",
+        None,
     )
     .unwrap();
     let attempt_id = initial_status.attempt_id.as_deref().unwrap();
@@ -3408,6 +3417,7 @@ fn assert_current_rejects_modified_attempt_and_prevents_publication() {
         "sha256-a".to_owned(),
         Some(json!({"pid": std::process::id()})),
         "resolving",
+        None,
     )
     .unwrap();
     assert!(status::assert_current(&root, &initial).is_ok());
@@ -3420,6 +3430,7 @@ fn assert_current_rejects_modified_attempt_and_prevents_publication() {
         "sha256-b".to_owned(),
         Some(json!({"pid": std::process::id()})),
         "resolving",
+        None,
     )
     .unwrap();
     assert!(status::assert_current(&root, &initial).is_err());
@@ -3436,6 +3447,7 @@ fn cancel_local_bootstrap_requires_and_matches_attempt_id() {
         "sha256-cancel".to_owned(),
         Some(json!({"pid": 999_999_999})),
         "resolving",
+        None,
     )
     .unwrap();
     let attempt_id = initial.attempt_id.as_deref().unwrap();
@@ -3481,6 +3493,7 @@ fn cancellation_fences_attempt_and_requires_writer_lease_release() {
         "target".into(),
         Some(json!({"pid":42})),
         "downloading",
+        None,
     )
     .unwrap();
     let attempt = initial.attempt_id.as_deref().unwrap();
@@ -3525,6 +3538,7 @@ fn cancellation_does_not_overwrite_a_replacement_attempt() {
         "target".into(),
         Some(json!({"pid":42})),
         "downloading",
+        None,
     )
     .unwrap();
     let attempt = initial.attempt_id.as_deref().unwrap();
@@ -3537,6 +3551,7 @@ fn cancellation_does_not_overwrite_a_replacement_attempt() {
             "next".into(),
             None,
             "downloading",
+            None,
         )
         .unwrap();
         Ok(())
@@ -4107,6 +4122,7 @@ mod runtime_fetch_seam_tests {
             "target_fp".to_owned(),
             None,
             "downloading",
+            None,
         )
         .unwrap()
     }
@@ -4570,8 +4586,8 @@ mod runtime_fetch_seam_tests {
 fn windows_admission_enforces_gpu_verdict_before_local_target() {
     use crate::VulkanDevice;
     use crate::install::{
-        TEST_ACQUIRER_SHORT_CIRCUIT, TEST_FETCH_RUNTIME_MEMBER_COUNT, TEST_INSTALL_MODEL_COUNT,
-        WindowsGpuAdmission, run_local_with_gpu_admission,
+        LocalHardwareAdmission, TEST_ACQUIRER_SHORT_CIRCUIT, TEST_FETCH_RUNTIME_MEMBER_COUNT,
+        TEST_INSTALL_MODEL_COUNT, run_local_with_gpu_admission,
     };
 
     let root = temp("win-admission-routine");
@@ -4584,7 +4600,7 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
     TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
     TEST_INSTALL_MODEL_COUNT.with(|count| count.set(0));
 
-    let below = WindowsGpuAdmission::Observed {
+    let below = LocalHardwareAdmission::WindowsObserved {
         probe_ok: true,
         devices: vec![VulkanDevice {
             index: 0,
@@ -4608,7 +4624,7 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
     assert_eq!(st.install_state, "failed");
     assert_eq!(st.error_code.as_deref(), Some("gpu_memory_insufficient"));
 
-    let failed_probe = WindowsGpuAdmission::Observed {
+    let failed_probe = LocalHardwareAdmission::WindowsObserved {
         probe_ok: false,
         devices: vec![],
         override_index: None,
@@ -4624,7 +4640,8 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
     );
     assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
 
-    let err = run_local_with_gpu_admission(&object, WindowsGpuAdmission::Unobserved).unwrap_err();
+    let err = run_local_with_gpu_admission(&object, LocalHardwareAdmission::WindowsUnobserved)
+        .unwrap_err();
     assert_eq!(
         err.envelope.error.as_ref().unwrap().reason_code,
         "gpu_memory_unknown"
@@ -4635,6 +4652,43 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
     );
     assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
 
+    // Windows vram_mib == 0 refuses gpu_memory_unknown with zero counters
+    let win_zero = LocalHardwareAdmission::WindowsObserved {
+        probe_ok: true,
+        devices: vec![VulkanDevice {
+            index: 0,
+            name: "zero".into(),
+            device_type: Some(2),
+            vram_mib: 0,
+        }],
+        override_index: None,
+    };
+    let err = run_local_with_gpu_admission(&object, win_zero).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "gpu_memory_unknown"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+
+    // Windows no hardware refuses gpu_unavailable with zero counters
+    let win_no_hw = LocalHardwareAdmission::WindowsObserved {
+        probe_ok: true,
+        devices: vec![],
+        override_index: None,
+    };
+    let err = run_local_with_gpu_admission(&object, win_no_hw).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "gpu_unavailable"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+
     let in_flight_root = temp("win-admission-inflight");
     let _ = status::begin(
         &in_flight_root,
@@ -4642,6 +4696,7 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
         "model".into(),
         None,
         "downloading",
+        None,
     )
     .unwrap();
     let mut if_object = serde_json::Map::new();
@@ -4649,8 +4704,8 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
         "journal".into(),
         serde_json::Value::String(in_flight_root.display().to_string()),
     );
-    let err =
-        run_local_with_gpu_admission(&if_object, WindowsGpuAdmission::Unobserved).unwrap_err();
+    let err = run_local_with_gpu_admission(&if_object, LocalHardwareAdmission::WindowsUnobserved)
+        .unwrap_err();
     assert_eq!(
         err.envelope.error.as_ref().unwrap().reason_code,
         "gpu_memory_unknown"
@@ -4672,18 +4727,260 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
     let _guard = ResetShortCircuit;
     TEST_ACQUIRER_SHORT_CIRCUIT.with(|c| c.set(true));
 
-    let res_not_win = run_local_with_gpu_admission(&object, WindowsGpuAdmission::NotWindows);
-    if let Err(e) = res_not_win {
-        let code = e
-            .envelope
-            .error
-            .as_ref()
-            .map(|x| x.reason_code.as_str())
-            .unwrap_or("");
-        assert_ne!(code, "gpu_memory_insufficient");
-        assert_ne!(code, "gpu_memory_unknown");
-        assert_ne!(code, "gpu_unavailable");
-    }
+    // Authority table:
+    // 1. Mac just below 16 GiB refuses with zero counters. Exactly 16 GiB proceeds.
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    TEST_INSTALL_MODEL_COUNT.with(|count| count.set(0));
+    let mac_below = LocalHardwareAdmission::AppleSilicon {
+        total_bytes: Some(16 * 1024 * 1024 * 1024 - 1),
+    };
+    let err = run_local_with_gpu_admission(&object, mac_below).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "memory_insufficient"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+    assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+
+    let mac_exact = LocalHardwareAdmission::AppleSilicon {
+        total_bytes: Some(16 * 1024 * 1024 * 1024),
+    };
+    let _ = run_local_with_gpu_admission(&object, mac_exact);
+    assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+    // 2. UnsupportedDarwin -> unsupported_platform, zero counters.
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    TEST_INSTALL_MODEL_COUNT.with(|count| count.set(0));
+    let mut darwin_obj = object.clone();
+    darwin_obj.insert("backend".into(), "metal".into());
+    let err = run_local_with_gpu_admission(&darwin_obj, LocalHardwareAdmission::UnsupportedDarwin)
+        .unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "unsupported_platform"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+    assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+
+    // 3. Linux NVIDIA memory just below GPU_DEVICE_LOCAL_MIN_BYTES refuses. Exactly that many bytes proceeds.
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let nvd_below = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: true,
+        nvidia_memory_bytes: Some(crate::vulkan::GPU_DEVICE_LOCAL_MIN_BYTES - 1),
+        probe_ok: true,
+        devices: vec![],
+        override_index: None,
+    };
+    let err = run_local_with_gpu_admission(&object, nvd_below).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "gpu_memory_insufficient"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+
+    let nvd_exact = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: true,
+        nvidia_memory_bytes: Some(crate::vulkan::GPU_DEVICE_LOCAL_MIN_BYTES),
+        probe_ok: true,
+        devices: vec![],
+        override_index: None,
+    };
+    let _ = run_local_with_gpu_admission(&object, nvd_exact);
+    assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+    // 4. Vulkan hardware 6144 MiB vs 6143
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let vk_6143 = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![VulkanDevice {
+            index: 0,
+            name: "RTX".into(),
+            device_type: Some(2),
+            vram_mib: 6143,
+        }],
+        override_index: None,
+    };
+    let err = run_local_with_gpu_admission(&object, vk_6143).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "gpu_memory_insufficient"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+
+    let vk_6144 = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![VulkanDevice {
+            index: 0,
+            name: "RTX".into(),
+            device_type: Some(2),
+            vram_mib: 6144,
+        }],
+        override_index: None,
+    };
+    let _ = run_local_with_gpu_admission(&object, vk_6144);
+    assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+    // 5. No hardware and CPU-only (device_type 4) refuse gpu_unavailable
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let no_hw = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![],
+        override_index: None,
+    };
+    let err = run_local_with_gpu_admission(&object, no_hw).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "gpu_unavailable"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+
+    let cpu_only = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![VulkanDevice {
+            index: 0,
+            name: "CPU".into(),
+            device_type: Some(4),
+            vram_mib: 16384,
+        }],
+        override_index: None,
+    };
+    let err = run_local_with_gpu_admission(&object, cpu_only).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "gpu_unavailable"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
+
+    // 6. Failed probe, NVIDIA detected with vram_mib and unified_memory_mib both None, and selected vram_mib == 0 proceed with a warning
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let failed_vk = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: false,
+        devices: vec![],
+        override_index: None,
+    };
+    let _ = run_local_with_gpu_admission(&object, failed_vk);
+    assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+    assert!(
+        status::read_status(&root, "local")
+            .unwrap()
+            .admission_warning
+            .is_some()
+    );
+
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let nvd_unreadable = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: true,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![],
+        override_index: None,
+    };
+    let _ = run_local_with_gpu_admission(&object, nvd_unreadable);
+    assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+    assert!(
+        status::read_status(&root, "local")
+            .unwrap()
+            .admission_warning
+            .is_some()
+    );
+
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let vk_zero = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![VulkanDevice {
+            index: 0,
+            name: "dev".into(),
+            device_type: Some(2),
+            vram_mib: 0,
+        }],
+        override_index: None,
+    };
+    let _ = run_local_with_gpu_admission(&object, vk_zero);
+    assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+    assert!(
+        status::read_status(&root, "local")
+            .unwrap()
+            .admission_warning
+            .is_some()
+    );
+
+    // 7. Override: device 0 below bar, device 1 at 6144, override_index: Some(1) proceeds. override_index that misses refuses gpu_unavailable.
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let dev_override = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![
+            VulkanDevice {
+                index: 0,
+                name: "small".into(),
+                device_type: Some(2),
+                vram_mib: 4096,
+            },
+            VulkanDevice {
+                index: 1,
+                name: "large".into(),
+                device_type: Some(2),
+                vram_mib: 6144,
+            },
+        ],
+        override_index: Some(1),
+    };
+    let _ = run_local_with_gpu_admission(&object, dev_override);
+    assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
+
+    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+    let dev_miss = LocalHardwareAdmission::GpuHost {
+        nvidia_detected: false,
+        nvidia_memory_bytes: None,
+        probe_ok: true,
+        devices: vec![VulkanDevice {
+            index: 0,
+            name: "dev".into(),
+            device_type: Some(2),
+            vram_mib: 6144,
+        }],
+        override_index: Some(99),
+    };
+    let err = run_local_with_gpu_admission(&object, dev_miss).unwrap_err();
+    assert_eq!(
+        err.envelope.error.as_ref().unwrap().reason_code,
+        "gpu_unavailable"
+    );
+    assert_eq!(
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+        0
+    );
 }
 
 #[test]
@@ -4691,7 +4988,7 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
 fn windows_admission_early_refusal_terminal_status() {
     use crate::VulkanDevice;
     use crate::install::{
-        TEST_FETCH_RUNTIME_MEMBER_COUNT, WindowsGpuAdmission, run_local_with_gpu_admission,
+        LocalHardwareAdmission, TEST_FETCH_RUNTIME_MEMBER_COUNT, run_local_with_gpu_admission,
     };
 
     let root = temp("win-admission-full-early");
@@ -4712,7 +5009,7 @@ fn windows_admission_early_refusal_terminal_status() {
 
     TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
 
-    let below = WindowsGpuAdmission::Observed {
+    let below = LocalHardwareAdmission::WindowsObserved {
         probe_ok: true,
         devices: vec![VulkanDevice {
             index: 0,
@@ -4737,7 +5034,7 @@ fn windows_admission_early_refusal_terminal_status() {
         Some("gpu_memory_insufficient")
     );
 
-    let unknown = WindowsGpuAdmission::Unobserved;
+    let unknown = LocalHardwareAdmission::WindowsUnobserved;
     let err = run_local_with_gpu_admission(&object, unknown).unwrap_err();
     assert_eq!(
         err.envelope.error.as_ref().unwrap().reason_code,
@@ -4754,7 +5051,7 @@ fn windows_admission_early_refusal_terminal_status() {
     let held = lease::acquire(&root, "local").unwrap().unwrap();
     let _ = run_local_with_gpu_admission(
         &object,
-        WindowsGpuAdmission::Observed {
+        LocalHardwareAdmission::WindowsObserved {
             probe_ok: true,
             devices: vec![VulkanDevice {
                 index: 0,
@@ -4776,14 +5073,16 @@ fn windows_admission_early_refusal_terminal_status() {
 #[test]
 #[cfg(all(feature = "full-tests", target_os = "windows"))]
 fn windows_admission_package_failure_is_a_new_terminal_attempt() {
-    use crate::install::{AcquisitionTestGuard, WindowsGpuAdmission, run_local_with_gpu_admission};
+    use crate::install::{
+        AcquisitionTestGuard, LocalHardwareAdmission, run_local_with_gpu_admission,
+    };
     let root = temp("win-admission-package-failure");
     let object = serde_json::Map::from_iter([("journal".into(), json!(root))]);
     let trace = AcquisitionTestGuard::new(false);
     let prior = status::record_terminal_refusal(&root, "local", "old_failure", "old").unwrap();
     let error = run_local_with_gpu_admission(
         &object,
-        WindowsGpuAdmission::Observed {
+        LocalHardwareAdmission::WindowsObserved {
             probe_ok: true,
             devices: vec![crate::VulkanDevice {
                 index: 0,
@@ -4812,7 +5111,7 @@ fn windows_admission_package_failure_is_a_new_terminal_attempt() {
 fn windows_admission_reaches_acquirer_at_floor() {
     use crate::VulkanDevice;
     use crate::install::{
-        TEST_ACQUIRER_SHORT_CIRCUIT, TEST_FETCH_RUNTIME_MEMBER_COUNT, WindowsGpuAdmission,
+        LocalHardwareAdmission, TEST_ACQUIRER_SHORT_CIRCUIT, TEST_FETCH_RUNTIME_MEMBER_COUNT,
         run_local_with_gpu_admission,
         windows_engine::{WindowsLlamaPackage, set_test_windows_llama_package},
     };
@@ -4837,7 +5136,7 @@ fn windows_admission_reaches_acquirer_at_floor() {
     TEST_ACQUIRER_SHORT_CIRCUIT.with(|c| c.set(true));
     TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
 
-    let eligible = WindowsGpuAdmission::Observed {
+    let eligible = LocalHardwareAdmission::WindowsObserved {
         probe_ok: true,
         devices: vec![VulkanDevice {
             index: 0,
@@ -4853,4 +5152,189 @@ fn windows_admission_reaches_acquirer_at_floor() {
         TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0,
         "acquirer hook reached at 6144 MiB floor"
     );
+}
+
+#[test]
+#[cfg(feature = "full-tests")]
+fn dispatch_run_local_forwards_injected_hardware_admission() {
+    use crate::install::{
+        AcquisitionTestGuard, LocalHardwareAdmission, LocalHardwareAdmissionTestGuard,
+        TEST_ACQUIRER_SHORT_CIRCUIT, TEST_FETCH_RUNTIME_MEMBER_COUNT, TEST_INSTALL_MODEL_COUNT,
+        dispatch,
+    };
+
+    let root = temp("dispatch-admission-forward");
+    let request = json!({
+        "journal": root.display().to_string(),
+    });
+
+    struct ResetShortCircuit;
+    impl Drop for ResetShortCircuit {
+        fn drop(&mut self) {
+            TEST_ACQUIRER_SHORT_CIRCUIT.with(|c| c.set(false));
+        }
+    }
+    let _guard = ResetShortCircuit;
+    TEST_ACQUIRER_SHORT_CIRCUIT.with(|c| c.set(true));
+
+    // Below-bar Apple total (16 GiB minus 1): zero mint, runtime-fetch, and model counters; reason memory_insufficient; nonzero exit; admission_warning is None on the refusal record.
+    {
+        let trace = AcquisitionTestGuard::new(true);
+        let _override =
+            LocalHardwareAdmissionTestGuard::new(LocalHardwareAdmission::AppleSilicon {
+                total_bytes: Some(16 * 1024 * 1024 * 1024 - 1),
+            });
+        let err = dispatch(InstallVerb::RunLocal, request.clone()).unwrap_err();
+        assert_eq!(err.exit_code, 65);
+        assert_eq!(
+            err.envelope.error.as_ref().unwrap().reason_code,
+            "memory_insufficient"
+        );
+        assert_eq!(trace.acquisitions(), 0);
+        assert_eq!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+        let st = status::read_status(&root, "local").unwrap();
+        assert_eq!(st.install_state, "failed");
+        assert_eq!(st.error_code.as_deref(), Some("memory_insufficient"));
+        assert_eq!(st.admission_warning, None);
+    }
+
+    // Exactly 16 GiB: counters increase, warning None.
+    {
+        let trace = AcquisitionTestGuard::new(true);
+        let _override =
+            LocalHardwareAdmissionTestGuard::new(LocalHardwareAdmission::AppleSilicon {
+                total_bytes: Some(16 * 1024 * 1024 * 1024),
+            });
+        let _ = dispatch(InstallVerb::RunLocal, request.clone());
+        assert!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0
+                || trace.acquisitions() > 0,
+            "counters increase on eligible admission"
+        );
+        let st = status::read_status(&root, "local").unwrap();
+        assert_eq!(st.admission_warning, None);
+    }
+
+    // AppleSilicon { total_bytes: None } and Linux GpuHost unknown twin:
+    // counters increase, admission_warning is Some, and a following eligible dispatch clears it.
+    {
+        let trace = AcquisitionTestGuard::new(true);
+        let _override =
+            LocalHardwareAdmissionTestGuard::new(LocalHardwareAdmission::AppleSilicon {
+                total_bytes: None,
+            });
+        let _ = dispatch(InstallVerb::RunLocal, request.clone());
+        assert!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0
+                || trace.acquisitions() > 0
+        );
+        let st = status::read_status(&root, "local").unwrap();
+        assert!(st.admission_warning.is_some());
+
+        // A following eligible dispatch clears it
+        let _eligible =
+            LocalHardwareAdmissionTestGuard::new(LocalHardwareAdmission::AppleSilicon {
+                total_bytes: Some(16 * 1024 * 1024 * 1024),
+            });
+        let _ = dispatch(InstallVerb::RunLocal, request.clone());
+        let st_cleared = status::read_status(&root, "local").unwrap();
+        assert_eq!(st_cleared.admission_warning, None);
+    }
+
+    // Linux GpuHost unknown twin (failed probe, nvidia detected with both fields empty, and selected hardware vram_mib == 0)
+    {
+        let trace = AcquisitionTestGuard::new(true);
+        let _override = LocalHardwareAdmissionTestGuard::new(LocalHardwareAdmission::GpuHost {
+            nvidia_detected: false,
+            nvidia_memory_bytes: None,
+            probe_ok: false,
+            devices: vec![],
+            override_index: None,
+        });
+        let _ = dispatch(InstallVerb::RunLocal, request.clone());
+        assert!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0
+                || trace.acquisitions() > 0
+        );
+        let st = status::read_status(&root, "local").unwrap();
+        assert!(st.admission_warning.is_some());
+
+        // A following eligible dispatch clears it
+        let _eligible = LocalHardwareAdmissionTestGuard::new(LocalHardwareAdmission::GpuHost {
+            nvidia_detected: true,
+            nvidia_memory_bytes: Some(6 * 1024 * 1024 * 1024),
+            probe_ok: true,
+            devices: vec![],
+            override_index: None,
+        });
+        let _ = dispatch(InstallVerb::RunLocal, request.clone());
+        let st_cleared = status::read_status(&root, "local").unwrap();
+        assert_eq!(st_cleared.admission_warning, None);
+    }
+}
+
+#[test]
+#[cfg(feature = "full-tests")]
+fn dispatch_run_local_preserves_configured_gpu_selection() {
+    use crate::install::{
+        AcquisitionTestGuard, LocalHardwareAdmission, LocalHardwareAdmissionTestGuard,
+        TEST_FETCH_RUNTIME_MEMBER_COUNT, TEST_INSTALL_MODEL_COUNT,
+    };
+    for (selection, reason) in [
+        (json!("1"), None),
+        (json!(0), Some("gpu_memory_insufficient")),
+        (json!(99), Some("gpu_unavailable")),
+    ] {
+        let root = temp("dispatch-gpu-selection");
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(
+            root.join("config/journal.json"),
+            json!({"providers":{"local":{"vulkan_device_index":selection}}}).to_string(),
+        )
+        .unwrap();
+        let trace = AcquisitionTestGuard::new(true);
+        let _observation = LocalHardwareAdmissionTestGuard::new(LocalHardwareAdmission::GpuHost {
+            nvidia_detected: false,
+            nvidia_memory_bytes: None,
+            probe_ok: true,
+            devices: vec![
+                crate::VulkanDevice {
+                    index: 0,
+                    name: "small".into(),
+                    device_type: Some(2),
+                    vram_mib: 4096,
+                },
+                crate::VulkanDevice {
+                    index: 1,
+                    name: "eligible".into(),
+                    device_type: Some(2),
+                    vram_mib: 6144,
+                },
+            ],
+            override_index: None,
+        });
+        let result = dispatch(InstallVerb::RunLocal, json!({"journal":root}));
+        if let Some(reason) = reason {
+            assert_eq!(
+                result.unwrap_err().envelope.error.unwrap().reason_code,
+                reason
+            );
+            assert_eq!(trace.acquisitions(), 0);
+            assert_eq!(
+                TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+                0
+            );
+            assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+        } else {
+            assert!(
+                trace.acquisitions() > 0
+                    || TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

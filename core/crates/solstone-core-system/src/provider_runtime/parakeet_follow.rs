@@ -311,6 +311,7 @@ mod tests {
             install_error: None,
             error_code: None,
             owner: None,
+            admission_warning: None,
         }
     }
 

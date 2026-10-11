@@ -530,6 +530,7 @@ mod tests {
                 "target".into(),
                 Some(serde_json::json!(identity)),
                 "downloading",
+                None,
             )
             .unwrap();
             released.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -599,6 +600,7 @@ mod tests {
                 "target".into(),
                 Some(serde_json::json!(identity)),
                 "downloading",
+                None,
             )
             .unwrap();
             released.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -691,6 +693,7 @@ mod tests {
             install_error: None,
             error_code: None,
             owner: None,
+            admission_warning: None,
         };
         let status_path = status::status_path(journal.path(), "local");
         std::fs::create_dir_all(status_path.parent().unwrap()).unwrap();

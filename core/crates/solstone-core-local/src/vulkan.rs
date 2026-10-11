@@ -16,6 +16,40 @@ use std::time::{Duration, Instant};
 
 use crate::VulkanDevice;
 
+/// Parse the configured Vulkan device selection consistently across install entry points.
+pub fn local_vulkan_device_index(value: &serde_json::Value) -> Option<u32> {
+    match value {
+        serde_json::Value::Bool(value) => Some(u32::from(*value)),
+        serde_json::Value::String(value) => value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .and_then(|index| u64::try_from(index).ok())
+            .map(saturating_vulkan_device_index),
+        serde_json::Value::Number(value) => {
+            if let Some(index) = value.as_i64() {
+                return u64::try_from(index)
+                    .ok()
+                    .map(saturating_vulkan_device_index);
+            }
+            if let Some(index) = value.as_u64() {
+                return Some(saturating_vulkan_device_index(index));
+            }
+            let index = value.as_f64()?.trunc();
+            if !index.is_finite() || index < 0.0 {
+                return None;
+            }
+            Some(saturating_vulkan_device_index(index as u64))
+        }
+        _ => None,
+    }
+}
+
+fn saturating_vulkan_device_index(index: u64) -> u32 {
+    // No real device index is u32::MAX, so this preserves an explicit nonmatching override.
+    u32::try_from(index).unwrap_or(u32::MAX)
+}
+
 const VK_TYPE_INTEGRATED: u32 = 1;
 const VK_TYPE_DISCRETE: u32 = 2;
 const VK_TYPE_VIRTUAL: u32 = 3;
@@ -259,6 +293,17 @@ pub enum GpuDeviceLocalVerdict {
     NoHardwareDevice,
 }
 
+/// Evaluate a raw byte capacity against the 6 GiB device-local minimum.
+pub(crate) fn device_local_capacity_verdict(available_bytes: u64) -> GpuDeviceLocalVerdict {
+    if available_bytes == 0 {
+        GpuDeviceLocalVerdict::Unknown
+    } else if available_bytes >= GPU_DEVICE_LOCAL_MIN_BYTES {
+        GpuDeviceLocalVerdict::Eligible { available_bytes }
+    } else {
+        GpuDeviceLocalVerdict::BelowBar { available_bytes }
+    }
+}
+
 /// Evaluate device-local GPU memory against the 6 GiB minimum.
 pub fn gpu_device_local_verdict(
     probe_ok: bool,
@@ -272,14 +317,7 @@ pub fn gpu_device_local_verdict(
         return GpuDeviceLocalVerdict::NoHardwareDevice;
     };
     let available_bytes = selected.vram_mib.saturating_mul(1024 * 1024);
-    if available_bytes == 0 {
-        return GpuDeviceLocalVerdict::Unknown;
-    }
-    if available_bytes >= GPU_DEVICE_LOCAL_MIN_BYTES {
-        GpuDeviceLocalVerdict::Eligible { available_bytes }
-    } else {
-        GpuDeviceLocalVerdict::BelowBar { available_bytes }
-    }
+    device_local_capacity_verdict(available_bytes)
 }
 
 /// Select an explicitly overridden hardware index, or the first discrete then integrated device.
@@ -611,6 +649,32 @@ mod tests {
         assert_eq!(
             gpu_device_local_verdict(true, &mixed, Some(99)),
             GpuDeviceLocalVerdict::NoHardwareDevice
+        );
+    }
+
+    #[test]
+    fn test_device_local_capacity_verdict() {
+        assert_eq!(
+            device_local_capacity_verdict(0),
+            GpuDeviceLocalVerdict::Unknown
+        );
+        assert_eq!(
+            device_local_capacity_verdict(GPU_DEVICE_LOCAL_MIN_BYTES - 1),
+            GpuDeviceLocalVerdict::BelowBar {
+                available_bytes: GPU_DEVICE_LOCAL_MIN_BYTES - 1,
+            }
+        );
+        assert_eq!(
+            device_local_capacity_verdict(GPU_DEVICE_LOCAL_MIN_BYTES),
+            GpuDeviceLocalVerdict::Eligible {
+                available_bytes: GPU_DEVICE_LOCAL_MIN_BYTES,
+            }
+        );
+        assert_eq!(
+            device_local_capacity_verdict(GPU_DEVICE_LOCAL_MIN_BYTES + 1024),
+            GpuDeviceLocalVerdict::Eligible {
+                available_bytes: GPU_DEVICE_LOCAL_MIN_BYTES + 1024,
+            }
         );
     }
 }

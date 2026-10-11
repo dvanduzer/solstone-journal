@@ -345,6 +345,7 @@ mod tests {
             install_error: error_code.map(Into::into),
             error_code: error_code.map(Into::into),
             owner: None,
+            admission_warning: None,
         }
     }
 
