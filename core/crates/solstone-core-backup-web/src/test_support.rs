@@ -95,6 +95,7 @@ pub fn hosted_binding() -> HostedBinding {
     }
 }
 
+#[cfg(all(test, feature = "full-tests"))]
 pub fn hosted_binding_wrong_origin() -> HostedBinding {
     HostedBinding {
         broker_endpoint: "https://broker.example".into(),

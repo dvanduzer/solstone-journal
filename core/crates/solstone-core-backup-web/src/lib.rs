@@ -1186,12 +1186,9 @@ async fn handoff_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
     if payload.get("status").and_then(Value::as_str) == Some("refused")
         || payload.contains_key("reason_code")
     {
-        let _ = match operation::match_handoff(&deps.operations, &nonce) {
+        let matched = match operation::match_handoff(&deps.operations, &nonce, None) {
             Ok(matched) => matched,
             Err(operation::HandoffError::Expired) => {
-                if let Some(generation) = operation::generation_of(&deps.operations) {
-                    operation::mark_expired(&deps.operations, generation);
-                }
                 return response::error(
                     axum::http::StatusCode::BAD_REQUEST,
                     "that action isn't available in the current state.",
@@ -1208,7 +1205,7 @@ async fn handoff_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
                 );
             }
         };
-        let generation = operation::generation_of(&deps.operations).unwrap_or(0);
+        let generation = matched.generation;
         let mut refused_payload = payload.clone();
         let _ = refused_payload.remove("nonce");
         let reason = match validation::refused_reason(&refused_payload) {
@@ -1227,12 +1224,9 @@ async fn handoff_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
         operation::mark_refused(&deps.operations, generation, reason);
         return status_response(&deps);
     }
-    let matched = match operation::match_handoff(&deps.operations, &nonce) {
+    let matched = match operation::match_handoff(&deps.operations, &nonce, None) {
         Ok(matched) => matched,
         Err(operation::HandoffError::Expired) => {
-            if let Some(generation) = operation::generation_of(&deps.operations) {
-                operation::mark_expired(&deps.operations, generation);
-            }
             return response::error(
                 axum::http::StatusCode::BAD_REQUEST,
                 "that action isn't available in the current state.",
@@ -1249,7 +1243,7 @@ async fn handoff_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
             );
         }
     };
-    let generation = operation::generation_of(&deps.operations).unwrap_or(0);
+    let generation = matched.generation;
     if payload.get("needs_subscription") == Some(&Value::Bool(true)) {
         if let Err(error) = validate_needs_subscription(&payload, &deps.portal_base) {
             operation::finish(
@@ -1277,17 +1271,13 @@ async fn handoff_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
             return error;
         }
     };
-    if persist_and_consume_hosted(
+    persist_and_consume_hosted(
         &deps,
         generation,
         matched.kind,
         binding,
         matched.restore_key,
-    )
-    .is_err()
-    {
-        return internal_error();
-    }
+    );
     status_response(&deps)
 }
 
@@ -1332,21 +1322,13 @@ pub(crate) fn persist_and_consume_hosted(
     kind: String,
     binding: HostedBinding,
     restore_key: Option<String>,
-) -> Result<(), ()> {
-    if save_hosted_binding(&deps.journal_root, &binding).is_err() {
-        operation::finish(
-            &deps.operations,
-            generation,
-            "error",
-            Some("failed".into()),
-            None,
-        );
-        return Err(());
-    }
+) {
     spawn_backup_worker(deps.clone(), generation, move |worker| {
+        if save_hosted_binding(&worker.journal_root, &binding).is_err() {
+            return Terminal::error("failed");
+        }
         consume_hosted(&worker, kind, binding, restore_key)
     });
-    Ok(())
 }
 
 pub(crate) fn consume_hosted(
