@@ -369,6 +369,8 @@ fn packaged_owned_archive_entry() {
         std::env::var_os("OWNED_ARCHIVE_PROBE_JSON").expect("explicit fixture required");
     let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
     let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let activity =
+        solstone_core_journal_io::activity::ActivityLease::try_acquire(root.clone()).unwrap();
     let member =
         solstone_core_installed_payload::resolve_current_member("lib/solstone-restic/restic")
             .unwrap();
@@ -398,7 +400,7 @@ fn packaged_owned_archive_entry() {
     );
     let parent = MediaDirectory::open(root.clone(), Path::new("media")).unwrap();
     let fresh = || {
-        MediaStage::create(parent.clone())
+        MediaStage::create(parent.clone(), activity.clone())
             .unwrap()
             .create_target()
             .unwrap()
@@ -411,7 +413,7 @@ fn packaged_owned_archive_entry() {
         let digest = digest_reader(&mut bytes.as_slice()).unwrap();
         assert_eq!(digest.sha256, file["sha256"].as_str().unwrap());
         assert_eq!(digest.size, file["bytes"].as_u64().unwrap());
-        MediaStage::create(parent.clone())
+        MediaStage::create(parent.clone(), activity.clone())
             .unwrap()
             .create_named_target(name)
             .unwrap()
@@ -430,7 +432,7 @@ fn packaged_owned_archive_entry() {
         wrong[0] ^= 1;
         fs::write(&path, &wrong).unwrap();
         let digest = digest_reader(&mut wrong.as_slice()).unwrap();
-        let prepared = MediaStage::create(parent.clone())
+        let prepared = MediaStage::create(parent.clone(), activity.clone())
             .unwrap()
             .create_named_target(name)
             .unwrap()

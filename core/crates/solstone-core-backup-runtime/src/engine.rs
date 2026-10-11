@@ -2686,7 +2686,10 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .digest;
-                let stage = MediaStage::create(parent.clone()).unwrap();
+                let activity =
+                    solstone_core_journal_io::activity::ActivityLease::try_acquire(root.clone())
+                        .unwrap();
+                let stage = MediaStage::create(parent.clone(), activity).unwrap();
                 let path = stage.diagnostic_path();
                 let media = stage
                     .create_named_target(OsStr::new("audio.flac"))
