@@ -9,6 +9,12 @@ mod unix {
 
     use serde_json::{Value, json};
     use solstone_core_journal_io::activity::ActivityLease;
+    use solstone_core_journal_io::activity_obligations::{
+        observe_obligations, observe_with_carrier,
+    };
+    use solstone_core_journal_io::media::{
+        Confirmation, Durability, MediaPrimitive, run_with_media_hook,
+    };
     use solstone_core_journal_io::{
         BoundPublicationPrimitive, is_publication_candidate_name,
         run_with_bound_publication_faults, run_with_bound_publication_faults_and_barrier,
@@ -44,8 +50,16 @@ mod unix {
     fn accept(
         _: &Arc<JournalRoot>,
         _: &TeardownConfiguration,
+        _: Option<RootCarrierObservation<'_>>,
     ) -> Result<(), TeardownReaderRefusal> {
         Ok(())
+    }
+
+    fn prepared(root: Arc<JournalRoot>) -> CarrierTeardownAdmission {
+        admit_teardown(root)
+            .unwrap()
+            .prepare_carrier(&mut accept)
+            .unwrap_or_else(|failure| panic!("{failure:?}"))
     }
 
     fn with_hook<T>(
@@ -100,9 +114,180 @@ mod unix {
     }
 
     #[test]
+    fn carrier_preparation_keeps_original_role_and_supplies_only_live_observations() {
+        let (_temp, root) = fixture();
+        let admission = admit_teardown(root.clone()).unwrap();
+        let original_lease = admission.lease.clone();
+        let original_sha = admission.configuration().sha256().to_owned();
+        let mut calls = 0;
+        let prepared = admission
+            .prepare_carrier(&mut |supplied, view, carrier| {
+                assert!(Arc::ptr_eq(supplied, &root));
+                assert_eq!(view.sha256(), original_sha);
+                assert_busy(supplied);
+                if let Some(carrier) = carrier {
+                    assert_eq!(calls, 1);
+                    let evidence = observe_with_carrier(supplied, carrier).unwrap();
+                    assert_eq!(evidence.entries().len(), 1);
+                    assert_eq!(evidence.unresolved_entries().count(), 0);
+                } else {
+                    assert_eq!(calls, 0);
+                    assert!(observe_obligations(supplied).unwrap().entries().is_empty());
+                }
+                calls += 1;
+                Ok(())
+            })
+            .unwrap_or_else(|failure| panic!("{failure:?}"));
+        assert_eq!(calls, 2);
+        assert!(Arc::ptr_eq(prepared.carrier.teardown(), &original_lease));
+        let reservation = prepared.carrier.diagnostic_path();
+        drop(original_lease);
+        assert_busy(&root);
+        drop(prepared);
+        assert!(reservation.is_dir());
+        assert_eq!(observe_obligations(&root).unwrap().entries().len(), 1);
+        drop(ActivityLease::try_acquire(root).unwrap());
+    }
+
+    #[test]
+    fn preparation_reader_failures_retain_exact_reservation_and_exclusion() {
+        for after_preparation in [false, true] {
+            let (temp, root) = fixture();
+            let before = fs::read(temp.path().join("config/journal.json")).unwrap();
+            let failure = admit_teardown(root.clone())
+                .unwrap()
+                .prepare_carrier(&mut |_, _, carrier| {
+                    if carrier.is_some() == after_preparation {
+                        Err(TeardownReaderRefusal::RecoveryHeld)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .err()
+                .unwrap();
+            assert_eq!(
+                failure.refusal(),
+                TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(
+                    TeardownReaderRefusal::RecoveryHeld
+                ))
+            );
+            assert!(Arc::ptr_eq(failure.journal_root(), &root));
+            assert_eq!(failure.preparation().is_some(), after_preparation);
+            assert!(failure.preparation_error().is_none());
+            let reservation = failure.reservation_path();
+            assert_eq!(reservation.is_some(), after_preparation);
+            assert_eq!(
+                fs::read(temp.path().join("config/journal.json")).unwrap(),
+                before
+            );
+            assert!(!temp.path().join("config/journal.json.lock").exists());
+            assert_busy(&root);
+            assert!(!format!("{failure:?}").contains("secret"));
+            drop(failure);
+            if let Some(reservation) = reservation {
+                assert!(reservation.is_dir());
+            }
+            assert_eq!(
+                observe_obligations(&root).unwrap().entries().len(),
+                usize::from(after_preparation)
+            );
+            drop(ActivityLease::try_acquire(root).unwrap());
+        }
+    }
+
+    #[test]
+    fn consuming_partial_preparation_keeps_actual_native_failure_and_reservation() {
+        let (temp, root) = fixture();
+        let before = fs::read(temp.path().join("config/journal.json")).unwrap();
+        let admission = admit_teardown(root.clone()).unwrap();
+        let (result, consumed) = run_with_media_hook(
+            MediaPrimitive::CarrierRootSync,
+            || Err(std::io::Error::other("actual root sync failure")),
+            || admission.prepare_carrier(&mut accept),
+        );
+        assert!(consumed);
+        let failure = result.err().unwrap();
+        assert_eq!(failure.refusal(), TeardownCarrierRefusal::Preparation);
+        assert_eq!(
+            failure.preparation_error().unwrap().kind(),
+            std::io::ErrorKind::Other
+        );
+        let receipt = failure.preparation().unwrap();
+        assert_eq!(receipt.stage_durability(), Durability::Synced);
+        assert_eq!(receipt.root_durability(), Durability::Unproven);
+        assert_eq!(receipt.confirmation(), Confirmation::Unverified);
+        let Some(RetainedCarrier::Failed(native)) = failure.carrier.as_deref() else {
+            panic!("actual lower failure must remain owned")
+        };
+        assert!(Arc::ptr_eq(native.teardown(), &failure.admission.lease));
+        assert!(Arc::ptr_eq(native.journal_root(), &root));
+        let reservation = failure.reservation_path().unwrap();
+        assert!(reservation.is_dir());
+        assert_busy(&root);
+        assert_eq!(
+            fs::read(temp.path().join("config/journal.json")).unwrap(),
+            before
+        );
+        drop(failure);
+        assert!(reservation.is_dir());
+        assert_eq!(observe_obligations(&root).unwrap().entries().len(), 1);
+        drop(TeardownLease::try_acquire(root).unwrap());
+    }
+
+    #[test]
+    fn carrier_drift_after_publication_refuses_phase_and_retains_effect_facts() {
+        for change in 0..3 {
+            let (temp, root) = fixture();
+            let admission = prepared(root.clone());
+            let reservation = admission.carrier.diagnostic_path();
+            let moved = temp.path().join(".tmp-offload-moved");
+            let changed = reservation.clone();
+            let retained = moved.clone();
+            let failure = with_hook(
+                ClearCheckpoint::AfterClear,
+                move || match change {
+                    0 => fs::write(changed.join("sole-raw"), b"keep").unwrap(),
+                    1 => {
+                        fs::rename(&changed, retained).unwrap();
+                        fs::create_dir(changed).unwrap();
+                    }
+                    _ => fs::remove_dir(changed).unwrap(),
+                },
+                || admission.clear_configuration(&mut accept),
+            )
+            .err()
+            .unwrap();
+            assert!(failure.attempted());
+            assert!(failure.publication().is_some());
+            assert!(matches!(
+                failure.refusal(),
+                TeardownClearRefusal::Admission(TeardownAdmissionRefusal::CarrierUnavailable)
+            ));
+            assert!(Arc::ptr_eq(
+                failure.admission.carrier.teardown(),
+                &failure.admission.admission.lease
+            ));
+            assert_eq!(failure.admission.carrier.diagnostic_path(), reservation);
+            let current: Value =
+                serde_json::from_slice(&fs::read(temp.path().join("config/journal.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                current["backup"],
+                Value::Object(solstone_core_backup::backup_defaults())
+            );
+            drop_failure(failure, &root);
+            match change {
+                0 => assert_eq!(fs::read(reservation.join("sole-raw")).unwrap(), b"keep"),
+                1 => assert!(moved.is_dir() && reservation.is_dir()),
+                _ => assert!(!reservation.exists()),
+            }
+        }
+    }
+
+    #[test]
     fn owned_clear_keeps_original_view_and_exclusion_for_each_fresh_callback() {
         let (temp, root) = fixture();
-        let admission = admit_teardown(root.clone()).unwrap();
+        let admission = prepared(root.clone());
         let original_sha = admission.configuration().sha256().to_owned();
         let backup = admission.configuration().backup().clone();
         let keys = admission.configuration().keys().cloned();
@@ -127,7 +312,10 @@ mod unix {
         assert_eq!(current["providers"]["credential"], "provider-secret");
         let view = phase.configuration();
         let mut calls = 0;
-        let mut reader = |supplied: &Arc<JournalRoot>, config: &TeardownConfiguration| {
+        let mut reader = |supplied: &Arc<JournalRoot>,
+                          config: &TeardownConfiguration,
+                          carrier: Option<RootCarrierObservation<'_>>| {
+            assert!(carrier.is_some());
             calls += 1;
             assert!(Arc::ptr_eq(supplied, &root));
             assert!(std::ptr::eq(config, view));
@@ -143,7 +331,7 @@ mod unix {
             TeardownReaderRefusal::RecoveryHeld,
         ] {
             assert_eq!(
-                phase.check(&mut |_, _| Err(refusal)),
+                phase.check(&mut |_, _, _| Err(refusal)),
                 Err(TeardownAdmissionRefusal::Reader(refusal))
             );
         }
@@ -160,7 +348,7 @@ mod unix {
     fn reader_or_precheck_refusal_starts_no_clear_and_retains_failure_owner() {
         for drift in [false, true] {
             let (temp, root) = fixture();
-            let admission = admit_teardown(root.clone()).unwrap();
+            let admission = prepared(root.clone());
             let path = temp.path().join("config/journal.json");
             if drift {
                 fs::write(&path, b"{}").unwrap();
@@ -168,7 +356,7 @@ mod unix {
             let before = fs::read(&path).unwrap();
             let mut calls = 0;
             let failure = admission
-                .clear_configuration(&mut |_, _| {
+                .clear_configuration(&mut |_, _, _| {
                     calls += 1;
                     Err(TeardownReaderRefusal::RecoveryHeld)
                 })
@@ -187,7 +375,7 @@ mod unix {
     fn stale_missing_invalid_or_replaced_parent_at_clear_cut_preserves_competing_state() {
         for kind in 0..4 {
             let (temp, root) = fixture();
-            let admission = admit_teardown(root.clone()).unwrap();
+            let admission = prepared(root.clone());
             let path = temp.path().join("config/journal.json");
             let original = fs::read(&path).unwrap();
             let directory = temp.path().join("config");
@@ -236,7 +424,7 @@ mod unix {
             (true, true, true),
         ] {
             let (temp, root) = fixture();
-            let admission = admit_teardown(root.clone()).unwrap();
+            let admission = prepared(root.clone());
             let mut faults = Vec::new();
             if durability {
                 faults.push((BoundPublicationPrimitive::ParentSync, 1, 5));
@@ -294,7 +482,7 @@ mod unix {
     #[test]
     fn lower_write_failure_preserves_native_orphan_and_cleanup_facts_with_owned_lease() {
         let (temp, root) = fixture();
-        let admission = admit_teardown(root.clone()).unwrap();
+        let admission = prepared(root.clone());
         let before = fs::read(temp.path().join("config/journal.json")).unwrap();
         let directory = temp.path().join("config");
         let (result, consumed, fired) = run_with_bound_publication_faults_and_barrier(
@@ -408,7 +596,7 @@ mod unix {
     fn post_clear_and_later_drift_never_adopt_candidate_bytes_identity_parent_or_binding() {
         for kind in 0..7 {
             let (temp, root) = fixture();
-            let admission = admit_teardown(root.clone()).unwrap();
+            let admission = prepared(root.clone());
             let path = temp.path().to_path_buf();
             let failure = with_hook(
                 ClearCheckpoint::AfterClear,
@@ -429,14 +617,13 @@ mod unix {
             drop_failure(failure, &root);
 
             let (temp, root) = fixture();
-            let phase = admit_teardown(root.clone())
-                .unwrap()
+            let phase = prepared(root.clone())
                 .clear_configuration(&mut accept)
                 .unwrap_or_else(|e| panic!("{e:?}"));
             drift(temp.path(), kind);
             assert!(
                 phase
-                    .check(&mut |_, _| panic!("drift refuses before callback"))
+                    .check(&mut |_, _, _| panic!("drift refuses before callback"))
                     .is_err()
             );
             assert_busy(&root);
@@ -447,12 +634,11 @@ mod unix {
     fn callback_drift_wins_over_accepting_or_refusing_reader() {
         for refusal in [None, Some(TeardownReaderRefusal::RecoveryHeld)] {
             let (temp, root) = fixture();
-            let phase = admit_teardown(root)
-                .unwrap()
+            let phase = prepared(root)
                 .clear_configuration(&mut accept)
                 .unwrap_or_else(|e| panic!("{e:?}"));
             assert_eq!(
-                phase.check(&mut |_, _| {
+                phase.check(&mut |_, _, _| {
                     fs::write(temp.path().join("config/journal.json"), b"{}").unwrap();
                     refusal.map_or(Ok(()), Err)
                 }),
@@ -471,7 +657,7 @@ mod unix {
             let path = parent.path().join("journal");
             fs::rename(temp.path(), &path).unwrap();
             let root = Arc::new(JournalRoot::open(&path).unwrap());
-            let admission = admit_teardown(root).unwrap();
+            let admission = prepared(root);
             let swap = path.clone();
             let replace = move || {
                 fs::rename(&swap, swap.with_file_name("old")).unwrap();
@@ -484,7 +670,7 @@ mod unix {
                 replace();
                 assert!(
                     phase
-                        .check(&mut |_, _| panic!("changed root refuses before callback"))
+                        .check(&mut |_, _, _| panic!("changed root refuses before callback"))
                         .is_err()
                 );
                 assert!(phase.journal_root().revalidate_canonical_binding().is_err());
@@ -518,7 +704,7 @@ mod unix {
             Some(TeardownClearRefusal::Unchanged)
         ));
         let (temp, root) = fixture();
-        let admission = admit_teardown(root.clone()).unwrap();
+        let admission = prepared(root.clone());
         let (result, consumed) =
             run_with_bound_publication_faults([(BoundPublicationPrimitive::Rename, 1, 5)], || {
                 admission.clear_configuration(&mut accept)
