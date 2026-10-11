@@ -18,7 +18,8 @@ mod unix_tests {
 
     use super::super::unix::{Hooks, NativePublication, Point};
     use crate::recovery::{RecoveryObligation, observe_obligations};
-    use crate::restore_intent::{MAX_INTENT_BYTES, Obligation, tests::fixture};
+    use crate::restore_intent::{Obligation, tests::fixture};
+    use solstone_core_journal_io::activity_obligations::MAX_INTENT_BYTES;
 
     struct Fixture {
         temp: tempfile::TempDir,

@@ -26,6 +26,8 @@ use solstone_core_journal_config::{
     LocalDoorConfig, MCP_LAN_DOOR_PORT, lan_door_config, read_journal_config,
 };
 use solstone_core_journal_io::{AtomicWriteOptions, JsonWriteOptions, atomic_replace, write_json};
+#[cfg(test)]
+use solstone_core_sol_link::pairing::addresses::RawInterfaceAddress;
 use solstone_core_sol_link::pairing::addresses::{
     EndpointScope, LocalEndpoint, RawInterfaceSource, SystemInterfaceSource,
     classify_interface_addresses,
@@ -120,6 +122,8 @@ pub struct LanDoorRun {
     pub peer_admitted: fn(IpAddr) -> bool,
     pub bind_admitted: fn(&LocalEndpoint) -> bool,
     #[cfg(test)]
+    pub classify_interfaces: fn(&[RawInterfaceAddress]) -> Vec<LocalEndpoint>,
+    #[cfg(test)]
     pub fail_accept_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     pub one_shot_panic: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -139,6 +143,8 @@ impl LanDoorRun {
             per_source_limit: DEFAULT_PER_SOURCE_LIMIT,
             peer_admitted: is_admitted_lan_peer,
             bind_admitted: is_admitted_lan_bind_endpoint,
+            #[cfg(test)]
+            classify_interfaces: classify_interface_addresses,
             #[cfg(test)]
             fail_accept_flag: None,
             #[cfg(test)]
@@ -1100,7 +1106,6 @@ pub(crate) async fn run_lan_door_loop_with_sources(
     let mut active_tasks: HashMap<IpAddr, (watch::Sender<bool>, JoinHandle<()>)> = HashMap::new();
     let mut address_states: HashMap<IpAddr, LanAddressState> = HashMap::new();
     let mut current_fingerprint: Option<String> = None;
-    let mut first_observation = true;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1119,22 +1124,21 @@ pub(crate) async fn run_lan_door_loop_with_sources(
             // 1. Read config
             let config_res = read_journal_config(journal_root);
             let config_enum = match config_res {
-                Ok(cfg) => {
-                    first_observation = false;
-                    lan_door_config(&cfg)
-                }
+                Ok(cfg) => lan_door_config(&cfg),
                 Err(_err) => {
-                    if first_observation {
-                        write_lan_door_state(
-                            journal_root,
-                            false,
-                            Some("config_unreadable"),
-                            None,
-                            None,
-                        );
-                        return Ok(());
-                    }
-                    LocalDoorConfig::On
+                    // Network access requires a readable, explicit opt-in on every pass.
+                    stop_all_listeners(&mut active_tasks).await;
+                    address_states.clear();
+                    server_config_cell.store(Arc::new(None));
+                    current_fingerprint = None;
+                    write_lan_door_state(
+                        journal_root,
+                        false,
+                        Some("config_unreadable"),
+                        None,
+                        None,
+                    );
+                    return Ok(());
                 }
             };
 
@@ -1186,7 +1190,10 @@ pub(crate) async fn run_lan_door_loop_with_sources(
                 }
             };
 
+            #[cfg(not(test))]
             let endpoints = classify_interface_addresses(&raw_interfaces);
+            #[cfg(test)]
+            let endpoints = (run.classify_interfaces)(&raw_interfaces);
             let mut admitted_ips: Vec<IpAddr> = endpoints
                 .into_iter()
                 .filter(run.bind_admitted)
@@ -2771,6 +2778,161 @@ mod full_tests {
                 rustls::SignatureScheme::ED25519,
                 rustls::SignatureScheme::RSA_PSS_SHA256,
             ]
+        }
+    }
+
+    #[tokio::test]
+    async fn lan_door_control_loop_config_failure_closes_and_recovers() {
+        #[derive(Clone, Copy, Debug)]
+        enum Failure {
+            Malformed,
+            Missing,
+            Unreadable,
+        }
+
+        impl Failure {
+            fn apply(self, journal: &Path) {
+                let config = journal.join("config/journal.json");
+                match self {
+                    Self::Malformed => fs::write(config, b"{").unwrap(),
+                    Self::Missing => fs::remove_file(config).unwrap(),
+                    Self::Unreadable => {
+                        fs::remove_file(&config).unwrap();
+                        // A directory is an unreadable settings file on every supported OS.
+                        fs::create_dir(config).unwrap();
+                    }
+                }
+            }
+
+            fn restore(self, journal: &Path, enabled: bool) {
+                if matches!(self, Self::Unreadable) {
+                    fs::remove_dir(journal.join("config/journal.json")).unwrap();
+                }
+                write_config(journal, Some(enabled));
+            }
+
+            fn reason(self) -> &'static str {
+                match self {
+                    Self::Missing => "disabled",
+                    Self::Malformed | Self::Unreadable => "config_unreadable",
+                }
+            }
+        }
+
+        async fn assert_state_after(
+            journal: &Path,
+            port: u16,
+            after: DateTime<Utc>,
+            listening: bool,
+            reason: Option<&str>,
+        ) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(state) = read_lan_door_state(journal)
+                        && state.observed_at > after
+                        && state.listening == listening
+                        && state.reason.as_deref() == reason
+                    {
+                        if !listening {
+                            assert!(state.fingerprint.is_none());
+                            assert!(state.addresses.is_none());
+                            assert!(
+                                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                                    .await
+                                    .is_err()
+                            );
+                        }
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "LAN door did not reach listening={listening}, reason={reason:?}; last state: {:?}",
+                    read_lan_door_state(journal)
+                )
+            });
+        }
+
+        for failure in [Failure::Malformed, Failure::Missing, Failure::Unreadable] {
+            let temp = tempfile::Builder::new()
+                .prefix("lan-door-config-failure-")
+                .tempdir_in(crate::test_scratch())
+                .unwrap();
+            let journal = temp.path();
+            write_config(journal, Some(false));
+            failure.apply(journal);
+            let port = {
+                let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                reservation.local_addr().unwrap().port()
+            };
+            let interfaces = MockInterfaceSource::new(vec![RawInterfaceAddress {
+                interface: "lo".to_owned(),
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            }]);
+            let mut run = LanDoorRun::production();
+            run.port = port;
+            run.config_interval = Duration::from_millis(20);
+            run.bind_admitted = test_admit_loopback_bind;
+            run.peer_admitted = test_admit_loopback_peer;
+            // Production classification excludes loopback before bind admission.
+            run.classify_interfaces = |raw| {
+                raw.iter()
+                    .map(|entry| LocalEndpoint {
+                        ip: entry.address,
+                        scope: EndpointScope::Lan,
+                    })
+                    .collect()
+            };
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let root = journal.to_path_buf();
+            let oauth = Arc::new(OAuthRuntime::new_lan_door(journal));
+            let after = Utc::now();
+            let task = tokio::spawn(async move {
+                run_lan_door_loop_with_sources(&root, run, shutdown_rx, oauth, &interfaces)
+                    .await
+                    .unwrap();
+            });
+
+            // Failure at startup and after an explicit off both keep the socket closed.
+            assert_state_after(journal, port, after, false, Some(failure.reason())).await;
+            failure.restore(journal, false);
+            assert_state_after(journal, port, Utc::now(), false, Some("disabled")).await;
+            failure.apply(journal);
+            assert_state_after(journal, port, Utc::now(), false, Some(failure.reason())).await;
+
+            // Valid opt-in opens the listener, and a later failure closes it.
+            failure.restore(journal, true);
+            assert_state_after(journal, port, Utc::now(), true, None).await;
+            // Restored off stays closed, and readable true permits recovery.
+            failure.apply(journal);
+            assert_state_after(journal, port, Utc::now(), false, Some(failure.reason())).await;
+            failure.restore(journal, false);
+            assert_state_after(journal, port, Utc::now(), false, Some("disabled")).await;
+            write_config(journal, Some(true));
+            assert_state_after(journal, port, Utc::now(), true, None).await;
+            // Probe authentication after the rebind checks: production sockets do not
+            // reuse addresses, so a completed HTTP connection can hold TIME_WAIT.
+            let (status, _, _) = tokio::time::timeout(
+                Duration::from_secs(5),
+                exchange_tls_http(
+                    port,
+                    &format!(
+                        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\n\r\n"
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 401, "{failure:?}");
+
+            write_config(journal, Some(false));
+            assert_state_after(journal, port, Utc::now(), false, Some("disabled")).await;
+
+            shutdown_tx.send(true).unwrap();
+            task.await.unwrap();
         }
     }
 

@@ -4292,3 +4292,43 @@ fn a_multi_word_type_derives_the_remainder() {
     assert!(dates.contains(&"20261001"));
     assert!(dates.contains(&"20261002"));
 }
+
+#[test]
+fn apostrophe_name_returns_its_granted_facet_context() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-apostrophe-name-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    write_entity_fixture(
+        journal.path(),
+        "alpha",
+        "renee",
+        "entity-renee",
+        "Renée O'Neill",
+        Some("Person"),
+        Some("Research lead."),
+        Some("Ask about the pilot results."),
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let res = probe(&journal, "search", json!({"query": "Renée O'Neill"})).unwrap();
+    assert!(res["results"].as_array().unwrap().is_empty());
+    let matches = res["entity_matches"].as_array().expect("person facet card");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["name"], "Renée O'Neill");
+    assert_eq!(matches[0]["facet"], FACET_A);
+    assert_eq!(matches[0]["description"], "Research lead.");
+    assert_eq!(matches[0]["observations"], "Ask about the pilot results.");
+}

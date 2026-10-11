@@ -4197,18 +4197,8 @@ function entityTrustFormat(template, values) {
   return result;
 }
 
-function entityTrustRepairRequired(err) {
-  return err?.payload?.operation_state === 'repair_required';
-}
-
 // Every entities refusal carries the same generic `error`; the reason is in `detail`.
 function entityErrorMessage(err, fallback = '') {
-  if (entityTrustRepairRequired(err)) {
-    return entityTrustFormat(ENT_COPY.ENT_TRUST_REPAIR_REQUIRED, {
-      detail: err.rawDetail || err.serverMessage || fallback,
-      remediation: err.payload.safe_remediation || ''
-    }).trim();
-  }
   // A failure's detail is engineering text; it stays under the error's details.
   if (err?.status >= 500) return fallback;
   return err?.rawDetail || window.SurfaceState.serverMessageFrom(err) || fallback;
@@ -4551,7 +4541,9 @@ async function commitJournalEntityMerge(sourceId, targetId, targetName, button) 
     location.hash = targetId;
     await loadJournalEntities({refresh: true});
   } catch (err) {
-    if (!entityTrustRepairRequired(err)) button.disabled = false;
+    // A repeat merge settles durable recovery under entity-trust before
+    // writing again. Recovery conflicts refuse without overwriting changes.
+    button.disabled = false;
     showInlineError(
       'journal-detail-trust-error',
       entityErrorMessage(err, ENT_COPY.ENT_TRUST_ACTION_FAILED)

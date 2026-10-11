@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `solstone link serve` now warns at startup that it is for development on trusted systems, because local callers can use the paired owner's full journal API authority.
 - when an agent you've connected searches your journal and may see transcripts, a result about a conversation now links to the transcript behind it, with its time, so the agent can read what was actually said before telling you who said what.
 - each segment your journal processes from now on also gets a list of what it was about and up to eight short passages copied word for word from what was said, so a search can find a conversation by its subject or by a line someone said in it. a passage is kept only when it matches the transcript exactly.
 - `solstone journal reprocess FIRST --through LAST --owed --json` reports, for each day in the range, whether the day is marked finished, the state of its daily results, how many there are, and how many are owed and why.
@@ -26,7 +27,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - when a screen summary runs out of room, your journal now retries it more concisely while keeping the same source material.
-
+- when a connected agent searches for a person's or project's full name, the results can now include a short description and notes from the facets you shared with it. for names such as "Project Juniper", the search also finds entries that call the project "Juniper".
+- starting the same connected agent repeatedly for short tasks no longer stops it with "MCP bearer session limit reached". your journal makes room by closing that connection's least recently used session. a quiet agent whose session was closed may have to reconnect.
+- security fix: agents on your network now stay disconnected while your journal's settings file is missing, unreadable or malformed. before, a file that couldn't be read could turn network access on even when you had turned it off. access resumes when the file is readable and network access is on.
 - on mac, installing local thinking or transcription now also clears quarantine, macos's marker for downloaded files, inside the downloaded folder.
 
 - a connected agent can now read transcripts of imported audio, and reads imported AI conversations and imported text transcripts as plain text with their times. before, imported audio couldn't be opened, and the others came back as raw data.
