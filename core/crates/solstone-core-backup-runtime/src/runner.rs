@@ -9,36 +9,9 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-#[cfg(unix)]
-use std::fs::File;
-#[cfg(unix)]
-use std::io::Read;
-#[cfg(unix)]
-use std::os::fd::{AsFd, OwnedFd};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(unix)]
-use std::process::{Command, Stdio};
-#[cfg(unix)]
-use std::thread;
-#[cfg(unix)]
-use std::time::Instant;
-
-#[cfg(unix)]
-use nix::errno::Errno;
-#[cfg(unix)]
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-#[cfg(unix)]
-use nix::sys::signal::{Signal, killpg};
-#[cfg(unix)]
-use nix::sys::wait::waitpid;
-#[cfg(unix)]
-use nix::unistd::{Pid, pipe};
 use serde_json::Value;
 #[cfg(windows)]
 use solstone_core_distribution::windows_payload::{WINDOWS_RCLONE_WORKER, WINDOWS_RESTIC_WORKER};
-#[cfg(unix)]
-use solstone_core_system::process::{Disposition, LaunchAuthority, LaunchError, launch};
 use thiserror::Error;
 
 /// An inherited OS handle explicitly passed to a backup child process.
@@ -136,21 +109,20 @@ impl ToolRunner for SystemToolRunner {
                 "stdin not supported on unix tool runner",
             ));
         }
-        let mut restored = Vec::with_capacity(request.pass_fds.len());
-        for &fd in &request.pass_fds {
-            let flags = fcntl(fd, FcntlArg::F_GETFD).map_err(io::Error::other)?;
-            let flags = FdFlag::from_bits_truncate(flags);
-            if flags.contains(FdFlag::FD_CLOEXEC) {
-                fcntl(fd, FcntlArg::F_SETFD(flags & !FdFlag::FD_CLOEXEC))
-                    .map_err(io::Error::other)?;
-                restored.push((fd, flags));
-            }
-        }
-        let result = self.run_child(request);
-        for (fd, flags) in restored {
-            let _ = fcntl(fd, FcntlArg::F_SETFD(flags));
-        }
-        result
+        let output = solstone_core_backup::bounded_child::run(
+            &solstone_core_backup::bounded_child::Request {
+                program: request.program.clone(),
+                argv: spawn_argv(&request.argv),
+                env: request.env.clone(),
+                timeout: request.timeout,
+                pass_fds: request.pass_fds.clone(),
+            },
+        )?;
+        Ok(ToolOutput {
+            returncode: output.returncode,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 
@@ -334,255 +306,6 @@ impl ToolRunner for SystemToolRunner {
             io::ErrorKind::Unsupported,
             "the backup child-process runner is unsupported on this platform",
         ))
-    }
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
-    Observe,
-    GroupCleanup,
-    CloseOwned,
-    Reap,
-    CollectReaders,
-}
-
-#[cfg(unix)]
-trait SessionIo {
-    fn observe_exit_without_reap(&mut self) -> io::Result<bool>;
-    fn group_cleanup(&mut self) -> io::Result<()>;
-    fn close_owned_endpoints(&mut self);
-    fn reap_root(&mut self) -> io::Result<i32>;
-    fn collect_readers(&mut self) -> io::Result<(Vec<u8>, Vec<u8>)>;
-}
-
-#[cfg(unix)]
-fn push_step(trace: &mut Option<&mut Vec<Step>>, step: Step) {
-    if let Some(trace) = trace {
-        trace.push(step);
-    }
-}
-
-#[cfg(unix)]
-fn complete_session<S: SessionIo>(
-    session: &mut S,
-    mut trace: Option<&mut Vec<Step>>,
-) -> io::Result<(i32, Vec<u8>, Vec<u8>)> {
-    push_step(&mut trace, Step::Observe);
-    session.observe_exit_without_reap()?;
-    push_step(&mut trace, Step::GroupCleanup);
-    let cleanup_err = session.group_cleanup().err();
-    push_step(&mut trace, Step::CloseOwned);
-    session.close_owned_endpoints();
-    push_step(&mut trace, Step::Reap);
-    let reaped = session.reap_root();
-    if let Some(err) = cleanup_err {
-        // If killpg failed with EPERM, descendants can still hold the
-        // pipe write ends; joining would reintroduce the unbounded hang
-        // this supervisor exists to remove.
-        return Err(err);
-    }
-    let status = reaped?;
-    push_step(&mut trace, Step::CollectReaders);
-    let (stdout, stderr) = session.collect_readers()?;
-    Ok((status, stdout, stderr))
-}
-
-#[cfg(unix)]
-struct GroupGuard {
-    pgid: Pid,
-    reaped: bool,
-}
-
-#[cfg(unix)]
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        if !self.reaped {
-            // Drop cannot return an error. Signal first, then reap.
-            // This is the only path that best-effort swallows these
-            // failures; returning paths never do.
-            let _ = kill_group(self.pgid);
-            let _ = waitpid(self.pgid, None);
-        }
-    }
-}
-
-#[cfg(unix)]
-type OutputReader = thread::JoinHandle<io::Result<Vec<u8>>>;
-
-#[cfg(unix)]
-struct SpawnedChild {
-    // Drop order is declaration order and is load-bearing: GroupGuard
-    // (kill group), parent write ends (EOF), LaunchAuthority, then detached readers.
-    guard: GroupGuard,
-    stdout_w: Option<OwnedFd>,
-    stderr_w: Option<OwnedFd>,
-    authority: LaunchAuthority,
-    readers: Option<(OutputReader, OutputReader)>,
-}
-
-#[cfg(unix)]
-impl SessionIo for SpawnedChild {
-    fn observe_exit_without_reap(&mut self) -> io::Result<bool> {
-        observe_exit_without_reap(self.guard.pgid)
-    }
-
-    fn group_cleanup(&mut self) -> io::Result<()> {
-        kill_group(self.guard.pgid)
-    }
-
-    fn close_owned_endpoints(&mut self) {
-        drop(self.stdout_w.take());
-        drop(self.stderr_w.take());
-    }
-
-    fn reap_root(&mut self) -> io::Result<i32> {
-        self.guard.reaped = true;
-        self.authority.wait()
-    }
-
-    fn collect_readers(&mut self) -> io::Result<(Vec<u8>, Vec<u8>)> {
-        let (stdout_reader, stderr_reader) = self.readers.take().expect("readers");
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| io::Error::other("stdout reader panicked"))??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| io::Error::other("stderr reader panicked"))??;
-        Ok((stdout, stderr))
-    }
-}
-
-#[cfg(unix)]
-fn kill_group(pgid: Pid) -> io::Result<()> {
-    match killpg(pgid, Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        // Darwin reports EPERM for an empty process group whose leader has
-        // already exited. Do not hide EPERM while that leader is still live.
-        #[cfg(target_os = "macos")]
-        Err(Errno::EPERM) if matches!(nix::unistd::getpgid(Some(pgid)), Err(Errno::ESRCH)) => {
-            Ok(())
-        }
-        Err(err) => Err(io::Error::from(err)),
-    }
-}
-
-#[cfg(unix)]
-fn observe_exit_without_reap(pid: Pid) -> io::Result<bool> {
-    let pid = rustix::process::Pid::from_raw(pid.as_raw())
-        .ok_or_else(|| io::Error::other("invalid child pid"))?;
-    rustix::process::waitid(
-        rustix::process::WaitId::Pid(pid),
-        rustix::process::WaitIdOptions::EXITED
-            | rustix::process::WaitIdOptions::NOHANG
-            | rustix::process::WaitIdOptions::NOWAIT,
-    )
-    .map(|status| status.is_some())
-    .map_err(io::Error::from)
-}
-
-#[cfg(unix)]
-fn set_cloexec(fd: PassedHandle<'_>) -> io::Result<()> {
-    let flags = fcntl(fd, FcntlArg::F_GETFD).map_err(io::Error::from)?;
-    let flags = FdFlag::from_bits_truncate(flags);
-    fcntl(fd, FcntlArg::F_SETFD(flags | FdFlag::FD_CLOEXEC)).map_err(io::Error::from)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
-    let (read, write) = pipe().map_err(io::Error::from)?;
-    set_cloexec(read.as_fd())?;
-    set_cloexec(write.as_fd())?;
-    Ok((read, write))
-}
-
-#[cfg(unix)]
-impl SystemToolRunner {
-    fn run_child(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-        let (stdout_r, stdout_w) = pipe_cloexec()?;
-        let (stderr_r, stderr_w) = pipe_cloexec()?;
-        let mut command = Command::new(&request.program);
-        command
-            .args(spawn_argv(&request.argv))
-            .env_clear()
-            .envs(&request.env);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout_w.try_clone()?))
-            .stderr(Stdio::from(stderr_w.try_clone()?));
-        command.process_group(0);
-        let authority = launch(
-            Disposition::IndependentBoundedHelper {
-                timeout: request.timeout.unwrap_or(Duration::MAX),
-            },
-            move || command.spawn(),
-            Box::new(|child, _timeout| {
-                let Ok(raw) = i32::try_from(child.id()) else {
-                    return child.kill().map_err(LaunchError::Terminate);
-                };
-                match killpg(Pid::from_raw(raw), Signal::SIGKILL) {
-                    Ok(()) | Err(Errno::ESRCH) => Ok(()),
-                    Err(err) => Err(LaunchError::Terminate(io::Error::from(err))),
-                }
-            }),
-        )
-        .map_err(|error| match error {
-            LaunchError::Spawn(inner) => inner,
-            other => io::Error::other(other),
-        })?;
-        // Command is moved into the spawn closure and dropped when launch()
-        // finishes spawning, closing its Stdio write-end clones so
-        // read_to_end sees EOF.
-        // pids fit in i32 on every target this crate builds; cast so no
-        // `?` can return between spawn and an armed GroupGuard.
-        let pgid = Pid::from_raw(authority.pid() as i32);
-        let mut session = SpawnedChild {
-            guard: GroupGuard {
-                pgid,
-                reaped: false,
-            },
-            stdout_w: Some(stdout_w),
-            stderr_w: Some(stderr_w),
-            authority,
-            readers: None,
-        };
-        let stdout_reader = thread::spawn(move || {
-            let mut stdout = File::from(stdout_r);
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let stderr_reader = thread::spawn(move || {
-            let mut stderr = File::from(stderr_r);
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        session.readers = Some((stdout_reader, stderr_reader));
-        let start = Instant::now();
-        let timed_out = loop {
-            if session.observe_exit_without_reap()? {
-                break false;
-            }
-            if request
-                .timeout
-                .is_some_and(|timeout| start.elapsed() >= timeout)
-            {
-                break true;
-            }
-            thread::sleep(Duration::from_millis(5));
-        };
-        let (status, stdout, stderr) = complete_session(&mut session, None)?;
-        Ok(ToolOutput {
-            returncode: if timed_out {
-                124
-            } else if status >= 0 {
-                status
-            } else {
-                1
-            },
-            stdout,
-            stderr,
-        })
     }
 }
 
@@ -1148,38 +871,5 @@ mod tests {
         };
         let err = runner.run(&request).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn complete_session_records_observe_cleanup_close_reap_order() {
-        struct Fake;
-        impl SessionIo for Fake {
-            fn observe_exit_without_reap(&mut self) -> io::Result<bool> {
-                Ok(true)
-            }
-            fn group_cleanup(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-            fn close_owned_endpoints(&mut self) {}
-            fn reap_root(&mut self) -> io::Result<i32> {
-                Ok(0)
-            }
-            fn collect_readers(&mut self) -> io::Result<(Vec<u8>, Vec<u8>)> {
-                Ok((Vec::new(), Vec::new()))
-            }
-        }
-        let mut log = Vec::new();
-        complete_session(&mut Fake, Some(&mut log)).unwrap();
-        assert_eq!(
-            log,
-            [
-                Step::Observe,
-                Step::GroupCleanup,
-                Step::CloseOwned,
-                Step::Reap,
-                Step::CollectReaders
-            ]
-        );
     }
 }

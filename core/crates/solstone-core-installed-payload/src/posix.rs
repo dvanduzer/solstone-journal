@@ -231,6 +231,68 @@ pub struct InstalledPackage {
     seen: Mutex<BTreeMap<String, String>>,
 }
 
+/// One verified final member of the installation running this process.
+/// No caller-supplied package root or digest constructs this value.
+pub struct CurrentInstalledMember {
+    package: InstalledPackage,
+    relative: String,
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+impl CurrentInstalledMember {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn relative_path(&self) -> &str {
+        &self.relative
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn revalidate(&self) -> Result<(), InstalledPayloadRefusal> {
+        if self.package.member(&self.relative)? != self.path {
+            return Err(member_changed(&self.relative));
+        }
+        Ok(())
+    }
+}
+
+pub fn resolve_current_member(
+    relative: &str,
+) -> Result<CurrentInstalledMember, InstalledPayloadRefusal> {
+    let executable =
+        std::env::current_exe().map_err(|error| unreadable("current executable", error))?;
+    resolve_current_member_from_executable(&executable, relative)
+}
+
+fn resolve_current_member_from_executable(
+    executable: &Path,
+    relative: &str,
+) -> Result<CurrentInstalledMember, InstalledPayloadRefusal> {
+    let root = locate_installed_package(executable, host_executable_platform())?;
+    let package = InstalledPackage::admit(&root, COMPILED_VERSION, crate::compiled_target())?;
+    let path = package.member(relative)?;
+    let listed = package
+        .files
+        .get(relative)
+        .ok_or_else(|| member_missing(relative))?;
+    let bytes = listed.bytes;
+    let sha256 = listed.sha256.clone();
+    Ok(CurrentInstalledMember {
+        package,
+        relative: relative.to_owned(),
+        path,
+        bytes,
+        sha256,
+    })
+}
+
 impl Clone for InstalledPackage {
     fn clone(&self) -> Self {
         Self {
@@ -833,6 +895,54 @@ mod tests {
         let mut bytes = b"\x7fELF".to_vec();
         bytes.extend_from_slice(body);
         bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_member_retains_final_manifest_digest_and_refuses_changed_bytes() {
+        let directory = scratch();
+        let root = directory.path();
+        write_file(root, "bin/solstone-core", &elf(b"probe"));
+        let relative = "lib/solstone-restic/restic";
+        let unsigned = elf(b"before signing");
+        let final_bytes = elf(b"after signing!");
+        write_file(root, relative, &final_bytes);
+        seal(root, COMPILED_VERSION, crate::compiled_target());
+        let member = super::resolve_current_member_from_executable(
+            &root.join("bin/solstone-core"),
+            relative,
+        )
+        .unwrap();
+        assert_eq!(member.bytes(), final_bytes.len() as u64);
+        assert_eq!(member.sha256(), super::sha256_hex(&final_bytes));
+        assert_ne!(member.sha256(), super::sha256_hex(&unsigned));
+        member.revalidate().unwrap();
+        write_file(root, relative, &unsigned);
+        assert_eq!(member.revalidate().unwrap_err().code, code::MEMBER_CHANGED);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_member_requires_running_package_location_and_exact_member() {
+        let directory = scratch();
+        let root = directory.path();
+        write_file(root, "bin/solstone-core", &elf(b"probe"));
+        write_file(root, "lib/solstone-restic/restic", &elf(b"restic"));
+        seal(root, COMPILED_VERSION, crate::compiled_target());
+        assert!(
+            super::resolve_current_member_from_executable(
+                &root.join("outside/probe"),
+                "lib/solstone-restic/restic"
+            )
+            .is_err()
+        );
+        assert!(
+            super::resolve_current_member_from_executable(
+                &root.join("bin/solstone-core"),
+                "lib/other/restic"
+            )
+            .is_err()
+        );
     }
 
     fn macho(body: &[u8]) -> Vec<u8> {

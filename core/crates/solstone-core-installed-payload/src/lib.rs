@@ -19,11 +19,12 @@ pub use pin::install_test_fixture_pin;
 pub use pin::{PRODUCT_PIN, resolve_pin, signed_package_pin_environment, verify_pinned_signature};
 
 pub use posix::{
-    COMPILED_VERSION, ExecutablePlatform, INSTALLED_PAYLOAD_MANIFEST, INSTALLED_PAYLOAD_SCHEMA,
-    INSTALLED_PAYLOAD_SIGNATURE, InstalledPackage, InstalledPayloadRefusal, PRODUCT,
-    TARGET_LINUX_AARCH64, TARGET_LINUX_X86_64, TARGET_MACOS_ARM64, bin_parent_root,
-    canonical_target, host_executable_platform, locate_installed_package,
-    package_root_from_executable_path, render_installed_payload, verify_installed_package,
+    COMPILED_VERSION, CurrentInstalledMember, ExecutablePlatform, INSTALLED_PAYLOAD_MANIFEST,
+    INSTALLED_PAYLOAD_SCHEMA, INSTALLED_PAYLOAD_SIGNATURE, InstalledPackage,
+    InstalledPayloadRefusal, PRODUCT, TARGET_LINUX_AARCH64, TARGET_LINUX_X86_64,
+    TARGET_MACOS_ARM64, bin_parent_root, canonical_target, host_executable_platform,
+    locate_installed_package, package_root_from_executable_path, render_installed_payload,
+    resolve_current_member, verify_installed_package,
 };
 
 pub use windows_payload::WINDOWS_PAYLOAD_TARGET as TARGET_WINDOWS_X86_64;
