@@ -870,7 +870,7 @@ pub fn generation_of(slot: &SharedOperationSlot) -> Option<u64> {
         .map(|slot| slot.generation)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 pub fn backdate_started(slot: &SharedOperationSlot, age: Duration) {
     let mut guard = slot.lock().expect("operation slot lock");
     if let Some(current) = guard.current.as_mut() {

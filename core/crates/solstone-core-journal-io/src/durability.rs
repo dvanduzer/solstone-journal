@@ -63,6 +63,7 @@ pub enum ArtifactId {
     DirectDoor,
     DirectDoorGeneration,
     Cadence,
+    ProcessingDisplay,
     ProviderRuntimeHealth,
     CortexUseId,
     SpeakersInstallGeneration,
@@ -192,6 +193,13 @@ pub const JOURNAL_ARTIFACTS: &[DurableArtifact] = &[
         class: DurabilityClass::RegenerableCache,
         parser: ParserKind::WholeJson,
         rationale: "cadence state; unreadable defaults to empty map",
+    },
+    DurableArtifact {
+        id: ArtifactId::ProcessingDisplay,
+        path: "health/processing-display.json",
+        class: DurabilityClass::RegenerableCache,
+        parser: ParserKind::WholeJson,
+        rationale: "supervisor's display-sleep sample, republished every 15 s; a stale or unreadable one reads as unavailable",
     },
     DurableArtifact {
         id: ArtifactId::ProviderRuntimeHealth,
