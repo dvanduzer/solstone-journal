@@ -1438,6 +1438,43 @@ mod removal {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn consuming_removal_receipt_preserves_original_error_and_releases_only_handles() {
+        let f = Fixture::new();
+        let (removal, hit) = run_with_media_hook(
+            MediaPrimitive::RemovalSourceSync,
+            || Err(io::Error::from_raw_os_error(13)),
+            || f.remove(f.stage()),
+        );
+        assert!(hit);
+        let receipt = removal.receipt();
+        assert_eq!(receipt.effect, RemovalEffect::Deleted);
+        assert_eq!(receipt.original_name, OriginalName::Absent);
+        assert_eq!(receipt.claim_confirmation, Confirmation::Confirmed);
+        assert_eq!(receipt.source_durability, Durability::Unproven);
+        assert_eq!(receipt.cleanup, Cleanup::Complete);
+        assert_eq!(receipt.failures.len(), 1);
+        assert_eq!(receipt.failures[0].error.raw_os_error(), Some(13));
+        let before = Arc::strong_count(&f.activity);
+        let receipt = removal.into_receipt();
+        assert!(Arc::strong_count(&f.activity) < before);
+        assert_eq!(receipt.effect, RemovalEffect::Deleted);
+        assert_eq!(receipt.original_name, OriginalName::Absent);
+        assert_eq!(receipt.claim_confirmation, Confirmation::Confirmed);
+        assert_eq!(receipt.source_durability, Durability::Unproven);
+        assert_eq!(receipt.cleanup, Cleanup::Complete);
+        assert_eq!(receipt.claimed_identity, Some(f.expected.identity));
+        assert_eq!(receipt.failures.len(), 1);
+        assert_eq!(receipt.failures[0].phase, RemovalPhase::SourceSync);
+        assert_eq!(
+            receipt.failures[0].error.kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(receipt.failures[0].error.raw_os_error(), Some(13));
+        assert!(!f.raw.exists());
+    }
+
     #[test]
     fn absent_changed_content_and_distinct_identity_never_claim() {
         for case in 0..3 {

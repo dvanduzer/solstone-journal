@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod legacy;
+mod settlement;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Point {
