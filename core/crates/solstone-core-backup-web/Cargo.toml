@@ -25,7 +25,9 @@ solstone-core-convey-http.workspace = true
 solstone-core-journal-config.workspace = true
 solstone-core-handoff-nonce.workspace = true
 solstone-core-journal-config-write.workspace = true
+solstone-core-journal-io.workspace = true
 solstone-core-offload.workspace = true
+solstone-core-retention.workspace = true
 solstone-core-sol-link = { workspace = true, default-features = false, features = ["host"] }
 solstone-core-system.workspace = true
 
@@ -39,7 +41,6 @@ nix = { workspace = true, features = ["fs"] }
 solstone-core-system = { workspace = true, features = ["test-hooks"] }
 
 [dev-dependencies]
-solstone-core-retention.workspace = true
 sha2.workspace = true
 tempfile = "3.24.0"
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }

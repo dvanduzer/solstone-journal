@@ -48,6 +48,7 @@ mod measurement;
 mod operation;
 mod response;
 mod restore_prepare;
+pub mod restore_report;
 mod status;
 mod validation;
 
@@ -640,7 +641,7 @@ fn publish_restore_error(deps: &BackupWebDeps, reason_code: &str) -> Terminal {
 }
 
 fn map_offload_restore(result: solstone_core_offload::RestoreResult) -> Terminal {
-    let report = offload_restore_report(&result);
+    let report = restore_report::summary(&result);
     let mut terminal = match result.status.as_str() {
         "ok" | "no_op" => Terminal::phase("done", result.reason),
         "refused" => Terminal::phase("refused", result.reason),
@@ -649,22 +650,6 @@ fn map_offload_restore(result: solstone_core_offload::RestoreResult) -> Terminal
     };
     terminal.report = Some(report);
     terminal
-}
-
-fn offload_restore_report(result: &solstone_core_offload::RestoreResult) -> Value {
-    json!({
-        "status":result.status, "reason":result.reason, "scope":result.scope, "day":result.day,
-        "segments_selected":result.segments_selected, "segments_restored":result.segments_restored,
-        "files_expected":result.files_expected, "files_restored":result.files_restored,
-        "bytes_expected":result.bytes_expected, "bytes_restored":result.bytes_restored,
-        "reason_detail":result.reason_detail,
-        "details":result.details.iter().map(|detail| json!({
-            "status":detail.status, "reason":detail.reason, "day":detail.day, "stream":detail.stream,
-            "segment":detail.segment, "snapshot_id":detail.snapshot_id,
-            "files_expected":detail.files_expected, "files_restored":detail.files_restored,
-            "bytes_expected":detail.bytes_expected, "bytes_restored":detail.bytes_restored,
-        })).collect::<Vec<_>>(),
-    })
 }
 
 async fn enable_backup(deps: BackupWebDeps) -> axum::response::Response {

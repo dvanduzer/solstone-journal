@@ -8,7 +8,9 @@ use std::sync::Arc;
 use solstone_core_journal_io::{JournalRoot, paths::SegmentLayout};
 use solstone_core_retention::{archive_proof::OffloadProof, receipt::Target};
 
-use solstone_core_retention::archive_catalog::RestoreOperation;
+use solstone_core_retention::archive_catalog::{
+    LegacyRestoreBinding, LegacyRestoreOperation, RestoreOperation,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LedgerWriteRefusal {
@@ -88,6 +90,23 @@ pub(crate) fn append_archive_witness(
     }
 }
 
+/// Resync an exact existing complete manifest without republishing missing history.
+pub(crate) fn confirm_archive_witness(
+    root: &Arc<JournalRoot>,
+    proof: &OffloadProof,
+    time: u64,
+) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+    #[cfg(unix)]
+    {
+        unix::confirm_archive(root, proof, time, &mut unix::NoHooks)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, proof, time);
+        Err(LedgerWriteRefusal::Unsupported)
+    }
+}
+
 pub(crate) fn append_restore_operation(
     root: &Arc<JournalRoot>,
     target: &Target,
@@ -102,6 +121,39 @@ pub(crate) fn append_restore_operation(
     #[cfg(not(unix))]
     {
         let _ = (root, target, layout, operation, time);
+        Err(LedgerWriteRefusal::Unsupported)
+    }
+}
+
+pub(crate) fn append_legacy_restore_binding(
+    root: &Arc<JournalRoot>,
+    binding: &LegacyRestoreBinding,
+    time: u64,
+) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+    #[cfg(unix)]
+    {
+        unix::append_legacy_binding(root, binding, time, &mut unix::NoHooks)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, binding, time);
+        Err(LedgerWriteRefusal::Unsupported)
+    }
+}
+
+pub(crate) fn append_legacy_restore_operation(
+    root: &Arc<JournalRoot>,
+    binding: &LegacyRestoreBinding,
+    operation: &LegacyRestoreOperation,
+    time: u64,
+) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+    #[cfg(unix)]
+    {
+        unix::append_legacy_restore(root, binding, operation, time, &mut unix::NoHooks)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, binding, operation, time);
         Err(LedgerWriteRefusal::Unsupported)
     }
 }
@@ -301,6 +353,13 @@ mod unix {
         layout: SegmentLayout,
         segment: String,
         event: Event,
+        expected_binding: Option<LegacyRestoreBinding>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum AppendMode {
+        AppendOrConfirm,
+        ConfirmExisting,
     }
 
     fn encode(event: &Event) -> Result<Vec<u8>, LedgerWriteRefusal> {
@@ -313,6 +372,25 @@ mod unix {
         root: &Arc<JournalRoot>,
         proof: &OffloadProof,
         time: u64,
+        hooks: &mut impl Hooks,
+    ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+        archive_record(root, proof, time, AppendMode::AppendOrConfirm, hooks)
+    }
+
+    pub(super) fn confirm_archive(
+        root: &Arc<JournalRoot>,
+        proof: &OffloadProof,
+        time: u64,
+        hooks: &mut impl Hooks,
+    ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+        archive_record(root, proof, time, AppendMode::ConfirmExisting, hooks)
+    }
+
+    fn archive_record(
+        root: &Arc<JournalRoot>,
+        proof: &OffloadProof,
+        time: u64,
+        mode: AppendMode,
         hooks: &mut impl Hooks,
     ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
         proof
@@ -346,7 +424,9 @@ mod unix {
                 layout: proof.layout,
                 segment,
                 event,
+                expected_binding: None,
             },
+            mode,
             hooks,
         )
     }
@@ -384,7 +464,84 @@ mod unix {
                 layout,
                 segment,
                 event,
+                expected_binding: None,
             },
+            AppendMode::AppendOrConfirm,
+            hooks,
+        )
+    }
+
+    pub(super) fn append_legacy_binding(
+        root: &Arc<JournalRoot>,
+        binding: &LegacyRestoreBinding,
+        time: u64,
+        hooks: &mut impl Hooks,
+    ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+        binding
+            .validate()
+            .map_err(|_| LedgerWriteRefusal::InvalidInput)?;
+        let segment = segment_key(&binding.target.dir).ok_or(LedgerWriteRefusal::InvalidInput)?;
+        append(
+            root,
+            Request {
+                target: binding.target.clone(),
+                layout: binding.layout,
+                segment: segment.clone(),
+                event: Event::RestoreBindingV1 {
+                    schema_version: 1,
+                    time,
+                    day: binding.target.day.clone(),
+                    stream: binding.target.stream.clone(),
+                    segment,
+                    binding: binding.clone(),
+                },
+                expected_binding: None,
+            },
+            AppendMode::AppendOrConfirm,
+            hooks,
+        )
+    }
+
+    pub(super) fn append_legacy_restore(
+        root: &Arc<JournalRoot>,
+        binding: &LegacyRestoreBinding,
+        operation: &LegacyRestoreOperation,
+        time: u64,
+        hooks: &mut impl Hooks,
+    ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
+        binding
+            .validate()
+            .map_err(|_| LedgerWriteRefusal::InvalidInput)?;
+        if operation.adoption_id != binding.adoption_id
+            || !component(&operation.operation.operation_id)
+            || operation.operation.files.is_empty()
+        {
+            return Err(LedgerWriteRefusal::InvalidInput);
+        }
+        let segment = segment_key(&binding.target.dir).ok_or(LedgerWriteRefusal::InvalidInput)?;
+        // The full binding is checked again under the same retained exclusion
+        // as the append, not accepted as a caller-supplied consent receipt.
+        append(
+            root,
+            Request {
+                target: binding.target.clone(),
+                layout: binding.layout,
+                segment: segment.clone(),
+                event: Event::LegacyRestoreV1 {
+                    schema_version: 1,
+                    time,
+                    day: binding.target.day.clone(),
+                    stream: binding.target.stream.clone(),
+                    segment,
+                    segment_dir: binding.target.dir.clone(),
+                    layout: binding.layout,
+                    adoption_id: operation.adoption_id.clone(),
+                    operation_id: operation.operation.operation_id.clone(),
+                    files: operation.operation.files.clone(),
+                },
+                expected_binding: Some(binding.clone()),
+            },
+            AppendMode::AppendOrConfirm,
             hooks,
         )
     }
@@ -394,6 +551,7 @@ mod unix {
         let mut manifests = BTreeSet::new();
         let mut witnesses = BTreeSet::new();
         let mut operations = BTreeSet::new();
+        let mut adoptions = BTreeSet::new();
         for segment in catalog.days.iter().flat_map(|d| &d.segments) {
             for manifest in &segment.history {
                 if !manifests.insert(&manifest.manifest_id) {
@@ -407,6 +565,11 @@ mod unix {
             }
             for operation in &segment.restores {
                 if !operations.insert(&operation.operation_id) {
+                    return Err(LedgerWriteRefusal::Collision);
+                }
+            }
+            for binding in &segment.restore_bindings {
+                if !adoptions.insert(&binding.adoption_id) {
                     return Err(LedgerWriteRefusal::Collision);
                 }
             }
@@ -489,6 +652,75 @@ mod unix {
                     None => Ok(false),
                 }
             }
+            Event::RestoreBindingV1 { binding, .. } => {
+                if segments()
+                    .filter(|segment| matching_segment(segment))
+                    .flat_map(|segment| &segment.history)
+                    .filter(|manifest| **manifest == binding.legacy_manifest)
+                    .count()
+                    != 1
+                {
+                    return Err(LedgerWriteRefusal::Changed);
+                }
+                match segments()
+                    .flat_map(|segment| segment.restore_bindings.iter().map(move |b| (segment, b)))
+                    .find(|(_, current)| current.adoption_id == binding.adoption_id)
+                {
+                    Some((segment, current)) if matching_segment(segment) && current == binding => {
+                        Ok(true)
+                    }
+                    Some(_) => Err(LedgerWriteRefusal::Collision),
+                    None => Ok(false),
+                }
+            }
+            Event::LegacyRestoreV1 {
+                adoption_id,
+                operation_id,
+                files,
+                segment_dir,
+                layout,
+                ..
+            } => {
+                let (segment, binding) = segments()
+                    .flat_map(|segment| segment.restore_bindings.iter().map(move |b| (segment, b)))
+                    .find(|(_, binding)| &binding.adoption_id == adoption_id)
+                    .ok_or(LedgerWriteRefusal::InvalidInput)?;
+                if !matching_segment(segment)
+                    || request.expected_binding.as_ref() != Some(binding)
+                    || binding.target.dir != *segment_dir
+                    || binding.layout != *layout
+                    || files.iter().any(|file| {
+                        !binding.files.iter().any(|bound| {
+                            bound.witness_id == file.witness_id && bound.name == file.name
+                        })
+                    })
+                {
+                    return Err(LedgerWriteRefusal::InvalidInput);
+                }
+                let expected = LegacyRestoreOperation {
+                    adoption_id: adoption_id.clone(),
+                    operation: RestoreOperation {
+                        operation_id: operation_id.clone(),
+                        files: files.clone(),
+                    },
+                };
+                match segments()
+                    .flat_map(|segment| segment.restores.iter().map(move |op| (segment, op)))
+                    .find(|(_, op)| &op.operation_id == operation_id)
+                {
+                    Some((segment, _))
+                        if matching_segment(segment)
+                            && segment
+                                .legacy_restores
+                                .iter()
+                                .any(|current| current == &expected) =>
+                    {
+                        Ok(true)
+                    }
+                    Some(_) => Err(LedgerWriteRefusal::Collision),
+                    None => Ok(false),
+                }
+            }
             _ => Err(LedgerWriteRefusal::InvalidInput),
         }
     }
@@ -496,6 +728,7 @@ mod unix {
     fn append(
         root: &Arc<JournalRoot>,
         request: Request,
+        mode: AppendMode,
         hooks: &mut impl Hooks,
     ) -> Result<LedgerWriteReceipt, LedgerWriteRefusal> {
         let bound = BoundLedger::open(root)?;
@@ -535,6 +768,9 @@ mod unix {
         }
         let line = encode(&request.event)?;
         let already = already_recorded(&request, &baseline, &line)?;
+        if !already && matches!(mode, AppendMode::ConfirmExisting) {
+            return Err(LedgerWriteRefusal::Changed);
+        }
         let mut expected_bytes = bytes.clone();
         if !already {
             expected_bytes.extend_from_slice(&line);

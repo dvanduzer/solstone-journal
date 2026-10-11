@@ -17,7 +17,9 @@ use solstone_core_journal_io::{JournalRoot, LockOptions, check_record_identities
 use solstone_core_retention::archive_catalog::{
     ArchiveWitness, RestoreDisposition, SegmentCatalog, read_complete_catalog,
 };
-use solstone_core_retention::mark_mutation::{BoundMutationOutcome, BoundMutationRefusal};
+use solstone_core_retention::mark_mutation::{
+    BoundMutationOutcome, BoundMutationRefusal, RestoredMarkRefusal,
+};
 
 use super::{RestoreResult, base, refused_selection};
 use crate::restore_intent_store::transaction::{
@@ -86,6 +88,12 @@ pub struct NoEffectCleanupFacts<'a> {
     pub parent_sync: Option<&'a std::io::Result<()>>,
 }
 
+#[derive(Debug)]
+pub enum RestoreRegisterRefusal {
+    Bound(BoundMutationRefusal),
+    Restored(RestoredMarkRefusal),
+}
+
 pub struct TransactionFacts<'a> {
     pub publication: Option<&'a PublicationReceipt>,
     pub intent_writes: Vec<IntentWriteFacts<'a>>,
@@ -99,7 +107,7 @@ pub struct TransactionFacts<'a> {
     #[cfg(unix)]
     pub marker_ancestor_sync: &'a [std::io::Result<()>],
     pub ledger: Option<LedgerFacts>,
-    pub register: Option<&'a Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    pub register: Option<&'a Result<BoundMutationOutcome, RestoreRegisterRefusal>>,
     pub no_effect_cleanup: Option<NoEffectCleanupFacts<'a>>,
     pub retirement: Option<RetirementFacts<'a>>,
     pub operation_id: Option<&'a str>,

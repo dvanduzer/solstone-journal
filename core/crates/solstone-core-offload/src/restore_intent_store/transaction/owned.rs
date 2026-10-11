@@ -32,7 +32,7 @@ pub(crate) struct DetachedTransaction {
     #[cfg(unix)]
     marker_ancestor_sync: Vec<std::io::Result<()>>,
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
-    register: Option<Result<BoundMutationOutcome, BoundMutationRefusal>>,
+    register: Option<Result<BoundMutationOutcome, RestoreRegisterRefusal>>,
     no_effect_cleanup: Option<NoEffectCleanup>,
     retirement: Option<retirement::RetirementFacts>,
     effects: AttemptEffects,

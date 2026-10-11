@@ -444,6 +444,250 @@ pub fn conditional_mutate_at_root(
     }
 }
 
+/// Borrowed observations for retiring exactly one durably restored file.
+/// The owning verifier reads current native and catalog evidence independently.
+pub struct RestoredMarkMutation<'a, 'clock> {
+    pub read: &'a solstone_core_backup::archive_readback::ReadOperation<'clock>,
+    pub operation: &'a crate::archive_catalog::RestoreOperation,
+    pub confirmed: &'a solstone_core_journal_io::media::MediaObservation,
+    pub plan: &'a PlannedMarkMutation,
+    pub claims: &'a solstone_core_segment::output_attempt::OutputClaims,
+    pub commit: &'a solstone_core_segment::output_attempt::SegmentCommit<'a>,
+}
+
+#[derive(Debug)]
+pub enum RestoredMarkRefusal {
+    Unsupported,
+    InvalidPlan,
+    Changed,
+    Catalog(String),
+    Readback(solstone_core_backup::archive_readback::ReadbackError),
+    Io(io::Error),
+    Segment(solstone_core_segment::SegmentError),
+    Bound(Box<BoundMutationRefusal>),
+}
+
+impl From<io::Error> for RestoredMarkRefusal {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl From<BoundMutationRefusal> for RestoredMarkRefusal {
+    fn from(error: BoundMutationRefusal) -> Self {
+        Self::Bound(Box::new(error))
+    }
+}
+
+/// Retire only the deterministic remainder after exact durable restore evidence.
+/// Generic typed mutations remain held. This does not retire Native resources.
+pub fn conditional_retire_restored(
+    input: RestoredMarkMutation<'_, '_>,
+) -> Result<BoundMutationOutcome, RestoredMarkRefusal> {
+    #[cfg(not(unix))]
+    {
+        let _input = input;
+        Err(RestoredMarkRefusal::Unsupported)
+    }
+    #[cfg(unix)]
+    {
+        use solstone_core_journal_io::media::MediaDirectory;
+        use solstone_core_segment::RetainedOwnerDeletion;
+        use std::sync::Arc;
+
+        input
+            .plan
+            .validate()
+            .map_err(|_| RestoredMarkRefusal::InvalidPlan)?;
+        let expected = input.plan.expected();
+        let offer = expected
+            .offload
+            .as_ref()
+            .filter(|_| expected.class == crate::marks::RemovalClass::OffloadRawRelease)
+            .ok_or(RestoredMarkRefusal::InvalidPlan)?;
+        let restored = match input.operation.files.as_slice() {
+            [file]
+                if matches!(
+                    file.disposition,
+                    crate::archive_catalog::RestoreDisposition::Published
+                        | crate::archive_catalog::RestoreDisposition::AlreadyPresent
+                ) =>
+            {
+                file
+            }
+            _ => return Err(RestoredMarkRefusal::InvalidPlan),
+        };
+        let file = offer
+            .proof
+            .files
+            .iter()
+            .find(|file| file.name == restored.name && file.witness_id == restored.witness_id)
+            .ok_or(RestoredMarkRefusal::InvalidPlan)?;
+        let remaining = expected
+            .proposal
+            .names
+            .iter()
+            .filter(|name| **name != restored.name)
+            .cloned()
+            .collect::<Vec<_>>();
+        if input.operation.operation_id.is_empty()
+            || input.read.repository_id() != offer.proof.repository_id
+            || PlannedMarkMutation::remainder(expected, &remaining)
+                .map_err(|_| RestoredMarkRefusal::InvalidPlan)?
+                != *input.plan
+        {
+            return Err(RestoredMarkRefusal::InvalidPlan);
+        }
+        let root = input.read.journal_root();
+        input
+            .read
+            .revalidate_admission()
+            .map_err(RestoredMarkRefusal::Readback)?;
+        let target = &offer.proof.target;
+        let relative = crate::layout::segment_rel_with_layout(
+            &target.day,
+            &target.stream,
+            &target.dir,
+            offer.proof.layout,
+        );
+        let segment = root.canonical_path().join(&relative);
+        let directory = MediaDirectory::open(Arc::clone(root), Path::new(&relative))?;
+        let parent = MediaDirectory::open(
+            Arc::clone(root),
+            Path::new(&crate::layout::stream_rel_with_layout(
+                &target.day,
+                &target.stream,
+                offer.proof.layout,
+            )),
+        )?;
+        let owner =
+            RetainedOwnerDeletion::open(parent, OsStr::new(&target.dir), Some(&directory), 65_536)
+                .map_err(RestoredMarkRefusal::Segment)?;
+        revalidate_restored(&input, file, &directory, &owner, &segment)?;
+        let health = open_health(root, OsStr::new("health"), root.canonical_path())
+            .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Read(error)))?
+            .ok_or(BoundMutationRefusal::Review(ReviewRefusal::RootChanged))?;
+        let (lock, mut register) = begin_bound_read(root, &health)?;
+        let status = apply(&mut register, input.plan)
+            .map_err(|error| BoundMutationRefusal::Review(ReviewRefusal::Register(error)))?;
+        let result = ConditionalResult { status, register };
+        revalidate_restored(&input, file, &directory, &owner, &segment)?;
+        if status == MutationStatus::Applied {
+            publish_bound(root, &health, &lock, result).map_err(RestoredMarkRefusal::from)
+        } else {
+            revalidate_health(root, &health).map_err(BoundMutationRefusal::from)?;
+            lock.revalidate_bound(&health, OsStr::new("retention-marks.json.lock"))
+                .map_err(BoundMutationRefusal::Lock)?;
+            Ok(BoundMutationOutcome::Unchanged(result))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn revalidate_restored(
+    input: &RestoredMarkMutation<'_, '_>,
+    file: &crate::archive_proof::ArchiveFileProof,
+    directory: &solstone_core_journal_io::media::MediaDirectory,
+    owner: &solstone_core_segment::RetainedOwnerDeletion,
+    segment: &Path,
+) -> Result<(), RestoredMarkRefusal> {
+    input
+        .read
+        .revalidate_admission()
+        .map_err(RestoredMarkRefusal::Readback)?;
+    directory.revalidate()?;
+    if input.claims.segment_identity(segment)? != directory.object_identity()
+        || owner.state().map_err(RestoredMarkRefusal::Segment)?
+            != solstone_core_segment::OwnerDeletionState::Live
+    {
+        return Err(RestoredMarkRefusal::Changed);
+    }
+    let expected = input.plan.expected();
+    input.commit.require_outputs(
+        input.claims,
+        segment,
+        expected.proposal.names.iter().map(|name| {
+            let mut output = segment.join(name);
+            output.set_extension("jsonl");
+            output
+        }),
+    )?;
+    let observed = directory
+        .observe_file(OsStr::new(&file.name))?
+        .ok_or(RestoredMarkRefusal::Changed)?;
+    if observed != *input.confirmed
+        || observed.digest.size != file.bytes
+        || observed.digest.sha256 != file.sha256
+    {
+        return Err(RestoredMarkRefusal::Changed);
+    }
+    let proof = &expected
+        .offload
+        .as_ref()
+        .ok_or(RestoredMarkRefusal::InvalidPlan)?
+        .proof;
+    let catalog = crate::archive_catalog::read_complete_catalog(input.read.journal_root())
+        .map_err(RestoredMarkRefusal::Catalog)?;
+    check_restored_catalog(&catalog, proof, file, input.operation)?;
+    directory.revalidate()?;
+    if owner.state().map_err(RestoredMarkRefusal::Segment)?
+        != solstone_core_segment::OwnerDeletionState::Live
+    {
+        return Err(RestoredMarkRefusal::Changed);
+    }
+    input
+        .read
+        .revalidate_admission()
+        .map_err(RestoredMarkRefusal::Readback)
+}
+
+#[cfg(unix)]
+fn check_restored_catalog(
+    catalog: &crate::archive_catalog::JournalCatalog,
+    proof: &crate::archive_proof::OffloadProof,
+    file: &crate::archive_proof::ArchiveFileProof,
+    operation: &crate::archive_catalog::RestoreOperation,
+) -> Result<(), RestoredMarkRefusal> {
+    let segments = || catalog.days.iter().flat_map(|day| &day.segments);
+    if catalog.degraded()
+        || segments().any(|segment| segment.degraded())
+        || catalog.days.iter().any(|day| day.degraded())
+        || segments()
+            .flat_map(|segment| &segment.history)
+            .filter(|manifest| manifest.manifest_id == proof.manifest_id)
+            .count()
+            != 1
+        || segments()
+            .flat_map(|segment| &segment.history)
+            .flat_map(|manifest| &manifest.files)
+            .filter(|witness| witness.witness_id == file.witness_id)
+            .count()
+            != 1
+        || segments()
+            .flat_map(|segment| &segment.restores)
+            .filter(|recorded| recorded.operation_id == operation.operation_id)
+            .count()
+            != 1
+        || catalog.historical_witness(proof, file).is_none()
+    {
+        return Err(RestoredMarkRefusal::Changed);
+    }
+    let key = solstone_core_format::segment::segment_key(&proof.target.dir)
+        .ok_or(RestoredMarkRefusal::InvalidPlan)?;
+    let found = segments().any(|segment| {
+        segment.day == proof.target.day
+            && segment.stream == proof.target.stream
+            && segment.segment == key
+            && segment
+                .restores
+                .iter()
+                .any(|recorded| recorded == operation)
+    });
+    if !found {
+        return Err(RestoredMarkRefusal::Changed);
+    }
+    Ok(())
+}
+
 /// One short phase under the existing register protocol. Never spans bookkeeping.
 #[cfg(unix)]
 pub(crate) struct CheckedMarkGuard<'a, 'op> {
@@ -668,6 +912,123 @@ mod tests {
             .unwrap(),
         );
         mark
+    }
+
+    #[cfg(unix)]
+    fn restored_catalog_fixture() -> (
+        crate::archive_catalog::JournalCatalog,
+        crate::archive_proof::OffloadProof,
+        crate::archive_catalog::RestoreOperation,
+    ) {
+        use crate::archive_catalog::{
+            ArchiveManifest, ArchiveWitness, DayCatalog, JournalCatalog, OffloadFile,
+            RestoreDisposition, RestoreFileV2, RestoreOperation, SegmentCatalog,
+        };
+        let proof = bound().offload.unwrap().proof;
+        let file = &proof.files[0];
+        let witness = ArchiveWitness {
+            manifest_id: proof.manifest_id.clone(),
+            witness_id: file.witness_id.clone(),
+            snapshot_id: proof.snapshot_id.clone(),
+            repository_id: Some(proof.repository_id.clone()),
+            archive_path: Some(file.archive_path.clone()),
+            journal_id: Some(proof.journal_id.clone()),
+            layout: Some(proof.layout),
+            segment_dir: Some(proof.target.dir.clone()),
+            processing: Some(file.processing.clone()),
+            file: OffloadFile {
+                name: file.name.clone(),
+                bytes: file.bytes,
+                sha256: file.sha256.clone(),
+            },
+        };
+        let operation = RestoreOperation {
+            operation_id: "restore".into(),
+            files: vec![RestoreFileV2 {
+                witness_id: file.witness_id.clone(),
+                name: file.name.clone(),
+                disposition: RestoreDisposition::AlreadyPresent,
+            }],
+        };
+        let catalog = JournalCatalog {
+            days: vec![DayCatalog {
+                day: proof.target.day.clone(),
+                segments: vec![SegmentCatalog {
+                    day: proof.target.day.clone(),
+                    stream: proof.target.stream.clone(),
+                    segment: solstone_core_format::segment::segment_key(&proof.target.dir).unwrap(),
+                    history: vec![ArchiveManifest {
+                        manifest_id: proof.manifest_id.clone(),
+                        files: vec![witness],
+                    }],
+                    restores: vec![operation.clone()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        (catalog, proof, operation)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_catalog_requires_exact_history_and_successful_record() {
+        let (catalog, proof, operation) = restored_catalog_fixture();
+        let file = &proof.files[0];
+        assert!(catalog.active_witness(&proof, file).is_none());
+        assert!(catalog.historical_witness(&proof, file).is_some());
+        assert!(check_restored_catalog(&catalog, &proof, file, &operation).is_ok());
+        for cut in 0..5 {
+            let mut changed = catalog.clone();
+            match cut {
+                0 => changed.days[0].segments[0].history.clear(),
+                1 => changed.days[0].segments[0].restores.clear(),
+                2 => {
+                    changed.days[0].segments[0].restores[0].files[0].disposition =
+                        crate::archive_catalog::RestoreDisposition::Conflict
+                }
+                3 => {
+                    changed.days[0].segments[0].history[0].files[0].archive_path =
+                        Some("/different/a.flac".into())
+                }
+                _ => changed.days[0].segments[0].history[0].files[0].processing = None,
+            }
+            assert!(check_restored_catalog(&changed, &proof, file, &operation).is_err());
+        }
+        // A newer active generation does not replace the exact historical record.
+        let mut newer = catalog.clone();
+        let mut witness = newer.days[0].segments[0].history[0].files[0].clone();
+        witness.manifest_id = "newer".into();
+        witness.witness_id = "newer-file".into();
+        newer.days[0].segments[0].active.push(witness);
+        assert!(check_restored_catalog(&newer, &proof, file, &operation).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_catalog_refuses_cross_day_manifest_witness_and_operation_collisions() {
+        let (catalog, proof, operation) = restored_catalog_fixture();
+        for cut in 0..3 {
+            let mut changed = catalog.clone();
+            let mut other_day = catalog.days[0].clone();
+            other_day.day = "20261008".into();
+            other_day.segments[0].day.clone_from(&other_day.day);
+            match cut {
+                0 => {
+                    other_day.segments[0].restores.clear();
+                    other_day.segments[0].history[0].files[0].witness_id = "other-witness".into();
+                }
+                1 => {
+                    other_day.segments[0].history[0].manifest_id = "other-manifest".into();
+                    other_day.segments[0].restores.clear();
+                }
+                _ => other_day.segments[0].history.clear(),
+            }
+            changed.days.push(other_day);
+            assert!(!changed.degraded());
+            assert!(check_restored_catalog(&changed, &proof, &proof.files[0], &operation).is_err());
+        }
     }
 
     #[test]
