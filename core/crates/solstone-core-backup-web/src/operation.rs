@@ -3,7 +3,7 @@
 
 #[cfg(not(windows))]
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(not(windows))]
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,8 +14,13 @@ use std::{cell::Cell, thread_local};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Serialize;
+use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation, Clock};
 
-use crate::{response, validation::RefusedReason};
+use crate::{
+    archive_operation::{ArchiveBegin, ArchiveBeginRefusal, ArchiveCancellationRequest},
+    response,
+    validation::RefusedReason,
+};
 
 pub const HANDOFF_TTL: Duration = Duration::from_secs(30 * 60);
 
@@ -43,6 +48,7 @@ pub struct Slot {
     pub started: Instant,
     pub generation: u64,
     pub(crate) worker_active: bool,
+    archive_cancellation: Option<ArchiveCancellation>,
     #[cfg(windows)]
     pub(crate) cleanup: Option<PendingCleanup>,
 }
@@ -283,6 +289,31 @@ pub fn begin(
     nonce: Option<String>,
     restore_key: Option<String>,
 ) -> Result<Begin, Response> {
+    let mut guard = lock_for_begin(slot).map_err(|()| busy_response())?;
+    Ok(install_slot(
+        &mut guard,
+        kind,
+        portal_url,
+        nonce,
+        restore_key,
+        None,
+    ))
+}
+
+pub(crate) fn begin_archive(
+    slot: &SharedOperationSlot,
+    kind: &str,
+    clock: &dyn Clock,
+) -> Result<ArchiveBegin, ArchiveBeginRefusal> {
+    let mut guard = lock_for_begin(slot).map_err(|()| ArchiveBeginRefusal::Busy)?;
+    let cancellation = ArchiveCancellation::new();
+    let budget = ArchiveBudget::new_cancellable(clock, cancellation.clone())
+        .map_err(ArchiveBeginRefusal::Admission)?;
+    let begun = install_slot(&mut guard, kind, None, None, None, Some(cancellation));
+    Ok(ArchiveBegin::new(begun.generation, budget))
+}
+
+fn lock_for_begin(slot: &SharedOperationSlot) -> Result<MutexGuard<'_, Option<Slot>>, ()> {
     #[cfg(windows)]
     {
         use solstone_core_system::process::{
@@ -292,17 +323,28 @@ pub fn begin(
             observe_bounded_helper_admission(),
             HelperAdmissionStatus::Ready
         ) {
-            return Err(busy_response());
+            return Err(());
         }
     }
     #[cfg(windows)]
-    let mut guard = slot.try_lock().map_err(|_| busy_response())?;
+    let mut guard = slot.try_lock().map_err(|_| ())?;
     #[cfg(not(windows))]
     let mut guard = slot.lock().expect("operation slot lock");
     if observe(&mut guard).is_some_and(|slot| !is_terminal(&slot.view.phase)) {
-        return Err(busy_response());
+        return Err(());
     }
-    let generation = guard
+    Ok(guard)
+}
+
+fn install_slot(
+    current: &mut Option<Slot>,
+    kind: &str,
+    portal_url: Option<String>,
+    nonce: Option<String>,
+    restore_key: Option<String>,
+    archive_cancellation: Option<ArchiveCancellation>,
+) -> Begin {
+    let generation = current
         .as_ref()
         .map(|slot| slot.generation.wrapping_add(1))
         .unwrap_or(1);
@@ -315,17 +357,51 @@ pub fn begin(
         recording_failure: None,
         portal_url,
     };
-    *guard = Some(Slot {
+    *current = Some(Slot {
         view,
         nonce,
         restore_key,
         started: Instant::now(),
         generation,
         worker_active: false,
+        archive_cancellation,
         #[cfg(windows)]
         cleanup: None,
     });
-    Ok(Begin { generation })
+    Begin { generation }
+}
+
+pub(crate) fn request_archive_cancellation(
+    slot: &SharedOperationSlot,
+    generation: u64,
+) -> ArchiveCancellationRequest {
+    #[cfg(windows)]
+    let Ok(mut guard) = slot.try_lock() else {
+        return ArchiveCancellationRequest::Refused;
+    };
+    #[cfg(not(windows))]
+    let mut guard = slot.lock().expect("operation slot lock");
+    let Some(current) = guard.as_mut() else {
+        return ArchiveCancellationRequest::Refused;
+    };
+    if current.generation != generation || is_terminal(&current.view.phase) {
+        return ArchiveCancellationRequest::Refused;
+    }
+    #[cfg(windows)]
+    if current.cleanup.is_some() {
+        return ArchiveCancellationRequest::Refused;
+    }
+    let Some(cancellation) = current.archive_cancellation.as_ref() else {
+        return ArchiveCancellationRequest::Refused;
+    };
+    cancellation.cancel();
+    if current.worker_active {
+        current.view.phase = "cancelling".into();
+        ArchiveCancellationRequest::Requested
+    } else {
+        apply_terminal(current, Terminal::error("cancelled"));
+        ArchiveCancellationRequest::BeforeStart
+    }
 }
 
 pub fn finish(
@@ -744,6 +820,7 @@ mod terminal_tests {
             started: Instant::now(),
             generation,
             worker_active: false,
+            archive_cancellation: None,
             #[cfg(windows)]
             cleanup: None,
         }
@@ -997,12 +1074,84 @@ mod worker_tests {
         wait_for_worker(spawn_worker(slot.clone(), next, Terminal::done).unwrap());
         assert_eq!(super::current(&slot).unwrap().phase, "done");
     }
+
+    #[test]
+    fn failed_archive_worker_creation_cannot_cancel_its_successor() {
+        struct ArchiveClock;
+        impl Clock for ArchiveClock {
+            fn now_unix(&self) -> i64 {
+                100
+            }
+            fn iso_week(&self) -> u8 {
+                1
+            }
+        }
+        let slot = new_slot();
+        let (generation, budget) = begin_archive(&slot, "offload_approve", &ArchiveClock)
+            .unwrap_or_else(|error| panic!("archive admission: {error:?}"))
+            .into_parts();
+        let old_flag = budget.cancellation().unwrap().clone();
+        FAIL_WORKER_START.with(|fail| fail.set(true));
+        assert_no_worker_starts(slot.clone(), generation);
+        assert_eq!(
+            current(&slot).unwrap().reason_code.as_deref(),
+            Some("failed")
+        );
+        assert!(!is_busy(&slot));
+        let (next, next_budget) = begin_archive(&slot, "offload_approve", &ArchiveClock)
+            .unwrap_or_else(|error| panic!("archive admission: {error:?}"))
+            .into_parts();
+        old_flag.cancel();
+        assert!(!next_budget.cancellation().unwrap().is_cancelled());
+        assert_eq!(
+            request_archive_cancellation(&slot, generation),
+            ArchiveCancellationRequest::Refused
+        );
+        assert_eq!(
+            request_archive_cancellation(&slot, next),
+            ArchiveCancellationRequest::BeforeStart
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
 mod cleanup_state_tests {
     use super::terminal_tests::admitted_slot;
     use super::*;
+
+    #[test]
+    fn archive_stop_preserves_worker_and_separate_cleanup_ownership() {
+        let flag = ArchiveCancellation::new();
+        let mut admitted = admitted_slot("offload_approve", 2, None, None, None);
+        admitted.archive_cancellation = Some(flag.clone());
+        let slot = Arc::new(Mutex::new(Some(admitted)));
+        assert!(start_worker(&slot, 2));
+        assert_eq!(
+            request_archive_cancellation(&slot, 2),
+            ArchiveCancellationRequest::Requested
+        );
+        assert!(flag.is_cancelled());
+        assert!(worker_or_cleanup_active(&slot, 2));
+        assert!(!mark_cancelled(&slot, 2));
+        {
+            let mut guard = slot.lock().unwrap();
+            let current = guard.as_mut().unwrap();
+            current.worker_active = false;
+            current.view.phase = "cleanup_pending".into();
+            current.cleanup = Some(PendingCleanup {
+                owners: Vec::new(),
+                terminal: Terminal::done(),
+            });
+        }
+        assert_eq!(
+            request_archive_cancellation(&slot, 2),
+            ArchiveCancellationRequest::Refused
+        );
+        let guard = slot.lock().unwrap();
+        let current = guard.as_ref().unwrap();
+        assert_eq!(current.view.phase, "cleanup_pending");
+        assert!(current.cleanup.is_some());
+    }
 
     #[test]
     fn active_worker_keeps_ownership_across_cancel_and_hosted_expiry() {

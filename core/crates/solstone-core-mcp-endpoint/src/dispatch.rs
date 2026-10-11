@@ -50,6 +50,10 @@ const MAX_SNIPPET_CHARS: usize = 800;
 const MAX_ENTITY_NOTES: usize = 50;
 const MAX_ENTITY_NOTE_BYTES: u64 = 4 * 1024;
 const MAX_ENTITY_DESCRIPTION_CHARS: usize = 2_000;
+const MAX_CARD_DESCRIPTION_CHARS: usize = 400;
+const MAX_CARD_OBSERVATIONS_CHARS: usize = 400;
+const MAX_CARD_NOTES: usize = 8;
+const MAX_CARD_NOTE_BYTES: u64 = 2048;
 
 static REFERENCES: OnceLock<ReferenceCodec> = OnceLock::new();
 
@@ -642,6 +646,374 @@ pub(crate) fn codec() -> &'static ReferenceCodec {
     })
 }
 
+fn is_plain_literal_query(query: &str) -> bool {
+    if query
+        .chars()
+        .any(|c| matches!(c, '"' | ':' | '*' | '(' | ')'))
+    {
+        return false;
+    }
+    for token in query.split_whitespace() {
+        if matches!(token, "AND" | "OR" | "NOT") {
+            return false;
+        }
+    }
+    true
+}
+
+fn fold_literal(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut result = String::with_capacity(trimmed.len());
+    let mut in_whitespace = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            if !in_whitespace {
+                result.push(' ');
+                in_whitespace = true;
+            }
+        } else {
+            in_whitespace = false;
+            for lower in ch.to_lowercase() {
+                result.push(lower);
+            }
+        }
+    }
+    result
+}
+
+fn clean_note_entry(raw: &str) -> Option<String> {
+    let cleaned = raw.trim().trim_start_matches("- ").trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_owned())
+    }
+}
+
+fn derived_name_query(name: &str, kind: Option<&str>) -> Option<String> {
+    let kind = kind?;
+    let folded_kind = fold_literal(kind);
+    let folded_name = fold_literal(name);
+    let kind_tokens: Vec<&str> = folded_kind.split(' ').filter(|t| !t.is_empty()).collect();
+    let name_tokens: Vec<&str> = folded_name.split(' ').filter(|t| !t.is_empty()).collect();
+    if kind_tokens.is_empty() || kind_tokens.len() >= name_tokens.len() {
+        return None;
+    }
+    if !name_tokens.starts_with(&kind_tokens) {
+        return None;
+    }
+    let collapsed_name_tokens: Vec<&str> = name.split_whitespace().collect();
+    if collapsed_name_tokens.len() != name_tokens.len() {
+        return None;
+    }
+    let remainder = collapsed_name_tokens[kind_tokens.len()..].join(" ");
+    if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntityResolutionStatus {
+    NotAttempted,
+    Incomplete,
+    Resolved,
+}
+
+struct ResolvedIdentitySummary {
+    facet_id: String,
+    entity_id: String,
+    name: String,
+    kind: Option<String>,
+    derived: Option<String>,
+}
+
+struct EntityMatchCard {
+    facet_id: String,
+    entity_id: String,
+    value: Value,
+    observations_path: Option<String>,
+}
+
+struct EntityResolutionOutcome {
+    status: EntityResolutionStatus,
+    effective_query: String,
+    identities: Vec<ResolvedIdentitySummary>,
+    cards: Vec<EntityMatchCard>,
+    matches_truncated: bool,
+}
+
+fn resolve_search_entities(
+    journal_root: &Path,
+    principal: DispatchPrincipal<'_>,
+    snapshot: &ConnectionReadSnapshot,
+    search_boundary: &ConnectionBoundary,
+    request: &ValidatedSearch,
+) -> EntityResolutionOutcome {
+    if !search_boundary
+        .categories()
+        .contains(&AdmittedCategory::Entities)
+        || request.query.trim().is_empty()
+        || !is_plain_literal_query(&request.query)
+    {
+        return EntityResolutionOutcome {
+            status: EntityResolutionStatus::NotAttempted,
+            effective_query: request.query.clone(),
+            identities: Vec::new(),
+            cards: Vec::new(),
+            matches_truncated: false,
+        };
+    }
+
+    let facets = match available_facets(journal_root, snapshot) {
+        Ok(facets) => facets,
+        Err(_) => {
+            return EntityResolutionOutcome {
+                status: EntityResolutionStatus::Incomplete,
+                effective_query: request.query.clone(),
+                identities: Vec::new(),
+                cards: Vec::new(),
+                matches_truncated: false,
+            };
+        }
+    };
+
+    struct GrantedMatch {
+        facet_id: String,
+        facet_dir: String,
+        entity_id: String,
+        name: String,
+        kind: Option<String>,
+        derived: Option<String>,
+        relationship_dir: String,
+        relationship: Value,
+    }
+
+    let mut matches = Vec::new();
+    let query_folded = fold_literal(&request.query);
+
+    for (facet_id, facet_dir, _) in facets {
+        if request.facet_id.as_deref().is_some_and(|id| id != facet_id) {
+            continue;
+        }
+        if matches!(
+            search_boundary.scope(),
+            ConnectionScope::ChosenFacets { ids } if !ids.contains(&facet_id)
+        ) {
+            continue;
+        }
+        let scoped = match read_scoped_entities(journal_root, &facet_dir) {
+            Ok(scoped) => scoped,
+            Err(_) => {
+                return EntityResolutionOutcome {
+                    status: EntityResolutionStatus::Incomplete,
+                    effective_query: request.query.clone(),
+                    identities: Vec::new(),
+                    cards: Vec::new(),
+                    matches_truncated: false,
+                };
+            }
+        };
+        for item in scoped {
+            let name = entity_name(&item.identity);
+            let kind = item
+                .identity
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned);
+            drop(item.identity);
+
+            if fold_literal(&name) == query_folded {
+                let derived = derived_name_query(&name, kind.as_deref());
+                matches.push(GrantedMatch {
+                    facet_id: facet_id.clone(),
+                    facet_dir: facet_dir.clone(),
+                    entity_id: item.entity_id,
+                    name,
+                    kind,
+                    derived,
+                    relationship_dir: item.relationship_dir,
+                    relationship: item.relationship,
+                });
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| {
+        a.facet_id
+            .cmp(&b.facet_id)
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
+
+    let effective_query = if matches.is_empty() {
+        request.query.clone()
+    } else {
+        if let Some(derived) = &matches[0].derived {
+            if matches.iter().all(|m| m.derived.as_ref() == Some(derived)) {
+                derived.clone()
+            } else {
+                request.query.clone()
+            }
+        } else {
+            request.query.clone()
+        }
+    };
+
+    let identities = matches
+        .iter()
+        .map(|m| ResolvedIdentitySummary {
+            facet_id: m.facet_id.clone(),
+            entity_id: m.entity_id.clone(),
+            name: m.name.clone(),
+            kind: m.kind.clone(),
+            derived: m.derived.clone(),
+        })
+        .collect();
+
+    let is_dated = request.day.is_some() || request.day_from.is_some() || request.day_to.is_some();
+    if is_dated {
+        return EntityResolutionOutcome {
+            status: EntityResolutionStatus::Resolved,
+            effective_query,
+            identities,
+            cards: Vec::new(),
+            matches_truncated: false,
+        };
+    }
+
+    let total_matches = matches.len();
+    let matches_truncated = total_matches > request.limit;
+    let returned_matches = &matches[..total_matches.min(request.limit)];
+
+    let mut cards = Vec::new();
+    for m in returned_matches {
+        let desc = m
+            .relationship
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let desc_chars_count = desc.map(|d| d.chars().count()).unwrap_or(0);
+        let desc_was_cut = desc_chars_count > MAX_CARD_DESCRIPTION_CHARS;
+        let desc_cut = desc.map(|d| {
+            d.chars()
+                .take(MAX_CARD_DESCRIPTION_CHARS)
+                .collect::<String>()
+        });
+
+        let notes_path =
+            solstone_core_facets::facet_links::LinkDirs::for_facet(journal_root, &m.facet_dir)
+                .observations_rel(&m.relationship_dir);
+
+        let notes_boundary = boundary(
+            snapshot,
+            Some(AdmittedCategory::Entities),
+            Some(&m.facet_id),
+        );
+        let indexed_notes = match read_indexed_path_entries(
+            journal_root,
+            &notes_boundary,
+            &notes_path,
+            MAX_CARD_NOTES,
+            MAX_CARD_NOTE_BYTES,
+        ) {
+            Ok(notes) => notes,
+            Err(_) => {
+                return EntityResolutionOutcome {
+                    status: EntityResolutionStatus::Incomplete,
+                    effective_query: request.query.clone(),
+                    identities: Vec::new(),
+                    cards: Vec::new(),
+                    matches_truncated: false,
+                };
+            }
+        };
+
+        let cleaned_notes = indexed_notes
+            .entries
+            .iter()
+            .filter_map(|e| clean_note_entry(e))
+            .collect::<Vec<_>>();
+
+        let joined = cleaned_notes.join("\n");
+        let joined_chars_count = joined.chars().count();
+        let joined_was_cut = joined_chars_count > MAX_CARD_OBSERVATIONS_CHARS;
+        let observations_cut = if joined.is_empty() {
+            None
+        } else {
+            Some(
+                joined
+                    .chars()
+                    .take(MAX_CARD_OBSERVATIONS_CHARS)
+                    .collect::<String>(),
+            )
+        };
+        let observations_path = if !cleaned_notes.is_empty() {
+            Some(notes_path)
+        } else {
+            None
+        };
+
+        let is_truncated = desc_was_cut || joined_was_cut || indexed_notes.truncated;
+
+        let reference = match codec().mint(
+            principal.connection,
+            snapshot.generation,
+            ReferenceTarget::Entity(EntityReference {
+                facet_id: m.facet_id.clone(),
+                entity_id: m.entity_id.clone(),
+            }),
+        ) {
+            Ok(r) => r,
+            Err(_) => {
+                return EntityResolutionOutcome {
+                    status: EntityResolutionStatus::Incomplete,
+                    effective_query: request.query.clone(),
+                    identities: Vec::new(),
+                    cards: Vec::new(),
+                    matches_truncated: false,
+                };
+            }
+        };
+
+        let mut card_val = json!({
+            "name": m.name,
+            "facet": m.facet_id,
+            "reference": reference,
+        });
+        if let Some(kind) = &m.kind {
+            card_val["type"] = json!(kind);
+        }
+        if let Some(description) = desc_cut {
+            card_val["description"] = json!(description);
+        }
+        if let Some(observations) = observations_cut {
+            card_val["observations"] = json!(observations);
+        }
+        if is_truncated {
+            card_val["truncated"] = Value::Bool(true);
+        }
+
+        cards.push(EntityMatchCard {
+            facet_id: m.facet_id.clone(),
+            entity_id: m.entity_id.clone(),
+            value: card_val,
+            observations_path,
+        });
+    }
+
+    EntityResolutionOutcome {
+        status: EntityResolutionStatus::Resolved,
+        effective_query,
+        identities,
+        cards,
+        matches_truncated,
+    }
+}
+
 fn search(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -649,13 +1021,38 @@ fn search(
     request: ValidatedSearch,
 ) -> Result<Prepared, DispatchError> {
     let boundary = boundary(snapshot, request.category, request.facet_id.as_deref());
+    let resolution =
+        resolve_search_entities(journal_root, principal, snapshot, &boundary, &request);
+    let resolution_status_str = match resolution.status {
+        EntityResolutionStatus::NotAttempted => "not_attempted",
+        EntityResolutionStatus::Incomplete => "incomplete",
+        EntityResolutionStatus::Resolved => "resolved",
+    };
+    let resolution_identities_val = resolution
+        .identities
+        .iter()
+        .map(|id| {
+            json!({
+                "facet_id": id.facet_id,
+                "entity_id": id.entity_id,
+                "name": id.name,
+                "type": id.kind,
+                "derived": id.derived,
+            })
+        })
+        .collect::<Vec<_>>();
     let query_hash = digest_json(&json!({
         "query": request.query,
+        "effective_query": resolution.effective_query,
         "day": request.day,
         "day_from": request.day_from,
         "day_to": request.day_to,
         "category": request.category.map(|category| category_token(&category)),
         "facet": request.facet_id,
+        "entity_resolution": {
+            "status": resolution_status_str,
+            "identities": resolution_identities_val,
+        },
     }));
     let mut start_after = request
         .cursor
@@ -689,7 +1086,7 @@ fn search(
             journal_root,
             &boundary,
             &ConnectionSearchRequest {
-                query: request.query.clone(),
+                query: resolution.effective_query.clone(),
                 limit: batch,
                 start_after: start_after.clone(),
                 day: request.day.clone(),
@@ -815,7 +1212,13 @@ fn search(
         .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
     let live_examination_complete =
         examined < MAX_SEARCH_EXAMINED_ROWS && !(live_dropped && results.len() < request.limit);
-    let count = results.len();
+    let count = results.len() + resolution.cards.len();
+    for card in &resolution.cards {
+        targets.push(format!("facet:{}/entity:{}", card.facet_id, card.entity_id));
+        if let Some(obs_path) = &card.observations_path {
+            targets.push(obs_path.clone());
+        }
+    }
     let complete = index_coverage_complete && live_examination_complete && !degraded;
     let mut subjects: Vec<LinkSubject<'_>> = subjects_data
         .iter()
@@ -846,26 +1249,40 @@ fn search(
             result["more_segments"] = Value::Bool(true);
         }
     }
-    Ok(Prepared::new(
-        json!({
-            "results": results,
-            "next_cursor": next_cursor,
-            "coverage": {
-                "index_classification_complete": index_coverage_complete,
-                "live_examination_complete": live_examination_complete,
-                "transcript_index": "Search does not read conversations word for word. Read the segments a result lists with get_transcript.",
-            },
-            "degraded": degraded,
-            "relaxed": relaxed,
-        }),
-        count,
-        targets,
-    )
-    .when_empty(if complete {
-        SEARCH_EMPTY
-    } else {
-        SEARCH_EMPTY_INCOMPLETE
-    }))
+    let mut response_val = json!({
+        "results": results,
+        "next_cursor": next_cursor,
+        "coverage": {
+            "index_classification_complete": index_coverage_complete,
+            "live_examination_complete": live_examination_complete,
+            "transcript_index": "Search does not read conversations word for word. Read the segments a result lists with get_transcript.",
+        },
+        "degraded": degraded,
+        "relaxed": relaxed,
+    });
+    if !resolution.cards.is_empty() {
+        let card_vals = resolution
+            .cards
+            .iter()
+            .map(|c| c.value.clone())
+            .collect::<Vec<_>>();
+        response_val["entity_matches"] = Value::Array(card_vals);
+    }
+    if resolution.matches_truncated {
+        response_val["entity_matches_truncated"] = Value::Bool(true);
+    }
+    if resolution.status == EntityResolutionStatus::Incomplete {
+        response_val["entity_context_incomplete"] = Value::Bool(true);
+    }
+    let mut prepared = Prepared::new(response_val, count, targets);
+    if count == 0 && resolution.status != EntityResolutionStatus::Incomplete {
+        prepared = prepared.when_empty(if complete {
+            SEARCH_EMPTY
+        } else {
+            SEARCH_EMPTY_INCOMPLETE
+        });
+    }
+    Ok(prepared)
 }
 
 fn resolve_search_cursor(
@@ -1088,6 +1505,14 @@ fn list_facets(
     Ok(Prepared::new(json!({"facets": values}), count, targets).when_empty(LIST_FACETS_EMPTY))
 }
 
+fn read_scoped_entities(
+    journal_root: &Path,
+    facet_dir: &str,
+) -> Result<Vec<solstone_core_facets::ScopedFacetEntity>, DispatchError> {
+    solstone_core_facets::list_scoped_facet_entities(journal_root, facet_dir, false, false)
+        .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))
+}
+
 fn list_entities(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -1101,13 +1526,7 @@ fn list_entities(
         if request.facet_id.as_deref().is_some_and(|id| id != facet_id) {
             continue;
         }
-        let scoped = solstone_core_facets::list_scoped_facet_entities(
-            journal_root,
-            &facet_dir,
-            false,
-            false,
-        )
-        .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
+        let scoped = read_scoped_entities(journal_root, &facet_dir)?;
         for item in scoped {
             if entities.len() == request.limit {
                 break;
@@ -1156,12 +1575,10 @@ fn get_entity(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
-    let item =
-        solstone_core_facets::list_scoped_facet_entities(journal_root, &facet_dir, false, false)
-            .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?
-            .into_iter()
-            .find(|item| item.entity_id == reference.entity_id)
-            .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
+    let item = read_scoped_entities(journal_root, &facet_dir)?
+        .into_iter()
+        .find(|item| item.entity_id == reference.entity_id)
+        .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
     let mut targets = vec![format!(
         "facet:{}/entity:{}",
         reference.facet_id, reference.entity_id
@@ -1211,8 +1628,7 @@ fn get_entity(
     let notes_list = notes
         .entries
         .iter()
-        .map(|note| note.trim().trim_start_matches("- ").trim().to_owned())
-        .filter(|note| !note.is_empty())
+        .filter_map(|note| clean_note_entry(note))
         .collect::<Vec<_>>();
     if !notes_list.is_empty() {
         targets.push(notes_path);
