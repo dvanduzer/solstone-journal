@@ -337,6 +337,34 @@ fn packaged_owned_archive_entry() {
             1
         }
     }
+    struct ProbeRunner;
+    impl ProbeRunner {
+        fn record(result: std::io::Result<ToolOutput>) -> std::io::Result<ToolOutput> {
+            if let Ok(output) = &result
+                && output.returncode != 0
+            {
+                eprintln!(
+                    "OWNED_ARCHIVE_TOOL_FAILURE {}",
+                    serde_json::json!({"returncode":output.returncode,
+                        "stdout":String::from_utf8_lossy(&output.stdout),
+                        "stderr":String::from_utf8_lossy(&output.stderr)})
+                );
+            }
+            result
+        }
+    }
+    impl ToolRunner for ProbeRunner {
+        fn run(&self, request: &ToolRequest<'_>) -> std::io::Result<ToolOutput> {
+            Self::record(SystemToolRunner.run(request))
+        }
+        fn run_cancellable(
+            &self,
+            request: &ToolRequest<'_>,
+            cancellation: &ArchiveCancellation,
+        ) -> std::io::Result<ToolOutput> {
+            Self::record(SystemToolRunner.run_cancellable(request, cancellation))
+        }
+    }
     let input_path =
         std::env::var_os("OWNED_ARCHIVE_PROBE_JSON").expect("explicit fixture required");
     let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
@@ -354,7 +382,7 @@ fn packaged_owned_archive_entry() {
         urls: RefCell::new(Vec::new()),
     };
     let services = BackupServices {
-        runner: &SystemToolRunner,
+        runner: &ProbeRunner,
         http: &http,
         clock: &clock,
         restic_path: Some(member.path()),
