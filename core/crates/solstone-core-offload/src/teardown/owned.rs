@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use solstone_core_backup::archive_admission::{AdmissionError, ArchiveCancellation, Clock};
+#[cfg(unix)]
 use solstone_core_backup::teardown_configuration::BindingRemovalReceipt;
 use solstone_core_backup_runtime::teardown::owned::{
     RemoteTeardownReport, TeardownOperation, TeardownRemoteRefusal,
@@ -87,6 +88,7 @@ pub struct SettledTeardownReport {
     remote: RemoteTeardownReport,
     attempts: TeardownAttemptJournal,
     publication: Arc<BoundConfigPublication>,
+    #[cfg(unix)]
     binding: Arc<BindingRemovalReceipt>,
     retirement: ActivityCarrierRetirementReceipt,
 }
@@ -101,6 +103,7 @@ impl SettledTeardownReport {
     pub fn publication(&self) -> &BoundConfigPublication {
         &self.publication
     }
+    #[cfg(unix)]
     pub fn binding(&self) -> &BindingRemovalReceipt {
         &self.binding
     }
@@ -118,6 +121,7 @@ struct Outside {
     carrier: Option<Arc<RootTeardownCarrier>>,
     attempts: TeardownAttemptJournal,
     publication: Option<Arc<BoundConfigPublication>>,
+    #[cfg(unix)]
     binding: Option<Arc<BindingRemovalReceipt>>,
     retirement: Option<ActivityCarrierRetirement<RootTeardownCarrier>>,
 }
@@ -133,6 +137,7 @@ impl Outside {
             carrier: None,
             attempts: TeardownAttemptJournal::default(),
             publication: None,
+            #[cfg(unix)]
             binding: None,
             retirement: None,
         }
@@ -228,6 +233,7 @@ impl OwnedTeardownOutcome {
             _ => self.held()?.outside.publication.as_deref(),
         }
     }
+    #[cfg(unix)]
     pub fn binding(&self) -> Option<&BindingRemovalReceipt> {
         match self {
             Self::Finished(report) => Some(report.binding()),
