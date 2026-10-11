@@ -3,6 +3,9 @@
 
 //! Exact archive bytes in an owned target. These values never authorize release.
 
+mod historical;
+pub use historical::{HistoricalArchiveFile, HistoricalSnapshotFiles};
+
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,7 +46,7 @@ pub struct ReadAdmission<'a> {
     operation: PreparedArchiveOperation<'a>,
     destination: Destination,
     password: String,
-    repository_id: String,
+    repository: RepositoryBinding,
     expected_restic_path: PathBuf,
 }
 impl<'a> ReadAdmission<'a> {
@@ -58,7 +61,21 @@ impl<'a> ReadAdmission<'a> {
             operation,
             destination,
             password,
-            repository_id,
+            repository: RepositoryBinding::Expected(repository_id),
+            expected_restic_path,
+        }
+    }
+    pub fn capture_current(
+        operation: PreparedArchiveOperation<'a>,
+        destination: Destination,
+        password: String,
+        expected_restic_path: PathBuf,
+    ) -> Self {
+        Self {
+            operation,
+            destination,
+            password,
+            repository: RepositoryBinding::CaptureCurrent,
             expected_restic_path,
         }
     }
@@ -68,6 +85,12 @@ impl<'a> ReadAdmission<'a> {
             owned: AdmissionOwner::Input(Box::new(self)),
         }
     }
+}
+
+enum RepositoryBinding {
+    Expected(String),
+    CaptureCurrent,
+    Confirmed(String),
 }
 
 pub struct ExactArchiveFile {
@@ -313,7 +336,7 @@ pub struct OwnedDirectReadHold {
     _member: CurrentInstalledMember,
     #[cfg(unix)]
     _env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
-    _repository_id: String,
+    _repository: RepositoryBinding,
     _execution: DirectExecution,
 }
 impl OwnedDirectReadHold {
@@ -345,7 +368,7 @@ struct OwnedReadInput {
     operation: OwnedPreparedArchiveHold,
     _destination: Destination,
     _password: String,
-    _repository_id: String,
+    _repository: RepositoryBinding,
     _expected_restic_path: PathBuf,
 }
 enum ClosedAdmissionOwner {
@@ -393,7 +416,7 @@ impl ReadbackAdmissionError<'_> {
                     operation,
                     destination,
                     password,
-                    repository_id,
+                    repository,
                     expected_restic_path,
                 } = *input;
                 let operation = operation
@@ -404,7 +427,7 @@ impl ReadbackAdmissionError<'_> {
                     operation,
                     _destination: destination,
                     _password: password,
-                    _repository_id: repository_id,
+                    _repository: repository,
                     _expected_restic_path: expected_restic_path,
                 }))
             }
@@ -425,7 +448,7 @@ pub struct ReadOperation<'a> {
     member: CurrentInstalledMember,
     #[cfg(unix)]
     env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
-    repository_id: String,
+    repository: RepositoryBinding,
     execution: std::cell::RefCell<DirectExecution>,
 }
 
@@ -648,7 +671,7 @@ impl<'a> ReadOperation<'a> {
             member,
             #[cfg(unix)]
             env,
-            repository_id,
+            repository,
             execution,
         } = self;
         let operation = operation
@@ -662,7 +685,7 @@ impl<'a> ReadOperation<'a> {
             _member: member,
             #[cfg(unix)]
             _env: env,
-            _repository_id: repository_id,
+            _repository: repository,
             _execution: execution.into_inner(),
         })
     }
@@ -733,7 +756,8 @@ impl<'a> ReadOperation<'a> {
                             && input.destination.backend == "s3" => {}
                     _ => return Err(ReadbackError::NotConfigured),
                 }
-                if !full_hex_identity(&input.repository_id) {
+                if matches!(&input.repository, RepositoryBinding::Expected(id) if !full_hex_identity(id))
+                {
                     return Err(ReadbackError::InvalidRepositoryIdentity);
                 }
                 let env = direct_environment(&input.destination, &input.password)?;
@@ -753,14 +777,14 @@ impl<'a> ReadOperation<'a> {
                     });
                 }
             };
-            let admitted = Self {
+            let mut admitted = Self {
                 root: Arc::clone(input.operation.journal_root()),
                 operation: input.operation,
                 #[cfg(feature = "full-tests")]
                 source_observations: std::cell::Cell::new((0, 0)),
                 member,
                 env,
-                repository_id: input.repository_id,
+                repository: input.repository,
                 execution: std::cell::RefCell::new(DirectExecution::default()),
             };
             let qualification = (|| {
@@ -777,7 +801,7 @@ impl<'a> ReadOperation<'a> {
                     .execution
                     .borrow_mut()
                     .accept(DirectInvocation::Version, version_child);
-                admitted.check_repository()?;
+                admitted.confirm_repository()?;
                 Ok(())
             })();
             match qualification {
@@ -801,7 +825,10 @@ impl<'a> ReadOperation<'a> {
         &self.root
     }
     pub fn repository_id(&self) -> &str {
-        &self.repository_id
+        match &self.repository {
+            RepositoryBinding::Confirmed(id) => id,
+            _ => unreachable!("only confirmed read operations leave admission"),
+        }
     }
 
     #[cfg(all(unix, feature = "full-tests"))]
@@ -888,6 +915,27 @@ impl<'a> ReadOperation<'a> {
     }
 
     #[cfg(unix)]
+    fn confirm_repository(&mut self) -> Result<(), ReadbackError> {
+        let result = self.query(vec!["cat".into(), "config".into(), "--no-cache".into()])?;
+        let parsed: Value = serde_json::from_slice(&result.output().stdout)
+            .map_err(|_| ReadbackError::InvalidRepositoryIdentity)?;
+        let id = parsed
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| full_hex_identity(id))
+            .ok_or(ReadbackError::InvalidRepositoryIdentity)?;
+        if matches!(&self.repository, RepositoryBinding::Expected(expected) if expected != id) {
+            return Err(ReadbackError::RepositoryIdentityChanged);
+        }
+        self.revalidate_local()?;
+        self.repository = RepositoryBinding::Confirmed(id.to_owned());
+        self.execution
+            .borrow_mut()
+            .accept(DirectInvocation::Config, result);
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn check_repository(&self) -> Result<(), ReadbackError> {
         let result = self.query(vec!["cat".into(), "config".into(), "--no-cache".into()])?;
         let parsed: Value = serde_json::from_slice(&result.output().stdout)
@@ -897,7 +945,7 @@ impl<'a> ReadOperation<'a> {
             .and_then(Value::as_str)
             .filter(|id| full_hex_identity(id))
             .ok_or(ReadbackError::InvalidRepositoryIdentity)?;
-        if id != self.repository_id {
+        if id != self.repository_id() {
             return Err(ReadbackError::RepositoryIdentityChanged);
         }
         self.execution
@@ -978,7 +1026,7 @@ impl<'a> ReadOperation<'a> {
             ])?;
             let file = owned_snapshot_file(
                 &output.output().stdout,
-                &self.repository_id,
+                self.repository_id(),
                 snapshot_id,
                 name,
                 source.digest(),
@@ -1094,7 +1142,7 @@ impl<'a> ReadOperation<'a> {
             let mut writer = WriterState::NotLaunched;
             let preflight = (|| {
                 file.validate()?;
-                if file.repository_id != self.repository_id {
+                if file.repository_id != self.repository_id() {
                     return Err(ReadbackError::RepositoryIdentityChanged);
                 }
                 if !Arc::ptr_eq(target.journal_root(), &self.root) {

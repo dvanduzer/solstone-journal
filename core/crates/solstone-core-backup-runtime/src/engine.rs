@@ -2060,7 +2060,7 @@ pub fn admit_prepared_archive_read<'a>(
 ) -> Result<ReadOperation<'a>, ArchiveAdmissionFailure<'a>> {
     admit_prepared_archive_read_with(
         operation,
-        expected_repository_id,
+        Some(expected_repository_id),
         services.http,
         services.restic_path,
         services.version,
@@ -2069,14 +2069,17 @@ pub fn admit_prepared_archive_read<'a>(
 
 fn admit_prepared_archive_read_with<'a>(
     mut operation: PreparedArchiveOperation<'a>,
-    expected_repository_id: String,
+    expected_repository_id: Option<String>,
     http: &dyn HttpTransport,
     restic_path: Option<&Path>,
     version: &str,
 ) -> Result<ReadOperation<'a>, ArchiveAdmissionFailure<'a>> {
     let mut effects = ArchiveAdmissionEffects::default();
     let admission = (|| {
-        if !full_archive_id(&expected_repository_id) {
+        if expected_repository_id
+            .as_ref()
+            .is_some_and(|id| !full_archive_id(id))
+        {
             return Err(ArchiveError::RepositoryIdentityInvalid);
         }
         operation.revalidate()?;
@@ -2128,13 +2131,10 @@ fn admit_prepared_archive_read_with<'a>(
             });
         }
     };
-    let input = ReadAdmission::bind(
-        operation,
-        destination,
-        password,
-        expected_repository_id,
-        restic_path,
-    );
+    let input = match expected_repository_id {
+        Some(id) => ReadAdmission::bind(operation, destination, password, id, restic_path),
+        None => ReadAdmission::capture_current(operation, destination, password, restic_path),
+    };
     effects.read_repository_requested = true;
     ReadOperation::admit(input).map_err(|readback| ArchiveAdmissionFailure {
         inner: Box::new(ArchiveAdmissionFailureInner {
@@ -2149,6 +2149,31 @@ fn admit_prepared_archive_read_with<'a>(
 pub fn admit_prepared_archive_read_installed<'a>(
     operation: PreparedArchiveOperation<'a>,
     expected_repository_id: String,
+    restic_path: &Path,
+    version: &str,
+    http: &UreqHttpTransport,
+) -> Result<InstalledArchiveRead<'a>, ArchiveAdmissionFailure<'a>> {
+    admit_prepared_archive_read_installed_with(
+        operation,
+        Some(expected_repository_id),
+        restic_path,
+        version,
+        http,
+    )
+}
+
+pub fn admit_prepared_archive_current_read_installed<'a>(
+    operation: PreparedArchiveOperation<'a>,
+    restic_path: &Path,
+    version: &str,
+    http: &UreqHttpTransport,
+) -> Result<InstalledArchiveRead<'a>, ArchiveAdmissionFailure<'a>> {
+    admit_prepared_archive_read_installed_with(operation, None, restic_path, version, http)
+}
+
+fn admit_prepared_archive_read_installed_with<'a>(
+    operation: PreparedArchiveOperation<'a>,
+    expected_repository_id: Option<String>,
     restic_path: &Path,
     version: &str,
     http: &UreqHttpTransport,

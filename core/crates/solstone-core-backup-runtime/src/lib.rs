@@ -56,7 +56,8 @@ pub use engine::{
     InstalledArchiveRead, JournalMaintenance, JournalMaintenanceError, NativeJournalMaintenance,
     NativeRestoreRecorder, OwnedArchiveAdmissionFailure, OwnedDirectReadFinish, PruneResult,
     RestoreRecorder, UnreadableSources, VerificationResult, admit_archive,
-    admit_archive_with_budget, admit_prepared_archive, admit_prepared_archive_read,
+    admit_archive_with_budget, admit_prepared_archive,
+    admit_prepared_archive_current_read_installed, admit_prepared_archive_read,
     admit_prepared_archive_read_installed, check_archive_snapshot_files, prepare,
     run_archive_backup, run_prune, run_verification,
 };

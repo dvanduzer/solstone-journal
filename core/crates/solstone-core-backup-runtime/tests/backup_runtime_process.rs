@@ -1634,3 +1634,213 @@ fn packaged_direct_read_finish_entry() {
         serde_json::json!({"mode":mode,"result":result,"limit":"lower direct only; no consuming RestoreRunOutcome or Consumer keeper/generation qualification"})
     );
 }
+
+#[cfg(all(target_os = "linux", feature = "full-tests"))]
+#[test]
+#[ignore = "requires a copied current package and synthetic historical-read fixture"]
+fn packaged_historical_archive_read_entry() {
+    use solstone_core_backup::archive_activity::PreparedArchiveOperation;
+    use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation};
+    use solstone_core_backup::archive_readback::{HistoricalArchiveFile, ReadbackError};
+    use solstone_core_backup_runtime::{
+        UreqHttpTransport, admit_prepared_archive_current_read_installed,
+        admit_prepared_archive_read_installed,
+    };
+    use solstone_core_journal_io::JournalRoot;
+    use solstone_core_journal_io::media::{Cleanup, MediaDirectory, MediaStage};
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::sync::Arc;
+
+    struct OwnedClock(Instant);
+    impl Clock for OwnedClock {
+        fn now_unix(&self) -> i64 {
+            10_000 + self.0.elapsed().as_secs() as i64
+        }
+        fn iso_week(&self) -> u8 {
+            1
+        }
+    }
+    let input_path =
+        std::env::var_os("HISTORICAL_READ_PROBE_JSON").expect("explicit fixture required");
+    let input: serde_json::Value = serde_json::from_slice(&fs::read(input_path).unwrap()).unwrap();
+    let mode = input["mode"].as_str().unwrap();
+    let root = Arc::new(JournalRoot::open(Path::new(input["journal"].as_str().unwrap())).unwrap());
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
+    let cancellation = ArchiveCancellation::new();
+    let original = PreparedArchiveOperation::prepare_owned(
+        Arc::clone(&root),
+        ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone()).unwrap(),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+    let carrier = Arc::clone(original.carrier());
+    let restic = Path::new(input["restic_path"].as_str().unwrap());
+    let admitted = if mode == "known-mismatch" {
+        admit_prepared_archive_read_installed(
+            original,
+            "f".repeat(64),
+            restic,
+            "2.0.40",
+            &UreqHttpTransport,
+        )
+    } else {
+        admit_prepared_archive_current_read_installed(
+            original,
+            restic,
+            "2.0.40",
+            &UreqHttpTransport,
+        )
+    };
+    let installed = match admitted {
+        Ok(installed) => installed,
+        Err(refusal) => {
+            assert!(Arc::ptr_eq(refusal.carrier().unwrap(), &carrier));
+            assert!(Arc::ptr_eq(refusal.journal_root(), &root));
+            assert!(Arc::ptr_eq(
+                refusal.readback().unwrap().owned_clock().unwrap(),
+                &clock
+            ));
+            let reason = refusal.readback().unwrap().reason();
+            let refusal = refusal.into_owned_hold().unwrap();
+            let refusal = thread::spawn(move || refusal).join().unwrap();
+            assert!(Arc::ptr_eq(refusal.carrier().unwrap(), &carrier));
+            assert!(Arc::ptr_eq(refusal.journal_root(), &root));
+            println!(
+                "HISTORICAL_READ_RESULT {}",
+                serde_json::json!({"admission_error":format!("{reason:?}"),"same_original_owner":true,"closed_send":true})
+            );
+            return;
+        }
+    };
+    let (mut read, finish) = installed.into_parts();
+    assert_eq!(
+        read.repository_id(),
+        input["repository_id"].as_str().unwrap()
+    );
+    assert!(Arc::ptr_eq(read.carrier(), &carrier));
+    assert!(Arc::ptr_eq(read.journal_root(), &root));
+    assert!(Arc::ptr_eq(read.owned_clock().unwrap(), &clock));
+    assert!(Arc::ptr_eq(finish.carrier(), &carrier));
+    assert!(Arc::ptr_eq(finish.owned_clock(), &clock));
+    let input_files = input["files"].as_array().unwrap();
+    let files: Vec<_> = input_files
+        .iter()
+        .map(|file| HistoricalArchiveFile {
+            name: file["name"].as_str().unwrap(),
+            bytes: file["bytes"].as_u64().unwrap(),
+            sha256: file["sha256"].as_str().unwrap(),
+        })
+        .collect();
+    let publisher = input["control_fd"].as_i64().map(|raw| {
+        // SAFETY: the disposable probe owns this explicitly inherited control socket.
+        #[allow(unsafe_code)]
+        let mut control =
+            unsafe { std::os::unix::net::UnixStream::from_raw_fd(i32::try_from(raw).unwrap()) };
+        control
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let cancellation = cancellation.clone();
+        thread::spawn(move || {
+            let mut byte = [0];
+            control.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], b'c');
+            cancellation.cancel();
+            control.write_all(b"a").unwrap();
+        })
+    });
+    if mode == "sticky-input" {
+        assert!(matches!(
+            read.discover_historical_snapshot("latest", &files),
+            Err(ReadbackError::InvalidSelection)
+        ));
+        let duplicate = [
+            HistoricalArchiveFile {
+                name: files[0].name,
+                bytes: files[0].bytes,
+                sha256: files[0].sha256,
+            },
+            HistoricalArchiveFile {
+                name: files[0].name,
+                bytes: files[0].bytes,
+                sha256: files[0].sha256,
+            },
+        ];
+        assert!(matches!(
+            read.discover_historical_snapshot(input["selector"].as_str().unwrap(), &duplicate),
+            Err(ReadbackError::InvalidSelection)
+        ));
+    }
+    let discovery = read.discover_historical_snapshot(input["selector"].as_str().unwrap(), &files);
+    if let Some(publisher) = publisher {
+        publisher.join().unwrap();
+    }
+    let result = match discovery {
+        Ok(observed) => {
+            assert_eq!(observed.snapshot_id, input["snapshot_id"].as_str().unwrap());
+            assert_eq!(
+                observed.archive_parent,
+                input["archive_parent"].as_str().unwrap()
+            );
+            assert_eq!(observed.files.len(), input_files.len());
+            let parent = MediaDirectory::open(Arc::clone(&root), Path::new("media")).unwrap();
+            for (file, expected) in observed.files.iter().zip(input_files) {
+                assert_eq!(file.name, expected["name"].as_str().unwrap());
+                assert_eq!(
+                    file.archive_path,
+                    expected["archive_path"].as_str().unwrap()
+                );
+                assert_eq!(file.sha256, expected["sha256"].as_str().unwrap());
+                let target = MediaStage::create(Arc::clone(&parent), Arc::clone(read.activity()))
+                    .unwrap()
+                    .create_target()
+                    .unwrap();
+                let mut prepared = read.read_exact(file, target).unwrap();
+                assert_eq!(prepared.digest().size, file.bytes);
+                assert_eq!(prepared.digest().sha256, file.sha256);
+                assert_eq!(prepared.cleanup(), Cleanup::Complete);
+            }
+            serde_json::json!({"snapshot_id":observed.snapshot_id,"archive_parent":observed.archive_parent,"verified_files":observed.files.len()})
+        }
+        Err(reason) => serde_json::json!({"discovery_error":format!("{reason:?}")}),
+    };
+    let (closed, _closed_owner): (_, Box<dyn Send>) =
+        if mode == "sticky-input" || result.get("discovery_error").is_some() {
+            let held = match read.settle_direct() {
+                Err(held) => held,
+                Ok(_) => panic!("failed discovery cannot settle"),
+            };
+            if mode == "sticky-input" {
+                assert_eq!(held.reason(), ReadbackError::InvalidSelection);
+            }
+            let reason = held.reason();
+            assert!(Arc::ptr_eq(held.carrier(), &carrier));
+            let closed = match held.into_owned_hold() {
+                Ok(closed) => closed,
+                Err(_) => panic!("owned clock must transfer"),
+            };
+            let closed = thread::spawn(move || closed).join().unwrap();
+            assert!(Arc::ptr_eq(closed.carrier(), &carrier));
+            (
+                serde_json::json!({"held_reason":format!("{reason:?}"),"closed_send":true}),
+                Box::new(closed),
+            )
+        } else {
+            let closed = match read.into_owned_hold() {
+                Ok(closed) => closed,
+                Err(_) => panic!("owned clock must transfer"),
+            };
+            let closed = thread::spawn(move || closed).join().unwrap();
+            assert!(Arc::ptr_eq(closed.carrier(), &carrier));
+            assert!(Arc::ptr_eq(closed.owned_clock(), &clock));
+            (serde_json::json!({"closed_send":true}), Box::new(closed))
+        };
+    let outside = finish.into_unknown();
+    assert!(Arc::ptr_eq(outside.owned_clock(), &clock));
+    assert!(Arc::ptr_eq(outside.journal_root(), &root));
+    assert!(outside.retirement().is_none());
+    println!(
+        "HISTORICAL_READ_RESULT {}",
+        serde_json::json!({"result":result,"custody":closed,"same_original_owner":true,"same_original_clock":true,"cancelled":cancellation.is_cancelled(),"limit":"discovery/read only; no publication, retirement, restart or consuming keeper credit"})
+    );
+}
