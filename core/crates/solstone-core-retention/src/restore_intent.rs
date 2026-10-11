@@ -33,7 +33,8 @@ pub use abandoned::{
 
 const INTENT_VERSION: u32 = 1;
 
-/// The leaf of a restore's download stage. No other producer creates it, and
+/// The leaf of a restore's or legacy probe's download stage, which holds only
+/// backup bytes. No other producer creates it, and
 /// with no extension it can never be an archived media name, so a stage
 /// holding only this file is a restore's unpublished copy even without an
 /// intent. Earlier restores recorded the shared `payload` leaf.

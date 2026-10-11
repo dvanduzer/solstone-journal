@@ -121,9 +121,10 @@ mod linux {
         recovered
     }
 
-    /// A restore that ended mid-download, before writing its intent, leaves a
-    /// stage holding only its dedicated download leaf. Only such a stage, in a
-    /// segment's parent directory and named by no intent, is removed.
+    /// A restore or legacy probe that ended mid-download, before any intent,
+    /// leaves a stage holding only the dedicated download leaf, or nothing if it
+    /// ended before creating it. Only such a stage, in a segment's parent
+    /// directory and named by no intent, is removed.
     fn retire_unrecorded_downloads(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
         let Ok(census) = observe_obligations(activity.journal_root()) else {
             return Vec::new();

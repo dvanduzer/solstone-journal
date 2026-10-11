@@ -253,8 +253,10 @@ fn any_other_stage_without_intent_is_held_untouched() {
         ("chronicle/20261009/.tmp-offload-a", vec!["payload"]),
         ("chronicle/20261009/.tmp-offload-b", vec!["audio.flac"]),
         ("chronicle/20261009/.tmp-offload-c", vec![leaf, "extra"]),
-        // Never at the journal root or inside a segment.
+        // Never at the journal root, where approval readback stages live, or
+        // inside a segment.
         (".tmp-offload-d", vec![leaf]),
+        (".tmp-offload-r", vec!["payload"]),
         ("chronicle/20261009/120000_60/.tmp-offload-e", vec![leaf]),
     ] {
         let temp = tempfile::tempdir().unwrap();
@@ -270,4 +272,22 @@ fn any_other_stage_without_intent_is_held_untouched() {
             assert_eq!(fs::read(stage.join(name)).unwrap(), RESTORED, "{relative}");
         }
     }
+}
+
+#[test]
+fn empty_stage_without_intent_in_a_restore_location_is_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let day = unrecorded(temp.path(), "chronicle/20261009/.tmp-offload-f", &[]);
+    let stream = unrecorded(temp.path(), "chronicle/20261009/camera/.tmp-offload-g", &[]);
+    let segment = unrecorded(
+        temp.path(),
+        "chronicle/20261009/120000_60/.tmp-offload-h",
+        &[],
+    );
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+    let activity = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+    assert_eq!(recover_abandoned_restores(&activity).len(), 2);
+    assert!(!day.exists() && !stream.exists());
+    // Inside a segment is not where restores stage; it stays held.
+    assert!(segment.is_dir());
 }

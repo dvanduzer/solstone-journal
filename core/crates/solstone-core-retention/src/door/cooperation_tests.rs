@@ -403,7 +403,13 @@ fn direct_reserved_and_parent_requests_preserve_every_kind() {
             let direct = remove_at(&fixture, &target);
             assert!(direct.targets[0].removed.is_empty());
             assert!(!direct.targets[0].not_removed.is_empty());
-            assert!(path.exists());
+            // An empty stage in a restore location holds no data, so deletion's
+            // admission retires it; the reserved request itself is still refused.
+            assert_eq!(path.exists(), kind != "empty");
+            if kind == "empty" {
+                // Nothing reserved remains for the parent requests to protect.
+                continue;
+            }
             if kind == "occupied" {
                 assert_eq!(fs::read(path.join("payload")).unwrap(), b"sole raw");
             }

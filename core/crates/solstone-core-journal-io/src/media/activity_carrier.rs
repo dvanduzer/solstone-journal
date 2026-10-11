@@ -692,10 +692,10 @@ pub fn retire_recorded_stage(
     retire_stage(activity, parent, name, directory, leaf_name, Some(leaf))
 }
 
-/// Remove one stage nothing records, which holds exactly one regular file named
-/// `leaf_name` and nothing else: the observed directory and its observed file,
-/// then the directory. Its caller must know that name is made only by a
-/// producer whose unpublished copies are disposable. Anything else refuses.
+/// Remove one stage nothing records, which is empty or holds exactly one
+/// regular file named `leaf_name`: the observed file, then the directory. Its
+/// caller must know that name is made only by a producer whose unpublished
+/// copies are disposable. Anything else refuses.
 pub fn retire_unrecorded_stage(
     activity: &Arc<ActivityLease>,
     parent: &Arc<MediaDirectory>,
@@ -734,8 +734,8 @@ fn retire_stage(
         }
         let entries = platform::entries(&stage, 2)?.ok_or_else(changed)?;
         match (entries.as_slice(), recorded) {
-            // Only a recorded stage may already be empty.
-            ([], Some(_)) => {}
+            // An empty directory holds no data.
+            ([], _) => {}
             ([entry], _)
                 if entry.name == leaf_name
                     && recorded.is_none_or(|leaf| entry.identity == leaf)

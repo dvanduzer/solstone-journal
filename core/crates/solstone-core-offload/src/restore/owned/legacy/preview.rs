@@ -282,7 +282,10 @@ impl<R> LegacyRestoreReview<R> {
                 return Err(refuse("legacy_stage_unavailable"));
             }
         };
-        let target = match stage.create_target() {
+        // Probes hold only backup bytes; the restore download leaf marks them so.
+        let target = match stage.create_named_target(std::ffi::OsStr::new(
+            solstone_core_retention::restore_intent::RESTORE_DOWNLOAD_LEAF,
+        )) {
             Ok(target) => target,
             Err(error) => {
                 self.probe_owner = Some(ProbeOwner::Target(error));
