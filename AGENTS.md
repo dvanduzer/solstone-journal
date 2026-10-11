@@ -120,7 +120,7 @@ Verified against `Makefile`. Grouped by use.
 | `make verify` | Alias for `make ci`. |
 | `make build-native-sol-inventory` | Regenerate the compiled `solstone call` inventory after an `authority.toml` change. A Rust `make ci` test refuses stale authority sources. `make check-native-sol-inventory` remains a manual exact-output check. |
 
-Use the narrowest applicable `make check-rust-*` target for a focused change, then `make test` for selected unit evidence and `make ci` before commit. Run `make ci-full` on the exact final-tree SHA before merge or release for full host evidence.
+Use the narrowest applicable `make check-rust-*` target for a focused change, then `make test` for selected unit evidence and `make ci` before commit. Run `make ci-full` on the exact release tree for full host evidence; a change lands on the tests that cover it and `make ci`, not on `make ci-full`.
 The native Windows rail is operator-run and deliberately separate from
 `ci-full`. `make win-host-ci` refuses untracked, non-ignored files, binds the
 transferred Git snapshot to the workspace lockfile digest, and reports success
@@ -164,9 +164,10 @@ Use `cargo test --manifest-path core/Cargo.toml -p <package> --no-default-featur
   of the Makefile or CI configuration in a test.
 - Do not write tests that enforce design choices such as copy, casing, punctuation or color.
 - Iterate with the narrowest command, such as `cargo test --manifest-path core/Cargo.toml -p <package> --lib` or the affected `--test <harness> <test>`. A default-feature `--lib`/`--bins` selection contains only routine same-crate evidence; an explicit `--test` harness keeps its declared validation scope. For a crate's `full-tests` evidence, run `make check-rust-registry-package CI_PACKAGE=<package> CI_FEATURES=<features> CI_RUNTIME=<runtime>` with the features and runtime its package suite in `core/ci/suites.toml` names; `make check-rust-clippy-full` lints the same feature sets. `make ci` is the routine gate: a formatting check, topology validation, library/binary Clippy, and library/binary unit harnesses. It does not link or execute integration-test binaries, so run affected harnesses directly.
-- Run [`make ci-full`](Makefile) once on the exact final tree before merge or
-  release. This host-conditional gate reports unsupported platform legs as
-  skipped, so run affected platform lanes on their supported hosts. Separately
+- [`make ci-full`](Makefile) runs once on the exact release tree, not on each
+  landing. It is host-conditional and reports unsupported platform legs as
+  skipped, so a change to code only one platform compiles runs that platform's
+  lane on its supported host before it lands. Separately
   run `make check-rust-race` for concurrency-sensitive supervisor changes.
 
 ### Linux service management (systemd)
@@ -398,7 +399,7 @@ Generic software principles (DRY, KISS, YAGNI, single responsibility, small focu
 ## 10. Commit hygiene
 
 - Small, focused commits with descriptive messages.
-- Validate each commit with focused checks appropriate to its diff. Use efficient `make ci` for routine validation. The full `make ci-full` gate belongs on the exact final tree before merge or release, not before every intermediate commit.
+- Validate each commit with focused checks appropriate to its diff. Use efficient `make ci` for routine validation. The full `make ci-full` gate belongs on the exact release tree, not on each landing.
 - Run `git` commands directly — not `git -C` — you're already in the repo.
 - Don't commit runtime artifacts written under `tests/fixtures/journal/` by `make dev` / `make sandbox` (`.gitignore` covers them; verify with `git status` anyway).
 

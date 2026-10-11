@@ -3,19 +3,494 @@
 
 //! Run an already admitted reviewed removal and retain its whole owning return.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
+    sync::Arc,
+    thread::JoinHandle,
+};
 
+use axum::{
+    Json,
+    response::{IntoResponse, Response},
+};
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::Serialize;
 use serde_json::{Value, json};
+use solstone_core_backup::archive_admission::AdmissionError;
+use solstone_core_backup_runtime::{ClosedToolError, resolve::resolve_restic_member};
+use solstone_core_journal_io::JournalRoot;
 use solstone_core_retention::Outcome;
 use solstone_core_retention::remove_marked::{
     OwnedReviewedArchiveFinish, remove_reviewed_with_owned_archive,
 };
-use solstone_core_retention::review_context::CheckedReviewContext;
+use solstone_core_retention::review_context::{
+    CheckedReviewContext, ReviewContext, ReviewRefusal, check_review_context,
+};
 
-use super::{ArchivePayload, PreparedArchiveWorker, entry, return_owned, runtime_facts};
-use crate::operation::{SharedOperationSlot, Terminal};
+use super::{
+    ArchivePayload, ArchiveTicket, OwnedArchiveBegin, PreparedArchiveWorker, begin_owned_locked,
+    entry, prepare_read, return_owned, runtime_facts,
+};
+use crate::operation::{self, OperationState, SharedOperationSlot, Terminal};
 use crate::removal_report;
+use crate::{BackupWebDeps, archive_operation::ArchiveBeginRefusal};
+
+const KIND: &str = "offload_approve";
+
+struct ApprovalInput {
+    begin: OwnedArchiveBegin,
+    checked: CheckedReviewContext,
+    repository: String,
+    executable: PathBuf,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+}
+
+enum UnusedRefusal {
+    Start,
+    Budget(AdmissionError),
+    Tools(ClosedToolError),
+    ResolverUnknown,
+}
+
+struct UnusedApproval {
+    input: ApprovalInput,
+    refusal: UnusedRefusal,
+}
+
+#[derive(Default)]
+pub(super) struct ApprovalCustody {
+    pub(super) generation: Option<u64>,
+    pub(super) accepted_completion: bool,
+    ticket: Option<ArchiveTicket>,
+    discharged_refusal: Option<String>,
+    input: Option<ApprovalInput>,
+    unused: Vec<UnusedApproval>,
+    refused_selection: Option<CheckedReviewContext>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ApprovalCustody {
+    pub(super) fn is_busy(&self) -> bool {
+        self.input.is_some()
+            || !self.unused.is_empty()
+            || self.refused_selection.is_some()
+            || self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+    }
+
+    fn settled(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+}
+
+#[derive(Debug)]
+pub enum ApprovalStartRefusal {
+    Review(ReviewRefusal),
+    UnsupportedSelection,
+    Begin(ArchiveBeginRefusal),
+}
+
+/// Generation transport only. It grants no consent or release authority.
+#[derive(Debug, Serialize)]
+pub struct ApprovalStart {
+    generation: String,
+}
+
+impl ApprovalStart {
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
+/// Server prerequisite; the public Home route remains prelaunch-held.
+pub fn start(
+    deps: &BackupWebDeps,
+    context: ReviewContext,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<ApprovalStart, ApprovalStartRefusal> {
+    let root = Arc::new(
+        JournalRoot::open(&deps.journal_root)
+            .map_err(|error| ApprovalStartRefusal::Review(ReviewRefusal::Root(error)))?,
+    );
+    let checked =
+        check_review_context(Arc::clone(&root), &context).map_err(ApprovalStartRefusal::Review)?;
+    let repository = checked
+        .marks()
+        .iter()
+        .find_map(|mark| {
+            mark.offload
+                .as_ref()
+                .map(|offer| offer.proof.repository_id.clone())
+        })
+        .ok_or(ApprovalStartRefusal::UnsupportedSelection)?;
+    // Proof rechecks the entire selection and every repository before release.
+    let mut state = operation::lock_for_begin(&deps.operations)
+        .map_err(|()| ApprovalStartRefusal::Begin(ArchiveBeginRefusal::Busy))?;
+    let begin = begin_owned_locked(&mut state, KIND, root, Arc::clone(&deps.clock))
+        .map_err(ApprovalStartRefusal::Begin)?;
+    let generation = begin.generation();
+    let ticket = ArchiveTicket(Arc::clone(&begin.ticket.0));
+    state.archive.approval = ApprovalCustody {
+        generation: Some(generation),
+        ticket: Some(ArchiveTicket(Arc::clone(&ticket.0))),
+        input: Some(ApprovalInput {
+            begin,
+            checked,
+            repository,
+            executable: deps.executable.clone(),
+            today,
+            now,
+        }),
+        ..Default::default()
+    };
+    let slot = Arc::clone(&deps.operations);
+    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+    let control = tests::take_dispatch();
+    // Keep the input in this same mutex through thread creation. The spawned
+    // closure cannot take it until its real JoinHandle is installed here.
+    match operation::spawn_thread(move || {
+        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        tests::install_dispatch(control);
+        run_pending(&slot, &ticket);
+    }) {
+        Ok(worker) => state.archive.approval.worker = Some(worker),
+        Err(_) => {
+            let input = state
+                .archive
+                .approval
+                .input
+                .take()
+                .expect("original pending input");
+            state.archive.approval.unused.push(UnusedApproval {
+                input,
+                refusal: UnusedRefusal::Start,
+            });
+        }
+    }
+    Ok(ApprovalStart {
+        generation: generation.to_string(),
+    })
+}
+
+fn current_matches(state: &OperationState, ticket: &ArchiveTicket) -> bool {
+    state.archive.matches(ticket)
+        && state.archive.approval.generation == Some(ticket.generation())
+        && state.current.as_ref().is_some_and(|current| {
+            current.generation == ticket.generation()
+                && current.view.kind == KIND
+                && current.handoff_poll.is_none()
+                && current.pending_handoff_terminal.is_none()
+                && {
+                    #[cfg(windows)]
+                    {
+                        current.cleanup.is_none()
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        true
+                    }
+                }
+        })
+}
+
+fn retain_unused(slot: &SharedOperationSlot, input: ApprovalInput, refusal: UnusedRefusal) {
+    // Poison recovery conserves custody only; status/response refuse it.
+    slot.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .archive
+        .approval
+        .unused
+        .push(UnusedApproval { input, refusal });
+}
+
+fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
+    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+    tests::before_pending();
+    let input = {
+        let mut state = match slot.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                let mut state = error.into_inner();
+                if state
+                    .archive
+                    .approval
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| Arc::ptr_eq(&input.begin.ticket.0, &ticket.0))
+                {
+                    let input = state.archive.approval.input.take().expect("matching input");
+                    state.archive.approval.unused.push(UnusedApproval {
+                        input,
+                        refusal: UnusedRefusal::Start,
+                    });
+                }
+                return;
+            }
+        };
+        let ready = current_matches(&state, ticket)
+            && state.current.as_ref().is_some_and(|current| {
+                !current.worker_active && !operation::is_terminal(&current.view.phase)
+            });
+        let Some(input) = state
+            .archive
+            .approval
+            .input
+            .take_if(|input| Arc::ptr_eq(&input.begin.ticket.0, &ticket.0))
+        else {
+            return;
+        };
+        if !ready {
+            state.archive.approval.unused.push(UnusedApproval {
+                input,
+                refusal: UnusedRefusal::Start,
+            });
+            return;
+        }
+        input
+    };
+    // The whole original input stays outside this borrowed unwind boundary.
+    let resolution = catch_unwind(AssertUnwindSafe(|| {
+        input
+            .begin
+            .budget
+            .remaining(input.begin.ticket.0.clock.as_ref())
+            .map_err(UnusedRefusal::Budget)?;
+        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        tests::before_resolver();
+        resolve_restic_member(&input.executable).map_err(UnusedRefusal::Tools)
+    }));
+    let restic = match resolution {
+        Ok(Ok(restic)) => restic,
+        Ok(Err(refusal)) => return retain_unused(slot, input, refusal),
+        Err(_) => return retain_unused(slot, input, UnusedRefusal::ResolverUnknown),
+    };
+    let ApprovalInput {
+        begin,
+        checked,
+        repository,
+        today,
+        now,
+        ..
+    } = input;
+    match prepare_read(slot, begin, repository, &restic) {
+        Some(worker) => remove(slot, worker, checked, today, now),
+        None => {
+            // Preparation already parked its real whole failure. Keep the
+            // selected context beside it rather than manufacturing a retry.
+            slot.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .archive
+                .approval
+                .refused_selection = Some(checked);
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalState {
+    Running,
+    Refused,
+    Held,
+    Unknown,
+    Completed,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApprovalStatus {
+    pub generation: String,
+    pub state: ApprovalState,
+    pub worker_settled: bool,
+    pub actor_phase: Option<String>,
+    pub reason_code: Option<String>,
+    pub report: Option<Value>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApprovalStatusRefusal {
+    Unavailable,
+    Stale,
+}
+
+fn generation(value: &str) -> Result<u64, ApprovalStatusRefusal> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|id| id.to_string() == value)
+        .ok_or(ApprovalStatusRefusal::Stale)
+}
+
+fn unused_reason(refusal: &UnusedRefusal) -> String {
+    match refusal {
+        UnusedRefusal::Start => "worker_start_failed".into(),
+        UnusedRefusal::Budget(error) => match error {
+            AdmissionError::ConfigurationUnavailable => "configuration_unavailable",
+            AdmissionError::ConfigurationChanged => "configuration_changed",
+            AdmissionError::JournalIdentityChanged => "journal_identity_changed",
+            AdmissionError::DeadlineExceeded => "deadline_exceeded",
+            AdmissionError::ClockChanged => "clock_changed",
+            AdmissionError::CredentialsExpired => "credentials_expired",
+            AdmissionError::Cancelled => "cancelled",
+        }
+        .into(),
+        UnusedRefusal::Tools(error) => error.to_string(),
+        UnusedRefusal::ResolverUnknown => "resolver_unknown".into(),
+    }
+}
+
+fn snapshot(
+    state: &OperationState,
+    generation: u64,
+) -> Result<ApprovalStatus, ApprovalStatusRefusal> {
+    let current = state
+        .current
+        .as_ref()
+        .filter(|current| {
+            current.generation == generation
+                && current.view.kind == KIND
+                && state.archive.approval.generation == Some(generation)
+        })
+        .ok_or(ApprovalStatusRefusal::Stale)?;
+    let approval = &state.archive.approval;
+    if !approval.accepted_completion
+        && approval.discharged_refusal.is_none()
+        && !approval
+            .ticket
+            .as_ref()
+            .is_some_and(|ticket| current_matches(state, ticket))
+    {
+        return Err(ApprovalStatusRefusal::Stale);
+    }
+    let mut result = ApprovalStatus {
+        generation: generation.to_string(),
+        state: ApprovalState::Running,
+        worker_settled: approval.settled(),
+        actor_phase: None,
+        reason_code: None,
+        report: None,
+    };
+    if let Some(refusal) = &approval.discharged_refusal {
+        result.state = ApprovalState::Refused;
+        result.reason_code = Some(refusal.clone());
+        return Ok(result);
+    }
+    if let Some(unused) = approval
+        .unused
+        .iter()
+        .find(|unused| unused.input.begin.generation() == generation)
+    {
+        if !current_matches(state, &unused.input.begin.ticket) {
+            return Err(ApprovalStatusRefusal::Stale);
+        }
+        result.state = ApprovalState::Refused;
+        result.reason_code = Some(unused_reason(&unused.refusal));
+        return Ok(result);
+    }
+    if let Some(returned) = state
+        .archive
+        .retained
+        .iter()
+        .find(|returned| returned.generation() == generation)
+    {
+        if !current_matches(state, &returned.ticket) {
+            return Err(ApprovalStatusRefusal::Stale);
+        }
+        result.state = match &returned.payload {
+            ArchivePayload::EarlyUnknown
+            | ArchivePayload::ProofFinishUnknown { .. }
+            | ArchivePayload::ProofUnknown { .. }
+            | ArchivePayload::Unknown { .. } => ApprovalState::Unknown,
+            ArchivePayload::ProofFinished { runtime, .. }
+                if runtime.state()
+                    == solstone_core_backup_runtime::DirectReadFinishState::Unknown =>
+            {
+                ApprovalState::Unknown
+            }
+            _ => ApprovalState::Held,
+        };
+        result.actor_phase = Some(returned.terminal.phase.clone());
+        result.reason_code = returned.terminal.reason_code.clone();
+        result.report = returned.terminal.report.clone();
+    } else if approval.accepted_completion {
+        // This marker is installed only by handoff after genuine Runtime
+        // completion, original custody identity and fresh binding succeed.
+        result.state = if result.worker_settled {
+            ApprovalState::Completed
+        } else {
+            ApprovalState::Running
+        };
+        result.actor_phase = Some(current.view.phase.clone());
+        result.reason_code = current.view.reason_code.clone();
+        result.report = current.view.report.clone();
+    } else if let Some(input) = approval.input.as_ref()
+        && !current_matches(state, &input.begin.ticket)
+    {
+        return Err(ApprovalStatusRefusal::Stale);
+    }
+    Ok(result)
+}
+
+/// Observe only the matching generation; never substitute a successor's facts.
+pub fn status(
+    slot: &SharedOperationSlot,
+    id: &str,
+) -> Result<ApprovalStatus, ApprovalStatusRefusal> {
+    let generation = generation(id)?;
+    let state = slot
+        .lock()
+        .map_err(|_| ApprovalStatusRefusal::Unavailable)?;
+    snapshot(&state, generation)
+}
+
+/// Serialize under the same mutex before discharging a genuine unused input.
+/// Admitted Held/Unknown and rejected returns are never released here.
+pub fn response(slot: &SharedOperationSlot, id: &str) -> Result<Response, ApprovalStatusRefusal> {
+    let generation = generation(id)?;
+    let mut state = slot
+        .lock()
+        .map_err(|_| ApprovalStatusRefusal::Unavailable)?;
+    let snapshot = snapshot(&state, generation)?;
+    let serialized = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        tests::before_response();
+        Json(&snapshot).into_response()
+    }))
+    .map_err(|_| ApprovalStatusRefusal::Unavailable)?;
+    if !serialized.status().is_success() {
+        return Err(ApprovalStatusRefusal::Unavailable);
+    }
+    if snapshot.worker_settled && !state.archive.approval.unused.is_empty() {
+        let unused = &state.archive.approval.unused;
+        if unused.len() != 1
+            || !current_matches(&state, &unused[0].input.begin.ticket)
+            || state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.worker_active)
+        {
+            return Err(ApprovalStatusRefusal::Unavailable);
+        }
+        let current = state.current.as_mut().expect("matching current");
+        operation::apply_terminal(
+            current,
+            Terminal::error(
+                snapshot
+                    .reason_code
+                    .clone()
+                    .unwrap_or_else(|| "failed".into()),
+            ),
+        );
+        state.archive.approval.discharged_refusal = snapshot.reason_code;
+        drop(state.archive.approval.unused.pop());
+        state.archive.reservation = None;
+    }
+    Ok(serialized)
+}
 
 /// Called synchronously inside the worker holding the original admission.
 pub fn remove(

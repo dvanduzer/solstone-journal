@@ -283,6 +283,60 @@ mod tests {
         assert!(!root.path().join("config/actions").exists());
     }
 
+    #[tokio::test]
+    async fn typed_approval_stays_prelaunch_held_after_reoffer_and_copied_context() {
+        let original = journal();
+        let copied = journal();
+        let mut typed = mark(original.path(), "typed.flac", true);
+        save(original.path(), std::slice::from_ref(&typed));
+        let rendered = list(original.path()).await["review_context"].clone();
+        let old = typed.offload.as_ref().unwrap();
+        typed.offload = Some(OffloadOffer::new(old.proof.clone()).unwrap());
+        let before = save(original.path(), std::slice::from_ref(&typed));
+        fs::create_dir_all(copied.path().join("health")).unwrap();
+        fs::write(copied.path().join("health/retention-marks.json"), &before).unwrap();
+        for root in [original.path(), copied.path()] {
+            let config = fs::read(root.join("config/journal.json")).unwrap();
+            let (_, response) = call(
+                root,
+                "POST",
+                "/app/home/api/approve",
+                json!({"review_context":rendered,"mark_ids":[typed.id]}).to_string(),
+            )
+            .await;
+            assert_eq!(response["state"], "approve.refused_before_start");
+            assert_eq!(response["removed_count"], 0);
+            assert_eq!(
+                fs::read(root.join("health/retention-marks.json")).unwrap(),
+                before
+            );
+            assert_eq!(fs::read(root.join("config/journal.json")).unwrap(), config);
+            assert_eq!(
+                fs::read(root.join("chronicle/raw.flac")).unwrap(),
+                b"original bytes"
+            );
+            assert!(!root.join("backup-activity.lock").exists());
+            assert!(!root.join("health/retention-marks.json.lock").exists());
+        }
+        // This route is a prelaunch refusal even when a current root cannot be opened.
+        let moved = original.path().join("detached");
+        fs::rename(original.path().join("health"), &moved).unwrap();
+        fs::write(original.path().join("config/journal.json"), b"{broken").unwrap();
+        let (_, response) = call(
+            original.path(),
+            "POST",
+            "/app/home/api/approve",
+            json!({"review_context":rendered,"mark_ids":[typed.id]}).to_string(),
+        )
+        .await;
+        assert_eq!(response["state"], "approve.refused_before_start");
+        assert_eq!(
+            fs::read(moved.join("retention-marks.json")).unwrap(),
+            before
+        );
+        assert!(!original.path().join("health").exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn retained_decline_removes_mixed_selected_rows_and_keeps_failed_unselected_row() {

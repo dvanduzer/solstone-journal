@@ -47,6 +47,237 @@ enum Cut {
 }
 thread_local! { static CONTROL: Cell<Option<Cut>> = const { Cell::new(None) }; }
 
+#[derive(Default)]
+pub(super) struct DispatchControl {
+    pause: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    resolver_panic: bool,
+    cut: Option<Cut>,
+}
+thread_local! {
+    static DISPATCH: std::cell::RefCell<DispatchControl> = std::cell::RefCell::new(DispatchControl::default());
+    static RESPONSE_PANIC: Cell<bool> = const { Cell::new(false) };
+}
+pub(super) fn take_dispatch() -> DispatchControl {
+    DISPATCH.with(|control| std::mem::take(&mut *control.borrow_mut()))
+}
+pub(super) fn install_dispatch(control: DispatchControl) {
+    CONTROL.set(control.cut);
+    DISPATCH.with(|current| *current.borrow_mut() = control);
+}
+pub(super) fn before_pending() {
+    let pause = DISPATCH.with(|control| control.borrow_mut().pause.take());
+    if let Some((entered, resume)) = pause {
+        entered.send(()).unwrap();
+        resume.recv().unwrap();
+    }
+}
+pub(super) fn before_resolver() {
+    if DISPATCH.with(|control| control.borrow().resolver_panic) {
+        panic!("resolver unwind after original pending input was taken");
+    }
+}
+pub(super) fn before_response() {
+    if RESPONSE_PANIC.replace(false) {
+        panic!("response construction while original unused owner remains held");
+    }
+}
+
+fn join_pending(slot: &SharedOperationSlot) {
+    let worker = slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .archive
+        .approval
+        .worker
+        .take();
+    if let Some(worker) = worker {
+        worker.join().unwrap();
+    }
+}
+
+struct MutableClock(std::sync::atomic::AtomicI64);
+impl Clock for MutableClock {
+    fn now_unix(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn iso_week(&self) -> u8 {
+        1
+    }
+}
+
+fn pending_fixture() -> (
+    tempfile::TempDir,
+    crate::BackupWebDeps,
+    Arc<MutableClock>,
+    ReviewContext,
+    Mark,
+) {
+    use sha2::{Digest, Sha256};
+    let journal = crate::test_support::hosted_bound_root();
+    let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+    let source = journal.path().join("audio.flac");
+    fs::write(&source, b"synthetic original").unwrap();
+    let bytes = fs::read(&source).unwrap();
+    let input = Input {
+        mode: Cut::Complete,
+        journal: journal.path().to_path_buf(),
+        restic_path: journal.path().join("missing-restic"),
+        repository_id: "a".repeat(64),
+        snapshot_id: "b".repeat(64),
+        archive_path: source.to_string_lossy().into_owned(),
+        bytes: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    };
+    let (mark, _) = seed(&input, &root);
+    let context = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
+    let mut deps = crate::BackupWebDeps::production(
+        journal.path().to_path_buf(),
+        crate::measurement::with_geometry(crate::measurement::DeviceGeometry {
+            free_bytes: None,
+            total_bytes: None,
+        }),
+    );
+    let clock = Arc::new(MutableClock(std::sync::atomic::AtomicI64::new(10_000)));
+    deps.clock = clock.clone();
+    deps.executable = journal.path().join("missing/bin/solstone");
+    (journal, deps, clock, context, mark)
+}
+
+#[test]
+fn approval_pending_inputs_preserve_original_budget_custody_and_exact_response() {
+    for cut in [
+        "spawn", "start", "tools", "resolver", "deadline", "cancel", "stale", "poison",
+    ] {
+        let (journal, deps, clock, context, mark) = pending_fixture();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        if cut == "spawn" {
+            operation::fail_next_worker_start();
+        } else {
+            DISPATCH.with(|control| {
+                *control.borrow_mut() = DispatchControl {
+                    pause: Some((entered_tx, resume_rx)),
+                    resolver_panic: cut == "resolver",
+                    cut: None,
+                }
+            });
+        }
+        let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
+        let started = start(&deps, context.clone(), now.date_naive(), now).unwrap();
+        if cut != "spawn" {
+            entered_rx.recv().unwrap();
+            assert!(
+                !status(&deps.operations, started.generation())
+                    .unwrap()
+                    .worker_settled
+            );
+            match cut {
+                "deadline" => clock.0.store(
+                    10_000 + 6 * 60 * 60 + 1,
+                    std::sync::atomic::Ordering::SeqCst,
+                ),
+                "cancel" => cancel(&deps.operations),
+                "start" => {
+                    deps.operations
+                        .lock()
+                        .unwrap()
+                        .current
+                        .as_mut()
+                        .unwrap()
+                        .worker_active = true
+                }
+                "stale" => {
+                    operation::install_slot(
+                        &mut deps.operations.lock().unwrap().current,
+                        "enable",
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                "poison" => {
+                    assert!(
+                        catch_unwind(AssertUnwindSafe(|| {
+                            let _guard = deps.operations.lock().unwrap();
+                            panic!("poison admission mutex");
+                        }))
+                        .is_err()
+                    );
+                }
+                _ => {}
+            }
+            resume_tx.send(()).unwrap();
+        }
+        join_pending(&deps.operations);
+        let state = deps
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let original = &state.archive.approval.unused[0];
+        assert_eq!(original.input.checked.marks(), std::slice::from_ref(&mark));
+        assert!(Arc::ptr_eq(
+            &original.input.begin.ticket.0.clock,
+            &deps.clock
+        ));
+        assert!(state.archive.matches(&original.input.begin.ticket));
+        match cut {
+            "cancel" => assert!(matches!(
+                &original.refusal,
+                UnusedRefusal::Budget(AdmissionError::Cancelled)
+            )),
+            "deadline" => assert!(matches!(
+                &original.refusal,
+                UnusedRefusal::Budget(AdmissionError::DeadlineExceeded)
+            )),
+            "resolver" => assert!(matches!(&original.refusal, UnusedRefusal::ResolverUnknown)),
+            "tools" => assert!(matches!(&original.refusal, UnusedRefusal::Tools(_))),
+            _ => assert!(matches!(&original.refusal, UnusedRefusal::Start)),
+        }
+        drop(state);
+        assert!(operation::is_busy(&deps.operations));
+        assert!(operation::begin(&deps.operations, "archive", None, None, None).is_err());
+        assert_eq!(
+            load_at_root(&JournalRoot::open(journal.path()).unwrap())
+                .unwrap()
+                .marks
+                .get(&mark.id),
+            Some(&mark)
+        );
+        assert!(
+            journal
+                .path()
+                .join("chronicle/20261009/120000_60_fixture/audio.flac")
+                .exists()
+        );
+        assert!(!journal.path().join("backup-activity.lock").exists());
+        assert!(response(&deps.operations, "999").is_err());
+        if matches!(cut, "stale" | "poison" | "start") {
+            assert!(response(&deps.operations, started.generation()).is_err());
+            assert!(operation::is_busy(&deps.operations));
+        } else {
+            RESPONSE_PANIC.set(true);
+            assert!(response(&deps.operations, started.generation()).is_err());
+            assert!(operation::is_busy(&deps.operations));
+            assert!(
+                response(&deps.operations, started.generation())
+                    .unwrap()
+                    .status()
+                    .is_success()
+            );
+            assert_eq!(
+                status(&deps.operations, started.generation())
+                    .unwrap()
+                    .state,
+                ApprovalState::Refused
+            );
+            assert!(!operation::is_busy(&deps.operations));
+            assert!(operation::begin(&deps.operations, "archive", None, None, None).is_ok());
+            assert!(status(&deps.operations, started.generation()).is_err());
+        }
+    }
+}
+
 pub(super) fn after_actor(proof: &OwnedReviewedArchiveRun) {
     if CONTROL.get() == Some(Cut::ActorPanic) {
         assert_eq!(proof.outcome().removed_paths().count(), 1);
@@ -266,6 +497,159 @@ fn positive(report: &Value) {
             .len(),
         1
     );
+}
+
+#[test]
+#[ignore = "requires copied package and synthetic approval entrance fixture"]
+fn packaged_owned_approval_entrance() {
+    let input: Input = serde_json::from_slice(
+        &fs::read(std::env::var_os("OWNED_APPROVAL_JSON").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        input.mode,
+        Cut::Complete | Cut::Stale | Cut::CancelBeforeFinish
+    ));
+    let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
+    let (mark, segment) = seed(&input, &root);
+    let context = read_review_context(&root, std::slice::from_ref(&mark.id)).unwrap();
+    let mut deps = crate::BackupWebDeps::production(
+        input.journal.clone(),
+        crate::measurement::with_geometry(crate::measurement::DeviceGeometry {
+            free_bytes: None,
+            total_bytes: None,
+        }),
+    );
+    deps.executable = std::env::current_exe().unwrap();
+    let clock: super::super::OwnedClock = Arc::new(LiveClock(Instant::now()));
+    deps.clock = Arc::clone(&clock);
+    DISPATCH.with(|control| control.borrow_mut().cut = Some(input.mode));
+    let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
+    let started = start(&deps, context, now.date_naive(), now).unwrap();
+    join_pending(&deps.operations);
+    assert!(!segment.join("audio.flac").exists());
+    assert!(load_at_root(&root).unwrap().marks.is_empty());
+    let observed = status(&deps.operations, started.generation());
+    let mut result = json!({"mode":format!("{:?}",input.mode),"typed_removed":true});
+    if input.mode == Cut::Complete {
+        let observed = observed.unwrap();
+        assert!(observed.worker_settled);
+        assert_eq!(observed.state, ApprovalState::Completed);
+        assert_eq!(observed.actor_phase.as_deref(), Some("done"));
+        positive(observed.report.as_ref().unwrap());
+        assert_eq!(
+            observed.report.as_ref().unwrap()["runtime"]["state"],
+            "completed"
+        );
+        assert!(!operation::is_busy(&deps.operations));
+        assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+        assert!(TeardownLease::try_acquire(Arc::clone(&root)).is_ok());
+        result["status"] = serde_json::to_value(observed).unwrap();
+        assert!(operation::begin(&deps.operations, "enable", None, None, None).is_ok());
+        assert!(status(&deps.operations, started.generation()).is_err());
+        result["successor_admitted"] = json!(true);
+    } else {
+        let state = deps.operations.lock().unwrap();
+        let returned = &state.archive.retained[0];
+        let ArchivePayload::ProofFinished { report, runtime } = returned.payload() else {
+            panic!("whole actual finished actor plus Runtime owner");
+        };
+        assert_eq!(report.outcome().removed_paths().count(), 1);
+        assert!(Arc::ptr_eq(runtime.owned_clock(), &clock));
+        assert_eq!(returned.terminal().phase, "done");
+        positive(returned.terminal().report.as_ref().unwrap());
+        result["original_report"] = returned.terminal().report.clone().unwrap();
+        if input.mode == Cut::Stale {
+            assert_eq!(runtime.state(), DirectReadFinishState::Completed);
+            assert_eq!(
+                returned.reason(),
+                Some(super::super::ArchiveHandoffRefusal::Stale)
+            );
+            assert!(matches!(observed, Err(ApprovalStatusRefusal::Stale)));
+            assert_eq!(
+                state.current.as_ref().unwrap().view.report,
+                Some(json!({"replacement":true}))
+            );
+            result["stale_refused"] = json!(true);
+        } else {
+            let observed = observed.unwrap();
+            assert_eq!(runtime.state(), DirectReadFinishState::Held);
+            assert_eq!(observed.state, ApprovalState::Held);
+            assert_eq!(observed.actor_phase.as_deref(), Some("done"));
+            assert!(observed.worker_settled);
+            assert_eq!(observed.report, returned.terminal().report);
+            result["status"] = serde_json::to_value(observed).unwrap();
+        }
+        drop(state);
+        assert!(operation::is_busy(&deps.operations));
+        assert!(operation::begin(&deps.operations, "enable", None, None, None).is_err());
+        assert!(
+            response(&deps.operations, started.generation()).is_err()
+                || operation::is_busy(&deps.operations)
+        );
+        result["held_busy"] = json!(true);
+    }
+    println!("OWNED_APPROVAL_RESULT {}", result);
+}
+
+#[test]
+fn approval_unknown_snapshot_keeps_actual_preparation_custody() {
+    use solstone_core_backup::archive_activity::OwnedArchivePreparationInput;
+    use solstone_core_journal_io::media::{MediaPrimitive, run_with_media_hook};
+    let (_journal, deps, _clock, context, _mark) = pending_fixture();
+    let root = Arc::new(JournalRoot::open(&deps.journal_root).unwrap());
+    let checked = check_review_context(Arc::clone(&root), &context).unwrap();
+    let begin = begin_owned(
+        &deps.operations,
+        KIND,
+        Arc::clone(&root),
+        Arc::clone(&deps.clock),
+    )
+    .unwrap();
+    let generation = begin.generation();
+    {
+        let mut state = deps.operations.lock().unwrap();
+        state.archive.approval.generation = Some(generation);
+        state.archive.approval.ticket = Some(ArchiveTicket(Arc::clone(&begin.ticket.0)));
+    }
+    let slot = Arc::clone(&deps.operations);
+    std::thread::spawn(move || {
+        assert!(super::super::start_owned_worker(&slot, &begin.ticket));
+        let (ticket, root, budget, clock) = begin.into_parts();
+        let (input, custody) = OwnedArchivePreparationInput::capture(root, budget, clock)
+            .unwrap_or_else(|_| panic!("actual preparation capture"));
+        let (result, consumed) = run_with_media_hook(
+            MediaPrimitive::CarrierRootSync,
+            || panic!("actual preparation publication unwind"),
+            || catch_unwind(AssertUnwindSafe(|| input.prepare())),
+        );
+        assert!(consumed && result.is_err());
+        return_owned(
+            &slot,
+            ticket,
+            Some(custody),
+            ArchivePayload::EarlyUnknown,
+            Terminal::error("unknown"),
+        );
+        slot.lock().unwrap().archive.approval.refused_selection = Some(checked);
+    })
+    .join()
+    .unwrap();
+    let observed = status(&deps.operations, &generation.to_string()).unwrap();
+    assert_eq!(observed.state, ApprovalState::Unknown);
+    assert!(observed.worker_settled);
+    assert!(operation::is_busy(&deps.operations));
+    assert!(
+        response(&deps.operations, &generation.to_string())
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert!(operation::is_busy(&deps.operations));
+    assert!(matches!(
+        ActivityLease::try_acquire(root),
+        Err(ActivityAdmissionError::Busy)
+    ));
 }
 
 #[test]
