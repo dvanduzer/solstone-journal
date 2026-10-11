@@ -378,3 +378,166 @@ fn packaged_legacy_restore_review_entry() {
         serde_json::json!({"mode":input.mode,"probes":probe_facts,"result":result})
     );
 }
+
+#[test]
+#[ignore = "requires a copied current package and synthetic whole-manifest legacy repository"]
+fn packaged_combined_restore_entry() {
+    use sha2::{Digest, Sha256};
+    let mut input: Input = serde_json::from_slice(
+        &fs::read(std::env::var_os("NATIVE_LEGACY_PROBE_JSON").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(input.files.len(), 3);
+    assert!(matches!(
+        input.mode.as_str(),
+        "combined_complete" | "combined_conflict" | "combined_tombstone" | "combined_mismatch"
+    ));
+    let target = Target {
+        day: "20261009".into(),
+        stream: "_default".into(),
+        dir: "120000_60_fixture".into(),
+    };
+    let segment = input
+        .journal
+        .join("chronicle")
+        .join(&target.day)
+        .join(&target.dir);
+    fs::create_dir_all(&segment).unwrap();
+    if input.mode == "combined_mismatch" {
+        input.files[2].sha256 = "0".repeat(64);
+    }
+    let ledger = crate::ledger::ledger_path_for_day(&input.journal, &target.day).unwrap();
+    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    let event = Event::Archive {
+        time: 1,
+        day: target.day.clone(),
+        stream: target.stream.clone(),
+        segment: solstone_core_format::segment::segment_key(&target.dir).unwrap(),
+        snapshot_id: input.snapshot_id[..8].to_owned(),
+        files: input.files.clone(),
+    };
+    write_event(&ledger, &event, false);
+    let mark_path = input.journal.join("health/retention-marks.json");
+    let names: Vec<_> = input.files.iter().map(|file| file.name.clone()).collect();
+    let mark = Mark {
+        id: MarkId::derive(RemovalClass::OffloadRawRelease, &target, &names),
+        class: RemovalClass::OffloadRawRelease,
+        target: target.clone(),
+        marked_at: "2026-10-10T00:00:00Z".into(),
+        proposal: Proposal {
+            bytes: input.files.iter().map(|file| file.bytes).sum(),
+            reason: "synthetic original legacy mark".into(),
+            names,
+        },
+        state: MarkState::Marked,
+        offload: None,
+    };
+    let mut register = Register::empty();
+    register.marks.insert(mark.id.clone(), mark);
+    let original_mark = serde_json::to_vec(&register).unwrap();
+    fs::write(&mark_path, &original_mark).unwrap();
+    match input.mode.as_str() {
+        "combined_conflict" => fs::write(
+            segment.join(&input.files[0].name),
+            b"existing different raw",
+        )
+        .unwrap(),
+        "combined_tombstone" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
+        _ => {}
+    }
+    let listing = |path: &Path| {
+        let mut entries: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        entries.sort();
+        entries
+    };
+    let before = listing(&segment);
+    let root = Arc::new(JournalRoot::open(&input.journal).unwrap());
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
+    let prepared = OwnedPreparedArchiveOperation::prepare(
+        Arc::clone(&root),
+        ArchiveBudget::new(clock.as_ref()).unwrap(),
+        Arc::clone(&clock),
+    )
+    .unwrap_or_else(|failure| panic!("combined preparation: {:?}", failure.reason()));
+    let (read, finish) = admit_prepared_archive_owned_current_read_installed(
+        prepared,
+        &input.restic_path,
+        env!("CARGO_PKG_VERSION"),
+        &UreqHttpTransport,
+    )
+    .unwrap_or_else(|failure| panic!("combined admission: {:?}", failure.error()))
+    .into_parts();
+    assert_eq!(read.repository_id(), input.repository_id);
+    let outcome = crate::restore::owned::restore_owned_all(read, 2);
+    let report = outcome.report().clone();
+    let files: Vec<_> = outcome
+        .files()
+        .map(|file| {
+            (
+                file.witness.file.name.clone(),
+                file.disposition,
+                file.reason,
+            )
+        })
+        .collect();
+    let bindings = outcome.legacy_bindings().len();
+    let catalog = read_complete_catalog(&root).unwrap();
+    let recorded = catalog.days[0].segments[0].restore_bindings.len();
+    match input.mode.as_str() {
+        "combined_complete" | "combined_conflict" => {
+            assert_eq!((bindings, recorded), (1, 1));
+            for (index, (name, disposition, reason)) in files.iter().enumerate() {
+                let local = fs::read(segment.join(name)).unwrap();
+                if input.mode == "combined_conflict" && index == 0 {
+                    assert_eq!(*disposition, RestoreDisposition::Conflict);
+                    assert_eq!(*reason, Some("restore_conflict"));
+                    assert_eq!(local, b"existing different raw");
+                } else {
+                    assert_eq!(*disposition, RestoreDisposition::Published);
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(&local)),
+                        input.files[index].sha256
+                    );
+                }
+            }
+            let (settled, _) = outcome
+                .settle_direct()
+                .unwrap_or_else(|_| panic!("combined settlement held"));
+            assert_eq!(
+                finish.finish_owned(settled).state(),
+                DirectReadFinishState::Completed
+            );
+            // Restore leaves the owner's release mark exactly as it was.
+            assert_eq!(fs::read(&mark_path).unwrap(), original_mark);
+        }
+        _ => {
+            // Nothing is published and no provenance is recorded for a refused manifest.
+            assert_eq!((bindings, recorded), (0, 0));
+            assert_eq!(report.files_restored, 0);
+            let expected: &[&str] = if input.mode == "combined_tombstone" {
+                &["destination_admission_failed"]
+            } else {
+                &["legacy_verification_failed", "legacy_read_failed"]
+            };
+            assert!(files.iter().all(|(_, disposition, reason)| {
+                *disposition == RestoreDisposition::Unattempted
+                    && reason.is_some_and(|reason| expected.contains(&reason))
+            }));
+            assert_eq!(listing(&segment), before);
+            let held = outcome.into_owned_hold();
+            let unknown = finish.into_unknown();
+            drop(std::thread::spawn(move || (held, unknown)).join().unwrap());
+        }
+    }
+    println!(
+        "NATIVE_COMBINED_RESULT {}",
+        serde_json::json!({"mode":input.mode,"status":report.status,"reason":report.reason,
+            "files_restored":report.files_restored,"bytes_restored":report.bytes_restored})
+    );
+}

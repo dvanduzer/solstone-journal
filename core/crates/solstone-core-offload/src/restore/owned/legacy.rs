@@ -30,6 +30,8 @@ mod finish;
 pub use finish::{
     HeldLegacyRestoreFinish, OwnedLegacyRestoreFinishHold, SettledLegacyRestoreReport,
 };
+mod combined;
+pub(super) use combined::continue_with_legacy;
 
 /// Selectors only; fresh catalog and native admission determine the selected values.
 pub struct LegacyRestoreSelection {
@@ -117,8 +119,8 @@ impl ProbeOwner {
     }
 }
 
-struct LegacyEvidence {
-    binding: LegacyRestoreBinding,
+pub(super) struct LegacyEvidence {
+    pub(super) binding: LegacyRestoreBinding,
     probes: Vec<ProbeRecord>,
     write: LedgerWriteReceipt,
 }
@@ -488,12 +490,50 @@ impl<R> LegacyRestoreReview<R> {
                 _operation: self.operation,
                 _binding: self.recovery_binding,
                 files,
+                legacy: Vec::new(),
             },
             evidence: LegacyEvidence {
                 binding,
                 probes: self.probes,
                 write,
             },
+        }
+    }
+}
+
+/// A refused review's uncertain probe and binding-write owners, kept with the
+/// first file of its manifest so the whole restore settles as held.
+pub(super) struct ReviewRemnant {
+    refusal: LegacyRestoreRefusal,
+    probes: Vec<ProbeRecord>,
+    probe_owner: Option<ProbeOwner>,
+    binding_write: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
+    _candidate: Option<LegacyRestoreBinding>,
+    _destination: Option<PreparedRestore>,
+}
+
+pub struct LegacyReviewFacts<'a> {
+    pub reason: &'static str,
+    pub readback: Option<ReadbackError>,
+    pub retained_probe: bool,
+    pub binding_write: Option<LedgerFacts>,
+    pub binding_refused: bool,
+    pub probes: Vec<LegacyProbeFacts<'a>>,
+}
+
+impl ReviewRemnant {
+    pub(super) fn facts(&self) -> LegacyReviewFacts<'_> {
+        LegacyReviewFacts {
+            reason: self.refusal.reason,
+            readback: self.refusal.readback,
+            retained_probe: self.probe_owner.is_some(),
+            binding_write: self
+                .binding_write
+                .as_ref()
+                .and_then(|write| write.as_ref().ok())
+                .map(ledger_facts),
+            binding_refused: self.binding_write.as_ref().is_some_and(Result::is_err),
+            probes: self.probes.iter().map(probe_facts).collect(),
         }
     }
 }

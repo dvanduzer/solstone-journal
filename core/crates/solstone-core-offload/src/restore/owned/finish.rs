@@ -47,6 +47,7 @@ enum HeldOwner<'clock> {
     Lower {
         report: RestoreResult,
         files: Vec<FileRecord>,
+        legacy: Vec<legacy::LegacyEvidence>,
         read: Box<HeldDirectRead<'clock>>,
     },
 }
@@ -68,6 +69,7 @@ enum OwnedRead {
 pub struct OwnedRestoreFinishHold {
     report: RestoreResult,
     files: Vec<FileRecord>,
+    legacy: Vec<legacy::LegacyEvidence>,
     _binding: Option<QualifiedArchiveRecoveryBinding>,
     read: OwnedRead,
 }
@@ -90,6 +92,7 @@ struct SettledFile {
 pub struct SettledRestoreReport {
     report: RestoreResult,
     files: Vec<SettledFile>,
+    legacy: Vec<legacy::LegacyEvidence>,
 }
 
 fn file_facts(file: &FileRecord) -> RestoreFileFacts<'_> {
@@ -106,6 +109,7 @@ fn file_facts(file: &FileRecord) -> RestoreFileFacts<'_> {
             FileOwner::None => FileEvidence::NotAttempted,
             FileOwner::Staging(failure) => FileEvidence::Staging(failure.facts()),
             FileOwner::Transaction(outcome) => FileEvidence::Transaction(Box::new(outcome.facts())),
+            FileOwner::Review(review) => FileEvidence::LegacyReview(review.facts()),
         },
     }
 }
@@ -140,6 +144,7 @@ impl<'clock> RestoreRunOutcome<'clock> {
             _operation: operation,
             _binding: binding,
             files,
+            legacy,
         } = self;
         drop(binding);
         match operation.settle_direct() {
@@ -147,12 +152,20 @@ impl<'clock> RestoreRunOutcome<'clock> {
                 owner: HeldOwner::Lower {
                     report,
                     files,
+                    legacy,
                     read,
                 },
             })),
             Ok(read) => {
                 let files = settled_files(files);
-                Ok((read, SettledRestoreReport { report, files }))
+                Ok((
+                    read,
+                    SettledRestoreReport {
+                        report,
+                        files,
+                        legacy,
+                    },
+                ))
             }
         }
     }
@@ -193,7 +206,7 @@ fn qualify_files(
             {
                 None
             }
-            FileOwner::None | FileOwner::Staging(_) => {
+            FileOwner::None | FileOwner::Staging(_) | FileOwner::Review(_) => {
                 Some(SettlementFailure::refused("unsettled_file"))
             }
             FileOwner::Transaction(transaction) => transaction
@@ -254,11 +267,13 @@ impl<'clock> HeldRestoreFinish<'clock> {
                     files,
                     _operation: operation,
                     _binding: binding,
+                    legacy,
                 } = *outcome;
                 match operation.into_owned_hold() {
                     Ok(read) => Ok(OwnedRestoreFinishHold {
                         report,
                         files,
+                        legacy,
                         _binding: binding,
                         read: OwnedRead::Native {
                             read: Box::new(read),
@@ -272,6 +287,7 @@ impl<'clock> HeldRestoreFinish<'clock> {
                                 files,
                                 _operation: *operation,
                                 _binding: binding,
+                                legacy,
                             }),
                             refusal,
                         },
@@ -281,11 +297,13 @@ impl<'clock> HeldRestoreFinish<'clock> {
             HeldOwner::Lower {
                 report,
                 files,
+                legacy,
                 read,
             } => match read.into_owned_hold() {
                 Ok(read) => Ok(OwnedRestoreFinishHold {
                     report,
                     files,
+                    legacy,
                     _binding: None,
                     read: OwnedRead::Lower(read),
                 }),
@@ -293,6 +311,7 @@ impl<'clock> HeldRestoreFinish<'clock> {
                     owner: HeldOwner::Lower {
                         report,
                         files,
+                        legacy,
                         read,
                     },
                 })),
@@ -304,6 +323,9 @@ impl<'clock> HeldRestoreFinish<'clock> {
 impl OwnedRestoreFinishHold {
     pub fn report(&self) -> &RestoreResult {
         &self.report
+    }
+    pub fn legacy_bindings(&self) -> impl ExactSizeIterator<Item = &LegacyRestoreBinding> {
+        self.legacy.iter().map(|evidence| &evidence.binding)
     }
     pub fn files(&self) -> impl ExactSizeIterator<Item = RestoreFileFacts<'_>> {
         self.files.iter().map(file_facts)
@@ -344,6 +366,7 @@ impl OwnedRestoreFinishHold {
         let Self {
             report,
             files,
+            legacy,
             _binding,
             read,
         } = self;
@@ -361,11 +384,13 @@ impl OwnedRestoreFinishHold {
                 SettledRestoreReport {
                     report,
                     files: settled_files(files),
+                    legacy,
                 },
             )),
             Err(read) => Err(Box::new(Self {
                 report,
                 files,
+                legacy,
                 _binding,
                 read,
             })),
@@ -376,6 +401,9 @@ impl OwnedRestoreFinishHold {
 impl SettledRestoreReport {
     pub fn report(&self) -> &RestoreResult {
         &self.report
+    }
+    pub fn legacy_bindings(&self) -> impl ExactSizeIterator<Item = &LegacyRestoreBinding> {
+        self.legacy.iter().map(|evidence| &evidence.binding)
     }
     pub fn files(&self) -> impl ExactSizeIterator<Item = RestoreFileFacts<'_>> {
         self.files.iter().map(|file| RestoreFileFacts {
@@ -464,8 +492,9 @@ fn settled_files(files: Vec<FileRecord>) -> Vec<SettledFile> {
             let transaction = match owner {
                 FileOwner::Transaction(transaction) => Some(Box::new(transaction.into_settled())),
                 // Only a refused release admits Staging, and only once no stage
-                // remains; no cleanup is inferred on consumption.
-                FileOwner::None | FileOwner::Staging(_) => None,
+                // remains; qualification excludes a retained review. No cleanup
+                // is inferred on consumption.
+                FileOwner::None | FileOwner::Staging(_) | FileOwner::Review(_) => None,
             };
             SettledFile {
                 _detail: detail,
@@ -495,6 +524,7 @@ impl OwnedRestoreRunOutcome {
             return Err(Box::new(OwnedRestoreFinishHold {
                 report: self.report,
                 files: self.files,
+                legacy: self.legacy,
                 _binding: self._binding,
                 read: OwnedRead::Native {
                     read: Box::new(self._operation.into_owned_hold()),
@@ -507,12 +537,14 @@ impl OwnedRestoreRunOutcome {
             files,
             _operation,
             _binding,
+            legacy,
         } = self;
         drop(_binding);
         match _operation.settle_direct() {
             Err(read) => Err(Box::new(OwnedRestoreFinishHold {
                 report,
                 files,
+                legacy,
                 _binding: None,
                 read: OwnedRead::Lower(read),
             })),
@@ -521,6 +553,7 @@ impl OwnedRestoreRunOutcome {
                 SettledRestoreReport {
                     report,
                     files: settled_files(files),
+                    legacy,
                 },
             )),
         }
@@ -530,6 +563,7 @@ impl OwnedRestoreRunOutcome {
         OwnedRestoreFinishHold {
             report: self.report,
             files: self.files,
+            legacy: self.legacy,
             _binding: self._binding,
             read: OwnedRead::Native {
                 read: Box::new(self._operation.into_owned_hold()),

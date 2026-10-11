@@ -25,7 +25,7 @@ pub fn prepare_owned_legacy_restore_with_recovery(
     prepare(operation, Some(binding), selection)
 }
 
-fn prepare<'clock, R: RestoreRead<'clock>>(
+pub(super) fn prepare<'clock, R: RestoreRead<'clock>>(
     operation: R,
     recovery_binding: Option<QualifiedArchiveRecoveryBinding>,
     selection: LegacyRestoreSelection,
