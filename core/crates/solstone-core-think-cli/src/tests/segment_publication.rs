@@ -5,6 +5,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use solstone_core_format::content::{
+    AdmittedCategory, Family, IndexDisposition, ScopeBasis, resolve_spec,
+};
 use solstone_core_indexer_store::db::open_index;
 use solstone_core_indexer_store::scan::RescanFileStatus;
 
@@ -653,4 +656,566 @@ fn multi_path_index_failure_records_oplog_and_preserves_successful_indexes() {
         rel_activity,
         "Summary of active work"
     ));
+}
+
+#[test]
+fn topics_happy_path_indexes_topics_md_with_admitted_transcripts_classification() {
+    let (_journal, context) = fixture_journal();
+    solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
+        .unwrap();
+
+    let segment_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("120000_60");
+    fs::create_dir_all(&segment_dir).unwrap();
+
+    fs::write(
+        segment_dir.join("audio.jsonl"),
+        r#"{"start": 1.0, "speaker": "Alice", "text": "We decided on the unique_arch_plan_alpha roadmap."}"#,
+    )
+    .unwrap();
+
+    let sense_val = serde_json::json!({
+        "density": "active",
+        "content_type": "meeting",
+        "activity_summary": "Architecture roadmap review",
+        "facets": [{"facet": "work", "level": "high"}],
+        "entities": [],
+        "topics": ["unique_arch_plan_alpha roadmap"],
+        "quotes": [{
+            "speaker": "wrong_speaker",
+            "text": "“We decided on the unique_arch_plan_alpha roadmap.”"
+        }]
+    });
+
+    let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log,
+        "120000_60",
+        Some("default"),
+        &segment_dir,
+        sense_val.as_object().unwrap(),
+    )
+    .unwrap();
+    log.finish().unwrap();
+
+    let rel_topics = "20260813/default/120000_60/talents/topics.md";
+    assert!(chunk_text_contains(
+        &context.journal,
+        rel_topics,
+        "unique_arch_plan_alpha"
+    ));
+
+    let spec = resolve_spec(rel_topics).expect("topics.md resolves to spec");
+    assert_eq!(spec.family, Family::Markdown);
+    assert_eq!(
+        spec.disposition,
+        IndexDisposition::Admitted {
+            category: AdmittedCategory::Transcripts,
+            basis: ScopeBasis::SegmentAssigned,
+        }
+    );
+
+    let topics_content = fs::read_to_string(segment_dir.join("talents/topics.md")).unwrap();
+    assert!(
+        topics_content.contains("- Alice: We decided on the unique_arch_plan_alpha roadmap.\n")
+    );
+}
+
+#[test]
+fn topics_emptied_second_call_clears_file_and_removes_indexed_chunks() {
+    let (_journal, context) = fixture_journal();
+    solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
+        .unwrap();
+
+    // Segment 1: cleared by empty topics and quotes arrays
+    let seg1_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("120000_60");
+    fs::create_dir_all(&seg1_dir).unwrap();
+    fs::write(
+        seg1_dir.join("audio.jsonl"),
+        r#"{"start": 1.0, "speaker": "Alice", "text": "Distinctive alpha keyword here."}"#,
+    )
+    .unwrap();
+
+    let sense_active1 = serde_json::json!({
+        "density": "active",
+        "content_type": "meeting",
+        "activity_summary": "Active session one",
+        "facets": [{"facet": "work", "level": "high"}],
+        "entities": [],
+        "topics": ["distinctive_alpha_topic"],
+        "quotes": [{"speaker": "Alice", "text": "Distinctive alpha keyword here."}]
+    });
+
+    let mut log1 = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log1,
+        "120000_60",
+        Some("default"),
+        &seg1_dir,
+        sense_active1.as_object().unwrap(),
+    )
+    .unwrap();
+    log1.finish().unwrap();
+
+    let rel_topics1 = "20260813/default/120000_60/talents/topics.md";
+    assert!(chunk_text_contains(
+        &context.journal,
+        rel_topics1,
+        "distinctive_alpha_topic"
+    ));
+
+    // Second call: empty topics and quotes
+    let sense_empty1 = serde_json::json!({
+        "density": "active",
+        "content_type": "meeting",
+        "activity_summary": "Now empty session",
+        "facets": [{"facet": "work", "level": "high"}],
+        "entities": [],
+        "topics": [],
+        "quotes": []
+    });
+
+    let mut log1_empty = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log1_empty,
+        "120000_60",
+        Some("default"),
+        &seg1_dir,
+        sense_empty1.as_object().unwrap(),
+    )
+    .unwrap();
+    log1_empty.finish().unwrap();
+
+    let seg1_topics_text = fs::read_to_string(seg1_dir.join("talents/topics.md")).unwrap();
+    assert_eq!(seg1_topics_text, "");
+    assert!(!chunk_text_contains(
+        &context.journal,
+        rel_topics1,
+        "distinctive_alpha_topic"
+    ));
+
+    // Segment 2: cleared by empty_input_sense_output()
+    let seg2_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("121000_60");
+    fs::create_dir_all(&seg2_dir).unwrap();
+    fs::write(
+        seg2_dir.join("audio.jsonl"),
+        r#"{"start": 1.0, "speaker": "Bob", "text": "Distinctive beta keyword here."}"#,
+    )
+    .unwrap();
+
+    let sense_active2 = serde_json::json!({
+        "density": "active",
+        "content_type": "meeting",
+        "activity_summary": "Active session two",
+        "facets": [{"facet": "work", "level": "high"}],
+        "entities": [],
+        "topics": ["distinctive_beta_topic"],
+        "quotes": [{"speaker": "Bob", "text": "Distinctive beta keyword here."}]
+    });
+
+    let mut log2 = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log2,
+        "121000_60",
+        Some("default"),
+        &seg2_dir,
+        sense_active2.as_object().unwrap(),
+    )
+    .unwrap();
+    log2.finish().unwrap();
+
+    let rel_topics2 = "20260813/default/121000_60/talents/topics.md";
+    assert!(chunk_text_contains(
+        &context.journal,
+        rel_topics2,
+        "distinctive_beta_topic"
+    ));
+
+    // Second call: empty_input_sense_output()
+    let idle_sense = crate::segment::empty_input_sense_output();
+    let mut log2_idle = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log2_idle,
+        "121000_60",
+        Some("default"),
+        &seg2_dir,
+        &idle_sense,
+    )
+    .unwrap();
+    log2_idle.finish().unwrap();
+
+    let seg2_topics_text = fs::read_to_string(seg2_dir.join("talents/topics.md")).unwrap();
+    assert_eq!(seg2_topics_text, "");
+    assert!(!chunk_text_contains(
+        &context.journal,
+        rel_topics2,
+        "distinctive_beta_topic"
+    ));
+}
+
+#[test]
+fn topics_no_prior_file_keyless_and_empty_does_not_create_file() {
+    let (_journal, context) = fixture_journal();
+    solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
+        .unwrap();
+
+    // Case 1: Keyless sense object (no topics or quotes keys)
+    let seg1_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("122000_60");
+    fs::create_dir_all(&seg1_dir).unwrap();
+
+    let keyless_sense = serde_json::json!({
+        "density": "idle",
+        "content_type": "idle",
+        "activity_summary": "Idle interval",
+        "facets": [{"facet": "work", "level": "low"}],
+        "entities": []
+    });
+
+    let mut log1 = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log1,
+        "122000_60",
+        Some("default"),
+        &seg1_dir,
+        keyless_sense.as_object().unwrap(),
+    )
+    .unwrap();
+    log1.finish().unwrap();
+
+    assert!(!seg1_dir.join("talents/topics.md").exists());
+    let records1 = oplog_records(&context.journal, DAY, "segment");
+    assert!(!records1.iter().any(|r| {
+        r["event"] == "index.attempt"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("talents/topics.md"))
+    }));
+    assert!(
+        records1
+            .iter()
+            .any(|r| { r["kept"] == 0 && r["dropped"] == 0 })
+    );
+
+    // Case 2: Sense object with empty topics and quotes
+    let seg2_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("123000_60");
+    fs::create_dir_all(&seg2_dir).unwrap();
+
+    let empty_sense = serde_json::json!({
+        "density": "idle",
+        "content_type": "idle",
+        "activity_summary": "Idle interval two",
+        "facets": [{"facet": "work", "level": "low"}],
+        "entities": [],
+        "topics": [],
+        "quotes": []
+    });
+
+    let mut log2 = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log2,
+        "123000_60",
+        Some("default"),
+        &seg2_dir,
+        empty_sense.as_object().unwrap(),
+    )
+    .unwrap();
+    log2.finish().unwrap();
+
+    assert!(!seg2_dir.join("talents/topics.md").exists());
+    let records2 = oplog_records(&context.journal, DAY, "segment");
+    assert!(!records2.iter().any(|r| {
+        r["event"] == "index.attempt"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("talents/topics.md"))
+    }));
+    assert!(
+        records2
+            .iter()
+            .any(|r| { r["kept"] == 0 && r["dropped"] == 0 })
+    );
+}
+
+#[test]
+fn topics_directory_collision_returns_ok_logs_cause() {
+    let (_journal, context) = fixture_journal();
+    solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
+        .unwrap();
+
+    let segment_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("124000_60");
+    fs::create_dir_all(segment_dir.join("talents/topics.md")).unwrap();
+
+    let sense_val = serde_json::json!({
+        "density": "active",
+        "content_type": "coding",
+        "activity_summary": "Coding session with directory collision",
+        "facets": [{"facet": "work", "level": "high"}],
+        "entities": [{
+            "type": "Person",
+            "name": "Alice Lead",
+            "role": "lead",
+            "source": "transcript",
+            "context": "debugging"
+        }],
+        "topics": ["Compiler architecture"],
+        "quotes": []
+    });
+
+    let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
+    let res = write_sense_and_change(
+        &context,
+        &mut log,
+        "124000_60",
+        Some("default"),
+        &segment_dir,
+        sense_val.as_object().unwrap(),
+    );
+    assert!(res.is_ok());
+    log.finish().unwrap();
+
+    assert!(segment_dir.join("talents/sense.md").is_file());
+    assert!(segment_dir.join("talents/change.json").is_file());
+
+    let records = oplog_records(&context.journal, DAY, "segment");
+    let failure_record = records.iter().find(|r| {
+        r["path"].as_str().is_some_and(|p| p.ends_with("topics.md"))
+            && r["cause"].as_str().is_some_and(|c| !c.is_empty())
+    });
+    assert!(
+        failure_record.is_some(),
+        "expected failure record with non-empty cause"
+    );
+
+    assert!(!records.iter().any(|r| {
+        r["event"] == "index.attempt"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("talents/topics.md"))
+    }));
+}
+
+#[test]
+fn topics_malformed_transcript_line_preserves_valid_transcript_quotes() {
+    let (_journal, context) = fixture_journal();
+    solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
+        .unwrap();
+
+    let segment_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("125000_60");
+    fs::create_dir_all(&segment_dir).unwrap();
+
+    fs::write(
+        segment_dir.join("audio.jsonl"),
+        [
+            r#"{"start": 1.0, "speaker": "Dev", "text": "First valid speech line."}"#,
+            "corrupt json { not valid",
+            r#"{"start": 2.0, "speaker": "Dev", "text": "Second valid speech line."}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let sense_val = serde_json::json!({
+        "density": "active",
+        "content_type": "coding",
+        "activity_summary": "Active work",
+        "facets": [{"facet": "work", "level": "high"}],
+        "entities": [],
+        "topics": ["Testing parser"],
+        "quotes": [
+            {"speaker": "Dev", "text": "First valid speech line."},
+            {"speaker": "Dev", "text": "Second valid speech line."}
+        ]
+    });
+
+    let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log,
+        "125000_60",
+        Some("default"),
+        &segment_dir,
+        sense_val.as_object().unwrap(),
+    )
+    .unwrap();
+    log.finish().unwrap();
+
+    let topics_content = fs::read_to_string(segment_dir.join("talents/topics.md")).unwrap();
+    assert!(topics_content.contains("- Dev: First valid speech line.\n"));
+    assert!(topics_content.contains("- Dev: Second valid speech line.\n"));
+}
+
+#[test]
+fn topics_imported_audio_and_chat_conversations_produce_labeled_quotes() {
+    let (_journal, context) = fixture_journal();
+    solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
+        .unwrap();
+
+    let segment_dir = context
+        .journal
+        .join("chronicle")
+        .join(DAY)
+        .join("default")
+        .join("126000_60");
+    fs::create_dir_all(&segment_dir).unwrap();
+
+    fs::write(
+        segment_dir.join("imported_audio.jsonl"),
+        r#"{"start": 1.0, "speaker": "Host", "text": "Welcome to our recorded session."}"#,
+    )
+    .unwrap();
+    fs::write(
+        segment_dir.join("conversation_transcript.jsonl"),
+        [
+            r#"{"start": 2.0, "speaker": "Human", "text": "Can you inspect this log?"}"#,
+            r#"{"start": 3.0, "speaker": "Assistant", "text": "The log is clean and valid."}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let sense_val = serde_json::json!({
+        "density": "active",
+        "content_type": "meeting",
+        "activity_summary": "Mixed conversation",
+        "facets": [{"facet": "work", "level": "high"}],
+        "entities": [],
+        "topics": ["Session and chat"],
+        "quotes": [
+            {"speaker": "Host", "text": "Welcome to our recorded session."},
+            {"speaker": "Human", "text": "Can you inspect this log?"},
+            {"speaker": "Assistant", "text": "The log is clean and valid."}
+        ]
+    });
+
+    let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
+    write_sense_and_change(
+        &context,
+        &mut log,
+        "126000_60",
+        Some("default"),
+        &segment_dir,
+        sense_val.as_object().unwrap(),
+    )
+    .unwrap();
+    log.finish().unwrap();
+
+    let topics_content = fs::read_to_string(segment_dir.join("talents/topics.md")).unwrap();
+    assert!(topics_content.contains("- Host: Welcome to our recorded session.\n"));
+    assert!(topics_content.contains("- Human: Can you inspect this log?\n"));
+    assert!(topics_content.contains("- Assistant: The log is clean and valid.\n"));
+}
+
+#[test]
+fn topics_no_speech_fixtures_retain_topics_with_empty_quotes_section() {
+    let (_journal, context) = fixture_journal();
+    solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
+        .unwrap();
+
+    let non_speech_files = [
+        // Each file holds the quoted words, so only the speech-file selector can drop them.
+        (
+            "seg_imported_md",
+            "imported.md",
+            "# Imported document\nUnmatched quote words here\n",
+        ),
+        (
+            "seg_transcript_md",
+            "event_transcript.md",
+            "# Event notes\nUnmatched quote words here\n",
+        ),
+        (
+            "seg_workout_json",
+            "workout.json",
+            "{\"start\": \"00:00:01\", \"text\": \"Unmatched quote words here\"}",
+        ),
+        ("seg_note_txt", "note.txt", "Unmatched quote words here"),
+        (
+            "seg_screen_jsonl",
+            "display_screen.jsonl",
+            "{\"start\": \"00:00:01\", \"text\": \"Unmatched quote words here\"}\n",
+        ),
+    ];
+
+    for (seg_name, filename, file_content) in non_speech_files {
+        let segment_dir = context
+            .journal
+            .join("chronicle")
+            .join(DAY)
+            .join("default")
+            .join(seg_name);
+        fs::create_dir_all(&segment_dir).unwrap();
+        fs::write(segment_dir.join(filename), file_content).unwrap();
+
+        let sense_val = serde_json::json!({
+            "density": "active",
+            "content_type": "coding",
+            "activity_summary": format!("Summary for {seg_name}"),
+            "facets": [{"facet": "work", "level": "high"}],
+            "entities": [],
+            "topics": [format!("Topic for {seg_name}")],
+            "quotes": [
+                {"speaker": "x", "text": "Unmatched quote words here"}
+            ]
+        });
+
+        let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
+        write_sense_and_change(
+            &context,
+            &mut log,
+            seg_name,
+            Some("default"),
+            &segment_dir,
+            sense_val.as_object().unwrap(),
+        )
+        .unwrap();
+        log.finish().unwrap();
+
+        let topics_content = fs::read_to_string(segment_dir.join("talents/topics.md")).unwrap();
+        assert!(topics_content.contains(&format!("- Topic for {seg_name}\n")));
+        assert!(topics_content.contains("## Quotes\n"));
+        assert!(!topics_content.contains("Unmatched quote words here"));
+        let quotes_section = topics_content.split("## Quotes\n").nth(1).unwrap();
+        assert_eq!(quotes_section.trim(), "");
+    }
 }

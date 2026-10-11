@@ -12,15 +12,51 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
 use solstone_core_format::content::{
-    Family, RawPerceptFamily, produce_chunks, produce_raw_percept_chunks,
+    ContentResolution, Family, RawPerceptFamily, classify, produce_chunks,
+    produce_raw_percept_chunks,
 };
-use solstone_core_journal_io::paths::Segment;
+use solstone_core_journal_io::paths::{Segment, segment_origin};
 
 /// Largest source-byte window parsed for one transcript page.
 pub const MAX_TRANSCRIPT_PAGE_BYTES: usize = 64 * 1024;
 /// Largest number of transcript entries returned for one transcript page.
 pub const MAX_TRANSCRIPT_PAGE_ITEMS: usize = 100;
+
+/// Parsed wall-clock times and formatted display range for a chronicle segment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentClock {
+    pub label: String,
+    pub start_seconds: u32,
+    pub exclusive_end_seconds: u32,
+}
+
+pub fn segment_clock(directory_name: &str) -> Option<SegmentClock> {
+    let key = solstone_core_format::segment::segment_key(directory_name)?;
+    let (time_part, length_part) = key.split_once('_')?;
+    if time_part.len() != 6 || !time_part.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let hour = time_part[0..2].parse::<u32>().ok()?;
+    let minute = time_part[2..4].parse::<u32>().ok()?;
+    let second = time_part[4..6].parse::<u32>().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let duration = length_part.parse::<u32>().ok()?;
+    let start_seconds = hour * 3600 + minute * 60 + second;
+    let exclusive_end_seconds = start_seconds.saturating_add(duration).min(86400);
+    let display_end = start_seconds.saturating_add(duration).min(86399);
+    let end_h = display_end / 3600;
+    let end_m = (display_end % 3600) / 60;
+    let label = format!("{hour:02}:{minute:02}-{end_h:02}:{end_m:02}");
+    Some(SegmentClock {
+        label,
+        start_seconds,
+        exclusive_end_seconds,
+    })
+}
 
 /// Opaque-to-callers source version for one segment's approved transcript files.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +96,7 @@ pub struct SegmentTranscriptPage {
     pub entries: Vec<SegmentTranscriptEntry>,
     pub next: Option<SegmentTranscriptCursor>,
     pub version: SegmentTranscriptVersion,
+    pub untimed: bool,
 }
 
 /// Failure while reading a bounded transcript page.
@@ -69,6 +106,23 @@ pub enum SegmentTranscriptReadError {
     InvalidCursor,
     Io,
     RecordTooLarge,
+}
+
+fn peek_untimed(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(file.take(MAX_TRANSCRIPT_PAGE_BYTES as u64));
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line.trim()) {
+        map.get("untimed") == Some(&Value::Bool(true))
+    } else {
+        false
+    }
 }
 
 /// Read one bounded page of approved transcript text from exactly one segment.
@@ -81,6 +135,10 @@ pub fn read_segment_transcript_page(
 ) -> Result<SegmentTranscriptPage, SegmentTranscriptReadError> {
     let files = transcript_files(segment.path())?;
     let version = source_version(&files)?;
+    let untimed = files
+        .iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .any(|path| peek_untimed(path));
     let (mut source_index, mut byte_offset) = match cursor {
         Some(cursor) if cursor.version != version => {
             return Err(SegmentTranscriptReadError::Changed);
@@ -96,6 +154,7 @@ pub fn read_segment_transcript_page(
     // this projection; no speaker-label storage API is widened for connection reads.
     let _labels = bounded_labels(segment.path());
 
+    let segment_origin = segment_origin(segment.path());
     let mut entries = Vec::new();
     while source_index < files.len() && entries.len() < MAX_TRANSCRIPT_PAGE_ITEMS {
         let path = &files[source_index];
@@ -107,7 +166,7 @@ pub fn read_segment_transcript_page(
         let mut consumed = 0;
         let mut stopped_in_window = false;
         for (line, line_end) in complete_lines(&window)? {
-            let text = project_line(name, line);
+            let text = project_line(&segment_origin, name, line);
             if !text.trim().is_empty() {
                 entries.push(SegmentTranscriptEntry { text });
             }
@@ -142,6 +201,7 @@ pub fn read_segment_transcript_page(
         entries,
         next,
         version,
+        untimed,
     })
 }
 
@@ -161,6 +221,7 @@ fn transcript_files(segment: &Path) -> Result<Vec<PathBuf>, SegmentTranscriptRea
 
 fn is_transcript_name(name: &str) -> bool {
     name == "audio.jsonl"
+        || name.ends_with("_audio.jsonl")
         || name.ends_with("_transcript.jsonl")
         || name == "imported.md"
         || name.ends_with("_transcript.md")
@@ -242,24 +303,58 @@ fn complete_lines(bytes: &[u8]) -> Result<Vec<(&str, usize)>, SegmentTranscriptR
     Ok(lines)
 }
 
-fn project_line(name: &str, line: &str) -> String {
-    if name == "audio.jsonl" {
-        return produce_raw_percept_chunks(RawPerceptFamily::Audio, "", line)
-            .chunks
-            .into_iter()
-            .map(|chunk| chunk.content)
-            .collect::<Vec<_>>()
-            .join("\n");
+fn project_line(segment_origin: &str, name: &str, line: &str) -> String {
+    let rel = format!("{segment_origin}/{name}");
+    match classify(&rel) {
+        ContentResolution::Unindexed(RawPerceptFamily::Audio) => {
+            produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
+                .chunks
+                .into_iter()
+                .map(|chunk| chunk.content)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        ContentResolution::Indexed(Family::AiChat) => {
+            let produced = produce_chunks(Family::AiChat, &rel, line);
+            let start = serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|v| v.get("start").and_then(Value::as_str).map(str::to_owned));
+            produced
+                .chunks
+                .into_iter()
+                .map(|chunk| {
+                    if let Some(ref start) = start {
+                        format!("[{start}] {}", chunk.content)
+                    } else {
+                        chunk.content
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => {
+            if name == "workout.json" {
+                produce_chunks(Family::Workout, name, line)
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| chunk.content)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if name == "audio.jsonl"
+                || name.ends_with("_audio.jsonl")
+                || name.ends_with("_transcript.jsonl")
+            {
+                produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
+                    .chunks
+                    .into_iter()
+                    .map(|chunk| chunk.content)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                line.to_owned()
+            }
+        }
     }
-    if name == "workout.json" {
-        return produce_chunks(Family::Workout, name, line)
-            .chunks
-            .into_iter()
-            .map(|chunk| chunk.content)
-            .collect::<Vec<_>>()
-            .join("\n");
-    }
-    line.to_owned()
 }
 
 #[cfg(test)]
@@ -268,8 +363,40 @@ mod tests {
 
     use super::{
         MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS, read_segment_transcript_page,
+        segment_clock,
+    };
+    use solstone_core_format::content::{
+        Family, RawPerceptFamily, produce_chunks, produce_raw_percept_chunks,
     };
     use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
+
+    #[test]
+    fn routine_tests_for_segment_clock() {
+        let clock = segment_clock("000000_86400").unwrap();
+        assert_eq!(clock.label, "00:00-23:59");
+        assert_eq!(clock.start_seconds, 0);
+        assert_eq!(clock.exclusive_end_seconds, 86400);
+
+        let clock = segment_clock("110000_60").unwrap();
+        assert_eq!(clock.label, "11:00-11:01");
+        assert_eq!(clock.start_seconds, 39600);
+        assert_eq!(clock.exclusive_end_seconds, 39660);
+
+        let clock = segment_clock("110000_30").unwrap();
+        assert_eq!(clock.label, "11:00-11:00");
+        assert_eq!(clock.start_seconds, 39600);
+        assert_eq!(clock.exclusive_end_seconds, 39630);
+
+        let clock = segment_clock("233000_3600").unwrap();
+        assert_eq!(clock.label, "23:30-23:59");
+        assert_eq!(clock.start_seconds, 84600);
+        assert_eq!(clock.exclusive_end_seconds, 86400);
+
+        let clock = segment_clock("x-120000_300").unwrap();
+        assert_eq!(clock.label, "12:00-12:05");
+        assert_eq!(clock.start_seconds, 43200);
+        assert_eq!(clock.exclusive_end_seconds, 43500);
+    }
 
     #[test]
     fn pages_one_large_transcript_without_reading_talent_or_percept_files() {
@@ -297,6 +424,7 @@ mod tests {
                 .all(|entry| entry.text == "approved transcript line")
         );
         assert!(first.next.is_some());
+        assert!(!first.untimed);
     }
 
     #[test]
@@ -335,6 +463,142 @@ mod tests {
                 },
             ]
         );
+        assert!(!page.untimed);
+    }
+
+    #[test]
+    fn audio_and_aichat_projections_and_renderer_guard() {
+        let root = tempfile::tempdir().unwrap();
+        // 1. import.audio
+        let seg_audio = root
+            .path()
+            .join("chronicle/20260914/import.audio/090000_300");
+        fs::create_dir_all(&seg_audio).unwrap();
+        let audio_bytes =
+            "{\"recording\":\"metadata\"}\n{\"start\":\"00:00:02\",\"text\":\"spoken words\"}\n";
+        fs::write(seg_audio.join("imported_audio.jsonl"), audio_bytes).unwrap();
+
+        // 2. legacy import.chatgpt
+        let seg_chatgpt = root
+            .path()
+            .join("chronicle/20260914/import.chatgpt/090000_300");
+        fs::create_dir_all(&seg_chatgpt).unwrap();
+        let chat_bytes = "{\"imported\":{}}\n{\"start\":\"00:00:00\",\"speaker\":\"Ana Lima\",\"text\":\"Hello all.\"}\n";
+        fs::write(seg_chatgpt.join("imported_audio.jsonl"), chat_bytes).unwrap();
+
+        // 3. source_audio.jsonl in default
+        let seg_custom = root.path().join("chronicle/20260914/default/090500_300");
+        fs::create_dir_all(&seg_custom).unwrap();
+        fs::write(seg_custom.join("mic_audio.jsonl"), audio_bytes).unwrap();
+
+        // 4. timed import.text
+        let seg_text = root
+            .path()
+            .join("chronicle/20260914/import.text/091000_300");
+        fs::create_dir_all(&seg_text).unwrap();
+        fs::write(seg_text.join("conversation_transcript.jsonl"), chat_bytes).unwrap();
+
+        let segments = iter_segments(root.path(), PathOrDay::Day("20260914")).unwrap();
+
+        // Verify import.audio page
+        let seg = segments.iter().find(|s| s.path() == seg_audio).unwrap();
+        let page = read_segment_transcript_page(seg, None).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].text, "[00:00:02] spoken words");
+
+        // Verify custom _audio.jsonl page
+        let seg = segments.iter().find(|s| s.path() == seg_custom).unwrap();
+        let page = read_segment_transcript_page(seg, None).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].text, "[00:00:02] spoken words");
+
+        // Verify import.chatgpt page
+        let seg = segments.iter().find(|s| s.path() == seg_chatgpt).unwrap();
+        let page = read_segment_transcript_page(seg, None).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].text, "[00:00:00] **Ana Lima:** Hello all.");
+
+        // Verify import.text page
+        let seg = segments.iter().find(|s| s.path() == seg_text).unwrap();
+        let page = read_segment_transcript_page(seg, None).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].text, "[00:00:00] **Ana Lima:** Hello all.");
+
+        // Renderer guard: call produce_raw_percept_chunks and produce_chunks directly
+        let raw = produce_raw_percept_chunks(
+            RawPerceptFamily::Audio,
+            "20260914/import.audio/090000_300/imported_audio.jsonl",
+            audio_bytes,
+        );
+        assert_eq!(raw.chunks.len(), 1);
+        assert_eq!(raw.chunks[0].content, "[00:00:02] spoken words");
+
+        let chat = produce_chunks(
+            Family::AiChat,
+            "20260914/import.chatgpt/090000_300/imported_audio.jsonl",
+            chat_bytes,
+        );
+        assert_eq!(chat.chunks.len(), 1);
+        assert_eq!(chat.chunks[0].content, "**Ana Lima:** Hello all.");
+        assert_eq!(chat.header.as_deref(), Some("# ChatGPT conversation"));
+    }
+
+    #[test]
+    fn a_flat_legacy_source_transcript_reads_projected_not_raw() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let segment = root.path().join("chronicle/20250301/093000_300");
+        fs::create_dir_all(&segment).unwrap();
+        fs::write(
+            segment.join("session_transcript.jsonl"),
+            "{\"raw\": \"session.flac\"}\n{\"start\": \"00:00:04\", \"speaker\": 2, \"text\": \"send the deck on friday\"}\n",
+        )
+        .unwrap();
+        let segment = iter_segments(root.path(), PathOrDay::Day("20250301"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let page = read_segment_transcript_page(&segment, None).unwrap();
+        assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
+        assert!(page.entries[0].text.contains("send the deck on friday"));
+        assert!(
+            !page.entries[0].text.contains('{'),
+            "{}",
+            page.entries[0].text
+        );
+    }
+
+    #[test]
+    fn untimed_flag_persists_across_continuation_pages() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let segment = root
+            .path()
+            .join("chronicle/20260914/import.text/090000_300");
+        fs::create_dir_all(&segment).unwrap();
+
+        let mut lines = String::from("{\"untimed\": true, \"imported\": {}}\n");
+        for i in 1..=MAX_TRANSCRIPT_PAGE_ITEMS + 10 {
+            lines.push_str(&format!(
+                "{{\"start\": \"00:00:00\", \"speaker\": \"User\", \"text\": \"turn {i}\"}}\n"
+            ));
+        }
+        fs::write(segment.join("conversation_transcript.jsonl"), lines).unwrap();
+
+        let segment = iter_segments(root.path(), PathOrDay::Day("20260914"))
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let first = read_segment_transcript_page(&segment, None).unwrap();
+        assert!(first.untimed);
+        assert_eq!(first.entries.len(), MAX_TRANSCRIPT_PAGE_ITEMS);
+        assert_eq!(first.entries[0].text, "[00:00:00] **User:** turn 1");
+        assert!(first.next.is_some());
+
+        let second = read_segment_transcript_page(&segment, first.next.as_ref()).unwrap();
+        assert!(second.untimed);
+        assert_eq!(second.entries.len(), 10);
+        assert_eq!(second.entries[0].text, "[00:00:00] **User:** turn 101");
+        assert!(second.next.is_none());
     }
 
     #[test]

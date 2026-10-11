@@ -2604,7 +2604,7 @@ fn log_change(
     log.log("sense.change_detect", context.event_now_ms(), fields);
 }
 
-fn empty_input_sense_output() -> Map<String, Value> {
+pub(crate) fn empty_input_sense_output() -> Map<String, Value> {
     Map::from_iter([
         ("density".to_owned(), Value::String("idle".to_owned())),
         ("content_type".to_owned(), Value::String("idle".to_owned())),
@@ -2764,6 +2764,15 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         let change_json_path = segment.join("talents/change.json");
         replace_json(&change_json_path, &change)?;
         published.insert(change_json_path.clone());
+        publish_segment_topics(
+            context,
+            log,
+            segment_name,
+            stream,
+            segment,
+            sense,
+            &mut published,
+        );
         Ok(change)
     })();
     if assignment_published {
@@ -2877,6 +2886,82 @@ fn log_dependency_discovery_failure<W: std::io::Write>(
             ]),
         ),
     );
+}
+
+fn publish_segment_topics<W: std::io::Write>(
+    context: &ThinkContext,
+    log: &mut RunLogWriter<W>,
+    segment_name: &str,
+    stream: Option<&str>,
+    segment_dir: &std::path::Path,
+    sense: &Map<String, Value>,
+    published: &mut BTreeSet<std::path::PathBuf>,
+) {
+    let eval = crate::topics::evaluate_topics(segment_dir, sense);
+
+    for (unreadable_path, cause) in eval.unreadable {
+        log.log(
+            "sense.transcript_unreadable",
+            context.event_now_ms(),
+            segment_event(
+                context,
+                segment_name,
+                stream,
+                Map::from_iter([
+                    (
+                        "path".to_owned(),
+                        Value::String(unreadable_path.display().to_string()),
+                    ),
+                    ("cause".to_owned(), Value::String(cause)),
+                ]),
+            ),
+        );
+    }
+
+    log.log(
+        "sense.quotes",
+        context.event_now_ms(),
+        segment_event(
+            context,
+            segment_name,
+            stream,
+            Map::from_iter([
+                ("kept".to_owned(), Value::from(eval.kept_quotes)),
+                ("dropped".to_owned(), Value::from(eval.dropped_quotes)),
+            ]),
+        ),
+    );
+
+    let topics_path = segment_dir.join("talents").join("topics.md");
+    let markdown = eval.markdown.as_deref();
+    let file_exists = topics_path.exists();
+
+    if markdown.is_some() || file_exists {
+        let bytes = markdown.unwrap_or("");
+        match replace_text(&topics_path, bytes) {
+            Ok(()) => {
+                published.insert(topics_path);
+            }
+            Err(cause) => {
+                log.log(
+                    "sense.topics_failed",
+                    context.event_now_ms(),
+                    segment_event(
+                        context,
+                        segment_name,
+                        stream,
+                        Map::from_iter([
+                            (
+                                "path".to_owned(),
+                                Value::String(topics_path.display().to_string()),
+                            ),
+                            ("cause".to_owned(), Value::String(cause)),
+                        ]),
+                    ),
+                );
+            }
+        }
+    }
 }
 
 fn log_index_attempt<W: std::io::Write>(

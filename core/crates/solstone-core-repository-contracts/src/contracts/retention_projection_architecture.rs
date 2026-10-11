@@ -76,8 +76,13 @@ fn retention_policy_projection_has_one_owner() {
             !constructs_retention_type(source, "Rule"),
             "{name} must not construct retention Rule values"
         );
+        let owning_projection = if name == "home-web removals" {
+            "read_review_context("
+        } else {
+            "policy_from_journal_config("
+        };
         assert!(
-            source.contains("policy_from_journal_config("),
+            source.contains(owning_projection),
             "{name} must call the retention-owned projection"
         );
     }

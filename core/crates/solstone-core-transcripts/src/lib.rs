@@ -20,9 +20,9 @@ use solstone_core_memory_original::{OriginalRead, read_original};
 mod segment_page;
 
 pub use segment_page::{
-    MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS, SegmentTranscriptCursor,
+    MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS, SegmentClock, SegmentTranscriptCursor,
     SegmentTranscriptEntry, SegmentTranscriptPage, SegmentTranscriptReadError,
-    SegmentTranscriptVersion, read_segment_transcript_page,
+    SegmentTranscriptVersion, read_segment_transcript_page, segment_clock,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
