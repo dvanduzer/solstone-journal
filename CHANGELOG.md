@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- your weekly page is written again on large journals. in 2.0.41, putting the week together could take longer than the ten minutes your journal allows, so no page was written for that week, and it isn't written later on its own.
+
 ## [2.0.41] - 2026-10-11
 
 ### Added

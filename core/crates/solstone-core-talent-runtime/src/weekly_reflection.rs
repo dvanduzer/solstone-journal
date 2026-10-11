@@ -50,6 +50,7 @@ use solstone_core_home::{HomeContext, readers::enabled_facet_names};
 use solstone_core_indexer_store::scan::{RescanFileStatus, rescan_file};
 use solstone_core_journal_io::iter_segments;
 use solstone_core_segment::owner_deleted;
+use solstone_core_transcripts::VoiceNames;
 
 use crate::contract::{CommitPlan, ParsedOutput, PrePostState};
 use crate::writers::{WriteIntent, index_warning};
@@ -196,12 +197,19 @@ pub fn build(
     let mut slot_counter = 0usize;
     let mut memory_counter = 0usize;
     let facets = enabled_facet_names(&HomeContext::new(&context.journal, utc));
+    // Every entity is read to name voices; once for the week, not per record.
+    let voices = crate::transcript::voice_names(&context.journal);
 
     let mut curr = start_date;
     while curr <= end_date {
         let curr_str = curr.format("%Y%m%d").to_string();
         let (classif, candidates) = assess_day(&context.journal, &curr_str);
-        said.extend(said_on_day(&context.journal, &facets, &curr_str));
+        said.extend(said_on_day(
+            &context.journal,
+            &facets,
+            &curr_str,
+            voices.as_ref(),
+        ));
         day_reports.push(DayReport {
             day: curr_str.clone(),
             classification: classif,
@@ -670,7 +678,12 @@ pub fn compute_said_key(said: &Said) -> String {
 
 /// The owner's voice-backed Story quotes on one day, in record order; a
 /// repeated quote is kept once and the day is capped.
-fn said_on_day(journal: &Path, facets: &[String], day: &str) -> Vec<Said> {
+fn said_on_day(
+    journal: &Path,
+    facets: &[String],
+    day: &str,
+    voices: Option<&VoiceNames>,
+) -> Vec<Said> {
     let mut said = Vec::new();
     let mut seen = BTreeSet::new();
     for facet in facets {
@@ -698,7 +711,7 @@ fn said_on_day(journal: &Path, facets: &[String], day: &str) -> Vec<Said> {
             else {
                 continue;
             };
-            let Some(owner_lines) = crate::story::owner_heard(journal, day, &record) else {
+            let Some(owner_lines) = crate::story::owner_heard(journal, day, &record, voices) else {
                 continue;
             };
 
@@ -1971,7 +1984,12 @@ mod tests {
                 .to_string(),
         );
 
-        let said = said_on_day(root.path(), &["work".to_owned()], "20260309");
+        let said = said_on_day(
+            root.path(),
+            &["work".to_owned()],
+            "20260309",
+            crate::transcript::voice_names(root.path()).as_ref(),
+        );
         assert_eq!(said.len(), 1);
         assert_eq!(said[0].quote, "I will get you the deck by friday");
         assert_eq!(said[0].day, "20260309");
@@ -1981,7 +1999,15 @@ mod tests {
             said_uri(&said[0]),
             "sol://facets/work/activities/20260309#meeting_1"
         );
-        assert!(said_on_day(root.path(), &["work".to_owned()], "20260310").is_empty());
+        assert!(
+            said_on_day(
+                root.path(),
+                &["work".to_owned()],
+                "20260310",
+                crate::transcript::voice_names(root.path()).as_ref(),
+            )
+            .is_empty()
+        );
 
         let quotes = [
             "I will get you the deck by friday",
@@ -2009,7 +2035,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         fs::write(&path, json!({"id":"meeting_1","stream":"phone","segments":["090000_300"],"story":{"body":body}}).to_string() + "\n").unwrap();
-        let said = said_on_day(root.path(), &["work".to_owned()], "20260309");
+        let said = said_on_day(
+            root.path(),
+            &["work".to_owned()],
+            "20260309",
+            crate::transcript::voice_names(root.path()).as_ref(),
+        );
         assert_eq!(
             said.iter()
                 .map(|row| row.quote.as_str())
