@@ -179,7 +179,10 @@ enum StagingEvidence {
     Stage(OwnedMediaFailure<Option<MediaStage>>),
     Target(OwnedMediaFailure<MediaStage>),
     Unconsumed(MediaStage),
-    Readback(ReadbackFailure),
+    Readback {
+        failure: ReadbackFailure,
+        cleanup: Cleanup,
+    },
     Prepared(PreparedMedia),
     ReadyTarget(OwnedMediaTarget),
 }
@@ -525,12 +528,15 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         } = owner;
         let media = match operation.read_exact(&exact, target) {
             Ok(media) => media,
-            Err(error) => {
+            Err(mut failure) => {
+                // Nothing was published from this unpublished copy. Its cleanup
+                // refuses unless the writer is known to have been reaped.
+                let cleanup = failure.cleanup();
                 return Err(Box::new(StagingFailure {
                     carrier,
                     destination,
-                    hold: Hold::Admission(error.to_string()),
-                    evidence: StagingEvidence::Readback(error),
+                    hold: Hold::Admission(failure.to_string()),
+                    evidence: StagingEvidence::Readback { failure, cleanup },
                 }));
             }
         };

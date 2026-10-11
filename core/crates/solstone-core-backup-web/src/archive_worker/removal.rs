@@ -18,11 +18,12 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 use solstone_core_backup::archive_admission::AdmissionError;
+use solstone_core_backup::archive_readback::{OwnedSettledDirectRead, RefusedDirectRead};
 use solstone_core_backup_runtime::{ClosedToolError, resolve::resolve_restic_member};
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_retention::Outcome;
 use solstone_core_retention::remove_marked::{
-    OwnedReviewedArchiveFinish, remove_reviewed_with_owned_archive,
+    OwnedReviewedArchiveFinish, ReviewedArchiveReport, remove_reviewed_with_owned_archive,
 };
 use solstone_core_retention::review_context::{
     CheckedReviewContext, ReviewContext, ReviewRefusal, check_review_context,
@@ -84,6 +85,16 @@ impl ApprovalCustody {
 
     fn settled(&self) -> bool {
         self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Record a refused approval whose whole return was released.
+    pub(super) fn discharge(&mut self, terminal: &Terminal) {
+        self.discharged_refusal = Some(
+            terminal
+                .reason_code
+                .clone()
+                .unwrap_or_else(|| "failed".into()),
+        );
     }
 }
 
@@ -587,6 +598,17 @@ pub fn remove(
                 }
                 .into();
                 terminal.reason_code = Some("failed".into());
+                // A removal that changed nothing ends here once its own stages
+                // are gone and its children reaped; anything else stays held.
+                let proof = match proof.release_refused() {
+                    Ok((read, report)) => {
+                        if let Some(view) = terminal.report.as_mut() {
+                            view["settlement"] = json!({"state":"refused"});
+                        }
+                        return Ok(Actor::Refused(Box::new(read), report));
+                    }
+                    Err(proof) => proof,
+                };
                 if let Some(report) = terminal.report.as_mut() {
                     report["settlement"] = json!({"state":"held"});
                 }
@@ -603,18 +625,35 @@ pub fn remove(
                 if let Some(view) = terminal.report.as_mut() {
                     view["settlement"] = json!({"state":"settled"});
                 }
-                Ok((read, report))
+                Ok(Actor::Settled(Box::new(read), report))
             }
         }
     }));
     let payload = match actor {
         Ok(Err(proof)) => ArchivePayload::ProofHeld { proof, outside },
-        Ok(Ok((read, report))) => {
+        Ok(Ok(Actor::Refused(read, report))) => {
+            match catch_unwind(AssertUnwindSafe(|| outside.finish_refused(*read))) {
+                Ok(runtime) => {
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = runtime_facts(&runtime);
+                    }
+                    ArchivePayload::ProofFinished { report, runtime }
+                }
+                Err(_) => {
+                    terminal.phase = "error".into();
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = json!({"state":"unknown"});
+                    }
+                    ArchivePayload::ProofFinishUnknown { report }
+                }
+            }
+        }
+        Ok(Ok(Actor::Settled(read, report))) => {
             #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
             tests::before_finish(slot);
             // Keep the genuine settled report and original custody outside
             // consuming Runtime finish; an unwind cannot certify retirement.
-            match catch_unwind(AssertUnwindSafe(|| outside.finish_owned(read))) {
+            match catch_unwind(AssertUnwindSafe(|| outside.finish_owned(*read))) {
                 Ok(runtime) => {
                     if let Some(view) = terminal.report.as_mut() {
                         view["runtime"] = runtime_facts(&runtime);
@@ -645,6 +684,11 @@ pub fn remove(
         }
     };
     return_owned(slot, ticket, Some(custody), payload, terminal);
+}
+
+enum Actor {
+    Settled(Box<OwnedSettledDirectRead>, ReviewedArchiveReport),
+    Refused(Box<RefusedDirectRead>, ReviewedArchiveReport),
 }
 
 fn project(terminal: &mut Terminal, outcome: &Outcome, report: Value) {

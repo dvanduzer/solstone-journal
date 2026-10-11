@@ -109,7 +109,7 @@ fn reads<'a>(reads: impl Iterator<Item = ArchiveReadState<'a>>) -> Value {
         ArchiveReadState::Stage(stage) => json!({"state":"stage","retained_stage":stage.is_some()}),
         ArchiveReadState::Target(_) => json!({"state":"target"}),
         ArchiveReadState::Prepared { file, target_identity, media, cleanup } => json!({"state":"prepared","name":file.name,"bytes":file.bytes,"repository_id":file.repository_id,"snapshot_id":file.snapshot_id,"archive_path":file.archive_path,"identity":target_identity,"digest":media.digest(),"cleanup":cleanup}),
-        ArchiveReadState::Readback { file, target_identity, failure } => json!({"state":"readback","name":file.name,"bytes":file.bytes,"repository_id":file.repository_id,"snapshot_id":file.snapshot_id,"archive_path":file.archive_path,"identity":target_identity,"reason":failure.reason().to_string()}),
+        ArchiveReadState::Readback { file, target_identity, failure, cleanup } => json!({"state":"readback","name":file.name,"bytes":file.bytes,"repository_id":file.repository_id,"snapshot_id":file.snapshot_id,"archive_path":file.archive_path,"identity":target_identity,"reason":failure.reason().to_string(),"cleanup":cleanup}),
     }).collect::<Vec<_>>())
 }
 fn settled_reads(reads: &[ReviewedArchiveReadReport]) -> Value {

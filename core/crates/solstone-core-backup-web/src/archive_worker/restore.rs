@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use solstone_core_backup::archive_readback::OwnedSettledDirectRead;
+use solstone_core_backup::archive_readback::{OwnedSettledDirectRead, RefusedDirectRead};
 use solstone_core_offload::restore::RestoreResult;
 use solstone_core_offload::restore::owned::{
     self, OwnedRestoreFinishHold, OwnedRestoreRunOutcome, RestoreFinishRefusal,
@@ -424,6 +424,22 @@ fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&s
                     restore_report::held(&native),
                 );
                 let refusal = native_refusal(native.refusal());
+                // A refused restore ends here once no stage of its own remains
+                // and its children were reaped; anything else stays held.
+                let native = match native.release_refused() {
+                    Ok((read, report)) => {
+                        // An unqualified read never presents as done.
+                        if terminal.phase == "done" {
+                            terminal.phase = "error".into();
+                            terminal.reason_code = Some("failed".into());
+                        }
+                        if let Some(view) = terminal.report.as_mut() {
+                            view["settlement"] = json!({"state":"refused", "refusal":refusal});
+                        }
+                        return Ok(Actor::Refused(Box::new(read), report));
+                    }
+                    Err(native) => native,
+                };
                 if let Some(report) = terminal.report.as_mut() {
                     report["settlement"] = json!({"state":"held", "refusal":refusal});
                 }
@@ -438,18 +454,35 @@ fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&s
                 if let Some(view) = terminal.report.as_mut() {
                     view["settlement"] = json!({"state":"settled"});
                 }
-                Ok((settled, report))
+                Ok(Actor::Settled(Box::new(settled), report))
             }
         }
     }));
     let payload = match actor {
         Ok(Err(native)) => ArchivePayload::NativeHeld { native, outside },
-        Ok(Ok((settled, report))) => {
+        Ok(Ok(Actor::Refused(read, report))) => {
+            match catch_unwind(AssertUnwindSafe(|| outside.finish_refused(*read))) {
+                Ok(runtime) => {
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = runtime_facts(&runtime);
+                    }
+                    ArchivePayload::NativeFinished { report, runtime }
+                }
+                Err(_) => {
+                    terminal.phase = "error".into();
+                    if let Some(view) = terminal.report.as_mut() {
+                        view["runtime"] = json!({"state":"unknown"});
+                    }
+                    ArchivePayload::NativeFinishUnknown { report }
+                }
+            }
+        }
+        Ok(Ok(Actor::Settled(settled, report))) => {
             #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
             tests::before_finish(slot);
             // The genuine settled report and original custody survive a
             // consuming Runtime-finish unwind independently of confirmation.
-            match catch_unwind(AssertUnwindSafe(|| outside.finish_owned(settled))) {
+            match catch_unwind(AssertUnwindSafe(|| outside.finish_owned(*settled))) {
                 Ok(runtime) => {
                     if let Some(view) = terminal.report.as_mut() {
                         view["runtime"] = runtime_facts(&runtime);
@@ -485,6 +518,11 @@ fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&s
         }
     };
     return_owned(slot, ticket, Some(custody), payload, terminal);
+}
+
+enum Actor {
+    Settled(Box<OwnedSettledDirectRead>, SettledRestoreReport),
+    Refused(Box<RefusedDirectRead>, SettledRestoreReport),
 }
 
 fn settle(

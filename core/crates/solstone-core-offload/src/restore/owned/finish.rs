@@ -7,7 +7,7 @@ use super::*;
 use crate::restore_intent_store::transaction::{SettledTransaction, SettlementFailure};
 use solstone_core_backup::archive_readback::{
     HeldDirectRead, OwnedDirectReadHold, OwnedHeldDirectRead, OwnedSettledDirectRead,
-    ReadbackError, SettledDirectRead,
+    ReadbackError, RefusedDirectRead, SettledDirectRead,
 };
 use solstone_core_journal_io::media::RootActivityCarrier;
 use solstone_core_retention::restore_intent::AttemptEffects;
@@ -162,6 +162,23 @@ fn qualify_native(
     files: &[FileRecord],
     operation: &ReadOperation<'_>,
 ) -> Result<(), NativeRefusal> {
+    qualify_files(files, operation.carrier(), false)?;
+    operation
+        .revalidate_admission()
+        .map_err(|readback| NativeRefusal {
+            file: None,
+            failure: SettlementFailure::refused("settlement_read_refused"),
+            readback: Some(readback),
+        })
+}
+
+/// A staging failure that left no stage never qualifies success; only a
+/// refused release, which never reports success, accepts it.
+fn qualify_files(
+    files: &[FileRecord],
+    carrier: &Arc<RootActivityCarrier>,
+    removed_staging: bool,
+) -> Result<(), NativeRefusal> {
     for (index, file) in files.iter().enumerate() {
         let failure = match &file.owner {
             FileOwner::None
@@ -171,12 +188,17 @@ fn qualify_native(
             {
                 None
             }
+            FileOwner::Staging(failure)
+                if removed_staging && failure.removed() && file.files == 0 && file.bytes == 0 =>
+            {
+                None
+            }
             FileOwner::None | FileOwner::Staging(_) => {
                 Some(SettlementFailure::refused("unsettled_file"))
             }
             FileOwner::Transaction(transaction) => transaction
                 .qualify_settlement(
-                    operation.carrier(),
+                    carrier,
                     &file.witness,
                     file.disposition,
                     AttemptEffects {
@@ -184,7 +206,7 @@ fn qualify_native(
                         bytes: file.bytes,
                     },
                 )
-                .and_then(|()| transaction.revalidate_settlement(operation.carrier()))
+                .and_then(|()| transaction.revalidate_settlement(carrier))
                 .err(),
         };
         if let Some(failure) = failure {
@@ -195,13 +217,7 @@ fn qualify_native(
             });
         }
     }
-    operation
-        .revalidate_admission()
-        .map_err(|readback| NativeRefusal {
-            file: None,
-            failure: SettlementFailure::refused("settlement_read_refused"),
-            readback: Some(readback),
-        })
+    Ok(())
 }
 
 impl<'clock> HeldRestoreFinish<'clock> {
@@ -304,6 +320,57 @@ impl OwnedRestoreFinishHold {
             OwnedRead::Lower(read) => read.carrier(),
         }
     }
+
+    /// End a refused restore once every file is settled, unattempted or left
+    /// no stage, and every child its read launched was reaped. Its empty
+    /// carrier remains for the outside finish owner; nothing reports success.
+    pub fn release_refused(
+        mut self,
+    ) -> Result<(RefusedDirectRead, SettledRestoreReport), Box<Self>> {
+        if self._binding.is_some() {
+            return Err(Box::new(self));
+        }
+        let carrier = Arc::clone(self.carrier());
+        let settled = qualify_files(&self.files, &carrier, true).and_then(|()| {
+            self.files
+                .iter_mut()
+                .enumerate()
+                .try_for_each(|(index, file)| cleanup_file(index, file, &carrier))
+        });
+        drop(carrier);
+        if settled.is_err() {
+            return Err(Box::new(self));
+        }
+        let Self {
+            report,
+            files,
+            _binding,
+            read,
+        } = self;
+        let released = match read {
+            OwnedRead::Native { read, refusal } => (*read)
+                .release_refused()
+                .map_err(|read| OwnedRead::Native { read, refusal }),
+            OwnedRead::Lower(read) => read
+                .release_refused()
+                .map_err(|read| OwnedRead::Lower(*read)),
+        };
+        match released {
+            Ok(read) => Ok((
+                read,
+                SettledRestoreReport {
+                    report,
+                    files: settled_files(files),
+                },
+            )),
+            Err(read) => Err(Box::new(Self {
+                report,
+                files,
+                _binding,
+                read,
+            })),
+        }
+    }
 }
 
 impl SettledRestoreReport {
@@ -351,22 +418,31 @@ fn cleanup_native<'clock>(
     // Inspect all files first; retain every earlier successful cleanup on a later refusal.
     for (index, file) in files.iter_mut().enumerate() {
         recovery_check(operation, binding)?;
-        if let FileOwner::Transaction(transaction) = &mut file.owner
-            && let Err(failure) = transaction
-                .revalidate_settlement(carrier)
-                .and_then(|()| transaction.cleanup_settlement())
-                .and_then(|()| transaction.revalidate_settlement(carrier))
-        {
-            return Err(NativeRefusal {
-                file: Some(index),
-                failure,
-                readback: None,
-            });
-        }
+        cleanup_file(index, file, carrier)?;
         recovery_check(operation, binding)?;
     }
     // Last original-token observation precedes release and lower settlement.
     recovery_check(operation, binding)
+}
+
+fn cleanup_file(
+    index: usize,
+    file: &mut FileRecord,
+    carrier: &Arc<RootActivityCarrier>,
+) -> Result<(), NativeRefusal> {
+    if let FileOwner::Transaction(transaction) = &mut file.owner
+        && let Err(failure) = transaction
+            .revalidate_settlement(carrier)
+            .and_then(|()| transaction.cleanup_settlement())
+            .and_then(|()| transaction.revalidate_settlement(carrier))
+    {
+        return Err(NativeRefusal {
+            file: Some(index),
+            failure,
+            readback: None,
+        });
+    }
+    Ok(())
 }
 
 fn settled_files(files: Vec<FileRecord>) -> Vec<SettledFile> {
@@ -387,7 +463,8 @@ fn settled_files(files: Vec<FileRecord>) -> Vec<SettledFile> {
             } = file;
             let transaction = match owner {
                 FileOwner::Transaction(transaction) => Some(Box::new(transaction.into_settled())),
-                // Qualification excludes Staging; no cleanup is inferred on consumption.
+                // Only a refused release admits Staging, and only once no stage
+                // remains; no cleanup is inferred on consumption.
                 FileOwner::None | FileOwner::Staging(_) => None,
             };
             SettledFile {

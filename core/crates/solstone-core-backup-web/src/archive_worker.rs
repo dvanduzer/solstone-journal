@@ -187,6 +187,13 @@ impl ArchivePayload {
             if runtime.state() == DirectReadFinishState::Completed)
     }
 
+    /// A refused operation whose carrier removal was confirmed: nothing of it
+    /// remains to hold, though it never completed.
+    fn released(&self) -> bool {
+        matches!(self, Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
+            if runtime.released())
+    }
+
     fn matches(
         &self,
         reservation: &Reservation,
@@ -393,7 +400,7 @@ pub fn handoff(
                 Some(ArchiveHandoffRefusal::Inactive)
             }
             Some(_)
-                if returned.payload.completed()
+                if (returned.payload.completed() || returned.payload.released())
                     && !operation::is_terminal(&returned.terminal.phase) =>
             {
                 Some(ArchiveHandoffRefusal::NonterminalCompletion)
@@ -405,7 +412,8 @@ pub fn handoff(
         returned.reason = Some(reason);
         return Err(returned);
     }
-    if returned.payload.completed() {
+    let completed = returned.payload.completed();
+    if completed || returned.payload.released() {
         let Some(custody) = returned.custody.as_ref() else {
             returned.reason = Some(ArchiveHandoffRefusal::CustodyMissing);
             return Err(returned);
@@ -416,7 +424,7 @@ pub fn handoff(
             }
             ArchivePayload::NativeFinished { runtime, .. }
             | ArchivePayload::ProofFinished { runtime, .. } => runtime,
-            _ => unreachable!("only actual finished owners can complete"),
+            _ => unreachable!("only actual finished owners can complete or release"),
         };
         if !runtime.retirement().is_some_and(|retirement| {
             std::ptr::eq(custody.activity(), retirement.owned.activity().as_ref())
@@ -433,7 +441,11 @@ pub fn handoff(
         current.worker_active = false;
         operation::apply_terminal(current, returned.terminal.clone());
         if state.archive.approval.generation == Some(returned.ticket.generation()) {
-            state.archive.approval.accepted_completion = true;
+            if completed {
+                state.archive.approval.accepted_completion = true;
+            } else {
+                state.archive.approval.discharge(&returned.terminal);
+            }
         }
         // All actual owners, including original lease custody, release while
         // this same admission mutex excludes a successor.

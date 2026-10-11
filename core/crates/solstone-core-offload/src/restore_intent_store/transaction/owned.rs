@@ -305,10 +305,24 @@ impl TransactionReceipts {
 
 impl StagingFailure {
     pub(crate) fn disposition(&self) -> RestoreDisposition {
-        if matches!(self.evidence, StagingEvidence::Readback(_)) {
+        if matches!(self.evidence, StagingEvidence::Readback { .. }) {
             RestoreDisposition::Unverified
         } else {
             RestoreDisposition::Unattempted
+        }
+    }
+
+    /// No stage of this failure remains: none was created, or the unpublished
+    /// copy of a reaped read was removed. Nothing here settles the read.
+    pub(crate) fn removed(&self) -> bool {
+        match &self.evidence {
+            StagingEvidence::None => true,
+            StagingEvidence::Stage(error) => error.owned.is_none(),
+            StagingEvidence::Readback { cleanup, .. } => *cleanup == Cleanup::Complete,
+            StagingEvidence::Target(_)
+            | StagingEvidence::Unconsumed(_)
+            | StagingEvidence::ReadyTarget(_)
+            | StagingEvidence::Prepared(_) => false,
         }
     }
 
@@ -318,9 +332,8 @@ impl StagingFailure {
             retained_stage: match &self.evidence {
                 StagingEvidence::None => false,
                 StagingEvidence::Stage(error) => error.owned.is_some(),
-                StagingEvidence::Target(_)
-                | StagingEvidence::Unconsumed(_)
-                | StagingEvidence::Readback(_) => true,
+                StagingEvidence::Target(_) | StagingEvidence::Unconsumed(_) => true,
+                StagingEvidence::Readback { cleanup, .. } => *cleanup != Cleanup::Complete,
                 StagingEvidence::ReadyTarget(target) => {
                     let _ = target.journal_root();
                     true
@@ -331,7 +344,7 @@ impl StagingFailure {
                 }
             },
             readback: match &self.evidence {
-                StagingEvidence::Readback(error) => Some(error),
+                StagingEvidence::Readback { failure, .. } => Some(failure),
                 _ => None,
             },
         }

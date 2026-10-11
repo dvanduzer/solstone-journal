@@ -652,6 +652,7 @@ pub enum ArchiveReadState<'a> {
         file: &'a solstone_core_backup::archive_readback::ExactArchiveFile,
         target_identity: &'a solstone_core_journal_io::media::MediaIdentity,
         failure: &'a solstone_core_backup::archive_readback::ReadbackFailure,
+        cleanup: solstone_core_journal_io::media::Cleanup,
     },
 }
 

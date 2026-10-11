@@ -159,7 +159,7 @@ fn evidence(
                 "kind": "readback_failure", "repository": failed.file.repository_id,
                 "snapshot": failed.file.snapshot_id, "path": failed.file.archive_path,
                 "name": failed.file.name, "identity": failed.target_identity,
-                "reason": format!("{:?}", failed.failure.reason()),
+                "reason": format!("{:?}", failed.failure.reason()), "cleanup": failed.cleanup,
             }),
             HeldResource::Stage(stage) => {
                 serde_json::json!({"kind": "stage", "present_owner": stage.is_some()})
@@ -205,10 +205,12 @@ fn check_failed_read(
     assert_eq!(failed.file.name, file.name);
     assert_eq!(failed.file.archive_path, file.archive_path);
     assert_eq!(failed.file.snapshot_id, file.snapshot_id);
-    assert!(
+    // A reaped writer's unpublished copy is removed at once; an unknown one stays.
+    assert_eq!(
         payloads(owner.resources.carrier.journal_root().canonical_path())?
             .iter()
-            .any(|(_, identity, _)| *identity == failed.target_identity)
+            .any(|(_, identity, _)| *identity == failed.target_identity),
+        failed.cleanup != Cleanup::Complete
     );
     Ok(())
 }
@@ -2159,7 +2161,7 @@ mod owned_finish_qualification {
                 Ok(json!({"kind":"prepared","file":file_facts(file,target_identity),
                     "owner_address":format!("{media:p}"),"digest":media.digest(),"cleanup":cleanup}))
             }
-            ArchiveReadState::Readback { file, target_identity, failure } => {
+            ArchiveReadState::Readback { file, target_identity, failure, .. } => {
                 assert_eq!(failure.reason(), ReadbackError::NativeFailure);
                 Ok(json!({"kind":"readback_failure","file":file_facts(file,target_identity),
                     "owner_address":format!("{failure:p}"),"reason":format!("{:?}",failure.reason()),

@@ -265,9 +265,14 @@ fn read_facts(read: ArchiveReadState<'_>) -> Value {
         ArchiveReadState::Prepared { file, cleanup, .. } => json!({
             "state":"prepared", "name":file.name, "bytes":file.bytes, "cleanup":cleanup,
         }),
-        ArchiveReadState::Readback { file, failure, .. } => json!({
+        ArchiveReadState::Readback {
+            file,
+            failure,
+            cleanup,
+            ..
+        } => json!({
             "state":"readback", "name":file.name, "bytes":file.bytes,
-            "reason":failure.reason().to_string(),
+            "reason":failure.reason().to_string(), "cleanup":cleanup,
         }),
     }
 }
