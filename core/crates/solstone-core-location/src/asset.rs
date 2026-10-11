@@ -124,7 +124,7 @@ pub fn area_tier() -> Result<&'static AreaTier, AreaTierError> {
             AreaTier::parse(&bytes).map_err(|error| error.to_string())
         })
         .as_ref()
-        .map_err(|detail| AreaTierError::Format(detail.clone()))
+        .map_err(|detail| AreaTierError::Unavailable(detail.clone()))
 }
 
 #[cfg(test)]

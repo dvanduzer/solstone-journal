@@ -22,6 +22,8 @@ pub enum AreaTierError {
     Format(String),
     /// The file could not be found or read.
     Asset(crate::asset::AssetError),
+    /// The process could not load the bundled file; the detail says why.
+    Unavailable(String),
 }
 
 impl fmt::Display for AreaTierError {
@@ -29,6 +31,7 @@ impl fmt::Display for AreaTierError {
         match self {
             Self::Format(detail) => write!(formatter, "area tier file is malformed: {detail}"),
             Self::Asset(error) => write!(formatter, "{error}"),
+            Self::Unavailable(detail) => formatter.write_str(detail),
         }
     }
 }
