@@ -253,8 +253,11 @@ fn packaged_archive_approval_entry() -> TestResult {
     ))
     .map_err(|error| invalid(&format!("actual read admission: {error:?}")))?;
     let admitted_carrier = Arc::clone(read.carrier());
+    // The admitted read already holds this journal's exclusive lease, so the
+    // foreign carrier comes from another journal with its own lease.
+    let foreign_journal = tempfile::tempdir()?;
     let carrier = if input.case == "root_arc" {
-        let foreign_root = Arc::new(JournalRoot::open(&input.journal)?);
+        let foreign_root = Arc::new(JournalRoot::open(foreign_journal.path())?);
         let foreign_activity = ActivityLease::try_acquire(foreign_root)?;
         Arc::new(
             RootActivityCarrier::prepare(foreign_activity)
@@ -265,11 +268,7 @@ fn packaged_archive_approval_entry() -> TestResult {
     };
     let activity = Arc::clone(carrier.activity());
     let carrier_path = carrier.diagnostic_path();
-    let mut original_stages = vec![carrier_path.clone()];
-    if input.case == "root_arc" {
-        original_stages.push(admitted_carrier.diagnostic_path());
-        original_stages.sort();
-    }
+    let original_stages = vec![admitted_carrier.diagnostic_path()];
     let files = selected_files(
         &input.marks,
         &root.identity().observation_id(),
@@ -425,7 +424,13 @@ fn packaged_archive_approval_entry() -> TestResult {
                 .first()
                 .ok_or_else(|| invalid("first tuple missing"))?,
         )?;
-        assert_eq!(stages(&input.journal)?.len(), 2);
+        // The cancelled dump was killed and reaped before its run returned, so
+        // its unpublished stage is already gone; only the carrier remains.
+        assert!(failed.owner.resources.held.iter().all(|held| matches!(
+            held,
+            HeldResource::Readback(read) if read.cleanup == Cleanup::Complete
+        )));
+        assert_eq!(stages(&input.journal)?, vec![carrier_path.clone()]);
         evidence(
             "launched_cancel_response_blocked",
             &failed.owner,
@@ -470,7 +475,10 @@ fn packaged_archive_approval_entry() -> TestResult {
                         .iter()
                         .find(|stage| **stage != observed_carrier)
                         .ok_or_else(|| invalid("actual reservation missing"))?;
-                    fs::write(stage.join("payload"), b"native payload collision")
+                    fs::write(
+                        stage.join(READBACK_DOWNLOAD_LEAF),
+                        b"native payload collision",
+                    )
                 },
                 || create_archive_approval_batch(read, carrier, &expected),
             )
@@ -594,7 +602,7 @@ fn packaged_archive_approval_entry() -> TestResult {
                     .find(|stage| **stage != carrier_path)
                     .ok_or_else(|| invalid("collision stage missing"))?;
                 assert_eq!(
-                    fs::read(stage.join("payload"))?,
+                    fs::read(stage.join(READBACK_DOWNLOAD_LEAF))?,
                     b"native payload collision"
                 );
             }

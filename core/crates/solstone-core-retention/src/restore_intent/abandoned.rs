@@ -8,7 +8,8 @@
 //! its mark as already present. Marks and the ledger are untouched either way,
 //! so nothing is counted twice. Any other published state is held. A restore
 //! that ended mid-download, before its intent, is recognised only by its
-//! dedicated download leaf and loses that stage the same way.
+//! dedicated download leaf and loses that stage the same way, as does an
+//! approval or offer readback at the journal root by its own leaf.
 
 use std::sync::Arc;
 
@@ -84,6 +85,7 @@ mod linux {
 
     use super::super::{MarkRetirement, Obligation, RESTORE_DOWNLOAD_LEAF, selected_name};
     use super::*;
+    use crate::archive_approval::READBACK_DOWNLOAD_LEAF;
 
     type Hold = AbandonedRestoreHold;
 
@@ -121,10 +123,10 @@ mod linux {
         recovered
     }
 
-    /// A restore or legacy probe that ended mid-download, before any intent,
-    /// leaves a stage holding only the dedicated download leaf, or nothing if it
-    /// ended before creating it. Only such a stage, in a segment's parent
-    /// directory and named by no intent, is removed.
+    /// A restore, legacy probe or approval readback that ended mid-download
+    /// leaves a stage holding only its dedicated download leaf, or nothing if it
+    /// ended before creating it. Only such a stage, where that producer stages
+    /// and named by no intent, is removed.
     fn retire_unrecorded_downloads(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
         let Ok(census) = observe_obligations(activity.journal_root()) else {
             return Vec::new();
@@ -153,11 +155,11 @@ mod linux {
                             .to_str()
                             .is_some_and(|name| !referenced.contains(name)) =>
                 {
-                    Some((restore_stage_parent(relative)?, entry))
+                    Some((download_stage_location(relative)?, entry))
                 }
                 _ => None,
             })
-            .filter_map(|(parent, entry)| {
+            .filter_map(|((parent, leaf), entry)| {
                 let parent =
                     MediaDirectory::open(Arc::clone(activity.journal_root()), &parent).ok()?;
                 retire_unrecorded_stage(
@@ -165,7 +167,7 @@ mod linux {
                     &parent,
                     &entry.name,
                     entry.identity,
-                    OsStr::new(RESTORE_DOWNLOAD_LEAF),
+                    OsStr::new(leaf),
                 )
                 .ok()
                 .filter(|retired| *retired)
@@ -177,9 +179,11 @@ mod linux {
             .collect()
     }
 
+    /// Where a download stage may sit, with the only leaf it may hold there.
     /// Restores stage in a segment's parent: a day directory, or a stream
-    /// directory under it. Never the journal root, a segment or anywhere else.
-    fn restore_stage_parent(relative: &Path) -> Option<PathBuf> {
+    /// directory under it. Approval and offer readback stage at the journal
+    /// root. Never a segment or anywhere else.
+    fn download_stage_location(relative: &Path) -> Option<(PathBuf, &'static str)> {
         let parts = relative
             .components()
             .map(|part| match part {
@@ -190,11 +194,15 @@ mod linux {
         let day = |name: &str| name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit());
         let stream = |name: &str| !name.starts_with('.') && segment_key(name).is_none();
         match parts.as_slice() {
+            [_] => Some((PathBuf::new(), READBACK_DOWNLOAD_LEAF)),
             ["chronicle", day_name, _] if day(day_name) => {
-                Some(Path::new("chronicle").join(day_name))
+                Some((Path::new("chronicle").join(day_name), RESTORE_DOWNLOAD_LEAF))
             }
             ["chronicle", day_name, stream_name, _] if day(day_name) && stream(stream_name) => {
-                Some(Path::new("chronicle").join(day_name).join(stream_name))
+                Some((
+                    Path::new("chronicle").join(day_name).join(stream_name),
+                    RESTORE_DOWNLOAD_LEAF,
+                ))
             }
             _ => None,
         }

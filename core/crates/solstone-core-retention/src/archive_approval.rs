@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,6 +25,11 @@ use solstone_core_journal_io::media::{
 };
 
 use crate::marks::{Mark, MarkState, Register, RemovalClass, validate};
+
+/// The leaf of an approval or offer readback stage at the journal root, which
+/// holds only bytes read back from the backup. No other producer creates it,
+/// and with no extension it can never be an archived media name.
+pub(crate) const READBACK_DOWNLOAD_LEAF: &str = "readback-download";
 
 #[derive(Debug)]
 pub(crate) enum ArchiveApprovalError {
@@ -582,7 +588,7 @@ fn fill_approval(
             resources.held.push(HeldResource::Stage(Some(stage)));
             return Err(reason);
         }
-        let target = match stage.create_target() {
+        let target = match stage.create_named_target(OsStr::new(READBACK_DOWNLOAD_LEAF)) {
             Ok(target) => target,
             Err(failure) => {
                 resources

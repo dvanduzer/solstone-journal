@@ -248,15 +248,19 @@ fn download_stage_without_intent_is_recovered_and_deletion_then_proceeds() {
 #[test]
 fn any_other_stage_without_intent_is_held_untouched() {
     let leaf = super::super::RESTORE_DOWNLOAD_LEAF;
+    let readback = crate::archive_approval::READBACK_DOWNLOAD_LEAF;
     for (relative, leaves) in [
         // A shared leaf is also how removal and readback stages look.
         ("chronicle/20261009/.tmp-offload-a", vec!["payload"]),
         ("chronicle/20261009/.tmp-offload-b", vec!["audio.flac"]),
         ("chronicle/20261009/.tmp-offload-c", vec![leaf, "extra"]),
-        // Never at the journal root, where approval readback stages live, or
-        // inside a segment.
+        // The root holds only readback stages, and only by their own leaf;
+        // an older readback stage with the shared leaf stays held.
         (".tmp-offload-d", vec![leaf]),
         (".tmp-offload-r", vec!["payload"]),
+        (".tmp-offload-s", vec![readback, "extra"]),
+        ("chronicle/20261009/.tmp-offload-t", vec![readback]),
+        // Never inside a segment.
         ("chronicle/20261009/120000_60/.tmp-offload-e", vec![leaf]),
     ] {
         let temp = tempfile::tempdir().unwrap();
@@ -290,4 +294,21 @@ fn empty_stage_without_intent_in_a_restore_location_is_removed() {
     assert!(!day.exists() && !stream.exists());
     // Inside a segment is not where restores stage; it stays held.
     assert!(segment.is_dir());
+}
+
+#[test]
+fn readback_stage_without_intent_at_the_root_is_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let readback = unrecorded(
+        temp.path(),
+        ".tmp-offload-0123456789abcdef0123456789abcdef",
+        &[crate::archive_approval::READBACK_DOWNLOAD_LEAF],
+    );
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+    let activity = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+    let recovered = recover_abandoned_restores(&activity);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].outcome, Ok(AbandonedRestoreRelease::Undone));
+    assert!(!readback.exists());
+    assert!(observe_obligations(&root).unwrap().entries().is_empty());
 }
