@@ -2372,7 +2372,7 @@ mod tests {
                     .unwrap()
                     .iter()
                     .position(|(t, _)| t == &name)
-                    .expect("script entry for talent");
+                    .unwrap_or_else(|| panic!("script entry for talent {name}"));
                 let (talent_name, action) = self.script.lock().unwrap().remove(idx);
                 let talent_dir = self.journal.join("talents").join(
                     solstone_core_journal_io::cortex_use::talent_directory_name(&talent_name),
@@ -2468,15 +2468,15 @@ mod tests {
                             },
                         );
                     }
-                    "non_retryable_error" => {
+                    "non_retryable_error" | "incomplete_json_length" => {
                         fs::write(
                             &events_path,
                             serde_json::to_string(&serde_json::json!({
                                 "use_id": use_id,
                                 "event": "error",
                                 "terminal": true,
-                                "reason_code": "provider_request_rejected",
-                                "retryable": false,
+                                "reason_code": if action == "incomplete_json_length" { action } else { "provider_request_rejected" },
+                                "retryable": action == "incomplete_json_length",
                             }))
                             .unwrap()
                                 + "\n",
@@ -2668,6 +2668,122 @@ mod tests {
             }
             Ok(report)
         }
+    }
+
+    #[test]
+    fn old_day_length_failure_recovers_and_runs_owed_daily_units() {
+        let journal = tempdir().unwrap();
+        let initial = context(journal.path());
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 10, 10)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        let mut ctx = ThinkContext::new(journal.path(), DAY.into(), initial.day_dir, now)
+            .unwrap()
+            .with_talent_roots(initial.talent_root, initial.apps_root);
+        let segment = "090000_300";
+        let dir = journal
+            .path()
+            .join(format!("chronicle/{DAY}/default/{segment}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("screen.jsonl"),
+            "{\"timestamp\":0,\"content\":{\"text\":\"synthetic screen\"}}\n",
+        )
+        .unwrap();
+        bump_stream_marker(journal.path(), DAY).unwrap();
+        for (name, schedule, priority, output) in [
+            ("sense", "segment", 1, "json"),
+            ("screen", "segment", 2, "md"),
+            ("entities:detection", "segment", 2, "json"),
+            ("schedule", "daily", 3, "json"),
+        ] {
+            let hook = if schedule == "daily" {
+                ",\"hook\":{\"post\":\"schedule\"}"
+            } else {
+                ""
+            };
+            fs::write(ctx.talent_root.join(format!("{name}.md")), format!(
+                "{{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"{schedule}\",\"priority\":{priority},\"output\":\"{output}\"{hook}\n}}\n"
+            )).unwrap();
+        }
+        let cortex = Arc::new(ScriptedSegmentCortex {
+            journal: journal.path().to_owned(),
+            day: DAY.into(),
+            segment: segment.into(),
+            dispatch_count: Mutex::new(0),
+            script: Mutex::new(vec![
+                ("sense".into(), "sense_active_success"),
+                ("entities:detection".into(), "success"),
+                ("screen".into(), "incomplete_json_length"),
+            ]),
+            dispatched_uses: Mutex::new(Vec::new()),
+        });
+        ctx = ctx.with_boundary(cortex.clone());
+        for recovered in [false, true] {
+            if recovered {
+                cortex.script.lock().unwrap().extend([
+                    ("sense".into(), "sense_active_success"),
+                    ("entities:detection".into(), "success"),
+                    ("screen".into(), "success"),
+                    ("schedule".into(), "daily_success"),
+                ]);
+            }
+            let mut run_log = log(journal.path());
+            let runner = RecordingPhaseProcessRunner::new([
+                PhaseProcessOutcome::Exited(0),
+                PhaseProcessOutcome::Exited(0),
+            ]);
+            let result = run_with_phase_process(
+                &ctx,
+                &mut run_log,
+                &ThinkArgs::default(),
+                1,
+                Some(Duration::from_secs(610)),
+                &runner,
+                &solstone_core_system::process::ChildLaunchContext::default(),
+            )
+            .unwrap();
+            assert_eq!(result.failed == 0, recovered, "{result:?}");
+            assert_eq!(blocked_segments(&ctx).unwrap().is_empty(), recovered);
+            assert_eq!(marker_generation(journal.path()).is_some(), recovered);
+            assert!(cortex.script.lock().unwrap().is_empty());
+        }
+        let names = cortex
+            .dispatched_uses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        // Whole-day repair currently redispatches the failed segment's talents;
+        // the worker-local length retry does not add another segment pass.
+        assert_eq!(names.iter().filter(|name| *name == "sense").count(), 2);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == "entities:detection")
+                .count(),
+            2
+        );
+        assert_eq!(names.iter().filter(|name| *name == "screen").count(), 2);
+        assert_eq!(names.last().map(String::as_str), Some("schedule"));
+        let mut run_log = log(journal.path());
+        let runner = RecordingPhaseProcessRunner::new([]);
+        let settled = run_with_phase_process(
+            &ctx,
+            &mut run_log,
+            &ThinkArgs::default(),
+            1,
+            Some(Duration::from_secs(610)),
+            &runner,
+            &solstone_core_system::process::ChildLaunchContext::default(),
+        )
+        .unwrap();
+        assert_eq!(settled.failed, 0);
+        assert_eq!(cortex.dispatched_uses.lock().unwrap().len(), names.len());
     }
 
     #[test]

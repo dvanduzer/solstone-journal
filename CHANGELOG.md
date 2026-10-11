@@ -25,6 +25,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- when a screen summary runs out of room, your journal now retries it more concisely while keeping the same source material.
+
 - on mac, installing local thinking or transcription now also clears quarantine, macos's marker for downloaded files, inside the downloaded folder.
 
 - a connected agent can now read transcripts of imported audio, and reads imported AI conversations and imported text transcripts as plain text with their times. before, imported audio couldn't be opened, and the others came back as raw data.
