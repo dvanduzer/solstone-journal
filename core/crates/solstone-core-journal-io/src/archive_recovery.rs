@@ -15,7 +15,7 @@ const RESERVATION_PREFIX: &str = ".tmp-offload-";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RecoveryLockObservation {
+pub struct RecoveryLockObservation {
     pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) size: u64,
@@ -198,3 +198,9 @@ impl ArchiveRecoveryBinding {
 
 #[cfg(test)]
 mod tests;
+
+mod recovered;
+pub use recovered::{
+    ArchiveRecoveryAdmissionFailure, RecoveredArchiveReservation, RecoveryAdmissionError,
+    RecoveryPopulationFailure,
+};

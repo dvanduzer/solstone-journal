@@ -73,6 +73,10 @@ const LIB: &str = include_str!("../src/lib.rs");
 
 const CHILD_SOURCES: &[(&str, &str)] = &[
     (
+        "mark_mutation::recovered",
+        include_str!("../src/mark_mutation/recovered.rs"),
+    ),
+    (
         "archive_offer::owned",
         include_str!("../src/archive_offer/owned.rs"),
     ),

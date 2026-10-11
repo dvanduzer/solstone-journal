@@ -351,6 +351,15 @@ impl OriginObservationFailure {
 
 impl LocalArchiveOrigin {
     #[cfg(target_os = "linux")]
+    pub(crate) fn revalidate_reboot_of(
+        &self,
+        old: &ArchiveOriginEvidence,
+    ) -> Result<(), OriginError> {
+        self.revalidate()?;
+        compare_reboot(old, self.evidence())?;
+        self.revalidate()
+    }
+    #[cfg(target_os = "linux")]
     pub(crate) fn root(&self) -> &Arc<JournalRoot> {
         &self.root
     }
@@ -368,6 +377,34 @@ impl LocalArchiveOrigin {
             Err(OriginError::Unsupported(OriginUnsupported::Platform))
         }
     }
+}
+
+// Current-only mount IDs and retained sysfs inodes are deliberately absent
+// from this cross-boot relation. Within-operation validation is unchanged.
+#[cfg(any(target_os = "linux", test))]
+fn compare_reboot(
+    old: &ArchiveOriginEvidence,
+    current: &ArchiveOriginEvidence,
+) -> Result<(), OriginError> {
+    validate_evidence(&old.0).map_err(|_| OriginError::Malformed(OriginInput::Evidence))?;
+    validate_evidence(&current.0).map_err(|_| OriginError::Malformed(OriginInput::Evidence))?;
+    if old.0.boot_id == current.0.boot_id {
+        return Err(OriginError::Changed(OriginRelation::Boot));
+    }
+    if old.0.machine_app_id_sha256 != current.0.machine_app_id_sha256 {
+        return Err(OriginError::Changed(OriginRelation::Machine));
+    }
+    if old.0.root_identity != current.0.root_identity
+        || old.0.canonical_chain != current.0.canonical_chain
+    {
+        return Err(OriginError::Changed(OriginRelation::CanonicalChain));
+    }
+    let mut stable = current.0.clone();
+    stable.boot_id.clone_from(&old.0.boot_id);
+    if stable != old.0 {
+        return Err(OriginError::Changed(OriginRelation::Topology));
+    }
+    Ok(())
 }
 
 pub fn observe_archive_origin(
@@ -1181,6 +1218,41 @@ mod tests {
             },
             partition: Some(1),
         })
+    }
+
+    #[test]
+    fn cross_boot_relation_checks_all_stable_evidence_without_weakening_current_comparison() {
+        let old = evidence();
+        let mut current = old.clone();
+        current.0.boot_id = "22222222-2222-2222-2222-222222222222".into();
+        assert!(compare_reboot(&old, &current).is_ok());
+        assert!(matches!(
+            compare_reboot(&old, &old),
+            Err(OriginError::Changed(OriginRelation::Boot))
+        ));
+        for cut in 0..8 {
+            let mut changed = current.clone();
+            match cut {
+                0 => changed.0.machine_app_id_sha256 = "b".repeat(64),
+                1 => {
+                    changed.0.root_identity =
+                        "native-root-v1:unix:0000000000010306:0000000000000003".into();
+                    changed.0.canonical_chain[1]
+                        .identity
+                        .clone_from(&changed.0.root_identity);
+                }
+                2 => {
+                    changed.0.canonical_chain[0].identity =
+                        "native-root-v1:unix:0000000000010306:0000000000000004".into()
+                }
+                3 => changed.0.canonical_chain[1].name = b"moved".to_vec(),
+                4 => changed.0.namespace_device.minor = 1,
+                5 => changed.0.partition = Some(2),
+                6 => changed.0.filesystem = "other".into(),
+                _ => changed.0.storage_topology = "other".into(),
+            }
+            assert!(compare_reboot(&old, &changed).is_err(), "cut {cut}");
+        }
     }
 
     #[test]
