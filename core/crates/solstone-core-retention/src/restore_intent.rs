@@ -8,6 +8,9 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::archive_proof::{ArchiveFileProof, OffloadProof};
+use crate::mark_mutation::PlannedMarkMutation;
+use crate::{Mark, Register, RemovalClass, Target};
 use serde::{Deserialize, Serialize};
 use solstone_core_format::segment::segment_key;
 use solstone_core_journal_io::activity_obligations::{MAX_INTENT_BYTES, intent_filename};
@@ -17,11 +20,8 @@ use solstone_core_journal_io::media::{
     PublicationEffect, PublicationReceipt,
 };
 use solstone_core_journal_io::paths::{DEFAULT_STREAM, Segment, SegmentLayout};
-use solstone_core_retention::archive_proof::{ArchiveFileProof, OffloadProof};
-use solstone_core_retention::mark_mutation::PlannedMarkMutation;
-use solstone_core_retention::{Mark, Register, RemovalClass, Target};
 
-use solstone_core_retention::archive_catalog::{
+use crate::archive_catalog::{
     ArchiveWitness, LegacyRestoreBinding, LegacyRestoreOperation, RestoreDisposition,
     RestoreFileV2, RestoreOperation, SegmentCatalog,
 };
@@ -53,7 +53,7 @@ impl io::Write for BoundedDocument {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RepairHold {
+pub enum RepairHold {
     UnreadableIntent,
     OversizedIntent,
     InvalidIntent,
@@ -89,7 +89,7 @@ fn same_platform(left: MediaIdentity, right: MediaIdentity) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RestoreLocator {
+pub struct RestoreLocator {
     pub target: Target,
     pub segment: String,
     pub layout: SegmentLayout,
@@ -138,7 +138,7 @@ impl RestoreLocator {
 /// Independent destination evidence, never compared to archived source provenance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DestinationObservation {
+pub struct DestinationObservation {
     pub root: String,
     pub parent: MediaIdentity,
     pub segment: MediaIdentity,
@@ -147,7 +147,7 @@ pub(crate) struct DestinationObservation {
 /// Diagnostic owned-stage evidence only. Restart cannot reconstruct ownership.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StageEvidence {
+pub struct StageEvidence {
     pub parent: MediaIdentity,
     pub directory: MediaIdentity,
     pub leaf: MediaIdentity,
@@ -158,7 +158,7 @@ pub(crate) struct StageEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum MarkRetirement {
+pub enum MarkRetirement {
     NoMark,
     Exact { plan: Box<PlannedMarkMutation> },
     PreserveLegacy { expected: Option<Box<Mark>> },
@@ -252,7 +252,7 @@ impl MarkRetirement {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Obligation {
+pub enum Obligation {
     Pending,
     Complete,
     NotRequired,
@@ -262,7 +262,7 @@ pub(crate) enum Obligation {
 /// after a real native mutation. `error` is diagnostic, never an effect classifier.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PublicationFacts {
+pub struct PublicationFacts {
     pub effect: PublicationEffect,
     pub confirmation: Confirmation,
     pub file_durability: Durability,
@@ -288,7 +288,7 @@ impl From<&PublicationReceipt> for PublicationFacts {
 
 /// A failed state transition cannot erase the native invocation's effect.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct OutcomeRefusal {
+pub struct OutcomeRefusal {
     pub hold: RepairHold,
     pub facts: PublicationFacts,
     pub effects: AttemptEffects,
@@ -296,7 +296,7 @@ pub(crate) struct OutcomeRefusal {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ConfirmedContent {
+pub struct ConfirmedContent {
     pub identity: MediaIdentity,
     pub digest: MediaDigest,
 }
@@ -314,7 +314,7 @@ impl From<MediaObservation> for ConfirmedContent {
 /// native metadata adapter must confirm exact bytes before any publication.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RestoreIntent {
+pub struct RestoreIntent {
     version: u32,
     pub locator: RestoreLocator,
     pub witness: ArchiveWitness,
@@ -692,7 +692,7 @@ impl RestoreIntent {
     }
 
     /// Evidence classification only; cleanup still needs the actual native owner.
-    pub(super) fn no_effect_outcome(&self) -> bool {
+    pub fn no_effect_outcome(&self) -> bool {
         self.confirmed.is_none()
             && self.outcome.as_ref().is_some_and(|outcome| {
                 outcome.identity.is_none()
@@ -821,7 +821,7 @@ impl RestoreIntent {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AttemptEffects {
+pub struct AttemptEffects {
     pub files: u64,
     pub bytes: u64,
 }
@@ -849,7 +849,7 @@ impl AttemptEffects {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CurrentContent {
+pub enum CurrentContent {
     Missing,
     Present(ConfirmedContent),
     Conflict,
@@ -857,7 +857,7 @@ pub(crate) enum CurrentContent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PublicationDecision {
+pub enum PublicationDecision {
     Missing,
     AlreadyPresent,
     Conflict,
@@ -865,7 +865,7 @@ pub(crate) enum PublicationDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RegisterDecision {
+pub enum RegisterDecision {
     NoMark,
     AwaitingSuccessfulEvent,
     AwaitingMarker,
@@ -879,7 +879,7 @@ pub(crate) enum RegisterDecision {
 /// Data only. In particular Missing/Ready cannot be used as capabilities after
 /// releasing exclusion. Native admission and owning CAS must run at execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RecoveryDecision {
+pub struct RecoveryDecision {
     pub publication: PublicationDecision,
     pub event: RestoreOperation,
     pub event_recorded: bool,
@@ -940,7 +940,7 @@ fn register_decision(
     RegisterDecision::Ready(plan.clone())
 }
 
-pub(crate) fn inspect_recovery(
+pub fn inspect_recovery(
     intent: &RestoreIntent,
     destination: &DestinationObservation,
     catalog: &SegmentCatalog,
@@ -1122,7 +1122,7 @@ pub(crate) fn inspect_recovery(
     })
 }
 
-pub(crate) fn content_observation(
+pub fn content_observation(
     intent: &RestoreIntent,
     observation: io::Result<Option<MediaObservation>>,
 ) -> CurrentContent {
@@ -1136,21 +1136,31 @@ pub(crate) fn content_observation(
     }
 }
 
-pub(crate) fn selected_name(intent: &RestoreIntent) -> &OsStr {
+pub fn selected_name(intent: &RestoreIntent) -> &OsStr {
     OsStr::new(&intent.witness.file.name)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::arithmetic_side_effects
+)]
 mod legacy_tests;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::arithmetic_side_effects
+)]
 pub(super) mod tests {
     use super::*;
-    use solstone_core_retention::archive_catalog::{ArchiveManifest, OffloadFile};
-    use solstone_core_retention::archive_proof::{AcceptedProcessingObservation, OffloadOffer};
-    use solstone_core_retention::{MarkId, MarkState, Proposal};
+    use crate::archive_catalog::{ArchiveManifest, OffloadFile};
+    use crate::archive_proof::{AcceptedProcessingObservation, OffloadOffer};
+    use crate::{MarkId, MarkState, Proposal};
 
     pub fn identity(inode: u64) -> MediaIdentity {
         MediaIdentity::Unix { device: 1, inode }
@@ -1475,6 +1485,20 @@ pub(super) mod tests {
 
     #[test]
     fn strict_small_document_roundtrip_preserves_windows_ids_and_unknown_boot() {
+        for (with_mark, captured) in [
+            (
+                false,
+                include_bytes!("restore_intent/fixtures/without-mark.json").as_slice(),
+            ),
+            (
+                true,
+                include_bytes!("restore_intent/fixtures/with-mark.json").as_slice(),
+            ),
+        ] {
+            let original = fixture(with_mark);
+            assert_eq!(original.encode().unwrap(), captured);
+            assert_eq!(RestoreIntent::decode(Ok(captured)).unwrap(), original);
+        }
         let mut intent = fixture(true);
         intent.destination.root =
             "native-root-v1:windows:000000000000000c:000102030405060708090a0b0c0d0e0f".into();

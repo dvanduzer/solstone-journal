@@ -4,11 +4,11 @@
 //! Private qualification and receipt-only transfer after actual lower settlement.
 
 use super::*;
-#[cfg(unix)]
-use crate::restore_intent::{MarkRetirement, PublicationFacts};
 use solstone_core_journal_io::media::{MediaRead, RemovalReceipt};
 #[cfg(unix)]
 use solstone_core_journal_io::media::{OriginalName, RemovalEffect};
+#[cfg(unix)]
+use solstone_core_retention::restore_intent::{MarkRetirement, PublicationFacts};
 
 pub(crate) struct SettlementFailure {
     pub(crate) reason: &'static str,

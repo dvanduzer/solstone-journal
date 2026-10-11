@@ -33,12 +33,12 @@ use crate::ledger::writer::{
 };
 use crate::restore::owned::RestoreRegisterRefusal;
 use crate::restore::owned::read::RestoreRead;
-use crate::restore_intent::{
+use crate::restore_prepared::PreparedRestore;
+use solstone_core_retention::restore_intent::{
     AttemptEffects, CurrentContent, Obligation, PublicationDecision, RecoveryDecision,
     RegisterDecision, RepairHold, RestoreIntent, StageEvidence, content_observation,
     inspect_recovery, selected_name,
 };
-use crate::restore_prepared::PreparedRestore;
 
 #[derive(Debug)]
 pub(super) enum Hold {
@@ -837,7 +837,8 @@ impl TransactionOutcome<'_, '_> {
                 let confirmed_live = self.live_matches()?;
                 self.effect_check(commit)?;
                 let intent = &self.record()?.intent;
-                let crate::restore_intent::MarkRetirement::Exact { plan } = &intent.retirement
+                let solstone_core_retention::restore_intent::MarkRetirement::Exact { plan } =
+                    &intent.retirement
                 else {
                     return Err(Hold::Register);
                 };
@@ -905,7 +906,7 @@ impl TransactionOutcome<'_, '_> {
     }
 
     fn unchanged_mark(&self) -> Result<(), Hold> {
-        use crate::restore_intent::MarkRetirement;
+        use solstone_core_retention::restore_intent::MarkRetirement;
         let intent = &self.record()?.intent;
         let marks = review_context::load_at_root(self.owner.root())
             .map_err(|error| Hold::Admission(format!("{error:?}")))?;
@@ -931,7 +932,7 @@ impl TransactionOutcome<'_, '_> {
         ) || receipt.identity.is_some()
             || self.effects != AttemptEffects::default()
             || self.record()?.intent.outcome.as_ref()
-                != Some(&crate::restore_intent::PublicationFacts::from(receipt))
+                != Some(&solstone_core_retention::restore_intent::PublicationFacts::from(receipt))
         {
             return Err(Hold::Retirement);
         }

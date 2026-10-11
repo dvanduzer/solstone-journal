@@ -1154,7 +1154,7 @@ mod tests {
 
     #[cfg(unix)]
     use chrono::DateTime;
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     use chrono::FixedOffset;
     use serde_json::json;
     #[cfg(unix)]

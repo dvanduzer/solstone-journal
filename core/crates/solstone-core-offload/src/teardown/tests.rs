@@ -16,8 +16,8 @@ mod unix {
     use super::super::*;
     use crate::ledger::{append_offload_event, ledger_path_for_day};
     use crate::recovery::{IntentObservation, RecoveryObligation, observe_obligations};
-    use crate::restore_intent::{ConfirmedContent, Obligation};
     use solstone_core_journal_io::activity_obligations::RecoveryObservationFailure;
+    use solstone_core_retention::restore_intent::{ConfirmedContent, Obligation};
 
     struct Fixture {
         temp: tempfile::TempDir,
@@ -292,7 +292,7 @@ mod unix {
     fn recorded_pending_and_serialized_complete_copied_intents_all_hold() {
         for complete in [false, true] {
             let f = Fixture::new();
-            let mut intent = crate::restore_intent::tests::fixture(false);
+            let mut intent = crate::test_restore_intent::fixture(false);
             assert_ne!(intent.destination.root, f.root.identity().observation_id());
             if complete {
                 intent.event.files[0].disposition = RestoreDisposition::AlreadyPresent;

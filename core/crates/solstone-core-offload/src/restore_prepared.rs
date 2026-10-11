@@ -14,7 +14,7 @@ use solstone_core_retention::{archive_catalog::read_complete_catalog, review_con
 use solstone_core_segment::output_attempt::OutputClaims;
 use solstone_core_segment::{OwnerDeletionState, RetainedOwnerDeletion};
 
-use crate::restore_intent::{
+use solstone_core_retention::restore_intent::{
     DestinationObservation, RecoveryDecision, RepairHold, RestoreIntent, RestoreLocator,
     content_observation, inspect_recovery, selected_name,
 };
@@ -219,10 +219,10 @@ impl PreparedRestore {
 mod tests {
     use super::*;
     use crate::ledger;
-    use crate::restore_intent::tests::{fixture, register};
-    use crate::restore_intent::{AttemptEffects, PublicationDecision};
+    use crate::test_restore_intent::{fixture, register};
     use sha2::{Digest, Sha256};
     use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
+    use solstone_core_retention::restore_intent::{AttemptEffects, PublicationDecision};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;

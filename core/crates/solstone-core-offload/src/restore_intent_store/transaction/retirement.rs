@@ -82,7 +82,7 @@ impl TransactionOutcome<'_, '_> {
                     && self.record.as_ref().is_some_and(|record| {
                         record.intent.no_effect_outcome()
                             && record.intent.outcome.as_ref()
-                                == Some(&crate::restore_intent::PublicationFacts::from(receipt))
+                                == Some(&solstone_core_retention::restore_intent::PublicationFacts::from(receipt))
                     })
             });
         let record = self.record()?;
