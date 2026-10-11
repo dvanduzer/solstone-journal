@@ -32,6 +32,7 @@ use crate::ledger::writer::{
     append_legacy_restore_operation, append_restore_operation,
 };
 use crate::restore::owned::RestoreRegisterRefusal;
+use crate::restore::owned::read::RestoreRead;
 use crate::restore_intent::{
     AttemptEffects, CurrentContent, Obligation, PublicationDecision, RecoveryDecision,
     RegisterDecision, RepairHold, RestoreIntent, StageEvidence, content_observation,
@@ -262,7 +263,7 @@ fn current_content(owner: &Owner<'_, '_>, intent: &RestoreIntent) -> Result<Curr
 impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
     pub(crate) fn read(
         destination: PreparedRestore,
-        operation: &'operation mut ReadOperation<'clock>,
+        operation: &'operation mut impl RestoreRead<'clock>,
         witness: ArchiveWitness,
         required_capacity: u64,
     ) -> Result<Self, Box<StagingFailure>> {
@@ -271,7 +272,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
 
     pub(crate) fn read_legacy(
         destination: PreparedRestore,
-        operation: &'operation mut ReadOperation<'clock>,
+        operation: &'operation mut impl RestoreRead<'clock>,
         witness: ArchiveWitness,
         required_capacity: u64,
         binding: LegacyRestoreBinding,
@@ -287,29 +288,29 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
 
     fn read_source(
         destination: PreparedRestore,
-        operation: &'operation mut ReadOperation<'clock>,
+        operation: &'operation mut impl RestoreRead<'clock>,
         witness: ArchiveWitness,
         required_capacity: u64,
         legacy_binding: Option<LegacyRestoreBinding>,
     ) -> Result<Self, Box<StagingFailure>> {
-        let carrier = Arc::clone(operation.carrier());
+        let carrier = Arc::clone(operation.as_read().carrier());
         let owner = Owner {
             carrier,
             destination,
-            admission: Admission::Readback(operation),
+            admission: Admission::Readback(operation.as_read()),
             media: None,
         };
         let preflight = (|| {
-            if !Arc::ptr_eq(operation.journal_root(), owner.root()) {
+            if !Arc::ptr_eq(operation.as_read().journal_root(), owner.root()) {
                 return Err(Hold::Repair(RepairHold::UnboundWitness));
             }
             if let Some(binding) = &legacy_binding {
-                if binding.repository_id != operation.repository_id()
+                if binding.repository_id != operation.as_read().repository_id()
                     || !binding.legacy_manifest.files.contains(&witness)
                 {
                     return Err(Hold::Repair(RepairHold::UnboundWitness));
                 }
-            } else if witness.repository_id.as_deref() != Some(operation.repository_id())
+            } else if witness.repository_id.as_deref() != Some(operation.as_read().repository_id())
                 || witness.layout != Some(owner.destination.locator().layout)
                 || witness.segment_dir.as_ref() != Some(&owner.destination.locator().target.dir)
             {
@@ -431,7 +432,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         let owner = Owner {
             carrier,
             destination,
-            admission: Admission::Readback(operation),
+            admission: Admission::Readback(operation.as_read()),
             media: Some(media),
         };
         Ok(Self {

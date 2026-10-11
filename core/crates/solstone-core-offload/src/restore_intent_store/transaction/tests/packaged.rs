@@ -394,13 +394,15 @@ fn finished_native_facts(
 #[test]
 #[ignore = "requires a copied current package and synthetic direct Native finish fixture"]
 fn packaged_native_restore_finish_entry() {
-    use crate::restore::owned::{RestoreFinishRefusal, restore_bound_day};
+    use crate::restore::owned::{RestoreFinishRefusal, restore_owned_bound_day};
     use solstone_core_backup_runtime::{
-        DirectReadFinishState, UreqHttpTransport, admit_prepared_archive_read_installed,
+        DirectReadFinishState, UreqHttpTransport, admit_prepared_archive_owned_read_installed,
     };
     use solstone_core_journal_io::activity::ActivityAdmissionError;
     use solstone_core_retention::archive_proof::AcceptedProcessingObservation;
     use std::time::Instant;
+
+    use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
 
     struct OwnedClock(Instant);
     impl Clock for OwnedClock {
@@ -451,27 +453,27 @@ fn packaged_native_restore_finish_entry() {
     let ledger = crate::ledger::writer::append_archive_witness(&root, &proof, 1).unwrap();
     assert_eq!(ledger.confirmation(), LedgerConfirmation::Confirmed);
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(OwnedClock(Instant::now()));
-    let prepared = PreparedArchiveOperation::prepare_owned(
+    let prepared = OwnedPreparedArchiveOperation::prepare(
         Arc::clone(&root),
         ArchiveBudget::new(clock.as_ref()).unwrap(),
         Arc::clone(&clock),
     )
-    .unwrap();
+    .unwrap_or_else(|_| panic!("typed prepared fixture admission failed"));
     let lease = Arc::downgrade(prepared.activity());
     let carrier = Arc::downgrade(prepared.carrier());
-    let installed = admit_prepared_archive_read_installed(
+    let installed = admit_prepared_archive_owned_read_installed(
         prepared,
         input.repository_id.clone(),
         &input.restic_path,
         "2.0.40",
         &UreqHttpTransport,
     )
-    .unwrap();
+    .unwrap_or_else(|_| panic!("typed installed fixture admission failed"));
     let (read, finish) = installed.into_parts();
     assert!(Arc::ptr_eq(read.carrier(), finish.carrier()));
-    assert!(Arc::ptr_eq(read.owned_clock().unwrap(), &clock));
+    assert!(Arc::ptr_eq(read.owned_clock(), &clock));
     assert!(Arc::ptr_eq(finish.owned_clock(), &clock));
-    let outcome = restore_bound_day(read, &proof.target.day, 2);
+    let outcome = restore_owned_bound_day(read, &proof.target.day, 2);
     assert_eq!(outcome.report().status, "ok", "{:?}", outcome.report());
     assert_eq!(outcome.report().files_restored, 1);
     assert_eq!(outcome.report().bytes_restored, input.bytes);
@@ -493,10 +495,7 @@ fn packaged_native_restore_finish_entry() {
             Err(_) => panic!("genuine Native settlement remained held"),
         };
         let facts = finished_native_facts(report.files().next().unwrap(), input.bytes, false);
-        let completed = match finish.finish(settled).into_owned_hold() {
-            Ok(value) => value,
-            Err(_) => panic!("original owned Runtime finish must close"),
-        };
+        let completed = finish.finish_owned(settled);
         assert_eq!(completed.state(), DirectReadFinishState::Completed);
         assert!(Arc::ptr_eq(completed.owned_clock(), &clock));
         let retirement = completed.retirement().unwrap();
@@ -512,7 +511,7 @@ fn packaged_native_restore_finish_entry() {
             Err(ActivityAdmissionError::Busy)
         ));
         assert!(
-            PreparedArchiveOperation::prepare_owned(
+            OwnedPreparedArchiveOperation::prepare(
                 Arc::clone(&root),
                 ArchiveBudget::new(clock.as_ref()).unwrap(),
                 Arc::clone(&clock)
@@ -528,29 +527,26 @@ fn packaged_native_restore_finish_entry() {
             carrier.upgrade().is_none(),
             "settled report must retain no carrier"
         );
-        let next = PreparedArchiveOperation::prepare_owned(
+        let next = OwnedPreparedArchiveOperation::prepare(
             Arc::clone(&root),
             ArchiveBudget::new(clock.as_ref()).unwrap(),
             Arc::clone(&clock),
         )
-        .unwrap();
-        let second = admit_prepared_archive_read_installed(
+        .unwrap_or_else(|_| panic!("typed next fixture admission failed"));
+        let second = admit_prepared_archive_owned_read_installed(
             next,
             input.repository_id.clone(),
             &input.restic_path,
             "2.0.40",
             &UreqHttpTransport,
         )
-        .unwrap();
+        .unwrap_or_else(|_| panic!("typed second fixture admission failed"));
         let (second_read, second_finish) = second.into_parts();
         let second_read = match second_read.settle_direct() {
             Ok(value) => value,
             Err(_) => panic!("fresh installed read must settle"),
         };
-        let second = match second_finish.finish(second_read).into_owned_hold() {
-            Ok(value) => value,
-            Err(_) => panic!("fresh owned Runtime result must close"),
-        };
+        let second = second_finish.finish_owned(second_read);
         assert_eq!(second.state(), DirectReadFinishState::Completed);
         drop(second);
         assert_eq!(
@@ -587,10 +583,8 @@ fn packaged_native_restore_finish_entry() {
             "finish refusal is independent of prior report"
         );
         let before = finished_native_facts(held.files().next().unwrap(), input.bytes, true);
-        let held = match held.into_owned_hold() {
-            Ok(value) => value,
-            Err(_) => panic!("original owned Native read must close"),
-        };
+        // Already closed by the typed Native return; no generic conversion exists here.
+        let held = *held;
         assert!(std::ptr::eq(Arc::as_ptr(held.carrier()), carrier.as_ptr()));
         let unknown = finish.into_unknown();
         let custody = std::thread::spawn(move || (held, unknown)).join().unwrap();
@@ -620,7 +614,7 @@ fn packaged_native_restore_finish_entry() {
             Err(ActivityAdmissionError::Busy)
         ));
         assert!(
-            PreparedArchiveOperation::prepare_owned(
+            OwnedPreparedArchiveOperation::prepare(
                 Arc::clone(&root),
                 ArchiveBudget::new(clock.as_ref()).unwrap(),
                 Arc::clone(&clock)

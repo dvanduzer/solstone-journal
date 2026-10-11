@@ -7,7 +7,8 @@ use super::*;
 use crate::restore_intent::AttemptEffects;
 use crate::restore_intent_store::transaction::{SettledTransaction, SettlementFailure};
 use solstone_core_backup::archive_readback::{
-    HeldDirectRead, OwnedDirectReadHold, OwnedHeldDirectRead, ReadbackError, SettledDirectRead,
+    HeldDirectRead, OwnedDirectReadHold, OwnedHeldDirectRead, OwnedSettledDirectRead,
+    ReadbackError, SettledDirectRead,
 };
 use solstone_core_journal_io::media::RootActivityCarrier;
 
@@ -57,7 +58,7 @@ pub struct HeldRestoreFinish<'clock> {
 
 enum OwnedRead {
     Native {
-        read: OwnedDirectReadHold,
+        read: Box<OwnedDirectReadHold>,
         refusal: NativeRefusal,
     },
     Lower(OwnedHeldDirectRead),
@@ -113,7 +114,7 @@ impl<'clock> RestoreRunOutcome<'clock> {
         mut self,
     ) -> Result<(SettledDirectRead<'clock>, SettledRestoreReport), Box<HeldRestoreFinish<'clock>>>
     {
-        if let Err(refusal) = self.qualify_native() {
+        if let Err(refusal) = qualify_native(&self.files, &self._operation) {
             return Err(Box::new(HeldRestoreFinish {
                 owner: HeldOwner::Native {
                     outcome: Box::new(self),
@@ -121,27 +122,13 @@ impl<'clock> RestoreRunOutcome<'clock> {
                 },
             }));
         }
-        // Inspect every file before any further cleanup. Each failure retains all files,
-        // including successful cleanup facts from earlier members of this same attempt.
-        for (index, file) in self.files.iter_mut().enumerate() {
-            if let FileOwner::Transaction(transaction) = &mut file.owner
-                && let Err(failure) = transaction
-                    .revalidate_settlement(self._operation.carrier())
-                    .and_then(|()| transaction.cleanup_settlement())
-                    .and_then(|()| transaction.revalidate_settlement(self._operation.carrier()))
-            {
-                let refusal = NativeRefusal {
-                    file: Some(index),
-                    failure,
-                    readback: None,
-                };
-                return Err(Box::new(HeldRestoreFinish {
-                    owner: HeldOwner::Native {
-                        outcome: Box::new(self),
-                        refusal,
-                    },
-                }));
-            }
+        if let Err(refusal) = cleanup_native(&mut self.files, self._operation.carrier()) {
+            return Err(Box::new(HeldRestoreFinish {
+                owner: HeldOwner::Native {
+                    outcome: Box::new(self),
+                    refusal,
+                },
+            }));
         }
         let Self {
             report,
@@ -157,89 +144,57 @@ impl<'clock> RestoreRunOutcome<'clock> {
                 },
             })),
             Ok(read) => {
-                let files = files
-                    .into_iter()
-                    .map(|file| {
-                        let FileRecord {
-                            detail,
-                            day,
-                            stream,
-                            segment,
-                            witness,
-                            disposition,
-                            reason,
-                            files,
-                            bytes,
-                            owner,
-                        } = file;
-                        let transaction = match owner {
-                            FileOwner::Transaction(transaction) => {
-                                Some(Box::new(transaction.into_settled()))
-                            }
-                            // Qualification excludes Staging; no cleanup is inferred on consumption.
-                            FileOwner::None | FileOwner::Staging(_) => None,
-                        };
-                        SettledFile {
-                            _detail: detail,
-                            day,
-                            stream,
-                            segment,
-                            witness,
-                            disposition,
-                            reason,
-                            files,
-                            bytes,
-                            transaction,
-                        }
-                    })
-                    .collect();
+                let files = settled_files(files);
                 Ok((read, SettledRestoreReport { report, files }))
             }
         }
     }
+}
 
-    fn qualify_native(&self) -> Result<(), NativeRefusal> {
-        for (index, file) in self.files.iter().enumerate() {
-            let failure = match &file.owner {
-                FileOwner::None
-                    if file.files == 0
-                        && file.bytes == 0
-                        && file.disposition == RestoreDisposition::Unattempted =>
-                {
-                    None
-                }
-                FileOwner::None | FileOwner::Staging(_) => {
-                    Some(SettlementFailure::refused("unsettled_file"))
-                }
-                FileOwner::Transaction(transaction) => transaction
-                    .qualify_settlement(
-                        self._operation.carrier(),
-                        &file.witness,
-                        file.disposition,
-                        AttemptEffects {
-                            files: file.files,
-                            bytes: file.bytes,
-                        },
-                    )
-                    .and_then(|()| transaction.revalidate_settlement(self._operation.carrier()))
-                    .err(),
-            };
-            if let Some(failure) = failure {
-                return Err(NativeRefusal {
-                    file: Some(index),
-                    failure,
-                    readback: None,
-                });
+fn qualify_native(
+    files: &[FileRecord],
+    operation: &ReadOperation<'_>,
+) -> Result<(), NativeRefusal> {
+    for (index, file) in files.iter().enumerate() {
+        let failure = match &file.owner {
+            FileOwner::None
+                if file.files == 0
+                    && file.bytes == 0
+                    && file.disposition == RestoreDisposition::Unattempted =>
+            {
+                None
             }
+            FileOwner::None | FileOwner::Staging(_) => {
+                Some(SettlementFailure::refused("unsettled_file"))
+            }
+            FileOwner::Transaction(transaction) => transaction
+                .qualify_settlement(
+                    operation.carrier(),
+                    &file.witness,
+                    file.disposition,
+                    AttemptEffects {
+                        files: file.files,
+                        bytes: file.bytes,
+                    },
+                )
+                .and_then(|()| transaction.revalidate_settlement(operation.carrier()))
+                .err(),
+        };
+        if let Some(failure) = failure {
+            return Err(NativeRefusal {
+                file: Some(index),
+                failure,
+                readback: None,
+            });
         }
-        self._operation
-            .revalidate_admission()
-            .map_err(|readback| NativeRefusal {
-                file: None,
-                failure: SettlementFailure::refused("settlement_read_refused"),
-                readback: Some(readback),
-            })
     }
+    operation
+        .revalidate_admission()
+        .map_err(|readback| NativeRefusal {
+            file: None,
+            failure: SettlementFailure::refused("settlement_read_refused"),
+            readback: Some(readback),
+        })
 }
 
 impl<'clock> HeldRestoreFinish<'clock> {
@@ -280,7 +235,10 @@ impl<'clock> HeldRestoreFinish<'clock> {
                     Ok(read) => Ok(OwnedRestoreFinishHold {
                         report,
                         files,
-                        read: OwnedRead::Native { read, refusal },
+                        read: OwnedRead::Native {
+                            read: Box::new(read),
+                            refusal,
+                        },
                     }),
                     Err(operation) => Err(Box::new(Self {
                         owner: HeldOwner::Native {
@@ -358,6 +316,119 @@ impl SettledRestoreReport {
                     FileEvidence::Transaction(Box::new(transaction.facts()))
                 }),
         })
+    }
+}
+
+fn cleanup_native(
+    files: &mut [FileRecord],
+    carrier: &Arc<RootActivityCarrier>,
+) -> Result<(), NativeRefusal> {
+    // Inspect all files first; retain every earlier successful cleanup on a later refusal.
+    for (index, file) in files.iter_mut().enumerate() {
+        if let FileOwner::Transaction(transaction) = &mut file.owner
+            && let Err(failure) = transaction
+                .revalidate_settlement(carrier)
+                .and_then(|()| transaction.cleanup_settlement())
+                .and_then(|()| transaction.revalidate_settlement(carrier))
+        {
+            return Err(NativeRefusal {
+                file: Some(index),
+                failure,
+                readback: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn settled_files(files: Vec<FileRecord>) -> Vec<SettledFile> {
+    files
+        .into_iter()
+        .map(|file| {
+            let FileRecord {
+                detail,
+                day,
+                stream,
+                segment,
+                witness,
+                disposition,
+                reason,
+                files,
+                bytes,
+                owner,
+            } = file;
+            let transaction = match owner {
+                FileOwner::Transaction(transaction) => Some(Box::new(transaction.into_settled())),
+                // Qualification excludes Staging; no cleanup is inferred on consumption.
+                FileOwner::None | FileOwner::Staging(_) => None,
+            };
+            SettledFile {
+                _detail: detail,
+                day,
+                stream,
+                segment,
+                witness,
+                disposition,
+                reason,
+                files,
+                bytes,
+                transaction,
+            }
+        })
+        .collect()
+}
+
+impl OwnedRestoreRunOutcome {
+    pub fn settle_direct(
+        mut self,
+    ) -> Result<(OwnedSettledDirectRead, SettledRestoreReport), Box<OwnedRestoreFinishHold>> {
+        let qualified = qualify_native(&self.files, self._operation.as_read());
+        if let Err(refusal) =
+            qualified.and_then(|()| cleanup_native(&mut self.files, self._operation.carrier()))
+        {
+            return Err(Box::new(OwnedRestoreFinishHold {
+                report: self.report,
+                files: self.files,
+                read: OwnedRead::Native {
+                    read: Box::new(self._operation.into_owned_hold()),
+                    refusal,
+                },
+            }));
+        }
+        let RestoreExecution {
+            report,
+            files,
+            _operation,
+        } = self;
+        match _operation.settle_direct() {
+            Err(read) => Err(Box::new(OwnedRestoreFinishHold {
+                report,
+                files,
+                read: OwnedRead::Lower(read),
+            })),
+            Ok(read) => Ok((
+                read,
+                SettledRestoreReport {
+                    report,
+                    files: settled_files(files),
+                },
+            )),
+        }
+    }
+
+    pub fn into_owned_hold(self) -> OwnedRestoreFinishHold {
+        OwnedRestoreFinishHold {
+            report: self.report,
+            files: self.files,
+            read: OwnedRead::Native {
+                read: Box::new(self._operation.into_owned_hold()),
+                refusal: NativeRefusal {
+                    file: None,
+                    failure: SettlementFailure::refused("restore_unsettled"),
+                    readback: None,
+                },
+            },
+        }
     }
 }
 

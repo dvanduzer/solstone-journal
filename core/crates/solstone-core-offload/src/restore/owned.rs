@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use solstone_core_backup::archive_readback::{ReadOperation, ReadbackFailure};
+use solstone_core_backup::archive_readback::{OwnedReadOperation, ReadOperation, ReadbackFailure};
 use solstone_core_journal_io::media::{
     Cleanup, Durability, MediaDirectory, PublicationReceipt, RemovalReceipt,
 };
@@ -26,6 +26,9 @@ use crate::restore_intent_store::transaction::{
     DetachedTransaction, StagedRestore, StagingFailure,
 };
 use crate::restore_prepared::PreparedRestore;
+
+pub(crate) mod read;
+use read::RestoreRead;
 
 #[cfg(unix)]
 pub enum IntentPublication<'a> {
@@ -192,13 +195,17 @@ impl FileRecord {
 }
 
 #[must_use = "retain the original operation, every native effect and unresolved obligation"]
-pub struct RestoreRunOutcome<'clock> {
+pub struct RestoreExecution<R> {
     report: RestoreResult,
-    _operation: ReadOperation<'clock>,
+    _operation: R,
     files: Vec<FileRecord>,
 }
 
-impl RestoreRunOutcome<'_> {
+pub type RestoreRunOutcome<'clock> = RestoreExecution<ReadOperation<'clock>>;
+/// Active execution remains worker-local; its consuming finish closes every normal return.
+pub type OwnedRestoreRunOutcome = RestoreExecution<OwnedReadOperation>;
+
+impl<R> RestoreExecution<R> {
     pub fn report(&self) -> &RestoreResult {
         &self.report
     }
@@ -236,6 +243,18 @@ pub fn restore_bound_all(operation: ReadOperation<'_>, time: u64) -> RestoreRunO
     run(operation, "all", None, time)
 }
 
+pub fn restore_owned_bound_day(
+    operation: OwnedReadOperation,
+    day: &str,
+    time: u64,
+) -> OwnedRestoreRunOutcome {
+    run(operation, "day", Some(day), time)
+}
+
+pub fn restore_owned_bound_all(operation: OwnedReadOperation, time: u64) -> OwnedRestoreRunOutcome {
+    run(operation, "all", None, time)
+}
+
 fn metadata_allowance() -> Option<u64> {
     u64::try_from(solstone_core_retention::review_context::MAX_REGISTER_BYTES)
         .ok()?
@@ -246,16 +265,16 @@ fn metadata_allowance() -> Option<u64> {
         )
 }
 
-fn run<'clock>(
-    operation: ReadOperation<'clock>,
+fn run<'clock, R: RestoreRead<'clock>>(
+    operation: R,
     scope: &str,
     day: Option<&str>,
     time: u64,
-) -> RestoreRunOutcome<'clock> {
-    let (mut report, mut files) = match select(operation.journal_root(), scope, day) {
+) -> RestoreExecution<R> {
+    let (mut report, mut files) = match select(operation.as_read().journal_root(), scope, day) {
         Ok(selected) => selected,
         Err(report) => {
-            return RestoreRunOutcome {
+            return RestoreExecution {
                 report: *report,
                 _operation: operation,
                 files: Vec::new(),
@@ -263,7 +282,7 @@ fn run<'clock>(
         }
     };
     if files.is_empty() {
-        return RestoreRunOutcome {
+        return RestoreExecution {
             report,
             _operation: operation,
             files,
@@ -271,7 +290,7 @@ fn run<'clock>(
     }
     let Some(largest) = bound_maximum(&mut files) else {
         summarize(&mut report, &files);
-        return RestoreRunOutcome {
+        return RestoreExecution {
             report,
             _operation: operation,
             files,
@@ -281,6 +300,7 @@ fn run<'clock>(
         .ok_or_else(|| "metadata allowance overflow".into())
         .and_then(|metadata| {
             operation
+                .as_read()
                 .offload_required_bytes(largest, metadata)
                 .map_err(|error| error.to_string())
         });
@@ -292,7 +312,7 @@ fn run<'clock>(
             }
             summarize(&mut report, &files);
             report.reason_detail = Some(error);
-            RestoreRunOutcome {
+            RestoreExecution {
                 report,
                 _operation: operation,
                 files,
@@ -477,14 +497,14 @@ fn summarize(report: &mut RestoreResult, files: &[FileRecord]) {
 
 // The public entry computes this requirement through the original operation's
 // retained configuration. It is repeated on the actual stage before any WAN.
-fn execute<'clock>(
-    mut operation: ReadOperation<'clock>,
+fn execute<'clock, R: RestoreRead<'clock>>(
+    mut operation: R,
     mut report: RestoreResult,
     mut files: Vec<FileRecord>,
     time: u64,
     required_capacity: u64,
-) -> RestoreRunOutcome<'clock> {
-    let root = Arc::clone(operation.journal_root());
+) -> RestoreExecution<R> {
+    let root = Arc::clone(operation.as_read().journal_root());
     let mut discovered = BTreeMap::new();
     let mut stopped = false;
     for file in &mut files {
@@ -545,7 +565,7 @@ fn execute<'clock>(
         }
     }
     summarize(&mut report, &files);
-    RestoreRunOutcome {
+    RestoreExecution {
         report,
         _operation: operation,
         files,
