@@ -49,6 +49,14 @@ pub struct TeardownAdmission {
     configuration: TeardownConfiguration,
 }
 
+#[cfg(unix)]
+mod binding;
+#[cfg(unix)]
+pub use binding::{
+    BindingTeardownAdmission, BoundTeardownAdmission, TeardownBindingFailure,
+    TeardownBindingRefusal,
+};
+
 /// Admit observation only. Destructive execution requires additional boundaries.
 pub fn admit_teardown(
     root: Arc<JournalRoot>,
@@ -73,6 +81,11 @@ pub fn admit_teardown(
 }
 
 impl TeardownAdmission {
+    /// The same original exclusion, retained by outside attempt custody.
+    pub fn teardown_lease(&self) -> &Arc<TeardownLease> {
+        &self.lease
+    }
+
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
         self.lease.journal_root()
     }
@@ -122,7 +135,7 @@ impl TeardownAdmission {
         };
         let prepared = CarrierTeardownAdmission {
             admission: self,
-            carrier,
+            carrier: Arc::new(carrier),
         };
         if let Err(refusal) = prepared.check(reader) {
             return Err(TeardownCarrierFailure::new(
@@ -142,7 +155,7 @@ pub enum TeardownCarrierRefusal {
 }
 
 enum RetainedCarrier {
-    Prepared(RootTeardownCarrier),
+    Prepared(Arc<RootTeardownCarrier>),
     Failed(TeardownCarrierPreparationFailure),
 }
 
@@ -204,10 +217,19 @@ impl std::fmt::Debug for TeardownCarrierFailure {
 /// Original admission and its actual live reservation. No public constructor.
 pub struct CarrierTeardownAdmission {
     admission: TeardownAdmission,
-    carrier: RootTeardownCarrier,
+    carrier: Arc<RootTeardownCarrier>,
 }
 
 impl CarrierTeardownAdmission {
+    /// Shares the one actual prepared reservation; it does not prepare another.
+    pub fn carrier(&self) -> &Arc<RootTeardownCarrier> {
+        &self.carrier
+    }
+
+    pub fn teardown_lease(&self) -> &Arc<TeardownLease> {
+        self.admission.teardown_lease()
+    }
+
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
         self.admission.journal_root()
     }
@@ -261,7 +283,7 @@ impl CarrierTeardownAdmission {
         };
         if let Some(refusal) = outcome_refusal(&outcome) {
             let publication = match outcome {
-                BoundConfigOutcome::Published(publication) => Some(publication),
+                BoundConfigOutcome::Published(publication) => Some(Arc::new(publication)),
                 BoundConfigOutcome::Unchanged => None,
             };
             return Err(TeardownClearFailure::new(
@@ -274,6 +296,7 @@ impl CarrierTeardownAdmission {
         let BoundConfigOutcome::Published(publication) = outcome else {
             unreachable!("unchanged refused above")
         };
+        let publication = Arc::new(publication);
         run_clear_hook(ClearCheckpoint::AfterClear);
         if let Err(refusal) = self.revalidate_publication(&publication) {
             return Err(TeardownClearFailure::new(
@@ -335,7 +358,7 @@ pub struct TeardownClearFailure {
     admission: Box<CarrierTeardownAdmission>,
     attempted: bool,
     refusal: TeardownClearRefusal,
-    publication: Option<Box<BoundConfigPublication>>,
+    publication: Option<Arc<BoundConfigPublication>>,
 }
 
 impl TeardownClearFailure {
@@ -343,13 +366,13 @@ impl TeardownClearFailure {
         admission: CarrierTeardownAdmission,
         attempted: bool,
         refusal: TeardownClearRefusal,
-        publication: Option<BoundConfigPublication>,
+        publication: Option<Arc<BoundConfigPublication>>,
     ) -> Self {
         Self {
             admission: Box::new(admission),
             attempted,
             refusal,
-            publication: publication.map(Box::new),
+            publication,
         }
     }
 
@@ -364,6 +387,9 @@ impl TeardownClearFailure {
     }
     pub fn publication(&self) -> Option<&BoundConfigPublication> {
         self.publication.as_deref()
+    }
+    pub fn publication_receipt(&self) -> Option<&Arc<BoundConfigPublication>> {
+        self.publication.as_ref()
     }
 }
 
@@ -380,10 +406,16 @@ impl std::fmt::Debug for TeardownClearFailure {
 /// Original admission plus its own exact confirmed publication. No public factory.
 pub struct ClearedTeardownAdmission {
     admission: CarrierTeardownAdmission,
-    publication: BoundConfigPublication,
+    publication: Arc<BoundConfigPublication>,
 }
 
 impl ClearedTeardownAdmission {
+    pub fn carrier(&self) -> &Arc<RootTeardownCarrier> {
+        self.admission.carrier()
+    }
+    pub fn teardown_lease(&self) -> &Arc<TeardownLease> {
+        self.admission.teardown_lease()
+    }
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
         self.admission.journal_root()
     }
@@ -391,6 +423,9 @@ impl ClearedTeardownAdmission {
         self.admission.configuration()
     }
     pub fn publication(&self) -> &BoundConfigPublication {
+        &self.publication
+    }
+    pub fn publication_receipt(&self) -> &Arc<BoundConfigPublication> {
         &self.publication
     }
     pub fn revalidate(&self) -> Result<(), TeardownAdmissionRefusal> {
