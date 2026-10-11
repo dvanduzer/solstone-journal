@@ -1102,6 +1102,9 @@ fn create_test_package(root: &Path) -> solstone_core_installed_payload::Installe
         render_installed_payload,
     };
     let bin = root.join("lib/solstone-nvattest/bin/nvattest");
+    #[cfg(target_os = "macos")]
+    let lib = root.join("lib/solstone-nvattest/lib/libnvat.1.dylib");
+    #[cfg(not(target_os = "macos"))]
     let lib = root.join("lib/solstone-nvattest/lib/libnvat.so.1");
     let ca = root.join("lib/solstone-nvattest/share/ca/ca-bundle.pem");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
@@ -1314,6 +1317,9 @@ fn planted_nvattest_locations_are_never_executed_or_mutated() {
         let port = counting_listener.local_addr().expect("port").port();
 
         let pkg_root = journal.join("missing_bin_pkg");
+        #[cfg(target_os = "macos")]
+        let lib = pkg_root.join("lib/solstone-nvattest/lib/libnvat.1.dylib");
+        #[cfg(not(target_os = "macos"))]
         let lib = pkg_root.join("lib/solstone-nvattest/lib/libnvat.so.1");
         let ca = pkg_root.join("lib/solstone-nvattest/share/ca/ca-bundle.pem");
         std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
