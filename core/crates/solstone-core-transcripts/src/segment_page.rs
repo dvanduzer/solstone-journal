@@ -340,7 +340,10 @@ fn project_line(segment_origin: &str, name: &str, line: &str) -> String {
                     .map(|chunk| chunk.content)
                     .collect::<Vec<_>>()
                     .join("\n")
-            } else if name == "audio.jsonl" || name.ends_with("_audio.jsonl") {
+            } else if name == "audio.jsonl"
+                || name.ends_with("_audio.jsonl")
+                || name.ends_with("_transcript.jsonl")
+            {
                 produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
                     .chunks
                     .into_iter()
@@ -538,6 +541,30 @@ mod tests {
         assert_eq!(chat.chunks.len(), 1);
         assert_eq!(chat.chunks[0].content, "**Ana Lima:** Hello all.");
         assert_eq!(chat.header.as_deref(), Some("# ChatGPT conversation"));
+    }
+
+    #[test]
+    fn a_flat_legacy_source_transcript_reads_projected_not_raw() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let segment = root.path().join("chronicle/20250301/093000_300");
+        fs::create_dir_all(&segment).unwrap();
+        fs::write(
+            segment.join("session_transcript.jsonl"),
+            "{\"raw\": \"session.flac\"}\n{\"start\": \"00:00:04\", \"speaker\": 2, \"text\": \"send the deck on friday\"}\n",
+        )
+        .unwrap();
+        let segment = iter_segments(root.path(), PathOrDay::Day("20250301"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let page = read_segment_transcript_page(&segment, None).unwrap();
+        assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
+        assert!(page.entries[0].text.contains("send the deck on friday"));
+        assert!(
+            !page.entries[0].text.contains('{'),
+            "{}",
+            page.entries[0].text
+        );
     }
 
     #[test]

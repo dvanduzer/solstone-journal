@@ -69,10 +69,6 @@ pub(crate) fn issue_segment_links(
         let candidates = resolve_candidates(journal_root, subject, &mut day_cache);
         let mut subject_checks = 0;
         for (day, candidate) in candidates {
-            if subject_checks == per_result || response_checks == response_budget {
-                subject.more_segments = true;
-                break;
-            }
             let Ok(identity) = candidate.record_identity() else {
                 continue;
             };
@@ -86,8 +82,14 @@ pub(crate) fn issue_segment_links(
                 Some(identity.stream),
                 &declarations,
             );
+            // Scope comes first: a segment this connection may not read leaves
+            // no trace, not even in `more_segments`.
             if !transcript_boundary.allows_classification(&classification) {
                 continue;
+            }
+            if subject_checks == per_result || response_checks == response_budget {
+                subject.more_segments = true;
+                break;
             }
             subject_checks += 1;
             response_checks += 1;

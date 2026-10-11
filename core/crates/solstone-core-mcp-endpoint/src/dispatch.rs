@@ -1376,17 +1376,19 @@ fn list_transcripts(
                 continue;
             }
 
+            // Scope comes first: a segment this connection may not read neither
+            // fills the page nor earns a `next_cursor`.
+            let probe_path = segment_assignment_probe_path(day, &stream, &name);
+            if !live_allows(journal_root, &boundary, &probe_path, Some(&stream)) {
+                continue;
+            }
+
             if segments.len() == request.limit {
                 has_more = true;
                 break 'outer;
             }
 
             last_examined = Some((day.clone(), stream.clone(), name.clone()));
-
-            let probe_path = segment_assignment_probe_path(day, &stream, &name);
-            if !live_allows(journal_root, &boundary, &probe_path, Some(&stream)) {
-                continue;
-            }
 
             let page = match solstone_core_transcripts::read_segment_transcript_page(&segment, None)
             {
@@ -1480,15 +1482,16 @@ fn get_transcript(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
-    let segment = iter_segments(journal_root, PathOrDay::Day(&reference.day))
-        .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?
-        .into_iter()
-        .find(|segment| {
-            segment
-                .record_identity()
-                .is_ok_and(|id| id.stream == reference.stream && id.name == reference.segment)
-        })
-        .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
+    let segment =
+        iter_segments_skipping_unreadable_streams(journal_root, PathOrDay::Day(&reference.day))
+            .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?
+            .into_iter()
+            .find(|segment| {
+                segment
+                    .record_identity()
+                    .is_ok_and(|id| id.stream == reference.stream && id.name == reference.segment)
+            })
+            .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
     let probe_path =
         segment_assignment_probe_path(&reference.day, &reference.stream, &reference.segment);
     if !live_allows(

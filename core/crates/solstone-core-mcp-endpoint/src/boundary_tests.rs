@@ -1543,7 +1543,7 @@ impl TranscriptPageCheck for CountingChecker {
 }
 
 #[test]
-fn test_1_search_hit_on_beta_links_only_to_beta() {
+fn a_summary_hit_links_only_to_its_own_streams_segment() {
     let journal = setup_shared_link_journal();
     let path = "20261010/beta/090000_300/talents/brief.md";
     plant_chunk(
@@ -1594,7 +1594,7 @@ fn test_1_search_hit_on_beta_links_only_to_beta() {
 }
 
 #[test]
-fn test_2_activity_stream_links_and_three_candidate_limit() {
+fn activity_hits_link_their_segments_within_the_per_result_budget() {
     let journal = setup_shared_link_journal();
     let chronicle = journal.path().join("chronicle/20261010");
     for (stream, name, token) in [
@@ -1717,7 +1717,7 @@ fn test_2_activity_stream_links_and_three_candidate_limit() {
 }
 
 #[test]
-fn test_3_activity_identity_time_and_title_case_fold() {
+fn activity_links_require_the_live_record_to_match_the_indexed_one() {
     let journal = setup_shared_link_journal();
     let act_path = "facets/alpha/activities/20261010.jsonl";
     fs::create_dir_all(journal.path().join("facets/alpha/activities")).unwrap();
@@ -1835,7 +1835,7 @@ fn test_3_activity_identity_time_and_title_case_fold() {
 }
 
 #[test]
-fn test_4_whole_journal_search_category_and_facet_keeps_links() {
+fn search_narrowing_does_not_change_which_links_are_issued() {
     let journal = setup_shared_link_journal();
     let act_path = "facets/alpha/activities/20261010.jsonl";
     fs::create_dir_all(journal.path().join("facets/alpha/activities")).unwrap();
@@ -1889,7 +1889,7 @@ fn test_4_whole_journal_search_category_and_facet_keeps_links() {
 }
 
 #[test]
-fn test_5_chosen_facets_excludes_multi_facet_segment() {
+fn chosen_facets_withhold_links_to_segments_partly_outside_scope() {
     let journal = setup_shared_link_journal();
     fs::write(
         journal
@@ -1995,7 +1995,7 @@ fn test_5_chosen_facets_excludes_multi_facet_segment() {
 }
 
 #[test]
-fn test_6_readable_segment_links_while_unreadable_omitted_and_post_grant_fails() {
+fn unreadable_or_deleted_segments_get_no_link_and_search_still_succeeds() {
     let journal = setup_shared_link_journal();
     let chronicle = journal.path().join("chronicle/20261010/alpha");
 
@@ -2109,7 +2109,7 @@ fn test_6_readable_segment_links_while_unreadable_omitted_and_post_grant_fails()
 }
 
 #[test]
-fn test_7_two_searches_digest_stable_and_targets_keep_coordinates() {
+fn links_keep_the_replay_digest_stable() {
     let journal = setup_shared_link_journal();
     plant_chunk(
         journal.path(),
@@ -2166,7 +2166,65 @@ fn test_7_two_searches_digest_stable_and_targets_keep_coordinates() {
 }
 
 #[test]
-fn test_9_list_transcripts_time_filtering_cursor_pagination_and_audit() {
+fn list_transcripts_offers_no_cursor_when_only_withheld_segments_remain() {
+    let journal = tempfile::Builder::new()
+        .prefix("list-withheld-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+    let day = journal.path().join("chronicle/20261010");
+    let write_segment = |stream: &str, name: &str, facet: &str| {
+        let seg = day.join(stream).join(name);
+        fs::create_dir_all(seg.join("talents")).unwrap();
+        fs::write(
+            seg.join("talents/facets.json"),
+            format!("[{{\"facet\":\"{facet}\"}}]"),
+        )
+        .unwrap();
+        fs::write(
+            seg.join("meeting_transcript.md"),
+            format!("{stream} {name}\n"),
+        )
+        .unwrap();
+    };
+    write_segment("alpha", "090000_300", "alpha");
+    write_segment("beta", "100000_300", "beta");
+
+    // The page is full and only a segment outside the scope remains: no cursor.
+    let page = probe(
+        &journal,
+        "list_transcripts",
+        json!({"day": "20261010", "limit": 1}),
+    )
+    .unwrap();
+    assert_eq!(page["transcripts"].as_array().unwrap().len(), 1);
+    assert!(page["next_cursor"].is_null(), "{page}");
+
+    // Positive twin: an in-scope segment remaining does earn a cursor.
+    write_segment("alpha", "110000_300", "alpha");
+    let page = probe(
+        &journal,
+        "list_transcripts",
+        json!({"day": "20261010", "limit": 1}),
+    )
+    .unwrap();
+    assert_eq!(page["transcripts"].as_array().unwrap().len(), 1);
+    assert!(page["next_cursor"].is_string(), "{page}");
+}
+
+#[test]
+fn list_transcripts_filters_by_time_and_pages_with_a_bound_cursor() {
     let journal = tempfile::Builder::new()
         .prefix("list-test-")
         .tempdir_in(crate::test_scratch())
@@ -2433,7 +2491,7 @@ fn test_9_list_transcripts_time_filtering_cursor_pagination_and_audit() {
 }
 
 #[test]
-fn test_11_tokens_in_raw_audio_never_appear_in_search_or_fetch() {
+fn raw_transcript_text_never_reaches_search_or_fetch() {
     let journal = setup_shared_link_journal();
     let seg = journal.path().join("chronicle/20261010/alpha/090000_300");
     fs::write(
@@ -2483,7 +2541,7 @@ fn test_11_tokens_in_raw_audio_never_appear_in_search_or_fetch() {
 }
 
 #[test]
-fn test_12_issuer_counting_checker_budgets_and_more_segments() {
+fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments() {
     let journal = tempfile::Builder::new()
         .prefix("issuer-test-")
         .tempdir_in(crate::test_scratch())
@@ -2619,11 +2677,12 @@ fn test_12_issuer_counting_checker_budgets_and_more_segments() {
     );
     assert_eq!(checker_budget1.count, 1);
     assert_eq!(subjects_budget1[0].segments.len(), 1);
-    assert!(subjects_budget1[0].more_segments);
+    // The only candidate past the budget is withheld, so nothing says more exist.
+    assert!(!subjects_budget1[0].more_segments);
 }
 
 #[test]
-fn test_12a_issuer_omits_transcripts_when_category_excluded() {
+fn no_links_without_the_transcripts_grant() {
     let journal = setup_shared_link_journal();
     let act_path = "facets/alpha/activities/20261010.jsonl";
     fs::create_dir_all(journal.path().join("facets/alpha/activities")).unwrap();
