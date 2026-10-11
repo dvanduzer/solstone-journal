@@ -21,6 +21,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- health shows queued work held for a safety check, with the affected work, technical details and a way to get help. if live status becomes unavailable, the last check stays visible.
+
 - the backup page now counts all original media on this device, including files proposed for removal. when a media total can't be checked completely, it shows the amount counted so far separately.
 - when a backup action fails, the backup page now shows any guidance the tool gave on what to do next.
 - your journal no longer saves a transcript or description after the media has changed or its segment has been deleted.
