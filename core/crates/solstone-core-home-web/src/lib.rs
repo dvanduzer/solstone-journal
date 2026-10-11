@@ -19,6 +19,14 @@ mod week;
 
 pub use clock::Clock;
 
+pub fn routes_with_backup_deps(
+    deps: solstone_core_backup_web::BackupWebDeps,
+    clock: Clock,
+    is_moment: fn(&str) -> bool,
+) -> Router {
+    routes(deps.journal_root.clone(), clock, is_moment).layer(Extension(deps))
+}
+
 pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) -> Router {
     let pulse_root = journal_root.clone();
     let pulse_clock = clock.clone();

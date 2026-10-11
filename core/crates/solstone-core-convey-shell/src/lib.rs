@@ -761,6 +761,7 @@ fn router_with_hosted_parent(
         relay_admissions,
         relay_access.clone(),
     ));
+    let backup_deps = solstone_core_backup_web::BackupWebDeps::new(journal_root.clone());
     let mut routes = Router::new()
         .route("/", get(root))
         .route("/favicon.ico", get(favicon))
@@ -1055,12 +1056,12 @@ fn router_with_hosted_parent(
             journal_root.clone(),
             solstone_core_stats_web::Clock::real(),
         ))
-        .merge(solstone_core_home_web::routes(
-            journal_root.clone(),
+        .merge(solstone_core_home_web::routes_with_backup_deps(
+            backup_deps.clone(),
             solstone_core_home_web::Clock::system(),
             source_link::reference_is_moment,
         ))
-        .merge(solstone_core_backup_web::routes(journal_root.clone()))
+        .merge(solstone_core_backup_web::routes_with_deps(backup_deps))
         .route("/app/body/", get(body::shell))
         .route("/app/body/trends", get(body::trends))
         .route("/app/body/{day}", get(body::shell_for_day))

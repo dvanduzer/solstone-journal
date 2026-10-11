@@ -89,6 +89,11 @@ impl Clock for ProductionClock {
 }
 
 impl BackupWebDeps {
+    pub fn new(journal_root: PathBuf) -> Self {
+        let cache = measurement::new(&journal_root);
+        Self::production(journal_root, cache)
+    }
+
     fn production(journal_root: PathBuf, cache: SharedMeasurementCache) -> Self {
         Self {
             journal_root,
@@ -109,8 +114,7 @@ impl BackupWebDeps {
 }
 
 pub fn routes(journal_root: PathBuf) -> Router {
-    let cache = measurement::new(&journal_root);
-    routes_with_deps(BackupWebDeps::production(journal_root, cache))
+    routes_with_deps(BackupWebDeps::new(journal_root))
 }
 
 #[cfg(test)]
@@ -118,7 +122,7 @@ fn routes_with_cache(journal_root: PathBuf, cache: SharedMeasurementCache) -> Ro
     routes_with_deps(BackupWebDeps::production(journal_root, cache))
 }
 
-pub(crate) fn routes_with_deps(deps: BackupWebDeps) -> Router {
+pub fn routes_with_deps(deps: BackupWebDeps) -> Router {
     let status = deps.clone();
     let offload = deps.clone();
     let config = deps.clone();
