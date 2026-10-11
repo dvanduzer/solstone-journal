@@ -22,14 +22,22 @@ use crate::permissions::ConnectionReadSnapshot;
 use crate::references::{ReferenceTarget, SegmentReference};
 
 pub(crate) trait TranscriptPageCheck {
-    fn check_first_page(&mut self, segment: &Segment) -> Result<Option<u64>, ()>;
+    fn check_first_page(
+        &mut self,
+        journal_root: &Path,
+        segment: &Segment,
+    ) -> Result<Option<u64>, ()>;
 }
 
 pub(crate) struct LiveTranscriptPages;
 
 impl TranscriptPageCheck for LiveTranscriptPages {
-    fn check_first_page(&mut self, segment: &Segment) -> Result<Option<u64>, ()> {
-        match solstone_core_transcripts::read_segment_transcript_page(segment, None) {
+    fn check_first_page(
+        &mut self,
+        journal_root: &Path,
+        segment: &Segment,
+    ) -> Result<Option<u64>, ()> {
+        match solstone_core_transcripts::read_segment_transcript_page(journal_root, segment, None) {
             Ok(page) if !page.entries.is_empty() => Ok(Some(page.version.fingerprint())),
             Ok(_) => Ok(None),
             Err(_) => Err(()),
@@ -93,7 +101,7 @@ pub(crate) fn issue_segment_links(
             }
             subject_checks += 1;
             response_checks += 1;
-            if let Ok(Some(version)) = checker.check_first_page(&candidate) {
+            if let Ok(Some(version)) = checker.check_first_page(journal_root, &candidate) {
                 let target = ReferenceTarget::Segment(SegmentReference {
                     day: day.clone(),
                     stream: identity.stream.to_string(),
@@ -101,6 +109,7 @@ pub(crate) fn issue_segment_links(
                     version,
                     source_index: None,
                     byte_offset: None,
+                    statement_ordinal: None,
                 });
                 if let Ok(token) = codec().mint(principal.connection, snapshot.generation, target) {
                     subject.segments.push(json!({

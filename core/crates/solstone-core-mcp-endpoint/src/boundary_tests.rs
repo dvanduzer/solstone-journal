@@ -915,6 +915,110 @@ fn get_transcript_reads_recorded_speech_from_audio_jsonl() {
 }
 
 #[test]
+fn transcript_local_names_page_under_a_transcripts_only_facet_grant() {
+    let journal = fixture();
+    let segment = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+    fs::remove_file(segment.join("meeting_transcript.md")).unwrap();
+    let mut text = String::from("{\"raw\":\"audio.flac\"}\n\ninvalid\n");
+    for id in 1..=99 {
+        text.push_str(&format!(
+            "{{\"start\":\"00:00:01\",\"speaker\":1,\"text\":\"sentence {id}\"}}\n"
+        ));
+    }
+    // This occupies ordinal 100, although the owner view skips its non-string start.
+    text.push_str("{\"start\":null,\"text\":\"non-string start\"}\n");
+    for id in 101..=103 {
+        text.push_str(&format!("{{\"start\":\"00:00:01\",\"sentence_id\":999,\"speaker\":1,\"text\":\"sentence {id}\"}}\n"));
+    }
+    fs::write(segment.join("audio.jsonl"), text).unwrap();
+    for (id, name) in [("local-person-a", "Ada"), ("local-person-b", "Bea")] {
+        let dir = journal.path().join("entities").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("entity.json"),
+            json!({"id":id,"name":name,"type":"Person",
+            "description":"private profile", "aka":["private alias"]})
+            .to_string(),
+        )
+        .unwrap();
+    }
+    fs::write(
+        segment.join("talents/speaker_labels.json"),
+        json!({"labels":[
+            {"sentence_id":99,"speaker":"local-person-a"},
+            {"sentence_id":101,"speaker":"local-person-b","confidence":"high","method":"acoustic"},
+            {"sentence_id":102,"speaker":"local-person-a"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(journal.path().join("awareness")).unwrap();
+    fs::write(journal.path().join("awareness/speaker_candidates.json"), json!({"next_id":2,"candidates":[{
+        "cand_id":1,"status":"confirmed","confirmed_entity":"local-person-b","source_segments":[{"day":DAY,"stream_layout":"named",
+        "stream":STREAM,"segment_key":SEGMENT,"source":"audio","cluster_label":1,"sentence_ids":[103]}]
+    }]}).to_string()).unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".into()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.into()],
+                },
+            },
+        )
+        .unwrap();
+    let listed = probe(&journal, "list_transcripts", json!({})).unwrap();
+    let reference = listed["transcripts"][0]["reference"].as_str().unwrap();
+    let first = probe(&journal, "get_transcript", json!({"reference":reference})).unwrap();
+    assert_eq!(first["entries"][98], "[00:00:01] Ada: sentence 99");
+    let second = probe(
+        &journal,
+        "get_transcript",
+        json!({"reference":reference,"cursor":first["next_cursor"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        second["entries"],
+        json!([
+            "[00:00:01] Bea: sentence 101",
+            "[00:00:01] Ada: sentence 102",
+            "[00:00:01] Speaker 1: sentence 103"
+        ])
+    );
+    assert!(second["next_cursor"].is_null());
+    for forbidden in [
+        "local-person",
+        "private profile",
+        "private alias",
+        "confidence",
+        "acoustic",
+    ] {
+        assert!(!second.to_string().contains(forbidden));
+    }
+    assert_eq!(
+        probe(&journal, "list_entities", json!({})),
+        Err(McpProbeError::PermissionDenied)
+    );
+    for assignments in [
+        json!([{"facet":"beta"}]),
+        json!([{"facet":"alpha"},{"facet":"beta"}]),
+        json!([]),
+    ] {
+        fs::write(segment.join("talents/facets.json"), assignments.to_string()).unwrap();
+        assert_eq!(
+            probe(&journal, "get_transcript", json!({"reference":reference})),
+            Err(McpProbeError::Unavailable)
+        );
+    }
+}
+
+#[test]
 fn ac7_ac21_ac22_entities_are_scoped_stable_and_omit_forbidden_fields() {
     let journal = fixture();
     PermissionStore::open(journal.path())
@@ -1536,6 +1640,7 @@ struct CountingChecker {
 impl TranscriptPageCheck for CountingChecker {
     fn check_first_page(
         &mut self,
+        _journal_root: &Path,
         _segment: &solstone_core_journal_io::paths::Segment,
     ) -> Result<Option<u64>, ()> {
         self.count += 1;

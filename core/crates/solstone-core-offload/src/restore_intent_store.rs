@@ -11,6 +11,8 @@ use solstone_core_journal_io::media::{Durability, MediaRead};
 
 use crate::restore_intent::{RepairHold, RestoreIntent};
 
+pub(super) mod transaction;
+
 #[derive(Debug, PartialEq, Eq)]
 enum StoreProblem {
     Unsupported,

@@ -35,6 +35,10 @@ const DOOR: &str = "door";
 
 const SOURCES: &[(&str, &str)] = &[
     ("age", include_str!("../src/age.rs")),
+    (
+        "archive_approval",
+        include_str!("../src/archive_approval.rs"),
+    ),
     ("archive_catalog", include_str!("../src/archive_catalog.rs")),
     ("archive_proof", include_str!("../src/archive_proof.rs")),
     ("class", include_str!("../src/class.rs")),
