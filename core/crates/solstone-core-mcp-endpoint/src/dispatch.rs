@@ -649,7 +649,7 @@ pub(crate) fn codec() -> &'static ReferenceCodec {
 fn is_plain_literal_query(query: &str) -> bool {
     if query
         .chars()
-        .any(|c| matches!(c, '"' | '\'' | ':' | '*' | '(' | ')'))
+        .any(|c| matches!(c, '"' | ':' | '*' | '(' | ')'))
     {
         return false;
     }
