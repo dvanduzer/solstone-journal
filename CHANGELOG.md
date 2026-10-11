@@ -6,8 +6,13 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- each tool your journal offers a connected agent now has a short name. saving a note, the one tool that doesn't only read, now says it adds without changing anything already in your journal. when an agent's call has arguments your journal can't use, it's told what to fix.
+
 ### Fixed
 
+- turning on solstone.me works again on linux and mac. since 2.0.18 it could stop at "your journal could not prepare its agent address" and not get further. if that happened to you, it finishes on its own once your journal is updated.
 - the local model's dropdown label no longer says "8 GB", which could be mistaken for its graphics memory requirement.
 - your weekly page is written again on large journals. in 2.0.41, putting the week together could take longer than the ten minutes your journal allows, so no page was written for that week, and it isn't written later on its own.
 - if you delete or edit something your journal made for a day, your journal now leaves it as you left it and counts the day as done. before, it kept treating that day as unfinished and processing it again. to have it made again, run `solstone journal reprocess DAY --from-scratch`. it redoes that whole day.
