@@ -17,6 +17,8 @@
 //! use solstone_core_backup_runtime::backup_journal_resolved_hook_armed;
 //! ```
 
+#[cfg(target_os = "linux")]
+mod controlled_http;
 pub mod destination;
 pub mod destination_admission;
 pub mod engine;
