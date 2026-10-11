@@ -1476,6 +1476,9 @@ h2.card-title {
 #schedulesValue li {padding:10px;border: 1px solid var(--hairline);border-radius: 8px;overflow-wrap:anywhere}
 #schedulesValue code {display:block;font-size:12px;color: var(--ink-soft-paper)}
 #brainHealthStatus summary {cursor:pointer;min-height:46px;padding:10px 0}
+#processingHolds summary {cursor:pointer;min-height:46px;padding:10px 0}
+#processingHolds pre {white-space:pre-wrap;overflow-wrap:anywhere;font-size:0.8rem}
+#processingHolds .held-work-row + .held-work-row {border-top:1px solid var(--hairline)}
 </style>
 
 <div class="health-dashboard">
@@ -1552,6 +1555,13 @@ h2.card-title {
       </div>
     </div>
   </div>
+
+  <section class="dashboard-card" id="processingHolds" aria-labelledby="processingHoldsTitle" hidden>
+    <h2 class="card-title" id="processingHoldsTitle">queued work</h2>
+    <p data-held-work-notice></p>
+    <div data-held-work-rows></div>
+    <p data-held-work-support><a href="https://support.solstone.app/">get help →</a></p>
+  </section>
 
   <div class="dashboard-card activity-section hidden" id="errorSummary">
     <div class="activity-section-header error">
