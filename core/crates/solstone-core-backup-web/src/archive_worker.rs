@@ -4,6 +4,7 @@
 //! Keep concrete archive owners independently of the displayed operation.
 //! Actor execution consumes the original admitted read in its owning worker.
 
+pub mod offload;
 pub mod removal;
 pub mod restore;
 
@@ -124,6 +125,7 @@ pub fn begin_owned(
 /// Closed concrete values only; no report can construct a native owner.
 #[must_use]
 pub enum ArchivePayload {
+    Offload(Box<offload::OffloadReturn>),
     BeginHeld(Box<OwnedArchiveBegin>),
     EarlyUnknown,
     NativeFinishUnknown {
@@ -166,6 +168,11 @@ pub enum ArchivePayload {
 
 impl ArchivePayload {
     fn completed(&self) -> bool {
+        if let Self::Offload(owner) = self {
+            return owner
+                .runtime()
+                .is_some_and(|runtime| runtime.state() == DirectReadFinishState::Completed);
+        }
         matches!(self, Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
             if runtime.state() == DirectReadFinishState::Completed)
     }
@@ -182,6 +189,7 @@ impl ArchivePayload {
             return false;
         }
         let (root, clock) = match self {
+            Self::Offload(owner) => return owner.matches(reservation, custody),
             Self::BeginHeld(owner) => (&owner.ticket.0.root, Some(&owner.ticket.0.clock)),
             Self::EarlyUnknown
             | Self::NativeFinishUnknown { .. }
@@ -386,6 +394,9 @@ pub fn handoff(
             return Err(returned);
         };
         let runtime = match &returned.payload {
+            ArchivePayload::Offload(owner) => {
+                owner.runtime().expect("actual completed offload runtime")
+            }
             ArchivePayload::NativeFinished { runtime, .. }
             | ArchivePayload::ProofFinished { runtime, .. } => runtime,
             _ => unreachable!("only actual finished owners can complete"),
@@ -481,6 +492,13 @@ pub(super) fn entry(
     {
         return Err("failed");
     }
+    entry_current(slot, ticket)
+}
+
+pub(super) fn entry_current(
+    slot: &SharedOperationSlot,
+    ticket: &ArchiveTicket,
+) -> Result<(), &'static str> {
     let state = slot.lock().map_err(|_| "failed")?;
     if !state.archive.matches(ticket) || !state.archive.retained.is_empty() {
         return Err("failed");

@@ -222,6 +222,8 @@ fn binding_rejected_projection_preserves_facts_and_other_handoff_views() {
 
 #[test]
 fn real_worker_retains_closed_owner_after_matching_and_rejected_handoffs() {
+    fn send_static<T: Send + 'static>() {}
+    send_static::<offload::OffloadReturn>();
     for reason in [
         None,
         Some(ArchiveHandoffRefusal::Missing),
