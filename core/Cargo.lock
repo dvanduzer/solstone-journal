@@ -4980,6 +4980,7 @@ dependencies = [
  "solstone-core-distribution",
  "solstone-core-format",
  "solstone-core-journal-config",
+ "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "solstone-core-retention",
  "solstone-core-segment",

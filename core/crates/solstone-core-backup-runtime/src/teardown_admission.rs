@@ -54,7 +54,7 @@ mod binding;
 #[cfg(unix)]
 pub use binding::{
     BindingTeardownAdmission, BoundTeardownAdmission, TeardownBindingFailure,
-    TeardownBindingRefusal,
+    TeardownBindingRefusal, TeardownFinishAdmission,
 };
 
 /// Admit observation only. Destructive execution requires additional boundaries.

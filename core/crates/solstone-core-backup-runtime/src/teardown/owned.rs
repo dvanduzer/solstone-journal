@@ -146,6 +146,12 @@ impl TeardownOperation {
     pub fn report(&self) -> &RemoteTeardownReport {
         &self.report
     }
+
+    /// Close operation resources and move the original observations unchanged.
+    /// This grants no local completion or cleanup authority.
+    pub fn into_report(self) -> RemoteTeardownReport {
+        self.report
+    }
     pub fn cancellation(&self) -> &ArchiveCancellation {
         &self.cancellation
     }

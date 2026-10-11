@@ -8,6 +8,9 @@ use solstone_core_backup::teardown_configuration::{
     BindingFinalization, BindingFinalizationRefusal, BindingRemovalReceipt,
 };
 
+mod finish;
+pub use finish::TeardownFinishAdmission;
+
 pub enum TeardownBindingRefusal {
     Admission(TeardownAdmissionRefusal),
     Binding(BindingFinalizationRefusal),

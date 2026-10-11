@@ -12,6 +12,12 @@ use solstone_core_journal_io::activity_obligations::{observe_obligations, observ
 use solstone_core_journal_io::media::RootCarrierObservation;
 use solstone_core_retention::archive_catalog::read_complete_catalog;
 
+mod owned;
+pub use owned::{
+    OwnedTeardownOutcome, SettledTeardownReport, TeardownAttemptJournal, TeardownRunPhase,
+    TeardownRunRefusal, run_owned_teardown,
+};
+
 /// Read both owning sources afresh inside `TeardownAdmission::check`.
 /// A successful observation grants no deletion, cleanup or crash-safety authority.
 /// Call again at each destructive boundary; config and lease checks stay in admission.
