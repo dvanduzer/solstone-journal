@@ -217,8 +217,8 @@ pub(crate) fn hold_entity_trust_lock_with_options(
 /// holds entity trust, so that is also after any facet trust). Work that must
 /// not wait on another journal lock while trust is held, such as taking the
 /// index writer lease, goes through here. Actions queued under one guard run
-/// once per `key`, in order. An action queued while the thread is unwinding a
-/// panic is dropped.
+/// once per `key`, in order. Actions due at a release that happens while the
+/// thread unwinds a panic are dropped, whenever they were queued, and logged.
 pub fn after_entity_trust_released(
     journal_root: &Path,
     key: &Path,
@@ -265,6 +265,12 @@ fn run_after_release(lock_path: &Path) {
         due
     });
     if thread::panicking() {
+        if !due.is_empty() {
+            log::warn!(
+                "{} actions due at trust release were dropped while unwinding a panic",
+                due.len()
+            );
+        }
         return;
     }
     for (_, _, action) in due {

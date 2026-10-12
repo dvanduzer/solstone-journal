@@ -156,6 +156,58 @@ mod tests {
     }
 
     #[test]
+    fn a_release_never_waits_on_the_index_lease_while_holding_trust() {
+        let root = tempfile::tempdir().unwrap();
+        create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let appended = append_activity_record(
+            root.path(),
+            "work",
+            "20260510",
+            record(json!({"id": "a1", "activity": "meeting", "title": "Plover sync"})),
+        )
+        .unwrap();
+        assert!(matches!(appended, AppendOutcome::Written(_)));
+        let trust = crate::hold_facet_trust_lock(root.path()).unwrap();
+        // Another thread takes the index lease and then asks for trust, the
+        // order reconciliation uses.
+        let (lease_held, lease_is_held) = std::sync::mpsc::channel();
+        let journal = root.path().to_path_buf();
+        let reconcile = std::thread::spawn(move || {
+            let lease = solstone_core_journal_io::hold_lock(
+                solstone_core_indexer_store::db::db_path(&journal),
+                solstone_core_journal_io::LockOptions::default(),
+            )
+            .unwrap();
+            lease_held.send(()).unwrap();
+            let trust = crate::hold_facet_trust_lock(&journal).unwrap();
+            drop(trust);
+            drop(lease);
+        });
+        lease_is_held.recv().unwrap();
+        crate::update_activity_record(
+            root.path(),
+            "work",
+            "20260510",
+            "a1",
+            &serde_json::Map::from_iter([("title".to_owned(), json!("Plover retro"))]),
+            "test",
+            "renamed",
+            "2026-05-10T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        let started = std::time::Instant::now();
+        drop(trust);
+        reconcile.join().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(searchable(
+            root.path(),
+            "facets/work/activities/20260510.jsonl",
+            "Plover retro"
+        ));
+    }
+
+    #[test]
     fn a_saved_entity_detection_is_searchable_at_once() {
         let root = tempfile::tempdir().unwrap();
         create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
