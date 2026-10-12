@@ -76,7 +76,7 @@ use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::media::RootActivityCarrier;
 
 #[cfg(unix)]
-const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
+pub(crate) const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
 #[cfg(unix)]
 const SUPPORTED_RESTIC_VERSION: &str = "0.19.0";
 #[cfg(unix)]
@@ -1386,6 +1386,7 @@ impl<'a> ReadOperation<'a> {
             .as_ref()
             .is_some_and(ArchivePredecessorCustody::creator_executor);
         self.execution.borrow_mut().attempt();
+        #[cfg(not(target_os = "macos"))]
         let completed = if creator {
             bounded_child::run_owned_archive_creator(
                 request,
@@ -1393,6 +1394,17 @@ impl<'a> ReadOperation<'a> {
                 self.operation.budget().cancellation(),
             )
         } else {
+            bounded_child::run_owned(
+                request,
+                Some(capture_limit),
+                self.operation.budget().cancellation(),
+            )
+        };
+        // macOS reads run as ordinary children, as in restore; only the
+        // creator's `backup` runs under the parent watch.
+        #[cfg(target_os = "macos")]
+        let completed = {
+            let _ = creator;
             bounded_child::run_owned(
                 request,
                 Some(capture_limit),

@@ -45,5 +45,5 @@ public class JournalService extends Service {
         }catch(Exception e){android.util.Log.e("JournalRuntime","worker evidence write failed",e);}
     }
     public IBinder onBind(Intent i) { return incoming.getBinder(); }
-    public void onDestroy() { evidence("service_destroyed","last binding released"); Native.run("","cancel",1);work.shutdownNow(); super.onDestroy(); }
+    public void onDestroy() { evidence("service_destroyed","last binding released"); Native.run("","cancel",1); work.execute(()->Native.run("","serve:{\"op\":\"stop\"}",1));work.shutdown(); super.onDestroy(); }
 }

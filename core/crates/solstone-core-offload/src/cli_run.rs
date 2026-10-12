@@ -18,7 +18,10 @@ use solstone_core_backup_runtime::{
     ClosedToolError, DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
     OwnedDirectReadFinish, admit_prepared_archive_owned_creator_installed, resolve_restic_member,
 };
+use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::{JournalRoot, JournalRootError};
+use solstone_core_retention::remove_marked::recover_interrupted_removals;
+use solstone_core_retention::restore_intent::recover_abandoned_restores;
 
 use crate::run::{
     OwnedOffloadPlanFinish, OwnedOffloadPlanHold, OwnedOffloadPlanInputFailure,
@@ -257,7 +260,7 @@ impl OwnedOffloadCliRun {
 
 /// Whether this host runs the installed offload producer. Elsewhere every
 /// non-preview run is refused before it opens the journal.
-pub const PRODUCER_SUPPORTED: bool = cfg!(target_os = "linux");
+pub const PRODUCER_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
 /// Run the installed offload producer while retaining its complete outcome.
 pub fn run_cli_offload(
@@ -295,6 +298,12 @@ pub fn run_cli_offload(
             );
         }
     };
+    // A run, removal or restore interrupted by a crash would refuse this
+    // admission. Recovery may hash originals, so it runs before the deadline starts.
+    if let Ok(activity) = ActivityLease::try_acquire(Arc::clone(&root)) {
+        recover_interrupted_removals(&activity);
+        recover_abandoned_restores(&activity);
+    }
     let budget = match ArchiveBudget::new(clock.as_ref()) {
         Ok(budget) => budget,
         Err(error) => {

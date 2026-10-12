@@ -504,6 +504,10 @@ fn main() -> ExitCode {
     if let Some(code) = solstone_core_backup::owned_dns::dispatch(&args) {
         return ExitCode::from(code);
     }
+    #[cfg(target_os = "macos")]
+    if let Some(code) = solstone_core_backup::owned_creator::dispatch(&args) {
+        return ExitCode::from(code);
+    }
     #[cfg(windows)]
     let installed_task = match service_windows::admit_task_action(&args) {
         Ok(action) => action,
