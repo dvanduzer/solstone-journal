@@ -637,6 +637,85 @@ fn synthetic_decode_promotes_empty_and_corrupt_results() {
 }
 
 #[test]
+fn failed_retry_keeps_a_partial_reading_and_still_exhausts() {
+    let test = TestRun::new("keep-partial");
+    run_decoded(
+        test.options(false, Vec::new()),
+        &ScriptedFactory::new(default_response),
+        decoded(&[1, 2]),
+    )
+    .expect("initial reading");
+    rewrite_header(&test.artifact(), |header| {
+        header["_solstone_processing"]["state"] = json!("failed");
+        header["_solstone_processing"]["reason_code"] = json!("analysis_failed");
+        header["_solstone_processing"]["attempts"] = json!(1);
+    });
+    let body = artifact_body(&test.artifact());
+
+    run_decoded(
+        test.options(false, Vec::new()),
+        &ScriptedFactory::new(default_response),
+        DescribeResult {
+            decode_failed: true,
+            ..DescribeResult::default()
+        },
+    )
+    .expect("a retry that cannot decode still completes");
+    assert_eq!(artifact_body(&test.artifact()), body);
+    let header = &test.rows()[0];
+    assert_eq!(header["_solstone_processing"]["state"], "failed");
+    assert_eq!(
+        header["_solstone_processing"]["reason_code"],
+        "analysis_failed"
+    );
+    assert_eq!(header["_solstone_processing"]["attempts"], 2);
+
+    let invalid = ScriptedFactory::new(|request| generated(request, "not json"));
+    assert!(matches!(
+        run_decoded(
+            test.options(false, Vec::new()),
+            &invalid,
+            decoded(&[1, 2, 3])
+        ),
+        Err(RunError::Internal(_))
+    ));
+    assert_eq!(artifact_body(&test.artifact()), body);
+    assert_eq!(test.rows()[0]["_solstone_processing"]["attempts"], 3);
+
+    let exhausted = ScriptedFactory::new(default_response);
+    run_decoded(
+        test.options(false, Vec::new()),
+        &exhausted,
+        decoded(&[1, 2]),
+    )
+    .expect("an exhausted reading is skipped");
+    assert!(exhausted.requests().is_empty());
+    assert_eq!(artifact_body(&test.artifact()), body);
+
+    let unread = TestRun::new("replace-unread");
+    fs::write(
+        unread.artifact(),
+        "{\"_solstone_processing\":{\"state\":\"failed\",\"reason_code\":\"analysis_failed\",\"handler\":\"describe\",\"attempts\":1}}\n{\"frame_id\":1,\"timestamp\":0.0,\"requests\":[],\"error\":\"prior failure\",\"enhanced\":false}\n",
+    )
+    .expect("write unread fixture");
+    run_decoded(
+        unread.options(false, Vec::new()),
+        &ScriptedFactory::new(default_response),
+        DescribeResult {
+            decode_failed: true,
+            ..DescribeResult::default()
+        },
+    )
+    .expect("corrupt retry promotes");
+    let rows = unread.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["_solstone_processing"]["reason_code"],
+        "corrupt_input"
+    );
+}
+
+#[test]
 fn synthetic_decode_preserves_category_contracts_and_extraction_outcomes() {
     for (primary, context, tokens, json_output) in [
         ("browsing", "observe.describe.browsing", 3072, false),
@@ -1273,4 +1352,58 @@ fn owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows() {
     let calls = factory.requests().len();
     run_decoded(run.options(false, vec![]), &factory, decoded(&[1])).unwrap();
     assert_eq!(factory.requests().len(), calls);
+    // Main's retained-partial-reading path must publish this attempt's receipt
+    // too, without replacing its rows with an empty decode failure.
+    use sha2::{Digest, Sha256};
+    let body = artifact_body(&run.artifact());
+    rewrite_header(&run.artifact(), |h| {
+        let record = &mut h["_solstone_processing"];
+        record["state"] = json!("failed");
+        record["reason_code"] = json!("analysis_failed");
+        record["attempts"] = json!(3);
+        record["body_sha256"] = json!(format!("{:x}", Sha256::digest(body.as_bytes())));
+    });
+    let evidence = raw::inspect_output(&run.journal, &run.artifact())
+        .unwrap()
+        .unwrap();
+    raw::observe(&run.journal, &evidence).unwrap();
+    work_retry::request(&run.journal, &evidence.unit).unwrap();
+    let attempt = work_retry::read(&run.journal, &id)
+        .unwrap()
+        .unwrap()
+        .permission(&evidence.input, &[])
+        .unwrap();
+    temp_env::with_vars(
+        [
+            (raw::JOURNAL_ENV, Some(run.journal.to_str().unwrap())),
+            (raw::UNIT_ENV, Some(id.as_str())),
+            (raw::CAUSE_ENV, Some(attempt.cause.as_str())),
+            (
+                raw::ATTEMPT_ENV,
+                Some(serde_json::to_string(&attempt).unwrap().as_str()),
+            ),
+        ],
+        || {
+            run_decoded(
+                run.options(false, vec![]),
+                &factory,
+                DescribeResult {
+                    decode_failed: true,
+                    ..DescribeResult::default()
+                },
+            )
+            .unwrap();
+        },
+    );
+    assert_eq!(artifact_body(&run.artifact()), body);
+    assert!(
+        !raw::inspect_output(&run.journal, &run.artifact())
+            .unwrap()
+            .unwrap()
+            .protected
+    );
+    raw::finish_output(&run.journal, &evidence.unit, &attempt).unwrap();
+    let record = work_retry::read(&run.journal, &id).unwrap().unwrap();
+    assert!(record.held);
+    assert!(record.attempt.is_none());
 }

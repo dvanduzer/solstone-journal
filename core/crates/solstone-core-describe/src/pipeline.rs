@@ -71,6 +71,7 @@ struct Promotion<'a> {
     reason: &'a str,
     previous_attempts: i64,
     carry_forward_observer: Option<&'a str>,
+    existing: Option<&'a merge::ExistingDescribeArtifact>,
 }
 
 enum RowContent {
@@ -244,6 +245,7 @@ fn run_with_decoder(
             reason,
             previous_attempts,
             carry_forward_observer: carry_forward_observer.as_deref(),
+            existing: existing_artifact.as_ref(),
         })?;
         send_described(&options, &output, start);
         return Ok(());
@@ -408,6 +410,7 @@ fn run_with_decoder(
             reason: vocab::REASON_ANALYSIS_FAILED,
             previous_attempts,
             carry_forward_observer: carry_forward_observer.as_deref(),
+            existing: existing_artifact.as_ref(),
         })?;
         return Err(RunError::Internal(
             "all describe frame requests failed".to_owned(),
@@ -633,6 +636,7 @@ fn run_with_decoder(
         reason,
         previous_attempts,
         carry_forward_observer: carry_forward_observer.as_deref(),
+        existing: existing_artifact.as_ref(),
     })?;
     send_described(&options, &output, start);
     Ok(())
@@ -919,6 +923,9 @@ fn promote(promotion: Promotion<'_>) -> Result<(), RunError> {
         .ok_or_else(|| RunError::Internal("output has no parent".to_owned()))?;
     let final_path = parent.join(format!(".describe-final-{}.jsonl.tmp", std::process::id()));
     let result = (|| {
+        if let Some(existing) = retained_reading(&promotion)? {
+            return keep_existing_reading(&promotion, existing, &final_path);
+        }
         let mut header = Map::new();
         header.insert(
             "raw".to_owned(),
@@ -960,7 +967,7 @@ fn promote(promotion: Promotion<'_>) -> Result<(), RunError> {
             "qualified_count".to_owned(),
             json!(promotion.decoded.qualified_count),
         );
-        if let Some(model) = promotion.model {
+        if let Some(model) = &promotion.model {
             header.insert("_solstone_thinking".to_owned(), json!({"model":model}));
         }
         let mut record = json!({"schema":vocab::SCHEMA,"state":promotion.state,"reason_code":promotion.reason,"handler":vocab::HANDLER_DESCRIBE,"attempted_at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),"input_size":promotion.input_size});
@@ -985,17 +992,87 @@ fn promote(promotion: Promotion<'_>) -> Result<(), RunError> {
         std::io::copy(&mut row_file, &mut final_file)
             .map_err(|error| RunError::Internal(error.to_string()))?;
         drop(final_file);
-        let _commit = promotion
-            .input
-            .commit(promotion.claims)
-            .map_err(|error| RunError::Internal(error.to_string()))?;
-        install_file(&final_path, promotion.output, AtomicWriteOptions::default())
-            .map_err(|error| RunError::Internal(error.to_string()))
+        install_promoted(&promotion, &final_path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&final_path);
     }
     result
+}
+
+fn install_promoted(promotion: &Promotion<'_>, final_path: &Path) -> Result<(), RunError> {
+    let _commit = promotion
+        .input
+        .commit(promotion.claims)
+        .map_err(|error| RunError::Internal(error.to_string()))?;
+    install_file(final_path, promotion.output, AtomicWriteOptions::default())
+        .map_err(|error| RunError::Internal(error.to_string()))
+}
+
+/// Return the prior reading a retry must keep: one with more analyzed frames
+/// than an incomplete new outcome (a failed or empty retry never shrinks it).
+fn retained_reading<'a>(
+    promotion: &Promotion<'a>,
+) -> Result<Option<&'a merge::ExistingDescribeArtifact>, RunError> {
+    let Some(existing) = promotion.existing else {
+        return Ok(None);
+    };
+    if promotion.state == vocab::STATE_ANALYZED {
+        return Ok(None);
+    }
+    let Some(rows) = existing.rows.as_ref() else {
+        return Ok(None);
+    };
+    let kept = rows
+        .iter()
+        .filter(|row| merge::is_analyzed(&row.data))
+        .count();
+    if kept == 0 {
+        return Ok(None);
+    }
+    let fresh = fs::read_to_string(promotion.rows)
+        .map_err(|error| RunError::Internal(error.to_string()))?;
+    let fresh = fresh
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(merge::is_analyzed)
+        .count();
+    Ok((kept > fresh).then_some(existing))
+}
+
+/// Rewrite the prior reading unchanged except for this attempt's bookkeeping,
+/// so the bounded retry still exhausts.
+fn keep_existing_reading(
+    promotion: &Promotion<'_>,
+    existing: &merge::ExistingDescribeArtifact,
+    final_path: &Path,
+) -> Result<(), RunError> {
+    let mut header = existing.header.clone();
+    let mut record = existing.record.clone();
+    record["attempted_at"] =
+        json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    record["attempts"] = json!(promotion.previous_attempts + 1);
+    solstone_core_system::work_retry::raw::stamp_failed_input(&mut record, promotion.video)
+        .map_err(RunError::Internal)?;
+    // The retained rows are this publication's body, not the unsuccessful
+    // replacement's scratch rows. Bind permission and protection to both.
+    use sha2::{Digest, Sha256};
+    let mut body_hash = Sha256::new();
+    for row in existing.rows.iter().flatten() {
+        body_hash.update(row.raw_line.as_bytes());
+    }
+    record["body_sha256"] = json!(format!("{:x}", body_hash.finalize()));
+    header["_solstone_processing"] = record;
+    let mut final_file =
+        File::create(final_path).map_err(|error| RunError::Internal(error.to_string()))?;
+    writeln!(final_file, "{header}").map_err(|error| RunError::Internal(error.to_string()))?;
+    for row in existing.rows.iter().flatten() {
+        final_file
+            .write_all(row.raw_line.as_bytes())
+            .map_err(|error| RunError::Internal(error.to_string()))?;
+    }
+    drop(final_file);
+    install_promoted(promotion, final_path)
 }
 
 #[cfg(all(test, not(feature = "full-tests")))]

@@ -947,6 +947,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "full-tests")]
     fn permit_owner_daily(context: &ThinkContext, identity: &DailyUnitIdentity) -> ThinkContext {
         use solstone_core_system::work_retry::{self, Unit};
         let unit = Unit::Daily {
@@ -984,6 +985,7 @@ mod tests {
         context
     }
 
+    #[cfg(feature = "full-tests")]
     fn permit_changed_daily(context: &ThinkContext, identity: &DailyUnitIdentity) -> ThinkContext {
         use solstone_core_system::work_retry::{self, Unit};
         let unit = Unit::Daily {
