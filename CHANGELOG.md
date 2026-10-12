@@ -13,6 +13,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - on linux, `solstone journal backup offload restore` now brings back media that offload moved into your backup, for one day or with `--all`, the same way the backup page does. before, it said restoring offloaded files was temporarily unavailable.
 - when bringing back offloaded media left a file out because a different file was already where one belongs, or because a file couldn't be put back, the backup page didn't say why. it now does.
 - your journal's home page no longer offers to delete originals for offload proposals made by an earlier version, which it couldn't do. your originals stay on this computer.
+- when you redo a past day with `solstone journal reprocess`, your journal now remakes that day's daily results soon after it finishes redoing its recordings. before, they could wait for your journal's next check of its recorded days, close to an hour on a large journal.
 
 ## [2.0.43] - 2026-10-12
 

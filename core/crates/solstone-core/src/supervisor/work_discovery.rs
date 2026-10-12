@@ -37,6 +37,67 @@ fn rest_after(pass: Duration) -> Duration {
     MIN_REST.max(pass * REST_PER_PASS)
 }
 
+/// While an owner's requested work is in the queue, a resting worker checks
+/// this often whether it has finished.
+const OWNER_POLL: Duration = Duration::from_secs(1);
+
+/// Days the owner asked to redo whose discovered work is still in the queue.
+fn owner_days_in_queue(journal: &Path, queue: &TaskQueue) -> BTreeSet<String> {
+    let Ok(intents) = work_intent::read(journal) else {
+        return BTreeSet::new();
+    };
+    intents
+        .into_keys()
+        .filter(|day| owner_work_in_queue(queue, day))
+        .collect()
+}
+
+fn owner_work_in_queue(queue: &TaskQueue, day: &str) -> bool {
+    let day = format!("-{day}-");
+    queue
+        .any_reference(|reference| reference.starts_with("supervisor-") && reference.contains(&day))
+}
+
+/// Rest until a wake, the next automatic pass, or the end of an owner's
+/// requested work. A day's later steps (its daily batch, or segments past the
+/// queue's admission bound) are found only by a pass, so a finished owner
+/// request starts one rather than waiting out the automatic rest. It still
+/// waits as long as the last pass ran, so discovery stays at most half a core
+/// while owner work keeps finishing. Returns false when the worker must exit.
+fn rest(
+    receiver: &mpsc::Receiver<()>,
+    next_pass: Option<Instant>,
+    owner: Option<(Instant, &dyn Fn() -> bool)>,
+) -> bool {
+    loop {
+        let now = Instant::now();
+        if next_pass.is_some_and(|due| now >= due)
+            || owner.is_some_and(|(from, done)| now >= from && done())
+        {
+            return true;
+        }
+        let poll = owner.map(|(from, _)| from.saturating_duration_since(now).max(OWNER_POLL));
+        let timeout = match (
+            next_pass.map(|due| due.saturating_duration_since(now)),
+            poll,
+        ) {
+            (Some(due), Some(poll)) => Some(due.min(poll)),
+            (due, poll) => due.or(poll),
+        };
+        let received = match timeout {
+            Some(timeout) => receiver.recv_timeout(timeout),
+            None => receiver
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match received {
+            Ok(()) => return true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 pub(crate) struct WorkDiscovery {
     stopped: Arc<AtomicBool>,
     wake: mpsc::SyncSender<()>,
@@ -99,13 +160,20 @@ impl WorkDiscovery {
                     if worker_stop.load(Ordering::Acquire) {
                         return;
                     }
-                    if automatic {
-                        let rest = rest_after(started.elapsed());
-                        match receiver.recv_timeout(rest) {
-                            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        }
-                    } else if receiver.recv().is_err() {
+                    let pass = started.elapsed();
+                    let ended = Instant::now();
+                    let owner_days = owner_days_in_queue(&journal, &queue);
+                    let owner_done = || {
+                        owner_days
+                            .iter()
+                            .any(|day| !owner_work_in_queue(&queue, day))
+                    };
+                    if !rest(
+                        &receiver,
+                        automatic.then(|| ended + rest_after(pass)),
+                        (!owner_days.is_empty())
+                            .then_some((ended + pass, &owner_done as &dyn Fn() -> bool)),
+                    ) {
                         return;
                     }
                 }
@@ -1730,6 +1798,102 @@ mod tests {
             report.holds
         );
     }
+
+    #[test]
+    fn only_a_requested_day_with_work_in_the_queue_is_owner_work() {
+        let root = fixture("local");
+        segment(root.path(), "19990101", "120000_60");
+        segment(root.path(), "19990102", "120000_60");
+        work_intent::register(root.path(), "19990101", false).unwrap();
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        // Both days have queued work; only the requested one is waited on.
+        assert!(queue.contains_reference("supervisor-work-19990102-notes-120000_60"));
+        assert_eq!(
+            owner_days_in_queue(root.path(), &queue),
+            BTreeSet::from(["19990101".to_owned()])
+        );
+        queue.replace_discovered(Vec::new());
+        assert!(owner_days_in_queue(root.path(), &queue).is_empty());
+    }
+
+    /// A requested day's next step is found only by a pass, so the end of its
+    /// queued work starts one instead of waiting out the automatic rest.
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn finished_owner_work_starts_the_next_pass_before_the_rest_ends() {
+        use solstone_core_system::lifecycle::{
+            CoordinatorBootstrap, DeclaredParent, ParentLossCoordinator,
+        };
+        use solstone_core_system::queue::{SubmitOutcome, SystemProcessStateProbe};
+        use solstone_core_system::request::ExecutionRequest;
+        let root = fixture("local");
+        let parent = DeclaredParent::capture_current().unwrap();
+        let (_coordinator, _) = ParentLossCoordinator::bootstrap(CoordinatorBootstrap {
+            journal: root.path().into(),
+            supervisor: parent.instance(),
+            enabled: Vec::new(),
+            supervisor_heartbeat_filename: format!(
+                "solstone-v2-owner-wake-test-{}.check",
+                std::process::id()
+            ),
+            capability: format!("owner-wake-test-{}", root.path().display()).into_bytes(),
+        })
+        .unwrap();
+        let queue = TaskQueue::new(TaskQueueOptions {
+            journal_root: root.path().into(),
+            cap_resolver: Arc::new(solstone_core_system::cap::DefaultCapResolver::default()),
+            process_state_probe: Arc::new(SystemProcessStateProbe),
+            queue_sink: None,
+            process_sink: None,
+            ready: true,
+            before_deadline_commit: None,
+            child_environment: BTreeMap::new(),
+            task_binary: None,
+        });
+        let (passes, passed) = mpsc::channel();
+        let mut count = 0;
+        let worker = WorkDiscovery::with_reconciler(
+            root.path().into(),
+            queue.clone(),
+            true,
+            move |journal, queue, _| {
+                count += 1;
+                if count == 1 {
+                    // The owner's request admits the day's segment work.
+                    work_intent::register(journal, "19990101", false)?;
+                    let mut work = task(
+                        "19990101",
+                        Some(("120000_60", "notes")),
+                        WorkPriority {
+                            band: WorkBand::Waiting,
+                            source_time: 19990101120000,
+                        },
+                        None,
+                        false,
+                    );
+                    work.request.cmd =
+                        TaskArgv::from_wire(vec!["/bin/sleep".into(), "0.5".into()]).unwrap();
+                    assert_eq!(
+                        queue.submit(ExecutionRequest::Bus(work.request)),
+                        SubmitOutcome::Dispatched
+                    );
+                }
+                passes.send(count).unwrap();
+                Ok(())
+            },
+        );
+        worker.request();
+        assert_eq!(passed.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        // The automatic rest is at least a minute; the owner's work ends sooner.
+        assert_eq!(passed.recv_timeout(Duration::from_secs(15)).unwrap(), 2);
+        assert!(!owner_work_in_queue(&queue, "19990101"));
+        // With no owner work left, the next pass waits for the rest.
+        assert!(passed.recv_timeout(Duration::from_secs(3)).is_err());
+        worker.stop();
+        queue.shutdown();
+    }
+
     #[cfg(all(unix, feature = "full-tests"))]
     #[test]
     fn blocked_discovery_coalesces_wakes_and_does_not_hold_task_admission_or_status() {
