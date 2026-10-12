@@ -307,6 +307,7 @@ pub enum ConveyServeError {
     LoopbackBind { port: u16, source: io::Error },
     PairingWindowCleanup(solstone_core_sol_link::pairing::nonces::NonceStoreError),
     EmbeddedRoot(solstone_core_journal_io::JournalRootError),
+    EmbeddedPayload(String),
 }
 
 #[cfg(feature = "host")]
@@ -317,6 +318,7 @@ impl std::fmt::Display for ConveyServeError {
                 formatter,
                 "could not bind loopback port {port}: {source}. convey may already be running, including under another login. the default port is shared across logins"
             ),
+            Self::EmbeddedPayload(error) => write!(formatter, "embedded payload: {error}"),
             Self::EmbeddedRoot(error) => write!(formatter, "embedded journal root: {error}"),
             Self::PairingWindowCleanup(error) => {
                 write!(
@@ -379,6 +381,27 @@ pub async fn bind_embedded_device_door(
     journal_root: PathBuf,
     address: std::net::SocketAddrV4,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
+    let app = router(journal_root.clone());
+    bind_embedded_router(journal_root, address, app).await
+}
+
+#[cfg(feature = "host")]
+pub async fn bind_embedded_device_door_with_payload(
+    journal_root: PathBuf,
+    address: std::net::SocketAddrV4,
+    payload_root: PathBuf,
+) -> Result<EmbeddedConveyHandle, ConveyServeError> {
+    let app = router_with_payload_root(journal_root.clone(), &payload_root)
+        .map_err(ConveyServeError::EmbeddedPayload)?;
+    bind_embedded_router(journal_root, address, app).await
+}
+
+#[cfg(feature = "host")]
+async fn bind_embedded_router(
+    journal_root: PathBuf,
+    address: std::net::SocketAddrV4,
+    app: Router,
+) -> Result<EmbeddedConveyHandle, ConveyServeError> {
     use solstone_core_sol_link::ledger::AuthorizedClientsRead;
     use tokio::sync::watch;
 
@@ -397,7 +420,7 @@ pub async fn bind_embedded_device_door(
             .map_err(ConveyServeError::EmbeddedRoot)?,
     );
     let cache: link_health_cache::RelayHealthCacheStore = Arc::new(std::sync::Mutex::new(None));
-    let router = router(journal_root.clone()).layer(Extension(cache));
+    let router = app.layer(Extension(cache));
     let door_router = authorization_gate::authorized_router_with_router(
         router.clone(),
         journal_root.clone(),
@@ -880,6 +903,24 @@ fn router_with_hosted_parent(
     hosted_parent: Option<Arc<solstone_core_system::lifecycle::HostedServiceParentRuntime>>,
     agents_routes: Option<Router>,
 ) -> Router {
+    router_with_roots(journal_root, hosted_parent, agents_routes, None)
+}
+
+/// Compose the production routes with an explicitly packaged app payload.
+pub fn router_with_payload_root(
+    journal_root: PathBuf,
+    payload_root: &std::path::Path,
+) -> Result<Router, String> {
+    let roots = thinking_sol_reads::TalentRoots::from_payload_root(payload_root)?;
+    Ok(router_with_roots(journal_root, None, None, Some(roots)))
+}
+
+fn router_with_roots(
+    journal_root: PathBuf,
+    hosted_parent: Option<Arc<solstone_core_system::lifecycle::HostedServiceParentRuntime>>,
+    agents_routes: Option<Router>,
+    payload_roots: Option<thinking_sol_reads::TalentRoots>,
+) -> Router {
     solstone_core_convey_body::warm_trends(journal_root.clone());
     let include_agents = agents_routes.is_some();
     let shell = Arc::new(if include_agents {
@@ -1229,7 +1270,10 @@ fn router_with_hosted_parent(
                 .fallback(not_found),
         )
         .merge(solstone_core_records_web::api_router(journal_root.clone()))
-        .merge(thinking::router(route_journal_root.clone()))
+        .merge(match payload_roots {
+            Some(roots) => thinking::router_with_roots(route_journal_root.clone(), roots),
+            None => thinking::router(route_journal_root.clone()),
+        })
         .merge(solstone_core_sol_link::http::init_router(
             journal_root.clone(),
         ))

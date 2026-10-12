@@ -381,6 +381,17 @@ fn poll_success_body(body: Result<String, ureq::Error>, portal_base: &str) -> Po
 }
 
 pub fn router(journal: Arc<JournalRoot>) -> Router {
+    router_with_roots(
+        journal,
+        crate::thinking_sol_reads::TalentRoots::production()
+            .unwrap_or_else(|error| panic!("{error}")),
+    )
+}
+
+pub(crate) fn router_with_roots(
+    journal: Arc<JournalRoot>,
+    roots: crate::thinking_sol_reads::TalentRoots,
+) -> Router {
     let confidential_runtime = ConfidentialRuntime {
         portal_base_url: std::env::var("SERVICES_PORTAL_URL")
             .unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_owned())
@@ -504,10 +515,7 @@ pub fn router(journal: Arc<JournalRoot>) -> Router {
             get(crate::thinking_sol_reads::api_updated_days),
         )
         .layer(Extension(journal))
-        .layer(Extension(Arc::new(
-            crate::thinking_sol_reads::TalentRoots::production()
-                .unwrap_or_else(|error| panic!("{error}")),
-        )))
+        .layer(Extension(Arc::new(roots)))
         .layer(Extension(Arc::new(OperationRegistry::default())))
         .layer(Extension(confidential_runtime))
         .layer(Extension(Arc::new(std::sync::Mutex::new(

@@ -322,6 +322,9 @@ impl DoorLifecycle {
     }
 
     pub(super) fn bound_addr(&self) -> Option<SocketAddr> {
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
         let running = self.running.lock().expect("door lifecycle lock");
         match running.as_ref().map(|current| &current.outcome) {
             Some(DoorOutcome::Bound(address)) => Some(*address),
