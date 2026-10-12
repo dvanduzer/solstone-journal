@@ -592,7 +592,12 @@ pdf_rung() {
 		cat "$journal/preview.out" "$journal/preview.err" >&2 || true
 		refuse "document preview failed"
 	}
-	grep -F '1 PDF documents, 2 total pages' "$journal/preview.out" >/dev/null \
+	# 2.0.42 renders every manual import's dry-run as the shared size preview
+	# (83214f167). For a document the size comes from the PDF worker's extract,
+	# so one recording proves the installed importer spawned the worker and read
+	# the fixture; a failed extract is a skip or an error, never a recording.
+	grep -Fx '1 recording across 1 day' "$journal/preview.out" >/dev/null \
+		&& ! grep -F 'skipped' "$journal/preview.out" >/dev/null \
 		|| {
 			cat "$journal/preview.out" "$journal/preview.err" >&2 || true
 			refuse "document preview did not report the fixture PDF"
