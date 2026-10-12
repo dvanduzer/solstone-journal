@@ -23,7 +23,7 @@ solstone-core-journal-config-write.workspace = true
 solstone-core-journal-io.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs", "process", "signal"] }
+nix = { workspace = true, features = ["event", "fs", "process", "resource", "signal"] }
 rustix = { workspace = true, features = ["process"] }
 solstone-core-installed-payload.workspace = true
 

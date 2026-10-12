@@ -12,7 +12,7 @@ use solstone_core_backup::teardown_configuration::BindingRemovalReceipt;
 use solstone_core_backup_runtime::teardown::owned::{
     RemoteTeardownReport, TeardownOperation, TeardownRemoteRefusal,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use solstone_core_backup_runtime::teardown_admission::admit_teardown;
 #[cfg(unix)]
 use solstone_core_backup_runtime::teardown_admission::{
@@ -141,7 +141,7 @@ impl Outside {
             retirement: None,
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn remaining(&self) -> Result<(), TeardownRunRefusal> {
         self.operation
             .as_ref()
@@ -154,7 +154,7 @@ impl Outside {
 
 // Refused platforms expose the same closed custody views without constructing
 // executing phases.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 enum PhaseOwner {
     Admission(Box<TeardownAdmission>),
     CarrierFailure(Box<TeardownCarrierFailure>),
@@ -383,7 +383,7 @@ fn held(
     }))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unknown(
     outside: Outside,
     owner: Option<PhaseOwner>,
@@ -399,7 +399,7 @@ fn unknown(
 
 /// Every journal writer that could change cataloged media takes the same exclusive
 /// activity lock this teardown holds, and the coverage reader runs again at each
-/// destructive boundary. Other platforms are refused before root admission or WAN.
+/// destructive boundary. Windows is refused before root admission or WAN.
 pub fn run_owned_teardown(
     journal: &Path,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -407,11 +407,11 @@ pub fn run_owned_teardown(
     version: &str,
 ) -> OwnedTeardownOutcome {
     let outside = Outside::new(clock, cancellation);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         execute(journal, outside, version)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (journal, version);
         held(
@@ -423,7 +423,7 @@ pub fn run_owned_teardown(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardownOutcome {
     use solstone_core_journal_io::media::{
         ActivityCarrierRetirementEffect, Confirmation, Durability,
@@ -762,12 +762,16 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
     OwnedTeardownOutcome::Finished(Box::new(report))
 }
 
-#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[cfg(all(
+    test,
+    feature = "full-tests",
+    any(target_os = "linux", target_os = "macos")
+))]
 thread_local! {
     static PANIC_AT: std::cell::Cell<Option<TeardownRunPhase>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn test_cut(phase: TeardownRunPhase) {
     #[cfg(all(test, feature = "full-tests"))]
     PANIC_AT.with(|cut| {
@@ -779,5 +783,9 @@ fn test_cut(phase: TeardownRunPhase) {
     let _ = phase;
 }
 
-#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[cfg(all(
+    test,
+    feature = "full-tests",
+    any(target_os = "linux", target_os = "macos")
+))]
 mod tests;

@@ -110,14 +110,14 @@ pub(crate) fn run_owned_archive_creator(
 #[derive(Clone, Copy)]
 enum ChildSetup {
     Ordinary,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Dns(Instant),
     Creator,
 }
 
 /// The DNS leaf supplies only an admitted executable, fixed DNS arguments and
 /// the original absolute end. No ambient environment or descriptors are passed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn run_owned_dns(
     program: &std::ffi::OsStr,
     argv: &[OsString],
@@ -371,6 +371,43 @@ fn prepare_dns_child(command: &mut Command) {
     }
 }
 
+/// No descriptor survives exec, and a child whose parent already left is killed
+/// before exec. macOS has neither `close_range` nor a parent-death signal: the
+/// sweep marks every descriptor below the soft limit close-on-exec, and the DNS
+/// entry itself watches its parent before resolving anything.
+#[cfg(target_os = "macos")]
+fn prepare_dns_child(command: &mut Command) {
+    // An unbounded or unreadable limit still sweeps a large fixed range.
+    const SWEEP_CEILING: nix::libc::c_int = 1 << 20;
+    let expected_parent = std::process::id() as nix::libc::pid_t;
+    let ceiling = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+        .ok()
+        .and_then(|(soft, _)| nix::libc::c_int::try_from(soft).ok())
+        .map_or(SWEEP_CEILING, |soft| soft.min(SWEEP_CEILING));
+    // SAFETY: the bound is computed above. Between fork and exec only fcntl,
+    // getppid, getpid and kill run, all async-signal-safe; nothing allocates and
+    // no parent descriptor flag changes.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            for fd in 3..ceiling {
+                let flags = nix::libc::fcntl(fd, nix::libc::F_GETFD);
+                if flags >= 0
+                    && flags & nix::libc::FD_CLOEXEC == 0
+                    && nix::libc::fcntl(fd, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if nix::libc::getppid() != expected_parent {
+                nix::libc::kill(nix::libc::getpid(), nix::libc::SIGKILL);
+                return Err(io::Error::from_raw_os_error(nix::libc::ECANCELED));
+            }
+            Ok(())
+        });
+    }
+}
+
 fn read_output(
     fd: OwnedFd,
     limit: Option<usize>,
@@ -501,7 +538,7 @@ fn execute_tracked(
     settled: &mut bool,
 ) -> io::Result<CompletedChild> {
     let dns_deadline: Option<Instant> = match setup {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         ChildSetup::Dns(deadline) => Some(deadline),
         _ => None,
     };
@@ -561,7 +598,14 @@ fn execute_tracked(
             inherit_in_child(&mut command, &request.pass_fds)?;
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    match setup {
+        ChildSetup::Dns(_) => prepare_dns_child(&mut command),
+        ChildSetup::Creator | ChildSetup::Ordinary => {
+            inherit_in_child(&mut command, &request.pass_fds)?;
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     inherit_in_child(&mut command, &request.pass_fds)?;
     if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
         return Err(cancelled());
@@ -685,6 +729,47 @@ mod tests {
             assert_eq!(steps, expected);
             assert_eq!(result.is_err(), fails);
         }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn dns_child_inherits_no_descriptor_its_parent_left_open() {
+        let (read, write) = pipe().unwrap();
+        for fd in [read.as_fd(), write.as_fd()] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        }
+        let probe = format!(
+            "for fd in {} {}; do [ -e /dev/fd/$fd ] && echo leaked; done; echo done",
+            read.as_raw_fd(),
+            write.as_raw_fd()
+        );
+        // Control: an ordinary spawn sees both descriptors, so the probe detects a leak.
+        let control = Command::new("/bin/sh")
+            .args(["-c", &probe])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(control.stdout, b"leaked\nleaked\ndone\n");
+        let request = Request {
+            program: "/bin/sh".into(),
+            argv: vec!["-c".into(), probe.into()],
+            env: BTreeMap::new(),
+            timeout: None,
+            pass_fds: Vec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let completed = execute_request(
+            &request,
+            Some(4096),
+            Some(&ArchiveCancellation::new()),
+            ChildSetup::Dns(deadline),
+        )
+        .map_err(ChildFailure::into_error)
+        .unwrap();
+        assert_eq!(completed.output().stdout, b"done\n");
+        // The parent's own descriptors are untouched.
+        assert_eq!(fcntl(read.as_fd(), FcntlArg::F_GETFD).unwrap(), 0);
     }
 
     #[cfg(all(test, feature = "full-tests"))]

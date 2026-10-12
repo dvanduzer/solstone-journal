@@ -11,7 +11,7 @@ use solstone_core_backup::archive_admission::{
 };
 
 use crate::hosted_runtime::{HostedCredsUnavailable, HttpError};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::hosted_runtime::{HttpRequest, HttpResponse};
 use crate::teardown_admission::{
     CarrierTeardownAdmission, TeardownAdmissionRefusal, TeardownReader,
@@ -165,7 +165,7 @@ impl TeardownOperation {
         Ok(wall.min(monotonic))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn date(&self) -> Result<String, TeardownRemoteRefusal> {
         self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
         let date = chrono::DateTime::<chrono::Utc>::from_timestamp(self.clock.now_unix(), 0)
@@ -174,7 +174,7 @@ impl TeardownOperation {
         Ok(date.format("%Y%m%dT%H%M%SZ").to_string())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn request(
         &self,
         mut request: HttpRequest,
@@ -197,7 +197,7 @@ impl TeardownOperation {
         reader: &mut TeardownReader<'_>,
         version: &str,
     ) -> Result<RemoteTeardownDisposition, TeardownRemoteRefusal> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use crate::hosted_runtime::{decode_hosted_credentials, hosted_credentials_request};
             if self.report.phase != RemoteTeardownPhase::NotStarted {
@@ -245,14 +245,14 @@ impl TeardownOperation {
             self.report.phase = RemoteTeardownPhase::Wiped;
             Ok(RemoteTeardownDisposition::Wiped)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (admission, reader, version);
             Err(TeardownRemoteRefusal::Unsupported)
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn report_mut(&mut self) -> &mut RemoteTeardownReport {
         &mut self.report
     }

@@ -17,7 +17,7 @@ mod destination;
 mod hosted;
 mod keys;
 mod merge;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod owned_dns;
 mod state;
 pub mod teardown_configuration;

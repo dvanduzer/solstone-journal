@@ -120,17 +120,72 @@ pub fn resolve_owned_http_host(
 }
 
 /// Exact early dispatch, before logging or any journal/service/config resolution.
-/// A privileged exec which cleared PDEATHSIG fails here before DNS is performed.
+/// An entry that can't end with its parent fails here before DNS is performed.
 pub fn dispatch(args: &[OsString]) -> Option<u8> {
     if args.first().is_none_or(|arg| arg != ENTRY) {
         return None;
     }
-    if !death_signal_armed() {
+    if !parent_death_armed() {
         return Some(90);
     }
     Some(run_entry(args))
 }
 
+/// A privileged exec which cleared PDEATHSIG is refused.
+#[cfg(target_os = "linux")]
+fn parent_death_armed() -> bool {
+    death_signal_armed()
+}
+
+/// macOS has no parent-death signal: the parent's exit is watched from here, and
+/// a parent that already left (reparented to launchd) is refused.
+#[cfg(target_os = "macos")]
+fn parent_death_armed() -> bool {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+    let parent = nix::unistd::getppid();
+    if parent.as_raw() <= 1 {
+        return false;
+    }
+    let Ok(queue) = Kqueue::new() else {
+        return false;
+    };
+    let registration = KEvent::new(
+        parent.as_raw() as usize,
+        EventFilter::EVFILT_PROC,
+        EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_CLEAR | EvFlags::EV_RECEIPT,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let mut receipt = [KEvent::new(
+        0,
+        EventFilter::EVFILT_PROC,
+        EvFlags::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+    match queue.kevent(&[registration], &mut receipt, None) {
+        Ok(1) if receipt[0].data() == 0 => {}
+        _ => return false,
+    }
+    // Registered first, then rechecked: an exit in between is either seen here
+    // or delivered to the watch.
+    if nix::unistd::getppid() != parent {
+        return false;
+    }
+    std::thread::Builder::new()
+        .name("owned-dns-parent".into())
+        .spawn(move || {
+            let mut event = receipt;
+            if queue.kevent(&[], &mut event, None).is_ok() {
+                std::process::exit(90);
+            }
+        })
+        .is_ok()
+}
+
+#[cfg(target_os = "linux")]
 fn death_signal_armed() -> bool {
     let mut signal: nix::libc::c_int = 0;
     // SAFETY: the output is one valid local c_int and PR_GET_PDEATHSIG has no

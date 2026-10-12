@@ -79,14 +79,23 @@ impl HttpTransport for UreqHttpTransport {
         request: &HttpRequest,
         cancellation: &ArchiveCancellation,
     ) -> Result<HttpResponse, HttpError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             crate::controlled_http::execute(request, cancellation)
         }
-        #[cfg(not(target_os = "linux"))]
+        // Windows has no owned resolver yet: the request runs to its own timeout,
+        // and cancellation is honoured on either side of it.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (request, cancellation);
-            Err(HttpError::Other)
+            if cancellation.is_cancelled() {
+                return Err(HttpError::Other);
+            }
+            let result = self.execute(request);
+            if cancellation.is_cancelled() {
+                Err(HttpError::Other)
+            } else {
+                result
+            }
         }
     }
 
@@ -1112,6 +1121,51 @@ mod body_deadline_tests {
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+/// The backup page's hosted setup and restore poll through `execute_cancellable`.
+/// It once refused before any request on every platform but Linux. Where the
+/// owned resolver runs, it needs the installed package and the packaged teardown
+/// control covers it.
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod transport_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn cancellable_requests_reach_the_network_without_an_owned_resolver() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let request = HttpRequest {
+            method: "GET".into(),
+            url: format!("http://{}/poll", listener.local_addr().unwrap()),
+            headers: vec![("Connection".into(), "close".into())],
+            body: vec![],
+            timeout: Duration::from_secs(10),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                peer.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            peer.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let response = UreqHttpTransport
+            .execute_cancellable(&request, &ArchiveCancellation::new())
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status, 204);
+        let cancelled = ArchiveCancellation::new();
+        cancelled.cancel();
+        assert_eq!(
+            UreqHttpTransport.execute_cancellable(&request, &cancelled),
+            Err(HttpError::Other)
         );
     }
 }

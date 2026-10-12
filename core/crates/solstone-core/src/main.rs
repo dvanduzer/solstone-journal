@@ -500,7 +500,7 @@ fn run_service(outcome: ServiceParseOutcome) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(code) = solstone_core_backup::owned_dns::dispatch(&args) {
         return ExitCode::from(code);
     }

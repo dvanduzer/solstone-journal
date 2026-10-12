@@ -202,7 +202,7 @@ mod tests {
                 panic!("whole teardown outcome required")
             };
             let native = owned.outcome();
-            if cfg!(target_os = "linux") {
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
                 assert_eq!(native.phase(), TeardownRunPhase::Admission);
                 assert!(matches!(
                     native.refusal(),
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn off_yes_names_backup_only_media_and_unsupported_destinations() {
         use solstone_core_backup::{HostedBinding, save_hosted_binding};

@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::hosted_runtime::{HttpError, HttpRequest, HttpTransport};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod owned;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod strict;
 
 type HmacSha256 = Hmac<Sha256>;

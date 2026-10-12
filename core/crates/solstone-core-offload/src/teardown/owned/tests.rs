@@ -25,6 +25,8 @@ impl Clock for TestClock {
 }
 
 fn request(peer: &mut TcpStream) -> (String, Vec<u8>) {
+    // macOS hands an accepted socket the listener's non-blocking mode; Linux doesn't.
+    peer.set_nonblocking(false).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     peer.set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -61,6 +63,7 @@ fn respond(peer: &mut TcpStream, body: &[u8]) {
 }
 
 fn closed(peer: &mut TcpStream) {
+    peer.set_nonblocking(false).unwrap();
     let mut extra = Vec::new();
     match peer.read_to_end(&mut extra) {
         Ok(_) => {}
@@ -343,7 +346,8 @@ fn packaged_owned_teardown_boundaries() {
     );
     let temp = tempfile::Builder::new()
         .prefix("owned-teardown-journal-")
-        .tempdir_in("/var/tmp")
+        // macOS links /var to /private/var; the journal root binds its real path.
+        .tempdir_in(fs::canonicalize("/var/tmp").unwrap())
         .unwrap();
     fs::create_dir(temp.path().join("config")).unwrap();
     fs::write(

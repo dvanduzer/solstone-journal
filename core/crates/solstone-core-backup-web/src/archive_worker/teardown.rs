@@ -556,7 +556,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
                 .unwrap();
         assert_eq!(body["operation"]["report"]["state"], "held");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             assert_eq!(body["operation"]["phase"], "error");
             assert_eq!(body["operation"]["reason_code"], "backup_only_held");
@@ -573,7 +573,7 @@ mod tests {
                 .unwrap(),
             );
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             assert_eq!(body["operation"]["phase"], "refused");
             assert_eq!(body["operation"]["report"]["phase"], "prelaunch");
@@ -802,7 +802,7 @@ mod tests {
         successor(&deps);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn teardown_names_unplaced_media_and_a_missing_offload_record() {
         let (root, deps, io) = fixture();
@@ -851,14 +851,14 @@ mod tests {
         ] {
             assert!(report[field].is_null(), "{field}");
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             assert_eq!(report["remote"]["phase"], "not_started");
             assert_eq!(report["remote"]["broker_attempted"], false);
             assert!(report["preparation_failure"]["receipt"].is_null());
             assert!(report["preparation_failure"]["error"].is_null());
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         for field in ["remote", "preparation_failure"] {
             assert!(report[field].is_null(), "{field}");
         }
