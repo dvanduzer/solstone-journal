@@ -364,6 +364,18 @@ fn importer_modes(inputs: &Inputs) -> [(&'static str, Vec<Case>); 8] {
         (
             "generic media",
             vec![
+                // The preview runs first, on a pristine journal: it reaches the audio
+                // body's size preview, and the import after it proves it recorded nothing.
+                Case {
+                    args: vec![
+                        "--dry-run".to_owned(),
+                        path(&inputs.audio),
+                        "20260311_120000".to_owned(),
+                    ],
+                    exit: 0,
+                    stream: Stream::Stdout,
+                    contains: "1 recording across 1 day\n",
+                },
                 Case {
                     args: vec![path(&inputs.audio), "20260311_120000".to_owned()],
                     exit: 0,
@@ -375,16 +387,6 @@ fn importer_modes(inputs: &Inputs) -> [(&'static str, Vec<Case>); 8] {
                     exit: 0,
                     stream: Stream::Stdout,
                     contains: "Generic text import complete",
-                },
-                Case {
-                    args: vec![
-                        "--dry-run".to_owned(),
-                        path(&inputs.audio),
-                        "20260311_120000".to_owned(),
-                    ],
-                    exit: 1,
-                    stream: Stream::Stderr,
-                    contains: "generic audio preview requires the audio import body's preview path",
                 },
                 Case {
                     args: vec![path(&inputs.text)],
@@ -412,14 +414,14 @@ fn importer_modes(inputs: &Inputs) -> [(&'static str, Vec<Case>); 8] {
                     &inputs.ics,
                     0,
                     Stream::Stdout,
-                    "2 events, 1 unique attendees",
+                    "2 recordings across 2 days\n",
                 ),
                 (
                     "obsidian",
                     &inputs.vault,
                     0,
                     Stream::Stdout,
-                    "1 daily notes, 2 knowledge notes, 1 unique wikilinks",
+                    "1 recording across 1 day\n",
                 ),
                 (
                     "document",
@@ -447,21 +449,21 @@ fn importer_modes(inputs: &Inputs) -> [(&'static str, Vec<Case>); 8] {
                     &inputs.chatgpt,
                     0,
                     Stream::Stdout,
-                    "1 messages from ChatGPT export",
+                    "1 recording across 1 day\n",
                 ),
                 (
                     "claude",
                     &inputs.claude,
                     0,
                     Stream::Stdout,
-                    "2 messages from Claude chat export",
+                    "1 recording across 1 day\n",
                 ),
                 (
                     "gemini",
                     &inputs.gemini,
                     0,
                     Stream::Stdout,
-                    "1 messages from Gemini export",
+                    "1 recording across 1 day\n",
                 ),
             ]
             .into_iter()

@@ -89,6 +89,16 @@ const MODE_CASES: &[ModeCase] = &[
     ModeCase {
         name: "generic media",
         invocations: &[
+            // The preview runs first, on a pristine journal: it reaches the audio
+            // body's size preview, and the import after it proves it recorded nothing.
+            (
+                Invocation::GenericAudioDryRun,
+                Expected {
+                    exit: 0,
+                    stream: Stream::Stdout,
+                    identifies: "1 recording across 1 day\n",
+                },
+            ),
             (
                 Invocation::GenericAudio,
                 Expected {
@@ -103,14 +113,6 @@ const MODE_CASES: &[ModeCase] = &[
                     exit: 0,
                     stream: Stream::Stdout,
                     identifies: "Generic text import complete",
-                },
-            ),
-            (
-                Invocation::GenericAudioDryRun,
-                Expected {
-                    exit: 1,
-                    stream: Stream::Stderr,
-                    identifies: "generic audio preview requires the audio import body's preview path",
                 },
             ),
             (
@@ -142,7 +144,7 @@ const MODE_CASES: &[ModeCase] = &[
                 Expected {
                     exit: 0,
                     stream: Stream::Stdout,
-                    identifies: "2 events, 1 unique attendees",
+                    identifies: "2 recordings across 2 days\n",
                 },
             ),
             (
@@ -153,7 +155,7 @@ const MODE_CASES: &[ModeCase] = &[
                 Expected {
                     exit: 0,
                     stream: Stream::Stdout,
-                    identifies: "1 daily notes, 2 knowledge notes, 1 unique wikilinks",
+                    identifies: "1 recording across 1 day\n",
                 },
             ),
             (
@@ -197,7 +199,7 @@ const MODE_CASES: &[ModeCase] = &[
                 Expected {
                     exit: 0,
                     stream: Stream::Stdout,
-                    identifies: "1 messages from ChatGPT export",
+                    identifies: "1 recording across 1 day\n",
                 },
             ),
             (
@@ -208,7 +210,7 @@ const MODE_CASES: &[ModeCase] = &[
                 Expected {
                     exit: 0,
                     stream: Stream::Stdout,
-                    identifies: "2 messages from Claude chat export",
+                    identifies: "1 recording across 1 day\n",
                 },
             ),
             (
@@ -219,7 +221,7 @@ const MODE_CASES: &[ModeCase] = &[
                 Expected {
                     exit: 0,
                     stream: Stream::Stdout,
-                    identifies: "1 messages from Gemini export",
+                    identifies: "1 recording across 1 day\n",
                 },
             ),
         ],

@@ -1317,13 +1317,7 @@ fn run_importer(args: Vec<OsString>) -> ExitCode {
         let preview_args =
             match solstone_core_import_host::cli_argv::preview_arguments(arguments, journal) {
                 Ok(args) => args,
-                Err(error) => {
-                    return (
-                        String::new(),
-                        format!("could not preview import: {error}\n"),
-                        1,
-                    );
-                }
+                Err(run) => return (run.stdout, run.stderr, run.exit_code),
             };
         if let Some(preview_args) = preview_args {
             execution_arguments = preview_args[1..].to_vec();
@@ -1336,15 +1330,20 @@ fn run_importer(args: Vec<OsString>) -> ExitCode {
             if preview.exit_code != 0 {
                 return (preview.stdout, preview.stderr, preview.exit_code);
             }
+            // Nothing to add means nothing starts: the import's own outcome
+            // ("Import skipped: ...", "... did not merge anything ...") stays first.
+            let announces =
+                solstone_core_import::size::ImportSize::rendered_announces_work(&preview.stdout);
             use std::io::Write;
             let mut notice: Box<dyn Write> = if arguments.iter().any(|arg| arg == "--json") {
                 Box::new(std::io::stderr())
             } else {
                 Box::new(std::io::stdout())
             };
-            if let Err(error) = notice
-                .write_all(preview.stdout.as_bytes())
-                .and_then(|()| notice.flush())
+            if announces
+                && let Err(error) = notice
+                    .write_all(preview.stdout.as_bytes())
+                    .and_then(|()| notice.flush())
             {
                 return (
                     String::new(),

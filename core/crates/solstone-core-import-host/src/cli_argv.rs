@@ -70,16 +70,33 @@ pub struct RegistryDispatch {
 
 /// A manual CLI import prints its size before the mutating invocation. Recurring
 /// connector commands retain their existing authorization and execution contracts.
-pub fn preview_arguments(args: &[String], journal: &Path) -> Result<Option<Vec<String>>, String> {
+///
+/// The supervisor preflight answers before the source is read, exactly as it does
+/// for the import itself, so a refused import keeps its contracted output (a
+/// silent 75 under a spawning supervisor) rather than a preview error. `Err` is the
+/// complete run to report.
+pub fn preview_arguments(args: &[String], journal: &Path) -> Result<Option<Vec<String>>, CliRun> {
+    preview_arguments_with(args, journal, || require_solstone(journal))
+}
+
+fn preview_arguments_with(
+    args: &[String],
+    journal: &Path,
+    preflight: impl FnOnce() -> Result<(), SupervisorRefusal>,
+) -> Result<Option<Vec<String>>, CliRun> {
     match parse_arguments(args) {
         Ok(ParsedCommand::Import(options)) if !options.dry_run => {
             let Some(media) = options.media else {
                 return Ok(None);
             };
+            if let Err(refusal) = preflight() {
+                return Err(refusal_run(refusal));
+            }
             let digest = match options.snapshot_digest {
                 Some(digest) => digest,
-                None => solstone_core_import::snapshot::fingerprint(Path::new(&media))
-                    .map_err(|error| error.to_string())?,
+                None => solstone_core_import::snapshot::fingerprint(Path::new(&media)).map_err(
+                    |error| failure("", &format!("could not preview import: {error}\n"), 1),
+                )?,
             };
             let mut preview = vec![
                 "--dry-run".to_owned(),
@@ -135,12 +152,8 @@ fn run_after_parse(
     journal_path: &Path,
     preflight: impl FnOnce() -> Result<(), SupervisorRefusal>,
 ) -> CliOutcome {
-    match preflight() {
-        Ok(()) => {}
-        Err(SupervisorRefusal::SpawnedUnavailable) => return rendered(failure("", "", 75)),
-        Err(SupervisorRefusal::Unavailable) => {
-            return rendered(failure("", &format!("{SUPERVISOR_MESSAGE}\n"), 1));
-        }
+    if let Err(refusal) = preflight() {
+        return rendered(refusal_run(refusal));
     }
 
     match parsed {
@@ -152,6 +165,13 @@ fn run_after_parse(
             rendered(run_sync(&backend, &options, journal_path))
         }
         ParsedCommand::Import(options) => run_import(options, journal_path),
+    }
+}
+
+fn refusal_run(refusal: SupervisorRefusal) -> CliRun {
+    match refusal {
+        SupervisorRefusal::SpawnedUnavailable => failure("", "", 75),
+        SupervisorRefusal::Unavailable => failure("", &format!("{SUPERVISOR_MESSAGE}\n"), 1),
     }
 }
 
@@ -1770,7 +1790,9 @@ mod tests {
         let source = root.path().join("notes.txt");
         fs::write(&source, "a note").unwrap();
         let args = vec![source.display().to_string(), "20261011_120000".into()];
-        let preview = preview_arguments(&args, root.path()).unwrap().unwrap();
+        let preview = preview_arguments_with(&args, root.path(), || Ok(()))
+            .unwrap()
+            .unwrap();
         let Ok(ParsedCommand::Import(options)) = parse_arguments(&preview) else {
             panic!("import");
         };
@@ -1790,6 +1812,34 @@ mod tests {
         assert_eq!(run.exit_code, 1);
         assert!(run.stderr.contains("time zone changed"));
         assert!(!root.path().join("chronicle").exists());
+    }
+
+    #[test]
+    fn preview_answers_the_supervisor_preflight_before_reading_the_source() {
+        let root = tempfile::tempdir().unwrap();
+        let args = vec!["missing-file".to_owned()];
+        let spawned = preview_arguments_with(&args, root.path(), || {
+            Err(SupervisorRefusal::SpawnedUnavailable)
+        })
+        .unwrap_err();
+        assert_eq!(spawned, failure("", "", 75));
+        let interactive =
+            preview_arguments_with(&args, root.path(), || Err(SupervisorRefusal::Unavailable))
+                .unwrap_err();
+        assert_eq!(
+            interactive,
+            failure("", &format!("{SUPERVISOR_MESSAGE}\n"), 1)
+        );
+        let unreadable = preview_arguments_with(&args, root.path(), || Ok(())).unwrap_err();
+        assert_eq!(unreadable.exit_code, 1);
+        assert!(unreadable.stderr.starts_with("could not preview import: "));
+        let dry_run = vec!["--dry-run".to_owned(), "missing-file".to_owned()];
+        assert_eq!(
+            preview_arguments_with(&dry_run, root.path(), || {
+                Err(SupervisorRefusal::SpawnedUnavailable)
+            }),
+            Ok(None)
+        );
     }
 
     fn recording(id: &str, filename: &str, fullname: &str) -> PlaudFile {
