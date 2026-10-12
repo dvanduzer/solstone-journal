@@ -159,7 +159,7 @@ fn router_with_dependencies(
         }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 pub(crate) fn router_with_test_spawner(
     journal_root: PathBuf,
     clock: Clock,

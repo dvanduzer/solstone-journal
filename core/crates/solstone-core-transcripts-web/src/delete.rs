@@ -338,6 +338,9 @@ impl From<&DeleteRecord> for DeleteRequest {
 
 /// Run one delete to its outcome under the record's lock.
 fn commit_delete(journal_root: &Path, pending_id: &str, resumed: bool) {
+    #[cfg(all(test, feature = "full-tests"))]
+    let _completion = commit_gate::enter(journal_root);
+
     STORE.commit(
         journal_root,
         pending_id,
@@ -2511,5 +2514,100 @@ mod tests {
             .await
             .expect("bad request response");
         assert_eq!(res_bad.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+// A per-journal rendezvous before the durable commit claim. Tests can let a
+// cancel finish, then release the losing commit and observe it returning.
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) mod commit_gate {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex, mpsc};
+    use std::time::Duration;
+
+    static GATES: LazyLock<Mutex<HashMap<PathBuf, Gate>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    const WAIT: Duration = Duration::from_secs(60);
+
+    struct Gate {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        finished: mpsc::Sender<()>,
+    }
+
+    pub(crate) struct Hold {
+        root: PathBuf,
+        entered: mpsc::Receiver<()>,
+        release: Option<mpsc::Sender<()>>,
+        finished: mpsc::Receiver<()>,
+    }
+
+    pub(crate) fn hold(root: &Path) -> Hold {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (finished_tx, finished) = mpsc::channel();
+        let gate = Gate {
+            entered: entered_tx,
+            release: release_rx,
+            finished: finished_tx,
+        };
+        assert!(
+            GATES
+                .lock()
+                .unwrap()
+                .insert(root.to_path_buf(), gate)
+                .is_none()
+        );
+        Hold {
+            root: root.to_path_buf(),
+            entered,
+            release: Some(release),
+            finished,
+        }
+    }
+
+    impl Hold {
+        pub(crate) fn wait_until_entered(&self) {
+            self.entered
+                .recv_timeout(WAIT)
+                .expect("commit did not reach the gate");
+        }
+
+        pub(crate) fn release_and_wait(mut self) {
+            self.release
+                .take()
+                .unwrap()
+                .send(())
+                .expect("commit left the gate");
+            self.finished
+                .recv_timeout(WAIT)
+                .expect("released commit did not finish");
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            GATES.lock().unwrap().remove(&self.root);
+            // Unblock on assertion failure too, before the journal is removed.
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    pub(crate) struct Completion(mpsc::Sender<()>);
+
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    pub(crate) fn enter(root: &Path) -> Option<Completion> {
+        let gate = GATES.lock().unwrap().remove(root)?;
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv();
+        Some(Completion(gate.finished))
     }
 }
