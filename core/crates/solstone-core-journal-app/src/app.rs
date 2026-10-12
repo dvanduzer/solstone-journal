@@ -72,11 +72,7 @@ fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
 fn convey_route_allowed(method: &str, path: &str) -> bool {
     matches!(
         (method, path),
-        ("GET", "/init/mark")
-            | ("POST", "/init/mark/regenerate")
-            | ("POST", "/init/mark/lock")
-            | ("POST", "/init/finalize")
-            | ("GET" | "PUT", "/app/settings/api/config")
+        ("GET" | "PUT", "/app/settings/api/config")
             | ("GET", "/app/link/api/identity")
             | ("GET", "/app/network/api/devices")
             | ("POST", "/app/network/pair-start")
@@ -88,9 +84,12 @@ fn convey_route_allowed(method: &str, path: &str) -> bool {
 }
 
 /// The pages the app opens in the owner's browser, by name, never by URL.
+/// The first run after setup is the journal's own page, the same on every
+/// computer, so the app opens it rather than repeating it.
 fn journal_page(name: &str) -> Option<&'static str> {
     Some(match name {
         "journal" => "/",
+        "init" => "/init",
         "backup" => "/app/backup",
         "devices" => "/app/network",
         _ => return None,
@@ -576,7 +575,6 @@ mod tests {
 
     #[test]
     fn the_page_reaches_only_the_routes_the_app_uses() {
-        assert!(convey_route_allowed("POST", "/init/mark/lock"));
         assert!(convey_route_allowed("PUT", "/app/settings/api/config"));
         assert!(convey_route_allowed("POST", "/app/network/unpair"));
         assert!(!convey_route_allowed("DELETE", "/app/settings/api/config"));
@@ -589,6 +587,17 @@ mod tests {
             "GET",
             "/app/settings/api/config/../../x"
         ));
+        // The first run is the journal's own page in the browser; the window
+        // never takes its steps itself.
+        for (method, path) in [
+            ("GET", "/init/mark"),
+            ("POST", "/init/mark/regenerate"),
+            ("POST", "/init/mark/lock"),
+            ("POST", "/init/finalize"),
+        ] {
+            assert!(!convey_route_allowed(method, path), "{method} {path}");
+        }
+        assert_eq!(journal_page("init"), Some("/init"));
         assert!(journal_page("backup").is_some());
         assert!(journal_page("https://example.com").is_none());
     }

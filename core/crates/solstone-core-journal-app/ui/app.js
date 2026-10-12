@@ -114,8 +114,6 @@ const COPY = {
   setupTitle: 'setting up your journal',
   setupSubtitle: 'this can take a minute.',
   setupStopped: "setup stopped before it finished.",
-  finishFailed: "couldn't finish setting up your journal.",
-  markFailed: "your journal couldn't do that just now.",
   whatHappened: 'what happened',
   steps: {
     doctor: 'checking this PC',
@@ -124,15 +122,11 @@ const COPY = {
     service: 'starting your journal',
     brain: 'setting up the model',
   },
-  markTitle: 'your journal mark',
-  markRevealSubtitle: 'this is your journal\'s mark. your journal is always private, only yours.',
-  markRevealExplainer: "lock it in and this mark is your journal's, for good. it can't be changed later. try as many as you like first.",
-  lockButton: 'lock it in',
-  tryAnotherButton: 'try another',
-  tryAnotherLoading: 'trying…',
-  finishingTitle: 'finishing',
-  finishingLoading: 'finishing…',
-  finishedWithNotes: 'finished with notes',
+  // the rest of the first run is the journal's own page, in the browser
+  browserTitle: 'finish setting up in your browser',
+  browserLine: 'this window moves on when you finish.',
+  openBrowser: 'open the setup page',
+  browserFailed: "your browser didn't open.",
   adoptLandingLine: 'nothing moved. your journal was always here.',
   // updates (the Mac app's update words)
   updates: {
@@ -296,7 +290,12 @@ async function serviceAction(action) {
   }
   state.pending = null;
   render();
-  if (display() === 'running') await loadJournalFacts();
+  if (display() !== 'running') return;
+  if (!await firstRunDone()) {
+    waitForFirstRun();
+    return;
+  }
+  await loadJournalFacts();
 }
 
 async function loadJournalFacts() {
@@ -371,8 +370,6 @@ const firstRun = {
   steps: [],
   current: null,
   error: null,
-  mark: null,
-  busy: false,
   adopted: false,
 };
 
@@ -419,28 +416,13 @@ function renderFirstRun(step) {
       firstRun.error ? el('div', { class: 'actions centered' },
         el('button', { type: 'button', on: { click: runSetup } }, COPY.tryAgain)) : null,
     );
-  } else if (step === 'mark') {
-    const markBox = el('div');
-    renderMarkCard(markBox, firstRun.mark, null);
+  } else if (step === 'browser') {
     put(card,
-      el('h1', {}, COPY.markTitle),
-      el('p', { class: 'muted' }, COPY.markRevealSubtitle),
-      markBox,
-      el('p', { class: 'faint' }, COPY.markRevealExplainer),
-      firstRun.error ? failure(COPY.markFailed, firstRun.error) : null,
+      el('h1', {}, COPY.browserTitle),
+      el('p', { class: 'muted' }, COPY.browserLine),
+      firstRun.error ? el('p', { class: 'error', role: 'alert' }, firstRun.error) : null,
       el('div', { class: 'actions centered' },
-        el('button', { type: 'button', disabled: firstRun.busy, on: { click: tryAnotherMark } },
-          firstRun.busy === 'trying' ? COPY.tryAnotherLoading : COPY.tryAnotherButton),
-        el('button', { type: 'button', class: 'primary', disabled: firstRun.busy, on: { click: lockMark } },
-          COPY.lockButton)),
-    );
-  } else if (step === 'finishing') {
-    put(card,
-      el('h1', {}, COPY.finishingTitle),
-      el('p', { class: 'muted' }, COPY.finishingLoading),
-      firstRun.error ? failure(COPY.finishFailed, firstRun.error) : null,
-      firstRun.error ? el('div', { class: 'actions centered' },
-        el('button', { type: 'button', on: { click: finishFirstRun } }, COPY.tryAgain)) : null,
+        el('button', { type: 'button', on: { click: openFirstRunPage } }, COPY.openBrowser)),
     );
   }
   show('firstrun');
@@ -503,64 +485,51 @@ async function routeAfterSetup() {
     await landHome();
     return;
   }
+  waitForFirstRun();
+}
+
+// Whether the journal's first run is done. An unreadable answer counts as
+// done, so the app never holds the owner away from their journal.
+async function firstRunDone() {
+  return await call('initProbe', { port: port() }).catch(() => 'complete') !== 'incomplete';
+}
+
+// The rest of the first run is the journal's own page, the one every journal
+// shows, in the owner's browser. The window waits until the journal says it
+// is done, then lands home. A sign-in start opens the page only once the
+// owner opens the window.
+const firstRunWait = { timer: null, opened: false, checking: false };
+
+function waitForFirstRun() {
+  firstRun.error = null;
+  renderFirstRun('browser');
+  if (firstRunWait.timer === null) firstRunWait.timer = setInterval(checkFirstRunDone, 2000);
+  if (!firstRunWait.opened && state.init.launch !== 'sign-in') openFirstRunPage();
+}
+
+async function openFirstRunPage() {
+  firstRunWait.opened = true;
+  firstRun.error = null;
   try {
-    const response = await call('convey', { method: 'GET', path: '/init/mark', port: port() });
-    firstRun.mark = response.mark;
-    if (response.locked) {
-      await finishFirstRun();
-    } else {
-      renderFirstRun('mark');
+    await call('open', { target: 'init', base: state.status?.base });
+  } catch {
+    firstRun.error = COPY.browserFailed;
+  }
+  if (firstRunWait.timer !== null) renderFirstRun('browser');
+}
+
+async function checkFirstRunDone() {
+  if (firstRunWait.checking || firstRunWait.timer === null) return;
+  firstRunWait.checking = true;
+  try {
+    if (await call('initProbe', { port: port() }) === 'complete' && firstRunWait.timer !== null) {
+      clearInterval(firstRunWait.timer);
+      firstRunWait.timer = null;
+      await landHome();
     }
-  } catch (error) {
-    firstRun.error = error.message;
-    renderFirstRun('setup');
+  } catch { /* the next check asks again */ } finally {
+    firstRunWait.checking = false;
   }
-}
-
-async function tryAnotherMark() {
-  firstRun.busy = 'trying';
-  firstRun.error = null;
-  renderFirstRun('mark');
-  try {
-    const response = await call('convey', { method: 'POST', path: '/init/mark/regenerate', port: port() });
-    firstRun.mark = response.mark;
-  } catch (error) {
-    firstRun.error = error.message;
-  }
-  firstRun.busy = false;
-  renderFirstRun('mark');
-}
-
-async function lockMark() {
-  firstRun.busy = 'locking';
-  firstRun.error = null;
-  renderFirstRun('mark');
-  try {
-    const response = await call('convey', { method: 'POST', path: '/init/mark/lock', port: port() });
-    firstRun.mark = response.mark;
-  } catch (error) {
-    firstRun.error = error.message;
-    firstRun.busy = false;
-    renderFirstRun('mark');
-    return;
-  }
-  firstRun.busy = false;
-  await finishFirstRun();
-}
-
-async function finishFirstRun() {
-  firstRun.error = null;
-  renderFirstRun('finishing');
-  try {
-    if (await call('initProbe', { port: port() }) !== 'complete') {
-      await call('convey', { method: 'POST', path: '/init/finalize', body: {}, port: port() });
-    }
-  } catch (error) {
-    firstRun.error = error.message;
-    renderFirstRun('finishing');
-    return;
-  }
-  await landHome();
 }
 
 async function landHome() {
@@ -1227,6 +1196,11 @@ listeners.update.push(({ view }) => {
 });
 
 listeners.shown.push(async () => {
+  if (firstRunWait.timer !== null) {
+    if (!firstRunWait.opened) openFirstRunPage();
+    await checkFirstRunDone();
+    return;
+  }
   if (!$('main').hidden) {
     await refreshStatus();
     if (display() === 'running') await loadJournalFacts();
@@ -1296,10 +1270,9 @@ async function main() {
   }
   await call('syncSignInLaunch', { on: state.status?.service?.starts_at_sign_in ?? true }).catch(() => {});
   if (display() === 'running') {
-    // A journal set up from the terminal may not have met its mark yet.
-    const probe = await call('initProbe', { port: port() }).catch(() => 'complete');
-    if (probe === 'incomplete') {
-      await routeAfterSetup();
+    // A journal set up from the terminal may not have finished its first run.
+    if (!await firstRunDone()) {
+      waitForFirstRun();
       return;
     }
     await loadJournalFacts();

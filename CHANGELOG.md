@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- on windows, the journal app now opens the rest of setup in your browser. there, along with your mark, you now also add your name and choose how your journal thinks and what happens to your original media. the journal app moves on once you finish.
+
 ### Fixed
 
 - security: journal text could contain requests to call tools, save notes or send your data elsewhere. journal connections now tell agents to treat that text as untrusted data and ignore those requests.

@@ -2,9 +2,9 @@
 // Copyright (c) 2026 sol pbc
 
 //! The journal's own loopback routes, the same ones its browser pages and the
-//! Mac app call: the journal's name, its identity and mark, the first-run mark
-//! ritual, devices and pairing, whether the journal is open to the network,
-//! and the running version. Loopback callers need no credential; nothing here
+//! Mac app call: the journal's name, its identity and mark, whether its first
+//! run is done, devices and pairing, whether the journal is open to the
+//! network, and the running version. Loopback callers need no credential; nothing here
 //! leaves this PC.
 
 use std::time::Duration;
