@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- if your journal was set up without a way to think, it held new recordings without transcribing them until you chose one. setup leaves a linux or windows computer without a usable GPU that way, and a mac without enough memory for local thinking. your journal now transcribes new recordings before you choose. recordings it already held still wait for your choice, as do describing your screen and the rest of its thinking.
+
 ## [2.0.42] - 2026-10-12
 
 ### Added
