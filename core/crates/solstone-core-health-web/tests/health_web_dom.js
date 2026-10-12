@@ -877,7 +877,7 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   const { doc, context } = createEnvironment();
   const section = doc.createElement('section');
   section.id = 'workProgress';
-  for (const key of ['reach', 'bands', 'confirm', 'details', 'allow', 'action-result']) {
+  for (const key of ['reach', 'bands', 'confirm', 'cost', 'details', 'allow', 'action-result']) {
     const child = doc.createElement('div');
     child.setAttribute('data-work-' + key, '');
     section.appendChild(child);
@@ -893,6 +893,11 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   vm.runInContext('renderWorkProgress(work)', context);
   assert.strictEqual(section.querySelector('[data-work-bands]').children.length, 0);
   assert.strictEqual(section.querySelector('[data-work-confirm]').hidden, false);
+  context.work.confirmation_available = false;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.strictEqual(section.querySelector('[data-work-confirm]').hidden, true);
+  context.work.confirmation_available = true;
+  vm.runInContext('renderWorkProgress(work)', context);
   const button = section.querySelector('[data-work-allow]');
   let submitted;
   context.fetch = async (route, options) => {
@@ -924,6 +929,16 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   context.work.inventory.complete = false;
   vm.runInContext('renderWorkProgress(work)', context);
   assert.notStrictEqual(section.querySelector('[data-work-reach]').textContent, stale);
+  context.work.inventory.complete = true;
+  vm.runInContext('renderWorkProgress(work)', context);
+  const cost = section.querySelector('[data-work-cost]');
+  assert.deepStrictEqual(cost.textContent.match(/\d+/g), ['4', '8', '0']);
+  context.work.inventory.bands[5].segments_owed = 11;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.deepStrictEqual(cost.textContent.match(/\d+/g), ['13', '8', '0']);
+  context.work.inventory.complete = false;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.strictEqual(cost.textContent.match(/\d+/g), null);
   context.work.error = '<unreadable>';
   vm.runInContext('renderWorkProgress(work)', context);
   assert.strictEqual(section.querySelector('[data-work-details]').hidden, false);

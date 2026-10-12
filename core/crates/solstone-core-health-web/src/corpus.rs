@@ -23,6 +23,57 @@ fn corpus() -> Value {
     .expect("health corpus")
 }
 
+#[cfg(feature = "full-tests")]
+#[tokio::test(flavor = "current_thread")]
+async fn history_confirmation_is_offered_only_for_the_owners_provider() {
+    for (providers, services, available) in [
+        (json!({"active":{"provider":"local"}}), json!({}), false),
+        (
+            json!({"active":{"provider":"openai","model":"model"}}),
+            json!({}),
+            true,
+        ),
+        (
+            json!({"active":{"provider":"local"},"local":{"endpoint_url":"https://example.test","served_model_id":"model"}}),
+            json!({}),
+            true,
+        ),
+        (
+            json!({"active":{"provider":"local"},"local":{"endpoint_url":"https://example.test/v1","served_model_id":"model","credential":"test"}}),
+            json!({"confidential":{"endpoint_url":"https://example.test","served_model_id":"model","credential_fingerprint_sha256":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}}),
+            false,
+        ),
+        (json!({}), json!({}), false),
+    ] {
+        let root = crate::test_support::root();
+        std::fs::write(
+            root.path().join("config/journal.json"),
+            serde_json::to_vec(&json!({
+                "setup":{"completed_at":1700000000000_i64},
+                "identity":{"timezone":"UTC"},
+                "providers":providers,
+                "services":services,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let response = solstone_core_convey_shell::router(root.path().to_path_buf())
+            .oneshot(
+                Request::get("/app/health/api/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["work"]["confirmation_available"], available);
+        assert_eq!(body["work"]["history_confirmed"], false);
+    }
+}
+
 #[test]
 fn ac3_replays_all_captured_health_cases_through_the_shell() {
     tokio::runtime::Builder::new_current_thread()

@@ -134,15 +134,10 @@ pub struct QueuedTaskSnapshot {
 /// The most discovered tasks the queue takes from one replacement.
 pub const DISCOVERED_ADMISSION: usize = 4;
 
-/// Reconstructed work, with consent established by the discovery reader.
-/// This internal type has no bus representation.
-pub type WorkGuard = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
-
+/// Reconstructed work. This internal type has no bus representation.
 #[derive(Clone)]
 pub struct DiscoveredTask {
-    pub guard: Option<WorkGuard>,
     pub request: crate::request::BusTaskRequest,
-    pub confirmed_import: bool,
 }
 
 /// Completion information retained for the most recent queue executions.
@@ -871,9 +866,7 @@ struct RunningSlot {
 
 #[derive(Clone)]
 struct Submission {
-    guard: Option<WorkGuard>,
     discovered: bool,
-    confirmed_import: bool,
     partition: Partition,
     cap: Duration,
     command: Vec<String>,
@@ -988,9 +981,7 @@ fn insert_loaded_record(
         let dispatch = Dispatch {
             sources: Vec::new(),
             submission: Submission {
-                guard: None,
                 discovered: false,
-                confirmed_import: false,
                 partition: partition.clone(),
                 cap: options.cap_resolver.cap_for(partition),
                 command: rec_state.command.clone(),
@@ -1415,9 +1406,7 @@ impl TaskQueue {
                 {
                     continue;
                 }
-                source.guard = candidate.guard;
                 source.discovered = true;
-                source.confirmed_import = candidate.confirmed_import;
                 changed.insert(source.partition.clone());
                 if state.ready {
                     enqueue_locked(&mut state, source);
@@ -2777,9 +2766,7 @@ fn normalize_request(request: ExecutionRequest, caps: &dyn CapResolver) -> Submi
     let (mut submission, explicit) = match request {
         ExecutionRequest::Bus(request) => (
             Submission {
-                guard: None,
                 discovered: false,
-                confirmed_import: false,
                 cap: caps.cap_for(&request.cmd.partition()),
                 partition: request.cmd.partition(),
                 command: request.cmd.as_wire().to_vec(),
@@ -2793,9 +2780,7 @@ fn normalize_request(request: ExecutionRequest, caps: &dyn CapResolver) -> Submi
         ),
         ExecutionRequest::Scheduled(request) => (
             Submission {
-                guard: None,
                 discovered: false,
-                confirmed_import: false,
                 cap: request
                     .max_runtime
                     .filter(|cap| !cap.is_zero())
@@ -2828,9 +2813,7 @@ fn enqueue_locked(state: &mut QueueState, submission: Submission) -> SubmitOutco
         if let Some(source) = entry.sources.iter_mut().find(|source| {
             source.reference == submission.reference && source.discovered == submission.discovered
         }) {
-            source.guard = submission.guard.clone();
             source.priority.merge(submission.priority);
-            source.confirmed_import |= submission.confirmed_import;
         } else {
             entry.sources.push(submission.clone());
         }
@@ -2880,10 +2863,8 @@ fn take_ready(
                             .enumerate()
                             .filter(|(_, entry)| {
                                 is_analysis_command(&entry.command)
-                                    && spending.permits(
-                                        entry.priority.resolve(&entry.command, today).band,
-                                        entry.sources.iter().any(|source| source.confirmed_import),
-                                    )
+                                    && spending
+                                        .permits(entry.priority.resolve(&entry.command, today).band)
                             })
                             .map(move |(index, entry)| {
                                 (
@@ -2922,9 +2903,7 @@ fn take_ready(
             state.queues.remove(&partition);
         }
         let submission = Submission {
-            guard: None,
             discovered: false,
-            confirmed_import: entry.sources.iter().any(|source| source.confirmed_import),
             partition: partition.clone(),
             cap: entry.cap,
             command: entry.command,
@@ -2971,42 +2950,9 @@ fn is_analysis_command(command: &[String]) -> bool {
 }
 
 fn start_dispatch(inner: Arc<QueueInner>, mut dispatch: Dispatch) {
-    let survivors = dispatch
-        .sources
-        .iter()
-        .filter(|source| {
-            source.guard.as_ref().is_none_or(|guard| match guard() {
-                Ok(current) => current,
-                Err(error) => {
-                    log::warn!("discovered work grant unavailable: {error}");
-                    false
-                }
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if survivors.len() != dispatch.sources.len() {
-        // Re-rank from surviving owners. An obsolete import must not lend
-        // either its permission or its priority to another producer.
-        {
-            let mut state = inner.state.lock().expect("queue state");
-            for source in survivors {
-                enqueue_locked(&mut state, source);
-            }
-        }
-        for next in finish_worker(
-            &inner,
-            &dispatch.submission.partition,
-            &dispatch.submission.reference,
-        ) {
-            start_dispatch(Arc::clone(&inner), next);
-        }
-        return;
-    }
     if is_analysis_command(&dispatch.submission.command)
         && (!crate::processing::processing_allowed(&inner.options.journal_root)
-            || !read_work_policy(&inner)
-                .permits(dispatch.priority.band, dispatch.submission.confirmed_import))
+            || !read_work_policy(&inner).permits(dispatch.priority.band))
     {
         let partition = dispatch.submission.partition.clone();
         requeue_dispatch_at_head(&inner, dispatch);
@@ -4786,7 +4732,7 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
-    fn confidential_import_permission_cannot_be_supplied_by_wire_priority() {
+    fn confidential_history_runs_without_spending_confirmation() {
         use sha2::{Digest, Sha256};
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("config")).unwrap();
@@ -4798,66 +4744,16 @@ mod tests {
             Err(QueueSpawnFailure::Clean(SpawnError::EmptyCommand))
         }));
         queue.submit(ranked_request("unconfirmed", "--segment", "4:3"));
-        queue.replace_discovered(vec![discovered("confirmed", "4:2", true)]);
+        queue.replace_discovered(vec![discovered("confirmed", "4:2")]);
         queue.submit(ranked_request("history", "--segment", "5:1"));
         queue.set_ready();
-        assert_eq!(
-            received.recv_timeout(TEST_TRANSITION_TIMEOUT).unwrap(),
-            "confirmed"
-        );
-        queue.join_test_workers(1, TEST_TRANSITION_TIMEOUT).unwrap();
-        assert!(queue.contains_reference("unconfirmed"));
-        assert!(queue.contains_reference("history"));
-        assert!(received.try_recv().is_err());
-    }
-
-    #[cfg(feature = "full-tests")]
-    #[test]
-    fn revoked_import_grant_recomputes_shared_priority_before_launch_and_valid_twin_executes() {
-        let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("config")).unwrap();
-        fs::write(
-            root.path().join("config/journal.json"),
-            serde_json::json!({"providers":{"active":{"provider":"openai","model":"fixture"}}})
-                .to_string(),
-        )
-        .unwrap();
-        let queue = processing_test_queue(root.path(), false, VecDeque::new());
-        let (sent, received) = mpsc::channel();
-        queue.set_worker_spawner(Arc::new(move |_, options, _| {
-            sent.send(options.reference).unwrap();
-            Err(QueueSpawnFailure::Clean(SpawnError::EmptyCommand))
-        }));
-        queue.submit(ranked_request("shared", "--segment", "5:3"));
-        let mut revoked = discovered("shared", "4:3", true);
-        let valid = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let observed = valid.clone();
-        revoked.guard = Some(Arc::new(move || {
-            Ok(observed.load(std::sync::atomic::Ordering::Acquire))
-        }));
-        let mut twin = discovered("twin", "4:2", true);
-        twin.guard = Some(Arc::new(|| Ok(true)));
-        queue.replace_discovered(vec![revoked, twin]);
-        valid.store(false, std::sync::atomic::Ordering::Release);
-        queue.set_ready();
-        assert_eq!(
-            received.recv_timeout(TEST_TRANSITION_TIMEOUT).unwrap(),
-            "twin"
-        );
-        queue.join_test_workers(1, TEST_TRANSITION_TIMEOUT).unwrap();
-        assert!(received.try_recv().is_err());
-        assert!(queue.contains_reference("shared"));
-        let state = queue.inner.state.lock().unwrap();
-        let entry = &state.queues[&Partition::new("segment")][0];
-        assert_eq!(entry.sources.len(), 1);
-        assert!(!entry.sources[0].confirmed_import);
-        assert_eq!(
-            entry
-                .priority
-                .resolve(&entry.command, selection_day(root.path()))
-                .band,
-            solstone_core_journal_config::work_priority::WorkBand::Completing
-        );
+        let mut started = Vec::new();
+        for _ in 0..3 {
+            started.push(received.recv_timeout(TEST_TRANSITION_TIMEOUT).unwrap());
+        }
+        queue.join_test_workers(3, TEST_TRANSITION_TIMEOUT).unwrap();
+        assert_eq!(started, ["unconfirmed", "confirmed", "history"]);
+        assert!(!queue.contains_reference("history"));
     }
 
     const TEST_TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -5023,9 +4919,7 @@ mod tests {
         Dispatch {
             sources: Vec::new(),
             submission: Submission {
-                guard: None,
                 discovered: false,
-                confirmed_import: false,
                 cap: Duration::from_secs(10),
                 partition: Partition::new("svc"),
                 command: vec!["svc".to_owned()],
@@ -5091,16 +4985,12 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
-    fn discovered(reference: &str, priority: &str, confirmed_import: bool) -> DiscoveredTask {
+    fn discovered(reference: &str, priority: &str) -> DiscoveredTask {
         let ExecutionRequest::Bus(request) = ranked_request(reference, "--segment", priority)
         else {
             unreachable!()
         };
-        DiscoveredTask {
-            guard: None,
-            request,
-            confirmed_import,
-        }
+        DiscoveredTask { request }
     }
 
     #[cfg(all(test, feature = "full-tests"))]
@@ -5110,14 +5000,14 @@ mod tests {
         for pass in 0..3 {
             queue.replace_discovered(
                 (0..12)
-                    .map(|n| discovered(&format!("{pass}-{n}"), "5:1", false))
+                    .map(|n| discovered(&format!("{pass}-{n}"), "5:1"))
                     .collect(),
             );
             assert_eq!(queue.inner.state.lock().unwrap().pending.len(), 4);
         }
         // Ordinary ownership of the same command survives removal of discovery.
         queue.submit(ranked_request("mixed", "--segment", "5:1"));
-        queue.replace_discovered(vec![discovered("mixed", "2:1", true)]);
+        queue.replace_discovered(vec![discovered("mixed", "2:1")]);
         {
             let mut state = queue.inner.state.lock().unwrap();
             for source in std::mem::take(&mut state.pending) {
@@ -5143,7 +5033,6 @@ mod tests {
         let entry = &state.queues[&Partition::new("segment")][0];
         assert_eq!(entry.references, ["mixed"]);
         assert_eq!(entry.sources.len(), 1);
-        assert!(!entry.sources[0].confirmed_import);
         assert_eq!(
             entry
                 .priority
@@ -5157,7 +5046,7 @@ mod tests {
     #[test]
     fn discovery_never_replaces_reserved_work_or_adds_after_shutdown() {
         let queue = queue(false, 10, VecDeque::new());
-        queue.replace_discovered(vec![discovered("reserved", "5:2", false)]);
+        queue.replace_discovered(vec![discovered("reserved", "5:2")]);
         {
             let mut state = queue.inner.state.lock().unwrap();
             for source in std::mem::take(&mut state.pending) {
@@ -5173,8 +5062,8 @@ mod tests {
             assert_eq!(reserved.len(), 1);
         }
         queue.replace_discovered(vec![
-            discovered("reserved", "5:2", false),
-            discovered("next", "5:1", false),
+            discovered("reserved", "5:2"),
+            discovered("next", "5:1"),
         ]);
         {
             let mut state = queue.inner.state.lock().unwrap();
@@ -5189,7 +5078,7 @@ mod tests {
             );
             state.shutdown = true;
         }
-        queue.replace_discovered(vec![discovered("late", "1:3", false)]);
+        queue.replace_discovered(vec![discovered("late", "1:3")]);
         assert!(!queue.contains_reference("late"));
     }
 

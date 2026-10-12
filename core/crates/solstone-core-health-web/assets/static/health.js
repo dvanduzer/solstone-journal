@@ -434,6 +434,12 @@
         rows.appendChild(row);
       });
     }
+    const cost = section.querySelector('[data-work-cost]');
+    const older = inventory?.bands?.slice(4);
+    const count = (key) => older?.reduce((total, band) => total + (band[key] || 0), 0);
+    cost.textContent = older && fresh && inventory.complete
+      ? `finishing ${count('segments_owed')} older recordings, ${count('daily_units_owed')} daily outputs and ${count('activities_owed')} activities uses your chosen model and may add charges from your provider. today's work goes first.`
+      : "finishing older recordings and day updates uses your chosen model and may add charges from your provider. today's work goes first.";
     section.querySelector('[data-work-confirm]').hidden = !work?.confirmation_available || work.history_confirmed;
     const details = section.querySelector('[data-work-details]');
     const errors = [...(work?.error ? [work.error] : inventory?.unreadable || []), ...(work?.retry_errors || [])];
@@ -450,7 +456,7 @@
           body: JSON.stringify({ section: 'processing', data: { history_confirmed: true } }),
         });
         if (!response.ok) throw new Error('save failed');
-        result.textContent = 'older work is allowed. it will run after higher-priority work.';
+        result.textContent = 'older work is allowed to use your chosen model, which may add charges from your provider. today\'s work goes first.';
         await loadHealthState();
       } catch {
         result.textContent = 'your choice could not be saved. try again.';

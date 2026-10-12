@@ -193,6 +193,52 @@ where
         &dyn solstone_core_spp_ratls::AdmissionClock,
     ) -> Result<EstablishedChannel, &'static str>,
 {
+    let priority =
+        match solstone_core_journal_config::work_priority::WorkPriority::from_environment() {
+            Ok(priority) => priority,
+            Err(error) => {
+                return ConfidentialResult::Failed(EndpointFailure {
+                    reason_code: Some("provider_request_rejected".into()),
+                    detail: Some(error),
+                });
+            }
+        };
+    let timeout = crate::endpoint::request_timeout(
+        call.request.timeout_s,
+        crate::endpoint::thinking_headroom(call.endpoint, call.config),
+    );
+    crate::confidential_pacing::run(call.journal_path, priority, timeout, |remaining| {
+        if priority.band < solstone_core_journal_config::work_priority::WorkBand::Import {
+            return confidential_generate_unpaced_with(call, readiness, establish);
+        }
+        let mut bounded = call.request.clone();
+        bounded.timeout_s = Some(remaining.as_secs_f64());
+        confidential_generate_unpaced_with(
+            ConfidentialCall {
+                request: &bounded,
+                ..call
+            },
+            readiness,
+            establish,
+        )
+    })
+}
+
+fn confidential_generate_unpaced_with<R, O, E>(
+    call: ConfidentialCall<'_>,
+    readiness: R,
+    establish: E,
+) -> ConfidentialResult
+where
+    R: FnOnce(&Path) -> O,
+    O: IntoReadinessOutcome,
+    E: FnOnce(
+        &RatlsEndpoint,
+        &Path,
+        u64,
+        &dyn solstone_core_spp_ratls::AdmissionClock,
+    ) -> Result<EstablishedChannel, &'static str>,
+{
     let ConfidentialCall {
         request,
         journal_path,
@@ -529,6 +575,15 @@ pub mod test_support {
     use super::*;
     use ring::rand::SecureRandom;
     use solstone_core_spp_ratls::CompositeVerifier;
+
+    pub fn confidential_background_call(
+        journal: &Path,
+        priority: solstone_core_journal_config::work_priority::WorkPriority,
+        timeout: Duration,
+        generate: impl FnOnce(Duration) -> ConfidentialResult,
+    ) -> ConfidentialResult {
+        crate::confidential_pacing::run(journal, priority, timeout, generate)
+    }
 
     pub fn confidential_generate_over_channel(
         request: &GenerateRequest,

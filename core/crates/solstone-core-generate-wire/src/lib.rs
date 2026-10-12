@@ -7,6 +7,7 @@ mod anthropic;
 mod bundled;
 pub mod chatgpt;
 mod confidential;
+mod confidential_pacing;
 mod endpoint;
 mod google;
 mod lane;
