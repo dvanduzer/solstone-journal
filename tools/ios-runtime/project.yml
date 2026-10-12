@@ -8,6 +8,7 @@ settings:
     IPHONEOS_DEPLOYMENT_TARGET: '26.0'
     GENERATE_INFOPLIST_FILE: true
     CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_ENTITLEMENTS: Shared/Serving.entitlements
     DEVELOPMENT_TEAM: 7QCG8V4M6H
     SWIFT_OBJC_BRIDGING_HEADER: Shared/Bridge.h
     OTHER_LDFLAGS: $(RUST_LIB) -lc++ -lz -liconv -framework Foundation -framework
@@ -24,6 +25,9 @@ targets:
     sources:
     - Host
     - Shared
+    - path: Resources/JournalPayload
+      type: folder
+      buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.solstone.journal.runtime.dev
@@ -40,6 +44,9 @@ targets:
     sources:
     - Helper
     - Shared
+    - path: Resources/JournalPayload
+      type: folder
+      buildPhase: resources
     dependencies:
     - sdk: ExtensionFoundation.framework
     settings:

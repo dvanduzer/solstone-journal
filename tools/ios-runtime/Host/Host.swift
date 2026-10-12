@@ -34,6 +34,7 @@ final class PendingReply: @unchecked Sendable {
   var session: XPCSession?
   var started = false
   var finished = false
+  var servingActive = false
   let output = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
   let args = ProcessInfo.processInfo.arguments
   func argument(_ name: String, _ fallback: String) -> String {
@@ -43,11 +44,11 @@ final class PendingReply: @unchecked Sendable {
   var journal: String { argument("--suite", "development") }
   func request(
     _ op: String, count: Int = 128, seconds: Int = 0, revision: Int = 0, mode: String = "reopen",
-    root: String = ""
+    root: String = "", payload: String = ""
   ) -> Request {
     Request(
       op: op, journal: journal, root: root, count: count, seconds: seconds, revision: revision,
-      mode: mode)
+      mode: mode, payload: payload, storage: args.contains("--serve") ? "serving" : "private")
   }
   func log(_ event: String, _ value: Any) {
     do {
@@ -121,6 +122,22 @@ final class PendingReply: @unchecked Sendable {
     guard let s = session else { throw NSError(domain: "journal-closed", code: 1) }
     return try await call(s, request, label)
   }
+  func servingCall(_ request: Request, _ label: String) async throws -> [String: Any] {
+    let start = ProcessInfo.processInfo.systemUptime
+    let reply: Reply = await withCheckedContinuation { continuation in
+      Engine.queue.async { continuation.resume(returning: Engine.execute(request)) }
+    }
+    let obj = try JSONSerialization.jsonObject(with: Data(reply.json.utf8)) as! [String: Any]
+    log(label, ["roundtrip_ms": (ProcessInfo.processInfo.systemUptime - start) * 1000, "reply": obj])
+    if let error = obj["error"] { throw NSError(domain: String(describing: error), code: 1) }
+    if let native = obj["journal"] as? [String: Any], let result = native["result"] as? [String: Any],
+      result["ok"] as? Bool == false {
+      throw NSError(domain: String(describing: result["error"]), code: 1)
+    }
+    if request.op == "serve-start" { servingActive = true }
+    if request.op == "serve-stop" { servingActive = false }
+    return obj
+  }
   func command(_ op: String) {
     Task {
       busy = true
@@ -139,6 +156,7 @@ final class PendingReply: @unchecked Sendable {
     }
   }
   func export() async throws {
+    guard !servingActive else { throw NSError(domain: "stop-serving-before-export", code: 1) }
     let exported = try await invoke(request("export"), "export")
     for file in [
       "indexer/journal.sqlite", "indexer/journal.sqlite-wal", "checkpoint.bin", "committed.bin",
@@ -150,13 +168,79 @@ final class PendingReply: @unchecked Sendable {
       }
     }
   }
+  func serve(_ duration: Int) async throws {
+    let port = Int(argument("--port", "37657")) ?? 37657
+    _ = try await servingCall(request("open"), "serve.open")
+    _ = try await servingCall(request("serve-start", count: port), "serve.start")
+    let deadline = ProcessInfo.processInfo.systemUptime + Double(duration)
+    let commandFile = output.appendingPathComponent("owner-command.json")
+    let replyFile = output.appendingPathComponent("owner-reply.json")
+    let seenFile = output.appendingPathComponent("owner-command-seen.txt")
+    var lastID = (try? String(contentsOf: seenFile, encoding: .utf8)) ?? ""
+    var done = false
+    while !done && ProcessInfo.processInfo.systemUptime < deadline {
+      if FileManager.default.fileExists(atPath: commandFile.path) {
+        let data = try Data(contentsOf: commandFile)
+        // USB transfer may still be writing the file. Consume only complete JSON.
+        guard let command = try? JSONDecoder().decode(ServingCommand.self, from: data) else {
+          try await Task.sleep(for: .milliseconds(500))
+          continue
+        }
+        guard command.id != lastID else {
+          try await Task.sleep(for: .milliseconds(500))
+          continue
+        }
+        // Retain the transfer destination until devicectl finishes its file-node check.
+        // Persist consumption before execution; host death leaves an uncertain reply,
+        // never an automatic replay of an owner operation.
+        try command.id.write(to: seenFile, atomically: true, encoding: .utf8)
+        lastID = command.id
+        var reply: [String: Any] = [:]
+        do {
+          reply["id"] = command.id
+          guard command.request.journal == journal, command.request.root.isEmpty,
+            command.request.storage == "serving" else {
+            throw NSError(domain: "command-journal-mismatch", code: 1)
+          }
+          if command.request.op == "serve-restart-worker" {
+            do { _ = try await invoke(request("serve-crash"), "serve.crash") } catch {
+              log("serve.crash.reply-loss", ["error": String(describing: error)])
+            }
+            try await reopen()
+            reply["reply"] = try await invoke(request("serve-index"), "serve.restarted")
+          } else if command.request.op == "serve-finish" {
+            reply["reply"] = try await servingCall(request("serve-stop"), "serve.stopped")
+            done = true
+          } else if command.request.op == "export" {
+            try await export()
+            reply["reply"] = ["exported": true]
+          } else if command.request.op == "serve-index" {
+            reply["reply"] = try await invoke(command.request, "owner.command")
+          } else {
+            reply["reply"] = try await servingCall(command.request, "owner.command")
+          }
+          reply["ok"] = true
+        } catch {
+          reply["ok"] = false
+          reply["error"] = String(describing: error)
+          log("owner.command.error", reply)
+        }
+        try JSONSerialization.data(withJSONObject: reply, options: [.sortedKeys])
+          .write(to: replyFile, options: .atomic)
+        log("owner.reply", reply)
+      }
+      try await Task.sleep(for: .milliseconds(500))
+    }
+    _ = try await servingCall(request("serve-stop"), "serve.stopped")
+    log("serve.complete", ["duration": duration, "explicit_finish": done])
+  }
   func start() async {
     guard !started else { return }
     started = true
     UIApplication.shared.isIdleTimerDisabled = true
     UIDevice.current.isBatteryMonitoringEnabled = true
-    guard args.contains("--qualify") else { return }
-    let scenario = argument("--scenario", "acceptance")
+    guard args.contains("--qualify") || args.contains("--serve") else { return }
+    let scenario = args.contains("--serve") ? "serving" : argument("--scenario", "acceptance")
     let count = Int(argument("--count", "128")) ?? 128
     let duration = Int(argument("--duration", "1200")) ?? 1200
     let watchdog = Task {
@@ -197,6 +281,10 @@ final class PendingReply: @unchecked Sendable {
       try Data("host-owned authority control".utf8).write(
         to: output.appendingPathComponent("host.txt"))
       try await reopen()
+      if scenario == "serving" {
+        try await serve(duration)
+        return
+      }
       _ = try await invoke(
         request("probe", root: output.appendingPathComponent("host.txt").path), "authority")
       if scenario != "reopen" {

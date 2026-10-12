@@ -6,10 +6,12 @@ DEVICE ?=
 DESTINATION ?= generic/platform=iOS
 RUST_LIB := $(BUILD_ROOT)/rust/aarch64-apple-ios/debug/libsolstone_ios_runtime.a
 APP := $(BUILD_ROOT)/derived/Build/Products/Debug-iphoneos/JournalRuntimeDev.app
-.PHONY: build rust project finalize install run check
+.PHONY: build rust payload project finalize install run check
 rust:
 	cargo build --locked --manifest-path native/Cargo.toml --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/rust
-project:
+payload:
+	python3 package_payload.py
+project: payload
 	xcodegen generate
 build: rust project
 	xcodebuild -project JournalRuntimeDev.xcodeproj -scheme JournalRuntimeDev -configuration Debug -destination '$(DESTINATION)' -derivedDataPath $(BUILD_ROOT)/derived -allowProvisioningUpdates RUST_LIB=$(RUST_LIB) build
