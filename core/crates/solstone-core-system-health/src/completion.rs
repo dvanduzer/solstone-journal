@@ -127,31 +127,12 @@ pub fn classify_segment_completion(
         {
             exhausted.insert(segment.key.clone());
         }
-        if !segment_fully_sensed(&segment.data_state) {
-            let detail = segment
-                .data_state
-                .0
-                .iter()
-                .filter(|(_, state)| !SENSED_TERMINAL_STATES.contains(&state.as_str()))
-                .map(|(modality, state)| format!("{modality}={state}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            completion.blockers.push(SegmentBlocker {
-                segment: segment.key.clone(),
-                dimension: SegmentBlockerDimension::NotSensed,
-                detail,
-            });
-            completion.not_sensed += 1;
-            continue;
-        }
-        let verdict = segment_fully_thought(segment_progress);
-        if verdict != ThoughtVerdict::Complete {
-            completion.blockers.push(SegmentBlocker {
-                segment: segment.key.clone(),
-                dimension: SegmentBlockerDimension::NotThought,
-                detail: verdict_detail(&verdict),
-            });
-            completion.not_thought += 1;
+        if let Some(blocker) = segment_blocker(segment, segment_progress) {
+            match blocker.dimension {
+                SegmentBlockerDimension::NotSensed => completion.not_sensed += 1,
+                SegmentBlockerDimension::NotThought => completion.not_thought += 1,
+            }
+            completion.blockers.push(blocker);
         }
     }
     completion.exhausted = exhausted.into_iter().collect();
@@ -162,22 +143,59 @@ pub fn blocked_segment_keys(
     segments: &[SegmentInput],
     progress: &BTreeMap<SegmentIdentity, SegmentProgress>,
 ) -> BTreeSet<SegmentIdentity> {
+    blocked_segment_details(segments, progress)
+        .into_keys()
+        .collect()
+}
+
+/// Each segment still blocking its day, with why: its unsensed modalities as
+/// `modality=state`, or the thinking it still waits on.
+pub fn blocked_segment_details(
+    segments: &[SegmentInput],
+    progress: &BTreeMap<SegmentIdentity, SegmentProgress>,
+) -> BTreeMap<SegmentIdentity, String> {
     segments
         .iter()
         .filter(|segment| segment_requires_processing(segment))
         .filter_map(|segment| {
-            let blocked = !segment_fully_sensed(&segment.data_state)
-                || segment_fully_thought(lookup_segment_progress(
-                    progress,
-                    &segment.stream,
-                    &segment.key,
-                )) != ThoughtVerdict::Complete;
-            blocked.then_some(SegmentIdentity {
-                stream: Some(segment.stream.clone()),
-                segment: segment.key.clone(),
-            })
+            let segment_progress = lookup_segment_progress(progress, &segment.stream, &segment.key);
+            let blocker = segment_blocker(segment, segment_progress)?;
+            Some((
+                SegmentIdentity {
+                    stream: Some(segment.stream.clone()),
+                    segment: segment.key.clone(),
+                },
+                blocker.detail,
+            ))
         })
         .collect()
+}
+
+fn segment_blocker(
+    segment: &SegmentInput,
+    progress: Option<&SegmentProgress>,
+) -> Option<SegmentBlocker> {
+    if !segment_fully_sensed(&segment.data_state) {
+        let detail = segment
+            .data_state
+            .0
+            .iter()
+            .filter(|(_, state)| !SENSED_TERMINAL_STATES.contains(&state.as_str()))
+            .map(|(modality, state)| format!("{modality}={state}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        return Some(SegmentBlocker {
+            segment: segment.key.clone(),
+            dimension: SegmentBlockerDimension::NotSensed,
+            detail,
+        });
+    }
+    let verdict = segment_fully_thought(progress);
+    (verdict != ThoughtVerdict::Complete).then(|| SegmentBlocker {
+        segment: segment.key.clone(),
+        dimension: SegmentBlockerDimension::NotThought,
+        detail: verdict_detail(&verdict),
+    })
 }
 
 fn verdict_detail(verdict: &ThoughtVerdict) -> String {

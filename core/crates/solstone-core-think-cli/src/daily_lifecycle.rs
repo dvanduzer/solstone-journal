@@ -3,7 +3,7 @@
 
 //! Whole-day catchup composition for the unscoped `journal think --day` mode.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -17,7 +17,7 @@ use solstone_core_system::catchup::{
     record_segment_repair_attempt, record_segment_repair_outcome,
 };
 use solstone_core_system_health::{
-    FilesystemHealthLogSource, FilesystemSegmentSource, SegmentIdentity, blocked_segment_keys,
+    FilesystemHealthLogSource, FilesystemSegmentSource, SegmentIdentity, blocked_segment_details,
     read_segment_progress, scan_day,
 };
 
@@ -590,6 +590,12 @@ fn force_all_repairs(args: &ThinkArgs) -> bool {
 }
 
 fn blocked_segments(context: &ThinkContext) -> Result<BTreeSet<SegmentIdentity>, String> {
+    Ok(blocked_segments_with_detail(context)?.into_keys().collect())
+}
+
+fn blocked_segments_with_detail(
+    context: &ThinkContext,
+) -> Result<BTreeMap<SegmentIdentity, String>, String> {
     let source = FilesystemSegmentSource;
     let (_, _, segments) = scan_day(&source, &context.journal, &context.day, Utc::now())
         .map_err(|error| error.to_string())?;
@@ -597,7 +603,40 @@ fn blocked_segments(context: &ThinkContext) -> Result<BTreeSet<SegmentIdentity>,
     let health = FilesystemHealthLogSource::new(&context.journal);
     let progress =
         read_segment_progress(&health, &context.day).map_err(|error| error.to_string())?;
-    Ok(blocked_segment_keys(&inputs, &progress.value))
+    Ok(blocked_segment_details(&inputs, &progress.value))
+}
+
+/// How many blocking segments an incomplete day names before counting the rest.
+const NAMED_BLOCKERS: usize = 3;
+
+/// Name the first few blocking segments with why each still blocks, as read now,
+/// as a `: `-led suffix (empty when nothing blocks).
+///
+/// A blocker that no longer reads as blocked, or a day that cannot be read
+/// again, is still named, just without a reason.
+fn describe_blockers(context: &ThinkContext, blockers: &BTreeSet<SegmentIdentity>) -> String {
+    if blockers.is_empty() {
+        return String::new();
+    }
+    let details = blocked_segments_with_detail(context).unwrap_or_default();
+    let mut named = blockers
+        .iter()
+        .take(NAMED_BLOCKERS)
+        .map(|identity| {
+            let name = match &identity.stream {
+                Some(stream) => format!("{stream}/{}", identity.segment),
+                None => identity.segment.clone(),
+            };
+            match details.get(identity).filter(|detail| !detail.is_empty()) {
+                Some(detail) => format!("{name} {detail}"),
+                None => name,
+            }
+        })
+        .collect::<Vec<_>>();
+    if blockers.len() > NAMED_BLOCKERS {
+        named.push(format!("+{} more", blockers.len() - NAMED_BLOCKERS));
+    }
+    format!(": {}", named.join(", "))
 }
 
 fn all_segments(context: &ThinkContext) -> Result<BTreeSet<SegmentIdentity>, String> {
@@ -718,8 +757,9 @@ fn maybe_finalize_completion(
                 failed_phase(
                     "daily_incomplete",
                     format!(
-                        "{nonterminal_daily} daily unit(s) non-terminal; {} segment blocker(s) remain",
-                        segment_blockers.len()
+                        "{nonterminal_daily} daily unit(s) non-terminal; {} segment blocker(s) remain{}",
+                        segment_blockers.len(),
+                        describe_blockers(context, segment_blockers)
                     ),
                 ),
             );
@@ -1408,7 +1448,53 @@ mod tests {
         assert_eq!(events, 0);
         assert_eq!(total.failed, 1);
         assert!(total.failed_names[0].starts_with("daily_incomplete ("));
+        assert!(total.failed_names[0].contains("default/090000_300"));
         assert_eq!(crate::mode_outcome(total).exit_code, 1);
+    }
+
+    #[test]
+    fn daily_incomplete_names_blocking_segments_and_their_state() {
+        let journal = tempdir().unwrap();
+        bump_stream_marker(journal.path(), DAY).unwrap();
+        let context = context(journal.path());
+        let mut log = log(journal.path());
+        let mut blockers = BTreeSet::new();
+        for minute in 0..5 {
+            let segment = format!("18{minute:02}00_300");
+            let path = journal
+                .path()
+                .join("chronicle")
+                .join(DAY)
+                .join("import.chatgpt")
+                .join(&segment);
+            fs::create_dir_all(&path).unwrap();
+            // A transcript with no rows yet: the scan reads it as pending.
+            fs::write(path.join("conversation_transcript.jsonl"), "{}\n").unwrap();
+            blockers.insert(SegmentIdentity {
+                stream: Some("import.chatgpt".to_owned()),
+                segment,
+            });
+        }
+        let mut total = succeeded_phase("all");
+        maybe_finalize_completion(
+            &context,
+            &mut log,
+            completion_scope(journal.path(), 1),
+            &complete_daily(),
+            &blockers,
+            Some((0, 5)),
+            DayScopedOutcome::default(),
+            &mut total,
+            |_, _, _| panic!("blocked completion emitted"),
+        );
+        let detail = &total.failed_names[0];
+        assert!(
+            detail.contains("import.chatgpt/180000_300 audio=pending"),
+            "{detail}"
+        );
+        assert!(detail.contains("import.chatgpt/180200_300"), "{detail}");
+        // Bounded: only the first few are listed.
+        assert_eq!(detail.matches("import.chatgpt/").count(), 3, "{detail}");
     }
 
     #[test]

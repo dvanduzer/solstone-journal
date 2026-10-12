@@ -41,9 +41,9 @@ pub use catchup_state::{
 };
 pub use change_detection::{detect_segment_change, resolve_predecessor};
 pub use completion::{
-    blocked_segment_keys, classify_segment_completion, lookup_segment_progress,
-    segment_fully_sensed, segment_fully_thought, segment_requires_processing,
-    segment_thinking_is_current,
+    blocked_segment_details, blocked_segment_keys, classify_segment_completion,
+    lookup_segment_progress, segment_fully_sensed, segment_fully_thought,
+    segment_requires_processing, segment_thinking_is_current,
 };
 pub use data_state::derive_modality_state;
 pub use error::HealthError;
