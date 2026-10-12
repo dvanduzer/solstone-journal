@@ -322,7 +322,7 @@ pub(crate) fn principal_folder(root: &Path, principal_id: &str) -> String {
 }
 
 fn owner_voice_state(root: &Path, principal_id: &str) -> OwnerVoice {
-    let voiceprint = awareness_voiceprint(root);
+    let voiceprint = solstone_core_speaker_resolve::owner_voice::voiceprint_state(root);
     let status = voiceprint
         .get("status")
         .and_then(Value::as_str)
@@ -358,22 +358,6 @@ fn owner_voice_state(root: &Path, principal_id: &str) -> OwnerVoice {
         built_at: None,
         refreshed_at: None,
     }
-}
-
-pub(crate) fn awareness_voiceprint(root: &Path) -> BTreeMap<String, Value> {
-    let path = root.join("awareness/current.json");
-    if !path.exists() {
-        return BTreeMap::new();
-    }
-    read_json_object(&path)
-        .and_then(|current| {
-            current
-                .get("voiceprint")
-                .and_then(Value::as_object)
-                .cloned()
-        })
-        .map(|voiceprint| voiceprint.into_iter().collect())
-        .unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -532,20 +516,14 @@ fn manual_owner_tag_stream(
     ) {
         return ManualOwnerTagResolution::NotTagged;
     }
-    if segment_overlap_fraction(&segment.join(format!("{source}.jsonl"))) <= 0.10 {
+    if solstone_core_speaker_resolve::owner_detection::segment_overlap_fraction(
+        &segment.join(format!("{source}.jsonl")),
+    ) <= 0.10
+    {
         ManualOwnerTagResolution::Tagged(stream.to_owned())
     } else {
         ManualOwnerTagResolution::NotTagged
     }
-}
-
-pub(crate) fn segment_overlap_fraction(path: &Path) -> f64 {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| contents.lines().next().map(str::to_owned))
-        .and_then(|line| serde_json::from_str::<Value>(&line).ok())
-        .and_then(|header| header.get("overlap_fraction").and_then(Value::as_f64))
-        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

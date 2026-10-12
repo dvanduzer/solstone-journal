@@ -81,14 +81,17 @@ country borders to 0.02 degrees) and keyed by name and ISO country code.
 
 ## downloaded place data (location accuracy)
 
-An owner who chooses "location accuracy" in the map app downloads
-`venues.slpk` (SHA-256
-`7bac3fd446c7d17c0c2811ccba04579b5210c69afccabaf046075437a901316e`, version
-`overture-2026-09-23.1-r2`) from the update origin into
-`cache/location/accuracy/` in their journal. The journal reads it on the
-owner's own computer to name the places within a stop's margin of error. It is
-built by `scripts/build_location_accuracy_packs.py` from Overture Maps release
-`2026-09-23.1`, and carries the notices below in its own header.
+An owner who chooses "location accuracy" in the map app downloads two files,
+version `overture-2026-09-23.1-r2`, from the update origin into
+`cache/location/accuracy/` in their journal: `venues.slpk` (SHA-256
+`7bac3fd446c7d17c0c2811ccba04579b5210c69afccabaf046075437a901316e`) and
+`containment.slpk` (SHA-256
+`0f8f4c7270c5938ebd395e1a879a9b23ce265db10af952a0af1f79682f319063`). The
+journal reads them on the owner's own computer to name the places within a
+stop's margin of error and the outlines a position lies inside. Both are built
+by `scripts/build_location_accuracy_packs.py` from Overture Maps release
+`2026-09-23.1`, and each carries its notices in its own header. The two files
+are separate databases; the journal looks a position up in each on its own.
 
 ### Overture Maps Places
 
@@ -131,6 +134,29 @@ See the License for the specific language governing permissions and limitations 
 
 We also encourage you to join our Placemaker community (https://opensource.foursquare.com/placemaker/)—where you can contribute and provide suggestions to improve the accuracy of the Data for future releases for yourself and others.
 ```
+
+### Overture Maps outlines (`containment.slpk`)
+
+Attribution: Outlines © OpenStreetMap contributors and Overture Maps
+Foundation, available under the Open Database License
+(https://opendatacommons.org/licenses/odbl/1-0/); see
+https://docs.overturemaps.org/attribution/
+
+License notice: this database is made available under the Open Database
+License: https://opendatacommons.org/licenses/odbl/1-0/. Rights in individual
+contents stay with their sources, under the licences listed at
+https://docs.overturemaps.org/attribution/. Some outlines are adapted from
+sources available under the Creative Commons Attribution 4.0 International
+licence (CC BY 4.0, https://creativecommons.org/licenses/by/4.0/):
+geoBoundaries; Esri Community Maps contributors; Land Information New Zealand
+(LINZ); Google Open Buildings; Qian Shi et al., building outlines for East
+Asian countries (doi:10.5281/zenodo.8174931); and work derived from BTN 2024,
+ign.es.
+
+Changes: named outlines are selected from Overture Maps divisions, land use,
+airports and buildings, simplified (tolerance per layer in the file's
+`tolerance_m`) and re-encoded into the file's compact form by
+`scripts/build_location_accuracy_packs.py`, which is the build method.
 
 ## map renderer (Leaflet)
 

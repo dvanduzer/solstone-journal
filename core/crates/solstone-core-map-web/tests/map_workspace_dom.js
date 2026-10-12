@@ -93,7 +93,7 @@ async function run({ pathname, responses, withLeaflet = false }) {
       if (!(url in responses)) throw new Error(`unexpected fetch ${url}`);
       return responses[url];
     },
-    location: { replace: (url) => replaced.push(url) },
+    location: { pathname, replace: (url) => replaced.push(url) },
     getComputedStyle: () => ({ getPropertyValue: () => '' }),
     L: leaflet ? leaflet.L : undefined,
   };
@@ -168,11 +168,13 @@ test('names are escaped, never markup', async () => {
   assert.ok(markup.includes('&lt;b&gt;Golden&lt;/b&gt;'));
 });
 
-test('the map draws every record and never a line between readings', async () => {
+test('the map draws every record, a precise run as one dot, and never a line between readings', async () => {
   const { calls } = await run({ pathname: '/app/map/20261002', responses: { '/app/map/api/day/20261002': day }, withLeaflet: true });
   const boundaryLines = day.map.regions.reduce((sum, region) => sum + region.lines.length, 0);
   assert.strictEqual(calls.polyline.length, boundaryLines, 'only borders are lines');
-  const recordPoints = day.entries.reduce((sum, entry) => sum + (entry.kind === 'readings' ? entry.points.length : entry.kind === 'visit' ? 1 : 0), 0);
+  const recordPoints = day.entries.reduce((sum, entry) => sum + (entry.kind === 'readings'
+    ? (entry.precision === 'precise' ? 1 : entry.points.length)
+    : entry.kind === 'visit' ? 1 : 0), 0);
   const townPoints = day.map.towns.length;
   assert.strictEqual(calls.circleMarker.length, recordPoints + townPoints);
   assert.strictEqual(calls.fitBounds, 1);
@@ -247,6 +249,65 @@ test('the accuracy card offers, follows and removes the download', async () => {
   assert.ok(!full.includes('aria-label="location accuracy"'), 'nothing to offer shows no card');
   const failed = await card({ offered, installed: null, current: false, attributions: [], job: { state: 'failed', reason_code: 'not_enough_space' } });
   assert.ok(failed.includes("there isn&#39;t enough free space"));
+});
+
+const stayDay = {
+  ...day,
+  entries: [
+    { kind: 'stay', device: 0, count: 18, first: time('08:30'), last: time('09:01'), point: [39.75, -105.0, 30],
+      area: { label: 'near Denver, Colorado', town: 'Denver', town_km: 2 },
+      place: { margin_m: 30, at: null, near: [{ name: 'Pigtrain Coffee', category: 'coffee shop', distance_m: 12 }] },
+      place_ref: { id: '0123456789ab', owner_name: 'the reading room', hidden: false },
+      segments: [{ url: '/app/transcripts/20261002?stream=s#083000_300', segment: '083000_300' }] },
+    { kind: 'visit', device: 0, area: { label: 'near Denver, Colorado' }, arrival: time('18:00'), departure: null,
+      point: [39.74, -104.99, 20], place_ref: { id: 'abcdef012345', owner_name: null, hidden: true }, on_map: false,
+      segments: [{ url: '/app/transcripts/20261002?stream=s#180000_300', segment: '180000_300' }] },
+    { kind: 'readings', device: 0, area: { label: 'near Denver, Colorado' }, precision: 'approximate',
+      first: time('19:00'), last: time('19:30'), count: 3,
+      points: [[39.74, -104.99, 900], [39.741, -104.99, 900], [39.80, -104.95, 900]],
+      map_points: [[39.80, -104.95, 900]],
+      segments: [{ url: '/app/transcripts/20261002?stream=s#190000_300', segment: '190000_300' }] },
+  ],
+};
+
+test('a worked-out stay says so, and a hidden place stays off the map', async () => {
+  const { elements, calls } = await run({ pathname: '/app/map/20261002', responses: { '/app/map/api/day/20261002': stayDay }, withLeaflet: true });
+  const markup = elements['map-view-root'].innerHTML;
+  assert.ok(markup.includes('<p class="map-row-title">at the reading room</p>'), 'the owner name leads');
+  assert.ok(markup.includes('a stay your journal worked out from readings from your iphone · 18 readings'));
+  assert.ok(markup.includes('href="/app/map/place/0123456789ab"'));
+  assert.ok(markup.includes('hidden from the map'));
+  assert.ok(markup.includes('href="/app/map/week/20261002"'), 'the day links to its week');
+  const townPoints = day.map.towns.length;
+  assert.strictEqual(calls.circleMarker.length, 1 + 1 + townPoints, 'nothing near the hidden place is drawn');
+  assert.ok(markup.includes('3 readings'), 'the list still counts every reading');
+});
+
+test('the week, places and a place page render from their own data', async () => {
+  const week = { start: '20260928', previous: '20260921', next: '20261005', days: [
+    { day: '20260928', readings: 0, devices: [], items: [] },
+    { day: '20260929', readings: 3, devices: ['iphone'], items: [stayDay.entries[0]] },
+  ] };
+  const weekPage = await run({ pathname: '/app/map/week/20260929', responses: { '/app/map/api/week/20260929': week } });
+  const weekMarkup = weekPage.elements['map-view-root'].innerHTML;
+  assert.ok(weekMarkup.includes('the week of Monday, September 28'));
+  assert.ok(weekMarkup.includes('no location kept'));
+  assert.ok(weekMarkup.includes('data-kind="stay"'));
+  assert.ok('data-map-page' in weekPage.elements['map-shell'].attributes, 'the day navigator is hidden');
+  const place = { id: '0123456789ab', label: 'the reading room', owner_name: 'the reading room', name: 'the reading room',
+    alias: 'home', hidden: false, area: { label: 'near Denver, Colorado' }, words: null, dates: 9, first: '20260929',
+    last: '20261009', night_dates: 9, stays: [{ day: '20261009', start: '21:00', end: '07:00', kind: 'reported' }] };
+  const places = await run({ pathname: '/app/map/places', responses: { '/app/map/api/places': { places: [place] } } });
+  const placesMarkup = places.elements['map-view-root'].innerHTML;
+  assert.ok(placesMarkup.includes('visits or stays here on 9 dates, Sep 29 to Oct 9.'));
+  assert.ok(placesMarkup.includes('on 9 nights, a visit or stay here covers at least two hours between 22:00 and 06:00.'));
+  const empty = await run({ pathname: '/app/map/places', responses: { '/app/map/api/places': { places: [] } } });
+  assert.ok(empty.elements['map-view-root'].innerHTML.includes('no places yet.'));
+  const page = await run({ pathname: '/app/map/place/0123456789ab', responses: { '/app/map/api/place/0123456789ab': place } });
+  const pageMarkup = page.elements['map-view-root'].innerHTML;
+  assert.ok(pageMarkup.includes('<option value="home" selected>home</option>'));
+  assert.ok(pageMarkup.includes('hide from the map'));
+  assert.ok(pageMarkup.includes('21:00–07:00 · a visit your phone reported'));
 });
 
 (async () => {

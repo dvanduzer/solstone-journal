@@ -424,15 +424,10 @@ fn owner_bootstrap_response(response: &mut Value, result: Result<Value, String>)
     let fields = match result {
         Ok(value)
             if value["status"] == "confirmed"
-                && value.as_object().is_some_and(|object| {
-                    object.len() == 4
-                        && object.contains_key("status")
-                        && object.contains_key("principal_id")
-                        && object.contains_key("cluster_size")
-                        && object.contains_key("evidence_tier")
-                }) =>
+                && value.get("principal_id").is_some()
+                && value.get("next_step").is_none() =>
         {
-            json!({"owner_bootstrap_outcome":"built"})
+            json!({"owner_bootstrap_outcome":"built","owner_voice_relabel":value["relabel"]})
         }
         Ok(value) if value["status"] == "confirmed" && value["next_step"] == "rebuild_owner" => {
             json!({"owner_bootstrap_outcome":"already_built"})
@@ -1126,17 +1121,13 @@ fn label(rows: &[Value], sentence_id: i64) -> Option<&Value> {
     rows.iter()
         .find(|row| row.get("sentence_id").and_then(Value::as_i64) == Some(sentence_id))
 }
+/// Whether the transcript holds this sentence, numbered the way the
+/// transcriber writes it: the row's `sentence_id`, or its position.
 fn sentence_exists(segment: &std::path::Path, source: &str, sentence_id: i64) -> bool {
-    fs::read_to_string(segment.join(format!("{source}.jsonl")))
+    fs::read(segment.join(format!("{source}.jsonl")))
         .ok()
-        .is_some_and(|body| {
-            body.lines().any(|line| {
-                serde_json::from_str::<Value>(line)
-                    .ok()
-                    .and_then(|value| value.get("id").and_then(Value::as_i64))
-                    .is_some_and(|id| id == sentence_id)
-            })
-        })
+        .and_then(|bytes| solstone_core_speaker_id::transcript::read_transcript_rows(&bytes).ok())
+        .is_some_and(|read| read.rows.iter().any(|row| row.sentence_id == sentence_id))
 }
 fn sentence_embedding(
     segment: &std::path::Path,

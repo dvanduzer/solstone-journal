@@ -249,7 +249,7 @@ async fn resolve_names_commit_merges_ready_candidate() {
 }
 
 #[tokio::test]
-async fn reject_declares_skipped_awareness_state() {
+async fn reject_cli_records_the_same_rejection_as_the_browser() {
     let journal = Journal::new();
     journal.entity("owner", true);
     fs::create_dir_all(journal.0.join("awareness")).expect("awareness");
@@ -264,6 +264,11 @@ async fn reject_declares_skipped_awareness_state() {
         },
     )
     .expect("candidate");
+    fs::write(
+        journal.0.join("awareness/current.json"),
+        json!({"voiceprint":{"status":"candidate","detected_at":"v1","candidate_cluster_id":7,"samples":[]}}).to_string(),
+    )
+    .expect("awareness");
 
     let (status, value) = call(
         router(journal.0.clone()),
@@ -271,15 +276,69 @@ async fn reject_declares_skipped_awareness_state() {
         json!({"version": "v1"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(value["status"], "rejected");
-    assert_eq!(value["partial_success"], true);
-    assert_eq!(value["awareness_state"]["status"], "skipped");
-    assert_eq!(
-        value["awareness_state"]["reason_code"],
-        "speaker_awareness_state_not_native"
-    );
+    assert_eq!(value["cooldown_days"], 14);
+    assert!(value["next_look_after"].is_string(), "{value}");
     assert!(!journal.0.join("awareness/owner_candidate.npz").exists());
+
+    let awareness: Value =
+        serde_json::from_slice(&fs::read(journal.0.join("awareness/current.json")).unwrap())
+            .unwrap();
+    let voiceprint = &awareness["voiceprint"];
+    assert_eq!(voiceprint["status"], "rejected", "{awareness}");
+    assert!(voiceprint["rejected_at"].is_string(), "{awareness}");
+    assert!(voiceprint.get("detected_at").is_none(), "{awareness}");
+    assert_eq!(voiceprint["rejected_candidates"][0]["cluster_id"], 7);
+
+    let (status, owner) =
+        get_call(router(journal.0.clone()), "/app/speakers/api/owner/status").await;
+    assert_eq!(status, StatusCode::OK, "{owner}");
+    assert_eq!(owner["reason"], "cooldown", "{owner}");
+    assert!(owner["next_look_after"].is_string(), "{owner}");
+}
+
+#[tokio::test]
+async fn undo_removes_the_saved_voice_and_refuses_when_there_is_none() {
+    let journal = Journal::new();
+    journal.entity("owner", true);
+    let mut centroid = vec![0.0_f32; 256];
+    centroid[0] = 1.0;
+    solstone_core_speaker_resolve::owner_centroid::write_owner_centroid(
+        &journal.0,
+        "owner",
+        &solstone_core_speaker_resolve::owner_centroid::OwnerCentroidWriteInput {
+            centroid,
+            cluster_size: 40,
+            timestamp: "2026-10-01T12:00:00+00:00".to_owned(),
+            evidence_tier: "standard".to_owned(),
+        },
+    )
+    .expect("centroid");
+
+    let (status, value) = call(
+        router(journal.0.clone()),
+        "/app/speakers/api/owner/undo",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "none");
+    assert_eq!(value["relabel"]["kind"], "undo", "{value}");
+    assert!(
+        !solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(&journal.0, "owner")
+            .unwrap()
+            .exists()
+    );
+
+    let (status, value) = call(
+        router(journal.0.clone()),
+        "/app/speakers/api/owner/undo",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    assert_eq!(value["reason_code"], "speaker_owner_voice_missing");
 }
 
 #[tokio::test]

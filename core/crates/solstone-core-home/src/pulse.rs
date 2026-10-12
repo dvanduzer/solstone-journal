@@ -172,7 +172,19 @@ fn build_pulse_context(context: &HomeContext) -> PulseContext {
     }
     let mut needs_you_items = classify_needs_you(&attention, &deduped_pulse_needs);
     if let Some(outcome) = resolve_owner_voice_tier(context)
-        && let Some(voice_item) = classify_owner_voice_needs(outcome)
+        && let Some(voice_item) = classify_owner_voice_needs(
+            outcome,
+            || {
+                solstone_core_speaker_resolve::owner_voice::owner_voice_setup(
+                    context.journal_root(),
+                )
+            },
+            |at| {
+                at.with_timezone(&context.now_local().timezone())
+                    .format("%a %b %-d")
+                    .to_string()
+            },
+        )
     {
         let key = needs_dedup_key(&voice_item);
         if needs_keys.insert(key) {
@@ -1599,7 +1611,7 @@ mod tests {
             })
             .expect("not established item present");
         assert_eq!(item["kind"], "route");
-        assert_eq!(item["payload"]["href"], "/app/speakers/");
+        assert_eq!(item["payload"]["href"], "/app/speakers/#your-voice");
         assert_eq!(item["disabled"], false);
         assert!(!items.iter().any(|item| {
             item.get("source_id").and_then(Value::as_str)

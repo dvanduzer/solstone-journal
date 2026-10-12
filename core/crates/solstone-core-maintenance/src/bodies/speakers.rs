@@ -16,11 +16,24 @@ pub(crate) fn backfill_pool(args: &[String], journal: &Path) -> CliRun {
         };
     }
     match solstone_core_speaker_resolve::candidate_tracker::backfill_speaker_pool(journal) {
+        // Once the pool has caught up, look for the owner's voice the way the
+        // Speakers page does, so a candidate is found without the owner opening
+        // any particular page.
         solstone_core_speaker_resolve::candidate_tracker::SpeakerPoolCatchUp::Done(report) => {
-            CliRun {
-                stdout: format!("{report}\n"),
-                stderr: String::new(),
-                exit_code: 0,
+            match solstone_core_speaker_resolve::owner_voice::refresh_owner_voice(journal) {
+                Ok(owner_voice) => CliRun {
+                    stdout: format!(
+                        "{}\n",
+                        serde_json::json!({"pool":report,"owner_voice":owner_voice})
+                    ),
+                    stderr: String::new(),
+                    exit_code: 0,
+                },
+                Err(error) => CliRun {
+                    stdout: format!("{}\n", serde_json::json!({"pool":report})),
+                    stderr: format!("owner voice look failed: {error}\n"),
+                    exit_code: 1,
+                },
             }
         }
         solstone_core_speaker_resolve::candidate_tracker::SpeakerPoolCatchUp::Refuse(refusal) => {
@@ -324,8 +337,9 @@ mod tests {
         assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert!(result.output().1.is_empty());
         let report = serde_json::from_str::<serde_json::Value>(result.output().0).unwrap();
-        assert_eq!(report["complete"], false);
-        assert_eq!(report["sources_read"], 0);
+        assert_eq!(report["pool"]["complete"], false);
+        assert_eq!(report["pool"]["sources_read"], 0);
+        assert_eq!(report["owner_voice"]["reason"], "identity_invalid");
 
         args.push("--commit".to_owned());
         let bad_arg = crate::run_cli(&args, root.path());
@@ -346,5 +360,114 @@ mod tests {
             invalid.output().1,
             "voice list catch-up refused: catch-up progress file is invalid; removing awareness/speaker_candidates_backfill.json from your journal restarts the catch-up safely\n"
         );
+    }
+
+    fn snapshot(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(root, &path, files);
+                } else {
+                    let key = path.strip_prefix(root).unwrap().display().to_string();
+                    files.insert(key, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        walk(root, root, &mut files);
+        files
+    }
+
+    /// A long-confirmed owner: a voice confirmed in August in the pre-2.x
+    /// format (seven members, no evidence hash, never refreshed), and a pool
+    /// large enough that detection could otherwise offer a candidate. The
+    /// scheduled look must change nothing: no candidate, no past-label update,
+    /// no awareness write.
+    #[test]
+    fn scheduled_look_leaves_a_confirmed_pre_2x_voice_alone() {
+        use serde_json::json;
+        use solstone_core_speaker_resolve::owner_centroid::{
+            OwnerCentroidWriteInput, load_owner_centroid, write_owner_centroid,
+        };
+        use solstone_core_speaker_resolve::owner_voice::{OwnerVoiceSetup, owner_voice_setup};
+
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path();
+        std::fs::create_dir_all(journal.join("entities/owner")).unwrap();
+        std::fs::write(
+            journal.join("entities/owner/entity.json"),
+            r#"{"id":"owner","name":"Owner","type":"Person","is_principal":true}"#,
+        )
+        .unwrap();
+        let mut voice = vec![0.0_f32; 256];
+        voice[0] = 1.0;
+        write_owner_centroid(
+            journal,
+            "owner",
+            &OwnerCentroidWriteInput {
+                centroid: voice.clone(),
+                cluster_size: 3000,
+                timestamp: "2026-08-05T15:49:00+00:00".to_owned(),
+                evidence_tier: "strong".to_owned(),
+            },
+        )
+        .unwrap();
+        let centroid = load_owner_centroid(journal, "owner").unwrap().unwrap();
+        assert_eq!(centroid.evidence_hash, None);
+        assert_eq!(
+            centroid.last_refreshed_at.as_deref(),
+            Some("2026-08-05T15:49:00+00:00")
+        );
+        std::fs::create_dir_all(journal.join("awareness")).unwrap();
+        std::fs::write(
+            journal.join("awareness/current.json"),
+            json!({"voiceprint":{"status":"confirmed","cluster_size":3000,"confirmed_at":"2026-08-05T15:49:00+00:00","detected_at":"2026-08-05T15:40:00+00:00","evidence_tier":"strong","recommendation":"ready","samples":[],"streams_represented":6}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            journal.join("awareness/speaker_candidates.json"),
+            json!({"next_id":2,"candidates":[{"cand_id":1,"centroid":voice,"n_segments":40,"n_intervals":400,"total_duration_s":800.0,"source_segments":[],"confirmed_entity":null,"status":"pending","merge_events":[]}]}).to_string(),
+        )
+        .unwrap();
+        let segment = journal.join("chronicle/20260806/default/093000_300/talents");
+        std::fs::create_dir_all(&segment).unwrap();
+        std::fs::write(
+            segment.join("speaker_labels.json"),
+            json!({"labels":[{"sentence_id":1,"speaker":"owner","confidence":"high","method":"owner_centroid"}],"owner_centroid_last_refreshed_at":"2026-08-05T15:49:00+00:00"}).to_string(),
+        )
+        .unwrap();
+        let before = snapshot(journal);
+
+        let args = vec!["run".to_owned(), "speakers:backfill-pool".to_owned()];
+        let result = crate::run_cli(&args, journal);
+        assert_eq!(result.output().2, 0, "{}", result.output().1);
+        let report = serde_json::from_str::<serde_json::Value>(result.output().0).unwrap();
+        assert_eq!(report["owner_voice"]["status"], "skipped", "{report}");
+        assert_eq!(report["owner_voice"]["reason"], "voice_saved", "{report}");
+
+        let after = snapshot(journal);
+        let changed = before
+            .keys()
+            .chain(after.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|path| before.get(*path) != after.get(*path))
+            // The pool catch-up keeps its own progress record and pool lock;
+            // neither is owner-voice state. The pool itself must not change.
+            .filter(|path| {
+                !path.starts_with("awareness/speaker_candidates_backfill")
+                    && path.as_str() != "awareness/speaker_candidates.json.lock"
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(changed.is_empty(), "the scheduled look changed {changed:?}");
+        assert!(!journal.join("awareness/owner_candidate.npz").exists());
+        assert!(!journal.join("speakers/backfill-operations.jsonl").exists());
+        assert_eq!(owner_voice_setup(journal), OwnerVoiceSetup::Saved);
     }
 }

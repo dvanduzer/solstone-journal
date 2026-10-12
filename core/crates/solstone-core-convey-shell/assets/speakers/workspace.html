@@ -1497,6 +1497,9 @@
   const ownerTeachDeclinedKeys = new Set();
   const OWNER_TEACH_HASH = 'owner-teach';
   const OWNER_TEACH_REVIEW_CONCURRENCY = 4;
+  // Teaching draws on recent days, newest first, until it has enough to offer.
+  const OWNER_TEACH_RECENT_DAYS = 14;
+  const OWNER_TEACH_TARGET_STATEMENTS = 40;
 
   function decodeSegmentLayout(value, allowMissing = false) {
     if (value === 'direct' || value === 'named') {
@@ -1556,8 +1559,8 @@
     return rows;
   }
 
-  function segmentRequestUrl(prefix, seg, suffix = '') {
-    const components = [day, seg.stream, seg.key, suffix]
+  function segmentRequestUrl(prefix, seg, suffix = '', segmentDay = day) {
+    const components = [segmentDay, seg.stream, seg.key, suffix]
       .filter((value, index) => index < 3 || value !== '')
       .map(value => encodeURIComponent(value));
     const params = new URLSearchParams({ stream_layout: segmentLayout(seg) });
@@ -1768,15 +1771,27 @@
         const revealSource = ownerRevealPendingSource;
         const reveal = ownerRevealDecision(ownerRevealShown, revealSource, data.status);
         ownerRevealShown = reveal.nextLatchShown;
-        ownerTeachState = null;
-        ownerTeachStartRequested = false;
         if (reveal.show) {
+          ownerTeachState = null;
+          ownerTeachStartRequested = false;
           ownerRevealPendingSource = null;
           hideDiscovery();
           renderOwnerReveal(data, revealSource);
           return data;
         }
         ownerRevealPendingSource = null;
+        // Teaching again while a voice is saved is how the owner redoes it.
+        if (ownerTeachState?.active) {
+          ownerTeachState.statusData = data;
+          renderOwnerTeachSession();
+          return data;
+        }
+        if (ownerTeachStartRequested) {
+          hideDiscovery();
+          startOwnerTeachSession(data);
+          return data;
+        }
+        ownerTeachState = null;
         hideOwnerBannerUnlessHandoff();
         checkDiscovery();
         return data;
@@ -1810,6 +1825,16 @@
 
       ownerDetectionInFlight = false;
       if (data.status === 'no_cluster') {
+        if (ownerTeachState?.active) {
+          ownerTeachState.statusData = data;
+          renderOwnerTeachSession();
+          return data;
+        }
+        if (ownerTeachStartRequested) {
+          hideDiscovery();
+          startOwnerTeachSession(data);
+          return data;
+        }
         ownerTeachState = null;
         ownerTeachStartRequested = false;
         hideDiscovery();
@@ -1899,10 +1924,11 @@
     ownerBanner.style.display = 'block';
     ownerBanner.innerHTML = `
       <div class="spk-owner-panel">
-        <div class="spk-owner-title">is this your voice?</div>
+        <div class="spk-owner-title">${escapeHtml(SPK_COPY.SPK_OWNER_CANDIDATE_TITLE || '')}</div>
         <div class="spk-owner-copy">
-          a voice pattern is likely yours, based on ${escapeHtml(String(data.cluster_size || 0))} voice samples. review a few examples before confirming.
+          ${escapeHtml(ownerTeachTemplateText(SPK_COPY.SPK_OWNER_CANDIDATE_BODY_TEMPLATE, { count: Number(data.cluster_size || 0).toLocaleString() }))}
         </div>
+        <div class="spk-owner-copy">${escapeHtml(SPK_COPY.SPK_OWNER_CANDIDATE_EFFECT || '')}</div>
         <div class="spk-owner-samples">
           ${samples.map((sample, index) => {
             const hasOffset = Number.isFinite(sample.offset_s);
@@ -1911,10 +1937,7 @@
               : '';
             return `
             <div class="spk-owner-sample" data-sample-idx="${index}">
-              <div class="spk-owner-sample-title">sample ${index + 1}</div>
-              <div class="spk-owner-sample-meta">
-                ${escapeHtml(sample.day)} · ${escapeHtml(sample.stream)} · ${escapeHtml(sample.segment_key)}
-              </div>
+              <div class="spk-owner-sample-title">${escapeHtml(ownerSampleWhen(sample) || `sample ${index + 1}`)}</div>
               ${sample.text ? `<div class="spk-owner-sample-text">${escapeHtml(sample.text)}</div>` : ''}
               ${sample.artifact_eligible && sample.audio_url
                 ? `<div class="spk-owner-sample-player">
@@ -1926,9 +1949,10 @@
           `;}).join('')}
         </div>
         <div class="spk-owner-actions">
-          <button class="spk-owner-btn spk-owner-btn-confirm" id="spkOwnerConfirm" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>yes, that's me</button>
-          <button class="spk-owner-btn spk-owner-btn-reject" id="spkOwnerReject" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>no, try again</button>
-          <button class="spk-owner-btn" id="spkOwnerSetAside">${escapeHtml(SPK_COPY.SPK_ACTION_SET_ASIDE || 'set aside')}</button>
+          <button class="spk-owner-btn spk-owner-btn-confirm" id="spkOwnerConfirm" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>${escapeHtml(SPK_COPY.SPK_OWNER_CONFIRM_LABEL || '')}</button>
+          <button class="spk-owner-btn spk-owner-btn-reject" id="spkOwnerReject" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>${escapeHtml(SPK_COPY.SPK_OWNER_REJECT_LABEL || '')}</button>
+          <button class="spk-owner-btn" id="spkOwnerSetAside">${escapeHtml(SPK_COPY.SPK_ACTION_NOT_NOW || '')}</button>
+          <button class="spk-owner-btn" id="spkOwnerTeachInstead" type="button">${escapeHtml(SPK_COPY.SPK_OWNER_TEACH_INSTEAD_LABEL || '')}</button>
         </div>
       </div>
     `;
@@ -1993,17 +2017,50 @@
       submitOwnerCandidateAction('/app/speakers/api/owner/set-aside', { version });
     });
 
-    attachAudioErrorListeners(ownerBanner);
-  }
+    document.getElementById('spkOwnerTeachInstead')?.addEventListener('click', navigateToOwnerHelp);
 
-  function formatOwnerMetric(value) {
-    if (typeof value !== 'number' || Number.isNaN(value)) return 'n/a';
-    if (Number.isInteger(value)) return String(value);
-    return value.toFixed(2);
+    attachAudioErrorListeners(ownerBanner);
   }
 
   function todayDayKey() {
     return window.JournalClock ? window.JournalClock.today() : '';
+  }
+
+  // A sample is named by when it was said, never by its file coordinates.
+  function ownerSampleWhen(sample) {
+    const format = window.JournalFormat;
+    if (!format?.day || !format?.segmentTimeOfDay) return '';
+    return `${format.day(sample.day)}, ${format.segmentTimeOfDay(sample.segment_key)}`;
+  }
+
+  function recentDayKeys(count) {
+    const today = todayDayKey() || day;
+    if (!/^\d{8}$/.test(today)) return [day];
+    const base = new Date(Number(today.slice(0, 4)), Number(today.slice(4, 6)) - 1, Number(today.slice(6, 8)));
+    return Array.from({ length: count }, (_, offset) => {
+      const date = new Date(base.getFullYear(), base.getMonth(), base.getDate() - offset);
+      return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+    });
+  }
+
+  // The day a declined voice's cooldown ends, on the journal's clock, in the
+  // anchored shape home uses ("Sun Oct 25").
+  function lookAgainDay(instant) {
+    if (!instant || !window.JournalFormat?.dayFull) return '';
+    const key = window.JournalClock?.dayKey
+      ? window.JournalClock.dayKey(instant)
+      : String(instant).slice(0, 10).replaceAll('-', '');
+    return window.JournalFormat.dayFull(key);
+  }
+
+  function ownerNotReadyLine(data) {
+    if (data.reason === 'cooldown') {
+      return ownerTeachTemplateText(SPK_COPY.SPK_OWNER_COOLDOWN_TEMPLATE, { date: lookAgainDay(data.next_look_after) });
+    }
+    if (data.low_quality_reason === 'median_duration_too_short' || data.low_quality_reason === 'cluster_too_diffuse') {
+      return SPK_COPY.SPK_OWNER_NOT_READY_SHORT_OR_MIXED || '';
+    }
+    return SPK_COPY.SPK_OWNER_NOT_READY_NEEDS_MORE || '';
   }
 
   function principalEntityId() {
@@ -2056,7 +2113,7 @@
   }
 
   function ownerRevealFactTexts(state, source, copy) {
-    if (source === 'manual_tags') return [ownerRevealStatementText(state, copy)];
+    if (source === 'manual_tags' || source === 'redo') return [ownerRevealStatementText(state, copy)];
     const meta = state?.centroid_metadata || {};
     const streams = Array.isArray(meta.streams) ? meta.streams.length : 0;
     // Plural forms are real: this read "appears in 1 places".
@@ -2205,7 +2262,7 @@
     if (window.location.hash.slice(1) !== OWNER_TEACH_HASH) {
       window.location.hash = OWNER_TEACH_HASH;
     }
-    if (ownerStatusData && ownerStatusStartsTeachSession(ownerStatusData)) {
+    if (ownerStatusData) {
       startOwnerTeachSession(ownerStatusData);
     } else {
       checkOwnerStatus();
@@ -2216,15 +2273,8 @@
     return `<details class="spk-owner-diagnostics">
           <summary class="spk-owner-diagnostics-summary">why not yet?</summary>
           <div class="spk-owner-diagnostics-body">
-            <div class="spk-owner-diagnostics-line">source: ${escapeHtml(data.source || 'auto')}</div>
-            ${data.low_quality_reason ? `
-              <div class="spk-owner-diagnostics-line">
-                gate: ${escapeHtml(data.low_quality_reason)}. measured ${escapeHtml(formatOwnerMetric(data.observed_value))}, needs ${escapeHtml(formatOwnerMetric(data.threshold_value))}
-              </div>
-            ` : ''}
-            <div class="spk-owner-diagnostics-line">Manual tags: ${escapeHtml(String(ownerTeachMomentumCount(data)))}</div>
-            <div class="spk-owner-diagnostics-line">Segments with audio: ${escapeHtml(String(data.segments_available || 0))}</div>
-            <div class="spk-owner-diagnostics-line">Embeddings: ${escapeHtml(String(data.embeddings_available || 0))}</div>
+            <div class="spk-owner-diagnostics-line">${escapeHtml(ownerTeachProgressText(data, SPK_COPY, OWNER_MIN || 0))}</div>
+            <div class="spk-owner-diagnostics-line">${escapeHtml(ownerTeachTemplateText(SPK_COPY.SPK_OWNER_RECORDINGS_TEMPLATE, { count: Number(data.segments_available || 0).toLocaleString() }))}</div>
           </div>
         </details>`;
   }
@@ -2244,6 +2294,7 @@
       ownerBanner.innerHTML = `
       <div class="spk-owner-panel">
         <div class="spk-owner-title">${escapeHtml(SPK_COPY.SPK_OWNER_TEACH_TITLE || '')}</div>
+        <div class="spk-owner-copy">${escapeHtml(ownerNotReadyLine(data))}</div>
         <div class="spk-owner-copy">
           ${escapeHtml(SPK_COPY.SPK_OWNER_TEACH_BODY || '')}
         </div>
@@ -2277,7 +2328,7 @@
         })
         .catch((err) => {
           btn.disabled = false;
-          renderOwnerBanner(`couldn't build from manual tags: ${err.serverMessage}`);
+          renderOwnerBanner(SPK_COPY.SPK_OWNER_BUILD_FAILED || '');
           window.logError(err, { context: 'speakers: owner build from tags failed' });
         });
     });
@@ -2333,7 +2384,7 @@
       `;
     } else {
       const meta = [
-        `${current.segment_start || ''} - ${current.segment_end || ''}`.trim(),
+        ownerSampleWhen(current),
         formatSource(current.source || ''),
         formatDuration(current.duration_s || 0),
       ].filter(Boolean).join(' · ');
@@ -2356,7 +2407,15 @@
     ownerBanner.innerHTML = `
       <div class="spk-owner-panel">
         <div class="spk-owner-title">${escapeHtml(SPK_COPY.SPK_OWNER_TEACH_TITLE || '')}</div>
+        ${ownerTeachState.redo ? `<div class="spk-owner-copy">${escapeHtml(SPK_COPY.SPK_OWNER_REDO_BODY || '')}</div>` : ''}
         ${renderOwnerTeachProgress(data)}
+        ${ownerTeachState.redo && !ownerTeachState.loading && ownerTeachMomentumCount(data) >= (OWNER_MIN || 0) ? `
+          <div class="spk-owner-actions">
+            <button class="spk-owner-btn ${current ? 'spk-owner-btn-reject' : 'spk-owner-btn-confirm'}" id="spkOwnerRedoSave" type="button">
+              ${escapeHtml(SPK_COPY.SPK_OWNER_REDO_SAVE_LABEL || '')}
+            </button>
+          </div>
+        ` : ''}
         ${partial ? `<div class="spk-owner-notice">${escapeHtml(SPK_COPY.SPK_OWNER_TEACH_PARTIAL || '')}</div>` : ''}
         ${body}
         <div class="spk-owner-actions">
@@ -2396,6 +2455,7 @@
       submitOwnerCandidateAction('/app/speakers/api/owner/set-aside', { version: ver });
     });
     document.getElementById('spkOwnerTeachPause')?.addEventListener('click', pauseOwnerTeachSession);
+    document.getElementById('spkOwnerRedoSave')?.addEventListener('click', submitOwnerRedo);
     document.getElementById('spkOwnerTeachMine')?.addEventListener('click', submitOwnerTeachMine);
     document.getElementById('spkOwnerTeachNotMe')?.addEventListener('click', declineOwnerTeachStatement);
     document.getElementById('spkOwnerTeachSkip')?.addEventListener('click', skipOwnerTeachStatement);
@@ -2435,16 +2495,37 @@
     renderOwnerTeachSession();
   }
 
-  async function ensureOwnerTeachSegments() {
+  async function ensureOwnerTeachSegments(dayKey) {
     let state = { segments: [], nextOffset: 0, done: false };
     while (!state.done) {
-      const data = await window.apiJson(ownerTeachSegmentsApiUrl(day, 100, state.nextOffset));
+      const data = await window.apiJson(ownerTeachSegmentsApiUrl(dayKey, 100, state.nextOffset));
       state = ownerTeachSegmentPageState(state.segments, data);
     }
     return state.segments;
   }
 
-  async function loadOwnerTeachReviews(poolSegments) {
+  async function collectOwnerTeachReviews(isCurrent) {
+    const results = [];
+    let eligible = 0;
+    for (const dayKey of recentDayKeys(OWNER_TEACH_RECENT_DAYS)) {
+      if (!isCurrent()) return results;
+      let daySegments;
+      try {
+        daySegments = await ensureOwnerTeachSegments(dayKey);
+      } catch (err) {
+        window.logError?.(err, { context: 'speakers: owner teach segments failed' });
+        results.push({ items: [], failed_count: 1 });
+        continue;
+      }
+      const dayResults = await loadOwnerTeachReviews(dayKey, daySegments);
+      results.push(...dayResults);
+      eligible += ownerTeachPoolCounts(dayResults).eligible_count;
+      if (eligible >= OWNER_TEACH_TARGET_STATEMENTS) break;
+    }
+    return results;
+  }
+
+  async function loadOwnerTeachReviews(dayKey, poolSegments) {
     const requests = [];
     poolSegments.forEach(seg => {
       (seg.sources || []).forEach(source => {
@@ -2458,12 +2539,12 @@
         const request = requests[nextIndex];
         nextIndex += 1;
         try {
-          const data = await window.apiJson(segmentRequestUrl('/app/speakers/api/review', request.seg, request.source));
+          const data = await window.apiJson(segmentRequestUrl('/app/speakers/api/review', request.seg, request.source, dayKey));
           const principal = (data.all_entities || []).find(entity => entity.is_principal);
           if (principal) ownerTeachPrincipalId = principal.entity_id;
           const payload = {
             ...data,
-            day,
+            day: dayKey,
             stream_layout: segmentLayout(request.seg),
             stream: request.seg.stream,
             segment_key: request.seg.key,
@@ -2486,10 +2567,12 @@
   async function startOwnerTeachSession(data) {
     ownerTeachStartRequested = true;
     ownerTeachPrincipalId = null;
+    const statusData = data || ownerStatusData || {};
     ownerTeachState = {
       active: true,
       loading: true,
-      statusData: data || ownerStatusData || {},
+      redo: statusData.status === 'confirmed',
+      statusData,
       items: [],
       index: 0,
       failed_count: 0,
@@ -2502,8 +2585,9 @@
     ownerTeachRequestId = requestId;
     renderOwnerTeachSession();
     try {
-      const poolSegments = await ensureOwnerTeachSegments();
-      const results = await loadOwnerTeachReviews(poolSegments);
+      const results = await collectOwnerTeachReviews(
+        () => Boolean(ownerTeachState) && ownerTeachRequestId === requestId
+      );
       if (!ownerTeachState || ownerTeachRequestId !== requestId) return;
       const counts = ownerTeachPoolCounts(results);
       const items = results.flatMap(result => result.items || []);
@@ -2549,7 +2633,11 @@
           speaker: principalId,
         }),
       });
-      const classification = classifyOwnerTeachResult(null, result.owner_bootstrap_outcome);
+      let classification = classifyOwnerTeachResult(null, result.owner_bootstrap_outcome);
+      // A saved voice is already there while redoing it; the statement still counts.
+      if (classification.kind === 'already_built' && ownerTeachState?.redo) {
+        classification = { kind: 'assigned', copyKey: '', advancesMomentum: true };
+      }
       if (classification.kind === 'built') {
         ownerRevealPendingSource = 'manual_tags';
         ownerTeachState = null;
@@ -2578,15 +2666,52 @@
     }
   }
 
+  // Rebuild a saved voice from what the owner taught, under the same guards as
+  // rebuild-owner: a voice that would get worse is refused, never overridden.
+  async function submitOwnerRedo() {
+    if (!ownerTeachState) return;
+    ownerBanner.querySelectorAll('button').forEach(btn => { btn.disabled = true; });
+    try {
+      const result = await window.apiJson('/app/speakers/api/owner/rebuild', { method: 'POST' });
+      if (result.status === 'rebuilt') {
+        ownerRevealShown = false;
+        ownerRevealPendingSource = 'redo';
+        ownerTeachState = null;
+        ownerTeachStartRequested = false;
+        await checkOwnerStatus();
+        return;
+      }
+      const copyKey = result.status === 'unchanged'
+        ? 'SPK_OWNER_REDO_UNCHANGED'
+        : result.status === 'rejected_regression'
+          ? 'SPK_OWNER_REDO_REFUSED'
+          : 'SPK_OWNER_REDO_NOT_ENOUGH';
+      if (!ownerTeachState) return;
+      ownerTeachState.notice = SPK_COPY[copyKey] || '';
+      ownerTeachState.noticeKind = 'redo';
+      renderOwnerTeachSession();
+    } catch (err) {
+      if (ownerTeachState) {
+        ownerTeachState.notice = SPK_COPY.SPK_OWNER_TEACH_FAILED || err.serverMessage || '';
+        ownerTeachState.noticeKind = 'failed';
+      }
+      renderOwnerTeachSession();
+      window.logError(err, { context: 'speakers: owner redo failed' });
+    }
+  }
+
   function renderOwnerReveal(data, source) {
     const facts = ownerRevealFactTexts(data, source, SPK_COPY);
+    const title = source === 'redo' ? SPK_COPY.SPK_OWNER_REDO_DONE : SPK_COPY.SPK_OWNER_REVEAL_TITLE;
     ownerBanner.style.display = 'block';
     ownerBanner.innerHTML = `
       <div class="spk-owner-panel spk-owner-reveal">
-        <div class="spk-owner-title">${escapeHtml(SPK_COPY.SPK_OWNER_REVEAL_TITLE || '')}</div>
+        <div class="spk-owner-title">${escapeHtml(title || '')}</div>
         <div class="spk-owner-facts">
           ${facts.map(fact => `<span class="spk-owner-fact">${escapeHtml(fact)}</span>`).join('')}
         </div>
+        <div class="spk-owner-copy">${escapeHtml((data.relabel?.state === 'waiting' ? SPK_COPY.SPK_OWNER_RELABEL_WAITING : SPK_COPY.SPK_OWNER_RELABEL_STARTED) || '')}</div>
+        <div class="spk-owner-copy">${escapeHtml(SPK_COPY.SPK_OWNER_RELABEL_SCOPE || '')}</div>
         <div class="spk-owner-actions">
           <button class="spk-owner-btn spk-owner-btn-confirm" id="spkOwnerRevealClose" type="button">
             ${escapeHtml(SPK_COPY.SPK_OWNER_REVEAL_CLOSE_LABEL || '')}
@@ -3768,8 +3893,9 @@
   }
 
   function formatDuration(seconds) {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const whole = Math.round(Number(seconds) || 0);
+    const mins = Math.floor(whole / 60);
+    const secs = whole % 60;
     if (mins === 0) return `${secs}s`;
     return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
   }
@@ -3897,6 +4023,13 @@
   background: var(--surface-dark);
   border-color: var(--surface-dark);
   color: var(--ink-on-dark);
+}
+
+/* A destructive confirm, as tokens.css names it. */
+.spk-overview-btn-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--ink-on-danger);
 }
 
 .spk-overview-select {
@@ -4246,33 +4379,88 @@
     return `<span class="spk-cohesion"><span class="spk-dots">${dots}</span><span>${escapeHtml(label)}</span></span>`;
   }
 
+  function copyTemplate(key, values) {
+    return String(COPY[key] || '').replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ''));
+  }
+
+  // A sample is named by when it was said, never by its file coordinates.
+  function sampleWhen(sample) {
+    const format = window.JournalFormat;
+    if (!format?.day || !format?.segmentTimeOfDay) return '';
+    return `${format.day(sample.day)}, ${format.segmentTimeOfDay(sample.segment_key)}`;
+  }
+
+  function relabelHtml(relabel) {
+    if (!relabel || !relabel.state) return '';
+    const undo = relabel.kind === 'undo';
+    const values = {
+      completed: Number(relabel.completed || 0).toLocaleString(),
+      total: Number(relabel.total || 0).toLocaleString(),
+      count: Number(relabel.not_updated || 0).toLocaleString(),
+    };
+    let line = '';
+    if (relabel.state === 'running') {
+      line = copyTemplate(undo ? 'SPK_OWNER_UNDO_RUNNING_TEMPLATE' : 'SPK_OWNER_RELABEL_RUNNING_TEMPLATE', values);
+    } else if (relabel.state === 'waiting') {
+      line = COPY.SPK_OWNER_RELABEL_WAITING || '';
+    } else if (relabel.state === 'incomplete') {
+      line = copyTemplate('SPK_OWNER_RELABEL_INCOMPLETE_TEMPLATE', values);
+    } else if (relabel.state === 'done') {
+      line = undo ? (COPY.SPK_OWNER_UNDO_DONE || '') : (COPY.SPK_OWNER_RELABEL_DONE || '');
+    }
+    if (!line) return '';
+    const scope = undo ? '' : `<p class="spk-overview-muted">${escapeHtml(COPY.SPK_OWNER_RELABEL_SCOPE || '')}</p>`;
+    return `<p class="spk-card-line" role="status">${escapeHtml(line)}</p>${scope}`;
+  }
+
+  // Progress is read again while the update runs, and stops once it is done.
+  let relabelPollTimer = null;
+  function pollRelabel(data) {
+    clearTimeout(relabelPollTimer);
+    if (data?.relabel && (data.relabel.state === 'running' || data.relabel.state === 'waiting')) {
+      relabelPollTimer = setTimeout(loadOwner, 5000);
+    }
+  }
+
+  // The day a declined voice's cooldown ends, on the journal's clock, in the
+  // anchored shape home uses ("Sun Oct 25").
+  function lookAgainDay(instant) {
+    if (!instant || !window.JournalFormat?.dayFull) return '';
+    const key = window.JournalClock?.dayKey
+      ? window.JournalClock.dayKey(instant)
+      : String(instant).slice(0, 10).replaceAll('-', '');
+    return window.JournalFormat.dayFull(key);
+  }
+
+  function ownerNotReadyLine(data) {
+    if (data.reason === 'cooldown') {
+      return copyTemplate('SPK_OWNER_COOLDOWN_TEMPLATE', { date: lookAgainDay(data.next_look_after) });
+    }
+    if (data.low_quality_reason === 'median_duration_too_short' || data.low_quality_reason === 'cluster_too_diffuse') {
+      return COPY.SPK_OWNER_NOT_READY_SHORT_OR_MIXED || '';
+    }
+    return COPY.SPK_OWNER_NOT_READY_NEEDS_MORE || '';
+  }
+
   function ownerNotReady(data) {
     const countValue = Number(data.manual_tags_count || 0);
-    const streamValue = Number(data.streams_represented || 0);
     const count = Number.isFinite(countValue) ? Math.max(0, countValue) : 0;
-    const streams = Number.isFinite(streamValue) ? Math.max(0, streamValue) : 0;
     const threshold = Number(OWNER_MIN);
     const hasProgress = Number.isFinite(threshold) && threshold > 0;
     const progress = hasProgress
       ? Math.min(100, Math.max(0, Math.round((count / threshold) * 100)))
       : null;
     const progressHtml = hasProgress
-      ? `<div class="spk-progress" aria-hidden="true"><div class="spk-progress-fill" style="width:${progress}%"></div></div>`
+      ? `<div class="spk-progress" aria-hidden="true"><div class="spk-progress-fill" style="width:${progress}%"></div></div>
+         <p class="spk-overview-muted">${escapeHtml(copyTemplate('SPK_OWNER_TEACH_PROGRESS_TEMPLATE', { count, minimum: threshold }))}</p>`
       : '';
-    let diagnostic = '';
-    if (data.low_quality_reason) {
-      diagnostic = `<p class="spk-overview-muted">gate: ${escapeHtml(data.low_quality_reason)}; measured ${escapeHtml(String(data.observed_value ?? ''))}; needs ${escapeHtml(String(data.threshold_value ?? ''))}</p>`;
-    } else if (!hasProgress) {
-      diagnostic = `<p class="spk-overview-muted">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_PROGRESS_UNKNOWN)}</p>`;
-    } else {
-      diagnostic = `<p class="spk-overview-muted">${count} ${escapeHtml(COPY.SPK_OVERVIEW_OWNER_PROGRESS_SUFFIX)} · ${streams} ${escapeHtml(COPY.SPK_OVERVIEW_OWNER_STREAMS_LABEL)}</p>`;
-    }
     ownerPanel.innerHTML = `
       <strong>${escapeHtml(COPY.SPK_OVERVIEW_YOUR_VOICE_LEARNING)}</strong>
+      ${relabelHtml(data.relabel)}
+      <p class="spk-card-line">${escapeHtml(ownerNotReadyLine(data))}</p>
       ${progressHtml}
-      ${diagnostic}
       <div class="spk-overview-actions">
-        <a class="spk-overview-btn spk-overview-btn-primary" href="/app/speakers/${TODAY}">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_HELP_LABEL)}</a>
+        <a class="spk-overview-btn spk-overview-btn-primary" href="/app/speakers/${TODAY}#owner-teach">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_HELP_LABEL)}</a>
         ${data.can_build_from_tags === true ? `<button id="spkBuildOwner" class="spk-overview-btn">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_BUILD_FROM_TAGS_LABEL)}</button>` : ''}
       </div>
     `;
@@ -4285,7 +4473,7 @@
     ownerPanel.innerHTML = `
       <strong>${escapeHtml(COPY.SPK_OVERVIEW_OWNER_STATUS_ERROR)}</strong>
       <div class="spk-overview-actions">
-        <a class="spk-overview-btn spk-overview-btn-primary" href="/app/speakers/${TODAY}">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_HELP_LABEL)}</a>
+        <a class="spk-overview-btn spk-overview-btn-primary" href="/app/speakers/${TODAY}#owner-teach">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_HELP_LABEL)}</a>
       </div>
     `;
   }
@@ -4308,7 +4496,6 @@
     function updateActionButtons() {
       const confirmBtn = document.getElementById('spkOwnerConfirm');
       const rejectBtn = document.getElementById('spkOwnerReject');
-      const teachLink = document.getElementById('spkOwnerTeachLink');
       const hasPlayable = playableIndices.size > 0 && !isReviewIncomplete;
       if (confirmBtn) {
         confirmBtn.style.display = hasPlayable ? '' : 'none';
@@ -4318,24 +4505,22 @@
         rejectBtn.style.display = hasPlayable ? '' : 'none';
         rejectBtn.disabled = !hasPlayable;
       }
-      if (teachLink) {
-        teachLink.style.display = hasPlayable ? 'none' : '';
-      }
     }
 
     ownerPanel.innerHTML = `
-      <strong>Is this you?</strong>
-      <p class="spk-overview-muted">${escapeHtml(String(data.cluster_size || 0))} ${escapeHtml(COPY.SPK_OVERVIEW_OWNER_SAMPLES_LABEL)}</p>
+      <strong>${escapeHtml(COPY.SPK_OWNER_CANDIDATE_TITLE || '')}</strong>
+      <p class="spk-overview-muted">${escapeHtml(copyTemplate('SPK_OWNER_CANDIDATE_BODY_TEMPLATE', { count: Number(data.cluster_size || 0).toLocaleString() }))}</p>
+      <p class="spk-overview-muted">${escapeHtml(COPY.SPK_OWNER_CANDIDATE_EFFECT || '')}</p>
       <div class="spk-owner-samples">
         ${samples.map((sample, index) => {
           const hasOffset = Number.isFinite(sample.offset_s);
           const playFromHere = (sample.artifact_eligible && sample.audio_url && hasOffset)
             ? `<button type="button" class="spk-overview-btn spk-owner-btn-play" data-sample-idx="${index}" data-play-offset="${sample.offset_s}">${escapeHtml(COPY.SPK_PLAY_FROM_HERE_LABEL || 'play from here')}</button>`
             : '';
+          const when = sampleWhen(sample);
           return `
           <div class="spk-owner-sample" data-sample-idx="${index}">
-            <div class="spk-card-title">sample ${index + 1}</div>
-            <div class="spk-card-line">${escapeHtml(sample.day)} · ${escapeHtml(sample.stream)} · ${escapeHtml(sample.segment_key)}</div>
+            <div class="spk-card-title">${escapeHtml(when || `sample ${index + 1}`)}</div>
             ${sample.text ? `<div class="spk-card-line">${escapeHtml(sample.text)}</div>` : ''}
             ${sample.artifact_eligible && sample.audio_url
               ? `<div class="spk-owner-sample-player">
@@ -4347,10 +4532,10 @@
         `;}).join('')}
       </div>
       <div class="spk-overview-actions">
-        <button id="spkOwnerConfirm" class="spk-overview-btn spk-overview-btn-primary" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>yes, that's me</button>
-        <button id="spkOwnerReject" class="spk-overview-btn" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>no, try again</button>
-        <button id="spkOwnerSetAside" class="spk-overview-btn">${escapeHtml(COPY.SPK_ACTION_SET_ASIDE || 'set aside')}</button>
-        <a class="spk-overview-btn" id="spkOwnerTeachLink" href="/app/speakers/${TODAY}#owner-teach" ${hasInitialEligible ? 'style="display:none;"' : ''}>${escapeHtml(COPY.SPK_OVERVIEW_OWNER_HELP_LABEL || 'help teach your voice')}</a>
+        <button id="spkOwnerConfirm" class="spk-overview-btn spk-overview-btn-primary" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>${escapeHtml(COPY.SPK_OWNER_CONFIRM_LABEL || '')}</button>
+        <button id="spkOwnerReject" class="spk-overview-btn" ${hasInitialEligible ? 'disabled' : 'style="display:none;"'}>${escapeHtml(COPY.SPK_OWNER_REJECT_LABEL || '')}</button>
+        <button id="spkOwnerSetAside" class="spk-overview-btn">${escapeHtml(COPY.SPK_ACTION_NOT_NOW || '')}</button>
+        <a class="spk-overview-btn" id="spkOwnerTeachLink" href="/app/speakers/${TODAY}#owner-teach">${escapeHtml(COPY.SPK_OWNER_TEACH_INSTEAD_LABEL || '')}</a>
       </div>
     `;
 
@@ -4458,13 +4643,62 @@
       : `<p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_REFRESHED_PREFIX)}: ${refreshed}</p>`;
     ownerPanel.innerHTML = `
       <strong>${escapeHtml(COPY.SPK_OVERVIEW_YOUR_VOICE_CONFIRMED)}</strong>
+      ${relabelHtml(data.relabel)}
       <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_SAMPLES_LABEL)}: ${escapeHtml(ownerSamplesText(meta))}</p>
       <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_STREAMS_LABEL)}: ${escapeHtml(streams.length ? streams.join(' · ') : COPY.SPK_OVERVIEW_OWNER_STREAMS_UNKNOWN)}</p>
       <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_COHESION_LABEL)}: ${cohesion(meta.intra_cosine_p25)}</p>
       <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_BUILT_PREFIX)}: ${built}</p>
       ${refreshedRow}
+      <div class="spk-overview-actions" id="spkOwnerConfirmedActions">
+        <a class="spk-overview-btn" href="/app/speakers/${TODAY}#owner-teach">${escapeHtml(COPY.SPK_OWNER_REDO_LABEL || '')}</a>
+        <button id="spkOwnerUndo" class="spk-overview-btn" type="button">${escapeHtml(COPY.SPK_OWNER_UNDO_LABEL || '')}</button>
+      </div>
     `;
+    document.getElementById('spkOwnerUndo')?.addEventListener('click', ownerUndoAsk);
   }
+
+  // Removing a saved voice is asked once more before it happens.
+  function ownerUndoAsk() {
+    const actions = document.getElementById('spkOwnerConfirmedActions');
+    if (!actions) return;
+    actions.innerHTML = `
+      <div class="spk-owner-undo-confirm" role="group" aria-labelledby="spkOwnerUndoTitle">
+        <p class="spk-card-line" id="spkOwnerUndoTitle"><strong>${escapeHtml(COPY.SPK_OWNER_UNDO_CONFIRM_TITLE || '')}</strong></p>
+        <p class="spk-overview-muted">${escapeHtml(COPY.SPK_OWNER_UNDO_CONFIRM_BODY || '')}</p>
+        <p class="spk-card-line" id="spkOwnerUndoError" role="alert" hidden></p>
+        <div class="spk-overview-actions">
+          <button id="spkOwnerUndoCancel" class="spk-overview-btn" type="button">${escapeHtml(COPY.SPK_OWNER_UNDO_CANCEL_LABEL || '')}</button>
+          <button id="spkOwnerUndoConfirm" class="spk-overview-btn spk-overview-btn-danger" type="button">${escapeHtml(COPY.SPK_OWNER_UNDO_CONFIRM_LABEL || '')}</button>
+        </div>
+      </div>
+    `;
+    const group = actions.querySelector('.spk-owner-undo-confirm');
+    group?.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') loadOwner();
+    });
+    document.getElementById('spkOwnerUndoCancel')?.addEventListener('click', loadOwner);
+    document.getElementById('spkOwnerUndoCancel')?.focus?.();
+    document.getElementById('spkOwnerUndoConfirm')?.addEventListener('click', (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      fetch('/app/speakers/api/owner/undo', { method: 'POST' })
+        .then((response) => {
+          if (!response.ok) throw new Error(`undo answered ${response.status}`);
+          loadOwner();
+          loadQuality();
+        })
+        .catch((err) => {
+          window.logError?.(err, { context: 'speakers: owner undo failed' });
+          button.disabled = false;
+          const error = document.getElementById('spkOwnerUndoError');
+          if (error) {
+            error.textContent = COPY.SPK_OWNER_UNDO_FAILED || '';
+            error.hidden = false;
+          }
+        });
+    });
+  }
+
 
   function qualityCount(value) {
     const count = Number(value || 0);
@@ -4600,12 +4834,13 @@
   }
 
   function loadOwner() {
-    fetch('/app/speakers/api/owner/status')
+    return fetch('/app/speakers/api/owner/status')
       .then((response) => response.json())
       .then((data) => {
         if (data.status === OWNER_STATUS_ROUTING.candidate) ownerCandidate(data);
         else if (data.status === OWNER_STATUS_ROUTING.confirmed) ownerConfirmed(data);
         else ownerNotReady(data);
+        pollRelabel(data);
       })
       .catch(ownerStatusError);
   }
@@ -5188,7 +5423,10 @@
   function init() {
     setupSort();
     loadDayGrid();
-    loadOwner();
+    // Home's "your voice" prompt lands here.
+    loadOwner().then(() => {
+      if (window.location.hash.slice(1) === 'your-voice') focusOverviewYourVoiceSection();
+    });
     loadQuality();
     loadKnown();
     discoveryScanBtn.textContent = DISCOVERY_SCAN_LABEL;

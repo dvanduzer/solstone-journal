@@ -19,13 +19,15 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use solstone_core_convey_http::envelope::error_envelope;
 use solstone_core_convey_http::owner_read::{OwnerReadRole, spawn_blocking_response};
-use solstone_core_location::accuracy::StopWords;
+use solstone_core_location::accuracy::{StopWords, margin_m};
 use solstone_core_location::day::{Device, LocalTime, Point};
+use solstone_core_location::places::PlaceStore;
 use solstone_core_location::{
     AreaName, AreaTier, Boundary, Bounds, DayLocation, Entry, Reconciler, SourceRef, TownPoint,
 };
 
 mod accuracy;
+mod places;
 
 const WORKSPACE: &[u8] = include_bytes!("../assets/workspace.html");
 /// How often the background pass checks every day's marker.
@@ -46,6 +48,15 @@ pub fn router(journal_root: PathBuf, shared_shell: fn() -> Response) -> Router {
         .route("/app/map/api/index", get(index))
         .route("/app/map/api/stats/{month}", get(month_stats))
         .route("/app/map/api/day/{day}", get(day_view))
+        .route("/app/map/places", get(day_shell_static))
+        .route("/app/map/place/{id}", get(place_shell))
+        .route("/app/map/week/{day}", get(week_shell))
+        .route("/app/map/api/places", get(places::list))
+        .route(
+            "/app/map/api/place/{id}",
+            get(places::show).post(places::edit),
+        )
+        .route("/app/map/api/week/{day}", get(places::week))
         .route("/app/map/api/accuracy", get(accuracy::get))
         .route("/app/map/api/accuracy/download", post(accuracy::download))
         .route("/app/map/api/accuracy/remove", post(accuracy::remove))
@@ -81,13 +92,13 @@ pub fn start_maintenance(journal_root: PathBuf) {
     }
 }
 
-fn valid_day(day: &str) -> bool {
+pub(crate) fn valid_day(day: &str) -> bool {
     day.len() == 8
         && day.bytes().all(|byte| byte.is_ascii_digit())
         && chrono::NaiveDate::parse_from_str(day, "%Y%m%d").is_ok()
 }
 
-fn invalid_day() -> Response {
+pub(crate) fn invalid_day() -> Response {
     error_envelope(
         "invalid_day",
         "that day couldn't be used.",
@@ -131,6 +142,30 @@ async fn root(State(state): State<Arc<AppState>>) -> Response {
         }
     })
     .await
+}
+
+async fn day_shell_static(State(state): State<Arc<AppState>>) -> Response {
+    shell(&state)
+}
+
+async fn place_shell(
+    State(state): State<Arc<AppState>>,
+    RoutePath(id): RoutePath<String>,
+) -> Response {
+    if !places::valid_id(&id) {
+        return places::unknown_place();
+    }
+    shell(&state)
+}
+
+async fn week_shell(
+    State(state): State<Arc<AppState>>,
+    RoutePath(day): RoutePath<String>,
+) -> Response {
+    if !valid_day(&day) {
+        return invalid_day();
+    }
+    shell(&state)
 }
 
 async fn day_shell(
@@ -228,22 +263,23 @@ async fn day_view(
             }
         };
         let days = solstone_core_location::list_location_days(&journal_root);
-        let mut payload = day_payload(&view, tier, &days);
+        let store = PlaceStore::read(&journal_root);
+        let mut payload = day_payload(&view, tier, &days, &store);
         payload["accuracy"] = accuracy::status(&journal_root);
         Json(payload).into_response()
     })
     .await
 }
 
-fn time_json(time: &LocalTime) -> Value {
+pub(crate) fn time_json(time: &LocalTime) -> Value {
     json!({"utc": time.utc.to_rfc3339(), "clock": time.clock(), "day": time.day()})
 }
 
-fn round(value: f64) -> f64 {
+pub(crate) fn round(value: f64) -> f64 {
     (value * 1e5).round() / 1e5
 }
 
-fn point_json(point: &Point) -> Value {
+pub(crate) fn point_json(point: &Point) -> Value {
     json!([
         round(point.latitude),
         round(point.longitude),
@@ -251,7 +287,7 @@ fn point_json(point: &Point) -> Value {
     ])
 }
 
-fn sources_json(sources: &[SourceRef]) -> Value {
+pub(crate) fn sources_json(sources: &[SourceRef]) -> Value {
     Value::Array(
         sources
             .iter()
@@ -268,7 +304,7 @@ fn sources_json(sources: &[SourceRef]) -> Value {
     )
 }
 
-fn area_json(area: &AreaName) -> Value {
+pub(crate) fn area_json(area: &AreaName) -> Value {
     json!({
         "label": area.label(),
         "words": area.words(),
@@ -293,7 +329,7 @@ fn outline_json(rings: &[Vec<[f64; 2]>]) -> Value {
     )
 }
 
-fn place_json(place: &StopWords) -> Value {
+pub(crate) fn place_json(place: &StopWords) -> Value {
     json!({
         "margin_m": place.margin_m.round(),
         "at": place.at.as_ref().map(|at| json!({
@@ -333,7 +369,22 @@ fn device_json(view: &DayLocation, index: usize, device: &Device) -> Value {
     })
 }
 
-fn entry_json(entry: &Entry) -> Value {
+/// The place a visit or stay belongs to, as the owner sees it.
+pub(crate) fn place_ref(store: &PlaceStore, point: &Point) -> Value {
+    let Some(margin) = margin_m(point.accuracy_m) else {
+        return Value::Null;
+    };
+    match store.place_for(point.latitude, point.longitude, margin) {
+        Some(place) => json!({
+            "id": place.id,
+            "owner_name": place.owner_name(),
+            "hidden": place.hidden,
+        }),
+        None => Value::Null,
+    }
+}
+
+pub(crate) fn entry_json(entry: &Entry, store: &PlaceStore) -> Value {
     match entry {
         Entry::Readings {
             device,
@@ -352,6 +403,12 @@ fn entry_json(entry: &Entry) -> Value {
             "last": time_json(last),
             "count": points.len(),
             "points": points.iter().map(point_json).collect::<Vec<_>>(),
+            // What the map may draw: nothing near a place the owner hid.
+            "map_points": points
+                .iter()
+                .filter(|point| !store.hides(point.latitude, point.longitude))
+                .map(point_json)
+                .collect::<Vec<_>>(),
             "segments": sources_json(sources),
         }),
         Entry::Visit {
@@ -367,8 +424,32 @@ fn entry_json(entry: &Entry) -> Value {
             "device": device,
             "area": area_json(area),
             "place": place.as_ref().map(place_json),
+            "place_ref": place_ref(store, point),
+            "on_map": !store.hides(point.latitude, point.longitude),
             "arrival": arrival.as_ref().map(time_json),
             "departure": departure.as_ref().map(time_json),
+            "point": point_json(point),
+            "segments": sources_json(sources),
+        }),
+        Entry::Stay {
+            device,
+            area,
+            place,
+            first,
+            last,
+            count,
+            point,
+            sources,
+        } => json!({
+            "kind": "stay",
+            "device": device,
+            "area": area_json(area),
+            "place": place.as_ref().map(place_json),
+            "place_ref": place_ref(store, point),
+            "on_map": !store.hides(point.latitude, point.longitude),
+            "first": time_json(first),
+            "last": time_json(last),
+            "count": count,
             "point": point_json(point),
             "segments": sources_json(sources),
         }),
@@ -390,9 +471,12 @@ fn entry_json(entry: &Entry) -> Value {
 }
 
 /// The smallest box holding every point the day's records draw, or `None`.
-fn record_bounds(view: &DayLocation) -> Option<Bounds> {
+fn record_bounds(view: &DayLocation, store: &PlaceStore) -> Option<Bounds> {
     let mut bounds: Option<Bounds> = None;
     let mut include = |point: &Point| {
+        if store.hides(point.latitude, point.longitude) {
+            return;
+        }
         let reach = point.accuracy_m.unwrap_or(0.0).min(50_000.0) / 111_195.0;
         let cos = point.latitude.to_radians().cos().max(0.05);
         let next = Bounds {
@@ -414,7 +498,7 @@ fn record_bounds(view: &DayLocation) -> Option<Bounds> {
     for entry in &view.entries {
         match entry {
             Entry::Readings { points, .. } => points.iter().for_each(&mut include),
-            Entry::Visit { point, .. } => include(point),
+            Entry::Visit { point, .. } | Entry::Stay { point, .. } => include(point),
             Entry::Unreadable { .. } => {}
         }
     }
@@ -458,8 +542,13 @@ fn town_json(town: &TownPoint) -> Value {
     json!({"name": town.name, "lat": round(town.latitude), "lon": round(town.longitude), "population": town.population})
 }
 
-fn day_payload(view: &DayLocation, tier: &AreaTier, days: &[(String, u64)]) -> Value {
-    let records = record_bounds(view);
+fn day_payload(
+    view: &DayLocation,
+    tier: &AreaTier,
+    days: &[(String, u64)],
+    store: &PlaceStore,
+) -> Value {
+    let records = record_bounds(view, store);
     let map = records.map(|records| {
         let context = context_bounds(records);
         json!({
@@ -487,7 +576,7 @@ fn day_payload(view: &DayLocation, tier: &AreaTier, days: &[(String, u64)]) -> V
             .enumerate()
             .map(|(index, device)| device_json(view, index, device))
             .collect::<Vec<_>>(),
-        "entries": view.entries.iter().map(entry_json).collect::<Vec<_>>(),
+        "entries": view.entries.iter().map(|entry| entry_json(entry, store)).collect::<Vec<_>>(),
         "map": map,
         "journal_has_location": !days.is_empty() || !view.is_empty(),
         "nearby": {"previous": previous, "next": next},

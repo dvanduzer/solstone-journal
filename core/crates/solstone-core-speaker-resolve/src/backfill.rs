@@ -10,12 +10,13 @@ use serde_json::{Map, Value};
 use solstone_core_entity::{
     hold_entity_trust_lock, is_admissible_person, load_all_journal_entities,
 };
-use solstone_core_speaker_id::labels::write_full_labels;
+use solstone_core_speaker_id::labels::{write_full_labels, write_stub_labels};
 use thiserror::Error;
 
 use crate::backfill_operations::{BackfillCheckpointOutcome, BackfillSegmentKey};
 use crate::bootstrap::scan_segments;
-use crate::owner_admission::OWNER_IDENTITY_INVALID_REASON;
+use crate::owner_admission::{OWNER_IDENTITY_INVALID_REASON, OwnerAdmission, admitted_owner_id};
+use crate::owner_centroid::owner_centroid_file;
 use crate::resolve::{ResolveError, ResolveOutcome, resolve};
 use crate::voiceprint_accumulation::{
     AccumulationEmbedding, AccumulationLabel, AccumulationOutcome, AccumulationRequest,
@@ -277,6 +278,16 @@ pub fn execute_backfill_member(
             BackfillCheckpointOutcome::Error,
             Some(OWNER_IDENTITY_INVALID_REASON.to_owned()),
         ),
+        // With no saved owner voice the speaker step names nobody, so a
+        // committed backfill writes what that step writes: the skipped labels,
+        // keeping labels the owner set by hand. A centroid that is present but
+        // unreadable is not "no voice", and those labels are left alone.
+        ResolveOutcome::NoOwnerCentroid if commit && owner_voice_absent(journal_root) => {
+            match write_stub_labels(segment_path, "no_owner_centroid") {
+                Ok(()) => (BackfillCheckpointOutcome::Processed, None),
+                Err(err) => (BackfillCheckpointOutcome::Error, Some(err.to_string())),
+            }
+        }
         ResolveOutcome::NoOwnerCentroid | ResolveOutcome::SegmentMissing => {
             (BackfillCheckpointOutcome::Skipped, None)
         }
@@ -288,6 +299,15 @@ pub fn execute_backfill_member(
             BackfillCheckpointOutcome::Error,
             Some("empty statements without source after embeddings inspection".to_owned()),
         ),
+    }
+}
+
+fn owner_voice_absent(journal_root: &Path) -> bool {
+    match admitted_owner_id(journal_root) {
+        OwnerAdmission::Admitted(id) => {
+            owner_centroid_file(journal_root, &id).is_ok_and(|path| !path.exists())
+        }
+        OwnerAdmission::Invalid => false,
     }
 }
 

@@ -7,22 +7,22 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::{Value, json};
 use solstone_core_convey_http::envelope::error_envelope;
 
 use crate::JournalRoot;
 use crate::speakers_calendar::audio_embedding_sources;
-use crate::speakers_known::intra_cosine_p25;
 use crate::speakers_npz::{load_voiceprints, npz_row_count, owner_centroid_summary};
-use crate::speakers_quality::{
-    ManualOwnerTagStats, awareness_voiceprint, manual_owner_tag_stats, principal_folder,
-    segment_overlap_fraction,
+use crate::speakers_quality::{ManualOwnerTagStats, manual_owner_tag_stats, principal_folder};
+use solstone_core_speaker_resolve::owner_detection::{
+    CANDIDATE_EXPANSION_MAX_EMBEDDINGS, intra_cosine_p25, segment_overlap_fraction,
+};
+use solstone_core_speaker_resolve::owner_voice::{
+    cooldown_days_remaining, next_look_after, relabel_progress, voiceprint_state,
 };
 use solstone_core_speaker_resolve::segment_catalog::{CatalogBuildError, catalog_journal};
 
 const OWNER_BOOTSTRAP_MIN_STATEMENTS: usize = 30;
-const OWNER_REJECTION_COOLDOWN_DAYS: i64 = 14;
 const OWNER_DETECT_CANDIDATE_GUIDANCE: &str =
     "Analyze available voice patterns to look for an owner voice candidate.";
 const OWNER_REJECTION_COOLDOWN_GUIDANCE: &str = "Wait for the owner voice rejection cooldown before running detection again, \
@@ -66,6 +66,14 @@ enum OwnerStatusError {
 }
 
 fn owner_status(root: &Path) -> Result<Value, OwnerStatusError> {
+    let mut status = owner_setup_status(root)?;
+    if let Some(relabel) = relabel_progress(root) {
+        status["relabel"] = relabel;
+    }
+    Ok(status)
+}
+
+fn owner_setup_status(root: &Path) -> Result<Value, OwnerStatusError> {
     let principal_id = match solstone_core_speaker_resolve::owner_admission::admitted_owner_id(root)
     {
         solstone_core_speaker_resolve::owner_admission::OwnerAdmission::Admitted(id) => id,
@@ -75,7 +83,7 @@ fn owner_status(root: &Path) -> Result<Value, OwnerStatusError> {
     };
     let _lock = solstone_core_speaker_resolve::owner_candidate::hold_owner_candidate_lock(root)
         .map_err(|e| OwnerStatusError::Failed(e.to_string()))?;
-    let voiceprint = awareness_voiceprint(root);
+    let voiceprint = voiceprint_state(root);
     let status = match voiceprint.get("status") {
         Some(Value::String(status)) => status.as_str(),
         Some(_) => "invalid",
@@ -169,7 +177,7 @@ fn owner_status(root: &Path) -> Result<Value, OwnerStatusError> {
             })
         }
         "none" | "rejected" => {
-            if let Some(cooldown) = rejection_cooldown(&voiceprint) {
+            if let Some(cooldown) = cooldown_days_remaining(&voiceprint) {
                 return Ok(json!({
                     "status": "none",
                     "manual_tags_count": diagnostics.manual_tags_count,
@@ -180,6 +188,7 @@ fn owner_status(root: &Path) -> Result<Value, OwnerStatusError> {
                     "segments_with_embeddings": diagnostics.segments_with_embeddings,
                     "reason": "cooldown",
                     "days_remaining": cooldown,
+                    "next_look_after": next_look_after(&voiceprint).map(|time| time.to_rfc3339()),
                     "next_step": "wait_for_cooldown",
                     "guidance": OWNER_REJECTION_COOLDOWN_GUIDANCE,
                 }));
@@ -235,7 +244,7 @@ fn confirmed_status(root: &Path, principal_id: &str, manual_stats: &ManualOwnerT
             "cluster_size": centroid.as_ref().map_or(0, |centroid| centroid.cluster_size),
             "cluster_size_capped": centroid.as_ref().is_some_and(|centroid| {
                 centroid.cluster_size
-                    >= crate::speakers_owner_write::CANDIDATE_EXPANSION_MAX_EMBEDDINGS as i32
+                    >= CANDIDATE_EXPANSION_MAX_EMBEDDINGS as i32
             }),
             "streams": streams,
             "created_at": centroid.as_ref().and_then(|centroid| centroid.created_at.clone()),
@@ -312,32 +321,6 @@ fn manual_fallback(diagnostics: &Diagnostics, manual_stats: &ManualOwnerTagStats
         "next_step": guidance.next_step,
         "guidance": guidance.guidance,
     })
-}
-
-fn rejection_cooldown(voiceprint: &std::collections::BTreeMap<String, Value>) -> Option<i64> {
-    let rejected_at = voiceprint.get("rejected_at")?.as_str()?;
-    let days_since = parse_rejection_time(rejected_at)?;
-    (days_since < OWNER_REJECTION_COOLDOWN_DAYS)
-        .then_some(OWNER_REJECTION_COOLDOWN_DAYS - days_since)
-}
-
-fn parse_rejection_time(value: &str) -> Option<i64> {
-    let elapsed = DateTime::parse_from_rfc3339(value)
-        .map(|time| {
-            Utc::now()
-                .signed_duration_since(time.with_timezone(&Utc))
-                .num_days()
-        })
-        .or_else(|_| {
-            NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").map(|time| {
-                Utc::now()
-                    .naive_utc()
-                    .signed_duration_since(time)
-                    .num_days()
-            })
-        })
-        .ok()?;
-    Some(elapsed)
 }
 
 fn owner_embedding_inventory(root: &Path) -> Result<(usize, usize), CatalogBuildError> {

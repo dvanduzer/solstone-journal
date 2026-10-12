@@ -114,11 +114,20 @@ pub fn backfill_status(
     Ok(backfill_operation_status(&rows, operation_id, active)?)
 }
 
-/// Start a new or existing backfill operation.
-pub fn start_backfill(
+/// An operation the ledger has accepted, ready for an attempt.
+struct AcceptedBackfill {
+    root_path: PathBuf,
+    root_identity: ObjectIdentity,
+    ledger_path: PathBuf,
+    operation_id: String,
+}
+
+/// Accept a new operation, or check an existing one's flags. A completed
+/// operation is returned as its final status instead.
+fn accept_backfill(
     journal_root: &Path,
     request: &StartBackfillRequest,
-) -> Result<BackfillOperationStatus, BackfillCoordinatorError> {
+) -> Result<Result<AcceptedBackfill, BackfillOperationStatus>, BackfillCoordinatorError> {
     if request.accumulation && !request.commit {
         return Err(BackfillCoordinatorError::InvalidFlags(
             "accumulation requires commit:true".to_owned(),
@@ -141,73 +150,124 @@ pub fn start_backfill(
         .clone()
         .unwrap_or_else(mint_operation_id);
 
-    {
-        let _ledger_lock = hold_lock(&ledger_path, LockOptions::default())?;
-        truncate_torn_tail_if_present(&ledger_path)?;
-        let rows = load_backfill_operations(&ledger_path)?;
-        let existing_state = fold_backfill_operation(&rows, &operation_id)?;
+    let _ledger_lock = hold_lock(&ledger_path, LockOptions::default())?;
+    truncate_torn_tail_if_present(&ledger_path)?;
+    let rows = load_backfill_operations(&ledger_path)?;
+    let existing_state = fold_backfill_operation(&rows, &operation_id)?;
 
-        if let Some(state) = existing_state {
-            if state.commit != request.commit
-                || state.reattribute != request.reattribute
-                || state.accumulation != request.accumulation
-            {
-                return Err(BackfillCoordinatorError::ImmutableFlagsMismatch {
-                    operation_id: operation_id.clone(),
-                    expected_commit: state.commit,
-                    expected_reattribute: state.reattribute,
-                    expected_accumulation: state.accumulation,
-                    got_commit: request.commit,
-                    got_reattribute: request.reattribute,
-                    got_accumulation: request.accumulation,
-                });
-            }
-            if state.completed
-                && state.pending_segments.is_empty()
-                && state.error_details.is_empty()
-            {
-                return Ok(backfill_operation_status(&rows, &operation_id, false)?
-                    .expect("folded state exists"));
-            }
-        } else {
-            let event = BackfillOperationEvent {
-                schema_version: BACKFILL_OPERATION_SCHEMA_VERSION,
-                event_id: format!("{operation_id}:accepted"),
+    if let Some(state) = existing_state {
+        if state.commit != request.commit
+            || state.reattribute != request.reattribute
+            || state.accumulation != request.accumulation
+        {
+            return Err(BackfillCoordinatorError::ImmutableFlagsMismatch {
                 operation_id: operation_id.clone(),
-                ts: Utc::now().to_rfc3339(),
-                payload: BackfillOperationPayload::Accepted {
-                    commit: request.commit,
-                    reattribute: request.reattribute,
-                    accumulation: request.accumulation,
-                },
-            };
-            crate::backfill_operations::append_backfill_event_locked(&ledger_path, &event)?;
+                expected_commit: state.commit,
+                expected_reattribute: state.reattribute,
+                expected_accumulation: state.accumulation,
+                got_commit: request.commit,
+                got_reattribute: request.reattribute,
+                got_accumulation: request.accumulation,
+            });
         }
+        if state.completed && state.pending_segments.is_empty() && state.error_details.is_empty() {
+            return Ok(Err(backfill_operation_status(&rows, &operation_id, false)?
+                .expect("folded state exists")));
+        }
+    } else {
+        let event = BackfillOperationEvent {
+            schema_version: BACKFILL_OPERATION_SCHEMA_VERSION,
+            event_id: format!("{operation_id}:accepted"),
+            operation_id: operation_id.clone(),
+            ts: Utc::now().to_rfc3339(),
+            payload: BackfillOperationPayload::Accepted {
+                commit: request.commit,
+                reattribute: request.reattribute,
+                accumulation: request.accumulation,
+            },
+        };
+        crate::backfill_operations::append_backfill_event_locked(&ledger_path, &event)?;
     }
+    Ok(Ok(AcceptedBackfill {
+        root_path,
+        root_identity,
+        ledger_path,
+        operation_id,
+    }))
+}
 
-    // Register active token and spawn if not currently active
-    let (token_id, needs_spawn) = {
-        let mut registry = ACTIVE_TOKENS.lock().unwrap();
-        let key = (root_identity, operation_id.clone());
-        if let Some(token) = registry.get(&key) {
-            (*token, false)
-        } else {
-            let token = NEXT_TOKEN.fetch_add(1, Ordering::SeqCst);
-            registry.insert(key, token);
-            (token, true)
-        }
+/// Register an attempt token for an operation, or return `None` when an
+/// attempt is already active in this process.
+fn claim_token(identity: ObjectIdentity, operation_id: &str) -> Option<u64> {
+    let mut registry = ACTIVE_TOKENS.lock().unwrap();
+    let key = (identity, operation_id.to_owned());
+    if registry.contains_key(&key) {
+        return None;
+    }
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::SeqCst);
+    registry.insert(key, token);
+    Some(token)
+}
+
+/// Start a new or existing backfill operation.
+pub fn start_backfill(
+    journal_root: &Path,
+    request: &StartBackfillRequest,
+) -> Result<BackfillOperationStatus, BackfillCoordinatorError> {
+    let accepted = match accept_backfill(journal_root, request)? {
+        Ok(accepted) => accepted,
+        Err(done) => return Ok(done),
     };
 
-    if needs_spawn {
-        let op_id = operation_id.clone();
+    if let Some(token_id) = claim_token(accepted.root_identity, &accepted.operation_id) {
+        let root_path = accepted.root_path.clone();
+        let identity = accepted.root_identity;
+        let op_id = accepted.operation_id.clone();
         let now_ms = request.now_ms;
         std::thread::spawn(move || {
-            run_backfill_attempt(root_path, root_identity, op_id, token_id, now_ms);
+            run_backfill_attempt(root_path, identity, op_id, token_id, now_ms);
         });
     }
 
-    let rows_now = load_backfill_operations(&ledger_path)?;
-    Ok(backfill_operation_status(&rows_now, &operation_id, true)?.expect("accepted state exists"))
+    let rows_now = load_backfill_operations(&accepted.ledger_path)?;
+    Ok(
+        backfill_operation_status(&rows_now, &accepted.operation_id, true)?
+            .expect("accepted state exists"),
+    )
+}
+
+/// Start or continue an operation and run its attempt on the calling thread.
+///
+/// For a caller whose process ends when it returns, where a background
+/// attempt would stop with it. Returns at once when the operation is already
+/// complete or running in this process; an attempt running in another process
+/// holds the execution lock, and this one then leaves it alone.
+pub fn run_backfill_blocking(
+    journal_root: &Path,
+    request: &StartBackfillRequest,
+) -> Result<BackfillOperationStatus, BackfillCoordinatorError> {
+    let accepted = match accept_backfill(journal_root, request)? {
+        Ok(accepted) => accepted,
+        Err(done) => return Ok(done),
+    };
+    if let Some(token_id) = claim_token(accepted.root_identity, &accepted.operation_id) {
+        run_backfill_attempt(
+            accepted.root_path.clone(),
+            accepted.root_identity,
+            accepted.operation_id.clone(),
+            token_id,
+            request.now_ms,
+        );
+    }
+    let rows_now = load_backfill_operations(&accepted.ledger_path)?;
+    let active = ACTIVE_TOKENS
+        .lock()
+        .unwrap()
+        .contains_key(&(accepted.root_identity, accepted.operation_id.clone()));
+    Ok(
+        backfill_operation_status(&rows_now, &accepted.operation_id, active)?
+            .expect("accepted state exists"),
+    )
 }
 
 /// Resume an interrupted or failed backfill operation.
@@ -241,19 +301,7 @@ pub fn resume_backfill(
         }
     }
 
-    let (token_id, needs_spawn) = {
-        let mut registry = ACTIVE_TOKENS.lock().unwrap();
-        let key = (root_identity, operation_id.to_owned());
-        if let Some(token) = registry.get(&key) {
-            (*token, false)
-        } else {
-            let token = NEXT_TOKEN.fetch_add(1, Ordering::SeqCst);
-            registry.insert(key, token);
-            (token, true)
-        }
-    };
-
-    if needs_spawn {
+    if let Some(token_id) = claim_token(root_identity, operation_id) {
         let op_id = operation_id.to_owned();
         std::thread::spawn(move || {
             run_backfill_attempt(root_path, root_identity, op_id, token_id, now_ms);

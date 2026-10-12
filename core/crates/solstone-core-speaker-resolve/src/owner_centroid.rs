@@ -407,6 +407,36 @@ pub fn rebuild_owner_centroid(
     })
 }
 
+/// Remove the owner's saved voice, returning whether a file was there.
+pub fn remove_owner_centroid(
+    journal_root: &Path,
+    principal_entity_id: &str,
+) -> Result<bool, OwnerCentroidWriteError> {
+    require_admitted_owner_target(journal_root, principal_entity_id)
+        .map_err(write_admission_failure)?;
+    let _trust = solstone_core_entity::hold_entity_trust_lock(journal_root).map_err(|error| {
+        OwnerCentroidWriteError::EntityPath(solstone_core_entity::EntityLifecycleError::TrustLock(
+            error,
+        ))
+    })?;
+    require_admitted_owner_target(journal_root, principal_entity_id)
+        .map_err(write_admission_failure)?;
+    let path = owner_centroid_file(journal_root, principal_entity_id)?;
+    let _lock = hold_lock(&path, LockOptions::default())?;
+    let relative = path.strip_prefix(journal_root).map_err(|_| {
+        OwnerCentroidWriteError::Invalid(format!(
+            "owner centroid {} is outside the journal",
+            path.display()
+        ))
+    })?;
+    let removed = solstone_core_journal_io::remove_file(journal_root, &relative.to_string_lossy())
+        .map_err(|error| OwnerCentroidWriteError::Invalid(error.to_string()))?;
+    Ok(matches!(
+        removed,
+        solstone_core_journal_io::Removed::Unlinked
+    ))
+}
+
 /// The owner centroid's path for the entity `principal_entity_id`, in the
 /// folder the entity store resolves that id to, present or not.
 pub fn owner_centroid_file(

@@ -224,7 +224,7 @@ pub async fn status(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
             .filter(|(_, entity)| is_admissible_speaker_entity(entity))
             .map(|(entity_id, _)| entity_id.clone())
             .collect::<BTreeSet<_>>();
-        let voiceprint = awareness_voiceprint(&root.0);
+        let voiceprint = solstone_core_speaker_resolve::owner_voice::voiceprint_state(&root.0);
         let segments = match catalog_journal(&root.0) {
             Ok(segments) => segments,
             Err(error) => {
@@ -370,13 +370,6 @@ fn journal_entities(root: &Path) -> BTreeMap<String, Value> {
         .into_iter()
         .map(|(_, entity)| (entity.id, entity.value))
         .collect()
-}
-
-fn awareness_voiceprint(root: &Path) -> BTreeMap<String, Value> {
-    read_json(&root.join("awareness/current.json"))
-        .and_then(|value| value.get("voiceprint").and_then(Value::as_object).cloned())
-        .map(|value| value.into_iter().collect())
-        .unwrap_or_default()
 }
 
 fn owner_centroid_exists(root: &Path, owner_id: &str) -> bool {

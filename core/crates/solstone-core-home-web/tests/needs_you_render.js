@@ -12,7 +12,7 @@ if (!manifestDir) throw new Error('manifest directory required');
 let source = fs.readFileSync(path.join(manifestDir, 'assets/home.js'), 'utf8');
 source = source.replace(
   '  window.toggleBriefingCard = toggleBriefingCard;\n',
-  `  window.__needsYou = { needsYouItemHtml, dispatchNeedsYouItem, renderNeedsYouHtml };
+  `  window.__needsYou = { needsYouItemHtml, dispatchNeedsYouItem, renderNeedsYouHtml, welcomeNeedsYouHtml };
   window.toggleBriefingCard = toggleBriefingCard;\n`,
 );
 
@@ -31,7 +31,7 @@ window.window = window;
 document.defaultView = window;
 
 vm.runInNewContext(source, { window, document, console }, { filename: 'home.js' });
-const { needsYouItemHtml, dispatchNeedsYouItem, renderNeedsYouHtml } = window.__needsYou;
+const { needsYouItemHtml, dispatchNeedsYouItem, renderNeedsYouHtml, welcomeNeedsYouHtml } = window.__needsYou;
 assert(needsYouItemHtml, 'needsYouItemHtml exported');
 assert(dispatchNeedsYouItem, 'dispatchNeedsYouItem exported');
 assert(renderNeedsYouHtml, 'renderNeedsYouHtml exported');
@@ -96,5 +96,22 @@ const emptyWithAttentionElsewhere = renderNeedsYouHtml({
   health_glance: { verdict: 'attention', headline: '1 thing needs your attention' },
 });
 assert(emptyWithAttentionElsewhere.includes('nothing else needs your attention right now.'), emptyWithAttentionElsewhere);
+
+// The welcome window carries no empty needs card, but an owed item such as the
+// voice prompt shows there from the first day.
+assert.strictEqual(welcomeNeedsYouHtml({ needs_you_items: [] }), '');
+const welcomeVoice = welcomeNeedsYouHtml({
+  needs_you_items: [{
+    text: 'set up your voice',
+    kind: 'route',
+    payload: { href: '/app/speakers/#your-voice' },
+    disabled: false,
+    reason: '',
+    source_id: 'owner_voice:not_established',
+  }],
+  needs_summary: '1 item needs attention',
+});
+assert(welcomeVoice.includes('data-home-surface="needs"'), welcomeVoice);
+assert(welcomeVoice.includes('/app/speakers/#your-voice'), welcomeVoice);
 
 console.log('needs-you render contract passed');

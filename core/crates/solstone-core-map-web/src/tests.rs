@@ -206,3 +206,110 @@ async fn the_accuracy_choice_is_offered_and_removal_is_safe_when_nothing_is_inst
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+async fn post(root: &Path, uri: &str, body: &str) -> (StatusCode, Value) {
+    let response = app(root.to_path_buf())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Visits a few metres apart on two dates: one place.
+fn journal_with_a_place() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    for (day, iso) in [("20261001", "2026-10-01"), ("20261002", "2026-10-02")] {
+        write(
+            root.path(),
+            day,
+            "phone_location",
+            "150000_300",
+            &format!(
+                "{IPHONE_HEADER}\n{{\"arrival\":\"{iso}T21:02:00Z\",\"departure\":\"{iso}T22:40:00Z\",\"h_acc\":20,\"lat\":39.7527,\"lon\":-105.0001,\"schema\":\"solstone.location.visit/1\"}}\n"
+            ),
+        );
+    }
+    let mut reconciler = Reconciler::default();
+    solstone_core_location::reconcile_journal(root.path(), &mut reconciler).unwrap();
+    root
+}
+
+#[tokio::test]
+async fn a_place_is_listed_described_renamed_and_hidden() {
+    let journal = journal_with_a_place();
+    let (status, _, list) = get(journal.path(), "/app/map/api/places").await;
+    assert_eq!(status, StatusCode::OK);
+    let places = list["places"].as_array().unwrap();
+    assert_eq!(places.len(), 1);
+    assert_eq!(places[0]["dates"], 2);
+    let id = places[0]["id"].as_str().unwrap().to_owned();
+    let uri = format!("/app/map/api/place/{id}");
+
+    let (status, _) = post(journal.path(), &uri, r#"{"alias":"garage"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post(
+        journal.path(),
+        "/app/map/api/place/ffffffffffff",
+        r#"{"hidden":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, edited) = post(
+        journal.path(),
+        &uri,
+        r#"{"name":"  the climbing gym ","alias":"work","hidden":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(edited["label"], "the climbing gym");
+    assert_eq!(edited["alias"], "work");
+    assert_eq!(edited["hidden"], true);
+    assert_eq!(edited["stays"].as_array().unwrap().len(), 2);
+
+    let (_, _, day) = get(journal.path(), "/app/map/api/day/20261002").await;
+    let visit = &day["entries"][0];
+    assert_eq!(visit["place_ref"]["owner_name"], "the climbing gym");
+    assert_eq!(visit["place_ref"]["hidden"], true);
+    assert_eq!(
+        visit["on_map"], false,
+        "a hidden place's visit is off the map"
+    );
+    assert_eq!(
+        day["map"],
+        Value::Null,
+        "with nothing left to draw, there is no map"
+    );
+
+    let (_, cleared) = post(journal.path(), &uri, r#"{"name":null,"alias":null}"#).await;
+    assert_eq!(cleared["owner_name"], Value::Null);
+    assert_eq!(cleared["hidden"], true, "a field left out is unchanged");
+}
+
+#[tokio::test]
+async fn a_week_runs_monday_to_sunday_with_its_visits() {
+    let journal = journal_with_a_place();
+    let (status, _, week) = get(journal.path(), "/app/map/api/week/20261002").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(week["start"], "20260928");
+    assert_eq!(week["previous"], "20260921");
+    let days = week["days"].as_array().unwrap();
+    assert_eq!(days.len(), 7);
+    assert_eq!(days[3]["day"], "20261001");
+    assert_eq!(days[3]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(days[0]["items"].as_array().unwrap().len(), 0);
+    let (status, _, _) = get(journal.path(), "/app/map/api/week/2026100").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

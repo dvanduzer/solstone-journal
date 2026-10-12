@@ -31,7 +31,8 @@ use solstone_core_journal_io::{
 use crate::accuracy::{Packs, StopWords};
 use crate::area::{AreaName, AreaTier};
 use crate::asset::AREA_TIER_SHA256;
-use crate::day::{DayLocation, DeviceDirectory, Entry, LOCATION_FILE, LocalTime, read_day};
+use crate::day::{DayLocation, DeviceDirectory, Entry, LOCATION_FILE, LocalTime, Point, read_day};
+use crate::places::{PlaceStore, StayRecord};
 
 /// The day's search document, under `chronicle/<day>/`.
 pub const DAY_DOCUMENT: &str = "location.md";
@@ -40,10 +41,10 @@ pub const BUILD_RECORD: &str = "location.json";
 const RECORD_VERSION: u32 = 1;
 /// Bumped whenever [`render_day_document`] changes what it writes, so every
 /// day's document is rewritten once by the next pass.
-const DOCUMENT_VERSION: u32 = 2;
+const DOCUMENT_VERSION: u32 = 3;
 
 /// What a day's document was built from, and what it counted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildRecord {
     pub version: u32,
     /// The day's stream marker when the build read its segments.
@@ -58,6 +59,63 @@ pub struct BuildRecord {
     pub readings: u64,
     pub visits: u64,
     pub devices: u64,
+    /// The day's stays and visits that are precise enough to make a place,
+    /// for the places pass. This file is never indexed or shown to agents.
+    #[serde(default)]
+    pub stays: Vec<StayRecord>,
+    /// The owner's place names the document was written with.
+    #[serde(default)]
+    pub names: String,
+}
+
+/// The stays and visits a day contributes to places.
+pub fn stay_records(view: &DayLocation) -> Vec<StayRecord> {
+    let mut records = Vec::new();
+    for entry in &view.entries {
+        let (device, start, end, point, kind) = match entry {
+            Entry::Visit {
+                device,
+                arrival,
+                departure,
+                point,
+                ..
+            } => (
+                *device,
+                arrival.map(|time| time.utc.timestamp()),
+                departure.map(|time| time.utc.timestamp()),
+                point,
+                "reported",
+            ),
+            Entry::Stay {
+                device,
+                first,
+                last,
+                point,
+                ..
+            } => (
+                *device,
+                Some(first.utc.timestamp()),
+                Some(last.utc.timestamp()),
+                point,
+                "worked",
+            ),
+            _ => continue,
+        };
+        let Some(margin_m) = crate::accuracy::margin_m(point.accuracy_m) else {
+            continue;
+        };
+        records.push(StayRecord {
+            day: view.day.clone(),
+            start,
+            end,
+            latitude: point.latitude,
+            longitude: point.longitude,
+            margin_m,
+            device: view.devices[device].key.clone(),
+            kind: kind.to_owned(),
+        });
+    }
+    records
 }
 
 /// A rebuild could not finish.
@@ -232,8 +290,29 @@ fn moment(time: &LocalTime, day: &str) -> String {
     }
 }
 
-/// The day's search text. It names areas and times, never a coordinate.
-pub fn render_day_document(day: &DayLocation) -> String {
+/// What the owner calls the place a stay or visit belongs to, if anything.
+fn owner_words(store: &PlaceStore, point: &Point) -> Option<String> {
+    let margin = crate::accuracy::margin_m(point.accuracy_m)?;
+    let place = store.place_for(point.latitude, point.longitude, margin)?;
+    place
+        .owner_name()
+        .map(|name| format!("at {name} (a place you named)"))
+}
+
+fn naming(area: &AreaName, place: Option<&StopWords>, owner: Option<String>) -> Option<String> {
+    let mut name = long_name(area)?;
+    if let Some(place) = place {
+        name = format!("{}; {name}", place_words(place));
+    }
+    if let Some(owner) = owner {
+        name = format!("{owner}; {name}");
+    }
+    Some(name)
+}
+
+/// The day's search text. It names areas, places and times, never a
+/// coordinate. Names the owner gave a place are used where they apply.
+pub fn render_day_document(day: &DayLocation, store: &PlaceStore) -> String {
     let heading = NaiveDate::parse_from_str(&day.day, "%Y%m%d")
         .map(|date| date.format("%A, %B %-d, %Y").to_string())
         .unwrap_or_else(|_| day.day.clone());
@@ -280,14 +359,12 @@ pub fn render_day_document(day: &DayLocation) -> String {
                 place,
                 arrival,
                 departure,
+                point,
                 ..
             } => {
-                let Some(mut name) = long_name(area) else {
+                let Some(name) = naming(area, place.as_ref(), owner_words(store, point)) else {
                     continue;
                 };
-                if let Some(place) = place {
-                    name = format!("{}; {name}", place_words(place));
-                }
                 let arrived = arrival.as_ref().map_or_else(
                     || "arrival not known".to_owned(),
                     |time| format!("arrived {}", moment(time, &day.day)),
@@ -299,6 +376,27 @@ pub fn render_day_document(day: &DayLocation) -> String {
                 text.push_str(&format!(
                     "- a visit {} reported {name}: {arrived}, {left}.\n",
                     day.device_phrase(*device)
+                ));
+                lines += 1;
+            }
+            Entry::Stay {
+                device,
+                area,
+                place,
+                first,
+                last,
+                count,
+                point,
+                ..
+            } => {
+                let Some(name) = naming(area, place.as_ref(), owner_words(store, point)) else {
+                    continue;
+                };
+                text.push_str(&format!(
+                    "- a stay your journal worked out from {count} readings from {} {name}: first reading {}, last {}.\n",
+                    day.device_phrase(*device),
+                    moment(first, &day.day),
+                    moment(last, &day.day)
                 ));
                 lines += 1;
             }
@@ -356,6 +454,7 @@ pub fn rebuild_day(
     day: &str,
     tier: &AreaTier,
     packs: Option<&Packs>,
+    store: &PlaceStore,
     directory: &dyn DeviceDirectory,
     owner: Tz,
 ) -> Result<Rebuilt, ProjectionError> {
@@ -377,7 +476,7 @@ pub fn rebuild_day(
             Rebuilt::Nothing
         });
     }
-    let text = render_day_document(&view);
+    let text = render_day_document(&view, store);
     let built = BuildRecord {
         version: RECORD_VERSION,
         source,
@@ -389,6 +488,8 @@ pub fn rebuild_day(
         readings: view.readings() as u64,
         visits: view.visits() as u64,
         devices: view.devices.len() as u64,
+        stays: stay_records(&view),
+        names: store.names_fingerprint(),
     };
     let unchanged = fs::read(&document).is_ok_and(|existing| existing == text.as_bytes());
     if !unchanged {
@@ -428,6 +529,10 @@ pub struct Reconciler {
     seen: HashMap<String, String>,
     /// The packs the seen days were checked against.
     packs: String,
+    /// The owner's place names the seen days were checked against.
+    names: String,
+    /// Whether places have been worked out since this process started.
+    places_current: bool,
 }
 
 impl Reconciler {
@@ -445,10 +550,14 @@ impl Reconciler {
         let identity = packs
             .map(|packs| packs.identity().to_owned())
             .unwrap_or_default();
-        if identity != self.packs {
-            // Downloading or removing the packs renames days once.
+        let store = PlaceStore::read(journal);
+        let names = store.names_fingerprint();
+        if identity != self.packs || names != self.names {
+            // Downloading or removing the packs, or renaming a place,
+            // rewrites each day once.
             self.seen.clear();
             self.packs.clone_from(&identity);
+            self.names.clone_from(&names);
         }
         let mut days: Vec<String> = day_dirs(journal)
             .map(|days| days.into_keys().collect())
@@ -465,6 +574,7 @@ impl Reconciler {
                 record.source == token
                     && record.area_tier == AREA_TIER_SHA256
                     && record.packs == identity
+                    && record.names == names
                     && record.document == DOCUMENT_VERSION
             });
             if current && document_path(journal, &day).is_file() {
@@ -477,7 +587,7 @@ impl Reconciler {
                 self.seen.insert(day, token);
                 continue;
             }
-            match rebuild_day(journal, &day, tier, packs, directory, owner) {
+            match rebuild_day(journal, &day, tier, packs, &store, directory, owner) {
                 Ok(Rebuilt::Written) => report.written += 1,
                 Ok(Rebuilt::Removed) => report.removed += 1,
                 Ok(Rebuilt::Unchanged | Rebuilt::Nothing) => {}
@@ -488,8 +598,37 @@ impl Reconciler {
             }
             self.seen.insert(day, token);
         }
+        if report.written + report.removed > 0 || !self.places_current {
+            match recompute_places(journal) {
+                Ok(()) => self.places_current = true,
+                Err(error) => report.failures.push(format!("places: {error}")),
+            }
+        }
         report
     }
+}
+
+/// Every stay and visit the days' build records hold, in day order.
+pub fn all_stays(journal: &Path) -> Vec<StayRecord> {
+    let mut stays = Vec::new();
+    let mut days: Vec<String> = day_dirs(journal)
+        .map(|days| days.into_keys().collect())
+        .unwrap_or_default();
+    days.sort_unstable();
+    for day in days {
+        if let Some(record) = read_build_record(journal, &day) {
+            stays.extend(record.stays);
+        }
+    }
+    stays
+}
+
+/// Work out the places again from every day's recorded stays.
+pub fn recompute_places(journal: &Path) -> std::io::Result<()> {
+    let stays = all_stays(journal);
+    PlaceStore::update(journal, |store| {
+        crate::places::recompute(store, &stays);
+    })
 }
 
 #[cfg(test)]
@@ -530,6 +669,7 @@ mod tests {
             DAY,
             tier(),
             None,
+            &PlaceStore::default(),
             &directory(),
             chrono_tz::America::Denver,
         )
@@ -589,6 +729,7 @@ mod tests {
             DAY,
             tier(),
             Some(&packs),
+            &PlaceStore::default(),
             &directory(),
             chrono_tz::America::Denver,
         )
@@ -615,6 +756,65 @@ mod tests {
                 .packs
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn visits_on_two_dates_make_a_place_and_its_owner_name_reaches_search() {
+        let root = tempfile::tempdir().unwrap();
+        let header = iphone_header("full", "light");
+        for (day, iso) in [("20261001", "2026-10-01"), ("20261002", "2026-10-02")] {
+            write(
+                root.path(),
+                day,
+                "phone_mobile-segment",
+                "150000_300",
+                &format!(
+                    "{header}\n{{\"arrival\":\"{iso}T21:02:00Z\",\"departure\":\"{iso}T22:40:00Z\",\"h_acc\":20,\"lat\":39.7527,\"lon\":-105.0001,\"schema\":\"solstone.location.visit/1\"}}\n"
+                ),
+            );
+        }
+        let mut reconciler = Reconciler::default();
+        let mut pass = || {
+            reconciler.reconcile(
+                root.path(),
+                tier(),
+                None,
+                &directory(),
+                chrono_tz::America::Denver,
+            )
+        };
+        let first = pass();
+        assert_eq!((first.written, first.failures.len()), (2, 0), "{first:?}");
+        let store = PlaceStore::read(root.path());
+        assert_eq!(store.places.len(), 1);
+        PlaceStore::update(root.path(), |store| {
+            store.places[0].name = Some("the climbing gym".to_owned());
+        })
+        .unwrap();
+        assert_eq!(
+            pass().written,
+            2,
+            "a new name rewrites the days that use it"
+        );
+        let text = fs::read_to_string(document_path(root.path(), "20261002")).unwrap();
+        assert!(
+            text.contains("- a visit your iphone reported at the climbing gym (a place you named); near Denver"),
+            "{text}"
+        );
+        assert_eq!(pass().written, 0);
+        // Deleting both days' segments takes the place, and its name, away.
+        for day in ["20261001", "20261002"] {
+            fs::remove_dir_all(
+                root.path()
+                    .join("chronicle")
+                    .join(day)
+                    .join("phone_mobile-segment"),
+            )
+            .unwrap();
+            solstone_core_journal_io::bump_stream_marker(root.path(), day).unwrap();
+        }
+        assert_eq!(pass().removed, 2);
+        assert!(PlaceStore::read(root.path()).places.is_empty());
     }
 
     #[test]

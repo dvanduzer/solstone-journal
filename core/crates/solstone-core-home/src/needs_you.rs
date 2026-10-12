@@ -2,18 +2,26 @@
 // Copyright (c) 2026 sol pbc
 
 use serde_json::{Value, json};
-use solstone_core_speaker_resolve::OWNER_IDENTITY_INVALID_REASON;
-use solstone_core_speaker_resolve::owner_contamination_screen::{
-    ContaminationScreen, classify_tier,
-};
 use solstone_core_speaker_resolve::owner_provisional::{OwnerTierOutcome, OwnerTierReason};
+use solstone_core_speaker_resolve::owner_voice::{NotYetReason, OwnerVoiceSetup};
 
 pub const SOURCE_ID_OWNER_VOICE_NOT_ESTABLISHED: &str = "owner_voice:not_established";
+pub const SOURCE_ID_OWNER_VOICE_CANDIDATE_READY: &str = "owner_voice:candidate_ready";
 pub const SOURCE_ID_OWNER_VOICE_DAMAGED: &str = "owner_voice:damaged";
 
-const COPY_OWNER_VOICE_NOT_ESTABLISHED: &str = "your voice isn't established yet.";
-const COPY_OWNER_VOICE_DAMAGED: &str = "your owner voiceprint reference is damaged.";
+const COPY_OWNER_VOICE_CANDIDATE_READY: &str =
+    "your journal may have found your voice. play a few samples and say whether it's you.";
+const COPY_OWNER_VOICE_NEEDS_MORE_AUDIO: &str =
+    "your voice isn't set up yet. your journal looks for it each day, or you can teach it now.";
+const COPY_OWNER_VOICE_TOO_SHORT_OR_MIXED: &str = "your voice isn't set up yet. so far your statements are mostly short or mixed with other voices, so teaching it helps most.";
+const COPY_OWNER_VOICE_DECLINED_TEMPLATE: &str =
+    "your voice isn't set up yet. your journal looks again after {date}, or you can teach it now.";
+const COPY_OWNER_VOICE_DAMAGED: &str =
+    "your saved voice can't be read. remove it on the speakers page, then teach it again.";
+const COPY_OWNER_VOICE_UNUSABLE: &str =
+    "your voice can't be set up from what's there. teach it on the speakers page.";
 const SPEAKERS_APP_HREF: &str = "/app/speakers/";
+const SPEAKERS_YOUR_VOICE_HREF: &str = "/app/speakers/#your-voice";
 
 pub fn classify_needs_you(attention: &Value, pulse_needs: &[Value]) -> Vec<Value> {
     let mut items = Vec::new();
@@ -241,31 +249,60 @@ fn classify_owner_tier_reason(reason: OwnerTierReason) -> OwnerVoiceClass {
     }
 }
 
-/// Classify a resolved owner tier into an actionable needs-you item, if required.
-pub fn classify_owner_voice_needs(outcome: OwnerTierOutcome) -> Option<Value> {
-    match classify_tier(outcome) {
-        Ok(_) => None,
-        Err(ContaminationScreen::Indeterminate { reason }) => {
-            if reason == OWNER_IDENTITY_INVALID_REASON {
-                return None;
-            }
-            let tier_reason = OwnerTierReason::ALL
-                .into_iter()
-                .find(|candidate| candidate.wire_str() == reason)?;
-            match classify_owner_tier_reason(tier_reason) {
-                OwnerVoiceClass::NotEstablished => Some(route_item(
-                    COPY_OWNER_VOICE_NOT_ESTABLISHED,
-                    SPEAKERS_APP_HREF,
-                    SOURCE_ID_OWNER_VOICE_NOT_ESTABLISHED,
-                )),
-                OwnerVoiceClass::Damaged => Some(route_item(
-                    COPY_OWNER_VOICE_DAMAGED,
-                    SPEAKERS_APP_HREF,
-                    SOURCE_ID_OWNER_VOICE_DAMAGED,
-                )),
-            }
+/// The owner-voice needs-you item, if one is owed.
+///
+/// A confirmed voice owes nothing, and a damaged one says so. Without a
+/// confirmed voice the item stays until one is confirmed, whatever the
+/// manual-tag count: it says a candidate is ready when one is, and otherwise
+/// what is missing. `next_look_after` renders the date a declined voice's
+/// cooldown ends.
+pub fn classify_owner_voice_needs(
+    outcome: OwnerTierOutcome,
+    setup: impl FnOnce() -> OwnerVoiceSetup,
+    next_look_after: impl Fn(&chrono::DateTime<chrono::Utc>) -> String,
+) -> Option<Value> {
+    match outcome {
+        OwnerTierOutcome::Confirmed(_) | OwnerTierOutcome::IdentityInvalid => None,
+        OwnerTierOutcome::None(reason)
+            if classify_owner_tier_reason(reason) == OwnerVoiceClass::Damaged =>
+        {
+            // Only the confirmed-tier reasons have a saved voice to remove.
+            let text = match reason {
+                OwnerTierReason::ConfirmedUnreadable
+                | OwnerTierReason::ConfirmedIncomplete
+                | OwnerTierReason::ConfirmedZeroNorm => COPY_OWNER_VOICE_DAMAGED,
+                _ => COPY_OWNER_VOICE_UNUSABLE,
+            };
+            Some(route_item(
+                text,
+                SPEAKERS_APP_HREF,
+                SOURCE_ID_OWNER_VOICE_DAMAGED,
+            ))
         }
-        Err(ContaminationScreen::Contaminated { .. } | ContaminationScreen::Clear { .. }) => None,
+        OwnerTierOutcome::None(_) | OwnerTierOutcome::Provisional(_) => match setup() {
+            OwnerVoiceSetup::IdentityInvalid | OwnerVoiceSetup::Saved => None,
+            OwnerVoiceSetup::CandidateReady => Some(route_item(
+                COPY_OWNER_VOICE_CANDIDATE_READY,
+                SPEAKERS_YOUR_VOICE_HREF,
+                SOURCE_ID_OWNER_VOICE_CANDIDATE_READY,
+            )),
+            OwnerVoiceSetup::NotYet(reason) => {
+                let text = match reason {
+                    NotYetReason::NeedsMoreAudio => COPY_OWNER_VOICE_NEEDS_MORE_AUDIO.to_owned(),
+                    NotYetReason::TooShortOrMixed => COPY_OWNER_VOICE_TOO_SHORT_OR_MIXED.to_owned(),
+                    NotYetReason::Declined {
+                        next_look_after: at,
+                    } => {
+                        COPY_OWNER_VOICE_DECLINED_TEMPLATE.replace("{date}", &next_look_after(&at))
+                    }
+                };
+                Some(route_item(
+                    &text,
+                    SPEAKERS_YOUR_VOICE_HREF,
+                    SOURCE_ID_OWNER_VOICE_NOT_ESTABLISHED,
+                ))
+            }
+        },
     }
 }
 
@@ -458,6 +495,14 @@ mod tests {
         );
     }
 
+    fn not_yet() -> OwnerVoiceSetup {
+        OwnerVoiceSetup::NotYet(NotYetReason::NeedsMoreAudio)
+    }
+
+    fn day(at: &chrono::DateTime<chrono::Utc>) -> String {
+        at.format("%b %-d").to_string()
+    }
+
     #[test]
     fn owner_voice_needs_healthy_and_identity_invalid_yield_none() {
         let centroid = OwnerCentroid {
@@ -472,17 +517,53 @@ mod tests {
             evidence_intra_cosine_p25: Some(0.52),
         };
         assert_eq!(
-            classify_owner_voice_needs(OwnerTierOutcome::Confirmed(centroid)),
+            classify_owner_voice_needs(OwnerTierOutcome::Confirmed(centroid), not_yet, day),
             None
         );
         assert_eq!(
-            classify_owner_voice_needs(OwnerTierOutcome::Provisional(vec![0.0; 256])),
+            classify_owner_voice_needs(OwnerTierOutcome::IdentityInvalid, not_yet, day),
             None
         );
-        assert_eq!(
-            classify_owner_voice_needs(OwnerTierOutcome::IdentityInvalid),
-            None
-        );
+    }
+
+    /// Five hand tags make a provisional voice, which is not a confirmed one:
+    /// the prompt stays until a voice is confirmed.
+    #[test]
+    fn owner_voice_needs_persists_past_the_provisional_tier() {
+        let item =
+            classify_owner_voice_needs(OwnerTierOutcome::Provisional(vec![0.0; 256]), not_yet, day)
+                .expect("a provisional voice still owes the prompt");
+        assert_eq!(item["source_id"], SOURCE_ID_OWNER_VOICE_NOT_ESTABLISHED);
+    }
+
+    #[test]
+    fn owner_voice_needs_says_when_a_candidate_is_ready() {
+        let item = classify_owner_voice_needs(
+            OwnerTierOutcome::None(OwnerTierReason::ConfirmedAbsent),
+            || OwnerVoiceSetup::CandidateReady,
+            day,
+        )
+        .expect("a ready candidate is announced");
+        assert_eq!(item["source_id"], SOURCE_ID_OWNER_VOICE_CANDIDATE_READY);
+        assert_eq!(item["payload"]["href"], "/app/speakers/#your-voice");
+    }
+
+    #[test]
+    fn owner_voice_needs_names_when_a_declined_voice_is_looked_for_again() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let item = classify_owner_voice_needs(
+            OwnerTierOutcome::None(OwnerTierReason::ConfirmedAbsent),
+            || {
+                OwnerVoiceSetup::NotYet(NotYetReason::Declined {
+                    next_look_after: at,
+                })
+            },
+            day,
+        )
+        .expect("a declined voice keeps the prompt");
+        assert!(item["text"].as_str().unwrap().contains("Oct 25"), "{item}");
     }
 
     #[test]
@@ -493,10 +574,10 @@ mod tests {
             OwnerTierReason::BelowRowFloor,
             OwnerTierReason::BelowEmbeddingFloor,
         ] {
-            let item = classify_owner_voice_needs(OwnerTierOutcome::None(reason))
+            let item = classify_owner_voice_needs(OwnerTierOutcome::None(reason), not_yet, day)
                 .expect("not established reason yields item");
             assert_eq!(item["kind"], "route");
-            assert_eq!(item["payload"]["href"], "/app/speakers/");
+            assert_eq!(item["payload"]["href"], "/app/speakers/#your-voice");
             assert_eq!(item["disabled"], false);
             assert_eq!(item["reason"], "");
             assert_eq!(item["source_id"], SOURCE_ID_OWNER_VOICE_NOT_ESTABLISHED);
@@ -513,7 +594,7 @@ mod tests {
             OwnerTierReason::VoiceprintsUnreadable,
             OwnerTierReason::ProvisionalZeroNorm,
         ] {
-            let item = classify_owner_voice_needs(OwnerTierOutcome::None(reason))
+            let item = classify_owner_voice_needs(OwnerTierOutcome::None(reason), not_yet, day)
                 .expect("damaged reason yields item");
             assert_eq!(item["kind"], "route");
             assert_eq!(item["payload"]["href"], "/app/speakers/");

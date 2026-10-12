@@ -80,7 +80,7 @@ impl Journal {
         fs::create_dir_all(directory.join("talents")).expect("talents");
         fs::write(
             directory.join("audio.jsonl"),
-            "{\"raw\":\"audio.flac\"}\n{\"id\":1,\"text\":\"test\"}\n",
+            "{\"raw\":\"audio.flac\"}\n{\"start\":\"00:00:01\",\"text\":\"test\",\"sentence_id\":1}\n",
         )
         .expect("sentences");
         fs::write(
@@ -101,7 +101,7 @@ impl Journal {
         fs::create_dir_all(directory.join("talents")).expect("talents");
         fs::write(
             directory.join("audio.jsonl"),
-            "{\"raw\":\"audio.flac\"}\n{\"id\":1,\"text\":\"test\"}\n",
+            "{\"raw\":\"audio.flac\"}\n{\"start\":\"00:00:01\",\"text\":\"test\",\"sentence_id\":1}\n",
         )
         .expect("sentences");
         fs::write(
@@ -122,7 +122,7 @@ impl Journal {
         fs::create_dir_all(directory.join("talents")).expect("talents");
         fs::write(
             directory.join("audio.jsonl"),
-            "{\"raw\":\"audio.flac\"}\n{\"id\":1,\"text\":\"test\"}\n",
+            "{\"raw\":\"audio.flac\"}\n{\"start\":\"00:00:01\",\"text\":\"test\",\"sentence_id\":1}\n",
         )
         .expect("sentences");
         fs::write(
@@ -636,10 +636,10 @@ async fn owner_write_routes_cover_ready_detect_build_rebuild_confirm_reject_and_
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{confirmed}");
-    assert_eq!(
-        confirmed,
-        json!({"status":"confirmed","principal_id":"owner"})
-    );
+    assert_eq!(confirmed["status"], "confirmed", "{confirmed}");
+    assert_eq!(confirmed["principal_id"], "owner", "{confirmed}");
+    // Confirming starts updating past speaker labels.
+    assert_eq!(confirmed["relabel"]["kind"], "confirm", "{confirmed}");
 
     let (status, after_confirm) = call(
         router(journal.0.clone()),
@@ -685,7 +685,8 @@ async fn owner_write_routes_cover_ready_detect_build_rebuild_confirm_reject_and_
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{rejected}");
-    assert_eq!(rejected["status"], "needs_detection");
+    assert_eq!(rejected["status"], "rejected");
+    assert_eq!(rejected["cooldown_days"], 14);
 }
 
 #[tokio::test]
@@ -703,6 +704,7 @@ async fn owner_identity_invalid_refuses_every_owner_surface_without_writes() {
             ("/app/speakers/api/owner/rebuild", json!({})),
             ("/app/speakers/api/owner/reject", json!({})),
             ("/app/speakers/api/owner/set-aside", json!({})),
+            ("/app/speakers/api/owner/undo", json!({})),
             (
                 "/app/speakers/api/owner/classify",
                 json!({"day":DAY,"stream":STREAM,"segment_key":SEGMENT,"source":SOURCE}),
@@ -765,7 +767,7 @@ async fn owner_detect_generates_candidate_from_the_native_candidate_pool() {
     for second in 0..=30 {
         let start = second * 2;
         transcript.push_str(&format!(
-            "{{\"id\":{},\"start\":\"00:00:{start:02}\"}}\n",
+            "{{\"sentence_id\":{},\"start\":\"00:00:{start:02}\"}}\n",
             second + 1
         ));
     }
