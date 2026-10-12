@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 use solstone_core_journal_config::owner_zone;
+use solstone_core_journal_io::append_jsonl;
 use solstone_core_journal_io::cortex_use::{
     CortexNamespaceAuthority, CortexRecoveryDisposition, CortexUseCandidateRead,
     CortexUseDestinationCheck, CortexUseFatal, CortexUseFileIdentity, CortexUseRefusal,
@@ -84,11 +85,13 @@ impl CortexStore {
         path: &Path,
         event: &Map<String, Value>,
     ) -> io::Result<bool> {
-        let line = serde_json::to_vec(&Value::Object(event.clone()))?;
+        // One write per row: the output thread and a timeout or cancel can append
+        // to the same file at once, and a separate newline write lets rows tear.
+        let mut line = serde_json::to_vec(&Value::Object(event.clone()))?;
+        line.push(b'\n');
         match OpenOptions::new().append(true).open(path) {
             Ok(mut file) => {
                 file.write_all(&line)?;
-                file.write_all(b"\n")?;
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -290,9 +293,13 @@ impl CortexStore {
             "prompt": request.get("prompt").cloned().unwrap_or_else(|| Value::String(String::new())),
             "index_attempts": index_attempts,
         });
+        // Talents finishing at the same time append to this one file from separate
+        // threads. Formatting straight into the file issued many small writes per
+        // row and interleaved concurrent rows; the shared helper builds the whole
+        // line and appends it in a single write.
         let path = self.talents.join(format!("{day}.jsonl"));
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{summary}");
+        if let Err(error) = append_jsonl(&path, &summary) {
+            log::warn!("cortex: failed to append day index row for {use_id}: {error}");
         }
     }
 
@@ -1822,5 +1829,107 @@ mod tests {
         assert!(active.ends_with("app--name/one_active.jsonl"));
         store.recover().unwrap();
         assert!(active.with_file_name("one.jsonl").exists());
+    }
+
+    // Concurrent writers on real threads, so these run with the broader suite.
+    #[cfg(feature = "full-tests")]
+    mod full_tests {
+        use super::*;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const WRITERS: usize = 8;
+        const ROWS_PER_WRITER: usize = 50;
+
+        /// A prompt the size of a real one, with characters JSON must escape, so
+        /// each row is several kilobytes and formats in many small pieces.
+        fn large_prompt(writer: usize) -> String {
+            (0..120)
+                .map(|line| format!("writer {writer} line {line}: \"quoted\" \\ tab\t é\n"))
+                .collect()
+        }
+
+        fn assert_every_line_is_one_object(text: &str, expected: usize) -> Vec<Map<String, Value>> {
+            let lines = text.lines().collect::<Vec<_>>();
+            let malformed = lines
+                .iter()
+                .filter(|line| serde_json::from_str::<Map<String, Value>>(line).is_err())
+                .count();
+            assert_eq!(
+                malformed,
+                0,
+                "{malformed} of {} lines are not whole rows",
+                lines.len()
+            );
+            assert_eq!(lines.len(), expected);
+            lines
+                .iter()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        #[test]
+        fn concurrent_day_index_appends_keep_every_row_whole() {
+            let directory = tempdir().unwrap();
+            let store = CortexStore::new(directory.path().to_path_buf()).unwrap();
+            let barrier = Barrier::new(WRITERS);
+            thread::scope(|scope| {
+                for writer in 0..WRITERS {
+                    let (store, barrier) = (&store, &barrier);
+                    scope.spawn(move || {
+                        let mut request = request();
+                        request.insert("prompt".into(), Value::String(large_prompt(writer)));
+                        barrier.wait();
+                        for row in 0..ROWS_PER_WRITER {
+                            store.append_day_index(
+                                &format!("{writer}-{row}"),
+                                &request,
+                                Path::new("/missing"),
+                            );
+                        }
+                    });
+                }
+            });
+            let text = fs::read_to_string(store.talents().join("19700101.jsonl")).unwrap();
+            let rows = assert_every_line_is_one_object(&text, WRITERS * ROWS_PER_WRITER);
+            let mut use_ids = rows
+                .iter()
+                .map(|row| row["use_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            use_ids.sort();
+            use_ids.dedup();
+            assert_eq!(use_ids.len(), WRITERS * ROWS_PER_WRITER);
+        }
+
+        #[test]
+        fn concurrent_active_appends_keep_every_row_whole() {
+            let directory = tempdir().unwrap();
+            let store = CortexStore::new(directory.path().to_path_buf()).unwrap();
+            let (active, _) = store
+                .claim("conversation", "1000", &request())
+                .unwrap()
+                .unwrap();
+            let barrier = Barrier::new(WRITERS);
+            thread::scope(|scope| {
+                for writer in 0..WRITERS {
+                    let (store, active, barrier) = (&store, &active, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for row in 0..ROWS_PER_WRITER {
+                            let event = serde_json::from_value::<Map<String, Value>>(json!({
+                                "event": "thinking",
+                                "writer": writer,
+                                "row": row,
+                                "text": large_prompt(writer),
+                            }))
+                            .unwrap();
+                            assert!(store.append_active(active, &event).unwrap());
+                        }
+                    });
+                }
+            });
+            let text = fs::read_to_string(&active).unwrap();
+            assert_every_line_is_one_object(&text, 1 + WRITERS * ROWS_PER_WRITER);
+        }
     }
 }
