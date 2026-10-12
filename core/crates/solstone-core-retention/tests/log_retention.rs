@@ -466,7 +466,6 @@ fn talent_day_indexes_require_wholly_old_valid_rows() {
         b"{\"ts\":1767225600000}\n{\"ts\":1767312000000}\n",
     );
     bed.file("talents/20260102.jsonl", b"{\"ts\":1786492800000}\n");
-    bed.file("talents/20260103.jsonl", b"{not json}\n");
 
     let built = bed.plan(7, "2026-08-05");
     assert_eq!(
@@ -481,9 +480,68 @@ fn talent_day_indexes_require_wholly_old_valid_rows() {
     assert!(built.retained.iter().any(|kept| {
         kept.rel == "talents/20260102.jsonl" && kept.reason == Kept::ContentNotFullyOld
     }));
+    teardown(&bed);
+}
+
+/// Talents finishing together could tear their rows into one unreadable line.
+/// No reader can use a torn line, so it does not keep an old index, and a recent
+/// readable row beside it still does.
+#[test]
+fn torn_talent_day_index_lines_neither_keep_nor_report_the_index() {
+    let bed = Bed::new("talent-day-index-torn");
+    bed.file(
+        "talents/20260103.jsonl",
+        b"{\"ts\":1767225600000}\n{\"ts\":17672{\"ts\":1767225600000,\"status\":\"ok\"}25600000}\n\n",
+    );
+    bed.file("talents/20260104.jsonl", b"{not json}\n[]\n\xff\n");
+    bed.file(
+        "talents/20260105.jsonl",
+        b"{\"ts\":1767225600000,\"pro\n{\"ts\":1786492800000}\n",
+    );
+
+    let built = bed.plan(7, "2026-08-05");
+    assert_eq!(
+        built
+            .by_class("talent_day_index")
+            .iter()
+            .map(|target| target.rel())
+            .collect::<Vec<&str>>(),
+        vec!["talents/20260103.jsonl", "talents/20260104.jsonl"],
+        "a torn line does not keep an old index: {built:?}"
+    );
     assert!(built.retained.iter().any(|kept| {
-        kept.rel == "talents/20260103.jsonl" && matches!(kept.reason, Kept::ContentMalformed { .. })
+        kept.rel == "talents/20260105.jsonl" && kept.reason == Kept::ContentNotFullyOld
     }));
+    assert!(
+        !built
+            .retained
+            .iter()
+            .any(|kept| matches!(kept.reason, Kept::ContentUnreadable { .. })),
+        "{built:?}"
+    );
+    teardown(&bed);
+}
+
+/// An index that cannot be opened is kept and named, not guessed at.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_talent_day_index_is_kept_and_named() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bed = Bed::new("talent-day-index-unreadable");
+    let path = bed.file("talents/20260103.jsonl", b"{\"ts\":1767225600000}\n");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read(&path).is_ok();
+
+    let built = bed.plan(7, "2026-08-05");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    if !readable {
+        assert!(built.by_class("talent_day_index").is_empty(), "{built:?}");
+        assert!(built.retained.iter().any(|kept| {
+            kept.rel == "talents/20260103.jsonl"
+                && matches!(kept.reason, Kept::ContentUnreadable { .. })
+        }));
+    }
     teardown(&bed);
 }
 
