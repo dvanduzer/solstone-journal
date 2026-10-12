@@ -287,6 +287,9 @@ function fixture(document) {
   const management = add(panels, 'article', { 'data-backup-panel': 'management', hidden: '' });
   const managementGrid = add(management, 'div', { class: 'backup-management-grid' });
   const lastBackup = add(managementGrid, 'p', { 'data-last-backup': '' });
+  add(managementGrid, 'p', { 'data-last-successful-backup': '' });
+  add(managementGrid, 'p', { 'data-last-successful-backup-reason': '', hidden: '' });
+  add(managementGrid, 'p', { 'data-backup-history-note': '', hidden: '', 'data-copy': 'management.status_labels.backup_history_note' });
   const backupNow = add(management, 'button', { 'data-action': 'backup-now' });
   const viewKey = add(management, 'button', { 'data-action': 'view-key' });
   const rotateKey = add(management, 'button', { 'data-action': 'rotate-key', disabled: '' });
@@ -1534,6 +1537,74 @@ asyncCase('a backup that stored an incomplete copy says so', async () => {
   assert.ok(/incomplete/.test(text), 'an incomplete copy is named');
   const clean = await lastBackupReason({ time: 1769990000, status: 'ok', error_reason: null });
   assert.strictEqual(clean, '', 'a clean backup shows no reason');
+});
+
+asyncCase('a failed attempt shows its own time and preserves an incomplete successful copy', async () => {
+  const earlier = 1769990000;
+  const later = 1770000000;
+  const payload = { ...status(), enabled: true,
+    last_backup: { status: 'error', time: later, error_reason: 'timeout', last_success: {
+      status: 'ok', time: earlier, snapshot_id: 'stored-copy', error_reason: 'incomplete',
+    } },
+  };
+  const harness = createHarness({ statusQueue: [payload] });
+  await settle();
+  const success = harness.root.querySelector('[data-last-successful-backup]');
+  const caveat = harness.root.querySelector('[data-last-successful-backup-reason]');
+  const latestReason = harness.root.querySelector('[data-last-backup-reason]');
+  assert.strictEqual(harness.lastBackup.title, new Date(later * 1000).toLocaleString());
+  assert.strictEqual(success.title, new Date(earlier * 1000).toLocaleString());
+  assert.ok(!latestReason.hidden && latestReason.textContent);
+  assert.ok(!caveat.hidden && caveat.textContent);
+  const note = harness.root.querySelector('[data-backup-history-note]');
+  assert.ok(!note.hidden && note.textContent, 'history has a visible coverage/destination qualification');
+});
+
+asyncCase('success history distinguishes intact legacy evidence from unknown and malformed values', async () => {
+  for (const [lastBackup, hasDate] of [
+    [{ status: 'ok', time: 1769990000 }, true],
+    [{ status: 'error', time: 1770000000 }, false],
+    [{ status: null, time: null }, false],
+    [{ status: 'ok', time: 1769990000, last_success: null }, false],
+    [{ status: 'error', last_success: { status: 'ok', time: 'yesterday' } }, false],
+    [{ status: 'error', last_success: { status: 'ok', time: 1e30 } }, false],
+  ]) {
+    const harness = createHarness({ statusQueue: [{ ...status(), enabled: true, last_backup: lastBackup }] });
+    await settle();
+    const success = harness.root.querySelector('[data-last-successful-backup]');
+    assert.strictEqual(Boolean(success.title), hasDate);
+    assert.ok(success.textContent, 'absence/malformed history has a visible unknown state');
+  }
+});
+
+asyncCase('refresh advances attempt history without presenting retained evidence as current protection', async () => {
+  const earlier = 1769990000;
+  const success = { status: 'ok', time: earlier, error_reason: null };
+  const initial = { ...status(restoreOperation('restoring')), enabled: true,
+    last_backup: { ...success, last_success: success },
+  };
+  const changed = { ...status(restoreOperation('restoring')), enabled: true,
+    destination: { repository: 's3:other-bucket/other-backup', backend: 's3' },
+    last_backup: { status: 'error', time: 1770000000, error_reason: 'timeout', last_success: success },
+  };
+  const harness = createHarness({ statusQueue: [initial, changed], respond(call, calls, queue) {
+    if (call.url === '/app/backup/status' && !queue.length) return response({}, 503);
+  } });
+  await settle();
+  const history = harness.root.querySelector('[data-last-successful-backup]');
+  const initialTitle = history.title;
+  await harness.runTimer(800);
+  await settle();
+  assert.strictEqual(history.title, initialTitle);
+  assert.notStrictEqual(harness.lastBackup.title, initialTitle);
+  assert.ok(!harness.root.querySelector('[data-backup-history-note]').hidden);
+  await harness.runTimer(800);
+  await settle();
+  assert.strictEqual(history.title, initialTitle, 'failed refresh does not manufacture or erase historical success');
+  assert.ok(!harness.root.querySelector('[data-backup-history-note]').hidden);
+  const reloaded = createHarness({ statusQueue: [changed] });
+  await settle();
+  assert.strictEqual(reloaded.root.querySelector('[data-last-successful-backup]').title, initialTitle);
 });
 
 asyncCase('a single-part verification says it covered everything', async () => {

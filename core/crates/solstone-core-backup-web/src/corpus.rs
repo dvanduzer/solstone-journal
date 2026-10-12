@@ -261,6 +261,66 @@ async fn offload_status_uses_injected_geometry_and_has_exact_shape() {
 }
 
 #[tokio::test]
+async fn backup_status_preserves_written_success_through_failure_and_destination_change() {
+    use solstone_core_backup::{Destination, record_backup_result, set_destination, status_view};
+    let root = crate::test_support::root("enabled_never_run");
+    record_backup_result(
+        root.path(),
+        "ok",
+        json!(100),
+        json!("saved-copy"),
+        json!("incomplete"),
+        None,
+    )
+    .unwrap();
+    record_backup_result(
+        root.path(),
+        "error",
+        json!(200),
+        Value::Null,
+        json!("timeout"),
+        None,
+    )
+    .unwrap();
+    set_destination(
+        root.path(),
+        &Destination {
+            repository: "s3:new-bucket/new-backup".into(),
+            backend: "s3".into(),
+            credentials: serde_json::Map::new(),
+        },
+    )
+    .unwrap();
+    let (_, body) = response_json(
+        crate::routes(root.path().to_path_buf()),
+        Request::get("/app/backup/status")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["last_backup"]["status"], "error");
+    assert_eq!(body["last_backup"]["time"], 200);
+    assert_eq!(
+        body["last_backup"]["last_success"]["snapshot_id"],
+        "saved-copy"
+    );
+    assert_eq!(
+        body["last_backup"]["last_success"]["error_reason"],
+        "incomplete"
+    );
+    assert_eq!(
+        body["last_backup"],
+        status_view(root.path()).unwrap()["last_backup"]
+    );
+    // Historical results have no attribution to the newly configured destination.
+    assert!(
+        body["last_backup"]["last_success"]
+            .get("destination")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn generation_is_secure_fill_only_and_confirmation_accepts_display_separators() {
     let first_root = crate::test_support::root("fresh");
     let second_root = crate::test_support::root("fresh");

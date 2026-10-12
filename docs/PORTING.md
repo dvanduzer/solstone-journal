@@ -19,9 +19,10 @@ Do not add shims, fallback aliases, or dual Python/Rust paths.
 `check-rust-ios` compiles and links the whole workspace for an iOS device
 (`aarch64-apple-ios`) on a macOS host with Xcode, with default features plus
 `solstone-core/journal-mcp-endpoint`. There are no package exclusions. This is
-compilation support. Nothing is packaged, installed or run, and it is not a
-claim that the journal runs on iOS: process lifecycle, supervisor admission and
-readiness refuse on iOS in source, and every engine is still a separate program.
+compilation support. The cross-build target does not package, install or run
+the workspace, and it is not a claim that the journal runs on iOS: process
+lifecycle, supervisor admission and readiness refuse on iOS in source, and every
+engine is still a separate program.
 Installation identity still maps iOS to the macOS platform tag and an absolute
 installation path. That is inherited, not a qualified iOS identity design.
 
@@ -70,7 +71,8 @@ One more target is checked without shipping:
 
 - **iOS** (`aarch64-apple-ios`) is `check-rust-ios`, a macOS-host build and
   link of the whole workspace (§ iOS cross-build, above). **No shipped-target
-  evidence exists for iOS** — nothing is packaged, installed, or smoke-tested.
+  release evidence exists for iOS.** The development runtime below is a
+  separate bounded app.
 
 ## Native dependency proof
 
@@ -82,6 +84,12 @@ The [Android development runtime](../tools/android-runtime/README.md) packages
 the storage/index/search slice in an app-owned service and provides physical
 device checks. Its bounded foreground evidence is separate from full native
 dependency compilation and shipped-target release qualification.
+
+The [iOS development runtime](../tools/ios-runtime/README.md) packages the
+storage/index/search slice in a standard bundled ExtensionFoundation helper
+that owns its journal files. A development host invokes the helper and provides
+repeatable physical checks. Its bounded foreground evidence is separate from
+full native dependency compilation and shipped-target release qualification.
 
 A crate that adds C/C++ build steps or native linkage is not done after
 `cargo test`. Prove it still builds on every shipped target in the table

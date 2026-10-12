@@ -255,7 +255,25 @@ pub fn record_backup_result(
     if let Some(detail) = detail {
         map.insert("detail".into(), Value::String(detail.into()));
     }
-    record(journal, "last_backup", map)
+    mutate_backup_section(journal, |backup| {
+        // Keep the successful operation's whole result, including incomplete-copy
+        // caveats. This is history, not proof of present coverage or verification.
+        let last_success = if status == "ok" {
+            Value::Object(map.clone())
+        } else {
+            backup
+                .get("last_backup")
+                .and_then(|prior| {
+                    prior.get("last_success").or_else(|| {
+                        (prior.get("status").and_then(Value::as_str) == Some("ok")).then_some(prior)
+                    })
+                })
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        map.insert("last_success".into(), last_success);
+        set_value(backup, "last_backup", Value::Object(map))
+    })
 }
 
 pub fn record_prune_result(
@@ -801,6 +819,92 @@ mod tests {
                 json!(false),
             )
         });
+    }
+
+    #[test]
+    fn backup_failures_preserve_success_and_its_incomplete_copy_caveat() {
+        let journal = journal();
+        record_backup_result(
+            journal.path(),
+            "ok",
+            json!(100),
+            json!("first"),
+            json!("incomplete"),
+            Some("unreadable-source"),
+        )
+        .unwrap();
+        let success =
+            get_backup_config(journal.path()).unwrap()["last_backup"]["last_success"].clone();
+        assert_eq!(success["snapshot_id"], "first");
+        assert_eq!(success["error_reason"], "incomplete");
+        assert_eq!(success["detail"], "unreadable-source");
+        assert!(
+            success.get("last_success").is_none(),
+            "history never nests itself"
+        );
+        for time in [200, 300] {
+            record_backup_result(
+                journal.path(),
+                "error",
+                json!(time),
+                Value::Null,
+                json!("timeout"),
+                None,
+            )
+            .unwrap();
+            let view = status_view(journal.path()).unwrap();
+            assert_eq!(view["last_backup"]["time"], time);
+            assert_eq!(view["last_backup"]["status"], "error");
+            assert_eq!(view["last_backup"]["last_success"], success);
+        }
+        record_backup_result(
+            journal.path(),
+            "ok",
+            json!(400),
+            json!("next"),
+            Value::Null,
+            None,
+        )
+        .unwrap();
+        let view = status_view(journal.path()).unwrap();
+        assert_eq!(view["last_backup"]["last_success"]["snapshot_id"], "next");
+        assert_eq!(view["last_backup"]["last_success"]["time"], 400);
+        assert!(view["last_backup"]["last_success"]["error_reason"].is_null());
+        assert!(view["last_backup"]["last_success"].get("detail").is_none());
+    }
+
+    #[test]
+    fn backup_history_keeps_intact_legacy_success_but_does_not_invent_lost_history() {
+        let journal = journal();
+        for prior in [
+            json!({"status":"ok", "time":100, "snapshot_id":"legacy", "error_reason":"incomplete"}),
+            json!({"status":"error", "time":100}),
+            json!({"status":"ok", "time":100, "last_success":null}),
+            Value::Null,
+        ] {
+            write_config(journal.path(), json!({"backup":{"last_backup":prior}}));
+            record_backup_result(
+                journal.path(),
+                "error",
+                json!(200),
+                Value::Null,
+                json!("locked"),
+                None,
+            )
+            .unwrap();
+            let saved = get_backup_config(journal.path()).unwrap()["last_backup"].clone();
+            if prior.get("snapshot_id").is_some() {
+                assert_eq!(saved["last_success"], prior);
+            } else {
+                assert!(saved["last_success"].is_null());
+            }
+        }
+        clear_backup_config(journal.path()).unwrap();
+        assert!(
+            get_backup_config(journal.path()).unwrap()["last_backup"]
+                .get("last_success")
+                .is_none()
+        );
     }
 
     #[test]
