@@ -72,6 +72,11 @@ enum WriterProgress {
     NoWriter,
     Submitted,
     Accepted,
+    // Read only by the Linux x86_64 settlement below.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     Refused(ReadbackError),
 }
 
@@ -182,6 +187,11 @@ impl ArchivePredecessorCustody {
             self.capture.repository_id = Some(id.to_owned());
         }
     }
+    // Direct readback qualifies only on Linux x86_64.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(super) fn qualify_settlement(&self) -> Result<(), ReadbackError> {
         match self.state {
             CreatorState::Direct(WriterProgress::NoWriter | WriterProgress::Accepted)

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use solstone_core_journal_io::activity::ActivityLease;
 
+#[cfg(target_os = "linux")]
 use super::RestoreIntent;
 
 /// Why an interrupted restore stays an unresolved obligation.

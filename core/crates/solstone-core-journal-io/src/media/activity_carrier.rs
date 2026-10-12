@@ -599,6 +599,8 @@ pub(crate) fn retire_recovered(
 /// every reservation, since an interrupted restore may name one. Removal is
 /// rmdir, so a reservation holding anything stays an unresolved obligation.
 pub fn retire_orphan_root_carriers(activity: &Arc<ActivityLease>) -> usize {
+    // Only the Linux retirement below mutates the count.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut retired = 0;
     // A refusal or error retires nothing further; the caller's census decides.
     #[cfg(target_os = "linux")]
