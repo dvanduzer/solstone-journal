@@ -3411,6 +3411,61 @@ mod tests {
     }
 
     #[test]
+    fn segment_senses_an_imported_conversation_with_a_long_message() {
+        let journal = tempdir().unwrap();
+        let roots = tempdir().unwrap();
+        let (context, recorder) = segment_context(
+            journal.path(),
+            roots.path(),
+            "{\n\"type\": \"generate\", \"max_output_tokens\": 1024, \"schedule\": \"segment\", \"priority\": 1, \"output\": \"json\", \"load\": {\"transcripts\": true, \"percepts\": true, \"talents\": false}\n}\n",
+        );
+        let stream = "import.chatgpt";
+        let segment = "185315_300";
+        let path = journal
+            .path()
+            .join("chronicle/20260813")
+            .join(stream)
+            .join(segment);
+        fs::create_dir_all(&path).unwrap();
+        let long = "word ".repeat(40_000);
+        let contents = [
+            serde_json::json!({"imported": {"id": "import-1"}, "model": "m"}),
+            serde_json::json!({"start": "18:53:15", "speaker": "Human", "text": long, "source": "import"}),
+            serde_json::json!({"start": "18:53:16", "speaker": "Assistant", "text": "ok", "source": "import"}),
+        ]
+        .map(|row| row.to_string() + "\n")
+        .concat();
+        assert!(contents.len() > 3 * 64 * 1024);
+        fs::write(path.join("conversation_transcript.jsonl"), contents).unwrap();
+
+        let mut log = test_log(&context, "segment");
+        segment::run(
+            &context,
+            &mut log,
+            segment,
+            false,
+            Some(stream),
+            2,
+            Some(std::time::Duration::from_secs(610)),
+            false,
+            &[],
+        )
+        .unwrap();
+
+        let requests = recorder.requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|request| request.name == "sense"),
+            "sense was not dispatched: {:?}",
+            requests.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !oplog_records(journal.path(), &context.day, "segment")
+                .iter()
+                .any(|record| record["reason"] == "raw_media_pending")
+        );
+    }
+
+    #[test]
     fn segment_without_a_stream_uses_the_only_named_stream_binding() {
         let journal = tempdir().unwrap();
         let roots = tempdir().unwrap();

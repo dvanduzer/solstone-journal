@@ -372,17 +372,13 @@ fn marker_ladder_uses_injected_time_and_processing_record_precedence() {
 }
 
 #[test]
-fn bounded_jsonl_probes_and_processing_record_fallbacks_are_conservative() {
+fn jsonl_row_probes_and_processing_record_fallbacks_are_conservative() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path();
-    let bounded = segment(root, Some("bounded"), "130000_300");
-    write(
-        &bounded,
-        "audio.jsonl",
-        &("x".repeat(vocab::MAX_FIRST_ROW_BYTES) + "\n{\"start\":0}\n"),
-    );
+    let third_row = segment(root, Some("thirdrow"), "130000_300");
+    write(&third_row, "audio.jsonl", "{}\n{}\n{\"start\":0}\n");
     let non_utf8 = segment(root, Some("nonutf8"), "131500_300");
-    fs::write(non_utf8.join("audio.jsonl"), b"{\"start\":0}\n\xff").unwrap();
+    fs::write(non_utf8.join("audio.jsonl"), b"{}\n\xff{\"start\":0}\n").unwrap();
     let fallback = segment(root, Some("fallback"), "133000_300");
     write(&fallback, "a_audio.jsonl", "not-json\n");
     write(
@@ -398,6 +394,55 @@ fn bounded_jsonl_probes_and_processing_record_fallbacks_are_conservative() {
     assert_eq!(segments[0].data_state.0["audio"], "pending");
     assert_eq!(segments[1].data_state.0["audio"], "pending");
     assert_eq!(segments[2].data_state.0["audio"], "empty");
+}
+
+/// An imported conversation's transcript is analyzed however long its rows are
+/// and wherever its bytes fall.
+#[test]
+fn long_imported_conversation_transcripts_are_analyzed() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path();
+    let bound = vocab::MAX_FIRST_ROW_BYTES;
+    let header = "{\"imported\":{\"id\":\"import-1\"},\"model\":\"m\"}\n";
+    let row = |start: &str, text: &str| {
+        format!(
+            "{}\n",
+            json!({"start": start, "speaker": "Human", "text": text, "source": "import"})
+        )
+    };
+
+    // One message longer than the bound.
+    let long_row = segment(root, Some("import.chatgpt"), "100000_300");
+    let contents = format!(
+        "{header}{}{}",
+        row("10:00:00", &"word ".repeat(bound / 2)),
+        row("10:00:01", "ok")
+    );
+    write(&long_row, "conversation_transcript.jsonl", &contents);
+
+    // Short messages, with a multi-byte character straddling the bound.
+    let split = segment(root, Some("import.chatgpt"), "101500_300");
+    let mut contents = format!("{header}{}", row("10:15:00", "hello"));
+    while contents.len() < bound - 2000 {
+        contents.push_str(&row("10:15:01", &"b".repeat(500)));
+    }
+    // The last row's four-byte character begins two bytes before the bound.
+    contents.push_str("{\"start\":\"10:15:02\",\"text\":\"");
+    contents.push_str(&"c".repeat(bound - 2 - contents.len()));
+    contents.push_str("\u{1F600}\"}\n");
+    assert!(contents.len() > bound);
+    assert!(!contents.is_char_boundary(bound));
+    write(&split, "conversation_transcript.jsonl", &contents);
+
+    let (_, _, segments) = scan_day(&FilesystemSegmentSource, root, DAY, now()).unwrap();
+    let states = segments
+        .iter()
+        .map(|segment| (segment.key.as_str(), segment.data_state.0["audio"].as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        [("100000_300", "analyzed"), ("101500_300", "analyzed")]
+    );
 }
 
 #[test]
