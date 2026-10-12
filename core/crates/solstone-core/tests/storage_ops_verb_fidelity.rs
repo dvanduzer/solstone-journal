@@ -322,7 +322,9 @@ fn storage_ops_body_diagnostics_and_reprocess_unreachable_are_preserved() {
     // A journal with no model chosen is refused before reachability is consulted,
     // which is what `reprocess` reporting "queued" for a journal that will not act
     // was changed to stop doing. Both arms stay covered: the precheck here, and the
-    // reachability message below once a model exists.
+    // saved request below once a model exists. Since paced whole-journal discovery,
+    // a request is durable owner intent: with the supervisor down it is saved,
+    // succeeds and says how to start the service, rather than failing unqueued.
     let reprocess = run_journal(
         journal.path(),
         &["reprocess", "20250101", "--from-scratch"],
@@ -347,12 +349,14 @@ fn storage_ops_body_diagnostics_and_reprocess_unreachable_are_preserved() {
         &["reprocess", "20250101", "--from-scratch"],
         false,
     );
-    assert_eq!(reachable.status.code(), Some(1));
-    assert_eq!(reachable.stdout, b"");
+    assert_eq!(reachable.status.code(), Some(0));
     assert_eq!(
-        text(reachable.stderr),
-        "supervisor not reachable - start it (solstone journal up), then retry\n"
+        text(reachable.stdout),
+        "request saved; start the background service with solstone journal up to process it\n"
     );
+    assert_eq!(reachable.stderr, b"");
+    let intents = solstone_core_system::work_intent::read(journal.path()).expect("saved intent");
+    assert!(intents["20250101"].from_scratch);
 }
 
 #[test]
