@@ -126,10 +126,18 @@ fn run_with_phase_process(
     phase_process: &dyn PhaseProcessRunner,
     sense_child_environment: &solstone_core_system::process::ChildLaunchContext,
 ) -> Result<ModeResult, String> {
-    if args.daily_only
-        && !solstone_core_system_health::day_segments_ready(&context.journal, &context.day)?
-    {
-        return Err("daily work is waiting for its segment prerequisites".into());
+    if args.daily_only {
+        // A thought segment owed only its publication does not hold the day:
+        // publish it here, with no model call, rather than wait for a repair.
+        let unpublished =
+            solstone_core_system_health::day_unpublished_segments(&context.journal, &context.day)?
+                .ok_or("daily work is waiting for its segment prerequisites")?;
+        for segment_dir in unpublished {
+            segment::publish_saved_outputs(context, &segment_dir)?;
+        }
+        if !solstone_core_system_health::day_segments_ready(&context.journal, &context.day)? {
+            return Err("daily work is waiting for its segment prerequisites".into());
+        }
     }
     let observed_generation = stream_generation(context)?;
     let observed_fingerprint = read_raw_input_fingerprint(&context.journal, &context.day)
@@ -2215,6 +2223,59 @@ mod tests {
             ]
         );
         assert_eq!(marker_generation(journal.path()), Some(0));
+    }
+
+    /// A segment thought before its publication was recorded holds nothing
+    /// back: daily-only work publishes it, with no model call, and goes on.
+    #[test]
+    fn daily_only_work_publishes_thought_segments_instead_of_waiting() {
+        let journal = tempdir().unwrap();
+        let context = context(journal.path());
+        let segment = journal
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join("default/090000_300");
+        fs::create_dir_all(segment.join("talents")).unwrap();
+        fs::write(
+            segment.join("audio.jsonl"),
+            "{\"start\":\"00:00:01\",\"text\":\"A meeting about a garden.\"}\n",
+        )
+        .unwrap();
+        fs::write(segment.join("talents/activity.md"), "A garden meeting.").unwrap();
+        RunLogWriter::open(journal.path(), DAY, "segment").log(
+            "sense.complete",
+            chrono::Utc::now().timestamp_millis() + 3_600_000,
+            Map::from_iter([
+                ("mode".to_owned(), Value::from("segment")),
+                ("stream".to_owned(), Value::from("default")),
+                ("segment".to_owned(), Value::from("090000_300")),
+                ("density".to_owned(), Value::from("idle")),
+            ]),
+        );
+        assert!(!solstone_core_system_health::day_segments_ready(journal.path(), DAY).unwrap());
+
+        let result = run_with_phase_process(
+            &context,
+            &mut log(journal.path()),
+            &ThinkArgs {
+                day: Some(DAY.to_owned()),
+                daily_only: true,
+                ..ThinkArgs::default()
+            },
+            1,
+            Some(Duration::from_secs(610)),
+            &RecordingPhaseProcessRunner::new(Vec::<PhaseProcessOutcome>::new()),
+            &solstone_core_system::process::ChildLaunchContext::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.failed, 0, "{:?}", result.failed_names);
+        assert!(solstone_core_system_health::day_segments_ready(journal.path(), DAY).unwrap());
+        assert_eq!(
+            fs::read_to_string(segment.join("talents/activity.md")).unwrap(),
+            "A garden meeting."
+        );
     }
 
     #[test]

@@ -131,10 +131,14 @@ pub struct QueuedTaskSnapshot {
     pub scheduler_name: Option<String>,
 }
 
+/// The most discovered tasks the queue takes from one replacement.
+pub const DISCOVERED_ADMISSION: usize = 4;
+
 /// Reconstructed work, with consent established by the discovery reader.
 /// This internal type has no bus representation.
 pub type WorkGuard = Arc<dyn Fn() -> Result<bool, String> + Send + Sync>;
 
+#[derive(Clone)]
 pub struct DiscoveredTask {
     pub guard: Option<WorkGuard>,
     pub request: crate::request::BusTaskRequest,
@@ -1421,7 +1425,7 @@ impl TaskQueue {
                     state.pending.push(source);
                 }
                 added += 1;
-                if added == 4 {
+                if added == DISCOVERED_ADMISSION {
                     break;
                 }
             }

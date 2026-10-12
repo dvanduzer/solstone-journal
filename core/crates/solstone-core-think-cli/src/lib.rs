@@ -6649,16 +6649,16 @@ mod tests {
             repair_segment: true,
             ..Default::default()
         };
-        assert!(
-            repair::run(
-                &context,
-                &mut test_log(&context, "segment"),
-                &parsed,
-                None,
-                &Default::default()
-            )
-            .is_err()
-        );
+        let failed = repair::run(
+            &context,
+            &mut test_log(&context, "segment"),
+            &parsed,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(failed.failed, 1);
+        assert!(failed.failed_names[0].starts_with("publication ("));
         let calls = recorder.requests.lock().unwrap().len();
         assert!(calls > 0);
         index.0.store(false, std::sync::atomic::Ordering::Release);
@@ -6798,6 +6798,54 @@ mod tests {
         let direct = think_segment(&context, false);
         assert_eq!((direct.success, direct.failed), (2, 0));
         assert_eq!(recorder.requests.lock().unwrap().len(), 4);
+    }
+
+    // Daily work waits for every segment of its day to be ready, and a ready
+    // segment has its saved outputs published. Live thinking is how most
+    // segments are thought, so it must leave them ready itself.
+    #[test]
+    fn live_thinking_leaves_its_segment_ready_for_daily_work() {
+        let journal = tempdir().unwrap();
+        let roots = tempdir().unwrap();
+        let (context, recorder) = thought_after_input_context(journal.path(), roots.path());
+        write_analyzed_screen(journal.path(), "20260813", "090000_300");
+        write_sense_output(
+            &context,
+            "090000_300",
+            serde_json::json!({"density":"active","content_type":"work","activity_summary":"A garden meeting."}),
+        );
+        let ready = || {
+            let (_, _, segments) = solstone_core_system_health::scan_day(
+                &solstone_core_system_health::FilesystemSegmentSource,
+                journal.path(),
+                "20260813",
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            let progress = solstone_core_system_health::read_segment_progress(
+                &solstone_core_system_health::FilesystemHealthLogSource::new(journal.path()),
+                "20260813",
+            )
+            .unwrap();
+            assert_eq!(segments.len(), 1);
+            solstone_core_system_health::segment_work_ready(
+                journal.path(),
+                "20260813",
+                &segments[0],
+                &progress.value,
+            )
+            .unwrap()
+        };
+        assert!(!ready());
+        let live = think_segment(&context, true);
+        assert_eq!((live.success, live.failed), (2, 0));
+        assert!(ready());
+        assert!(
+            segment_dir(journal.path(), "20260813", "090000_300")
+                .join("talents/publication.json")
+                .is_file()
+        );
+        assert_eq!(recorder.requests.lock().unwrap().len(), 2);
     }
 
     // A modality that lands, or is analyzed again, after the segment was
