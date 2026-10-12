@@ -1,0 +1,55 @@
+name: JournalRuntimeDev
+options:
+  deploymentTarget:
+    iOS: '26.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    IPHONEOS_DEPLOYMENT_TARGET: '26.0'
+    GENERATE_INFOPLIST_FILE: true
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: 7QCG8V4M6H
+    SWIFT_OBJC_BRIDGING_HEADER: Shared/Bridge.h
+    OTHER_LDFLAGS: $(RUST_LIB) -lc++ -lz -liconv -framework Foundation -framework
+      Security -framework SystemConfiguration
+    ENABLE_DEBUG_DYLIB: false
+    OTHER_CODE_SIGN_FLAGS: --keychain /Users/jer/Library/Keychains/sol-signing.keychain-db
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.0.1
+    TARGETED_DEVICE_FAMILY: 1,2
+targets:
+  JournalRuntimeDev:
+    type: application
+    platform: iOS
+    sources:
+    - Host
+    - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.solstone.journal.runtime.dev
+        EX_ENABLE_EXTENSION_POINT_GENERATION: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+    dependencies:
+    - sdk: ExtensionFoundation.framework
+    - target: JournalWorker
+      embed: true
+  JournalWorker:
+    type: extensionkit-extension
+    platform: iOS
+    sources:
+    - Helper
+    - Shared
+    dependencies:
+    - sdk: ExtensionFoundation.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.solstone.journal.runtime.dev.worker
+        EX_ENABLE_EXTENSION_POINT_GENERATION: true
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+schemes:
+  JournalRuntimeDev:
+    build:
+      targets:
+        JournalRuntimeDev: all

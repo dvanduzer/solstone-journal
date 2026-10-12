@@ -11,7 +11,7 @@ use rusqlite::{
 };
 use solstone_core_indexer_store::db::AUTHORED_CHAT_PATH_PREDICATE;
 
-use crate::compile::{CompileOutcome, compile_query};
+use crate::compile::{CompileOutcome, QueryCompilation, compile_query};
 use crate::ladder::relaxed_plan;
 use crate::predicate::{EffectiveDateConstraint, PredicateInput, QueryPredicate};
 use crate::temporal::TemporalExtraction;
@@ -33,20 +33,24 @@ pub fn search(
     reference_date: NaiveDate,
 ) -> Result<SearchResponse, IndexAccessError> {
     let compilation = compile_query(&request.query, reference_date);
-    if matches!(compilation.outcome, CompileOutcome::NoTokenizableTerm) {
-        return Ok(SearchResponse {
-            results: Vec::new(),
-            order: order_for_plan(false),
-            relaxed: false,
-            total: None,
-            counts: None,
-            reason: Some("not_tokenizable".to_string()),
-            cleaned_query: compilation.temporal.remaining_text.clone(),
-            degraded: None,
-        });
+    if let Some(response) = untokenizable_response(&compilation) {
+        return Ok(response);
     }
     let mut connection = open_index_reader(journal, &QueryBoundary::Owner)?;
     search_on_connection(&mut connection, request, reference_date, compilation)
+}
+
+fn untokenizable_response(compilation: &QueryCompilation) -> Option<SearchResponse> {
+    matches!(compilation.outcome, CompileOutcome::NoTokenizableTerm).then(|| SearchResponse {
+        results: Vec::new(),
+        order: order_for_plan(false),
+        relaxed: false,
+        total: None,
+        counts: None,
+        reason: Some("not_tokenizable".to_string()),
+        cleaned_query: compilation.temporal.remaining_text.clone(),
+        degraded: None,
+    })
 }
 
 /// Execute journal aggregation independently of a search invocation.
@@ -472,6 +476,23 @@ pub fn open_owner_index(
 }
 
 impl OwnerIndex {
+    /// Search using this reader without opening another SQLite connection.
+    ///
+    /// Each invocation finishes its statements; it does not retain a read
+    /// transaction between calls. Commits to the same index become visible on
+    /// the next call. Reopen this session if the index file itself is replaced.
+    pub fn search(
+        &mut self,
+        request: &SearchRequest,
+        reference_date: NaiveDate,
+    ) -> Result<SearchResponse, IndexAccessError> {
+        let compilation = compile_query(&request.query, reference_date);
+        if let Some(response) = untokenizable_response(&compilation) {
+            return Ok(response);
+        }
+        search_on_connection(&mut self.connection, request, reference_date, compilation)
+    }
+
     pub fn resolve_counts(
         &mut self,
         request: &SearchRequest,
