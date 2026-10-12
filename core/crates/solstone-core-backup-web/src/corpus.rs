@@ -5295,7 +5295,8 @@ async fn hosted_poll_watchdog_expiry_is_proven_by_direct_slot_lock_not_observati
             );
             {
                 let (view, has_nonce, has_key) = {
-                    let guard = deps.operations.try_lock().expect("fixture slot");
+                    // The live watchdog takes this slot every tick; wait for it.
+                    let guard = deps.operations.lock().expect("fixture slot");
                     let slot = guard.current.as_ref().expect("slot");
                     (
                         slot.view.clone(),

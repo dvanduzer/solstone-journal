@@ -106,6 +106,9 @@ pub fn remove_marked(
     outcome
 }
 
+const UNBOUND_OFFLOAD: &str =
+    "this offload proposal has no record of its backup copy, so its originals were kept";
+
 fn remove_one(
     journal: &Path,
     id: &MarkId,
@@ -118,6 +121,11 @@ fn remove_one(
             mark,
             &PreflightRefusal::ArchiveBound { id: id.clone() }.to_string(),
         ));
+    }
+    // An offload proposal without its backup proof never falls through to the
+    // retention policy: the policy verdict is not evidence of a backup copy.
+    if mark.class == RemovalClass::OffloadRawRelease {
+        return Ok(refused(mark, UNBOUND_OFFLOAD));
     }
     let live = crate::layout::segment_rel(&target.day, &target.stream, &target.dir);
     if let Err(reason) = require_legacy_raw_target(context.activity, target) {
@@ -2525,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    fn ac3_b_offload_raw_release_records_offload_class_in_events_jsonl() {
+    fn ac3_b_unbound_offload_marks_never_fall_through_to_the_policy() {
         let journal = tempfile::tempdir().unwrap();
         let target = target();
         let segment = seed_empty_audio(journal.path(), &target);
@@ -2560,24 +2568,10 @@ mod tests {
         );
 
         assert_eq!(outcome.targets.len(), 1);
-        assert_eq!(outcome.targets[0].removed.len(), 1);
-        assert_eq!(
-            outcome.targets[0].removed[0].as_str(),
-            "chronicle/20260701/field.audio/070000_17/audio.flac"
-        );
-        assert!(!segment.join("audio.flac").exists());
-
-        let events_path = segment.join("events.jsonl");
-        assert!(events_path.exists());
-        let content = fs::read_to_string(&events_path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(row["tract"], "retention");
-        assert_eq!(row["event"], "original_deleted");
-        assert_eq!(row["name"], "audio.flac");
-        assert_eq!(row["class"], "offload_raw_release");
-        assert_eq!(row["ts"], now.timestamp_millis());
+        assert!(outcome.targets[0].removed.is_empty());
+        assert_eq!(outcome.targets[0].not_removed[0].reason, UNBOUND_OFFLOAD);
+        assert!(segment.join("audio.flac").exists());
+        assert!(!segment.join("events.jsonl").exists());
     }
 
     #[test]

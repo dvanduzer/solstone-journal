@@ -460,7 +460,12 @@ fn project_mark(mark: retention::Mark) -> Option<Value> {
             Value::String(retention::human_bytes(mark.proposal.bytes)),
         ),
     ]);
+    let unbound_offload =
+        mark.class == retention::RemovalClass::OffloadRawRelease && mark.offload.is_none();
     match mark.state {
+        // An earlier version's offload proposal carries no proof of its backup
+        // copy, so it can never be approved; offer planning withdraws it.
+        retention::MarkState::Marked if unbound_offload => return None,
         retention::MarkState::Marked if approval_required => {
             row.insert("state".to_owned(), Value::String("marked".to_owned()));
         }
@@ -952,6 +957,22 @@ mod tests {
         assert_eq!(failed["state"], "failed");
         assert!(failed.get("reason").is_some());
         assert_eq!(failed["staged"], Value::Null);
+    }
+
+    #[test]
+    fn an_offload_proposal_without_backup_proof_is_never_offered() {
+        let class = serde_json::to_value(RemovalClass::OffloadRawRelease).expect("class");
+        let unbound: super::retention::Mark = serde_json::from_value(json!({
+            "id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "class": class,
+            "target": {"day": "20260101", "stream": "_default", "dir": "070000_17"},
+            "marked_at": "2026-01-01T00:00:00Z",
+            "proposal": {"bytes": 12, "reason": "r", "names": ["a"]},
+            "state": "marked",
+        }))
+        .expect("earlier version's offload row");
+        assert!(unbound.offload.is_none());
+        assert!(project_mark(unbound).is_none());
     }
 
     fn leftover(day: &str, dir: &str) -> Value {
