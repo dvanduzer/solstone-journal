@@ -8,9 +8,14 @@ use solstone_core_indexer_store::{SavedPublicationOutcome, attempt_saved_publica
 /// Bring a saved facet day file into search now, not at the next daily scan.
 ///
 /// Call only after the store's own locks are released: reconciliation takes
-/// the index writer lease before entity and facet trust. A failed update
-/// leaves the file to the daily scan, and health counts it as pending.
+/// the index writer lease before entity and facet trust. Trust locks are
+/// reentrant, so a caller may still hold one here; then the file is left to
+/// the daily scan rather than waiting on the lease while trust is held. A
+/// failed update also leaves the file to the daily scan.
 pub(super) fn publish_saved(journal_root: &Path, saved: &Path) {
+    if solstone_core_entity::entity_trust_held_by_current_thread(journal_root) {
+        return;
+    }
     let attempt = attempt_saved_publication(journal_root, saved, |journal, path| {
         solstone_core_indexer_store::scan::rescan_file(journal, path).map_err(|e| e.to_string())
     });
@@ -87,13 +92,53 @@ mod tests {
             publish_anticipation_batch(root.path(), &batch, true, || Err("interrupt".into()))
                 .is_err()
         );
-        let _ = std::fs::remove_dir_all(root.path().join("indexer"));
+        let index = root.path().join("indexer");
+        if index.exists() {
+            std::fs::remove_dir_all(&index).unwrap();
+        }
+        assert!(!index.exists());
         publish_anticipation_batch(root.path(), &batch, true, || Ok(())).unwrap();
         assert!(searchable(
             root.path(),
             "facets/work/activities/20260920.jsonl",
             "Osprey planning"
         ));
+    }
+
+    #[test]
+    fn a_write_under_a_held_trust_lock_never_waits_on_the_index_lease() {
+        let root = tempfile::tempdir().unwrap();
+        create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let appended = append_activity_record(
+            root.path(),
+            "work",
+            "20260510",
+            record(json!({"id": "a1", "activity": "meeting", "title": "Heron sync"})),
+        )
+        .unwrap();
+        assert!(matches!(appended, AppendOutcome::Written(_)));
+        // A scan holds the writer lease, and the caller holds facet trust
+        // around the write, as enrichment and the daily schedule do.
+        let _lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(root.path()),
+            solstone_core_journal_io::LockOptions::default(),
+        )
+        .unwrap();
+        let _trust = crate::hold_facet_trust_lock(root.path()).unwrap();
+        let started = std::time::Instant::now();
+        crate::update_activity_record(
+            root.path(),
+            "work",
+            "20260510",
+            "a1",
+            &serde_json::Map::from_iter([("title".to_owned(), json!("Heron retro"))]),
+            "test",
+            "renamed",
+            "2026-05-10T00:00:00Z",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

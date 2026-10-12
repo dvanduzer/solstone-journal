@@ -25,6 +25,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - a screen category in the ignored group in settings was still read in detail when it was the first thing on screen in a recording, or when it was on screen beside another app. it's now never read in detail, and your journal still keeps a short description of it.
 - the help under "frames read in detail" in settings said the number counted frames across your whole screen segment. it counts for each screen separately, and the help now says so.
 - on mac and windows, the health page no longer lists "original media cleanup" as scheduled, and your journal no longer starts it every day. offload isn't available there in this version, so each run stopped without doing anything.
+- your activities, and the people and things your journal detects in each facet, now show up in search as soon as they're saved. before, they waited for your journal's daily search update, and until then the health page said search was catching up.
 
 ## [2.0.43] - 2026-10-12
 

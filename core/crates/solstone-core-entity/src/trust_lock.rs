@@ -212,6 +212,20 @@ pub(crate) fn hold_entity_trust_lock_with_options(
     }
 }
 
+/// Whether this thread holds the entity trust lock, directly or through the
+/// facet trust lock. A caller that must not wait on another journal lock while
+/// trust is held (the index writer lease is taken before trust) checks this.
+pub fn entity_trust_held_by_current_thread(journal_root: &Path) -> bool {
+    let Ok(lock_path) = contained_path(journal_root, TRUST_LOCK_RELATIVE_PATH) else {
+        return false;
+    };
+    let owner = thread::current().id();
+    matches!(
+        lock_state(coordinator()).get(&lock_path),
+        Some(TrustLockState::Held { owner: held_owner, .. }) if *held_owner == owner
+    )
+}
+
 /// Acquire the raw entity trust-lock file directly, bypassing the in-process
 /// reentrant coordinator `hold_entity_trust_lock` uses. Exists so integration
 /// tests in other crates can simulate the trust lock already held by another

@@ -32,6 +32,7 @@
 //! - backup `NativeJournalMaintenance::full_scan`
 //! - segment move prune+rescan
 //! - retention `RetentionIndex::paths_removed` via `notify_index` (transcripts delete, strava delete while `imports/.strava` is held, `release_misplaced_strava_pieces`)
+//! - facets store saved activity and detection day files (`publish_saved`), after the store's own trust guards drop, and skipped while the thread still holds entity trust
 //!
 //! Read-only, no lease:
 //! - `open_index_reader`
@@ -47,7 +48,7 @@
 //! - `open_index` exists only in unit-test builds or with `test-fixtures`.
 //!
 //! Lock Order:
-//! Doctor file mutation is entity/facet trust, then release, then this lease.
+//! Doctor file mutation and facets store saves are entity/facet trust, then release, then this lease.
 //! Reconciliation is the facet-reconcile single-flight lock, then this lease, then entity/facet trust for the snapshot only.
 //! Daily-unit, segment-turn, `imports/.strava`, and `imports/<id>.lock` stay outside and before this lease.
 //! Nested prune, classify, and rebuild take `&IndexAdmission` and must not call `hold_lock`.
