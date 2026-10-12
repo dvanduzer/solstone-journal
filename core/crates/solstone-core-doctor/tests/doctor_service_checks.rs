@@ -356,7 +356,8 @@ fn run_poison_battery_child(root: &Path) {
             ("service_identity", Status::Skip),
             ("service_running", Status::Skip),
             ("journal_sync", Status::Ok),
-            ("journal_caught_up", Status::Ok),
+            // No whole-journal inspection has reported for this empty journal.
+            ("journal_caught_up", Status::Warn),
             ("journal_durability", Status::Ok),
             ("search_index", Status::Ok),
             ("journal_sources_readable", Status::Skip),

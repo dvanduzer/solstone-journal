@@ -655,6 +655,16 @@ fn staged_coverage_result(name: &str, ok: bool) -> CheckResult {
             }
         }
         "journal_caught_up" => {
+            // Caught up needs a fresh, complete whole-journal inspection with
+            // nothing owed; both branches have one, so the non-OK branch is the
+            // recent backlog, not a missing inspection.
+            solstone_core_system::work_inventory::WorkInventory {
+                as_of_ms: context.now.timestamp_millis(),
+                complete: true,
+                ..Default::default()
+            }
+            .publish(&context.journal_path)
+            .unwrap();
             if !ok {
                 stage_backlog_pending(&context);
             }
