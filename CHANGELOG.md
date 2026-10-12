@@ -28,6 +28,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - on mac and windows, the health page no longer lists "original media cleanup" as scheduled, and your journal no longer starts it every day. offload isn't available there in this version, so each run stopped without doing anything.
 - your activities, and the people and things your journal detects in each facet, now show up in search as soon as they're saved. before, they waited for your journal's daily search update, and until then the health page said search was catching up.
 - when two of your journal's thinking runs finished at the same moment, their entries in that day's record of runs could get mixed together. `solstone call health` then warned that the record couldn't be fully read and stopped counting the runs that failed in the last day, for good. each entry is now written whole, and a mixed-up entry in a record that hasn't changed in the last day no longer stops the count.
+- a facet's entity review for a day could stop for good when one entity it added was named by another's alias, for example Ali, and Alice Smith with the alias Ali, or when two of them shared an alias. the later one now leaves that alias out, and the review finishes.
+- if a review already stopped this way, `solstone journal reprocess DAY --unit entities:entities_review --facet FACET` now runs it again, and `solstone journal doctor` names that command. what the stopped review already added stays. before, the command said the review couldn't be retried, and nothing else could finish it.
+- when another daily step stopped after its automatic retry, `solstone journal doctor` suggested `solstone journal reprocess --unit`, which refuses that step. it now suggests redoing the day with `--from-scratch`.
 
 ## [2.0.43] - 2026-10-12
 

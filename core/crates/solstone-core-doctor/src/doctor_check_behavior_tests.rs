@@ -3477,7 +3477,7 @@ fn journal_caught_up_names_any_daily_unit_stopped_by_an_owner_change() {
     assert_eq!(
         row.fix.as_deref(),
         Some(
-            "schedule stopped on 20251230 after its automatic retry; run solstone journal reprocess 20251230 --unit schedule"
+            "schedule stopped on 20251230 after its automatic retry; run solstone journal reprocess 20251230 --from-scratch"
         )
     );
 
@@ -3889,7 +3889,8 @@ fn journal_caught_up_outside_window_exhausted_and_ambiguous_scenarios() {
     );
     assert!(!fix_amb.contains("--unit"), "{fix_amb}");
 
-    // 4. If unit has committed owner action without started left: recorded change message, no --unit
+    // 4. A conflict found before its write, after earlier changes committed,
+    // is retried as a unit; the new preparation keeps what committed.
     record.receipts.clear();
     record.receipts.push(serde_json::json!({
         "kind": "owner_action",
@@ -3900,13 +3901,12 @@ fn journal_caught_up_outside_window_exhausted_and_ambiguous_scenarios() {
     let row_cm = result("journal_caught_up", &c);
     assert_eq!(row_cm.status, Status::Warn);
     let fix_cm = row_cm.fix.as_deref().unwrap_or_default();
-    assert!(
-        fix_cm.contains("entities:entities_review recorded a change on 20251001/work; resolve the recorded change before that day is redone"),
-        "unexpected fix: {fix_cm}"
+    assert_eq!(
+        fix_cm,
+        "entities:entities_review stopped on 20251001/work with reason alias_claimed; run solstone journal reprocess 20251001 --unit entities:entities_review --facet work"
     );
-    assert!(!fix_cm.contains("--unit"), "{fix_cm}");
 
-    // A confirmed started/committed pair is a recorded change, not ambiguity.
+    // A confirmed started/committed pair is a committed change, not ambiguity.
     record.receipts.insert(
         0,
         serde_json::json!({
@@ -3915,14 +3915,19 @@ fn journal_caught_up_outside_window_exhausted_and_ambiguous_scenarios() {
     );
     solstone_core_journal_io::save_daily_unit_record(root, &record).unwrap();
     let paired = result("journal_caught_up", &c);
-    assert!(paired.fix.as_deref().unwrap().contains("recorded a change"));
+    assert_eq!(paired.fix.as_deref(), Some(fix_cm));
+
+    // A recorded change a unit retry can't take names no retry.
+    record.owner_conflict_kind = None;
+    solstone_core_journal_io::save_daily_unit_record(root, &record).unwrap();
+    let unknown = result("journal_caught_up", &c);
+    let fix_unknown = unknown.fix.as_deref().unwrap_or_default();
     assert!(
-        !paired
-            .fix
-            .as_deref()
-            .unwrap()
-            .contains("did not confirm completion")
+        fix_unknown.contains("entities:entities_review recorded a change on 20251001/work; resolve the recorded change before that day is redone"),
+        "unexpected fix: {fix_unknown}"
     );
+    assert!(!fix_unknown.contains("--unit"), "{fix_unknown}");
+    record.owner_conflict_kind = Some("alias_claimed".into());
 
     let record_path = solstone_core_journal_io::daily_unit_record_path(root, &identity);
     for (field, value, expected) in [
