@@ -3360,6 +3360,8 @@ impl<'a> AdmittedArchive<'a> {
     /// Force an archive of retained prepared inputs using their exact native
     /// transport. The caller keeps every prepared file and stage on refusal.
     /// Success still requires exact snapshot content readback before proof use.
+    /// macOS sources are anchored relative paths, which only the owned creator
+    /// can run, so they refuse here.
     pub fn archive_owned(
         &mut self,
         sources: &[ArchiveSource<'_>],
@@ -4813,7 +4815,9 @@ mod tests {
             }
         }
 
-        #[cfg(all(test, feature = "full-tests", unix))]
+        // macOS sources are relative to an anchor only the owned creator holds;
+        // this generic runner refuses them.
+        #[cfg(all(test, feature = "full-tests", unix, not(target_os = "macos")))]
         mod owned_sources {
             use super::*;
             use solstone_core_journal_io::media::{

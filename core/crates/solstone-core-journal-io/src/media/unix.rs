@@ -266,6 +266,7 @@ pub(super) fn entry_from_file(name: &OsStr, file: &File) -> io::Result<MediaEntr
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(super) fn archive_path(directory: &Directory, name: &OsStr) -> io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {

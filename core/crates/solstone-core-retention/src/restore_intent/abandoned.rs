@@ -9,7 +9,8 @@
 //! so nothing is counted twice. Any other published state is held. A restore
 //! that ended mid-download, before its intent, is recognised only by its
 //! dedicated download leaf and loses that stage the same way, as does an
-//! approval or offer readback at the journal root by its own leaf.
+//! approval or offer readback at the journal root by its own leaf, and an
+//! offload producer's copy at the journal root, whose original never moved.
 
 use std::sync::Arc;
 
@@ -80,8 +81,10 @@ mod local {
         IntentRead, NativeObligation, intent_filename, observe_obligations,
     };
     use solstone_core_journal_io::media::{
-        Cleanup, Confirmation, MediaDirectory, MediaEntry, MediaStage, OriginalName, RemovalEffect,
-        digest_reader, exclusive_local_activity, retire_recorded_stage, retire_unrecorded_stage,
+        Cleanup, Confirmation, MediaDirectory, MediaEntry, MediaStage, OriginalName,
+        REMOVAL_ORIGINAL_LEAF, REMOVAL_RECORD_LEAF, RemovalEffect, digest_reader,
+        exclusive_local_activity, retire_recorded_stage, retire_unrecorded_stage,
+        retire_unrecorded_stage_where,
     };
 
     use super::super::{MarkRetirement, Obligation, RESTORE_DOWNLOAD_LEAF, selected_name};
@@ -126,8 +129,9 @@ mod local {
 
     /// A restore, legacy probe or approval readback that ended mid-download
     /// leaves a stage holding only its dedicated download leaf, or nothing if it
-    /// ended before creating it. Only such a stage, where that producer stages
-    /// and named by no intent, is removed.
+    /// ended before creating it. An offload producer that ended mid-run leaves
+    /// a root stage holding one copy of an original that never moved. Only such
+    /// a stage, where that producer stages and named by no intent, is removed.
     fn retire_unrecorded_downloads(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
         let Ok(census) = observe_obligations(activity.journal_root()) else {
             return Vec::new();
@@ -163,13 +167,22 @@ mod local {
             .filter_map(|((parent, leaf), entry)| {
                 let parent =
                     MediaDirectory::open(Arc::clone(activity.journal_root()), &parent).ok()?;
-                retire_unrecorded_stage(
-                    activity,
-                    &parent,
-                    &entry.name,
-                    entry.identity,
-                    OsStr::new(leaf),
-                )
+                match leaf {
+                    Leaf::Download(leaf) => retire_unrecorded_stage(
+                        activity,
+                        &parent,
+                        &entry.name,
+                        entry.identity,
+                        OsStr::new(leaf),
+                    ),
+                    Leaf::RootCopy => retire_unrecorded_stage_where(
+                        activity,
+                        &parent,
+                        &entry.name,
+                        entry.identity,
+                        &root_copy,
+                    ),
+                }
                 .ok()
                 .filter(|retired| *retired)
                 .map(|_| AbandonedRestore {
@@ -180,11 +193,31 @@ mod local {
             .collect()
     }
 
-    /// Where a download stage may sit, with the only leaf it may hold there.
-    /// Restores stage in a segment's parent: a day directory, or a stream
-    /// directory under it. Approval and offer readback stage at the journal
-    /// root. Never a segment or anywhere else.
-    fn download_stage_location(relative: &Path) -> Option<(PathBuf, &'static str)> {
+    enum Leaf {
+        Download(&'static str),
+        RootCopy,
+    }
+
+    /// At the root: a readback download, or an offload producer's copy under
+    /// its original's name. A name any other stage producer uses stays held,
+    /// including `payload`, which an earlier version's readback used.
+    fn root_copy(name: &OsStr) -> bool {
+        name == READBACK_DOWNLOAD_LEAF
+            || ![
+                "payload",
+                RESTORE_DOWNLOAD_LEAF,
+                REMOVAL_ORIGINAL_LEAF,
+                REMOVAL_RECORD_LEAF,
+            ]
+            .iter()
+            .any(|held| name == *held)
+    }
+
+    /// Where a download stage may sit, with what it may hold there. Restores
+    /// stage in a segment's parent: a day directory, or a stream directory
+    /// under it. Approval and offer readback, and the offload producer's
+    /// copies, stage at the journal root. Never a segment or anywhere else.
+    fn download_stage_location(relative: &Path) -> Option<(PathBuf, Leaf)> {
         let parts = relative
             .components()
             .map(|part| match part {
@@ -195,14 +228,15 @@ mod local {
         let day = |name: &str| name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit());
         let stream = |name: &str| !name.starts_with('.') && segment_key(name).is_none();
         match parts.as_slice() {
-            [_] => Some((PathBuf::new(), READBACK_DOWNLOAD_LEAF)),
-            ["chronicle", day_name, _] if day(day_name) => {
-                Some((Path::new("chronicle").join(day_name), RESTORE_DOWNLOAD_LEAF))
-            }
+            [_] => Some((PathBuf::new(), Leaf::RootCopy)),
+            ["chronicle", day_name, _] if day(day_name) => Some((
+                Path::new("chronicle").join(day_name),
+                Leaf::Download(RESTORE_DOWNLOAD_LEAF),
+            )),
             ["chronicle", day_name, stream_name, _] if day(day_name) && stream(stream_name) => {
                 Some((
                     Path::new("chronicle").join(day_name).join(stream_name),
-                    RESTORE_DOWNLOAD_LEAF,
+                    Leaf::Download(RESTORE_DOWNLOAD_LEAF),
                 ))
             }
             _ => None,

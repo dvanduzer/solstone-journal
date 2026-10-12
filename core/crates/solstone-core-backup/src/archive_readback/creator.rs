@@ -72,9 +72,9 @@ enum WriterProgress {
     NoWriter,
     Submitted,
     Accepted,
-    // Read only by the Linux x86_64 settlement below.
+    // Read only by the Linux x86_64 and macOS settlement below.
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
+        not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")),
         allow(dead_code)
     )]
     Refused(ReadbackError),
@@ -170,7 +170,14 @@ impl ArchivePredecessorCustody {
                 Err(ReadbackError::UnsupportedToolVersion)
             }
         }
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        // No byte pin on macOS (see `pinned_member`): the manifest member,
+        // revalidated around every use, reported the supported version.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = member;
+            Ok(())
+        }
+        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
         {
             let _ = member;
             Err(ReadbackError::Unsupported)
@@ -187,9 +194,9 @@ impl ArchivePredecessorCustody {
             self.capture.repository_id = Some(id.to_owned());
         }
     }
-    // Direct readback qualifies only on Linux x86_64.
+    // Direct readback qualifies only on Linux x86_64 and macOS.
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
+        not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")),
         allow(dead_code)
     )]
     pub(super) fn qualify_settlement(&self) -> Result<(), ReadbackError> {
@@ -445,18 +452,33 @@ impl OwnedArchiveCreator {
         let mut names = std::collections::BTreeSet::new();
         if sources.is_empty()
             || sources.iter().any(|source| {
-                !source.path().is_absolute()
+                !anchored_path(source)
                     || source.path().to_str().is_none()
                     || source.path().file_name() != Some(source.name())
                     || source
                         .name()
                         .to_str()
                         .is_none_or(|name| !plain_name(name) || !names.insert(name))
-                    || source.descriptor().is_none()
             })
         {
             return Err(ReadbackError::InvalidSelection);
         }
+        #[cfg(target_os = "macos")]
+        let (anchor, core) = {
+            use std::os::fd::AsRawFd;
+            let anchor = sources[0].anchor();
+            if sources
+                .iter()
+                .any(|source| source.anchor().as_raw_fd() != anchor.as_raw_fd())
+            {
+                return Err(ReadbackError::InvalidSelection);
+            }
+            let core = solstone_core_installed_payload::resolve_current_member(
+                crate::owned_creator::CORE_MEMBER,
+            )
+            .map_err(|_| ReadbackError::ToolUnavailable)?;
+            (anchor, core)
+        };
         self.revalidate_sources(sources)?;
         self.read.read.check_repository()?;
         self.read.read.check_repository()?;
@@ -465,8 +487,20 @@ impl OwnedArchiveCreator {
             .prepared_operation()
             .budget()
             .remaining(self.prepared_operation().clock())?;
+        #[cfg(not(target_os = "macos"))]
+        let (program, argv) = (self.read.read.member.path().as_os_str().to_owned(), argv);
+        #[cfg(target_os = "macos")]
+        let (program, argv) = {
+            revalidate_core(&core)?;
+            let mut wrapped = vec![
+                crate::owned_creator::ENTRY.into(),
+                self.read.read.member.path().as_os_str().to_owned(),
+            ];
+            wrapped.extend(argv);
+            (core.path().as_os_str().to_owned(), wrapped)
+        };
         let request = Request {
-            program: self.read.read.member.path().as_os_str().to_owned(),
+            program,
             argv,
             env: self.read.read.env.clone(),
             timeout: Some(timeout),
@@ -489,8 +523,16 @@ impl OwnedArchiveCreator {
             };
             custody.capture.archives[index].effects = effects.clone();
         }
+        #[cfg(not(target_os = "macos"))]
         let child = bounded_child::run_owned_archive_creator(
             &request,
+            Some(64 * 1024 * 1024),
+            self.prepared_operation().budget().cancellation(),
+        );
+        #[cfg(target_os = "macos")]
+        let child = bounded_child::run_owned_archive_creator_at(
+            &request,
+            anchor,
             Some(64 * 1024 * 1024),
             self.prepared_operation().budget().cancellation(),
         );
@@ -504,6 +546,8 @@ impl OwnedArchiveCreator {
             observed_snapshot_id: snapshot.clone(),
         };
         self.revalidate_sources(sources)?;
+        #[cfg(target_os = "macos")]
+        revalidate_core(&core)?;
         let child = child.map_err(|_| self.read.read.execution_error())?;
         self.read.read.check_repository()?;
         self.read.read.check_repository()?;
@@ -520,6 +564,32 @@ impl OwnedArchiveCreator {
             snapshot_id,
         })
     }
+}
+
+/// Linux reads each source through its stage's descriptor; macOS reads
+/// `<stage>/<name>` from inside the stage parent the child starts in.
+#[cfg(unix)]
+fn anchored_path(source: &ArchiveSource<'_>) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        source.path().is_absolute() && source.descriptor().is_some()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut components = source.path().components();
+        matches!(
+            (components.next(), components.next(), components.next()),
+            (Some(std::path::Component::Normal(stage)), Some(std::path::Component::Normal(_)), None)
+                if stage.to_str().is_some_and(|stage| stage.starts_with(".tmp-offload-") && plain_name(stage))
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn revalidate_core(
+    core: &solstone_core_installed_payload::CurrentInstalledMember,
+) -> Result<(), ReadbackError> {
+    core.revalidate().map_err(|_| ReadbackError::ToolChanged)
 }
 
 #[cfg(unix)]

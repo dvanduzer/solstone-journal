@@ -27,7 +27,7 @@ pub use activity_carrier::{
     ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,
     RootActivityCarrier, RootCarrierObservation, RootTeardownCarrier,
     TeardownCarrierPreparationFailure, exclusive_local_activity, retire_orphan_root_carriers,
-    retire_recorded_stage, retire_unrecorded_stage,
+    retire_recorded_stage, retire_unrecorded_stage, retire_unrecorded_stage_where,
 };
 mod observation;
 pub use observation::{MediaEntry, MediaRead};
@@ -810,6 +810,14 @@ impl ArchiveSource<'_> {
         }
     }
 
+    /// macOS can't traverse a directory descriptor by path, so the helper is
+    /// started inside this held stage parent and reads `path()` relative to it.
+    #[cfg(target_os = "macos")]
+    pub fn anchor(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.prepared.target.stage.parent.inner.as_fd()
+    }
+
     pub fn revalidate(&self) -> io::Result<()> {
         self.prepared.revalidate_source()
     }
@@ -879,6 +887,12 @@ impl PreparedMedia {
         self.revalidate_source()?;
         let directory = self.target.stage.directory.as_ref().ok_or_else(changed)?;
         let leaf = self.target.stage.leaf.as_ref().ok_or_else(changed)?;
+        #[cfg(target_os = "macos")]
+        let path = {
+            let _ = directory;
+            Path::new(&self.target.stage.name).join(&leaf.name)
+        };
+        #[cfg(not(target_os = "macos"))]
         let path = platform::archive_path(&directory.inner, &leaf.name)?;
         Ok(ArchiveSource {
             prepared: self,
