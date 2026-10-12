@@ -4581,6 +4581,28 @@ mod runtime_fetch_seam_tests {
     }
 }
 
+/// A Windows host resolves the local target from the signed package, so these
+/// cross-platform admission tests stand in the mock package there; without it
+/// every eligible admission stops at `package_unavailable` before acquisition.
+#[cfg(all(feature = "full-tests", target_os = "windows"))]
+struct WindowsMockPackageGuard;
+
+#[cfg(all(feature = "full-tests", target_os = "windows"))]
+impl WindowsMockPackageGuard {
+    fn install() -> Self {
+        use crate::install::windows_engine::{WindowsLlamaPackage, set_test_windows_llama_package};
+        set_test_windows_llama_package(Some(WindowsLlamaPackage::mock()));
+        Self
+    }
+}
+
+#[cfg(all(feature = "full-tests", target_os = "windows"))]
+impl Drop for WindowsMockPackageGuard {
+    fn drop(&mut self) {
+        crate::install::windows_engine::set_test_windows_llama_package(None);
+    }
+}
+
 #[test]
 #[cfg(feature = "full-tests")]
 fn windows_admission_enforces_gpu_verdict_before_local_target() {
@@ -4589,6 +4611,8 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
         LocalHardwareAdmission, TEST_ACQUIRER_SHORT_CIRCUIT, TEST_FETCH_RUNTIME_MEMBER_COUNT,
         TEST_INSTALL_MODEL_COUNT, run_local_with_gpu_admission,
     };
+    #[cfg(target_os = "windows")]
+    let _package = WindowsMockPackageGuard::install();
 
     let root = temp("win-admission-routine");
     let mut object = serde_json::Map::new();
@@ -5162,6 +5186,8 @@ fn dispatch_run_local_forwards_injected_hardware_admission() {
         TEST_ACQUIRER_SHORT_CIRCUIT, TEST_FETCH_RUNTIME_MEMBER_COUNT, TEST_INSTALL_MODEL_COUNT,
         dispatch,
     };
+    #[cfg(target_os = "windows")]
+    let _package = WindowsMockPackageGuard::install();
 
     let root = temp("dispatch-admission-forward");
     let request = json!({
@@ -5284,6 +5310,8 @@ fn dispatch_run_local_preserves_configured_gpu_selection() {
         AcquisitionTestGuard, LocalHardwareAdmission, LocalHardwareAdmissionTestGuard,
         TEST_FETCH_RUNTIME_MEMBER_COUNT, TEST_INSTALL_MODEL_COUNT,
     };
+    #[cfg(target_os = "windows")]
+    let _package = WindowsMockPackageGuard::install();
     for (selection, reason) in [
         (json!("1"), None),
         (json!(0), Some("gpu_memory_insufficient")),
