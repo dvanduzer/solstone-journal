@@ -781,8 +781,10 @@ pub(super) fn shared_storage() -> io::Error {
 fn local_storage(kind: nix::sys::statfs::FsType) -> bool {
     use nix::sys::statfs::{
         BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, F2FS_SUPER_MAGIC, FsType, OVERLAYFS_SUPER_MAGIC,
-        TMPFS_MAGIC, XFS_SUPER_MAGIC,
+        TMPFS_MAGIC,
     };
+    // nix gates XFS_SUPER_MAGIC out on musl, which the release builds use.
+    const XFS_SUPER_MAGIC: FsType = FsType(0x5846_5342);
     const ZFS_SUPER_MAGIC: FsType = FsType(0x2fc1_2fc1);
     [
         EXT4_SUPER_MAGIC,
