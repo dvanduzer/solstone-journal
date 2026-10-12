@@ -64,26 +64,36 @@ pub fn unit_for_output(journal: &Path, output: &Path, handler: &str) -> Result<U
 /// The header stays bounded and read errors remain errors, never an absent
 /// processing record that could manufacture a fresh attempt.
 fn header(output: &Path) -> Result<Value, String> {
+    bounded_header(output)?.ok_or_else(|| "native processing header is incomplete".into())
+}
+
+/// `None` when the first row fills the bound: like any sidecar, that file has no
+/// readable record. A shorter row without its newline is still an error.
+fn bounded_header(output: &Path) -> Result<Option<Value>, String> {
+    let bound = solstone_core_processing_record::vocab::MAX_FIRST_ROW_BYTES;
     let file = std::fs::File::open(output).map_err(|e| e.to_string())?;
-    let mut reader = std::io::BufReader::new(
-        file.take(solstone_core_processing_record::vocab::MAX_FIRST_ROW_BYTES as u64),
-    );
+    let mut reader = std::io::BufReader::new(file.take(bound as u64));
     let mut row = Vec::new();
     reader
         .read_until(b'\n', &mut row)
         .map_err(|e| e.to_string())?;
     if row.last() != Some(&b'\n') {
+        if row.len() == bound {
+            return Ok(None);
+        }
         return Err("native processing header is incomplete".into());
     }
     let header: Value = serde_json::from_slice(&row).map_err(|e| e.to_string())?;
     if !header.is_object() {
         return Err("native processing header is not an object".into());
     }
-    Ok(header)
+    Ok(Some(header))
 }
 
 pub fn inspect_output(journal: &Path, output: &Path) -> Result<Option<Evidence>, String> {
-    let header = header(output)?;
+    let Some(header) = bounded_header(output)? else {
+        return Ok(None);
+    };
     let Some(record) = header.get("_solstone_processing") else {
         return Ok(None);
     };

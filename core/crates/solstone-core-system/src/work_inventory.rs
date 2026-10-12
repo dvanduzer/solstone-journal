@@ -59,7 +59,13 @@ pub struct WorkInventory {
     pub bands: [BandProgress; 6],
     pub holds: Vec<WorkHold>,
     pub unreadable: Vec<String>,
+    /// When discovery will look again. A finished pass stays current until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_pass_ms: Option<i64>,
 }
+
+/// How long a snapshot stays current past its pass or its promised next one.
+pub const CURRENT_FOR_MS: i64 = 180_000;
 
 impl Default for WorkInventory {
     fn default() -> Self {
@@ -74,6 +80,7 @@ impl Default for WorkInventory {
             bands: std::array::from_fn(|_| BandProgress::default()),
             holds: Vec::new(),
             unreadable: Vec::new(),
+            next_pass_ms: None,
         }
     }
 }
@@ -81,6 +88,14 @@ impl Default for WorkInventory {
 impl WorkInventory {
     pub fn band(&mut self, band: WorkBand) -> &mut BandProgress {
         &mut self.bands[band as usize - 1]
+    }
+    /// Whether a reader may treat this snapshot as discovery's current view.
+    pub fn current_at(&self, now_ms: i64) -> bool {
+        let until = self
+            .next_pass_ms
+            .unwrap_or(self.as_of_ms)
+            .max(self.as_of_ms);
+        now_ms >= self.as_of_ms && now_ms - until < CURRENT_FOR_MS
     }
     pub fn publish(&self, journal: &Path) -> Result<(), String> {
         solstone_core_journal_io::write_json(
@@ -104,4 +119,23 @@ pub fn read(journal: &Path) -> Result<Option<WorkInventory>, String> {
         return Err("unrecognized work inventory".into());
     }
     Ok(Some(report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_pass_stays_current_until_the_next_one_is_due() {
+        let mut report = WorkInventory {
+            as_of_ms: 1_000_000,
+            ..WorkInventory::default()
+        };
+        assert!(report.current_at(1_000_000 + CURRENT_FOR_MS - 1));
+        assert!(!report.current_at(1_000_000 + CURRENT_FOR_MS));
+        assert!(!report.current_at(999_999));
+        report.next_pass_ms = Some(1_000_000 + 3_600_000);
+        assert!(report.current_at(1_000_000 + 3_600_000 + CURRENT_FOR_MS - 1));
+        assert!(!report.current_at(1_000_000 + 3_600_000 + CURRENT_FOR_MS));
+    }
 }

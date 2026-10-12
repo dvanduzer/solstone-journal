@@ -49,8 +49,7 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
     let inventory = solstone_core_system::work_inventory::read(&context.journal_path);
     let (summary, complete) = match inventory {
         Ok(Some(report)) => {
-            let age = context.now.timestamp_millis() - report.as_of_ms;
-            let fresh = (0..180_000).contains(&age);
+            let fresh = report.current_at(context.now.timestamp_millis());
             let owed = report.bands.iter().any(|band| {
                 band.segments_owed
                     + band.daily_units_owed

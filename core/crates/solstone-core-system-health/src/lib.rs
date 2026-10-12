@@ -99,8 +99,8 @@ pub use sync_copy::{
     describe_sync_rescan, format_admission_waiting_copy, format_sync_scan_failure_copy,
 };
 pub use terminal::{
-    is_floor_talent_capped, read_completed_since, read_completed_units,
-    read_daily_deterministic_failures, read_terminal_states,
+    is_floor_talent_capped, read_capped_segment_talents, read_completed_since,
+    read_completed_units, read_daily_deterministic_failures, read_terminal_states,
 };
 pub use types::{
     BacklogDay, BacklogError, BacklogUnit, BacklogView, BackoffSummary, CappedDailySummary,

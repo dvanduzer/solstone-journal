@@ -159,14 +159,7 @@ pub fn is_floor_talent_capped<S: HealthLogSource>(
     segment: &str,
     name: &str,
 ) -> Result<FoldRead<bool>, HealthError> {
-    let scanned = read_day_records(source, day)?;
-    let mut grouped = group_observed_terminals(
-        scanned
-            .value
-            .into_iter()
-            .map(|record| (day.to_owned(), record)),
-        None,
-    );
+    let capped = read_capped_segment_talents(source, day)?;
     let unit = TerminalUnit {
         day: day.to_owned(),
         mode: "segment".to_owned(),
@@ -176,35 +169,61 @@ pub fn is_floor_talent_capped<S: HealthLogSource>(
         segment: Some(segment.to_owned()),
         activity: None,
     };
-    let capped = grouped.remove(&unit).is_some_and(|terminals| {
-        let mut count = 0;
-        let mut latest_counted_ts = None;
-        let mut oldest_counted_ts = None;
-        for terminal in terminals.iter().rev() {
-            if terminal.event != TerminalEvent::Fail {
-                break;
-            }
-            if terminal.reason_code.as_deref().is_some_and(|code| {
-                code == "confidential_access_ended"
-                    || solstone_core_generate::is_attestation_family_reason(code)
-            }) {
-                continue;
-            }
-            count += 1;
-            if latest_counted_ts.is_none() {
-                latest_counted_ts = Some(terminal.ts);
-            }
-            oldest_counted_ts = Some(terminal.ts);
-        }
-        count >= CAP
-            && latest_counted_ts
-                .zip(oldest_counted_ts)
-                .is_some_and(|(latest, oldest)| latest - oldest >= MIN_SPAN_MS)
-    });
+    Ok(FoldRead {
+        value: capped.value.contains(&unit),
+        malformed_line_count: capped.malformed_line_count,
+    })
+}
+
+/// Every capped segment talent on one day, from one read of its logs. A caller
+/// checking many segments reads this once rather than once per segment.
+pub fn read_capped_segment_talents<S: HealthLogSource>(
+    source: &S,
+    day: &str,
+) -> Result<FoldRead<BTreeSet<TerminalUnit>>, HealthError> {
+    let scanned = read_day_records(source, day)?;
+    let grouped = group_observed_terminals(
+        scanned
+            .value
+            .into_iter()
+            .map(|record| (day.to_owned(), record)),
+        None,
+    );
+    let capped = grouped
+        .into_iter()
+        .filter(|(unit, terminals)| unit.mode == "segment" && trailing_failures_capped(terminals))
+        .map(|(unit, _)| unit)
+        .collect();
     Ok(FoldRead {
         value: capped,
         malformed_line_count: scanned.malformed_line_count,
     })
+}
+
+fn trailing_failures_capped(terminals: &[ObservedTerminal]) -> bool {
+    let mut count = 0;
+    let mut latest_counted_ts = None;
+    let mut oldest_counted_ts = None;
+    for terminal in terminals.iter().rev() {
+        if terminal.event != TerminalEvent::Fail {
+            break;
+        }
+        if terminal.reason_code.as_deref().is_some_and(|code| {
+            code == "confidential_access_ended"
+                || solstone_core_generate::is_attestation_family_reason(code)
+        }) {
+            continue;
+        }
+        count += 1;
+        if latest_counted_ts.is_none() {
+            latest_counted_ts = Some(terminal.ts);
+        }
+        oldest_counted_ts = Some(terminal.ts);
+    }
+    count >= CAP
+        && latest_counted_ts
+            .zip(oldest_counted_ts)
+            .is_some_and(|(latest, oldest)| latest - oldest >= MIN_SPAN_MS)
 }
 
 pub fn read_completed_units<S: HealthLogSource>(

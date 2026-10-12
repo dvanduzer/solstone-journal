@@ -914,6 +914,12 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   assert.strictEqual(section.querySelector('[data-work-bands]').children.length, 6);
   assert.strictEqual(section.querySelector('[data-work-confirm]').hidden, true);
   const stale = section.querySelector('[data-work-reach]').textContent;
+  // A finished pass resting until its next one is due is still current.
+  context.work.inventory.next_pass_ms = now + 600000;
+  vm.runInContext('renderWorkProgress(work)', context);
+  const resting = section.querySelector('[data-work-reach]').textContent;
+  assert.notStrictEqual(resting, stale);
+  delete context.work.inventory.next_pass_ms;
   context.work.inventory.as_of_ms = now;
   context.work.inventory.complete = false;
   vm.runInContext('renderWorkProgress(work)', context);

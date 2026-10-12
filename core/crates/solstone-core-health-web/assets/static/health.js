@@ -411,8 +411,9 @@
     const reach = section.querySelector('[data-work-reach]');
     const rows = section.querySelector('[data-work-bands]');
     rows.replaceChildren();
-    const fresh = inventory && Date.now() - inventory.as_of_ms >= 0
-      && Date.now() - inventory.as_of_ms < 180000;
+    // A finished pass stays current until its next one is due, as on the journal.
+    const fresh = inventory && Date.now() >= inventory.as_of_ms
+      && Date.now() - Math.max(inventory.as_of_ms, inventory.next_pass_ms ?? inventory.as_of_ms) < 180000;
     if (!inventory) {
       reach.textContent = 'the journal has not finished checking its work. keep it running to see progress here.';
     } else {
@@ -833,7 +834,8 @@
   function heldWorkVerdict() {
     const action = { href: '#processingHolds', label: 'view queued work' };
     const inventory = state.work?.inventory;
-    const workStale = inventory && (Date.now() - inventory.as_of_ms < 0 || Date.now() - inventory.as_of_ms >= 180000);
+    const workStale = inventory && !(Date.now() >= inventory.as_of_ms
+        && Date.now() - Math.max(inventory.as_of_ms, inventory.next_pass_ms ?? inventory.as_of_ms) < 180000);
     if (!state.heldWorkCurrent || workStale || state.work?.error) {
       return { key: 'HEALTH_GLANCE_WORK_UNAVAILABLE', vars: {}, action };
     }
@@ -848,7 +850,8 @@
     if (!section) return;
     const holds = [...queuedWorkHolds(state.heldWorkSnapshot), ...setAsideHolds()];
     const inventory = state.work?.inventory;
-    const workStale = inventory && (Date.now() - inventory.as_of_ms < 0 || Date.now() - inventory.as_of_ms >= 180000);
+    const workStale = inventory && !(Date.now() >= inventory.as_of_ms
+        && Date.now() - Math.max(inventory.as_of_ms, inventory.next_pass_ms ?? inventory.as_of_ms) < 180000);
     const current = state.heldWorkCurrent && !workStale && !state.work?.error;
     section.hidden = current && holds.length === 0;
     section.dataset.current = String(current);

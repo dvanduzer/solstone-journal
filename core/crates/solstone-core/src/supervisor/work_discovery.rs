@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use solstone_core_import::thinking::{Coordinate, ImportThinking};
 use solstone_core_journal_config::work_priority::{WorkBand, WorkPriority};
@@ -25,6 +25,18 @@ use solstone_core_system::{
     work_retry::{self, Unit},
 };
 
+/// The least time between automatic passes.
+const MIN_REST: Duration = Duration::from_secs(60);
+/// An automatic pass then rests nine times as long as it ran, so on any journal
+/// discovery holds at most a tenth of one core. A request still wakes it at once.
+const REST_PER_PASS: u32 = 9;
+/// How often a pass publishes its progress before it finishes.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+fn rest_after(pass: Duration) -> Duration {
+    MIN_REST.max(pass * REST_PER_PASS)
+}
+
 pub(crate) struct WorkDiscovery {
     stopped: Arc<AtomicBool>,
     wake: mpsc::SyncSender<()>,
@@ -32,7 +44,9 @@ pub(crate) struct WorkDiscovery {
 
 impl WorkDiscovery {
     pub fn new(journal: PathBuf, queue: TaskQueue, automatic: bool) -> Self {
-        Self::with_reconciler(journal, queue, automatic, reconcile)
+        Self::with_reconciler(journal, queue, automatic, move |journal, queue, stopped| {
+            reconcile_pass(journal, queue, stopped, automatic)
+        })
     }
 
     fn with_reconciler(
@@ -57,6 +71,7 @@ impl WorkDiscovery {
                     if worker_stop.load(Ordering::Acquire) {
                         return;
                     }
+                    let started = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if initial {
                             solstone_core_system::catchup::reconcile_stale_catchup_attempts(
@@ -85,7 +100,8 @@ impl WorkDiscovery {
                         return;
                     }
                     if automatic {
-                        match receiver.recv_timeout(Duration::from_secs(60)) {
+                        let rest = rest_after(started.elapsed());
+                        match receiver.recv_timeout(rest) {
                             Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                             Err(mpsc::RecvTimeoutError::Disconnected) => return,
                         }
@@ -240,6 +256,7 @@ fn raw_retries(
     intent: Option<&OwnerIntent>,
     imports: &[ImportThinking],
     policy: WorkPolicy,
+    capped: &BTreeSet<solstone_core_system_health::TerminalUnit>,
     report: &mut WorkInventory,
 ) -> Result<Vec<DiscoveredTask>, String> {
     let directory = match segment.stream_layout {
@@ -270,18 +287,15 @@ fn raw_retries(
         if work_retry::read(journal, &unit.id()?)?.is_some() {
             continue;
         }
-        let capped = solstone_core_system_health::is_floor_talent_capped(
-            &solstone_core_system_health::FilesystemHealthLogSource::new(journal),
-            day,
-            Some(&segment.stream),
-            &segment.key,
-            talent,
-        )
-        .map_err(|e| e.to_string())?;
-        if capped.malformed_line_count != 0 {
-            return Err("floor failure evidence is unreadable".into());
-        }
-        if capped.value {
+        if capped.contains(&solstone_core_system_health::TerminalUnit {
+            day: day.into(),
+            mode: "segment".into(),
+            name: (*talent).into(),
+            facet: None,
+            stream: Some(segment.stream.clone()),
+            segment: Some(segment.key.clone()),
+            activity: None,
+        }) {
             match work_retry::input::current(journal, &unit) {
                 Ok(input) => work_retry::observe_held(journal, &unit, "floor_failed", &input)?,
                 Err(error) => report.unreadable.push(error),
@@ -609,13 +623,29 @@ fn inspect_day(
     if progress.malformed_line_count != 0 {
         return Err("segment progress contains unreadable records".into());
     }
+    // One read of the day's logs; never one per segment.
+    let capped = solstone_core_system_health::read_capped_segment_talents(
+        &solstone_core_system_health::FilesystemHealthLogSource::new(journal),
+        day,
+    )
+    .map_err(|error| error.to_string())?;
+    if capped.malformed_line_count != 0 {
+        return Err("floor failure evidence is unreadable".into());
+    }
     let mut prerequisites_ready = true;
     for segment in &segments {
         if super::tick::is_mcp_audit_segment(Some(&segment.stream)) {
             continue;
         }
         work.candidates.extend(raw_retries(
-            journal, day, segment, intent, imports, policy, report,
+            journal,
+            day,
+            segment,
+            intent,
+            imports,
+            policy,
+            &capped.value,
+            report,
         )?);
         let coordinate = Coordinate {
             day: day.into(),
@@ -889,7 +919,11 @@ fn admit(
     }
     let imports = solstone_core_import::thinking::read(journal)?;
     let mut current = Vec::new();
-    report.unreadable.extend(imports.unreadable.clone());
+    for error in &imports.unreadable {
+        if !report.unreadable.contains(error) {
+            report.unreadable.push(error.clone());
+        }
+    }
     if !imports.unreadable.is_empty() {
         report.complete = false;
     }
@@ -954,13 +988,53 @@ fn admit(
         }
     }
     if !stopped.load(Ordering::Acquire) {
-        report.publish(journal)?;
         queue.replace_discovered(current);
     }
     Ok(())
 }
 
+/// Fold the per-day snapshots into the published totals. Built only when it
+/// is about to be published: the holds grow with the journal.
+fn aggregate(
+    report: &mut WorkInventory,
+    day_reports: &BTreeMap<String, WorkInventory>,
+    import_errors: &[String],
+    days: &BTreeMap<String, PathBuf>,
+    days_inspected: usize,
+) {
+    report.bands = std::array::from_fn(|_| Default::default());
+    report.holds.clear();
+    report.unreadable = import_errors.to_vec();
+    for day_report in day_reports.values() {
+        for (total, day) in report.bands.iter_mut().zip(&day_report.bands) {
+            total.add(day);
+        }
+        report.holds.extend(day_report.holds.iter().cloned());
+        report
+            .unreadable
+            .extend(day_report.unreadable.iter().cloned());
+    }
+    report.days_inspected = days_inspected;
+    report.days_total = days.len();
+    report.oldest_day = days.keys().next().cloned();
+    report.newest_day = days.keys().next_back().cloned();
+    report.as_of_ms = chrono::Utc::now().timestamp_millis();
+}
+
+#[cfg(test)]
 fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<(), String> {
+    reconcile_pass(journal, queue, stopped, false)
+}
+
+/// An automatic pass says when the next one is due, so its snapshot stays
+/// current while discovery rests rather than being rewritten to look fresh.
+fn reconcile_pass(
+    journal: &Path,
+    queue: &TaskQueue,
+    stopped: &AtomicBool,
+    automatic: bool,
+) -> Result<(), String> {
+    let pass_started = Instant::now();
     let policy = WorkPolicy::read(journal)?;
     let mut days = solstone_core_journal_io::day_dirs(journal)
         .map_err(|error| error.to_string())?
@@ -1006,6 +1080,7 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
     report.unreadable.extend(held_errors);
     report.unreadable.extend(retry_errors);
     report.publish(journal)?;
+    let mut last_publish = Instant::now();
     let mut candidates = Vec::new();
     let mut day_reports = BTreeMap::<String, WorkInventory>::new();
     let import_errors = report.unreadable.clone();
@@ -1153,27 +1228,21 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
         }
         inspected.insert(day.clone());
         day_reports.insert(day, day_report);
-        report.bands = std::array::from_fn(|_| Default::default());
-        report.holds.clear();
-        report.unreadable = import_errors.clone();
-        for day_report in day_reports.values() {
-            for (total, day) in report.bands.iter_mut().zip(&day_report.bands) {
-                total.add(day);
-            }
-            report.holds.extend(day_report.holds.iter().cloned());
-            report
-                .unreadable
-                .extend(day_report.unreadable.iter().cloned());
-        }
-        report.days_inspected = inspected.len();
-        report.days_total = days.len();
-        report.oldest_day = days.keys().next().cloned();
-        report.newest_day = days.keys().next_back().cloned();
-        report.as_of_ms = chrono::Utc::now().timestamp_millis();
         if stopped.load(Ordering::Acquire) {
             return Ok(());
         }
-        report.publish(journal)?;
+        // Progress, not a rewrite of the whole inventory after every day.
+        if last_publish.elapsed() >= PROGRESS_INTERVAL {
+            aggregate(
+                &mut report,
+                &day_reports,
+                &import_errors,
+                &days,
+                inspected.len(),
+            );
+            report.publish(journal)?;
+            last_publish = Instant::now();
+        }
         if owner_wakeup
             || candidates.iter().any(|task| {
                 task.request
@@ -1198,6 +1267,13 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
             admit(journal, queue, stopped, early, &mut report)?;
         }
     }
+    aggregate(
+        &mut report,
+        &day_reports,
+        &import_errors,
+        &days,
+        inspected.len(),
+    );
     for import in imports.imports {
         let segments = import
             .segments
@@ -1214,13 +1290,14 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
         }
     }
     report.complete = report.unreadable.is_empty() && report.days_inspected == report.days_total;
-    report.as_of_ms = chrono::Utc::now().timestamp_millis();
+    admit(journal, queue, stopped, candidates, &mut report)?;
     if stopped.load(Ordering::Acquire) {
         return Ok(());
     }
-    report.publish(journal)?;
-    admit(journal, queue, stopped, candidates, &mut report)?;
-    Ok(())
+    report.as_of_ms = chrono::Utc::now().timestamp_millis();
+    report.next_pass_ms =
+        automatic.then(|| report.as_of_ms + rest_after(pass_started.elapsed()).as_millis() as i64);
+    report.publish(journal)
 }
 
 #[cfg(test)]
@@ -1347,6 +1424,7 @@ mod tests {
                 None,
                 &[],
                 local,
+                &BTreeSet::new(),
                 &mut report,
             )
             .unwrap();
@@ -1364,6 +1442,7 @@ mod tests {
                             None,
                             &[],
                             policy,
+                            &BTreeSet::new(),
                             &mut report
                         )
                         .unwrap()
@@ -1379,6 +1458,7 @@ mod tests {
                     Some(&intent),
                     &[],
                     own_keys,
+                    &BTreeSet::new(),
                     &mut WorkInventory::default(),
                 )
                 .unwrap();
@@ -1428,6 +1508,39 @@ mod tests {
             assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
             assert!(!queue.contains_reference("supervisor-work-20040101-daily"));
         }
+    }
+
+    #[test]
+    fn other_importers_records_and_oversized_capture_rows_leave_the_inventory_complete() {
+        let root = fixture("local");
+        segment(root.path(), "19990101", "120000_60");
+        // A captured page whose first row is longer than any processing header.
+        let row = serde_json::json!({"text": "x".repeat(64 * 1024)});
+        std::fs::write(
+            root.path()
+                .join("chronicle/19990101/notes/120000_60/browser_mail-example-com.jsonl"),
+            format!("{row}\n"),
+        )
+        .unwrap();
+        let import = root.path().join("imports/19990101_120000");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::write(
+            import.join("imported.json"),
+            serde_json::json!({
+                "processed_timestamp": "19990101_120000",
+                "target_day": "19990101",
+                "segments": ["120000_60"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        reconcile(root.path(), &queue(root.path()), &AtomicBool::new(false)).unwrap();
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert!(report.unreadable.is_empty(), "{:?}", report.unreadable);
+        assert_eq!(report.days_inspected, report.days_total);
+        assert!(report.complete);
     }
 
     #[test]

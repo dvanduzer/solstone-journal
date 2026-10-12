@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solstone_core_journal_io::{JsonWriteOptions, LockOptions, hold_lock, write_json};
 
-use crate::publish::{PUBLICATION_SCHEMA, SegmentBindingOutcome, read_publication_record};
+use crate::publish::{PUBLICATION_SCHEMA, PublicationRecord, SegmentBindingOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Coordinate {
@@ -87,10 +87,22 @@ pub(crate) fn prepare(directory: &Path) -> Result<(), String> {
 
 fn inspect(journal: &Path, id: &str) -> Result<Option<ImportThinking>, String> {
     let directory = journal.join("imports").join(id);
-    let Some(record) = read_publication_record(&directory).map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
+    let bytes = match std::fs::read(directory.join("imported.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
     };
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    // Other importers' records carry no publication schema and never asked for thinking.
+    if value
+        .as_object()
+        .is_some_and(|record| !record.contains_key("schema"))
+    {
+        return Ok(None);
+    }
+    let record: PublicationRecord =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
     if record.schema == crate::publish::LEGACY_PUBLICATION_SCHEMA {
         return Ok(None);
     }
@@ -307,6 +319,18 @@ mod tests {
             JsonWriteOptions::default(),
         )
         .unwrap();
+        assert_eq!(read(root.path()).unwrap().unreadable.len(), 1);
+        // The shapes earlier importers wrote: no schema, segments as bare keys.
+        for other in [
+            serde_json::json!({"processed_timestamp":"20250922_084053","target_day":"20250922","outputs":[]}),
+            serde_json::json!({"processed_timestamp":"20260429_112605","target_day":"20260429","source_type":"generic","segments":["112605_299","113104_300"]}),
+        ] {
+            std::fs::write(directory.join("imported.json"), other.to_string()).unwrap();
+            let inventory = read(root.path()).unwrap();
+            assert!(inventory.unreadable.is_empty());
+            assert!(inventory.imports.is_empty());
+        }
+        std::fs::write(directory.join("imported.json"), "{").unwrap();
         assert_eq!(read(root.path()).unwrap().unreadable.len(), 1);
     }
 
