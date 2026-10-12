@@ -137,6 +137,34 @@ pub fn bind_import_record(
     })
 }
 
+/// Read the semantic time that a later binding of these bytes will use.
+/// Planning never allocates an import directory.
+pub fn source_timestamp_for_preview(
+    journal_root: &Path,
+    requested: &Timestamp,
+    source: &Path,
+) -> Result<Timestamp, ImportError> {
+    // A web preview can choose a new date before its staged folder moves. The
+    // start boundary updates the semantic date when it performs that move.
+    if let Ok(relative) = source.strip_prefix(journal_root.join("imports")) {
+        let mut parts = relative.components();
+        if let (Some(id), Some(snapshot)) = (parts.next(), parts.next())
+            && id.as_os_str() != requested.as_str()
+            && snapshot
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with("preview-")
+        {
+            return Ok(requested.clone());
+        }
+    }
+    let hash = hash_source(source)?;
+    match matching_record_id(journal_root, requested, &hash)? {
+        Some(id) => source_timestamp_of(journal_root, &id),
+        None => Ok(requested.clone()),
+    }
+}
+
 /// The source time stored on a record.
 ///
 /// A record written by this allocator always has `source_timestamp`. A record

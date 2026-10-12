@@ -442,6 +442,19 @@ pub(crate) async fn detail(
     State(state): State<AppState>,
     AxumPath(timestamp): AxumPath<String>,
 ) -> Response {
+    if solstone_core_import::validate_timestamp(&timestamp).is_err() {
+        return import_not_found("Import not found");
+    }
+    match tokio::task::spawn_blocking(move || detail_sync(state, timestamp)).await {
+        Ok(response) => response,
+        Err(_) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":"could not read import progress"}),
+        ),
+    }
+}
+
+fn detail_sync(state: AppState, timestamp: String) -> Response {
     let Ok(info) = load_import_info(&state.root, &timestamp) else {
         return import_not_found("Import not found");
     };
@@ -556,6 +569,10 @@ pub(crate) async fn detail(
             .get("error_stage")
             .cloned()
             .unwrap_or(Value::Null),
+    );
+    body.insert(
+        "thinking".into(),
+        crate::progress::read(&state.root, &timestamp),
     );
     json_response(StatusCode::OK, Value::Object(body))
 }

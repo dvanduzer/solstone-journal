@@ -3,6 +3,7 @@
 
 //! Native generic audio import.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
 use std::io::{BufRead, BufReader};
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
-use chrono::{NaiveDateTime, Timelike};
+use chrono::{NaiveDateTime, TimeZone};
 use ffmpeg_next as ffmpeg;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -301,7 +302,7 @@ where
         });
     }
 
-    let count = (((duration + 299.0) / CHUNK_SECONDS).floor() as u64).max(1);
+    let count = chunk_count(duration);
     let source_extension = request
         .source_media
         .extension()
@@ -320,16 +321,6 @@ where
         }
     })?;
     let extension = extension.as_str();
-    let segment_parent = request
-        .journal_root
-        .join("chronicle")
-        .join(&request.day)
-        .join(&request.stream);
-    fs::create_dir_all(&segment_parent).map_err(|error| ImportError::AudioSegmentDirectory {
-        path: segment_parent.clone(),
-        message: error.to_string(),
-    })?;
-
     let mut created = Vec::new();
     let mut created_records = Vec::new();
     let mut files_created = Vec::new();
@@ -343,8 +334,19 @@ where
         } else {
             CHUNK_SECONDS
         };
-        let true_start = request.base_timestamp
-            + chrono::Duration::seconds((index * CHUNK_SECONDS as u64) as i64);
+        let true_start = chunk_start(&request, index)?;
+        let day = true_start.format("%Y%m%d").to_string();
+        let segment_parent = request
+            .journal_root
+            .join("chronicle")
+            .join(&day)
+            .join(&request.stream);
+        fs::create_dir_all(&segment_parent).map_err(|error| {
+            ImportError::AudioSegmentDirectory {
+                path: segment_parent.clone(),
+                message: error.to_string(),
+            }
+        })?;
         let key_duration = chunk_duration_seconds.ceil().max(1.0) as u64;
         let (segment, segment_dir, admitted) =
             match allocate_segment_directory(&request, &segment_parent, true_start, key_duration) {
@@ -379,7 +381,7 @@ where
                     platform: None,
                 };
                 created.push(CreatedSegment {
-                    day: request.day.clone(),
+                    day: day.clone(),
                     segment: segment.clone(),
                     stream: request.stream.clone(),
                     hints,
@@ -387,7 +389,7 @@ where
                 files_created.push(output.clone());
                 created_records.push(AudioImportRecordSegment {
                     key: segment.clone(),
-                    day: request.day.clone(),
+                    day: day.clone(),
                     stream: request.stream.clone(),
                     chunk_index: index,
                     start_offset_seconds,
@@ -402,7 +404,7 @@ where
                 });
                 observing.push(ObservingSegment {
                     segment,
-                    day: request.day.clone(),
+                    day: day.clone(),
                     files: vec![format!("imported_audio.{extension}")],
                     meta: ObservingMeta {
                         import_id: request.import_id.clone(),
@@ -676,6 +678,140 @@ pub fn audio_container_for_codec(codec: ffmpeg::codec::Id) -> Option<&'static st
     }
 }
 
+fn chunk_count(duration: f64) -> u64 {
+    ((duration + CHUNK_SECONDS - 1.0) / CHUNK_SECONDS)
+        .floor()
+        .max(1.0) as u64
+}
+
+fn chunk_start(request: &AudioImportRequest, index: u64) -> Result<NaiveDateTime, ImportError> {
+    let zone = solstone_core_journal_config::owner_zone(&request.journal_root);
+    // A timestamp without an offset chooses the first occurrence of a repeated
+    // local clock. Elapsed audio time then crosses DST in the owner's zone.
+    let start = zone
+        .from_local_datetime(&request.base_timestamp)
+        .earliest()
+        .ok_or_else(|| ImportError::AudioInputUnreadable {
+            path: request.source_media.clone(),
+            detail: "the import start time does not exist in your time zone".to_owned(),
+        })?;
+    Ok((start + chrono::Duration::seconds((index * CHUNK_SECONDS as u64) as i64)).naive_local())
+}
+
+/// Probe and plan generic audio without creating a segment or requesting a model.
+pub fn preview(
+    request: &AudioImportRequest,
+) -> Result<solstone_core_import::size::ImportSize, ImportError> {
+    let probe = native_source_probe(&request.source_media).map_err(|error| {
+        ImportError::AudioInputUnreadable {
+            path: request.source_media.clone(),
+            detail: format!("{error:?}"),
+        }
+    })?;
+    preview_with_probe(request, probe)
+}
+
+pub fn preview_with_probe(
+    request: &AudioImportRequest,
+    probe: AudioSourceProbe,
+) -> Result<solstone_core_import::size::ImportSize, ImportError> {
+    let duration = probe.duration_seconds;
+    if !duration.is_finite() || duration < 0.0 {
+        return Err(ImportError::AudioDurationUnavailable {
+            path: request.source_media.clone(),
+            detail: "duration probe returned a non-finite or negative value".to_owned(),
+        });
+    }
+    let extension = request
+        .source_media
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if probe.audio_codec.is_none() || chunk_extension(extension, probe.audio_codec).is_none() {
+        return Err(ImportError::AudioInputUnreadable {
+            path: request.source_media.clone(),
+            detail: "no supported audio track to import".to_owned(),
+        });
+    }
+    let mut recordings = BTreeSet::new();
+    for index in 0..chunk_count(duration) {
+        let start = chunk_start(request, index)?;
+        let day = start.format("%Y%m%d").to_string();
+        let remaining = duration - index as f64 * CHUNK_SECONDS;
+        let length = if index + 1 == chunk_count(duration) {
+            remaining
+        } else {
+            remaining.min(CHUNK_SECONDS)
+        }
+        .ceil()
+        .max(1.0) as u64;
+        let parent = request
+            .journal_root
+            .join("chronicle")
+            .join(&day)
+            .join(&request.stream);
+        let mut found = None;
+        for attempt in 0..COLLISION_FORWARD_PROBE_LIMIT {
+            let Some((segment, _)) = segment_candidate(request, &parent, start, length, attempt)?
+            else {
+                continue;
+            };
+            let recording = solstone_core_import::size::Recording {
+                day: day.clone(),
+                stream: request.stream.clone(),
+                segment,
+            };
+            if !recordings.contains(&recording) {
+                found = Some(recording);
+                break;
+            }
+        }
+        let recording = found.ok_or_else(|| ImportError::AudioSegmentCollision {
+            day,
+            stream: request.stream.clone(),
+            start: start.to_string(),
+            attempts: COLLISION_FORWARD_PROBE_LIMIT,
+        })?;
+        recordings.insert(recording);
+    }
+    Ok(solstone_core_import::size::ImportSize {
+        recordings,
+        ..Default::default()
+    })
+}
+
+fn segment_candidate(
+    request: &AudioImportRequest,
+    parent: &Path,
+    true_start: NaiveDateTime,
+    key_duration: u64,
+    attempt: u32,
+) -> Result<Option<(String, PathBuf)>, ImportError> {
+    let candidate = true_start + chrono::Duration::seconds(i64::from(attempt));
+    if candidate.date() != true_start.date() {
+        return Err(ImportError::AudioSegmentDayOverflow {
+            day: true_start.format("%Y%m%d").to_string(),
+            stream: request.stream.clone(),
+            start: true_start.to_string(),
+        });
+    }
+    let segment = format!("{}_{key_duration}", candidate.format("%H%M%S"));
+    let path = parent.join(&segment);
+    let occupied = solstone_core_journal_io::path_lexists(&path).map_err(|error| {
+        ImportError::AudioSegmentDirectory {
+            path: path.clone(),
+            message: error.to_string(),
+        }
+    })?;
+    let deleted = solstone_core_segment::owner_deleted(&path).map_err(|error| {
+        ImportError::AudioSegmentDirectory {
+            path: path.clone(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok((!occupied && !deleted).then_some((segment, path)))
+}
+
 fn allocate_segment_directory(
     request: &AudioImportRequest,
     parent: &Path,
@@ -683,34 +819,11 @@ fn allocate_segment_directory(
     key_duration: u64,
 ) -> Result<(String, PathBuf, solstone_core_journal_io::JournalRoot), ImportError> {
     for attempt in 0..COLLISION_FORWARD_PROBE_LIMIT {
-        let candidate = true_start + chrono::Duration::seconds(i64::from(attempt));
-        if candidate.format("%Y%m%d").to_string() != request.day {
-            return Err(ImportError::AudioSegmentDayOverflow {
-                day: request.day.clone(),
-                stream: request.stream.clone(),
-                start: true_start.format("%Y-%m-%dT%H:%M:%S").to_string(),
-            });
-        }
-        let segment = format!(
-            "{:02}{:02}{:02}_{key_duration}",
-            candidate.hour(),
-            candidate.minute(),
-            candidate.second()
-        );
-        let path = parent.join(&segment);
-        // A segment the owner is removing has been moved aside, so nothing sits at
-        // its name; claiming that name would put new audio where a deletion is in
-        // progress. Step past it, as past any segment already there.
-        match solstone_core_segment::owner_deleted(&path) {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(error) => {
-                return Err(ImportError::AudioSegmentDirectory {
-                    path,
-                    message: error.to_string(),
-                });
-            }
-        }
+        let Some((segment, path)) =
+            segment_candidate(request, parent, true_start, key_duration, attempt)?
+        else {
+            continue;
+        };
         let _allocation = solstone_core_segment::output_attempt::SegmentMutation::acquire(
             &path,
             solstone_core_journal_io::LockOptions::default(),

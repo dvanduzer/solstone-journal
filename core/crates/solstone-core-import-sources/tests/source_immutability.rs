@@ -153,6 +153,15 @@ fn image_import_preserves_source_and_records_its_segment_contract() {
     let source_mode = fs::metadata(&source).unwrap().permissions().mode() & 0o777;
     let mut progress = Vec::new();
 
+    let size = solstone_core_import_sources::image::preview_size(
+        &source,
+        &journal,
+        solstone_core_journal_config::owner_zone(&journal),
+    )
+    .unwrap();
+    assert_eq!(size.recordings.len(), 1);
+    assert_eq!(size.recordings.first().unwrap().segment, segment_key);
+    assert!(!journal.join("chronicle").exists());
     let report = observe_source_immutability(&source_root, |_| {
         let result = import_image(
             &source,

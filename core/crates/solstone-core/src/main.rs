@@ -1313,11 +1313,51 @@ fn run_streams(args: Vec<OsString>) -> ExitCode {
 fn run_importer(args: Vec<OsString>) -> ExitCode {
     run_storage_ops_verb("importer", args, |arguments, journal| {
         use solstone_core_import_host::cli_argv::CliOutcome;
+        let mut execution_arguments = arguments.to_vec();
+        let preview_args =
+            match solstone_core_import_host::cli_argv::preview_arguments(arguments, journal) {
+                Ok(args) => args,
+                Err(error) => {
+                    return (
+                        String::new(),
+                        format!("could not preview import: {error}\n"),
+                        1,
+                    );
+                }
+            };
+        if let Some(preview_args) = preview_args {
+            execution_arguments = preview_args[1..].to_vec();
+            let preview = match solstone_core_import_host::cli_argv::run_cli(&preview_args, journal)
+            {
+                CliOutcome::Rendered(run) => run,
+                CliOutcome::Registry(dispatch) => import_sources::run_bound(dispatch, journal).0,
+                CliOutcome::Imported { .. } => unreachable!("preview never admits an import"),
+            };
+            if preview.exit_code != 0 {
+                return (preview.stdout, preview.stderr, preview.exit_code);
+            }
+            use std::io::Write;
+            let mut notice: Box<dyn Write> = if arguments.iter().any(|arg| arg == "--json") {
+                Box::new(std::io::stderr())
+            } else {
+                Box::new(std::io::stdout())
+            };
+            if let Err(error) = notice
+                .write_all(preview.stdout.as_bytes())
+                .and_then(|()| notice.flush())
+            {
+                return (
+                    String::new(),
+                    format!("could not show import size: {error}\n"),
+                    1,
+                );
+            }
+        }
         let started_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
         let (run, import_id) =
-            match solstone_core_import_host::cli_argv::run_cli(arguments, journal) {
+            match solstone_core_import_host::cli_argv::run_cli(&execution_arguments, journal) {
                 CliOutcome::Rendered(run) => (run, None),
                 CliOutcome::Imported { run, import_id } => (run, Some(import_id)),
                 CliOutcome::Registry(dispatch) => import_sources::run_bound(dispatch, journal),

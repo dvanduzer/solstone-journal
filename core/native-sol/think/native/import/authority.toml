@@ -12,7 +12,7 @@ help = "Import media through the journal"
 operation_id = "import.top_level"
 entry_type = "top-level-import"
 handler = "import_top_level"
-backing_contract_operation_ids = ["import.save", "import.savePath", "import.start"]
+backing_contract_operation_ids = ["import.save", "import.savePath", "import.preview", "import.start"]
 params = [
   { name = "media", kind = "argument", type = "text", required = false, nargs = 1, multiple = false, options = ["media"], secondary = [], hidden = false, is_flag = false, count = false },
   { name = "extra", kind = "argument", type = "text", required = false, nargs = -1, multiple = false, options = ["extra"], secondary = [], hidden = true, is_flag = false, count = false },

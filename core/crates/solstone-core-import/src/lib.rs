@@ -21,6 +21,8 @@ pub mod heartbeat;
 pub mod metadata;
 pub mod projection;
 pub mod publish;
+pub mod size;
+pub mod snapshot;
 pub mod staging;
 pub mod stream_name;
 pub mod sync_audio;
@@ -33,7 +35,7 @@ pub mod timestamp;
 
 pub use allocate::{
     AllocatedImport, BoundImport, IMPORT_ID_PROBE_LIMIT, allocate_import_id, bind_import_record,
-    remember_source_hash, stored_source_timestamp,
+    remember_source_hash, source_timestamp_for_preview, stored_source_timestamp,
 };
 pub use connect::{OuraConnectOutcome, OuraConnectRequest, connect_oura};
 pub use consent_gate::{

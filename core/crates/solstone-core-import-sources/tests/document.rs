@@ -68,6 +68,25 @@ fn ac1_document_text_layer_imports_verbatim_with_zero_model_calls() {
         0.0,
         Some("Raw text\n"),
     )]))]);
+    let preview_worker = FakeWorker::new(vec![Ok(payload(vec![page(
+        1,
+        50,
+        0.0,
+        Some("Raw text\n"),
+    )]))]);
+    let preview = solstone_core_import_sources::document::preview_size(
+        solstone_core_import_sources::document::DocumentPreviewRequest {
+            source: &source,
+            password: None,
+            now: SystemTime::now(),
+            zone: solstone_core_journal_config::owner_zone(tree.journal()),
+        },
+        tree.journal(),
+        false,
+        &preview_worker,
+    )
+    .unwrap();
+    assert!(!tree.journal().join("chronicle").exists());
     let model = FakeModel::generated([]);
     let publication = FakePublication::default();
 
@@ -80,6 +99,15 @@ fn ac1_document_text_layer_imports_verbatim_with_zero_model_calls() {
         SystemTime::now(),
     );
 
+    assert_eq!(preview.recordings.len(), 1);
+    let coordinate = preview.recordings.first().unwrap();
+    assert_eq!(
+        (&coordinate.day, &coordinate.segment),
+        (
+            &result.segments.as_ref().unwrap()[0].0,
+            &result.segments.as_ref().unwrap()[0].1
+        )
+    );
     assert_eq!(result.entries_written, 1);
     assert!(model.requests().is_empty());
     assert_eq!(

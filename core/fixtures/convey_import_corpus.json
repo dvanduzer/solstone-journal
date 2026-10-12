@@ -1211,7 +1211,10 @@
             "processed": true
           },
           "status": "success",
-          "timestamp": "20260801_120000"
+          "timestamp": "20260801_120000",
+          "thinking": {
+            "status": "unavailable"
+          }
         },
         "method": "GET",
         "normalized_fields": [],
@@ -1246,7 +1249,10 @@
             "processed": false
           },
           "status": "failed",
-          "timestamp": "20260802_130000"
+          "timestamp": "20260802_130000",
+          "thinking": {
+            "status": "unavailable"
+          }
         },
         "method": "GET",
         "normalized_fields": [],
@@ -1277,7 +1283,10 @@
           },
           "imported_json": null,
           "status": "pending",
-          "timestamp": "20260803_140000"
+          "timestamp": "20260803_140000",
+          "thinking": {
+            "status": "not_published"
+          }
         },
         "method": "GET",
         "normalized_fields": [],

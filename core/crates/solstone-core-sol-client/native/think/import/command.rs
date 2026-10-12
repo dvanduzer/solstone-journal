@@ -20,6 +20,24 @@ const HELP: &str = "usage: solstone import [-h] [--timestamp TIMESTAMP] [--setti
 
 #[must_use]
 pub fn import_top_level(ctx: CommandContext<'_>) -> CommandOutput {
+    import_with_preview(ctx, &mut |text, json| {
+        use std::io::Write;
+        // Keep --json stdout one document. Human progress goes to stderr in that mode.
+        let mut output: Box<dyn Write> = if json {
+            Box::new(std::io::stderr())
+        } else {
+            Box::new(std::io::stdout())
+        };
+        output
+            .write_all(text.as_bytes())
+            .and_then(|()| output.flush())
+    })
+}
+
+fn import_with_preview(
+    ctx: CommandContext<'_>,
+    announce: &mut dyn FnMut(&str, bool) -> std::io::Result<()>,
+) -> CommandOutput {
     let parsed = match parse_args(ctx.args) {
         Ok(parsed) => parsed,
         Err(error) => return argparse_error(error),
@@ -39,7 +57,7 @@ pub fn import_top_level(ctx: CommandContext<'_>) -> CommandOutput {
     if parsed.media.is_none() {
         return argparse_error("the following arguments are required: media".to_string());
     }
-    run_import(ctx, &parsed)
+    run_import(ctx, &parsed, announce)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -154,11 +172,6 @@ fn push_positional(parsed: &mut ParsedArgs, value: String) {
 }
 
 fn reject_unsupported_modes(parsed: &ParsedArgs) -> Option<CommandOutput> {
-    if parsed.dry_run {
-        return Some(rejected(format!(
-            "`--dry-run` requires the journal host. {JOURNAL_HOST_HINT}"
-        )));
-    }
     if parsed.backends {
         return Some(rejected(format!(
             "`--backends` requires the journal host. {JOURNAL_HOST_HINT}"
@@ -204,7 +217,11 @@ fn argparse_error(error: String) -> CommandOutput {
     CommandOutput::failure(format!("{HELP}solstone import: error: {error}\n"), 2)
 }
 
-fn run_import(ctx: CommandContext<'_>, parsed: &ParsedArgs) -> CommandOutput {
+fn run_import(
+    ctx: CommandContext<'_>,
+    parsed: &ParsedArgs,
+    announce: &mut dyn FnMut(&str, bool) -> std::io::Result<()>,
+) -> CommandOutput {
     let client_item_id = ctx
         .client_item_ids
         .map(|provider| provider.client_item_id())
@@ -232,7 +249,7 @@ fn run_import(ctx: CommandContext<'_>, parsed: &ParsedArgs) -> CommandOutput {
         .and_then(Value::as_str)
         .unwrap_or_else(|| parsed.media.as_deref().unwrap_or_default())
         .to_string();
-    let start_response = match start_import(ctx, parsed, &save_response) {
+    let start_response = match start_import(ctx, parsed, &save_response, announce) {
         Ok(response) => response,
         Err(ImportError::Unreachable) => {
             return CommandOutput::failure(
@@ -244,6 +261,16 @@ fn run_import(ctx: CommandContext<'_>, parsed: &ParsedArgs) -> CommandOutput {
         }
         Err(error) => return print_partial_error(&staged_path, error),
     };
+    if parsed.dry_run {
+        return CommandOutput::success(if parsed.json {
+            format!(
+                "{}\n",
+                sorted_json_compact_ascii(&Value::Object(start_response.clone()))
+            )
+        } else {
+            format_size(&start_response)
+        });
+    }
     print_success(&save_response, &start_response, parsed.json)
 }
 
@@ -335,6 +362,7 @@ fn start_import(
     ctx: CommandContext<'_>,
     parsed: &ParsedArgs,
     save_response: &Map<String, Value>,
+    announce: &mut dyn FnMut(&str, bool) -> std::io::Result<()>,
 ) -> Result<Map<String, Value>, ImportError> {
     let path = save_response
         .get("path")
@@ -347,22 +375,55 @@ fn start_import(
         .or_else(|| save_response.get("timestamp").and_then(Value::as_str))
         .filter(|value| !value.is_empty())
         .ok_or(ImportError::Malformed)?;
+    let import_id = save_response
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .ok_or(ImportError::Malformed)?;
+    let mut payload = json!({ "path": path, "timestamp": timestamp, "import_id": import_id, "force": parsed.force });
+    let preview = decode_object(
+        ctx.transport
+            .request(ApiRequest {
+                method: HttpMethod::Post,
+                path: format!("{IMPORT_API}/preview"),
+                params: vec![],
+                json: Some(payload.clone()),
+                headers: vec![],
+                policy: TimeoutPolicy::Upload,
+            })
+            .map_err(map_transport_error)?,
+    )?;
+    let token = preview
+        .get("preview_token")
+        .and_then(Value::as_str)
+        .ok_or(ImportError::Malformed)?;
+    let size = preview.get("size").ok_or(ImportError::Malformed)?;
+    if size["recordings"].as_u64().is_none() || size["days"].as_u64().is_none() {
+        return Err(ImportError::Malformed);
+    }
+    if parsed.dry_run {
+        return Ok(preview);
+    }
+    announce(&format_size(&preview), parsed.json).map_err(|error| ImportError::Client {
+        error: format!("could not show import size: {error}"),
+        detail: None,
+    })?;
+    payload["preview_token"] = json!(token);
     let response = ctx
         .transport
         .request(ApiRequest {
             method: HttpMethod::Post,
             path: format!("{IMPORT_API}/start"),
             params: vec![],
-            json: Some(json!({
-                "path": path,
-                "timestamp": timestamp,
-                "force": parsed.force,
-            })),
+            json: Some(payload),
             headers: vec![],
-            policy: TimeoutPolicy::Api,
+            policy: TimeoutPolicy::Upload,
         })
         .map_err(map_transport_error)?;
-    let object = decode_object(response)?;
+    let mut object = decode_object(response)?;
+    object.insert(
+        "size".to_owned(),
+        preview.get("size").cloned().ok_or(ImportError::Malformed)?,
+    );
     let task_id = object
         .get("task_id")
         .and_then(Value::as_str)
@@ -434,6 +495,35 @@ fn print_partial_error(staged_path: &str, error: ImportError) -> CommandOutput {
             1,
         ),
     }
+}
+
+fn format_size(response: &Map<String, Value>) -> String {
+    let size = response.get("size").unwrap_or(&Value::Null);
+    let mut output = format!(
+        "{} {} across {} {}\n",
+        size["recordings"].as_u64().unwrap_or(0),
+        if size["recordings"].as_u64() == Some(1) {
+            "recording"
+        } else {
+            "recordings"
+        },
+        size["days"].as_u64().unwrap_or(0),
+        if size["days"].as_u64() == Some(1) {
+            "day"
+        } else {
+            "days"
+        }
+    );
+    if let (Some(unit), Some(count)) = (
+        size["other_units"][0].as_str(),
+        size["other_units"][1].as_u64(),
+    ) {
+        output.push_str(&format!("{count} {unit}\n"));
+    }
+    if let Some(skipped) = size["skipped"].as_u64().filter(|count| *count > 0) {
+        output.push_str(&format!("{skipped} skipped\n"));
+    }
+    output
 }
 
 fn print_success(
@@ -575,20 +665,85 @@ mod tests {
     ) -> CommandOutput {
         let args = string_args(args);
         let env = BTreeMap::new();
-        import_top_level(CommandContext {
-            args: &args,
-            env: &env,
-            stdin: "",
-            transport,
-            clock: None,
-            files: Some(files),
-            build_identity: None,
-            client_item_ids: Some(client_item_ids),
-            notification_sink: None,
-            link_pairing: None,
-            link_serve: None,
-            link_status_probe: None,
-        })
+        import_with_preview(
+            CommandContext {
+                args: &args,
+                env: &env,
+                stdin: "",
+                transport,
+                clock: None,
+                files: Some(files),
+                build_identity: None,
+                client_item_ids: Some(client_item_ids),
+                notification_sink: None,
+                link_pairing: None,
+                link_serve: None,
+                link_status_probe: None,
+            },
+            &mut |_, _| Ok(()),
+        )
+    }
+
+    #[test]
+    fn preview_and_failed_size_display_never_queue_processing() {
+        for dry_run in [true, false] {
+            let args = if dry_run {
+                string_args(&["notes.txt", "--dry-run"])
+            } else {
+                string_args(&["notes.txt"])
+            };
+            let parsed = parse_args(&args).unwrap();
+            let env = BTreeMap::new();
+            let size = json!({"recordings":0,"days":0,"other_units":["other archive files",3],"skipped":2});
+            let transport = ScriptedHttpTransport::new(vec![ExpectedHttpCall::Request {
+                expected: ApiRequest {
+                    method: HttpMethod::Post,
+                    path: format!("{IMPORT_API}/preview"),
+                    params: vec![],
+                    json: Some(
+                        json!({"path":"/staged/notes.txt","timestamp":"20261011_120000","import_id":"20261011_120000","force":false}),
+                    ),
+                    headers: vec![],
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({"preview_token":"token","size":size}),
+                    TimeoutPolicy::Upload,
+                )),
+            }]);
+            let context = CommandContext {
+                args: &args,
+                env: &env,
+                stdin: "",
+                transport: &transport,
+                clock: None,
+                files: None,
+                build_identity: None,
+                client_item_ids: None,
+                notification_sink: None,
+                link_pairing: None,
+                link_serve: None,
+                link_status_probe: None,
+            };
+            let saved = json!({"path":"/staged/notes.txt","timestamp":"20261011_120000"});
+            let mut announced = false;
+            let result = start_import(
+                context,
+                &parsed,
+                saved.as_object().unwrap(),
+                &mut |text, _| {
+                    announced = true;
+                    assert_eq!(
+                        text,
+                        "0 recordings across 0 days\n3 other archive files\n2 skipped\n"
+                    );
+                    Err(std::io::Error::other("closed output"))
+                },
+            );
+            assert_eq!(result.is_ok(), dry_run);
+            assert_eq!(announced, !dry_run);
+            transport.assert_done();
+        }
     }
 
     #[test]
@@ -644,19 +799,40 @@ mod tests {
             ExpectedHttpCall::Request {
                 expected: ApiRequest {
                     method: HttpMethod::Post,
+                    path: "/app/import/api/preview".to_string(),
+                    params: vec![],
+                    json: Some(json!({
+                        "path": "/staged/imports/20260101_120000/sample.txt",
+                        "timestamp": "20260101_120000",
+                        "import_id": "20260101_120000",
+                        "force": true,
+                    })),
+                    headers: vec![],
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({"preview_token":"preview-1","size":{"recordings":2,"days":1,"skipped":0}}),
+                    TimeoutPolicy::Upload,
+                )),
+            },
+            ExpectedHttpCall::Request {
+                expected: ApiRequest {
+                    method: HttpMethod::Post,
                     path: "/app/import/api/start".to_string(),
                     params: vec![],
                     json: Some(json!({
                         "path": "/staged/imports/20260101_120000/sample.txt",
                         "timestamp": "20260101_120000",
+                        "import_id": "20260101_120000",
+                        "preview_token": "preview-1",
                         "force": true,
                     })),
                     headers: vec![],
-                    policy: TimeoutPolicy::Api,
+                    policy: TimeoutPolicy::Upload,
                 },
                 result: Ok(json_response(
                     json!({"status": "ok", "task_id": "task-file"}),
-                    TimeoutPolicy::Api,
+                    TimeoutPolicy::Upload,
                 )),
             },
         ]);
@@ -714,19 +890,40 @@ mod tests {
             ExpectedHttpCall::Request {
                 expected: ApiRequest {
                     method: HttpMethod::Post,
+                    path: "/app/import/api/preview".to_string(),
+                    params: vec![],
+                    json: Some(json!({
+                        "path": "/staged/imports/20260101_130000/source-dir",
+                        "timestamp": "20260202_030405",
+                        "import_id": "20260101_130000",
+                        "force": false,
+                    })),
+                    headers: vec![],
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({"preview_token":"preview-1","size":{"recordings":2,"days":1,"skipped":0}}),
+                    TimeoutPolicy::Upload,
+                )),
+            },
+            ExpectedHttpCall::Request {
+                expected: ApiRequest {
+                    method: HttpMethod::Post,
                     path: "/app/import/api/start".to_string(),
                     params: vec![],
                     json: Some(json!({
                         "path": "/staged/imports/20260101_130000/source-dir",
                         "timestamp": "20260202_030405",
+                        "import_id": "20260101_130000",
+                        "preview_token": "preview-1",
                         "force": false,
                     })),
                     headers: vec![],
-                    policy: TimeoutPolicy::Api,
+                    policy: TimeoutPolicy::Upload,
                 },
                 result: Ok(json_response(
                     json!({"status": "ok", "task_id": "task-path"}),
-                    TimeoutPolicy::Api,
+                    TimeoutPolicy::Upload,
                 )),
             },
         ]);
@@ -779,19 +976,40 @@ mod tests {
             ExpectedHttpCall::Request {
                 expected: ApiRequest {
                     method: HttpMethod::Post,
+                    path: "/app/import/api/preview".to_string(),
+                    params: vec![],
+                    json: Some(json!({
+                        "path": "/staged/imports/20260101_140000/media.txt",
+                        "timestamp": "20260101_140000",
+                        "import_id": "20260101_140000",
+                        "force": false,
+                    })),
+                    headers: vec![],
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({"preview_token":"preview-1","size":{"recordings":2,"days":1,"skipped":0}}),
+                    TimeoutPolicy::Upload,
+                )),
+            },
+            ExpectedHttpCall::Request {
+                expected: ApiRequest {
+                    method: HttpMethod::Post,
                     path: "/app/import/api/start".to_string(),
                     params: vec![],
                     json: Some(json!({
                         "path": "/staged/imports/20260101_140000/media.txt",
                         "timestamp": "20260101_140000",
+                        "import_id": "20260101_140000",
+                        "preview_token": "preview-1",
                         "force": false,
                     })),
                     headers: vec![],
-                    policy: TimeoutPolicy::Api,
+                    policy: TimeoutPolicy::Upload,
                 },
                 result: Ok(json_response(
                     json!({"status": "ok", "task_id": "task-json"}),
-                    TimeoutPolicy::Api,
+                    TimeoutPolicy::Upload,
                 )),
             },
         ]);
@@ -805,7 +1023,7 @@ mod tests {
 
         assert_eq!(
             output.stdout,
-            "{\"path\": \"/staged/imports/20260101_140000/media.txt\", \"save\": {\"path\": \"/staged/imports/20260101_140000/media.txt\", \"timestamp\": \"20260101_140000\"}, \"start\": {\"status\": \"ok\", \"task_id\": \"task-json\"}, \"status\": \"queued\", \"timestamp\": \"20260101_140000\"}\n"
+            "{\"path\": \"/staged/imports/20260101_140000/media.txt\", \"save\": {\"path\": \"/staged/imports/20260101_140000/media.txt\", \"timestamp\": \"20260101_140000\"}, \"start\": {\"size\": {\"days\": 1, \"recordings\": 2, \"skipped\": 0}, \"status\": \"ok\", \"task_id\": \"task-json\"}, \"status\": \"queued\", \"timestamp\": \"20260101_140000\"}\n"
         );
         assert_eq!(output.stderr, "");
         assert_eq!(output.exit, 0);
@@ -815,10 +1033,6 @@ mod tests {
     #[test]
     fn host_only_modes_reject_with_frozen_messages() {
         let cases: Vec<(Vec<&str>, &str)> = vec![
-            (
-                vec!["media.txt", "--dry-run"],
-                "solstone import: `--dry-run` requires the journal host. Run this on the journal host with `solstone journal importer`.\n",
-            ),
             (
                 vec!["--backends"],
                 "solstone import: `--backends` requires the journal host. Run this on the journal host with `solstone journal importer`.\n",
@@ -1000,15 +1214,36 @@ mod tests {
             ExpectedHttpCall::Request {
                 expected: ApiRequest {
                     method: HttpMethod::Post,
+                    path: "/app/import/api/preview".to_string(),
+                    params: vec![],
+                    json: Some(json!({
+                        "path": "/staged/imports/20260101_160000/media.txt",
+                        "timestamp": "20260101_160000",
+                        "import_id": "20260101_160000",
+                        "force": false,
+                    })),
+                    headers: vec![],
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({"preview_token":"preview-1","size":{"recordings":2,"days":1,"skipped":0}}),
+                    TimeoutPolicy::Upload,
+                )),
+            },
+            ExpectedHttpCall::Request {
+                expected: ApiRequest {
+                    method: HttpMethod::Post,
                     path: "/app/import/api/start".to_string(),
                     params: vec![],
                     json: Some(json!({
                         "path": "/staged/imports/20260101_160000/media.txt",
                         "timestamp": "20260101_160000",
+                        "import_id": "20260101_160000",
+                        "preview_token": "preview-1",
                         "force": false,
                     })),
                     headers: vec![],
-                    policy: TimeoutPolicy::Api,
+                    policy: TimeoutPolicy::Upload,
                 },
                 result: Err(ClientError::ReasonRejected {
                     status: 500,

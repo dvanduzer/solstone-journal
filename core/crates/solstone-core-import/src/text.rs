@@ -34,7 +34,7 @@ use solstone_core_generate::{
 };
 use solstone_core_journal_io::{
     AtomicWriteError, AtomicWriteOptions, HealthMarkerKind, SegmentDeconflictError,
-    bump_stream_marker, find_available_segment_with_occupied, health_marker_path, write_jsonl,
+    bump_stream_marker, health_marker_path, write_jsonl,
 };
 
 use solstone_core_segment::{ImportSource, Kind, StreamHints};
@@ -305,64 +305,43 @@ fn import(
                 path: path.to_path_buf(),
             })
         })?;
-    let (journal_root, day) = journal_marker_context(day_dir).map_err(early)?;
-    let start_seconds = clock_seconds(start_time).ok_or_else(|| {
-        early(TextImportError::InvalidTime {
-            value: start_time.to_owned(),
-        })
-    })?;
+    let (journal_root, _) = journal_marker_context(day_dir).map_err(early)?;
     stage_raw_source(day_dir, import_id, path, raw_filename).map_err(early)?;
 
-    let chronicle = day_dir.parent().unwrap_or(day_dir);
     let hints = StreamHints {
         kind: Some(Kind::Imported(ImportSource::Named("text".to_owned()))),
         host: None,
         platform: None,
     };
-    let mut occupied: HashMap<String, HashSet<String>> = HashMap::new();
     let mut model_available = true;
     let mut created = Vec::new();
 
-    let reading = read_turns(&text);
-    let untimed = reading.untimed;
-    let base = reading.clock_start.unwrap_or(start_seconds);
-    for (tile, turns) in tiles(reading.turns) {
-        let tile_start = base + tile * TILE_SECONDS;
-        let tile_day = match tile_start / DAY_SECONDS {
-            0 => day.to_owned(),
-            later => match next_day(day, later) {
-                Some(next) => next,
-                None => {
-                    return Err((
-                        created,
-                        TextImportError::NextDay {
-                            day: day.to_owned(),
-                        },
-                    ));
-                }
-            },
-        };
-        let tile_day_dir = if tile_day == day {
-            day_dir.to_path_buf()
-        } else {
-            chronicle.join(&tile_day)
-        };
-        let parent = tile_day_dir.join(stream);
-        let candidate = format!("{}_{TILE_SECONDS}", clock_key(tile_start % DAY_SECONDS));
-        let day_occupied = occupied.entry(tile_day.clone()).or_default();
-        let segment_key =
-            match find_available_segment_with_occupied(&parent, &candidate, 100, day_occupied) {
-                Ok(Some(key)) => key,
-                Ok(None) => {
-                    return Err((
-                        created,
-                        TextImportError::SegmentKeyUnavailable { candidate },
-                    ));
-                }
-                Err(error) => return Err((created, TextImportError::SegmentDeconflict(error))),
-            };
-
+    let (planned, untimed) = plan_tiles(&text, day_dir, start_time, stream).map_err(early)?;
+    for tile_plan in planned {
+        let tile_plan = tile_plan.map_err(|error| (created.clone(), error))?;
+        let PlannedTile {
+            tile,
+            turns,
+            day: tile_day,
+            segment: segment_key,
+        } = tile_plan;
+        let parent = day_dir
+            .parent()
+            .unwrap_or(day_dir)
+            .join(&tile_day)
+            .join(stream);
         let directory = parent.join(&segment_key);
+        // Planning reserves nothing. Refuse a destination that became occupied before
+        // this writer could claim it; do not overwrite a different import's recording.
+        if let Err(source) = fs::create_dir_all(&parent).and_then(|()| fs::create_dir(&directory)) {
+            return Err((
+                created,
+                TextImportError::SourceRead {
+                    path: directory,
+                    source,
+                },
+            ));
+        }
         if let Err(source) = solstone_core_segment::output_attempt::prepare_segment(&directory) {
             return Err((
                 created,
@@ -451,7 +430,6 @@ fn import(
                 },
             ));
         }
-        day_occupied.insert(segment_key);
     }
 
     // An empty file wrote nothing, so there is no untimed segment to speak of.
@@ -479,6 +457,122 @@ fn journal_marker_context(day_dir: &Path) -> Result<(&Path, &str), TextImportErr
         });
     };
     Ok((journal_root, day))
+}
+
+/// Plan the same tiles and destination collisions as the writer, without creating files.
+pub fn preview(
+    path: &Path,
+    day_dir: &Path,
+    start_time: &str,
+    stream: &str,
+) -> Result<crate::size::ImportSize, TextImportError> {
+    let text = read_transcript(path)?;
+    let (planned, _) = plan_tiles(&text, day_dir, start_time, stream)?;
+    Ok(crate::size::ImportSize {
+        recordings: planned
+            .into_iter()
+            .map(|tile| {
+                tile.map(|tile| crate::size::Recording {
+                    day: tile.day,
+                    stream: stream.to_owned(),
+                    segment: tile.segment,
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        ..Default::default()
+    })
+}
+
+struct PlannedTile {
+    tile: u64,
+    turns: Vec<Turn>,
+    day: String,
+    segment: String,
+}
+
+fn plan_tiles(
+    text: &str,
+    day_dir: &Path,
+    start_time: &str,
+    stream: &str,
+) -> Result<(Vec<Result<PlannedTile, TextImportError>>, bool), TextImportError> {
+    let (_, day) = journal_marker_context(day_dir)?;
+    let start_seconds = clock_seconds(start_time).ok_or_else(|| TextImportError::InvalidTime {
+        value: start_time.to_owned(),
+    })?;
+    let chronicle = day_dir.parent().unwrap_or(day_dir);
+    let reading = read_turns(text);
+    let untimed = reading.untimed;
+    let base = reading.clock_start.unwrap_or(start_seconds);
+    let mut occupied: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut planned = Vec::new();
+    for (tile, turns) in tiles(reading.turns) {
+        let result = (|| {
+            let tile_start = base + tile * TILE_SECONDS;
+            let tile_day = if tile_start / DAY_SECONDS == 0 {
+                day.to_owned()
+            } else {
+                next_day(day, tile_start / DAY_SECONDS).ok_or_else(|| TextImportError::NextDay {
+                    day: day.to_owned(),
+                })?
+            };
+            let parent = chronicle.join(&tile_day).join(stream);
+            let candidate = format!("{}_{TILE_SECONDS}", clock_key(tile_start % DAY_SECONDS));
+            let day_occupied = occupied.entry(tile_day.clone()).or_default();
+            let segment = text_segment_key(&parent, tile_start % DAY_SECONDS, day_occupied)?
+                .ok_or(TextImportError::SegmentKeyUnavailable { candidate })?;
+            day_occupied.insert(segment.clone());
+            Ok(PlannedTile {
+                tile,
+                turns,
+                day: tile_day,
+                segment,
+            })
+        })();
+        let failed = result.is_err();
+        planned.push(result);
+        if failed {
+            break;
+        }
+    }
+    Ok((planned, untimed))
+}
+
+fn text_segment_key(
+    parent: &Path,
+    seconds: u64,
+    occupied: &HashSet<String>,
+) -> Result<Option<String>, TextImportError> {
+    for attempt in 0_i64..100 {
+        let offset = if attempt % 2 == 0 {
+            -(attempt / 2)
+        } else {
+            (attempt + 1) / 2
+        };
+        let candidate = seconds as i64 + offset;
+        if !(0..DAY_SECONDS as i64).contains(&candidate) {
+            continue;
+        }
+        let key = format!("{}_{TILE_SECONDS}", clock_key(candidate as u64));
+        let path = parent.join(&key);
+        if occupied.contains(&key)
+            || solstone_core_journal_io::path_lexists(&path).map_err(|error| {
+                TextImportError::SegmentDeconflict(SegmentDeconflictError::Path(error))
+            })?
+        {
+            continue;
+        }
+        if solstone_core_segment::owner_deleted(&path).map_err(|source| {
+            TextImportError::SourceRead {
+                path,
+                source: std::io::Error::other(source),
+            }
+        })? {
+            continue;
+        }
+        return Ok(Some(key));
+    }
+    Ok(None)
 }
 
 /// One entry of the transcript as the file gives it.

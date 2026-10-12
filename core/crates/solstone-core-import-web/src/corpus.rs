@@ -49,6 +49,7 @@ pub(crate) mod tests {
         "/app/import/api/save",
         "/app/import/api/save-path",
         "/app/import/api/meta",
+        "/app/import/api/preview",
         "/app/import/api/start",
         "/app/import/api/journal-archive/preview",
     ];

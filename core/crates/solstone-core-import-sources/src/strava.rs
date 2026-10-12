@@ -2110,6 +2110,7 @@ pub fn apply(
     let summary = format_count_summary(&placement.counts);
 
     let rendered = RenderedImport {
+        skipped: 0,
         source: RegistrySource::Strava,
         files,
         items: Vec::new(),

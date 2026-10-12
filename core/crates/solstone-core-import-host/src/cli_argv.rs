@@ -64,7 +64,39 @@ pub struct RegistryDispatch {
     pub source: RegistrySource,
     pub timestamp: String,
     pub dry_run: bool,
+    pub json: bool,
     pub force: bool,
+}
+
+/// A manual CLI import prints its size before the mutating invocation. Recurring
+/// connector commands retain their existing authorization and execution contracts.
+pub fn preview_arguments(args: &[String], journal: &Path) -> Result<Option<Vec<String>>, String> {
+    match parse_arguments(args) {
+        Ok(ParsedCommand::Import(options)) if !options.dry_run => {
+            let Some(media) = options.media else {
+                return Ok(None);
+            };
+            let digest = match options.snapshot_digest {
+                Some(digest) => digest,
+                None => solstone_core_import::snapshot::fingerprint(Path::new(&media))
+                    .map_err(|error| error.to_string())?,
+            };
+            let mut preview = vec![
+                "--dry-run".to_owned(),
+                "--snapshot-digest".to_owned(),
+                digest,
+                "--preview-zone".to_owned(),
+                options.preview_zone.unwrap_or_else(|| {
+                    solstone_core_journal_config::owner_zone(journal)
+                        .name()
+                        .to_owned()
+                }),
+            ];
+            preview.extend_from_slice(args);
+            Ok(Some(preview))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Run the importer grammar with the process environment and local supervisor probe.
@@ -186,6 +218,36 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             "the following arguments are required: media".to_owned(),
         ));
     };
+    if options
+        .preview_zone
+        .as_deref()
+        .is_some_and(|zone| zone != solstone_core_journal_config::owner_zone(journal_path).name())
+    {
+        return rendered(failure(
+            "",
+            "the time zone changed after preview; preview again before importing\n",
+            1,
+        ));
+    }
+    if let Some(digest) = &options.snapshot_digest
+        && let Err(error) = solstone_core_import::snapshot::verify(Path::new(media), digest)
+    {
+        return rendered(failure("", &format!("{error}\n"), 1));
+    }
+    if let Some(token) = &options.preview_token {
+        let timestamp = options.timestamp.as_deref().unwrap_or_default();
+        if let Err(error) = solstone_core_import::snapshot::verify_preview(
+            journal_path,
+            Path::new(media),
+            token,
+            timestamp,
+            options.force,
+            options.setting.as_deref(),
+            options.source.as_deref(),
+        ) {
+            return rendered(failure("", &format!("{error}\n"), 1));
+        }
+    }
     let outcome = match resolve(options_ref(&options, media), journal_path) {
         Ok(outcome) => outcome,
         Err(error) => return rendered(failure("", &format!("{error}\n"), 1)),
@@ -201,7 +263,17 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             1,
         )),
         ResolutionOutcome::Skipped { reason, .. } => {
-            rendered(success(cli_render::resolution_skipped(reason)))
+            if options.dry_run {
+                rendered(success(
+                    solstone_core_import::size::ImportSize {
+                        skipped: 1,
+                        ..Default::default()
+                    }
+                    .render(options.json),
+                ))
+            } else {
+                rendered(success(cli_render::resolution_skipped(reason)))
+            }
         }
         ResolutionOutcome::Resolved {
             source: ResolvedSource::GenericAudio,
@@ -229,6 +301,7 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             source,
             timestamp: timestamp.as_str().to_owned(),
             dry_run: options.dry_run,
+            json: options.json,
             force: options.force,
         }),
     }
@@ -266,12 +339,43 @@ fn run_audio(
     wait_for_processing: bool,
 ) -> (CliRun, String) {
     if options.dry_run {
+        let semantic = solstone_core_import::validate_timestamp(timestamp)
+            .map_err(|error| error.to_string())
+            .and_then(|requested| {
+                solstone_core_import::source_timestamp_for_preview(
+                    journal_path,
+                    &requested,
+                    Path::new(media),
+                )
+                .map_err(|error| error.to_string())
+            });
+        let semantic = match semantic {
+            Ok(value) => value,
+            Err(error) => return (failure("", &format!("{error}\n"), 1), timestamp.to_owned()),
+        };
+        let base_timestamp = match NaiveDateTime::parse_from_str(semantic.as_str(), "%Y%m%d_%H%M%S")
+        {
+            Ok(value) => value,
+            Err(error) => return (failure("", &format!("{error}\n"), 1), timestamp.to_owned()),
+        };
+        let request = AudioImportRequest {
+            source_media: PathBuf::from(media),
+            journal_root: journal_path.to_path_buf(),
+            day: base_timestamp.format("%Y%m%d").to_string(),
+            base_timestamp,
+            import_id: timestamp.to_owned(),
+            stream: "import.audio".to_owned(),
+            facet: options.facet.clone(),
+            setting: options.setting.clone(),
+            wait_for_processing: false,
+            stall_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(250),
+        };
         return (
-            failure(
-                "",
-                "generic audio preview requires the audio import body's preview path\n",
-                1,
-            ),
+            match crate::audio::preview(&request) {
+                Ok(size) => success(size.render(options.json)),
+                Err(error) => failure("", &format!("{error}\n"), 1),
+            },
             timestamp.to_owned(),
         );
     }
@@ -444,12 +548,31 @@ fn run_text(
     stream: &str,
 ) -> (CliRun, String) {
     if options.dry_run {
+        let semantic = match solstone_core_import::source_timestamp_for_preview(
+            journal_path,
+            timestamp,
+            Path::new(media),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return (
+                    failure("", &format!("{error}\n"), 1),
+                    timestamp.as_str().to_owned(),
+                );
+            }
+        };
+        let timestamp = &semantic;
+        let day_dir = journal_path.join("chronicle").join(timestamp.day());
         return (
-            failure(
-                "",
-                "generic text preview requires a native preview adapter\n",
-                1,
-            ),
+            match solstone_core_import::text::preview(
+                Path::new(media),
+                &day_dir,
+                &timestamp.clock(),
+                stream,
+            ) {
+                Ok(size) => success(size.render(options.json)),
+                Err(error) => failure("", &format!("{error}\n"), 1),
+            },
             timestamp.as_str().to_owned(),
         );
     }
@@ -613,7 +736,6 @@ fn resolve(
     }
     if options.source.is_none()
         && is_generic_media(options.media)
-        && !options.dry_run
         && !options.force
         && let Some(manifest) = generic_manifest_summary(journal_path, options.media)?
         && manifest.entry_count > 0
@@ -1437,6 +1559,9 @@ struct Options {
     backends: bool,
     json: bool,
     deterministic_only: bool,
+    snapshot_digest: Option<String>,
+    preview_token: Option<String>,
+    preview_zone: Option<String>,
 }
 
 enum ParsedCommand {
@@ -1517,7 +1642,10 @@ fn parse_arguments(args: &[String]) -> Result<ParsedCommand, String> {
 fn takes_value(argument: &str) -> bool {
     matches!(
         argument,
-        "--timestamp"
+        "--preview-token"
+            | "--preview-zone"
+            | "--snapshot-digest"
+            | "--timestamp"
             | "--facet"
             | "--setting"
             | "--source"
@@ -1532,6 +1660,9 @@ fn takes_value(argument: &str) -> bool {
 
 fn assign_value(options: &mut Options, name: &str, value: &str) -> Result<(), String> {
     match name {
+        "--preview-zone" => options.preview_zone = Some(value.to_owned()),
+        "--preview-token" => options.preview_token = Some(value.to_owned()),
+        "--snapshot-digest" => options.snapshot_digest = Some(value.to_owned()),
         "--timestamp" => options.timestamp = Some(value.to_owned()),
         "--source" => options.source = Some(value.to_owned()),
         "--sync" => options.sync = Some(value.to_owned()),
@@ -1629,6 +1760,37 @@ fn failure(stdout: &str, stderr: &str, exit_code: i32) -> CliRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_preview_binds_bytes_and_owner_zone_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        let config = root.path().join("config/journal.json");
+        fs::write(&config, r#"{"identity":{"timezone":"UTC"}}"#).unwrap();
+        let source = root.path().join("notes.txt");
+        fs::write(&source, "a note").unwrap();
+        let args = vec![source.display().to_string(), "20261011_120000".into()];
+        let preview = preview_arguments(&args, root.path()).unwrap().unwrap();
+        let Ok(ParsedCommand::Import(options)) = parse_arguments(&preview) else {
+            panic!("import");
+        };
+        assert_eq!(options.preview_zone.as_deref(), Some("UTC"));
+        assert_eq!(
+            options.snapshot_digest.as_deref(),
+            Some(
+                solstone_core_import::snapshot::fingerprint(&source)
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        fs::write(&config, r#"{"identity":{"timezone":"Asia/Tokyo"}}"#).unwrap();
+        let CliOutcome::Rendered(run) = run_import(options, root.path()) else {
+            panic!("refusal");
+        };
+        assert_eq!(run.exit_code, 1);
+        assert!(run.stderr.contains("time zone changed"));
+        assert!(!root.path().join("chronicle").exists());
+    }
 
     fn recording(id: &str, filename: &str, fullname: &str) -> PlaudFile {
         plaud_file(&serde_json::json!({

@@ -286,16 +286,37 @@ pub(crate) fn sweep_abandoned_strava_uploads(root: &Path) {
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age >= ABANDONED_STRAVA_UPLOAD);
-        if old_enough
-            && solstone_core_import::project_import_result(root, &id).status
+        if old_enough {
+            if solstone_core_import::project_import_result(root, &id).status
                 == solstone_core_import::ProjectionStatus::Pending
-        {
-            let _ = solstone_core_import::remove_import_records(root, &id);
+            {
+                let _ = solstone_core_import::remove_import_records(root, &id);
+            } else {
+                discard_terminal_strava_download(root, &id);
+            }
         }
     }
 }
 
-fn source_hint(metadata: &ImportMetadata) -> Option<String> {
+/// Preflight can fail before the source producer runs its own cleanup. Keep the
+/// terminal record, but never retain its uploaded Strava download or snapshots.
+fn discard_terminal_strava_download(root: &Path, id: &str) {
+    use solstone_core_import::ProjectionStatus;
+    if matches!(
+        solstone_core_import::project_import_result(root, id).status,
+        ProjectionStatus::Pending | ProjectionStatus::Running
+    ) {
+        return;
+    }
+    if read_import_metadata(root, id)
+        .is_ok_and(|metadata| source_hint(&metadata).as_deref() == Some(STRAVA_SOURCE))
+        && let Err(error) = solstone_core_import::snapshot::discard_download(root, id)
+    {
+        log::warn!("could not remove the Strava download for {id}: {error}");
+    }
+}
+
+pub(crate) fn source_hint(metadata: &ImportMetadata) -> Option<String> {
     clean_optional(metadata.get("source_hint")).filter(|hint| hint != "null")
 }
 
@@ -1049,11 +1070,12 @@ pub(crate) async fn meta(State(state): State<AppState>, Json(data): Json<Value>)
     if raw_path.is_empty() {
         return missing("Missing import path");
     }
-    let Some(timestamp) = Path::new(&raw_path)
-        .parent()
-        .and_then(|path| path.file_name())
-        .and_then(|value| value.to_str())
-    else {
+    let Some(timestamp) = data.get("import_id").and_then(Value::as_str).or_else(|| {
+        Path::new(&raw_path)
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|value| value.to_str())
+    }) else {
         return import_not_found("Import metadata not found");
     };
     if contained_import_file(&state.root, timestamp, "import.json").is_err() {
@@ -1063,6 +1085,9 @@ pub(crate) async fn meta(State(state): State<AppState>, Json(data): Json<Value>)
         Ok(metadata) => metadata,
         Err(_) => return import_not_found("Import metadata not found"),
     };
+    if metadata.get("file_path").and_then(Value::as_str) != Some(raw_path.as_str()) {
+        return import_not_found("Import metadata not found");
+    }
     if import_is_running_or_successful(&state.root, timestamp, &metadata) {
         return invalid_state("import already started or processed");
     }
@@ -1141,7 +1166,12 @@ fn metadata_error_with_task(task_id: &str, detail: String) -> Response {
     )
 }
 
-fn command(path: &str, timestamp: &str, metadata: &ImportMetadata, force: bool) -> Vec<String> {
+pub(crate) fn command(
+    path: &str,
+    timestamp: &str,
+    metadata: &ImportMetadata,
+    force: bool,
+) -> Vec<String> {
     // This request path is an intentionally unvalidated trust boundary: iOS echoes metadata.file_path.
     let mut cmd = vec![
         "solstone".to_owned(),
@@ -1163,28 +1193,52 @@ fn command(path: &str, timestamp: &str, metadata: &ImportMetadata, force: bool) 
     if force {
         cmd.push("--force".to_owned());
     }
+    if let Some(digest) = metadata
+        .get("preview")
+        .and_then(|value| value.get("digest"))
+        .and_then(Value::as_str)
+    {
+        cmd.extend(["--snapshot-digest".to_owned(), digest.to_owned()]);
+        if let Some(token) = metadata["preview"]["token"].as_str() {
+            cmd.extend(["--preview-token".to_owned(), token.to_owned()]);
+        }
+    }
     cmd
 }
 
 pub(crate) async fn start(State(state): State<AppState>, Json(data): Json<Value>) -> Response {
+    let data = match crate::preview::validate_start(&state.root, data).await {
+        Ok(data) => data,
+        Err(error) => {
+            return json_response(
+                StatusCode::CONFLICT,
+                json!({"error": error, "reason_code": "import_preview_required"}),
+            );
+        }
+    };
     // The request goes out on the connection that hears the task end, so an importer that
     // refuses its arguments and exits within milliseconds is still seen.
-    let watch = RefCell::new(TaskWatch::subscribe(&state.root).await);
-    start_with(
-        &state.root,
-        &data,
-        |root, task_id, cmd| match watch.borrow().as_ref() {
-            Some(watch) => watch.request(task_id, cmd),
-            None => request_required(root, task_id, cmd),
-        },
-        write_import_metadata,
-        spawn_inprocess_import,
-        |task_id, timestamp| {
-            if let Some(watch) = watch.borrow_mut().take() {
-                settle_on_exit(watch, state.root.clone(), task_id, timestamp);
-            }
-        },
-    )
+    let watch = TaskWatch::subscribe(&state.root).await;
+    tokio::task::spawn_blocking(move || {
+        let watch = RefCell::new(watch);
+        start_with(
+            &state.root,
+            &data,
+            |root, task_id, cmd| match watch.borrow().as_ref() {
+                Some(watch) => watch.request(task_id, cmd),
+                None => request_required(root, task_id, cmd),
+            },
+            write_import_metadata,
+            spawn_inprocess_import,
+            |task_id, timestamp| {
+                if let Some(watch) = watch.borrow_mut().take() {
+                    settle_on_exit(watch, state.root.clone(), task_id, timestamp);
+                }
+            },
+        )
+    })
+    .await
+    .unwrap_or_else(|error| metadata_failed(format!("could not start the import: {error}")))
 }
 
 /// When the queued importer exits, settle a record it left running, then tell the page how it
@@ -1222,6 +1276,7 @@ enum ExitEvent {
 /// Send the terminal event an exited queued import is owed, whether the importer recorded its
 /// own outcome or the settle recorded one for it.
 fn announce_exit(root: &Path, timestamp: &str) {
+    discard_terminal_strava_download(root, timestamp);
     let projection = solstone_core_import::project_import_result(root, timestamp);
     let emitter = solstone_core_import::EventEmitter::new(root, None);
     match exit_event(timestamp, &projection) {
@@ -1321,7 +1376,9 @@ where
     let imports = root.join("imports");
     let file_path = Path::new(path);
     let is_local_path = !file_path.starts_with(&imports);
-    let original_timestamp = if is_local_path {
+    let original_timestamp = if let Some(id) = data.get("import_id").and_then(Value::as_str) {
+        id
+    } else if is_local_path {
         timestamp
     } else {
         file_path
@@ -1363,7 +1420,7 @@ where
         _ => {}
     }
     let mut command_path = path.to_owned();
-    if !is_local_path && original_timestamp != timestamp {
+    if original_timestamp != timestamp {
         if let Err(error) = contained_import_file(root, timestamp, "import.json") {
             return metadata_failed(error.to_string());
         }
@@ -1375,11 +1432,33 @@ where
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
-        command_path = new_directory.join(filename).display().to_string();
+        if !is_local_path {
+            command_path = new_directory.join(filename).display().to_string();
+        }
         metadata.insert("file_path".to_owned(), json!(command_path));
+        metadata.insert("source_timestamp".to_owned(), json!(timestamp));
         if let Err(error) = write(root, timestamp, &metadata) {
             return metadata_failed(format!("Failed to update file path in metadata: {error}"));
         }
+    }
+    if let Some(relative) = data.get("_preview_source").and_then(Value::as_str) {
+        command_path = match contained_import_file(root, timestamp, relative) {
+            Ok(path) => path.display().to_string(),
+            Err(error) => return metadata_failed(error.to_string()),
+        };
+    }
+    if let Some(token) = data.get("preview_token").and_then(Value::as_str)
+        && let Err(error) = solstone_core_import::snapshot::verify_preview(
+            root,
+            Path::new(&command_path),
+            token,
+            timestamp,
+            force,
+            metadata.get("setting").and_then(Value::as_str),
+            source_hint(&metadata).as_deref(),
+        )
+    {
+        return invalid_state(&error);
     }
     let inprocess_source = detect_inprocess_source(&metadata, &command_path);
     let task_id = now_ms().to_string();
@@ -1558,6 +1637,39 @@ fn run_inprocess_import(
     force: bool,
     generation: u64,
 ) {
+    let metadata = match read_import_metadata(root, import_id) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            log::warn!("import {import_id}: {error}");
+            return;
+        }
+    };
+    if let Some(token) = metadata
+        .get("preview")
+        .and_then(|value| value.get("token"))
+        .and_then(Value::as_str)
+        && let Err(error) = solstone_core_import::snapshot::verify_preview(
+            root,
+            source_path,
+            token,
+            import_id,
+            force,
+            metadata.get("setting").and_then(Value::as_str),
+            source_hint(&metadata).as_deref(),
+        )
+    {
+        log::warn!("import {import_id}: {error}");
+        if let Err(record_error) = solstone_core_import::record_unconfirmed_attempt(
+            root,
+            import_id,
+            generation,
+            now_ms() as u64,
+            Some("the source or settings changed; preview again before importing".to_owned()),
+        ) {
+            log::warn!("import {import_id}: could not record preview refusal: {record_error}");
+        }
+        return;
+    }
     let wire = solstone_core_import_sources::image::SystemWireClient;
     let publication = solstone_core_import::NativePublicationOperations;
     let req = inprocess_producer_request(root, source_path, import_id, source, force, generation);
@@ -3067,6 +3179,47 @@ mod tests {
             .unwrap();
             assert!(manifest_exists(root.path(), &hash));
         }
+    }
+
+    #[test]
+    fn terminal_strava_cleanup_covers_preflight_failure_without_removing_history() {
+        let root = TempDir::new().unwrap();
+        let id = "20261011_120000";
+        let directory = root.path().join("imports").join(id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("export.zip");
+        std::fs::write(&source, b"download").unwrap();
+        write_import_metadata(
+            root.path(),
+            id,
+            json!({"source_hint":"strava","file_path":source})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let snapshot = solstone_core_import::snapshot::create(root.path(), id, &source).unwrap();
+        let copy = directory.join(&snapshot.relative);
+        snapshot.persist();
+        super::discard_terminal_strava_download(root.path(), id);
+        assert!(
+            source.exists(),
+            "pending uploads remain available to preview"
+        );
+        let attempt =
+            solstone_core_import::record_running_attempt(root.path(), id, super::now_ms() as u64)
+                .unwrap();
+        solstone_core_import::record_unconfirmed_attempt(
+            root.path(),
+            id,
+            attempt.generation,
+            super::now_ms() as u64,
+            Some("preflight failed".to_owned()),
+        )
+        .unwrap();
+        super::announce_exit(root.path(), id);
+        assert!(!source.exists());
+        assert!(!copy.exists());
+        assert!(directory.join("import.json").exists());
     }
 
     #[test]

@@ -217,6 +217,37 @@ pub fn preview(path: &Path, zone: Tz) -> ImportPreview {
     }
 }
 
+/// Plan the real image destination without generation, locks, or journal writes.
+pub fn preview_size(
+    path: &Path,
+    journal: &Path,
+    zone: Tz,
+) -> Result<solstone_core_import::size::ImportSize, ImageImportError> {
+    let (_, format, modified, _) = read_image(path)?;
+    if format_details(format).is_none() {
+        return Err(ImageImportError::UndecodableSource {
+            path: path.to_path_buf(),
+            detail: format!("unsupported image format {format:?}"),
+        });
+    }
+    let timestamp = DateTime::<Utc>::from(modified).with_timezone(&zone);
+    let extension = path
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy().to_ascii_lowercase()))
+        .unwrap_or_default();
+    let planned =
+        allocate_image_segment(journal, timestamp.naive_local(), path, &extension, false)?;
+    Ok(solstone_core_import::size::ImportSize {
+        recordings: [solstone_core_import::size::Recording {
+            day: planned.day,
+            stream: IMPORT_STREAM.to_owned(),
+            segment: planned.segment,
+        }]
+        .into(),
+        ..Default::default()
+    })
+}
+
 /// In-memory prepared image import data before publication phase.
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
@@ -295,6 +326,31 @@ fn claim_image_segment(
     source: &Path,
     extension: &str,
 ) -> Result<ClaimedImageSegment, ImageImportError> {
+    let planned = allocate_image_segment(journal_root, start, source, extension, true)?;
+    Ok(ClaimedImageSegment {
+        day: planned.day,
+        segment: planned.segment,
+        directory: planned.directory,
+        binding: planned
+            .binding
+            .expect("publication acquired a segment binding"),
+    })
+}
+
+struct ImageAllocation {
+    day: String,
+    segment: String,
+    directory: PathBuf,
+    binding: Option<solstone_core_journal_io::JournalRoot>,
+}
+
+fn allocate_image_segment(
+    journal_root: &Path,
+    start: NaiveDateTime,
+    source: &Path,
+    extension: &str,
+    publish: bool,
+) -> Result<ImageAllocation, ImageImportError> {
     let source_meta = fs::symlink_metadata(source).map_err(|error| ImageImportError::Install {
         path: source.to_path_buf(),
         detail: error.to_string(),
@@ -313,10 +369,12 @@ fn claim_image_segment(
             path: journal_root.to_path_buf(),
             detail: error.to_string(),
         })?;
-    fs::create_dir_all(&parent).map_err(|error| ImageImportError::JournalIo {
-        path: parent.clone(),
-        detail: error.to_string(),
-    })?;
+    if publish {
+        fs::create_dir_all(&parent).map_err(|error| ImageImportError::JournalIo {
+            path: parent.clone(),
+            detail: error.to_string(),
+        })?;
+    }
 
     let expected_original_name = format!("original{extension}");
     let mut cached_source_hash = None;
@@ -357,15 +415,30 @@ fn claim_image_segment(
         })? {
             continue;
         }
-        let _allocation = solstone_core_segment::output_attempt::SegmentMutation::acquire(
-            &candidate_path,
-            solstone_core_journal_io::LockOptions::default(),
-        )
-        .map_err(|error| ImageImportError::JournalIo {
-            path: candidate_path.clone(),
-            detail: error.to_string(),
-        })?;
-        match fs::create_dir(&candidate_path) {
+        let _allocation = if publish {
+            Some(
+                solstone_core_segment::output_attempt::SegmentMutation::acquire(
+                    &candidate_path,
+                    solstone_core_journal_io::LockOptions::default(),
+                )
+                .map_err(|error| ImageImportError::JournalIo {
+                    path: candidate_path.clone(),
+                    detail: error.to_string(),
+                })?,
+            )
+        } else {
+            None
+        };
+        let create = if publish {
+            fs::create_dir(&candidate_path)
+        } else {
+            match fs::symlink_metadata(&candidate_path) {
+                Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        };
+        match create {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let candidate_meta = match fs::symlink_metadata(&candidate_path) {
@@ -457,6 +530,14 @@ fn claim_image_segment(
             }
         }
 
+        if !publish {
+            return Ok(ImageAllocation {
+                day,
+                segment,
+                directory: candidate_path,
+                binding: None,
+            });
+        }
         let resolved =
             SegmentDir::resolve(journal_root, &day, &segment, IMPORT_STREAM).map_err(|error| {
                 ImageImportError::JournalIo {
@@ -470,16 +551,18 @@ fn claim_image_segment(
                 detail: error.to_string(),
             }
         })?;
-        return Ok(ClaimedImageSegment {
+        return Ok(ImageAllocation {
             day,
             segment,
             directory: resolved.path().to_path_buf(),
-            binding: solstone_core_journal_io::JournalRoot::open(resolved.path()).map_err(
-                |error| ImageImportError::JournalIo {
-                    path: resolved.path().to_path_buf(),
-                    detail: error.to_string(),
-                },
-            )?,
+            binding: Some(
+                solstone_core_journal_io::JournalRoot::open(resolved.path()).map_err(|error| {
+                    ImageImportError::JournalIo {
+                        path: resolved.path().to_path_buf(),
+                        detail: error.to_string(),
+                    }
+                })?,
+            ),
         });
     }
 

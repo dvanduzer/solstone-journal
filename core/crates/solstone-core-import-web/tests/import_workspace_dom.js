@@ -17,6 +17,21 @@ function scriptFromWorkspace() {
   return workspaceScript[1];
 }
 
+function makeContext(globals) {
+  const context = vm.createContext({ document: { getElementById: () => null, addEventListener: () => {} }, showError: message => { throw new Error(message); }, setTimeout: () => 0, clearTimeout: () => {}, ...globals });
+  const source = scriptFromWorkspace();
+  vm.runInContext(`
+    const importPreviews = { guided: null, quick: null };
+    const previewRevisions = { guided: 0, quick: 0 };
+    const importInFlight = { guided: false, quick: false };
+    let thinkingProgressTimer = null;
+  `, context);
+  for (const name of ['invalidateImportPreview', 'restoreImportButton', 'prepareImportPreview', 'renderThinkingProgress', 'scheduleThinkingProgress']) {
+    vm.runInContext(functionSource(source, name), context);
+  }
+  return context;
+}
+
 // The import content pane (renderContentItems and neighbors) lives in workspace.html's
 // second <script> block, not the submission-form one scriptFromWorkspace() returns.
 function contentPaneScriptFromWorkspace() {
@@ -61,7 +76,7 @@ function detailSource() {
 // shipped file runs and the tests call the real thing. The drawer chrome is the
 // shell's; the body it is handed is what this crate renders.
 function loadImportDetailModule() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.window = {
     JournalFormat: { day: (value) => String(value) },
     Drawer: {
@@ -218,6 +233,7 @@ class Element {
   }
 
   focus() {
+    if (this.disabled) return;
     this.focused = true;
   }
 
@@ -274,7 +290,7 @@ function makeHarness(ids) {
   };
   const fetch = async (url, options) => {
     requests.push({ url, options });
-    return { ok: true, async json() { return {}; } };
+    return { ok: true, async json() { return url.endsWith('/preview') ? { preview_token: 'preview-1', size: { recordings: 2, days: 1, skipped: 0 } } : {}; } };
   };
   const window = {
     _quickClientItemId: null,
@@ -283,7 +299,7 @@ function makeHarness(ids) {
     showError() {},
   };
   window.window = window;
-  const context = vm.createContext({
+  const context = makeContext({
     window,
     document,
     FormData: CapturedFormData,
@@ -351,12 +367,16 @@ async function runGuidedSubmit() {
   vm.runInContext(functionSource(workspace, 'startGuidedImport'), harness.context);
   vm.runInContext("currentGuidedSaved = { path: '/saved', timestamp: '1700000000' };", harness.context);
   await harness.context.startGuidedImport({ name: 'notes', display_name: 'Notes' });
+  assert.ok(!harness.requests.some(request => request.url.endsWith('/start')), 'first click previews without starting');
+  await harness.context.startGuidedImport({ name: 'notes', display_name: 'Notes' });
   assert.deepStrictEqual(harness.requests.map((request) => request.url), [
+    '/app/import/api/meta',
+    '/app/import/api/preview',
     '/app/import/api/meta',
     '/app/import/api/start',
   ]);
   assertFacetAbsentAndSettingPreserved(harness.requests[0], 'guided setting');
-  assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(harness.requests[1].options.body), 'facet'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(harness.requests[3].options.body), 'facet'));
   cases += 1;
 }
 
@@ -370,17 +390,21 @@ async function runConfirmSubmit() {
   const body = arrowBody(workspace, "startBtn.addEventListener('click', async () =>");
   vm.runInContext(`async function confirmImport() ${body}`, harness.context);
   await harness.context.confirmImport();
+  assert.ok(!harness.requests.some(request => request.url.endsWith('/start')), 'first click previews without starting');
+  await harness.context.confirmImport();
   assert.deepStrictEqual(harness.requests.map((request) => request.url), [
+    '/app/import/api/meta',
+    '/app/import/api/preview',
     '/app/import/api/meta',
     '/app/import/api/start',
   ]);
   assertFacetAbsentAndSettingPreserved(harness.requests[0], 'confirm setting');
-  assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(harness.requests[1].options.body), 'facet'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(harness.requests[3].options.body), 'facet'));
   cases += 1;
 }
 
 function runHistoryHeaderSummary() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   vm.runInContext([
     "let importsCache = [];",
     "const sourceMetadataByName = {};",
@@ -415,7 +439,7 @@ function runHistoryHeaderSummary() {
 }
 
 function runImportRowColumns() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   vm.runInContext([
     "const window = {",
     "  JournalFormat: { timestamp: () => '2026-07-22, 7:30 PM', day: (value) => value },",
@@ -535,7 +559,7 @@ function runImportRowColumns() {
 // render -- the frozen "preparing..." a field report showed us.
 function runProgressPanelUpdatesOnCompletion() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   vm.runInContext([
     "const window = {",
     "  location: { hash: '#progress/1700000000' },",
@@ -564,7 +588,7 @@ function runProgressPanelUpdatesOnCompletion() {
 
   vm.runInContext("refreshInlineProgress('1700000000', { import_id: '1700000000', event: 'completed', entries_written: 1, entities_seeded: 0, duration_ms: 4000 })", context);
   assert.ok(
-    guideSteps.innerHTML.includes('import complete'),
+    guideSteps.innerHTML.includes('recordings saved'),
     'G3-401: a completed event re-renders the open progress panel'
   );
   assert.ok(
@@ -573,7 +597,7 @@ function runProgressPanelUpdatesOnCompletion() {
   );
   assert.ok(
     !guideSteps.innerHTML.includes('preparing'),
-    'G3-401: the stale preparing stage is gone once the import completes'
+    'G3-401: the stale preparing stage is gone once the recordings saveds'
   );
 
   // An event for a different import must not repaint this panel.
@@ -588,7 +612,7 @@ function runProgressPanelUpdatesOnCompletion() {
 // A heartbeat carries one stage, so its row names the stage like a reading
 // step and shows the elapsed time once, not the same time twice.
 function runHeartbeatStatusReadsOnce() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   vm.runInContext(`const STAGE_NAMES = ${arrowBody(workspace, 'const STAGE_NAMES =')};`, context);
   for (const name of ['capitalizeStage', 'humanStageName', 'formatElapsed', 'statusElapsedDetail']) {
     vm.runInContext(functionSource(workspace, name), context);
@@ -612,7 +636,7 @@ function runHeartbeatStatusReadsOnce() {
 // finished, which no later event would correct.
 function runInitWaitsForTheImportList() {
   const order = [];
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   context.window = {
     solPathContext: () => ({ segment: null }),
     appEvents: { listen: () => ({ pending: { track() {}, clear() {} } }) },
@@ -652,7 +676,7 @@ function runInitWaitsForTheImportList() {
 // reload empties it, which is exactly the case a reload lands in.
 function runReloadedPanelAgreesWithItsOwnSummary() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   vm.runInContext([
     "const window = {",
     "  location: { hash: '#progress/1700000000' },",
@@ -676,7 +700,7 @@ function runReloadedPanelAgreesWithItsOwnSummary() {
 
   vm.runInContext("showProgressView('1700000000')", context);
   assert.ok(
-    guideSteps.innerHTML.includes('import complete'),
+    guideSteps.innerHTML.includes('recordings saved'),
     'G3-403: a reload onto a finished import says so'
   );
   assert.ok(
@@ -725,7 +749,7 @@ async function runRepeatSourceFocus() {
   const pathInput = new Element();
   const guide = new Element();
   const guideSteps = new Element();
-  const context = vm.createContext({ console, Promise, setImmediate, setTimeout });
+  const context = makeContext({ console, Promise, setImmediate, setTimeout });
   let showGridCalled = false;
   let dropArea = null;
 
@@ -800,7 +824,7 @@ function runTerminalImportEventsNotOverwrittenByStart() {
   const settingInput = new Element();
   settingInput.value = '';
 
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   context.window = {
     location: { hash: '' },
     showError: () => {},
@@ -819,9 +843,9 @@ function runTerminalImportEventsNotOverwrittenByStart() {
   context.clearPendingImport = () => {};
   context.loadImports = () => {};
   context.navigateTo = () => {};
-  context.fetch = async () => ({
+  context.fetch = async url => ({
     ok: true,
-    json: async () => ({ status: 'started' }),
+    json: async () => url.endsWith('/preview') ? { preview_token: 'preview-1', size: { recordings: 1, days: 1 } } : { status: 'started' },
   });
   context.IMPORT_TERMINAL_EVENTS = new Set(['completed', 'error', 'declined']);
   context.importEvents = {
@@ -840,7 +864,7 @@ function runTerminalImportEventsNotOverwrittenByStart() {
     'start-path spread preserves an existing terminal event'
   );
 
-  return vm.runInContext("startGuidedImport({ name: 'image', display_name: 'Images', input_type: 'file_upload' })", context).then(() => {
+  return vm.runInContext("startGuidedImport({ name: 'image', display_name: 'Images', input_type: 'file_upload' })", context).then(() => vm.runInContext("startGuidedImport({ name: 'image', display_name: 'Images', input_type: 'file_upload' })", context)).then(() => {
     const event = context.importEvents['1700000001'];
     assert.strictEqual(event.event, 'completed', 'terminal completed event is not overwritten by start');
     assert.strictEqual(event.entries_written, 5, 'completed event properties are preserved');
@@ -849,7 +873,7 @@ function runTerminalImportEventsNotOverwrittenByStart() {
 }
 
 async function runStallCallsReconcile() {
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   const fetchedUrls = [];
   const tracked = [];
   const statusCell = new Element();
@@ -904,7 +928,7 @@ async function runStallCallsReconcile() {
 
 function runGenerationComparisonInRowUpdates() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.importEvents = {
     '1700000001': { import_id: '1700000001', generation: 2, event: 'status', stage: 'writing' }
   };
@@ -961,7 +985,7 @@ function runGenerationComparisonInRowUpdates() {
 
 function runShowProgressViewDoesNotReconcile() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   let reconcileCount = 0;
   context.document = {
     getElementById: (id) => (id === 'guideSteps' ? guideSteps : null),
@@ -992,7 +1016,7 @@ function runShowProgressViewDoesNotReconcile() {
 
 function runDistinctUnconfirmedAndUnavailablePanels() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.document = {
     getElementById: (id) => (id === 'guideSteps' ? guideSteps : null),
   };
@@ -1046,7 +1070,7 @@ function runDistinctUnconfirmedAndUnavailablePanels() {
 }
 
 async function runSingleFlightReconcile() {
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   let fetchCount = 0;
   let resolveFirst;
   const firstPromise = new Promise((resolve) => { resolveFirst = resolve; });
@@ -1082,7 +1106,7 @@ async function runSingleFlightReconcile() {
 async function runNavigateToProgressIssuesOnlyOneGet() {
   const guideSteps = new Element();
   const guide = new Element();
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   let fetchCount = 0;
   const location = new QueuedHashLocation('');
   context.window = {
@@ -1145,7 +1169,7 @@ async function runNavigateToProgressIssuesOnlyOneGet() {
 }
 
 async function runConnectionStateReconcile() {
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   let reconciledId = null;
   let connectionCallback = null;
 
@@ -1196,7 +1220,7 @@ async function runRepeatSourceThenDelayedOldGenCompleted() {
   const pathInput = new Element();
   const guide = new Element();
   const guideSteps = new Element();
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
 
   let _hash = '#progress/1700000001';
   context.window = {
@@ -1266,7 +1290,7 @@ async function runRepeatSourceThenDelayedOldGenCompleted() {
 }
 
 function runShowGridResetsGuidedClientItemId() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.window = { _guidedClientItemId: 'client-1' };
   context.currentGuideSource = 'image';
   context.currentGuidedFile = 'file.png';
@@ -1282,7 +1306,7 @@ function runShowGridResetsGuidedClientItemId() {
 }
 
 function runAuthoritativeUpdateBypassesGenerationFloor() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.importEvents = {
     '1700000001': { import_id: '1700000001', generation: 1, event: 'started', status: 'running' }
   };
@@ -1308,7 +1332,7 @@ function runAuthoritativeUpdateBypassesGenerationFloor() {
 }
 
 function runLiveEventClearsStalled() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.importEvents = {
     '1700000001': { import_id: '1700000001', generation: 1, event: 'status', status: 'running', stalled: true }
   };
@@ -1331,7 +1355,7 @@ function runLiveEventClearsStalled() {
 
 function runSingularPageUnavailable() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.document = {
     getElementById: (id) => (id === 'guideSteps' ? guideSteps : null),
   };
@@ -1364,7 +1388,7 @@ function runSingularPageUnavailable() {
 
 function runAudioContentItemsLinkToTranscriptsInsteadOfExpanding() {
   const contentItems = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.document = {
     getElementById: (id) => (id === 'contentItems' ? contentItems : null),
   };
@@ -1411,7 +1435,7 @@ function runAudioContentItemsLinkToTranscriptsInsteadOfExpanding() {
 }
 
 function runFormatStatValueEscapesAndHandlesEmDash() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   installRealEscapeHtml(context);
   assertEscaperIsReal(context);
 
@@ -1427,7 +1451,7 @@ function runFormatStatValueEscapesAndHandlesEmDash() {
 async function runAsyncNavigateToWithGuideFetch() {
   const grid = new Element();
   const guide = new Element();
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   let guideFlowFinished = false;
   context.window = {
     location: { hash: '' },
@@ -1460,7 +1484,7 @@ async function runAsyncNavigateToWithGuideFetch() {
 // already down when the handler reads it, and every programmatic navigation ran
 // its work a second time.
 async function runHashChangeDedupConsumesTheFlag() {
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   const location = new QueuedHashLocation('');
   const guideRuns = [];
   context.window = { location };
@@ -1509,7 +1533,7 @@ async function runHashChangeDedupConsumesTheFlag() {
 // into progress/<ts>) assigns a value that reads back identical: no event fires,
 // and a flag left raised swallows the owner's next navigation.
 async function runNavigateToDropsTheFlagWhenTheFragmentDoesNotChange() {
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   const location = new QueuedHashLocation('');
   const seen = [];
   context.window = { location };
@@ -1549,7 +1573,7 @@ async function runNavigateToDropsTheFlagWhenTheFragmentDoesNotChange() {
   // The same holds for the other characters a browser rewrites.
   for (const id of ['a"b', 'a<b>c', 'a`b', 'dagbok-ø']) {
     const runs = [];
-    const scoped = vm.createContext({ console, Promise });
+    const scoped = makeContext({ console, Promise });
     const scopedLocation = new QueuedHashLocation('');
     scoped.window = { location: scopedLocation };
     scoped.document = { getElementById: () => null, querySelector: () => null };
@@ -1577,7 +1601,7 @@ async function runNavigateToDropsTheFlagWhenTheFragmentDoesNotChange() {
 // is in flight -- "import another source" goes to the grid -- must not be pulled
 // back by the navigation that was already on its way out.
 async function runNavigateToDoesNotReassertAStaleHash() {
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   const location = new QueuedHashLocation('#guide/image');
   let releaseRead;
   const readInFlight = new Promise((resolve) => { releaseRead = resolve; });
@@ -1622,7 +1646,7 @@ function runRepaintSeesTheFactsThatWereStored() {
   for (const scenario of [{ name: 'no row on screen', row: false }, { name: 'row on screen', row: true }]) {
     const guideSteps = new Element();
     const statusCell = new Element();
-    const context = vm.createContext({ console });
+    const context = makeContext({ console });
     const row = {
       classList: { add() {}, remove() {} },
       dataset: {},
@@ -1703,7 +1727,7 @@ async function runRepeatSourceFocusSurvivesTheQueuedHashChange() {
   ];
 
   for (const variant of variants) {
-    const context = vm.createContext({ console, Promise });
+    const context = makeContext({ console, Promise });
     const location = new QueuedHashLocation('#progress/1700000000');
     const guideSteps = new Element();
     const guide = new Element();
@@ -1770,7 +1794,7 @@ async function runRepeatSourceFocusSurvivesTheQueuedHashChange() {
 // rewriting it to running and blanking the counts the owner had been shown.
 async function runAuthoritativeRunningReadKeepsACompletedImportComplete() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   context.window = {
     location: { hash: '#progress/1700000060' },
     CONVEY_COPY: { RELOAD_HINT: 'reload to try again.' },
@@ -1828,7 +1852,7 @@ async function runAuthoritativeRunningReadKeepsACompletedImportComplete() {
   vm.runInContext(functionSource(workspace, 'reconcileImportState'), context);
 
   vm.runInContext("showProgressView('1700000060')", context);
-  assert.ok(guideSteps.innerHTML.includes('import complete'), 'the panel opens on the completed import');
+  assert.ok(guideSteps.innerHTML.includes('recordings saved'), 'the panel opens on the completed import');
   assert.ok(
     guideSteps.innerHTML.includes('<strong>entries written:</strong> 60'),
     'and it names what the import wrote'
@@ -1840,7 +1864,7 @@ async function runAuthoritativeRunningReadKeepsACompletedImportComplete() {
   assert.strictEqual(event.event, 'completed', 'a canonical running read does not un-complete a completed import');
   assert.strictEqual(event.status, 'success', 'the terminal status survives the canonical read');
   assert.strictEqual(event.entries_written, 60, 'and the counts survive with it');
-  assert.ok(guideSteps.innerHTML.includes('import complete'), 'the open panel still reads as complete');
+  assert.ok(guideSteps.innerHTML.includes('recordings saved'), 'the open panel still reads as complete');
   assert.ok(
     guideSteps.innerHTML.includes('<strong>entries written:</strong> 60'),
     'the open panel still names the entries'
@@ -1851,7 +1875,7 @@ async function runAuthoritativeRunningReadKeepsACompletedImportComplete() {
 // A read of an import that is still going carries null for everything it cannot
 // answer yet. Those nulls must not land on top of facts already known.
 function runRunningReadKeepsKnownFacts() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.document = { querySelector: () => null, getElementById: () => null };
   context.importEvents = {
     '1700000070': {
@@ -1884,7 +1908,7 @@ function runRunningReadKeepsKnownFacts() {
 
 function runImporterStatusAfterTerminalDoesNotReArmPendingTimer() {
   const calls = [];
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.IMPORT_ROW_EVENTS = new Set(['started', 'status', 'completed', 'error']);
   context.IMPORT_TERMINAL_EVENTS = new Set(['completed', 'error', 'declined']);
   context.importEvents = {};
@@ -1955,7 +1979,7 @@ function runImporterStatusAfterTerminalDoesNotReArmPendingTimer() {
 function runImporterEventsReadTheRecordAfterATerminalEvent() {
   // Which live events trigger the follow-up read: the two terminal ones, and only those.
   const calls = [];
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.IMPORT_ROW_EVENTS = new Set(['started', 'status', 'completed', 'error']);
   context.IMPORT_TERMINAL_EVENTS = new Set(['completed', 'error', 'declined']);
   context.clearPendingImport = (id) => calls.push(['clear', id]);
@@ -1982,7 +2006,7 @@ async function runCompletionThenAQuietReadShowsThePartialNotice() {
     const guideSteps = new Element();
     const failure = new Element();
     failure.setAttribute = () => {};
-    const context = vm.createContext({ console, Promise });
+    const context = makeContext({ console, Promise });
     context.window = { location: { hash: '#progress/1700000090' }, apiJson };
     context.document = {
       getElementById: (id) => (id === 'guideSteps' ? guideSteps : id === 'progressReconcileError' ? failure : null),
@@ -2026,7 +2050,7 @@ async function runCompletionThenAQuietReadShowsThePartialNotice() {
     ok.guideSteps.innerHTML.includes('partially extracted (2 pages unavailable)'),
     'the panel gains the partial notice once the durable record is read'
   );
-  assert.ok(ok.guideSteps.innerHTML.includes('import complete'), 'and stays complete');
+  assert.ok(ok.guideSteps.innerHTML.includes('recordings saved'), 'and stays complete');
 
   // The producer can emit a plain error when it could not record its own completion: the
   // canonical read then says "unconfirmed", and the panel must offer "check status".
@@ -2054,7 +2078,7 @@ async function runCompletionThenAQuietReadShowsThePartialNotice() {
 async function runCanonicalReadOutranksTheGenerationFloor() {
   const guideSteps = new Element();
   const statusCell = new Element();
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   const row = {
     classList: { add() {}, remove() {} },
     dataset: {},
@@ -2130,7 +2154,7 @@ async function runCanonicalReadOutranksTheGenerationFloor() {
 // is a state a later running update can overwrite. unconfirmed and unavailable
 // are ends of the road as much as completed and failed are.
 function runTerminalStateCoversEveryEndState() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.document = { querySelector: () => null, getElementById: () => null };
   context.refreshInlineProgress = () => {};
   context.clearPendingImport = () => {};
@@ -2177,7 +2201,7 @@ function runTerminalStateCoversEveryEndState() {
 // the one startGuidedImport writes when an import starts. If nothing raises it,
 // a delayed event from an older run walks straight back in.
 function runGenerationFloorIsRaisedByEveryEvent() {
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.document = { querySelector: () => null, getElementById: () => null };
   context.importEvents = {};
   context.importGenerationFloor = {};
@@ -2225,7 +2249,7 @@ function runGenerationFloorIsRaisedByEveryEvent() {
 function runEveryOwnerSinkEscapes() {
   // --- the progress panel: failed error text, stalled import id ---
   const guideSteps = new Element();
-  const panelContext = vm.createContext({ console });
+  const panelContext = makeContext({ console });
   panelContext.document = { getElementById: (id) => (id === 'guideSteps' ? guideSteps : null) };
   panelContext.window = {
     location: { hash: `#progress/${ESCAPE_PAYLOAD}` },
@@ -2268,7 +2292,7 @@ function runEveryOwnerSinkEscapes() {
 
   // --- the live row: started stage, status detail, error detail, gap chip ---
   const statusCell = new Element();
-  const rowContext = vm.createContext({ console });
+  const rowContext = makeContext({ console });
   const row = {
     classList: { add() {}, remove() {} },
     dataset: {},
@@ -2325,7 +2349,7 @@ function runEveryOwnerSinkEscapes() {
   );
 
   // --- the history table: row error detail, source cell, filter options ---
-  const historyContext = vm.createContext({ console });
+  const historyContext = makeContext({ console });
   vm.runInContext([
     "const window = {",
     "  JournalFormat: { timestamp: () => '2026-07-22, 7:30 PM', day: (value) => value },",
@@ -2626,7 +2650,7 @@ function runLoadErrorsAreShown() {
       },
     },
   };
-  const context = vm.createContext({ console, Error, Promise });
+  const context = makeContext({ console, Error, Promise });
   context.window = {
     CONVEY_COPY: { RELOAD_HINT: 'reload to try again.' },
     SurfaceState: { serverMessageFrom: (err) => err?.serverMessage || err?.message || '' },
@@ -2699,7 +2723,7 @@ function runDetailPageCountMatchesItsNumber() {
 // it something we are willing to say to an owner.
 function runUnavailablePanelNeverEchoesTheServer() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   const hostile = 'ORA-01017: invalid username/password; logon denied <b>at</b> pg-7';
   context.document = { getElementById: (id) => (id === 'guideSteps' ? guideSteps : null) };
   context.window = {
@@ -2748,7 +2772,7 @@ function runUnavailablePanelNeverEchoesTheServer() {
 // The card carries it as data and the delegated listener reads it.
 async function runSourceCardsCarryNoInlineHandler() {
   const grid = new Element();
-  const context = vm.createContext({ console, Promise });
+  const context = makeContext({ console, Promise });
   context.document = { getElementById: (id) => (id === 'importGrid' ? grid : null) };
   context.window = {};
   context.cachedSources = [];
@@ -2776,7 +2800,7 @@ async function runSourceCardsCarryNoInlineHandler() {
   assert.ok(!grid.innerHTML.includes('<b>'), 'no payload markup reaches the grid');
 
   // And the delegated listener acts on it, so the card is not inert.
-  const clickContext = vm.createContext({ console });
+  const clickContext = makeContext({ console });
   const navigated = [];
   let quickOpened = 0;
   clickContext.navigateTo = (view) => { navigated.push(view); };
@@ -2819,7 +2843,7 @@ async function runSourceCardsCarryNoInlineHandler() {
 // A measured zero is a number the import actually reported, not an unknown.
 function runMeasuredZeroIsNotUnknown() {
   const guideSteps = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.document = { getElementById: (id) => (id === 'guideSteps' ? guideSteps : null) };
   context.window = {
     location: { hash: '#progress/1700000050' },
@@ -2869,7 +2893,7 @@ function runMeasuredZeroIsNotUnknown() {
 function runImportIdSelectorsEscapeQuotes() {
   const importId = '17000"0001';
   const statusCell = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   const row = {
     classList: { add() {}, remove() {} },
     dataset: {},
@@ -2919,7 +2943,7 @@ function runImportIdSelectorsEscapeQuotes() {
 // Every attribute an import writes from server- or URL-derived text, with a
 // payload that would break out of each one.
 function runOwnerSinksEscapeServerDerivedPayloads() {
-  const rowContext = vm.createContext({ console });
+  const rowContext = makeContext({ console });
   vm.runInContext([
     "const window = {",
     "  JournalFormat: { timestamp: () => '2026-07-22, 7:30 PM', day: (value) => value },",
@@ -2954,7 +2978,7 @@ function runOwnerSinksEscapeServerDerivedPayloads() {
   assert.ok(!rowHtml.includes(`data-import-id="x"`), 'the raw quote never reaches the attribute');
 
   const guideSteps = new Element();
-  const panelContext = vm.createContext({ console });
+  const panelContext = makeContext({ console });
   panelContext.document = { getElementById: (id) => (id === 'guideSteps' ? guideSteps : null) };
   panelContext.window = {
     location: { hash: `#progress/${ESCAPE_PAYLOAD}` },
@@ -3014,7 +3038,7 @@ async function runCheckStatusFocusLandsOnThePanel() {
     // An id with a quote in it: the selector this restore builds goes through
     // CSS.escape like the row selectors do, or the browser throws on it.
     const importId = '1700000080"x';
-    const context = vm.createContext({ console, Promise });
+    const context = makeContext({ console, Promise });
     const doc = { activeElement: null };
     const guideSteps = new Element();
     const panel = new FocusableElement('panel', doc);
@@ -3114,7 +3138,7 @@ function runStalledRowNamesTheImportId() {
   const importId = '1700000090';
   const guideSteps = new Element();
   const statusCell = new Element();
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   const row = {
     classList: { add() {}, remove() {} },
     dataset: {},
@@ -3161,7 +3185,7 @@ function runGenerationFloorIsPruned() {
   assert.ok(capMatch, 'the generation floor carries a cap');
   const cap = Number(capMatch[1]);
 
-  const context = vm.createContext({ console });
+  const context = makeContext({ console });
   context.window = { location: { hash: '#progress/open-panel' } };
   context.importEvents = {
     'live-event': { import_id: 'live-event', event: 'status', status: 'running' },
@@ -3220,7 +3244,74 @@ function runGenerationFloorIsPruned() {
   cases += 1;
 }
 
+async function runSourceChangeWhileUploading() {
+  const h = makeHarness({ guidedStartBtn: '', guidedSettingInput: '' });
+  h.context.currentGuidedFile = { name: 'old.txt' };
+  let finish;
+  h.context.fetch = async (url, options) => {
+    h.requests.push({ url, options });
+    return { ok: true, json: () => new Promise(resolve => { finish = resolve; }) };
+  };
+  for (const name of ['uploadGuidedSourceFile', 'startGuidedImport']) vm.runInContext(functionSource(workspace, name), h.context);
+  const pending = h.context.startGuidedImport({ name: 'recording', input_type: 'file_upload' });
+  await Promise.resolve();
+  h.context.currentGuidedFile = { name: 'new.txt' };
+  vm.runInContext("invalidateImportPreview('guided')", h.context);
+  assert.strictEqual(h.elements.guidedStartBtn.disabled, true, 'editing does not admit a concurrent start');
+  await h.context.startGuidedImport({ name: 'recording', input_type: 'file_upload' });
+  assert.strictEqual(h.requests.length, 1);
+  finish({ path: '/old.txt', timestamp: '20261011_120000' });
+  await pending;
+  assert.strictEqual(vm.runInContext('currentGuidedSaved', h.context), null, 'old upload cannot become the selected source');
+  assert.strictEqual(h.requests.length, 1, 'stale upload never previews or starts');
+  assert.strictEqual(h.elements.guidedStartBtn.disabled, false);
+  cases += 1;
+}
+
+async function runPreviewEditRequiresNewPreview() {
+  const h = makeHarness({ guidedStartBtn: '', guidedSettingInput: 'first', guidedSizePreview: '' });
+  vm.runInContext("currentGuidedSaved = { path: '/saved', timestamp: '20261011_120000' }", h.context);
+  vm.runInContext(functionSource(workspace, 'startGuidedImport'), h.context);
+  await h.context.startGuidedImport({ name: 'recording' });
+  assert.ok(h.elements.guidedSizePreview.textContent.includes('2 recordings'));
+  assert.strictEqual(h.elements.guidedStartBtn.focused, true, 'the enabled final start button receives keyboard focus');
+  h.elements.guidedSettingInput.value = 'changed';
+  vm.runInContext("invalidateImportPreview('guided')", h.context);
+  await h.context.startGuidedImport({ name: 'recording' });
+  assert.strictEqual(h.requests.filter(request => request.url.endsWith('/preview')).length, 2);
+  assert.ok(!h.requests.some(request => request.url.endsWith('/start')));
+  cases += 1;
+}
+
+async function runThinkingRefreshKeepsControlsAndFocus() {
+  let timer;
+  const control = {};
+  const panel = { innerHTML: '', contains: element => element === control };
+  const context = makeContext({
+    console,
+    setTimeout: callback => { timer = callback; return 1; },
+    clearTimeout: () => {},
+    importEvents: { id: {} },
+    document: { activeElement: control, querySelector: () => panel },
+    window: { location: { hash: '#progress/id' }, apiJson: async () => ({ thinking: { status: 'current', recordings: 3, ready: 1, waiting: 1, held: 1, unreadable: 0 } }) },
+  });
+  installRealEscapeHtml(context);
+  context.scheduleThinkingProgress();
+  await timer();
+  assert.strictEqual(panel.innerHTML, '', 'a focused Health link is not detached');
+  context.document.activeElement = null;
+  await timer();
+  assert.ok(panel.innerHTML.includes('1'), 'thinking counts refresh without a publication event');
+  assert.strictEqual(context.importEvents.id.thinking.ready, 1);
+  context.window.location.hash = '#history';
+  await timer();
+  cases += 1;
+}
+
 Promise.resolve()
+  .then(runSourceChangeWhileUploading)
+  .then(runPreviewEditRequiresNewPreview)
+  .then(runThinkingRefreshKeepsControlsAndFocus)
   .then(runQuickSubmit)
   .then(runGuidedSubmit)
   .then(runConfirmSubmit)

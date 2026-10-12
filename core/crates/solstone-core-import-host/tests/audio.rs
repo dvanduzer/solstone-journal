@@ -1735,3 +1735,76 @@ async fn a_real_video_file_imports_an_audio_only_chunk_the_transcriber_claims() 
         "and nothing is written for it"
     );
 }
+
+#[tokio::test]
+async fn preview_matches_published_coordinates_across_midnight_dst_and_collisions() {
+    use solstone_core_import::size::Recording;
+    for (stamp, duration) in [
+        ("20261011_235800", 600.1),
+        ("20260308_015800", 901.0),
+        ("20261101_015800", 4200.1),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let mut req = request(&temp, stamp);
+        req.base_timestamp = NaiveDateTime::parse_from_str(stamp, "%Y%m%d_%H%M%S").unwrap();
+        req.day = stamp[..8].to_owned();
+        fs::create_dir_all(req.journal_root.join("config")).unwrap();
+        fs::write(
+            req.journal_root.join("config/journal.json"),
+            br#"{"identity":{"timezone":"America/Denver"}}"#,
+        )
+        .unwrap();
+        fs::write(&req.source_media, b"audio source").unwrap();
+        // A real destination collision must shift both the planner and writer.
+        let occupied = req
+            .journal_root
+            .join("chronicle")
+            .join(&req.day)
+            .join(&req.stream)
+            .join(format!("{}_300", &stamp[9..]));
+        fs::create_dir_all(&occupied).unwrap();
+        fs::write(occupied.join("owner.txt"), b"keep").unwrap();
+        let before = solstone_core_import::snapshot::fingerprint(&req.journal_root).unwrap();
+        let preview =
+            solstone_core_import_host::audio::preview_with_probe(&req, probed(duration)).unwrap();
+        assert_eq!(
+            before,
+            solstone_core_import::snapshot::fingerprint(&req.journal_root).unwrap(),
+            "preview writes nothing"
+        );
+        let outcome = fake_import(
+            req.clone(),
+            duration,
+            None,
+            Rc::new(RefCell::new(Vec::new())),
+        )
+        .await
+        .unwrap();
+        let actual = outcome
+            .created()
+            .segments
+            .iter()
+            .map(|segment| Recording {
+                day: segment.day.clone(),
+                stream: segment.stream.clone(),
+                segment: segment.segment.clone(),
+            })
+            .collect();
+        assert_eq!(preview.recordings, actual, "{stamp}");
+        assert_eq!(fs::read(occupied.join("owner.txt")).unwrap(), b"keep");
+    }
+}
+
+#[test]
+fn preview_refuses_a_nonexistent_local_audio_start() {
+    let temp = TempDir::new().unwrap();
+    let mut req = request(&temp, "20260308_023000");
+    req.base_timestamp = NaiveDateTime::parse_from_str("20260308_023000", "%Y%m%d_%H%M%S").unwrap();
+    fs::create_dir_all(req.journal_root.join("config")).unwrap();
+    fs::write(
+        req.journal_root.join("config/journal.json"),
+        br#"{"identity":{"timezone":"America/Denver"}}"#,
+    )
+    .unwrap();
+    assert!(solstone_core_import_host::audio::preview_with_probe(&req, probed(1.0)).is_err());
+}

@@ -21,11 +21,10 @@ use solstone_core_import_host::import_publication::{
 };
 use solstone_core_import_sources::archive::{
     ArchiveMergeOptions, ArchiveMergeResult, FullReindexRequester, ReindexStatus, RetryDisposition,
-    merge_journal_archive, plan_journal_archive, validate_archive_preflight,
+    merge_journal_archive, validate_archive_preflight,
 };
 use solstone_core_import_sources::{
-    ImportSourcesError, MergeMutationState, chatgpt, claude, document, gemini, ics, image,
-    obsidian, save, strava,
+    ImportSourcesError, MergeMutationState, document, image, save, strava,
 };
 use solstone_core_journal_io::{DEFAULT_LOCK_TIMEOUT, LockOptions, hold_lock};
 
@@ -81,24 +80,22 @@ pub fn run(dispatch: RegistryDispatch, journal: &Path) -> CliRun {
 /// Dry-run and preview return `None` and do not allocate. The id is the
 /// selected directory, which can differ from the source timestamp.
 pub fn run_bound(dispatch: RegistryDispatch, journal: &Path) -> (CliRun, Option<String>) {
+    if dispatch.dry_run {
+        return (
+            match preview_size(&dispatch, journal) {
+                Ok(size) => success(size.render(dispatch.json)),
+                Err(error) => failure(format!("import preview failed: {error}\n")),
+            },
+            None,
+        );
+    }
     let mut selected = None;
-    let zone = solstone_core_journal_config::owner_zone(journal);
     let cli = match dispatch.source {
-        RegistrySource::Ics => run_save(dispatch, journal, &mut selected, |path| {
-            ics::preview(path, &zone)
-        }),
-        RegistrySource::Obsidian => run_save(dispatch, journal, &mut selected, |path| {
-            obsidian::preview(path, &zone)
-        }),
-        RegistrySource::Claude => run_save(dispatch, journal, &mut selected, |path| {
-            claude::preview(path, &zone)
-        }),
-        RegistrySource::Chatgpt => run_save(dispatch, journal, &mut selected, |path| {
-            chatgpt::preview(path, &zone)
-        }),
-        RegistrySource::Gemini => run_save(dispatch, journal, &mut selected, |path| {
-            gemini::preview(path, &zone)
-        }),
+        RegistrySource::Ics
+        | RegistrySource::Obsidian
+        | RegistrySource::Claude
+        | RegistrySource::Chatgpt
+        | RegistrySource::Gemini => run_save(dispatch, journal, &mut selected),
         RegistrySource::Document => run_document(dispatch, journal, &mut selected),
         RegistrySource::Image => run_image(dispatch, journal, &mut selected),
         RegistrySource::JournalArchive => run_archive(dispatch, journal, &mut selected),
@@ -108,6 +105,85 @@ pub fn run_bound(dispatch: RegistryDispatch, journal: &Path) -> (CliRun, Option<
         }
     };
     (cli, selected)
+}
+
+fn preview_size(
+    dispatch: &RegistryDispatch,
+    journal: &Path,
+) -> Result<solstone_core_import::size::ImportSize, String> {
+    let zone = solstone_core_journal_config::owner_zone(journal);
+    if let Some(rendered) =
+        save::render(dispatch.source, &dispatch.media, &dispatch.timestamp, zone)
+    {
+        let rendered = rendered?;
+        if !dispatch.force && already_saved(journal, &dispatch.media) {
+            return Ok(solstone_core_import::size::ImportSize {
+                skipped: rendered.files.len(),
+                ..Default::default()
+            });
+        }
+        return save::preview_size(journal, &rendered);
+    }
+    match dispatch.source {
+        RegistrySource::Image => {
+            image::preview_size(&dispatch.media, journal, zone).map_err(|error| error.to_string())
+        }
+        RegistrySource::JournalArchive => {
+            solstone_core_import_sources::archive::preview_size(&dispatch.media, journal)
+                .map_err(|error| error.to_string())
+        }
+        RegistrySource::Document => {
+            #[cfg(windows)]
+            let worker = document::WindowsPdfWorker::from_verified_package(PDF_WORKER_TIMEOUT)
+                .map_err(|error| error.to_string())?;
+            #[cfg(not(windows))]
+            let worker = document::SystemPdfWorker::new(pdf_worker_sibling()?, PDF_WORKER_TIMEOUT);
+            document::preview_size(
+                document::DocumentPreviewRequest {
+                    source: &dispatch.media,
+                    password: None,
+                    now: SystemTime::now(),
+                    zone,
+                },
+                journal,
+                dispatch.force,
+                &worker,
+            )
+        }
+        RegistrySource::Strava => {
+            let zone = strava::read_zone_record(journal).map_err(|error| error.to_string())?;
+            let workouts = strava::read_workouts(&dispatch.media, strava::DEFAULT_LIST_CAP)
+                .map_err(|error| error.to_string())?;
+            let placement = strava::place(journal, &workouts.workouts, zone, None)
+                .map_err(|error| error.to_string())?;
+            let mut recordings: std::collections::BTreeSet<_> = placement
+                .publish
+                .into_iter()
+                .map(|tile| solstone_core_import::size::Recording {
+                    day: tile.day,
+                    stream: "import.strava".to_owned(),
+                    segment: tile.segment,
+                })
+                .collect();
+            for tile in &placement.tiles {
+                if let strava::TileAction::Updated { day, segment, .. } = tile {
+                    recordings.insert(solstone_core_import::size::Recording {
+                        day: day.clone(),
+                        stream: "import.strava".to_owned(),
+                        segment: segment.clone(),
+                    });
+                }
+            }
+            Ok(solstone_core_import::size::ImportSize {
+                recordings,
+                skipped: placement.counts.stayed_deleted_tiles
+                    + placement.counts.no_free_key_tiles
+                    + placement.counts.duplicate_identity_tiles,
+                ..Default::default()
+            })
+        }
+        _ => Err("this source has no manual import preview".to_owned()),
+    }
 }
 
 fn bind_dispatch(journal: &Path, dispatch: &RegistryDispatch) -> Result<String, String> {
@@ -210,23 +286,13 @@ fn already_saved(journal: &Path, media: &Path) -> bool {
         .is_some_and(|entries| entries > 0)
 }
 
-fn run_save<E>(
+fn run_save(
     mut dispatch: RegistryDispatch,
     journal: &Path,
     selected: &mut Option<String>,
-    preview: impl FnOnce(&Path) -> Result<solstone_core_import::ImportPreview, E>,
-) -> CliRun
-where
-    E: std::fmt::Display,
-{
+) -> CliRun {
     let source = dispatch.source;
     let name = source.name();
-    if dispatch.dry_run {
-        return match preview(&dispatch.media) {
-            Ok(preview) => success(cli_render::source_preview(source, &preview)),
-            Err(error) => failure(format!("{name} preview failed: {error}\n")),
-        };
-    }
     if !dispatch.force && already_saved(journal, &dispatch.media) {
         return success(cli_render::resolution_skipped(
             solstone_core_import::SkipReason::AlreadyImported,
@@ -401,18 +467,6 @@ fn run_document(
     };
     #[cfg(not(windows))]
     let worker = document::SystemPdfWorker::new(worker_path, PDF_WORKER_TIMEOUT);
-    if dispatch.dry_run {
-        let preview = document::preview(
-            document::DocumentPreviewRequest {
-                source: &dispatch.media,
-                password: None,
-                now: SystemTime::now(),
-                zone: solstone_core_journal_config::owner_zone(journal),
-            },
-            &worker,
-        );
-        return success(cli_render::source_preview(dispatch.source, &preview));
-    }
     let model_client = match solstone_core_generate::OneShotClient::sibling() {
         Ok(client) => client,
         Err(error) => {
@@ -500,15 +554,6 @@ fn run_image(
     journal: &Path,
     selected: &mut Option<String>,
 ) -> CliRun {
-    if dispatch.dry_run {
-        return success(cli_render::source_preview(
-            dispatch.source,
-            &image::preview(
-                &dispatch.media,
-                solstone_core_journal_config::owner_zone(journal),
-            ),
-        ));
-    }
     if let Err(error) = claim_dispatch_id(journal, &mut dispatch, selected) {
         return failure(format!(
             "{} import failed: {error}\n",
@@ -611,15 +656,6 @@ fn run_archive_with_seams(
     selected: &mut Option<String>,
     seams: &ArchiveTerminalSeams<'_>,
 ) -> CliRun {
-    if dispatch.dry_run {
-        return match plan_journal_archive(&dispatch.media) {
-            Ok(plan) => success(cli_render::source_preview(dispatch.source, &plan.into())),
-            Err(error) => failure(format!(
-                "{} preview failed: {error}\n",
-                dispatch.source.name()
-            )),
-        };
-    }
     let options = ArchiveMergeOptions {
         working_root: solstone_core_import_sources::archive::archive_merge_working_root(journal),
         ..ArchiveMergeOptions::default()
@@ -969,10 +1005,18 @@ pub(crate) fn run_strava(
     selected: &mut Option<String>,
 ) -> CliRun {
     let media = dispatch.media.clone();
-    let dry_run = dispatch.dry_run;
+    let requested_id = dispatch.timestamp.clone();
     let run = run_strava_internal(dispatch, journal, selected, None);
-    if !dry_run {
+    {
         discard_uploaded_download(journal, Path::new(&media));
+        let import_id = selected.as_deref().unwrap_or(&requested_id);
+        if journal.join("imports").join(import_id).exists()
+            && let Err(error) = solstone_core_import::snapshot::discard_download(journal, import_id)
+        {
+            return failure(format!(
+                "could not remove the staged Strava download: {error}\n"
+            ));
+        }
     }
     run
 }
@@ -1020,11 +1064,7 @@ fn run_strava_internal(
 ) -> CliRun {
     let source = dispatch.source;
     let name = source.name();
-    let action_label = if dispatch.dry_run {
-        "preview"
-    } else {
-        "import"
-    };
+    let action_label = "import";
 
     // 1. read_zone_record
     let pre_lock_zone = match strava::read_zone_record(journal) {
@@ -1044,30 +1084,12 @@ fn run_strava_internal(
     let fault = None;
 
     // 3. place as fail-fast
-    let pre_placement = match strava::place(journal, &workouts.workouts, pre_lock_zone, fault) {
-        Ok(p) => p,
+    match strava::place(journal, &workouts.workouts, pre_lock_zone, fault) {
+        Ok(_) => {}
         Err(e) => return failure(format!("{name} {action_label} failed: {e}\n")),
     };
 
     // 4. dry_run
-    if dispatch.dry_run {
-        let mut summary = strava::format_count_summary(&pre_placement.counts);
-        let owner_z = solstone_core_journal_config::owner_zone(journal);
-        if pre_placement.zone.name() != owner_z.name() {
-            summary.push_str(&format!(" zone={}", pre_placement.zone.name()));
-        }
-        let date_range = match (&pre_placement.first_day, &pre_placement.last_day) {
-            (Some(f), Some(l)) => (f.clone(), l.clone()),
-            _ => (String::new(), String::new()),
-        };
-        let preview = solstone_core_import::ImportPreview {
-            date_range,
-            item_count: pre_placement.counts.new_workouts as u64,
-            entity_count: pre_placement.counts.tiles_to_create as u64,
-            summary,
-        };
-        return success(cli_render::source_preview(source, &preview));
-    }
 
     // 5. Ignore dispatch.force. No same-file skip.
 
@@ -1313,6 +1335,7 @@ mod tests {
             media: image_path.to_path_buf(),
             timestamp: timestamp.to_owned(),
             dry_run: false,
+            json: false,
             force: false,
         }
     }
@@ -1659,6 +1682,7 @@ mod tests {
             media: archive_path.to_path_buf(),
             timestamp: timestamp.to_owned(),
             dry_run: false,
+            json: false,
             force: false,
         }
     }
@@ -1711,7 +1735,7 @@ mod tests {
         dispatch.dry_run = true;
         let run = run(dispatch, journal.path());
         assert_eq!(run.exit_code, 0, "{}", run.stderr);
-        assert!(run.stdout.contains("preview:"));
+        assert!(run.stdout.contains("recording"));
 
         // Confirm no attempt was admitted
         let meta =
@@ -2358,6 +2382,7 @@ mod tests {
             media,
             timestamp: "20260408_120000".to_owned(),
             dry_run: false,
+            json: false,
             force: false,
         };
         let req = cli_producer_request(root, &dispatch, 1);
@@ -2726,6 +2751,7 @@ mod tests {
             media: path.to_path_buf(),
             timestamp: stamp.to_owned(),
             dry_run: false,
+            json: false,
             force: false,
         };
 
@@ -2868,6 +2894,7 @@ mod tests {
             media: csv_path.to_path_buf(),
             timestamp: timestamp.to_owned(),
             dry_run: false,
+            json: false,
             force: false,
         }
     }
@@ -3029,7 +3056,7 @@ mod tests {
         assert_eq!(run.exit_code, 0, "{}", run.stderr);
         assert!(id.is_none());
         assert!(
-            run.stdout.contains("strava preview: date_range=20260810..20260812 items=2 entities=3 summary=new=2 tiles_to_create=3"),
+            run.stdout.contains("3 recordings across 2 days"),
             "{}",
             run.stdout
         );
@@ -3048,7 +3075,7 @@ mod tests {
 
         let (run, _) = run_bound(dispatch, journal.path());
         assert_ne!(run.exit_code, 0);
-        assert!(run.stderr.contains("strava preview failed:"));
+        assert!(run.stderr.contains("import preview failed:"));
     }
 
     #[test]
@@ -4472,7 +4499,7 @@ mod tests {
         let (run_dry, id_dry) = run_bound(dispatch_dry, journal.path());
         assert_eq!(run_dry.exit_code, 0);
         assert!(id_dry.is_none());
-        assert!(run_dry.stdout.contains("new=1 tiles_to_create=1"));
+        assert!(run_dry.stdout.contains("1 recording across 1 day"));
         assert!(!journal.path().join("chronicle").exists());
         assert!(!journal.path().join("imports").exists());
 

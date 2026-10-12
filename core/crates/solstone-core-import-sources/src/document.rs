@@ -910,6 +910,69 @@ pub fn preview(request: DocumentPreviewRequest<'_>, worker: &dyn PdfWorker) -> I
     }
 }
 
+/// Destination-aware PDF plan. The same extraction and collision rules run at publication.
+pub fn preview_size(
+    request: DocumentPreviewRequest<'_>,
+    journal: &Path,
+    force: bool,
+    worker: &dyn PdfWorker,
+) -> Result<solstone_core_import::size::ImportSize, String> {
+    let pdfs = find_pdfs(request.source);
+    if pdfs.is_empty() {
+        return Err("no PDF documents found".to_owned());
+    }
+    let mut result = solstone_core_import::size::ImportSize::default();
+    let mut occupied = HashMap::new();
+    let mut failures = Vec::new();
+    for source in pdfs {
+        let payload = match worker.execute(&worker_request(
+            PdfCommand::Extract,
+            &source,
+            request.password,
+            None,
+        )) {
+            Ok(payload) => payload,
+            Err(error) => {
+                failures.push(owner_message(&source, &error));
+                result.skipped += 1;
+                continue;
+            }
+        };
+        let source_hash = hash_source(&source).map_err(|error| error.to_string())?;
+        let hash = if payload.sha256.is_empty() {
+            source_hash.as_str()
+        } else {
+            &payload.sha256
+        };
+        let timestamp = claim_timestamp(&payload, &source, request.now);
+        let claim = allocate_segment(
+            journal,
+            request.zone,
+            timestamp.timestamp,
+            hash,
+            &mut occupied,
+            force,
+            false,
+        )
+        .map_err(|error| error.to_string())?;
+        if claim.already_imported {
+            result.skipped += 1;
+        } else {
+            result
+                .recordings
+                .insert(solstone_core_import::size::Recording {
+                    day: claim.day,
+                    stream: STREAM.to_owned(),
+                    segment: claim.segment,
+                });
+        }
+    }
+    if result.recordings.is_empty() && !failures.is_empty() {
+        return Err(failures.join("\n"));
+    }
+    Ok(result)
+}
+
 pub struct PreparedDocumentItem {
     pub input_index: usize,
     pub source: PathBuf,
@@ -1439,6 +1502,18 @@ fn claim_segment(
     occupied: &mut HashMap<(String, String), String>,
     force: bool,
 ) -> Result<SegmentClaim, DocumentSegmentError> {
+    allocate_segment(journal, zone, start, sha256, occupied, force, true)
+}
+
+fn allocate_segment(
+    journal: &Path,
+    zone: Tz,
+    start: SystemTime,
+    sha256: &str,
+    occupied: &mut HashMap<(String, String), String>,
+    force: bool,
+    publish: bool,
+) -> Result<SegmentClaim, DocumentSegmentError> {
     let start_local = DateTime::<Utc>::from(start).with_timezone(&zone);
     let day = start_local.format("%Y%m%d").to_string();
     let parent_rel = format!("chronicle/{day}/{STREAM}");
@@ -1447,10 +1522,12 @@ fn claim_segment(
             path: journal.join(&parent_rel),
             detail: error.to_string(),
         })?;
-    fs::create_dir_all(&parent).map_err(|error| DocumentSegmentError::Io {
-        path: parent.clone(),
-        detail: error.to_string(),
-    })?;
+    if publish {
+        fs::create_dir_all(&parent).map_err(|error| DocumentSegmentError::Io {
+            path: parent.clone(),
+            detail: error.to_string(),
+        })?;
+    }
 
     for attempt in 0..DOCUMENT_SEGMENT_PROBE_LIMIT {
         let candidate_local = start_local + chrono::Duration::seconds(i64::from(attempt));
@@ -1495,37 +1572,50 @@ fn claim_segment(
         })? {
             continue;
         }
-        let _allocation = solstone_core_segment::output_attempt::SegmentMutation::acquire(
-            &candidate_path,
-            solstone_core_journal_io::LockOptions::default(),
-        )
-        .map_err(|error| DocumentSegmentError::Io {
-            path: candidate_path.clone(),
-            detail: error.to_string(),
-        })?;
-        let fresh = match fs::create_dir(&candidate_path) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-            // `create_dir` follows a dangling symlink and reports the missing
-            // target. The symlink itself is the occupant: leave it and move on.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::symlink_metadata(&candidate_path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => continue,
-                    Ok(_) => false,
-                    Err(stat_error) => {
-                        return Err(DocumentSegmentError::Io {
-                            path: candidate_path,
-                            detail: stat_error.to_string(),
-                        });
+        let _allocation = if publish {
+            Some(
+                solstone_core_segment::output_attempt::SegmentMutation::acquire(
+                    &candidate_path,
+                    solstone_core_journal_io::LockOptions::default(),
+                )
+                .map_err(|error| DocumentSegmentError::Io {
+                    path: candidate_path.clone(),
+                    detail: error.to_string(),
+                })?,
+            )
+        } else {
+            None
+        };
+        let fresh = if publish {
+            match fs::create_dir(&candidate_path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+                // `create_dir` follows a dangling symlink and reports the missing
+                // target. The symlink itself is the occupant: leave it and move on.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match fs::symlink_metadata(&candidate_path) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => continue,
+                        Ok(_) => false,
+                        Err(stat_error) => {
+                            return Err(DocumentSegmentError::Io {
+                                path: candidate_path,
+                                detail: stat_error.to_string(),
+                            });
+                        }
                     }
                 }
+                Err(error) => {
+                    return Err(DocumentSegmentError::Io {
+                        path: candidate_path,
+                        detail: error.to_string(),
+                    });
+                }
             }
-            Err(error) => {
-                return Err(DocumentSegmentError::Io {
-                    path: candidate_path,
-                    detail: error.to_string(),
-                });
-            }
+        } else {
+            !path_lexists(&candidate_path).map_err(|error| DocumentSegmentError::Io {
+                path: candidate_path.clone(),
+                detail: error.to_string(),
+            })?
         };
         if fresh || reusable_original(&candidate_path, sha256)? {
             if !fresh && !force && document_transcript_exists(&candidate_path)? {
@@ -1538,6 +1628,15 @@ fn claim_segment(
                 });
             }
             occupied.insert(key, sha256.to_owned());
+            if !publish {
+                return Ok(SegmentClaim {
+                    day,
+                    segment,
+                    timestamp: SystemTime::from(candidate_local.with_timezone(&Utc)),
+                    already_imported: false,
+                    binding: None,
+                });
+            }
             let resolved =
                 SegmentDir::resolve(journal, &day, &segment, STREAM).map_err(|error| {
                     DocumentSegmentError::Io {

@@ -134,10 +134,12 @@ pub fn render_notes(
     notes: Vec<NoteEntry>,
     zone: &impl TimeZone<Offset: fmt::Display>,
 ) -> RenderedImport {
+    let total_notes = notes.len();
     let notes = notes
         .into_iter()
         .filter(|note| !note.content.trim().is_empty())
         .collect::<Vec<_>>();
+    let skipped = total_notes - notes.len();
     let entry_count = u64::try_from(notes.len()).expect("note count fits u64");
     let stream = format!("import.{}", RegistrySource::Obsidian.name());
     let windows = window(
@@ -189,6 +191,7 @@ pub fn render_notes(
         .collect::<BTreeSet<_>>()
         .len();
     RenderedImport {
+        skipped,
         source: RegistrySource::Obsidian,
         files,
         items,

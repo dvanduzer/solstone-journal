@@ -58,6 +58,16 @@ The public API-root commands are `solstone call`, `solstone import`, and
 HTTP boundary; it is distinct from `solstone journal status`, which reports local
 journal state.
 
+`solstone import FILE` shows the planned recordings and days before it queues
+work. `--dry-run` stages the source and shows that preview without starting
+processing. On the computer running your journal,
+`solstone journal importer FILE --dry-run` reads the source and destination
+without creating journal recordings. Both previews accept `--json`.
+`solstone import FILE --json` keeps its final JSON on stdout and prints the
+size notice to stderr before starting. The import page also shows
+thinking progress after recordings have been saved, with a link to health for
+work that has been set aside.
+
 The `solstone journal` family's command grammar and local operations live in
 `solstone-core-journal-cli`; its closed process census maps every retained
 service name to its historical owner module. The native dispatch table in

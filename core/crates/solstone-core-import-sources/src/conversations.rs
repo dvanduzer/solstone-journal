@@ -82,6 +82,7 @@ pub fn render(source: RegistrySource, plan: ImportPlan, import_id: &str) -> Rend
         .collect::<Vec<_>>();
 
     RenderedImport {
+        skipped: plan.skipped.len(),
         source,
         summary: crate::save::conversations_summary(
             plan.item_count,

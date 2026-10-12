@@ -45,6 +45,7 @@ pub struct SegmentFile {
 /// An import rendered from its source and ready to write.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderedImport {
+    pub skipped: usize,
     pub source: RegistrySource,
     pub files: Vec<SegmentFile>,
     /// Rows of `content_manifest.jsonl`: what the owner browses on the Import page.
@@ -116,6 +117,36 @@ pub fn render(
         }
         _ => return None,
     })
+}
+
+/// Count unique publishable recordings, applying the writer's owner-deletion rule.
+pub fn preview_size(
+    journal: &Path,
+    rendered: &RenderedImport,
+) -> Result<solstone_core_import::size::ImportSize, String> {
+    let stream = rendered.stream();
+    let mut size = solstone_core_import::size::ImportSize {
+        skipped: rendered.skipped,
+        ..Default::default()
+    };
+    for file in &rendered.files {
+        let path = journal
+            .join("chronicle")
+            .join(&file.day)
+            .join(&stream)
+            .join(&file.segment);
+        if solstone_core_segment::owner_deleted(&path).map_err(|error| error.to_string())? {
+            size.skipped += 1;
+        } else {
+            size.recordings
+                .insert(solstone_core_import::size::Recording {
+                    day: file.day.clone(),
+                    stream: stream.clone(),
+                    segment: file.segment.clone(),
+                });
+        }
+    }
+    Ok(size)
 }
 
 /// Write every rendered segment file and, for an import with an id, its content manifest.
@@ -376,6 +407,7 @@ mod tests {
         let c_dir = stream_dir.join("seg_c");
 
         let rendered = RenderedImport {
+            skipped: 0,
             source: RegistrySource::Ics,
             files: vec![
                 SegmentFile {
@@ -480,6 +512,7 @@ mod tests {
         assert!(solstone_core_segment::owner_deleted(&segment_dir).is_err());
 
         let rendered = RenderedImport {
+            skipped: 0,
             source: RegistrySource::Ics,
             files: vec![SegmentFile {
                 day: "20260804".to_owned(),
@@ -499,6 +532,7 @@ mod tests {
 
         // Control layout writes successfully with normal name
         let control_rendered = RenderedImport {
+            skipped: 0,
             source: RegistrySource::Ics,
             files: vec![SegmentFile {
                 day: "20260804".to_owned(),

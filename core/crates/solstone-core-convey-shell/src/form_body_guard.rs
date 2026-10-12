@@ -146,6 +146,7 @@ mod tests {
             assert!(!refused(&Method::POST, path, &multipart), "{path}");
         }
         for path in [
+            "/app/import/api/preview",
             "/app/import/api/start",
             "/app/devices/ingest/x",
             "/app/import/api/save/",

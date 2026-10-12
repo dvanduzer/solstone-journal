@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- imports now show how many recordings they will add or update, and how many days they cover, before they start. the import page keeps showing how many are ready to find, still waiting or set aside after the recordings are saved.
+
 - health now brings set-aside work into one list, with a reason and a try-again for each failed step. your request joins the priority order and keeps accepted results and your edits. a retry also becomes possible when its input changes or an update contains a declared fix for that failure. an update alone does not retry it.
 
 - searching your journal now finds a day by the towns your phone's location was near, and your journal's own thinking, and an agent that may see transcripts across your whole journal, can read those town names, never the coordinates.

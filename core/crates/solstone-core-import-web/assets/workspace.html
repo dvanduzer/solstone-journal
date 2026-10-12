@@ -474,7 +474,8 @@
   border-color: var(--focus);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 10%, transparent);
 }
-.modal-actions { margin-top: 1em; display: flex; justify-content: flex-end; }
+.modal-actions { margin-top: 1em; display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: flex-end; }
+#quickSizePreview { flex: 1 1 100%; }
 
 .import-list { margin-top: 2em; overflow-x: auto; padding: 1rem 1.25rem; border-radius: 12px; background: var(--panel); }
 .import-list h2 { font-size: 1.15rem; font-weight: 600; margin: 0 0 0.75rem 0; color: var(--ink); }
@@ -705,7 +706,8 @@
     <input type="hidden" id="savedPath" />
     <div id="detectDuplicateNotice"></div>
     <div class="modal-actions">
-      <button id="startBtn" class="import-primary-btn">start import</button>
+      <div id="quickSizePreview" role="status" aria-live="polite"></div>
+      <button id="startBtn" class="import-primary-btn">preview import</button>
     </div>
   </div>
 </div>
@@ -848,6 +850,7 @@ async function navigateTo(view, options = {}) {
     showProgressView(importId);
     if (typeof reconcileImportState === 'function') {
       await reconcileImportState(importId);
+      scheduleThinkingProgress();
     }
   } else {
     currentGuideSource = null;
@@ -889,6 +892,7 @@ function showGrid() {
   currentGuideSource = null;
   currentGuidedFile = null;
   currentGuidedSaved = null;
+  invalidateImportPreview('guided');
   window._guidedClientItemId = null;
   navigateTo('grid');
 }
@@ -968,6 +972,7 @@ function duplicateNoticeText(duplicate = {}, inProgress = false) {
 }
 
 function showDetect(res) {
+  invalidateImportPreview('quick');
   window._quickSaved = res;
   document.getElementById('timestampInput').value = res.timestamp || '';
   document.getElementById('savedPath').value = res.path;
@@ -1657,6 +1662,7 @@ async function loadGuidedFlow(sourceName) {
   currentGuideSource = sourceName;
   currentGuidedFile = null;
   currentGuidedSaved = null;
+  invalidateImportPreview('guided');
   window._guidedClientItemId = null;
   if (!guideSteps) {
     return;
@@ -1711,14 +1717,14 @@ async function loadGuidedFlow(sourceName) {
       </div></li>
       <li><div class="import-step">
         <div class="import-step-number">step ${configureStepNumber}</div>
+        <div id="guidedSizePreview" role="status" aria-live="polite"></div>
         ${source.name === 'journal_archive' ? `
           <h4>preview, then merge your archive</h4>
           <div class="import-action-row">
-            <button id="guidedPreviewBtn" class="import-secondary-btn" type="button">preview</button>
-            <button id="guidedStartBtn" class="import-primary-btn" type="submit">start import</button>
+            <button id="guidedStartBtn" class="import-primary-btn" type="button">preview import</button>
             <a class="import-secondary-btn" href="/app/import/api/journal-archive/export">download this journal</a>
           </div>
-          <div id="guidedArchivePreview"></div>
+
         ` : `
           <h4>configure and start</h4>
           <div class="import-inline-fields">
@@ -1729,7 +1735,7 @@ async function loadGuidedFlow(sourceName) {
             </div>
           </div>
           <div class="import-action-row">
-            <button id="guidedStartBtn" class="import-primary-btn" type="submit">start import</button>
+            <button id="guidedStartBtn" class="import-primary-btn" type="button">preview import</button>
           </div>
         `}
       </div></li>
@@ -1743,6 +1749,7 @@ async function loadGuidedFlow(sourceName) {
     if (guidedPathInput) {
       guidedPathInput.addEventListener('input', () => {
         currentGuidedSaved = null;
+  invalidateImportPreview('guided');
         window._guidedClientItemId = crypto.randomUUID();
       });
     }
@@ -1750,10 +1757,6 @@ async function loadGuidedFlow(sourceName) {
   const guidedStartBtn = document.getElementById('guidedStartBtn');
   if (guidedStartBtn) {
     guidedStartBtn.addEventListener('click', () => startGuidedImport(source));
-  }
-  const guidedPreviewBtn = document.getElementById('guidedPreviewBtn');
-  if (guidedPreviewBtn) {
-    guidedPreviewBtn.addEventListener('click', () => previewGuidedJournalArchive(source));
   }
   const guidedForm = document.getElementById('guidedImportForm');
   if (guidedForm && guidedStartBtn) {
@@ -1819,6 +1822,7 @@ function setupGuidedUploadArea() {
     currentGuidedFile = file || null;
     fileLabel.textContent = file ? file.name : '';
     currentGuidedSaved = null;
+  invalidateImportPreview('guided');
     window._guidedClientItemId = file ? crypto.randomUUID() : null;
   };
 
@@ -1867,6 +1871,7 @@ function setupQuickImportForm() {
   currentFile = null;
   window._quickClientItemId = null;
   window._quickSaved = null;
+  invalidateImportPreview('quick');
   dropArea.onclick = () => fileInput.click();
   dropArea.addEventListener('keydown', e => {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -1889,6 +1894,7 @@ function setupQuickImportForm() {
       fileLabel.textContent = file.name;
       window._quickClientItemId = crypto.randomUUID();
       window._quickSaved = null;
+  invalidateImportPreview('quick');
     }
   });
   fileInput.onchange = e => {
@@ -1897,12 +1903,14 @@ function setupQuickImportForm() {
       fileLabel.textContent = currentFile.name;
       window._quickClientItemId = crypto.randomUUID();
       window._quickSaved = null;
+  invalidateImportPreview('quick');
     }
   };
   ['input', 'paste'].forEach(eventName => {
     pasteText.addEventListener(eventName, () => {
       window._quickClientItemId = crypto.randomUUID();
       window._quickSaved = null;
+  invalidateImportPreview('quick');
     });
   });
 
@@ -1962,6 +1970,7 @@ function setupQuickImportForm() {
 }
 
 async function uploadGuidedSourceFile(source) {
+  const revision = previewRevisions.guided;
   if (!currentGuidedFile) {
     throw new Error('Please select a file to import.');
   }
@@ -1989,6 +1998,7 @@ async function uploadGuidedSourceFile(source) {
     throw new Error(importErrorMessage(data, 'Failed to save import'));
   }
 
+  if (revision !== previewRevisions.guided) return null;
   currentGuidedSaved = data;
 
   if (isTerminalDuplicate(data)) {
@@ -2009,6 +2019,7 @@ function showDedupNotice(duplicate, inProgress = false) {
 }
 
 async function saveGuidedPath(source) {
+  const revision = previewRevisions.guided;
   const pathInput = document.getElementById('guidedPathInput');
   if (!pathInput || !pathInput.value.trim()) {
     throw new Error('Please enter the path to your vault folder.');
@@ -2036,6 +2047,7 @@ async function saveGuidedPath(source) {
     throw new Error(importErrorMessage(data, 'Path not found'));
   }
 
+  if (revision !== previewRevisions.guided) return null;
   currentGuidedSaved = data;
   if (isTerminalDuplicate(data)) {
     showDedupNotice(data.duplicate, Boolean(data.in_progress));
@@ -2043,10 +2055,68 @@ async function saveGuidedPath(source) {
   return data;
 }
 
+const importPreviews = { guided: null, quick: null };
+const previewRevisions = { guided: 0, quick: 0 };
+const importInFlight = { guided: false, quick: false };
+
+function invalidateImportPreview(kind) {
+  importPreviews[kind] = null;
+  previewRevisions[kind] += 1;
+  const panel = document.getElementById(`${kind}SizePreview`);
+  if (panel) panel.textContent = '';
+  const button = document.getElementById(kind === 'guided' ? 'guidedStartBtn' : 'startBtn');
+  if (button) { button.textContent = 'preview import'; button.disabled = importInFlight[kind]; }
+}
+
+function restoreImportButton(kind, button) {
+  const preview = importPreviews[kind];
+  button.textContent = preview ? 'start import' : 'preview import';
+  button.disabled = importInFlight[kind] || Boolean(preview && !preview.ready);
+}
+
+async function prepareImportPreview(kind, payload, setting, button) {
+  const key = JSON.stringify({ ...payload, setting });
+  const previous = importPreviews[kind];
+  if (previous?.key === key && previous.ready) return previous.token;
+  const revision = previewRevisions[kind];
+  button.textContent = 'preparing preview…';
+  const response = await fetch('/app/import/api/preview', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(importErrorMessage(data, 'could not preview this import'));
+  if (revision !== previewRevisions[kind]) return null;
+  const size = data.size;
+  if (!size || !Number.isInteger(size.recordings) || !Number.isInteger(size.days) || !data.preview_token) {
+    throw new Error('could not read the import size');
+  }
+  const ready = size.recordings > 0 || Boolean(size.other_units?.[1]);
+  importPreviews[kind] = { key, token: data.preview_token, ready };
+  const panel = document.getElementById(`${kind}SizePreview`);
+  if (panel) {
+    panel.textContent = `${size.recordings} ${size.recordings === 1 ? 'recording' : 'recordings'} across ${size.days} ${size.days === 1 ? 'day' : 'days'}`;
+    if (size.other_units) panel.textContent += ` · ${size.other_units[1]} ${size.other_units[0]}`;
+    if (size.skipped) panel.textContent += ` · ${size.skipped} skipped`;
+    if (!ready) panel.textContent += ' · nothing to import';
+  }
+  restoreImportButton(kind, button);
+  return null;
+}
+
+document.addEventListener('input', event => {
+  const id = event.target?.id;
+  if (['guidedPathInput', 'guidedFileInput'].includes(id)) currentGuidedSaved = null;
+  if (['guidedSettingInput', 'guidedPathInput', 'guidedFileInput'].includes(id)) invalidateImportPreview('guided');
+  if (['timestampInput', 'settingInput', 'fileInput', 'pasteText', 'quickSettingInput'].includes(id)) invalidateImportPreview('quick');
+});
+
 async function startGuidedImport(source) {
+  if (importInFlight.guided) return;
+  importInFlight.guided = true;
+  const revision = previewRevisions.guided;
+  let preparedPreview = false;
   const startButton = document.getElementById('guidedStartBtn');
   const guidedSettingInput = document.getElementById('guidedSettingInput');
-  const originalText = startButton.textContent;
 
   startButton.disabled = true;
   startButton.innerHTML = 'starting<span class="spinner"></span>';
@@ -2058,6 +2128,7 @@ async function startGuidedImport(source) {
     } else {
       saved = currentGuidedSaved || await uploadGuidedSourceFile(source);
     }
+    if (revision !== previewRevisions.guided) return;
     if (isTerminalDuplicate(saved)) {
       showDedupNotice(saved.duplicate, Boolean(saved.in_progress));
       return;
@@ -2069,7 +2140,7 @@ async function startGuidedImport(source) {
     const metaResponse = await fetch('/app/import/api/meta', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, setting }),
+      body: JSON.stringify({ path, setting, import_id: saved.timestamp }),
     });
 
     if (!metaResponse.ok) {
@@ -2077,6 +2148,11 @@ async function startGuidedImport(source) {
       throw new Error(importErrorMessage(errorData, 'Failed to save import settings'));
     }
 
+    if (revision !== previewRevisions.guided) return;
+    const payload = { path, timestamp: ts, import_id: saved.timestamp };
+    const previewToken = await prepareImportPreview('guided', payload, setting, startButton);
+    preparedPreview = !previewToken && revision === previewRevisions.guided && Boolean(importPreviews.guided?.ready);
+    if (!previewToken || revision !== previewRevisions.guided) return;
     trackPendingImport(ts);
     if (!importEvents[ts]) {
       importEvents[ts] = {
@@ -2091,7 +2167,7 @@ async function startGuidedImport(source) {
     const startResponse = await fetch('/app/import/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, timestamp: ts }),
+      body: JSON.stringify({ ...payload, preview_token: previewToken }),
     });
 
     if (!startResponse.ok) {
@@ -2113,52 +2189,21 @@ async function startGuidedImport(source) {
     loadImports();
     navigateTo(`progress/${ts}`);
   } catch (err) {
+    invalidateImportPreview('guided');
     if (window.showError && err instanceof Error) {
       showError(err.message);
     }
   } finally {
-    startButton.disabled = false;
-    startButton.textContent = originalText;
-  }
-}
-
-async function previewGuidedJournalArchive(source) {
-  const previewButton = document.getElementById('guidedPreviewBtn');
-  const preview = document.getElementById('guidedArchivePreview');
-  const originalText = previewButton.textContent;
-
-  previewButton.disabled = true;
-  previewButton.innerHTML = 'previewing<span class="spinner"></span>';
-  try {
-    const saved = currentGuidedSaved || await uploadGuidedSourceFile(source);
-    const response = await fetch('/app/import/api/journal-archive/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: saved.path, timestamp: saved.timestamp }),
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(importErrorMessage(data, 'Failed to preview archive'));
-    }
-    const days = Array.isArray(data.days) ? data.days : [];
-    preview.innerHTML = `
-      <div class="import-dedup-notice">
-        <span class="dedup-text">${escapeHtml(days.length ? `Archive days: ${days.join(', ')}` : 'The archive has no chronicle days.')}</span>
-      </div>
-    `;
-  } catch (err) {
-    if (window.showError && err instanceof Error) {
-      showError(err.message);
-    }
-  } finally {
-    previewButton.disabled = false;
-    previewButton.textContent = originalText;
+    importInFlight.guided = false;
+    restoreImportButton('guided', startButton);
+    if (preparedPreview) startButton.focus();
   }
 }
 
 async function repeatSource(sourceName) {
   currentGuidedFile = null;
   currentGuidedSaved = null;
+  invalidateImportPreview('guided');
   window._guidedClientItemId = null;
   const hash = window.location.hash.slice(1);
   if (hash.startsWith('progress/')) {
@@ -2190,6 +2235,15 @@ function formatStatValue(val) {
   return escapeHtml(String(val));
 }
 
+function renderThinkingProgress(progress) {
+  if (!progress || progress.status === 'not_published') return '';
+  if (progress.status !== 'current') return 'thinking progress is unavailable';
+  return `${escapeHtml(progress.ready)} of ${escapeHtml(progress.recordings)} ${progress.recordings === 1 ? 'recording' : 'recordings'} ready to find`
+    + (progress.waiting ? ` · ${escapeHtml(progress.waiting)} waiting` : '')
+    + (progress.held ? ` · ${escapeHtml(progress.held)} held — <a href="/app/health/">review on Health</a>` : '')
+    + (progress.unreadable ? ` · ${escapeHtml(progress.unreadable)} could not be checked` : '');
+}
+
 function showProgressView(importId, eventData = null) {
   const guideSteps = document.getElementById('guideSteps');
   const source = sourceMetadataByName[currentGuideSource] || null;
@@ -2219,7 +2273,7 @@ function showProgressView(importId, eventData = null) {
   const stageLabel = isStalled
     ? 'stalled: no updates in 10 minutes'
     : isConfirmedSuccess
-      ? 'import complete'
+      ? 'recordings saved'
       : isUnconfirmed
         ? 'import unconfirmed'
         : isUnavailable
@@ -2334,12 +2388,16 @@ function showProgressView(importId, eventData = null) {
       ${currentEvent?.elapsed_ms ? `<div class="progress-detail">${escapeHtml(formatElapsed(currentEvent.elapsed_ms))} elapsed</div>` : ''}
       <div id="progressReconcileError" role="alert" aria-live="polite" style="display:none; color:var(--danger); margin-top:0.5rem; font-size:0.9rem;"></div>
       ${progressHtml}
+      <div class="import-thinking-progress" role="status" aria-live="polite">${renderThinkingProgress(currentEvent?.thinking)}</div>
       ${completionHtml}
     </div>
   `;
 }
 
 startBtn.addEventListener('click', async () => {
+  if (importInFlight.quick) return;
+  const revision = previewRevisions.quick;
+  let preparedPreview = false;
   const ts = document.getElementById('timestampInput').value.trim();
   const path = document.getElementById('savedPath').value;
   const setting = settingInput.value.trim();
@@ -2353,7 +2411,7 @@ startBtn.addEventListener('click', async () => {
     return;
   }
 
-  const originalText = startBtn.textContent;
+  importInFlight.quick = true;
   startBtn.disabled = true;
   startBtn.innerHTML = 'starting<span class="spinner"></span>';
 
@@ -2361,7 +2419,7 @@ startBtn.addEventListener('click', async () => {
     const response = await fetch('/app/import/api/meta', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, setting }),
+      body: JSON.stringify({ path, setting, import_id: window._quickSaved?.timestamp }),
     });
 
     if (!response.ok) {
@@ -2369,6 +2427,11 @@ startBtn.addEventListener('click', async () => {
       throw new Error(importErrorMessage(errorData, 'Failed to save import settings'));
     }
 
+    if (revision !== previewRevisions.quick) return;
+    const payload = { path, timestamp: ts, import_id: window._quickSaved?.timestamp };
+    const previewToken = await prepareImportPreview('quick', payload, setting, startBtn);
+    preparedPreview = !previewToken && revision === previewRevisions.quick && Boolean(importPreviews.quick?.ready);
+    if (!previewToken || revision !== previewRevisions.quick) return;
     trackPendingImport(ts);
     if (!importEvents[ts]) {
       importEvents[ts] = {
@@ -2383,7 +2446,7 @@ startBtn.addEventListener('click', async () => {
     const startResponse = await fetch('/app/import/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, timestamp: ts }),
+      body: JSON.stringify({ ...payload, preview_token: previewToken }),
     });
 
     if (!startResponse.ok) {
@@ -2392,8 +2455,7 @@ startBtn.addEventListener('click', async () => {
       throw new Error(importErrorMessage(errorData, 'Failed to start import'));
     }
 
-    startBtn.disabled = false;
-    startBtn.textContent = originalText;
+    restoreImportButton('quick', startBtn);
     closeDetectModal();
     if (!importEvents[ts] || !IMPORT_TERMINAL_EVENTS.has(importEvents[ts].event)) {
       importEvents[ts] = {
@@ -2408,9 +2470,13 @@ startBtn.addEventListener('click', async () => {
     loadImports();
     navigateTo(`progress/${ts}`);
   } catch (err) {
-    startBtn.disabled = false;
-    startBtn.textContent = originalText;
+    invalidateImportPreview('quick');
+    restoreImportButton('quick', startBtn);
     if (window.showError && err instanceof Error) showError(err.message);
+  } finally {
+    importInFlight.quick = false;
+    restoreImportButton('quick', startBtn);
+    if (preparedPreview) startBtn.focus();
   }
 });
 
@@ -2425,6 +2491,30 @@ document.addEventListener('keydown', function(e) {
     closeDetectModal();
   }
 });
+
+let thinkingProgressTimer = null;
+function scheduleThinkingProgress() {
+  if (thinkingProgressTimer !== null) clearTimeout(thinkingProgressTimer);
+  const hash = window.location.hash.slice(1);
+  if (!hash.startsWith('progress/')) { thinkingProgressTimer = null; return; }
+  const id = hash.split('/')[1];
+  thinkingProgressTimer = setTimeout(async () => {
+    thinkingProgressTimer = null;
+    if (window.location.hash.slice(1) !== `progress/${id}`) return;
+    try {
+      const res = await window.apiJson(`/app/import/api/${encodeURIComponent(id)}`);
+      if (window.location.hash.slice(1) === `progress/${id}`) {
+        if (importEvents[id]) importEvents[id].thinking = res?.thinking;
+        const panel = document.querySelector('.import-thinking-progress');
+        // Keep controls in place during background refresh so focus stays put.
+        const markup = renderThinkingProgress(res?.thinking);
+        if (panel && panel.innerHTML !== markup && !panel.contains(document.activeElement)) panel.innerHTML = markup;
+      }
+    } catch (_) { /* The next read can recover without replacing the last known progress. */ }
+    scheduleThinkingProgress();
+  }, 30000);
+}
+window.addEventListener('hashchange', scheduleThinkingProgress);
 
 const inFlightReconcile = new Set();
 
@@ -2448,6 +2538,7 @@ async function reconcileImportState(importId, options = {}) {
       import_id: importId,
       event: eventName,
       status: canonicalStatus,
+      thinking: res.thinking,
       generation: res.generation,
       attempt_id: res.attempt_id,
       entries_written: res.entries_written,

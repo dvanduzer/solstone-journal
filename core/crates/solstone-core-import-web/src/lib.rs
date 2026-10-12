@@ -19,6 +19,8 @@ mod imports;
 mod journal_archive;
 mod lifecycle;
 mod multipart;
+mod preview;
+mod progress;
 mod save_stream;
 
 #[cfg(test)]
@@ -59,6 +61,7 @@ pub fn routes(journal_root: PathBuf) -> Router {
         )
         .route("/app/import/api/save-path", post(lifecycle::save_path))
         .route("/app/import/api/meta", post(lifecycle::meta))
+        .route("/app/import/api/preview", post(preview::preview))
         .route("/app/import/api/start", post(lifecycle::start))
         .route(
             "/app/import/api/{timestamp}/content/{item_id}",

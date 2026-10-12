@@ -554,6 +554,73 @@ pub fn reap_abandoned_archive_extractions(journal_root: &Path) -> usize {
         .count()
 }
 
+/// Plan eligible recordings against this destination using the merge's own
+/// collision/deletion rules. Extraction and decision logs stay in disposable scratch.
+pub fn preview_size(
+    archive: &Path,
+    target: &Path,
+) -> Result<solstone_core_import::size::ImportSize, ImportSourcesError> {
+    require_zip_archive(archive)?;
+    let scratch = tempfile::tempdir().map_err(|error| ImportSourcesError::StagingWrite {
+        path: std::env::temp_dir(),
+        detail: error.to_string(),
+    })?;
+    let options = ArchiveMergeOptions {
+        working_root: scratch.path().to_path_buf(),
+        ..Default::default()
+    };
+    let validated = validate_archive(archive, &options)?;
+    let source = extract_archive(
+        archive,
+        &validated,
+        &scratch.path().join("extract"),
+        &options,
+    )?;
+    let mut state = MergeState::new(
+        scratch.path().join("decisions.jsonl"),
+        scratch.path().join("entities"),
+        scratch.path().join("publish"),
+        scratch.path().join("undo"),
+    );
+    stage_segments(&source, target, &mut state)?;
+    let mut size = solstone_core_import::size::ImportSize {
+        skipped: state.summary.segments_skipped,
+        ..Default::default()
+    };
+    let mut other_files = 0;
+    for name in ["entities", "facets", "imports"] {
+        let directory = source.join(name);
+        if directory.is_dir() {
+            other_files += sorted_files_recursive(&directory)?.len();
+        }
+    }
+    if other_files > 0 {
+        size.other_units = Some(("other archive files".to_owned(), other_files));
+    }
+    for relative in state.chronicle_units.keys() {
+        let parts = relative.split('/').collect::<Vec<_>>();
+        let (day, stream, segment) = match parts.as_slice() {
+            ["chronicle", day, stream, segment] => (*day, *stream, *segment),
+            ["chronicle", day, segment] => {
+                (*day, solstone_core_journal_io::DEFAULT_STREAM, *segment)
+            }
+            _ => {
+                return Err(ImportSourcesError::SegmentMerge {
+                    path: target.join(relative),
+                    detail: "invalid planned recording coordinate".to_owned(),
+                });
+            }
+        };
+        size.recordings
+            .insert(solstone_core_import::size::Recording {
+                day: day.to_owned(),
+                stream: stream.to_owned(),
+                segment: segment.to_owned(),
+            });
+    }
+    Ok(size)
+}
+
 /// Validate, extract, and merge an archive while holding the target merge lock.
 pub fn merge_journal_archive(
     archive_path: &Path,
@@ -3594,8 +3661,21 @@ mod tests {
         );
         let target = tree.path.join("target");
         fs::create_dir(&target).unwrap();
+        let preview = preview_size(&archive, &target).unwrap();
+        assert_eq!(preview.recordings.len(), 2);
+        assert_eq!(preview.days().len(), 1);
+        assert!(
+            collect_tree(&target).is_empty(),
+            "preview writes nothing to the journal"
+        );
         let result = merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap();
-        assert_eq!(result.merge_summary.segments_copied, 2);
+        assert_eq!(
+            result.merge_summary.segments_copied,
+            preview.recordings.len()
+        );
+        let again = preview_size(&archive, &target).unwrap();
+        assert!(again.recordings.is_empty());
+        assert_eq!(again.skipped, 2);
         assert_eq!(
             fs::read(target.join("chronicle/20260101/other/093000_300_a/value")).unwrap(),
             b"a"

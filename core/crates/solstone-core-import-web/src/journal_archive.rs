@@ -317,24 +317,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn journal_archive_guided_flow_keeps_the_apply_control() {
-        let workspace = include_str!("../assets/workspace.html");
-        let branch = workspace
-            .split("${source.name === 'journal_archive' ? `")
-            .nth(1)
-            .and_then(|tail| tail.split("` : `").next())
-            .expect("journal archive guided branch");
-
-        assert!(branch.contains("id=\"guidedStartBtn\""));
-        assert!(branch.contains("start import"));
-        assert!(branch.contains("id=\"guidedPreviewBtn\""));
-        assert!(workspace.contains(
-            "guidedStartBtn.addEventListener('click', () => startGuidedImport(source));"
-        ));
-        assert!(workspace.contains("fetch('/app/import/api/start'"));
-    }
-
     fn assert_no_facet_control(markup: &str) {
         assert!(!markup.contains("<select"));
         assert!(!markup.contains("for=\"facet"));
@@ -393,7 +375,7 @@ mod tests {
         assert!(confirm.contains("id=\"settingInput\""));
         assert_eq!(
             workspace
-                .matches("body: JSON.stringify({ path, setting })")
+                .matches("body: JSON.stringify({ path, setting, import_id:")
                 .count(),
             2
         );

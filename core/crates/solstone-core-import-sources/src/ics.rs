@@ -206,6 +206,7 @@ pub fn render(
         .collect::<HashSet<_>>()
         .len();
     Ok(RenderedImport {
+        skipped: 0,
         source: RegistrySource::Ics,
         files,
         items,
