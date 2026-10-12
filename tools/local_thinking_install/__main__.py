@@ -53,6 +53,14 @@ def _parse_args(args: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--expect-hardware-refusal",
+        action="store_true",
+        help=(
+            "Service-context mode on hardware with no usable GPU: require the "
+            "local install to be refused before any download, with the cause persisted."
+        ),
+    )
+    parser.add_argument(
         "--timeout-seconds",
         type=float,
         default=60.0,
@@ -94,6 +102,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    if args.expect_hardware_refusal and not args.existing_service_journal:
+        sys.stderr.write(
+            "Error: --expect-hardware-refusal applies only to --existing-service-journal.\n"
+        )
+        return 2
+
     if args.existing_service_journal and not args.existing_service_journal.is_absolute():
         sys.stderr.write(
             "Error: --existing-service-journal must be an absolute path.\n"
@@ -123,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
                 journal_dir=args.existing_service_journal,
                 run_dir=run_dir,
                 install_timeout_seconds=args.install_timeout_seconds,
+                expect_hardware_refusal=args.expect_hardware_refusal,
             )
         else:
             report = run_harness(

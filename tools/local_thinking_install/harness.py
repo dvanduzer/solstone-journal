@@ -310,6 +310,49 @@ def collect_provenance(candidate_dir: Path) -> dict[str, Any]:
     }
 
 
+INSTALLER_EXITED_SNIPPET = "installer exited before admission"
+HARDWARE_REFUSAL_CODES = ("gpu_unavailable", "gpu_memory_insufficient")
+
+
+def classify_hardware_refusal(
+    resp: HttpResponse,
+    status: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Hardware with no usable GPU must refuse a local install before any download.
+
+    The portal reports the installer's refusal as a 500, and the owner-visible
+    cause is the persisted provider status, so both must agree.
+    """
+    detail = ""
+    reason = None
+    if isinstance(resp.json_data, dict):
+        detail = str(resp.json_data.get("detail") or "")
+        reason = resp.json_data.get("reason_code")
+    if (resp.status != 500 or reason != "settings_operation_failed"
+            or INSTALLER_EXITED_SNIPPET not in detail):
+        return (
+            "unexpected",
+            f"expected a hardware refusal, got HTTP {resp.status}: {resp.body[:200]}",
+        )
+    if not isinstance(status, dict):
+        return ("unexpected", "provider status unreadable after the refusal")
+    if (status.get("install_state") != "failed"
+            or status.get("error_code") not in HARDWARE_REFUSAL_CODES):
+        return (
+            "unexpected",
+            "persisted status is "
+            f"{status.get('install_state')}/{status.get('error_code')}, "
+            "expected a failed hardware refusal",
+        )
+    if (status.get("progress_bytes_received") not in (None, 0)
+            or status.get("target_fingerprint_sha256") is not None):
+        return ("unexpected", "the refusal recorded download progress or a target")
+    return (
+        "hardware_refused",
+        f"Refused before download: {status.get('error_code')} persisted",
+    )
+
+
 def classify_bootstrap_response(
     resp: HttpResponse,
     case_name: str,
@@ -961,6 +1004,7 @@ def run_service_harness(
     journal_dir: Path,
     run_dir: Path,
     install_timeout_seconds: float = 3600.0,
+    expect_hardware_refusal: bool = False,
 ) -> HarnessReport:
     """Exercise portal installation through an already-running user service.
 
@@ -1001,6 +1045,7 @@ def run_service_harness(
         "journal_dir": str(journal_dir),
         "service_context": "systemd-user",
         "convey_port": convey_port,
+        "expect_hardware_refusal": expect_hardware_refusal,
     })
     (run_dir / "provenance.json").write_text(
         json.dumps(provenance, indent=2), encoding="utf-8"
@@ -1024,9 +1069,20 @@ def run_service_harness(
         }, indent=2),
         encoding="utf-8",
     )
-    classification, note = classify_bootstrap_response(resp, "fresh")
     post_admit_outcome = None
     metal_evidence = None
+    if expect_hardware_refusal:
+        status_path = journal_dir / "health" / "providers" / "local.json"
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            status = None
+        (case_dir / "provider-status.json").write_text(
+            json.dumps(status, indent=2), encoding="utf-8"
+        )
+        classification, note = classify_hardware_refusal(resp, status)
+    else:
+        classification, note = classify_bootstrap_response(resp, "fresh")
     if classification == "admitted":
         post_admit_outcome, _, metal_evidence = run_post_admit_checks(
             port=convey_port,
@@ -1052,7 +1108,10 @@ def run_service_harness(
         post_admit_outcome=post_admit_outcome,
         metal_evidence=metal_evidence,
     )
-    passed = classification == "admitted" and post_admit_outcome == "passed_install_only"
+    if expect_hardware_refusal:
+        passed = classification == "hardware_refused"
+    else:
+        passed = classification == "admitted" and post_admit_outcome == "passed_install_only"
     if passed:
         overall_outcome = "passed"
     elif post_admit_outcome and post_admit_outcome.startswith("terminal_state_failed"):
@@ -1119,7 +1178,15 @@ def write_report(report: HarnessReport, run_dir: Path) -> None:
         receipt_txt_lines.append("------------------------------------------------------------")
 
     receipt_txt_lines.append(
-        "RESULT: " + ("PASS (All admitted and verified)" if report.all_passed else f"FAIL ({report.overall_outcome})")
+        "RESULT: " + (
+            (
+                "PASS (Refused before download, cause persisted)"
+                if any(c.classification == "hardware_refused" for c in report.cases)
+                else "PASS (All admitted and verified)"
+            )
+            if report.all_passed
+            else f"FAIL ({report.overall_outcome})"
+        )
     )
     receipt_txt_lines.append("============================================================")
 

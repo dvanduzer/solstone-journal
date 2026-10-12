@@ -308,13 +308,17 @@ UNIT
                 "$origin/init/finalize" >/tmp/init-finalize.json
         '
 
-        log "local-thinking-install: drive portal bootstrap through terminal installed"
+        # The generic container has no usable GPU, and the product refuses a
+        # local install there before downloading. Prove that refusal through
+        # the resident service; installation needs a suitable host.
+        log "local-thinking-install: drive portal bootstrap through the hardware refusal"
         if docker exec -u "$TEST_USER" "$CONTAINER" bash -lc '
                 set -euo pipefail
                 cd /harness
                 python3 -m tools.local_thinking_install \
                     --candidate-dir /usr/bin \
                     --existing-service-journal "$HOME/journal" \
+                    --expect-hardware-refusal \
                     --run-dir /var/tmp/lti-systemd
             '
         then

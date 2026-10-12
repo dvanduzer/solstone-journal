@@ -34,12 +34,15 @@ full` to drop those flags.
 
 `local-thinking-install` installs the same candidate package, starts the real
 `systemd --user` service, and uses `tools/local_thinking_install` to ask that
-resident portal to install the bundled local model. It waits for terminal
-`installed`, verifies byte progress, and copies the harness receipt to the new
-host directory named by `LOCAL_THINKING_RECEIPT_DIR`. This service-context cell
-is intentionally install-only because the generic container has no supported
-GPU. Run the direct harness on a suitable Linux host for the separate runtime
-readiness and real-generation proof.
+resident portal to install the bundled local model. The generic container has
+no usable GPU, and the product refuses a local install on such hardware before
+downloading, so this cell runs with `--expect-hardware-refusal`: it requires the
+portal's installer refusal and a persisted `failed` status with a hardware
+cause (`gpu_unavailable` or `gpu_memory_insufficient`), no download progress
+and no target. It copies the harness receipt to the new host directory named
+by `LOCAL_THINKING_RECEIPT_DIR`. Without that flag, service-context mode waits
+for terminal `installed` and verifies byte progress; run it, and the direct
+harness for runtime readiness and real generation, on a suitable Linux host.
 
 Linked-device ingest is not a systemd-test mode. It requires a paired client certificate, so use `tools/journal_device_sim` with a disposable journal for protocol-v3 ingest and reconciliation proof.
 

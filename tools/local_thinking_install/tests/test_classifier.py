@@ -14,6 +14,7 @@ from tools.local_thinking_install.harness import (
     MODEL_TOTAL_BYTES,
     PrerequisiteError,
     classify_bootstrap_response,
+    classify_hardware_refusal,
     find_or_build_helper,
     is_leftover_mlx,
     run_post_admit_checks,
@@ -260,3 +261,43 @@ class TestBootstrapClassifier(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHardwareRefusalClassifier(unittest.TestCase):
+    BODY = {
+        "error": "those settings couldn't be saved.",
+        "reason_code": "settings_operation_failed",
+        "detail": "installer exited before admission (1)",
+    }
+    REFUSED = {
+        "install_state": "failed",
+        "error_code": "gpu_unavailable",
+        "progress_bytes_received": None,
+        "target_fingerprint_sha256": None,
+    }
+
+    def response(self, status: int = 500, body: dict | None = None) -> HttpResponse:
+        body = self.BODY if body is None else body
+        import json
+        return HttpResponse(status, {}, json.dumps(body), body, body.get("detail"))
+
+    def test_refusal_persisted_before_download_passes(self) -> None:
+        for code in ("gpu_unavailable", "gpu_memory_insufficient"):
+            classification, _ = classify_hardware_refusal(
+                self.response(), {**self.REFUSED, "error_code": code}
+            )
+            self.assertEqual(classification, "hardware_refused")
+
+    def test_admission_or_other_failures_do_not_pass(self) -> None:
+        cases = [
+            (self.response(202, {"install_state": "downloading"}), self.REFUSED),
+            (self.response(500, {**self.BODY, "detail": "lease busy"}), self.REFUSED),
+            (self.response(), None),
+            (self.response(), {**self.REFUSED, "error_code": "install_failed"}),
+            (self.response(), {**self.REFUSED, "install_state": "downloading"}),
+            (self.response(), {**self.REFUSED, "progress_bytes_received": 4096}),
+            (self.response(), {**self.REFUSED, "target_fingerprint_sha256": "a" * 64}),
+        ]
+        for resp, status in cases:
+            classification, _ = classify_hardware_refusal(resp, status)
+            self.assertEqual(classification, "unexpected", (resp.status, status))
