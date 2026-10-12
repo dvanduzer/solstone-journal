@@ -24,6 +24,34 @@ use crate::archive_admission::ArchiveCancellation;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// A command running archive work stops it on the first SIGINT or SIGTERM: its
+/// children are killed and reaped and its result is still reported. A second
+/// signal takes the default action.
+pub fn stop_archive_work_on_signals() {
+    extern "C" fn stop(_: nix::libc::c_int) {
+        crate::archive_admission::stop_archive_work();
+    }
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    let action = SigAction::new(
+        SigHandler::Handler(stop),
+        SaFlags::SA_RESETHAND | SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    for signal in [Signal::SIGINT, Signal::SIGTERM] {
+        // SAFETY: the handler performs one atomic store, which is async-signal-safe.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = sigaction(signal, &action);
+        }
+    }
+}
+
+/// Cancelled by its operation, or the whole process is stopping.
+fn stop_requested(cancellation: Option<&ArchiveCancellation>) -> bool {
+    crate::archive_admission::archive_work_stopping()
+        || cancellation.is_some_and(ArchiveCancellation::is_cancelled)
+}
+
 pub struct Request<'a> {
     pub program: OsString,
     pub argv: Vec<OsString>,
@@ -428,7 +456,7 @@ fn read_output(
     let mut exceeded = false;
     loop {
         if signals.stop.load(Ordering::Acquire)
-            || cancellation.is_some_and(ArchiveCancellation::is_cancelled)
+            || stop_requested(cancellation)
             || timeout.is_some_and(|timeout| start.elapsed() >= timeout)
         {
             break;
@@ -495,7 +523,7 @@ fn await_exit(
     cancellation: Option<&ArchiveCancellation>,
 ) -> io::Result<StopReason> {
     loop {
-        if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
+        if stop_requested(cancellation) {
             return Ok(StopReason::Cancelled);
         }
         if session.reader_signals.failed.load(Ordering::Acquire) {
@@ -554,7 +582,7 @@ fn execute_tracked(
         .map(|deadline| deadline.saturating_duration_since(start))
         .or(request.timeout);
     let cancelled = || io::Error::new(io::ErrorKind::Interrupted, "archive operation cancelled");
-    if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
+    if stop_requested(cancellation) {
         return Err(cancelled());
     }
     if dns_deadline.is_some_and(|deadline| start >= deadline) {
@@ -609,7 +637,7 @@ fn execute_tracked(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     inherit_in_child(&mut command, &request.pass_fds)?;
-    if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
+    if stop_requested(cancellation) {
         return Err(cancelled());
     }
     if dns_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -619,6 +647,8 @@ fn execute_tracked(
         ));
     }
     let child = command.spawn()?;
+    // Declared before the session, so it is released after the session's drop reaps.
+    let _live = crate::archive_admission::LiveArchiveChild::enter();
     *settled = false;
     let pgid = Pid::from_raw(child.id() as i32);
     let mut session = SpawnedChild {
@@ -658,7 +688,7 @@ fn execute_tracked(
     // The group was killed and the root reaped; later refusals leave nothing alive.
     *settled = true;
     let stopped = stopped?;
-    if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
+    if stop_requested(cancellation) {
         return Err(cancelled());
     }
     if stopped == StopReason::ReaderFailed {
@@ -798,6 +828,61 @@ mod tests {
             .map_err(ChildFailure::into_error)
             .unwrap();
         assert_eq!(completed.output().stdout, b"passed\ndone\n");
+    }
+
+    /// Run in its own process: the stop is process-wide.
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    #[ignore = "private child of process_stop_kills_and_reaps_running_children"]
+    fn process_stop_child() {
+        let started = Instant::now();
+        let worker = std::thread::spawn(|| {
+            let request = Request {
+                program: "/bin/sleep".into(),
+                argv: vec!["30".into()],
+                env: BTreeMap::new(),
+                timeout: None,
+                pass_fds: Vec::new(),
+            };
+            execute(&request, Some(64), None)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        crate::archive_admission::stop_archive_work();
+        let failure = worker
+            .join()
+            .unwrap()
+            .err()
+            .expect("a stopped child is not a success");
+        assert!(failure.settled(), "the stopped child was reaped");
+        assert!(crate::archive_admission::wait_for_archive_children(
+            Duration::from_secs(5)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // A later operation sees the stop before it launches anything.
+        assert!(crate::archive_admission::ArchiveCancellation::new().is_cancelled());
+        println!("PROCESS_STOP_CHILD_OK");
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn process_stop_kills_and_reaps_running_children() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bounded_child::tests::process_stop_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("PROCESS_STOP_CHILD_OK"), "{stdout}");
     }
 
     #[cfg(all(test, feature = "full-tests"))]

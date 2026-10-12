@@ -88,11 +88,100 @@ pub(crate) enum CurrentSegment {
 /// other run's finished work.
 const SEGMENT_TURN_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// Think one segment, then publish its saved outputs once its thinking covers
+/// its input. Every way a segment is thought ends here, so a thought segment
+/// is ready for its day's daily work without a separate repair.
 #[allow(
     clippy::too_many_arguments,
     reason = "The reference keeps segment mode, timeout, live, and skip controls distinct at this boundary."
 )]
 pub(crate) fn run_with(
+    context: &ThinkContext,
+    log: &mut RunLogWriter,
+    segment: &str,
+    refresh: bool,
+    stream: Option<&str>,
+    max_concurrency: i64,
+    timeout: Option<Duration>,
+    live: bool,
+    skip_talents: &[String],
+    current: CurrentSegment,
+) -> Result<ModeResult, String> {
+    let mut result = think(
+        context,
+        log,
+        segment,
+        refresh,
+        stream,
+        max_concurrency,
+        timeout,
+        live,
+        skip_talents,
+        current,
+    )?;
+    publish_if_thought(context, segment, stream, &mut result);
+    Ok(result)
+}
+
+/// After a run that succeeded, publish the segment's saved outputs if its
+/// thinking now covers its input. A failed publication is the run's failure;
+/// the segment stays owed and nothing is thought again to retry it.
+pub(crate) fn publish_if_thought(
+    context: &ThinkContext,
+    segment: &str,
+    stream: Option<&str>,
+    result: &mut ModeResult,
+) {
+    if result.failed != 0 || result.timed_out {
+        return;
+    }
+    let published = (|| {
+        let Some(segment_dir) =
+            resolve_segment_dir(&context.journal, &context.day, segment, stream)?
+        else {
+            return Ok(());
+        };
+        let stream = stream.or_else(|| named_stream(&segment_dir, &context.day));
+        if !thinking_is_current(context, segment, stream, &segment_dir) {
+            return Ok(());
+        }
+        publish_saved_outputs(context, &segment_dir)
+    })();
+    if let Err(error) = published {
+        crate::dispatch::record_followup_failure(result, "publication", &error);
+    }
+}
+
+/// Index a thought segment's saved outputs and record that they are
+/// published. No model is called and no output is rewritten.
+pub(crate) fn publish_saved_outputs(
+    context: &ThinkContext,
+    segment_dir: &std::path::Path,
+) -> Result<(), String> {
+    // Taken so a run thinking this segment does not change it underneath.
+    let _turn = segment_turn(context, segment_dir);
+    let before = newest_segment_input_ms(segment_dir).map_err(|error| error.to_string())?;
+    if solstone_core_system::segment_publication::is_current(&context.journal, segment_dir, before)?
+    {
+        return Ok(());
+    }
+    solstone_core_system::segment_publication::publish(
+        &context.journal,
+        segment_dir,
+        before,
+        |journal, path| context.index.rescan_file(journal, path),
+    )?;
+    if before != newest_segment_input_ms(segment_dir).map_err(|error| error.to_string())? {
+        return Err("segment input changed during publication".into());
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The reference keeps segment mode, timeout, live, and skip controls distinct at this boundary."
+)]
+fn think(
     context: &ThinkContext,
     log: &mut RunLogWriter,
     segment: &str,
@@ -650,14 +739,7 @@ pub(crate) fn retry_talent(
     if result.failed == 0 {
         let directory = find_segment_dir(&context.journal, &context.day, segment, Some(stream))
             .ok_or("segment no longer exists")?;
-        let newest = solstone_core_system_health::newest_segment_input_ms(&directory)
-            .map_err(|e| e.to_string())?;
-        solstone_core_system::segment_publication::publish(
-            &context.journal,
-            &directory,
-            newest,
-            |journal, path| context.index.rescan_file(journal, path),
-        )?;
+        publish_saved_outputs(context, &directory)?;
     }
     Ok(result)
 }

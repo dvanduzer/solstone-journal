@@ -248,6 +248,7 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
         lifecycle_state: String,
         has_started_owner_action: bool,
         has_committed_owner_action: bool,
+        unit_retry_reprepares: bool,
     }
 
     let mut candidate_map: std::collections::BTreeMap<
@@ -275,7 +276,7 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
             );
             let path =
                 solstone_core_journal_io::daily_unit_record_path(&context.journal_path, &identity);
-            let (has_started, has_committed) =
+            let (has_started, has_committed, reprepares) =
                 match solstone_core_journal_io::durability::observe_json_durable::<
                     solstone_core_journal_io::DailyUnitRecord,
                 >(
@@ -290,10 +291,14 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
                                 && r.get("state").and_then(serde_json::Value::as_str)
                                     == Some("committed")
                         });
-                        (has_st, has_cm)
+                        (
+                            has_st,
+                            has_cm,
+                            solstone_core_system::daily_coverage::review_conflict_reprepares(&rec),
+                        )
                     }
                     solstone_core_journal_io::durability::DurableObservation::Absent => {
-                        (false, false)
+                        (false, false, false)
                     }
                     solstone_core_journal_io::durability::DurableObservation::Unreadable {
                         path,
@@ -307,7 +312,7 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
                             "couldn't fully determine; unreadable daily unit file {file_name} on day {}: {source}",
                             day.day
                         ));
-                        (false, false)
+                        (false, false, false)
                     }
                     solstone_core_journal_io::durability::DurableObservation::Malformed {
                         path,
@@ -321,7 +326,7 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
                             "couldn't fully determine; malformed daily unit file {file_name} on day {}: {source}",
                             day.day
                         ));
-                        (false, false)
+                        (false, false, false)
                     }
                 };
 
@@ -336,6 +341,7 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
                     lifecycle_state: lifecycle_state.to_owned(),
                     has_started_owner_action: has_started,
                     has_committed_owner_action: has_committed,
+                    unit_retry_reprepares: reprepares,
                 },
             );
         }
@@ -589,6 +595,10 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
                         lifecycle_state: lifecycle_state.to_owned(),
                         has_started_owner_action: has_started,
                         has_committed_owner_action: has_committed,
+                        unit_retry_reprepares:
+                            solstone_core_system::daily_coverage::review_conflict_reprepares(
+                                &record,
+                            ),
                     });
             }
         }
@@ -670,6 +680,17 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
         None => day.to_owned(),
     };
     let reason = |kind: Option<&str>| kind.map_or(String::new(), |k| format!(" with reason {k}"));
+    let unit_retry = |candidate: &CandidateUnit| {
+        let opt_facet = match candidate.facet.as_deref().filter(|facet| !facet.is_empty()) {
+            Some(facet) => format!(" --facet {}", shell_argument(facet)),
+            None => String::new(),
+        };
+        format!(
+            "solstone journal reprocess {} --unit {}{opt_facet}",
+            candidate.day,
+            shell_argument(&candidate.name)
+        )
+    };
 
     let fix = match winning_candidate {
         Some(candidate)
@@ -687,6 +708,19 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
                 candidate.name
             )
         }
+        Some(candidate)
+            if candidate.has_committed_owner_action
+                && candidate.unit_retry_reprepares
+                && candidate.day.as_str() < today.as_str() =>
+        {
+            let loc = location(&candidate.day, candidate.facet.as_deref());
+            format!(
+                "{} stopped on {loc}{}; run {}",
+                candidate.name,
+                reason(candidate.owner_conflict_kind.as_deref()),
+                unit_retry(candidate)
+            )
+        }
         Some(candidate) if candidate.has_committed_owner_action => {
             let loc = location(&candidate.day, candidate.facet.as_deref());
             format!(
@@ -696,24 +730,23 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
         }
         Some(candidate) if candidate.lifecycle_state == "exhausted" => {
             let loc = location(&candidate.day, candidate.facet.as_deref());
-            let opt_facet = match candidate
-                .facet
-                .as_deref()
-                .filter(|facet| !facet.is_empty())
-            {
-                Some(facet) => format!(" --facet {}", shell_argument(facet)),
-                None => String::new(),
-            };
             if candidate.day.as_str() >= today.as_str() {
                 format!("{} stopped on {loc}{}; resolve the conflict before reprocessing a past day",
                     candidate.name, reason(candidate.owner_conflict_kind.as_deref()))
-            } else { format!(
-                "{} stopped on {loc}{} after its automatic retry; run solstone journal reprocess {} --unit {}{opt_facet}",
-                candidate.name,
-                reason(candidate.owner_conflict_kind.as_deref()),
-                candidate.day,
-                shell_argument(&candidate.name)
-            ) }
+            } else {
+                // A unit retry takes only the conflicts a fresh preparation can
+                // clear; any other stopped unit is redone with its whole day.
+                let command = if candidate.unit_retry_reprepares {
+                    unit_retry(candidate)
+                } else {
+                    format!("solstone journal reprocess {} --from-scratch", candidate.day)
+                };
+                format!(
+                    "{} stopped on {loc}{} after its automatic retry; run {command}",
+                    candidate.name,
+                    reason(candidate.owner_conflict_kind.as_deref()),
+                )
+            }
         }
         Some(candidate) if candidate.lifecycle_state == "stale_deferred" => {
             let loc = location(&candidate.day, candidate.facet.as_deref());

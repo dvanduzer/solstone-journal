@@ -85,7 +85,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::Search,
         wire_name: "search",
         title: "search the journal",
-        description: "Search what this connection may see of the owner's journal: short summaries of conversations and work sessions, activities and their stories, imported documents and calendar events, and notes about people and projects. Use a few keywords such as names or topics, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. Search does not read conversations word for word. When a result lists transcript segments, read them with get_transcript before saying who said, promised or decided something. When a result shows more_segments, fetch it for more. When nothing matches, say so rather than guessing.",
+        description: "Search what this connection may see of the owner's journal: short summaries of conversations and work sessions, activities and their stories, imported documents and calendar events, and notes about people and projects. Use a few keywords such as names or topics, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. Search does not read conversations word for word. When a result lists transcript segments, read them with get_transcript before saying who said, promised or decided something. When a result shows more_segments, fetch it for more.",
         input_schema: search_input_schema,
         requires: TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::Search,

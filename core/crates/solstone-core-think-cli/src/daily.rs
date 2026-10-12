@@ -291,6 +291,12 @@ fn queue_daily(
         solstone_core_journal_io::load_daily_unit_record(&context.journal, &identity)
             .map_err(|e| e.to_string())?;
     let retry = grant.is_some();
+    // The owner asked to retry an entity review whose conflict a fresh
+    // preparation can clear; its retained packet and plan are what conflicted.
+    let reprepare = retry
+        && existing_record
+            .as_ref()
+            .is_some_and(solstone_core_system::daily_coverage::review_conflict_reprepares);
     if let Some(record) = &existing_record {
         if record.has_uncommitted_started_receipt() {
             // An in-doubt started write cannot be automatically retried, reset, or wiped.
@@ -332,7 +338,10 @@ fn queue_daily(
                 result.capped_units.insert(unit);
                 return Ok(());
             }
-            if record.evidence_revision == evidence_rev && record.contract_digest == contract_dig {
+            if !reprepare
+                && record.evidence_revision == evidence_rev
+                && record.contract_digest == contract_dig
+            {
                 match solstone_core_system::daily_coverage::conflict_recovery(
                     record,
                     &today,
@@ -416,6 +425,7 @@ fn queue_daily(
         .as_ref()
         .filter(|record| {
             !from_scratch
+                && !reprepare
                 && record.evidence_revision == evidence_rev
                 && record.contract_digest == contract_dig
         })
@@ -553,7 +563,12 @@ pub(crate) fn reserve_daily_attempt(
         }
         let same =
             record.evidence_revision == evidence_rev && record.contract_digest == contract_dig;
+        // Re-checked under the lock. Committed changes stay in the journal and
+        // the replacement attempt prepares against them.
+        let reprepare =
+            retry && solstone_core_system::daily_coverage::review_conflict_reprepares(&record);
         if (!same || from_scratch)
+            && !reprepare
             && !record.status.is_terminal_success()
             && record
                 .receipts
@@ -568,7 +583,7 @@ pub(crate) fn reserve_daily_attempt(
             && !from_scratch
             && record.status == solstone_core_journal_io::DailyUnitStatus::Unfinished
             && record.frozen_packet.is_some();
-        if same && !from_scratch {
+        if same && !from_scratch && !reprepare {
             match solstone_core_system::daily_coverage::conflict_recovery(&record, today, journal) {
                 solstone_core_system::daily_coverage::ConflictRecovery::Exhausted
                 | solstone_core_system::daily_coverage::ConflictRecovery::StaleDeferred => {
@@ -616,7 +631,7 @@ pub(crate) fn reserve_daily_attempt(
             ));
         }
         let kept_attempt_day = record.attempt_day.clone();
-        if !same || from_scratch {
+        if !same || from_scratch || reprepare {
             let accepted = record.accepted.take();
             record = solstone_core_journal_io::DailyUnitRecord::new(
                 identity.clone(),
@@ -3974,6 +3989,326 @@ cat "${0%/*}/response-$kind.json"
             Some(Some(
                 solstone_core_system::daily_coverage::AcceptedReuse::FrozenBriefing
             ))
+        );
+    }
+
+    /// An entity review that stopped on a conflict after its earlier changes
+    /// committed, once its automatic retry is spent.
+    fn stopped_review_record(
+        identity: &DailyUnitIdentity,
+        evidence: &str,
+        contract: &str,
+        receipts: &[(&str, &str)],
+    ) -> DailyUnitRecord {
+        let mut record = DailyUnitRecord::new(identity.clone(), evidence, contract);
+        record.status = DailyUnitStatus::Conflicting;
+        record.reason_code = Some("daily_owner_conflict".into());
+        record.owner_conflict_kind = Some("alias_claimed".into());
+        record.error_detail =
+            Some("conflict: promotion alias was claimed after preparation".into());
+        record.failure_count = 2;
+        record.attempt_day = Some(identity.day.clone());
+        record.lock_token = Some("stopped".into());
+        let stale = json!({"stale":"packet"});
+        record.packet_digest = Some(solstone_core_talent_runtime::daily_prepare::packet_digest(
+            &stale,
+        ));
+        record.frozen_packet = Some(stale);
+        record.generated_result = Some(json!({"response":"stale"}));
+        record.action_plan = Some(json!({"actions":[], "no_output":false}));
+        record.receipts = receipts
+            .iter()
+            .map(|(action, state)| {
+                json!({"kind":"owner_action","action_id":action,"token":"stopped","state":state})
+            })
+            .collect();
+        record
+    }
+
+    #[test]
+    fn an_owner_retry_replaces_a_review_stopped_before_its_conflicting_write() {
+        let identity =
+            DailyUnitIdentity::new("20260910", "entities:entities_review", Some("work".into()));
+        // The same inputs, and inputs that changed since the stop.
+        for evidence in ["E", "E2"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut stopped = stopped_review_record(
+                &identity,
+                "E",
+                "C",
+                &[("0:a", "committed"), ("1:b", "committed")],
+            );
+            stopped.accepted = Some(solstone_core_journal_io::AcceptedDailyResult {
+                evidence_revision: "earlier".into(),
+                contract_digest: "C".into(),
+                status: DailyUnitStatus::Committed,
+                packet_digest: None,
+                generated_result: None,
+                receipts: vec![],
+                committed_at_ms: 7,
+            });
+            save_daily_unit_record(root.path(), &stopped).unwrap();
+            let fresh = json!({"fresh":"packet"});
+            let reserve = |retry| {
+                reserve_daily_attempt(
+                    root.path(),
+                    &identity,
+                    evidence,
+                    "C",
+                    &fresh,
+                    "20260912",
+                    "owner-retry",
+                    false,
+                    retry,
+                    9,
+                )
+            };
+            // Without the owner's request the stop holds.
+            assert!(reserve(false).is_err());
+            assert_eq!(
+                load_daily_unit_record(root.path(), &identity)
+                    .unwrap()
+                    .unwrap(),
+                stopped
+            );
+            reserve(true).unwrap();
+            let reserved = load_daily_unit_record(root.path(), &identity)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reserved.status, DailyUnitStatus::Unfinished);
+            assert_eq!(reserved.evidence_revision, evidence);
+            assert_eq!(reserved.frozen_packet.as_ref(), Some(&fresh));
+            assert!(reserved.generated_result.is_none());
+            assert!(reserved.action_plan.is_none());
+            assert!(reserved.receipts.is_empty());
+            assert_eq!(reserved.failure_count, 0);
+            assert_eq!(reserved.lock_token.as_deref(), Some("owner-retry"));
+            assert_eq!(reserved.attempt_day.as_deref(), Some("20260912"));
+            assert_eq!(reserved.accepted, stopped.accepted);
+        }
+    }
+
+    #[test]
+    fn an_owner_retry_never_replaces_a_review_that_may_have_started_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let identity =
+            DailyUnitIdentity::new("20260910", "entities:entities_review", Some("work".into()));
+        let stopped = stopped_review_record(
+            &identity,
+            "E",
+            "C",
+            &[("0:a", "committed"), ("1:b", "started")],
+        );
+        save_daily_unit_record(root.path(), &stopped).unwrap();
+        let error = reserve_daily_attempt(
+            root.path(),
+            &identity,
+            "E",
+            "C",
+            &json!({"fresh":"packet"}),
+            "20260912",
+            "owner-retry",
+            false,
+            true,
+            9,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous uncommitted owner action"),
+            "{error}"
+        );
+        assert_eq!(
+            load_daily_unit_record(root.path(), &identity)
+                .unwrap()
+                .unwrap(),
+            stopped
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests", unix))]
+    #[test]
+    fn an_owner_retry_of_a_stopped_review_prepares_again_and_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let day = "20260910";
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"identity":{"timezone":"UTC"},"providers":{"active":{"provider":"openai","model":"test-model"}}}"#,
+        )
+        .unwrap();
+        solstone_core_facets::create_facet(root, "work", "Work", "", "", "", None).unwrap();
+        solstone_core_facets::ensure_daily_facet_id(root, "work").unwrap();
+        let talent = root.join("payload/talent");
+        let apps = root.join("payload/apps");
+        std::fs::create_dir_all(&talent).unwrap();
+        std::fs::create_dir_all(apps.join("entities/talent")).unwrap();
+        std::fs::write(
+            apps.join("entities/talent/entities_review.md"),
+            "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":56,\"output\":\"json\",\"multi_facet\":true,\"hook\":{\"pre\":\"entities:entities_review\",\"post\":\"entities:entities_review\"}\n}\nprompt",
+        )
+        .unwrap();
+        let people = ["Ali", "Alice Smith"].map(|name| solstone_core_facets::DetectedEntityInput {
+            entity_type: "Person".to_owned(),
+            name: name.to_owned(),
+            description: "Collaborator.".to_owned(),
+        });
+        for detected_day in ["20260908", "20260909"] {
+            solstone_core_facets::upsert_detection_segment(
+                root,
+                "work",
+                detected_day,
+                "090000_300",
+                &people,
+            )
+            .unwrap();
+        }
+        // The stopped attempt committed "Ali" before Alice's alias conflicted.
+        solstone_core_facets::attach_or_reactivate_entity(
+            root,
+            "work",
+            "Person",
+            "Ali",
+            "Designer.",
+        )
+        .unwrap();
+        let review = json!({"promotions":[
+            {"name":"Ali", "description":"Designer.", "promote":true, "aliases":[]},
+            {"name":"Alice Smith", "description":"Engineer.", "promote":true,
+                "aliases":["Ali", "Ally"]},
+        ], "merges":[]});
+        let stub = root.join("generate-stub.sh");
+        std::fs::write(
+            root.join("response.json"),
+            model_response(&review.to_string(), Value::Null).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncat >/dev/null\ncat \"${0%/*}/response.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = Arc::new(Worker {
+            context: solstone_core_talent_runtime::ExecutionContext {
+                journal: root.to_owned(),
+            },
+            paths: solstone_core_talent_runtime::prepare::RuntimePaths {
+                talent_root: talent.clone(),
+                apps_root: apps.clone(),
+                templates_dir: root.join("payload/think/templates"),
+            },
+            stub,
+            outcomes: Mutex::new(Default::default()),
+            sibling_rewrites: None,
+        });
+        let context = ThinkContext::new(
+            root,
+            day.to_owned(),
+            root.join("chronicle").join(day),
+            1789400000000,
+        )
+        .unwrap()
+        .with_talent_roots(talent.clone(), apps.clone())
+        .with_boundary(worker.clone());
+        let config = load_talent_configs(
+            &talent,
+            &apps,
+            None,
+            TalentFilter {
+                r#type: None,
+                schedule: Some("daily"),
+                include_disabled: false,
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .find(|config| config.key == "entities:entities_review")
+        .unwrap();
+        let identity = DailyUnitIdentity::new(day, "entities:entities_review", Some("work".into()));
+        let (evidence, contract) = crate::snapshot::compute_daily_evidence_revision(
+            root,
+            day,
+            &config,
+            Some("work"),
+            None,
+        )
+        .unwrap();
+        let runtime = runtime().unwrap();
+        let mut log = RunLogWriter::open(root, day, "daily");
+        let mut queue = |context: &ThinkContext| {
+            let mut pending = Vec::new();
+            queue_daily(
+                context,
+                &mut log,
+                &runtime,
+                &config,
+                Some("work"),
+                false,
+                &mut pending,
+                &mut ModeResult::default(),
+            )
+            .unwrap();
+            pending.len()
+        };
+
+        // An unconfirmed write keeps its guard even when the owner asks.
+        let started = stopped_review_record(
+            &identity,
+            &evidence,
+            &contract,
+            &[("0:a", "committed"), ("1:b", "started")],
+        );
+        save_daily_unit_record(root, &started).unwrap();
+        assert_eq!(queue(&permit_owner_daily(&context, &identity)), 0);
+        assert_eq!(
+            load_daily_unit_record(root, &identity).unwrap().unwrap(),
+            started
+        );
+
+        let stopped = stopped_review_record(
+            &identity,
+            &evidence,
+            &contract,
+            &[("0:a", "committed"), ("1:b", "committed")],
+        );
+        save_daily_unit_record(root, &stopped).unwrap();
+        // An ordinary run leaves the stop where it is.
+        assert_eq!(queue(&context), 0);
+        assert!(worker.outcomes.lock().unwrap().is_empty());
+
+        assert_eq!(queue(&permit_owner_daily(&context, &identity)), 1);
+        let finished = load_daily_unit_record(root, &identity).unwrap().unwrap();
+        assert_eq!(finished.status, DailyUnitStatus::Committed);
+        assert_ne!(finished.frozen_packet, stopped.frozen_packet);
+        assert!(!finished.has_uncommitted_started_receipt());
+        assert!(
+            finished
+                .receipts
+                .iter()
+                .filter(|receipt| receipt["kind"] == "owner_action")
+                .all(|receipt| receipt["state"] == "committed")
+        );
+        let attached =
+            solstone_core_facets::list_scoped_facet_entities(root, "work", false, false).unwrap();
+        let alice = attached
+            .iter()
+            .find(|entity| entity.entity_id == "alice_smith")
+            .expect("the new preparation promotes Alice");
+        assert_eq!(alice.identity["aka"], json!(["Ally"]));
+        assert!(attached.iter().any(|entity| entity.entity_id == "ali"));
+        let unit = solstone_core_system::work_retry::Unit::Daily {
+            day: day.into(),
+            talent: identity.name.clone(),
+            facet: identity.facet.clone(),
+        };
+        assert!(
+            !solstone_core_system::work_retry::read(root, &unit.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .held
         );
     }
 }

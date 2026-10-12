@@ -34,7 +34,9 @@ pub(crate) fn run(
         Some(Duration::from_secs(1800)),
     )
     .map_err(|error| error.to_string())?;
-    let result = segment::run_with(
+    // Thinking that is already current is skipped, so a segment owed only its
+    // publication is published without a model call.
+    segment::run_with(
         context,
         log,
         segment,
@@ -45,30 +47,5 @@ pub(crate) fn run(
         false,
         &[],
         segment::CurrentSegment::Skip,
-    )?;
-    if result.failed != 0 {
-        return Ok(result);
-    }
-    let directory = solstone_core_system_health::find_segment_dir(
-        &context.journal,
-        &context.day,
-        segment,
-        args.stream.as_deref(),
     )
-    .ok_or("repair segment no longer exists")?;
-    let before = solstone_core_system_health::newest_segment_input_ms(&directory)
-        .map_err(|error| error.to_string())?;
-    solstone_core_system::segment_publication::publish(
-        &context.journal,
-        &directory,
-        before,
-        |journal, path| context.index.rescan_file(journal, path),
-    )?;
-    if before
-        != solstone_core_system_health::newest_segment_input_ms(&directory)
-            .map_err(|error| error.to_string())?
-    {
-        return Err("segment input changed during publication".into());
-    }
-    Ok(result)
 }

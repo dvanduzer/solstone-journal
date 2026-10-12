@@ -1052,6 +1052,7 @@ mod tests {
             "Owner",
             &["Captain".into()],
             false,
+            &Default::default(),
         )
         .unwrap();
         let change = promotion.identity.unwrap();
@@ -1735,6 +1736,7 @@ mod tests {
             "Engineer",
             &["Amazing Grace".into()],
             false,
+            &Default::default(),
         )
         .unwrap();
         solstone_core_entity::publish_identity_change(
@@ -1792,6 +1794,7 @@ mod tests {
             "A friend",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         let create = plan.identity.as_ref().expect("a new identity");
@@ -1820,6 +1823,7 @@ mod tests {
             "A friend",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         if let Some(change) = plan.identity.as_ref() {
@@ -2114,7 +2118,7 @@ mod tests {
                 "output" => bind_output_action(root.path(), &root.path().join("facets/work/entities/20260910_review_outcome.json"), b"result".to_vec(), false).unwrap(),
                 "proposals" => PreparedDailyAction::MergeProposals { facet:"work".into(), facet_id, batch:solstone_core_entity::prepare_merge_proposals(root.path(), &[json!({"facet":"work", "day":"20260910", "source":"Ada", "source_slug":"ada", "target":"Grace", "target_slug":"grace", "summary":"Variant"})]).unwrap() },
                 _ => {
-                    let promotion = solstone_core_facets::prepare_review_promotion(root.path(), "work", "Person", "Grace Hopper", "Engineer", &["Amazing Grace".into()], false).unwrap();
+                    let promotion = solstone_core_facets::prepare_review_promotion(root.path(), "work", "Person", "Grace Hopper", "Engineer", &["Amazing Grace".into()], false, &Default::default()).unwrap();
                     match kind {
                         "identity" => PreparedDailyAction::Identity { facet:"work".into(), facet_id, change:promotion.identity.unwrap() },
                         "attachment" => PreparedDailyAction::Attachment { change:promotion.attachment },
@@ -2618,6 +2622,7 @@ mod tests {
             "Engineer",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         solstone_core_facets::publish_review_attachment(
@@ -2654,6 +2659,7 @@ mod tests {
             "Engineer",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap_err();
         assert_eq!(
@@ -2669,6 +2675,7 @@ mod tests {
             "Engineer",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         // A journal keeps one enabled facet; the sibling lets "work" go.
@@ -2776,6 +2783,7 @@ mod tests {
             "Engineer",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap_err();
         assert!(
@@ -2845,6 +2853,7 @@ mod tests {
             "Engineer",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap_err();
 

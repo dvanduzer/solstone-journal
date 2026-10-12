@@ -10,10 +10,14 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - when your journal's thinking runs on a local model, on confidential processing or at your own endpoint, it now settles which kind of app is in a screen frame consistently, rather than sometimes landing on a different kind for the same frame. that choice decides what it reads in detail.
 - when a 5 minute recording of a screen comes down to a single frame, your journal no longer asks the thinking model which frames to read in detail, so it spends fewer tokens. what it keeps is the same.
+- the agents app's steps for connecting Claude through solstone.me now say to choose solstone in Claude's connector directory if it's there, and to add your journal's address as a custom connector if it isn't. through your own hostname the steps are the same as before: a custom connector.
 
 ### Fixed
 
 - a failed backup attempt no longer replaces the record of your last successful backup. the backup page shows both, including when a stored copy was incomplete.
+- each day's daily results, like your morning briefing, are made again once the day ends. since 2.0.42, your journal waited for each of the day's recordings to be checked off one by one, a few every hour or so. when recordings ran all day, those results stopped coming. days already waiting catch up soon after you update, and catching up on older recordings keeps going as each one finishes instead of a few at a time.
+- some long conversations you imported from ChatGPT, Claude, Gemini or a text file were never read. your journal kept waiting on them, so that day's daily results never finished, and nothing said why. they're now read like any other conversation, and when a day's daily results can't finish, your journal's log names the recordings or conversations holding it up.
+- on linux, media offload could stop proposing anything to move into your backup when one screen or audio recording had a long description or transcript. that no longer stops it.
 - on mac and windows, turning on encrypted backup operated by sol pbc and restoring your journal from it work again. since 2.0.41 both stopped as soon as they started.
 - on mac, you can turn off and delete encrypted backup operated by sol pbc again. as on linux, your journal won't delete it while your backup holds the only copy of some of your media.
 - on linux and mac, you can turn off and delete a backup you set up in your own storage again. your journal deletes every snapshot in it, but not while your backup holds the only copy of some of your media. if your storage may keep deleted files anyway, for example when versioning or object lock is on, or a B2 bucket has no rule that removes hidden files, your journal says so, and also says when it couldn't check.
@@ -27,6 +31,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - the help under "frames read in detail" in settings said the number counted frames across your whole screen segment. it counts for each screen separately, and the help now says so.
 - on mac and windows, the health page no longer lists "original media cleanup" as scheduled, and your journal no longer starts it every day. offload isn't available there in this version, so each run stopped without doing anything.
 - your activities, and the people and things your journal detects in each facet, now show up in search as soon as they're saved. before, they waited for your journal's daily search update, and until then the health page said search was catching up.
+- when two of your journal's thinking runs finished at the same moment, their entries in that day's record of runs could get mixed together. `solstone call health` then warned that the record couldn't be fully read and stopped counting the runs that failed in the last day, for good. each entry is now written whole, and a mixed-up entry in a record that hasn't changed in the last day no longer stops the count. the daily cleanup of operational logs now also removes such a record once it's older than the number of days you keep them, instead of keeping it and reporting an error each day.
+- a facet's entity review for a day could stop for good when one entity it added was named by another's alias, for example Ali, and Alice Smith with the alias Ali, or when two of them shared an alias. the later one now leaves that alias out, and the review finishes.
+- if a review already stopped this way, `solstone journal reprocess DAY --unit entities:entities_review --facet FACET` now runs it again, and `solstone journal doctor` names that command. what the stopped review already added stays. before, the command said the review couldn't be retried, and nothing else could finish it.
+- when another daily step stopped after its automatic retry, `solstone journal doctor` suggested `solstone journal reprocess --unit`, which refuses that step. it now suggests redoing the day with `--from-scratch`.
 
 ## [2.0.43] - 2026-10-12
 

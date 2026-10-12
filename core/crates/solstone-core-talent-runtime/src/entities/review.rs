@@ -457,6 +457,9 @@ pub fn prepare_publication(
     let mut skipped = 0usize;
     let mut seen = BTreeSet::new();
     let mut batch_principal_taken = false;
+    // Every promotion is prepared before any publishes, so the journal cannot
+    // show what earlier promotions in this batch will claim.
+    let mut batch_claims = BTreeMap::new();
     for row in promotions {
         let name = row
             .get("name")
@@ -526,6 +529,7 @@ pub fn prepare_publication(
             description,
             &aliases,
             batch_principal_taken,
+            &batch_claims,
         )?;
         // A merged or deleted entity is never created again. A name a live
         // entity carries (one the owner added again under a new id) resolves
@@ -541,6 +545,11 @@ pub fn prepare_publication(
             && change.after.get("is_principal").and_then(Value::as_bool) == Some(true)
         {
             batch_principal_taken = true;
+        }
+        for claim in &promotion.claims {
+            batch_claims
+                .entry(claim.clone())
+                .or_insert_with(|| promotion.attachment.entity_id.clone());
         }
         if let Some(change) = promotion.identity {
             actions.push(PreparedDailyAction::Identity {
@@ -1636,6 +1645,7 @@ mod tests {
             "Desc",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         let change_no_names = promo_no_names.identity.unwrap();
@@ -1663,6 +1673,7 @@ mod tests {
             "Desc",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         let change_missing = promo_missing.identity.unwrap();
@@ -1891,6 +1902,7 @@ mod tests {
             "A company.",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_ne!(
@@ -1912,6 +1924,7 @@ mod tests {
             "A coworker.",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_ne!(
@@ -1933,6 +1946,7 @@ mod tests {
             "A coworker.",
             &["Jordan Rivera".into()],
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_ne!(
@@ -1961,6 +1975,7 @@ mod tests {
             "Owner candidate.",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_ne!(
@@ -1997,6 +2012,7 @@ mod tests {
             "Adopting existing.",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         assert!(promo_unmarked.identity.is_none());
@@ -2036,6 +2052,7 @@ mod tests {
             "New person.",
             &[],
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_ne!(

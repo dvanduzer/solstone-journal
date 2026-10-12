@@ -119,20 +119,29 @@ fn observe_using(
     Ok(Some(current))
 }
 
-/// An explicit unit request also covers a failed unit before its ordinary cap.
-/// Conflicts, accepted output and uncertain owner actions retain their guards.
+/// An explicit unit request also covers a failed unit before its ordinary cap,
+/// and an entity review whose conflict a fresh preparation can clear. Other
+/// conflicts, accepted output and uncertain owner actions retain their guards.
 pub fn request(journal: &Path, unit: &Unit) -> Result<String, String> {
+    request_using(journal, unit, || evidence(journal, unit))
+}
+
+fn request_using(
+    journal: &Path,
+    unit: &Unit,
+    read_evidence: impl FnOnce() -> Result<solstone_core_indexer::daily_evidence::DailyEvidence, String>,
+) -> Result<String, String> {
     let record = solstone_core_journal_io::load_daily_unit_record(journal, &identity(unit)?)
         .map_err(|e| e.to_string())?
         .ok_or("daily unit is missing")?;
-    if !matches!(
+    let retryable = matches!(
         record.status,
         DailyUnitStatus::Failed | DailyUnitStatus::Capped
-    ) || record.has_uncommitted_started_receipt()
-    {
+    ) || crate::daily_coverage::review_conflict_reprepares(&record);
+    if !retryable || record.has_uncommitted_started_receipt() {
         return Err("this daily unit cannot be retried without resolving its current state".into());
     }
-    let evidence = evidence(journal, unit)?;
+    let evidence = read_evidence()?;
     if crate::daily_coverage::accepted_reuse(
         &record,
         &evidence,
@@ -254,5 +263,87 @@ mod tests {
             ledger.permission("changed", &[]).is_none(),
             "accepted output is not eligible work"
         );
+    }
+
+    /// An entity review that stopped on a conflict after committing some of its
+    /// changes, as its record reads once the automatic retry is spent.
+    fn stopped_review(
+        root: &Path,
+        kind: Option<&str>,
+        receipts: &[(&str, &str)],
+    ) -> (Unit, solstone_core_indexer::daily_evidence::DailyEvidence) {
+        let talents = root.join("talents");
+        let apps = root.join("apps");
+        std::fs::create_dir_all(&talents).unwrap();
+        std::fs::create_dir_all(apps.join("entities/talent")).unwrap();
+        std::fs::write(apps.join("entities/talent/entities_review.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":56,\"output\":\"json\",\"multi_facet\":true,\"hook\":{\"pre\":\"entities:entities_review\",\"post\":\"entities:entities_review\"}\n}\nReview entities.").unwrap();
+        let unit = Unit::Daily {
+            day: "19990101".into(),
+            talent: "entities:entities_review".into(),
+            facet: Some("work".into()),
+        };
+        let evidence = evidence_with_roots(root, &unit, &talents, &apps).unwrap();
+        let mut record = DailyUnitRecord::new(
+            identity(&unit).unwrap(),
+            &evidence.revision,
+            &evidence.contract,
+        );
+        record.status = DailyUnitStatus::Conflicting;
+        record.reason_code = Some("daily_owner_conflict".into());
+        record.owner_conflict_kind = kind.map(str::to_owned);
+        record.failure_count = 2;
+        record.receipts = receipts
+            .iter()
+            .map(|(action, state)| {
+                serde_json::json!({"kind":"owner_action","action_id":action,"token":"t","state":state})
+            })
+            .collect();
+        save_daily_unit_record(root, &record).unwrap();
+        (unit, evidence)
+    }
+
+    #[test]
+    fn an_owner_request_retries_a_review_stopped_before_its_conflicting_write() {
+        let root = tempfile::tempdir().unwrap();
+        let (unit, evidence) = stopped_review(
+            root.path(),
+            Some("alias_claimed"),
+            &[("0:a", "committed"), ("1:b", "committed")],
+        );
+        let input = evidence.retry_revision_under(INPUT_CONTRACT);
+        request_using(root.path(), &unit, || Ok(evidence.clone())).unwrap();
+        let ledger = super::super::read(root.path(), &unit.id().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(ledger.held);
+        assert_eq!(ledger.reason, "daily_owner_conflict");
+        let grant = ledger.permission(&input, &[]).unwrap();
+        assert!(grant.cause.starts_with("owner:"), "{grant:?}");
+    }
+
+    #[test]
+    fn a_review_conflict_that_may_have_started_a_write_still_refuses() {
+        for (kind, receipts) in [
+            // A change that started and never confirmed may be half applied.
+            (
+                Some("alias_claimed"),
+                &[("0:a", "committed"), ("1:b", "started")][..],
+            ),
+            // A conflict outside the known pre-write kinds keeps its guard.
+            (None, &[("0:a", "committed")][..]),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (unit, evidence) = stopped_review(root.path(), kind, receipts);
+            let error = request_using(root.path(), &unit, || Ok(evidence)).unwrap_err();
+            assert_eq!(
+                error,
+                "this daily unit cannot be retried without resolving its current state"
+            );
+            assert!(
+                super::super::read(root.path(), &unit.id().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

@@ -244,6 +244,9 @@ async function test(name, body) {
     await click({action:'connect'});
     await click({way:'byo'});
     has(view, 'https://journal.example.com/mcp');
+    await click({agent: 'claude'});
+    has(view, 'custom connector');
+    lacks(view, 'connector directory', 'the directory listing never matches an owner hostname');
     await click({action:'new-code'});
     const post = calls.find(call => call.url === '/app/agents/api/pairing' && call.method === 'POST');
     assert(post && post.body.door === 'byo');
@@ -351,6 +354,7 @@ async function test(name, body) {
     lacks(view, 'data-agent="tiles"', 'Tiles reaches a journal on its own computer only');
     await click({agent: 'claude'});
     has(view, 'data-agent-hint="claude"');
+    has(view, 'connector directory', 'a solstone.me address is what the directory listing matches');
   });
 
   await test('solstone.me turned off turns back on without a new consent', async () => {

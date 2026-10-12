@@ -343,10 +343,10 @@ pub enum Kept {
     Undateable,
     /// Not the kind of entry this class removes, or not a matching extension.
     NotAMatch,
-    /// An old-named talent index had no rows, or at least one row was still recent.
+    /// An old-named talent index was empty, or at least one row was still recent.
     ContentNotFullyOld,
-    /// A talent index could not be read as wholly valid dated JSONL.
-    ContentMalformed { day: NaiveDate, detail: String },
+    /// An old-named talent index could not be read at all.
+    ContentUnreadable { day: NaiveDate, detail: String },
 }
 
 /// One examined-and-kept entry.
@@ -480,41 +480,33 @@ fn entry_bytes(path: &Path, kind: EntryKind) -> u64 {
 /// Whether an old-named talent day index is safe to remove.
 ///
 /// An index is a denormalized view across talent runs, so its filename is only a
-/// first filter. Every nonblank row must carry an epoch-millisecond `ts`, and every
-/// row's UTC day must be outside the window before the index can go.
+/// first filter. Every row that carries an epoch-millisecond `ts` must fall on a
+/// UTC day outside the window before the index can go.
+///
+/// A line that is not such a row is skipped, not a reason to keep the file. Rows
+/// from talents finishing together could interleave into torn lines, and every
+/// reader of the index skips a line it cannot parse, so a torn line holds nothing
+/// to protect. Counting one as a reason to keep would hold the index, and report
+/// it, forever.
 fn talent_day_index_is_fully_old(path: &Path, cutoff: NaiveDate) -> Result<bool, String> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read talent day-index: {error}"))?;
-    let mut rows = 0usize;
-    for (number, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
+    let contents =
+        std::fs::read(path).map_err(|error| format!("could not read talent day-index: {error}"))?;
+    let mut lines = 0usize;
+    for line in contents.split(|byte| *byte == b'\n') {
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        let row: serde_json::Value = serde_json::from_str(line)
-            .map_err(|_| format!("line {}: malformed JSON", number.saturating_add(1)))?;
-        let object = row
-            .as_object()
-            .ok_or_else(|| format!("line {}: non-object row", number.saturating_add(1)))?;
-        let timestamp = object
-            .get("ts")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| {
-                format!(
-                    "line {}: missing or non-integer ts",
-                    number.saturating_add(1)
-                )
-            })?;
-        let Some(row_day) =
-            DateTime::from_timestamp_millis(timestamp).map(|when| when.date_naive())
-        else {
-            return Err(format!("line {}: invalid ts", number.saturating_add(1)));
-        };
-        rows = rows.saturating_add(1);
-        if row_day >= cutoff {
+        lines = lines.saturating_add(1);
+        let row_day = serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .and_then(|row| row.get("ts").and_then(serde_json::Value::as_i64))
+            .and_then(DateTime::from_timestamp_millis)
+            .map(|when| when.date_naive());
+        if row_day.is_some_and(|day| day >= cutoff) {
             return Ok(false);
         }
     }
-    Ok(rows > 0)
+    Ok(lines > 0)
 }
 
 /// Every directory a class's entries are found in, with the expanded component.
@@ -660,7 +652,7 @@ pub fn plan(journal: &Path, policy: &LogPolicy, today: NaiveDate) -> LogPlan {
                         Err(detail) => {
                             built
                                 .retained
-                                .push(retained(Kept::ContentMalformed { day, detail }));
+                                .push(retained(Kept::ContentUnreadable { day, detail }));
                             continue;
                         }
                     }

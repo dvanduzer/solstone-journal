@@ -344,9 +344,7 @@ fn render_prune(
             Kept::Undateable => {
                 Some("the entry's retention date could not be determined".to_owned())
             }
-            Kept::ContentMalformed { detail, .. } => {
-                Some(format!("malformed talent day-index row: {detail}"))
-            }
+            Kept::ContentUnreadable { detail, .. } => Some(detail.clone()),
             Kept::TooYoung(_) | Kept::Exempt | Kept::NotAMatch | Kept::ContentNotFullyOld => None,
         };
         if let Some(reason) = reason {

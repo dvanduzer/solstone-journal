@@ -1292,6 +1292,9 @@ fn run_owned_backup_command(
         Ok(input) => input,
         Err(code) => return code,
     };
+    // Ctrl-C or SIGTERM stops running archive children instead of orphaning them.
+    #[cfg(unix)]
+    solstone_core_backup::bounded_child::stop_archive_work_on_signals();
     let owned = call(&arguments, &journal);
     let (stdout, stderr, code) = match &owned {
         OwnedBackupCommand::Backup(run) => run.output(),

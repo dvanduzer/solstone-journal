@@ -4,11 +4,12 @@
 //! Bounded JSONL evidence reads and analysis-output re-entry decisions.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use serde_json::Value;
 
+use crate::rows::{LeadingRow, read_leading_rows};
 use crate::{analysis_row_key, is_failure_exhausted, vocab};
 
 /// Branch-2 allowlist for recordless re-entry (describe | depict).
@@ -39,36 +40,20 @@ pub fn read_processing_record_header(path: &Path) -> Option<Value> {
         .cloned()
 }
 
-/// Return whether either of the first two nonblank JSONL rows carries `row_key`.
+/// Return whether either of the first two nonblank JSONL rows carries `row_key`
+/// as a top-level key.
 ///
-/// This deliberately bounds Python's unbounded processing_record.py:92 probe to
-/// one header-sized window. An unreadable or truncated window never manufactures
-/// row evidence and therefore remains conservative for re-entry.
+/// Each row is read whole, in constant memory, so its length does not matter;
+/// at most two rows are read ([`read_leading_rows`]). A row that is not one UTF-8
+/// JSON object on its own line is no evidence, but still counts as one of the two.
 pub fn jsonl_has_row_with_key(path: &Path, row_key: &str) -> bool {
-    let Ok(mut file) = File::open(path) else {
+    let Ok(file) = File::open(path) else {
         return false;
     };
-    let mut window = Vec::with_capacity(vocab::MAX_FIRST_ROW_BYTES);
-    if file
-        .by_ref()
-        .take(vocab::MAX_FIRST_ROW_BYTES as u64)
-        .read_to_end(&mut window)
-        .is_err()
-    {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(&window) else {
-        return false;
-    };
-    text.split('\n')
-        .filter(|line| !line.trim().is_empty())
-        .take(2)
-        .any(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|row| row.as_object().map(|row| row.contains_key(row_key)))
-                .unwrap_or(false)
-        })
+    read_leading_rows(BufReader::new(file), Some(row_key)).is_ok_and(|rows| {
+        rows.iter()
+            .any(|row| matches!(row, LeadingRow::Object { has_key: true, .. }))
+    })
 }
 
 /// Return whether an existing analysis output should be retried by `handler`.
@@ -103,7 +88,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{read_processing_record_header, should_reenter_analysis_output};
+    use super::{
+        jsonl_has_row_with_key, read_processing_record_header, should_reenter_analysis_output,
+    };
     use crate::test_support::reserve_temp_path;
     use crate::vocab;
 
@@ -253,6 +240,86 @@ mod tests {
             vocab::HANDLER_DEPICT
         ));
         fs::remove_file(path).expect("remove sidecar");
+    }
+
+    /// A header row followed by one message row that alone runs past the old
+    /// header-sized window.
+    #[test]
+    fn row_key_is_found_in_a_row_longer_than_the_header_bound() {
+        let path = temporary_path("long-row");
+        let text = "a".repeat(3 * vocab::MAX_FIRST_ROW_BYTES);
+        write(
+            &path,
+            &format!(
+                "{{\"imported\":{{\"id\":\"x\"}}}}\n{}\n",
+                json!({"start": "00:00:00", "speaker": "Human", "text": text})
+            ),
+        );
+        assert!(jsonl_has_row_with_key(
+            &path,
+            vocab::AUDIO_TRANSCRIPT_ROW_KEY
+        ));
+        assert!(!jsonl_has_row_with_key(&path, "missing"));
+        fs::remove_file(path).expect("remove sidecar");
+    }
+
+    /// Short rows, but a multi-byte character straddles the old window's last byte.
+    #[test]
+    fn row_key_is_found_when_a_later_row_splits_a_character_at_the_bound() {
+        let path = temporary_path("split-char");
+        let bound = vocab::MAX_FIRST_ROW_BYTES;
+        let mut contents = format!(
+            "{{\"imported\":{{\"id\":\"x\"}}}}\n{}\n",
+            json!({"start": "00:00:00", "text": "hi"})
+        );
+        let filler = format!(
+            "{}\n",
+            json!({"start": "00:00:01", "text": "b".repeat(1000)})
+        );
+        while contents.len() + filler.len() < bound - 2000 {
+            contents.push_str(&filler);
+        }
+        // Pad the last row so its four-byte character begins two bytes before the bound.
+        let lead = "{\"start\":\"00:00:02\",\"text\":\"";
+        let pad = "c".repeat(bound - 2 - contents.len() - lead.len());
+        contents.push_str(&format!("{lead}{pad}\u{1F600}\"}}\n"));
+        assert!(contents.len() > bound);
+        assert!(!contents.is_char_boundary(bound));
+        write(&path, &contents);
+        assert!(jsonl_has_row_with_key(
+            &path,
+            vocab::AUDIO_TRANSCRIPT_ROW_KEY
+        ));
+        fs::remove_file(path).expect("remove sidecar");
+    }
+
+    #[test]
+    fn row_key_evidence_reads_only_the_first_two_nonblank_rows() {
+        let path = temporary_path("rows");
+        let cases: [(&str, bool); 9] = [
+            ("\n  \n{}\n\n{\"start\":0}\n", true),
+            ("{}\n{}\n{\"start\":0}\n", false),
+            ("not-json\n{\"start\":0}\n", true),
+            ("[\"start\"]\n{\"other\":{\"start\":0}}\n", false),
+            ("{\"start\":0} trailing\n", false),
+            ("{\"start\":0}{\"start\":1}\n", false),
+            ("{\"start\":0,\"text\":\"cut", false),
+            ("{\"text\":\"cut\n{\"start\":0}\n", true),
+            ("{\"start\":0}", true),
+        ];
+        for (contents, expected) in cases {
+            write(&path, contents);
+            assert_eq!(
+                jsonl_has_row_with_key(&path, vocab::AUDIO_TRANSCRIPT_ROW_KEY),
+                expected,
+                "{contents:?}"
+            );
+        }
+        fs::remove_file(&path).expect("remove sidecar");
+        assert!(!jsonl_has_row_with_key(
+            &path,
+            vocab::AUDIO_TRANSCRIPT_ROW_KEY
+        ));
     }
 
     #[test]

@@ -61,6 +61,13 @@ use measurement::SharedMeasurementCache;
 use operation::{SharedOperationSlot, Terminal};
 use restore_prepare::SharedRestorePrepare;
 
+/// The service is stopping: running archive children are killed and reaped
+/// rather than left behind. False if some remain after `timeout`.
+pub fn stop_archive_work(timeout: std::time::Duration) -> bool {
+    solstone_core_backup::archive_admission::stop_archive_work();
+    solstone_core_backup::archive_admission::wait_for_archive_children(timeout)
+}
+
 #[derive(Clone)]
 pub struct BackupWebDeps {
     pub journal_root: PathBuf,

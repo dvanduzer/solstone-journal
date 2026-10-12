@@ -36,7 +36,49 @@ impl ArchiveCancellation {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire) || archive_work_stopping()
+    }
+}
+
+static ARCHIVE_WORK_STOPPING: AtomicBool = AtomicBool::new(false);
+static LIVE_ARCHIVE_CHILDREN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The process is stopping: every archive cancellation now reads as cancelled,
+/// so running archive children are killed and reaped instead of outliving it.
+/// Only an atomic store, so a signal handler may call it.
+pub fn stop_archive_work() {
+    ARCHIVE_WORK_STOPPING.store(true, Ordering::Release);
+}
+
+pub fn archive_work_stopping() -> bool {
+    ARCHIVE_WORK_STOPPING.load(Ordering::Acquire)
+}
+
+/// Wait until every archive child this process started has been reaped.
+/// Returns false if some remain when `timeout` ends.
+pub fn wait_for_archive_children(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while LIVE_ARCHIVE_CHILDREN.load(Ordering::Acquire) != 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
+/// Held from spawn until the child is reaped; see [`wait_for_archive_children`].
+pub(crate) struct LiveArchiveChild(());
+impl LiveArchiveChild {
+    pub(crate) fn enter() -> Self {
+        LIVE_ARCHIVE_CHILDREN.fetch_add(1, Ordering::AcqRel);
+        Self(())
+    }
+}
+impl Drop for LiveArchiveChild {
+    fn drop(&mut self) {
+        LIVE_ARCHIVE_CHILDREN.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
