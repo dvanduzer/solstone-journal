@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use solstone_core_journal_config::work_priority::WorkBand;
+use solstone_core_journal_io::durability::{ArtifactId, artifact};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,7 +84,7 @@ impl WorkInventory {
     }
     pub fn publish(&self, journal: &Path) -> Result<(), String> {
         solstone_core_journal_io::write_json(
-            journal.join("health/work-inventory.json"),
+            journal.join(artifact(ArtifactId::WorkInventory).path),
             self,
             solstone_core_journal_io::JsonWriteOptions::default(),
         )
@@ -92,7 +93,7 @@ impl WorkInventory {
 }
 
 pub fn read(journal: &Path) -> Result<Option<WorkInventory>, String> {
-    let bytes = match std::fs::read(journal.join("health/work-inventory.json")) {
+    let bytes = match std::fs::read(journal.join(artifact(ArtifactId::WorkInventory).path)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),

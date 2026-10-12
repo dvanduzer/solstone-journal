@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use solstone_core_journal_io::durability::{ArtifactId, artifact};
 use solstone_core_journal_io::{JsonWriteOptions, LockOptions, hold_lock, write_json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +38,7 @@ fn valid_day(day: &str) -> bool {
 }
 
 pub fn read(journal: &Path) -> Result<BTreeMap<String, OwnerIntent>, String> {
-    let bytes = match std::fs::read(journal.join("health/work-intent.json")) {
+    let bytes = match std::fs::read(journal.join(artifact(ArtifactId::WorkIntent).path)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(error) => return Err(error.to_string()),
@@ -59,7 +60,7 @@ fn mutate<T>(
     journal: &Path,
     update: impl FnOnce(&mut BTreeMap<String, OwnerIntent>) -> Result<T, String>,
 ) -> Result<T, String> {
-    let path = journal.join("health/work-intent.json");
+    let path = journal.join(artifact(ArtifactId::WorkIntent).path);
     std::fs::create_dir_all(path.parent().expect("health parent"))
         .map_err(|error| error.to_string())?;
     let _lock = hold_lock(path.with_extension("lock"), LockOptions::default())

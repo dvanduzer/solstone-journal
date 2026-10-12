@@ -99,6 +99,8 @@ pub enum ArtifactId {
     AwarenessLog,
     TalentDayAccumulator,
     TaskQueueHolds,
+    WorkIntent,
+    WorkInventory,
 }
 
 /// One artifact the journal reads, with its declared class and path glob.
@@ -278,6 +280,13 @@ pub const JOURNAL_ARTIFACTS: &[DurableArtifact] = &[
         parser: ParserKind::WholeJson,
         rationale: "daily health update marker; invalid non-empty copied aside and kept as MalformedNonEmpty",
     },
+    DurableArtifact {
+        id: ArtifactId::WorkInventory,
+        path: "health/work-inventory.json",
+        class: DurabilityClass::RegenerableCache,
+        parser: ParserKind::WholeJson,
+        rationale: "whole-journal discovery progress, replaced by every discovery pass and read by work_inventory::read for doctor and health; an unreadable one reports inspection unavailable until the next pass rewrites it",
+    },
     // Wipeable
     DurableArtifact {
         id: ArtifactId::TaskQueueHolds,
@@ -285,6 +294,13 @@ pub const JOURNAL_ARTIFACTS: &[DurableArtifact] = &[
         class: DurabilityClass::Wipeable,
         parser: ParserKind::RecordFramedJsonl,
         rationale: "audit log of task-queue partition holds and releases",
+    },
+    DurableArtifact {
+        id: ArtifactId::WorkIntent,
+        path: "health/work-intent.json",
+        class: DurabilityClass::Wipeable,
+        parser: ParserKind::WholeJson,
+        rationale: "the owner's saved reprocess requests by day, written under a lock with atomic replace and read strictly by work_intent::read; an unreadable one fails new requests and stops each discovery pass, which reports it as unreadable; losing it costs the owner asking again, and nothing destructive runs without a request",
     },
     DurableArtifact {
         id: ArtifactId::CatchupState,

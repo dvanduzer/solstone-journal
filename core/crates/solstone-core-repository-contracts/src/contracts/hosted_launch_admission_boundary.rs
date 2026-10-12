@@ -179,6 +179,14 @@ const SCANNED_MODULE_SOURCES: &[(&str, &str, &str)] = &[
         "user_skill_refresh",
         include_str!("../../../solstone-core/src/supervisor/user_skill_refresh.rs"),
     ),
+    // Discovery reconstructs owed work and hands candidates to the TaskQueue;
+    // the runtime launches them through `launch_managed_hosted`. It must never
+    // launch a process itself.
+    (
+        "supervisor",
+        "work_discovery",
+        include_str!("../../../solstone-core/src/supervisor/work_discovery.rs"),
+    ),
     (
         "cortex",
         "process",
