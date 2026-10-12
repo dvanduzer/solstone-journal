@@ -87,7 +87,11 @@
       "rotate_key_caption": "this replaces your recovery key. the old key stops working, so every copy of it you saved becomes useless. write the new one down before you leave this page.",
       "retention_hint": "how many recent copies to keep at each interval.",
       "status_labels": {
-        "last_backup": "last backup",
+        "last_backup": "latest backup attempt",
+        "last_successful_backup": "last successful backup",
+        "backup_attempt_unknown": "the latest backup attempt isn't known on this computer.",
+        "backup_history_unknown": "the last successful backup isn't known on this computer.",
+        "backup_history_note": "this is a past result. it doesn't confirm what's stored at your current backup destination or whether it has been verified.",
         "last_prune": "last cleanup",
         "last_verification": "last verification",
         "verification_subset_one": "checked all of your backup this week.",
@@ -1778,8 +1782,9 @@
     const lastVerification = state.last_verification || {};
     const selection = selectStatusCopy(lastBackup.status, lastVerification.status);
     const nodes = ensureBackupStatusNodes();
-    if (nodes.backup && selection) {
-      const display = statusSelectionDisplay(selection.backup);
+    if (nodes.backup) {
+      const display = selection ? statusSelectionDisplay(selection.backup)
+        : { text: statusLabels.backup_attempt_unknown || '', title: '' };
       nodes.backup.textContent = display.text;
       if (display.title) {
         nodes.backup.title = display.title;
@@ -1797,6 +1802,24 @@
       nodes.reason.textContent = reason || '';
       nodes.reason.hidden = !reason;
     }
+    // An absent history field can still have an intact successful attempt.
+    // Explicit null means success history is unknown, not "never backed up".
+    const success = Object.hasOwn(lastBackup, 'last_success')
+      ? lastBackup.last_success : lastBackup.status === 'ok' ? lastBackup : null;
+    const knownSuccess = success?.status === 'ok' && validTimestamp(success.time)
+      && Number.isFinite(new Date(success.time * 1000).getTime());
+    setTextWithTitle('[data-last-successful-backup]', knownSuccess
+      ? timestampDisplay(success.time)
+      : { text: statusLabels.backup_history_unknown || '', title: '' });
+    const successReason = root.querySelector('[data-last-successful-backup-reason]');
+    if (successReason) {
+      const reason = success?.status === 'ok' && success.error_reason === 'incomplete'
+        ? backupErrorReasonLine(success.error_reason) : '';
+      successReason.textContent = reason || '';
+      successReason.hidden = !reason;
+    }
+    const historyNote = root.querySelector('[data-backup-history-note]');
+    if (historyNote) historyNote.hidden = success?.status !== 'ok';
     if (nodes.verification && selection) {
       const display = statusSelectionDisplay(selection.verification);
       nodes.verification.textContent = display.text;
