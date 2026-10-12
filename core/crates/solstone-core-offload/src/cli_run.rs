@@ -255,35 +255,8 @@ impl OwnedOffloadCliRun {
     }
 }
 
-/// Production remains held until an interrupted or failed archive operation can
-/// clear its own leftover activity; until then one crash would block every later
-/// removal. The qualified executor below stays for the installed fixtures.
+/// Run the installed offload producer while retaining its complete outcome.
 pub fn run_cli_offload(
-    _journal: &Path,
-    clock: Arc<dyn Clock + Send + Sync>,
-    dry_run: bool,
-) -> OwnedOffloadCliRun {
-    let refusal = if dry_run {
-        CliPrelaunchRefusal::DryRun
-    } else if !cfg!(target_os = "linux") {
-        CliPrelaunchRefusal::UnsupportedPlatform
-    } else {
-        CliPrelaunchRefusal::NamespaceCooperationHeld
-    };
-    OwnedOffloadCliRun::receive(
-        Custody::Prelaunch {
-            refusal,
-            _root: None,
-            _clock: clock,
-        },
-        CliObservedEffects::default(),
-    )
-}
-
-// Preserve the qualified executor for the private installed fixture. This is not
-// a production activation entry or a caller-supplied cooperation certificate.
-#[cfg_attr(not(all(test, feature = "full-tests")), allow(dead_code))]
-fn run_cli_offload_qualified(
     journal: &Path,
     clock: Arc<dyn Clock + Send + Sync>,
     dry_run: bool,

@@ -17,12 +17,18 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- on mac and windows, and for a backup you set up in your own storage, turning off and deleting your backup isn't available in this version. nothing is deleted when you try.
+- when today's thinking and older work are both waiting, your journal now starts today's work first. local model calls follow the same order, with newer recordings first within each priority. work already running can finish.
 - your journal now looks for your voice by itself each day. from your first day, your journal's home page says when it has found a voice that may be yours, or what it still needs. once you confirm it, your past conversations are updated in the background to show who said what, and the speakers page shows how far along that is. only the speaker names change: stories and weekly reflections already written stay as they were. on the speakers page you can also teach your voice from the last two weeks, teach it again later, or remove your saved voice. a voice you say isn't yours isn't offered again, and after a "no" your journal looks again in 14 days. transcripts now show your lines as "you".
 - on a mac or linux computer, a local thinking install now stops before downloading when that computer is known to be below the memory bar or has no usable GPU. when that memory cannot be read, the install still starts and the thinking page keeps a warning for that attempt.
 - each tool your journal offers a connected agent now has a short name. saving a note, the one tool that doesn't only read, now says it adds without changing anything already in your journal. when an agent's call has arguments your journal can't use, it's told what to fix.
 
 ### Fixed
 
+- on linux, media offload runs again, and approving an offload proposal now frees its space even when your settings keep media forever. before it proposes a file, and again when you approve, your journal reads the file's copy back from your backup and checks that it matches. proposals made by an earlier version are withdrawn, and offload proposes again from scratch. on mac and windows, offload stays paused.
+- on linux, you can bring back media that offload moved into your backup from the backup page again, including media offloaded by an earlier version of your journal. each file is checked against the record of what was offloaded before it comes back, and a file already on this computer is kept as it is. on mac and windows, restoring stays paused.
+- on linux, you can approve the removals your retention settings propose again, and on every platform you can decline proposed removals again. a file that's already gone, or that your settings now keep, is reported as such instead of holding up the rest.
+- on linux, your journal now won't turn off and delete encrypted backup operated by sol pbc while your backup holds the only copy of some of your media.
 - turning on solstone.me works again on linux and mac. since 2.0.18 it could stop at "your journal could not prepare its agent address" and not get further. if that happened to you, it finishes on its own once your journal is updated.
 - the local model's dropdown label no longer says "8 GB", which could be mistaken for its graphics memory requirement.
 - your weekly page is written again on large journals. in 2.0.41, putting the week together could take longer than the ten minutes your journal allows, so no page was written for that week, and it isn't written later on its own.

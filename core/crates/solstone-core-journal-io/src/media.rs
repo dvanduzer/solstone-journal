@@ -26,14 +26,16 @@ pub use activity_carrier::{
     ActivityCarrierPreparationFailure, ActivityCarrierPreparationReceipt,
     ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,
     RootActivityCarrier, RootCarrierObservation, RootTeardownCarrier,
-    TeardownCarrierPreparationFailure,
+    TeardownCarrierPreparationFailure, exclusive_local_activity, retire_orphan_root_carriers,
+    retire_recorded_stage, retire_unrecorded_stage,
 };
 mod observation;
 pub use observation::{MediaEntry, MediaRead};
 mod removal;
 pub use removal::{
-    MediaRemoval, OriginalName, RemovalEffect, RemovalFailure, RemovalPhase, RemovalReceipt,
-    StageObservation,
+    InterruptedRemovalRecord, InterruptedRemovalResolution, MediaRemoval, OriginalName,
+    REMOVAL_ORIGINAL_LEAF, REMOVAL_RECORD_LEAF, RemovalEffect, RemovalFailure, RemovalPhase,
+    RemovalReceipt, StageObservation, resolve_interrupted_removal,
 };
 
 #[cfg(unix)]

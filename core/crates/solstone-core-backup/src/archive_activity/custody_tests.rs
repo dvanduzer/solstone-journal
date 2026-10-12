@@ -275,3 +275,30 @@ fn lock_replacement_refuses_original_custody_and_cannot_alias_fresh_allocation()
     );
     busy(&root);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admission_retires_only_reservations_whose_owner_ended_empty() {
+    let (_temp, root, _clock) = fixture();
+    let live = ArchiveActivity::prepare(Arc::clone(&root)).unwrap();
+    let ended = live.carrier().diagnostic_path();
+    // A live operation keeps its reservation through any other admission.
+    assert!(ArchiveActivity::prepare(Arc::clone(&root)).is_err());
+    assert!(ended.is_dir());
+    // It ends without retiring the reservation, as on a crash or restart.
+    drop(live);
+    assert!(ended.is_dir());
+    let next = ArchiveActivity::prepare(Arc::clone(&root)).unwrap();
+    assert!(!ended.exists());
+    assert_eq!(observe_obligations(&root).unwrap().entries().len(), 1);
+    // A reservation holding anything is never removed and still holds admission.
+    let occupied = next.carrier().diagnostic_path();
+    drop(next);
+    fs::write(occupied.join("payload"), b"unpublished copy").unwrap();
+    let refused = ArchiveActivity::prepare(Arc::clone(&root)).err().unwrap();
+    assert_eq!(refused.error().to_string(), "unresolved journal activity");
+    assert_eq!(
+        fs::read(occupied.join("payload")).unwrap(),
+        b"unpublished copy"
+    );
+}

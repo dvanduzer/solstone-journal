@@ -1550,7 +1550,7 @@ mod removal {
             let f = Fixture::new();
             let stage = f.stage();
             let path = stage.diagnostic_path();
-            let claim = path.join("raw.flac");
+            let claim = path.join(super::REMOVAL_ORIGINAL_LEAF);
             let mut result = if late {
                 let competitor = claim.clone();
                 let (result, hit) = run_with_media_hook(
@@ -1582,7 +1582,7 @@ mod removal {
     fn source_swap_in_native_claim_gap_preserves_wrong_claim_and_original_object() {
         let f = Fixture::new();
         let stage = f.stage();
-        let claim = stage.diagnostic_path().join("raw.flac");
+        let claim = stage.diagnostic_path().join(super::REMOVAL_ORIGINAL_LEAF);
         let raw = f.raw.clone();
         let old = raw.with_extension("saved");
         let saved = old.clone();
@@ -1612,7 +1612,7 @@ mod removal {
     fn same_identity_mutation_and_new_original_after_claim_are_preserved() {
         let f = Fixture::new();
         let stage = f.stage();
-        let claim = stage.diagnostic_path().join("raw.flac");
+        let claim = stage.diagnostic_path().join(super::REMOVAL_ORIGINAL_LEAF);
         let changed_claim = claim.clone();
         let raw = f.raw.clone();
         let (mut result, hit) = run_with_media_hook(
@@ -1642,7 +1642,7 @@ mod removal {
     fn replaced_private_claim_is_never_deleted_by_cleanup_or_drop() {
         let f = Fixture::new();
         let stage = f.stage();
-        let claim = stage.diagnostic_path().join("raw.flac");
+        let claim = stage.diagnostic_path().join(super::REMOVAL_ORIGINAL_LEAF);
         let saved = claim.with_extension("saved");
         let changed_claim = claim.clone();
         let old = saved.clone();
@@ -1671,7 +1671,7 @@ mod removal {
         ] {
             let f = Fixture::new();
             let stage = f.stage();
-            let claim = stage.diagnostic_path().join("raw.flac");
+            let claim = stage.diagnostic_path().join(super::REMOVAL_ORIGINAL_LEAF);
             let (mut result, hit) = run_with_media_hook(cut, fault, || f.remove(stage));
             assert!(hit);
             assert_eq!(result.receipt().effect, RemovalEffect::Claimed);
@@ -1718,7 +1718,10 @@ mod removal {
             assert!(path.is_dir());
             assert!(!f.raw.exists());
             if effect == RemovalEffect::ClaimUncertain {
-                assert_eq!(fs::read(path.join("raw.flac")).unwrap(), b"abc");
+                assert_eq!(
+                    fs::read(path.join(super::REMOVAL_ORIGINAL_LEAF)).unwrap(),
+                    b"abc"
+                );
             }
         }
     }
@@ -1938,7 +1941,10 @@ mod removal_rebinding {
             drop(result);
             assert!(retained_stage.is_dir());
             if cut == MediaPrimitive::AfterRemovalClaim {
-                assert_eq!(fs::read(retained_stage.join("raw.flac")).unwrap(), b"abc");
+                assert_eq!(
+                    fs::read(retained_stage.join(super::REMOVAL_ORIGINAL_LEAF)).unwrap(),
+                    b"abc"
+                );
             }
         }
     }
@@ -1992,7 +1998,12 @@ mod removal_rebinding {
             }
             drop(result);
             assert_eq!(fs::read(target.join("raw.flac")).unwrap(), b"foreign");
-            assert_eq!(fs::read(old.join("raw.flac")).unwrap(), b"abc");
+            let moved = if cut == MediaPrimitive::BeforeRemovalClaim {
+                "raw.flac"
+            } else {
+                super::REMOVAL_ORIGINAL_LEAF
+            };
+            assert_eq!(fs::read(old.join(moved)).unwrap(), b"abc");
         }
     }
 }

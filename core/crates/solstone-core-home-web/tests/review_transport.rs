@@ -746,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn public_approval_refuses_invalid_current_selection_before_admission() {
         for cut in [
-            "ordinary",
+            "legacy",
             "stale",
             "reoffer",
             "copied",
@@ -755,8 +755,13 @@ mod tests {
             "oversized",
         ] {
             let root = journal();
-            let mut row = mark(root.path(), "selected.flac", cut != "ordinary");
-            let original = save(root.path(), &[row.clone()]);
+            let mut row = mark(root.path(), "selected.flac", cut != "legacy");
+            if cut == "legacy" {
+                // An offload row from before archive offers: no backup proof.
+                row.class = RemovalClass::OffloadRawRelease;
+                row.id = MarkId::derive(row.class, &row.target, &row.proposal.names);
+            }
+            save(root.path(), &[row.clone()]);
             let listed = list(root.path()).await;
             let context = listed["review_context"].as_str().unwrap().to_owned();
             let mut body =
@@ -834,9 +839,107 @@ mod tests {
                 fs::read(root.path().join("chronicle/raw.flac")).unwrap(),
                 b"original bytes"
             );
-            if cut == "ordinary" {
-                assert_eq!(before, original);
-            }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn public_policy_only_approval_starts_and_settles_locally() {
+        let root = journal();
+        let row = mark(root.path(), "selected.flac", false);
+        let segment = root
+            .path()
+            .join(solstone_core_retention::layout::segment_rel(
+                &row.target.day,
+                &row.target.stream,
+                &row.target.dir,
+            ));
+        fs::create_dir_all(&segment).unwrap();
+        fs::create_dir_all(root.path().join("chronicle/20261009/health")).unwrap();
+        fs::write(segment.join("selected.flac"), b"policy").unwrap();
+        fs::write(
+            segment.join("selected.jsonl"),
+            "{\"_solstone_processing\":{\"schema\":\"solstone.processing.v1\",\"state\":\"analyzed\",\"reason_code\":\"ok\",\"handler\":\"transcribe\",\"input_size\":6,\"attempted_at\":\"2026-10-09T12:00:00Z\"}}\n{\"start\":0,\"text\":\"x\"}\n",
+        )
+        .unwrap();
+        save(root.path(), std::slice::from_ref(&row));
+        let context = list(root.path()).await["review_context"].clone();
+        let mut deps = solstone_core_backup_web::BackupWebDeps::new(root.path().to_path_buf());
+        deps.executable = root.path().join("missing-package/bin/solstone");
+        let router = solstone_core_home_web::routes_with_backup_deps(
+            deps.clone(),
+            solstone_core_home_web::Clock::fixed(
+                Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap(),
+            ),
+            |_| false,
+        );
+        let request = |method: &str, uri: String, body: String| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/app/home/api/approve".into(),
+                json!({"review_context":context,"mark_ids":[row.id.as_str()]}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let started: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(started["state"], "approve.started");
+        let generation = started["generation"].as_str().unwrap().to_owned();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let observed = loop {
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    format!("/app/home/api/approve/{generation}"),
+                    String::new(),
+                ))
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let observed: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            if observed["worker_settled"] == json!(true) {
+                break observed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not settle"
+            );
+            std::thread::park_timeout(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(observed["state"], "completed");
+        assert_eq!(observed["report"]["settlement"]["state"], "settled");
+        assert!(!segment.join("selected.flac").exists());
+        assert!(
+            solstone_core_retention::review_context::load_at_root(
+                &JournalRoot::open(root.path()).unwrap()
+            )
+            .unwrap()
+            .marks
+            .is_empty()
+        );
+        assert_eq!(
+            fs::read(root.path().join("chronicle/raw.flac")).unwrap(),
+            b"original bytes"
+        );
+        assert!(
+            solstone_core_backup_web::archive_operation::begin(
+                &deps.operations,
+                "probe",
+                deps.clock.as_ref()
+            )
+            .is_ok()
+        );
     }
 }

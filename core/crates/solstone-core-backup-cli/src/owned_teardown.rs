@@ -6,6 +6,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use solstone_core_backup::archive_admission::ArchiveCancellation;
+use solstone_core_backup_runtime::teardown_admission::{
+    TeardownAdmissionRefusal, TeardownCarrierRefusal, TeardownReaderRefusal,
+};
 use solstone_core_offload::teardown::{
     OwnedTeardownOutcome, TeardownRunRefusal, run_owned_teardown,
 };
@@ -13,7 +16,13 @@ use solstone_core_offload::teardown::{
 use super::{CliRun, ProductionClock};
 
 pub(super) const PRELAUNCH_HELD: &str =
-    "backup teardown is temporarily unavailable. no backup changes were made.";
+    "turning off and deleting your backup isn't available here. no backup changes were made.";
+pub(super) const BACKUP_ONLY_HELD: &str = "your backup holds the only copy of some of your media, so no backup changes were made. restore everything from the backup page first, then try again.";
+pub(super) const DESTINATION_UNSUPPORTED: &str = "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made.";
+pub(super) const BACKUP_ONLY_UNPLACED: &str = "your backup holds the only copy of some older media that can't be matched to a recording on this device, so it can't be restored and no backup changes were made. if your journal was moved or copied, bring back its missing days, then try again.";
+pub(super) const OFFLOAD_RECORD_UNAVAILABLE: &str = "the record of what media offload moved into your backup is missing or can't be read, so no backup changes were made. if your journal was moved or copied, bring back its health folder, then try again.";
+pub(super) const NOT_STARTED: &str =
+    "turning off and deleting your backup couldn't start. no backup changes were made.";
 
 /// The complete native outcome remains alive while output is borrowed.
 #[must_use = "Retain the whole teardown result through printing and exit"]
@@ -59,9 +68,31 @@ pub(super) fn run(journal: &Path) -> OwnedTeardownCliRun {
     ))
 }
 
-fn reason(refusal: Option<&TeardownRunRefusal>) -> &'static str {
-    match refusal {
-        Some(TeardownRunRefusal::NamespaceCooperationHeld) => "namespace_cooperation_held",
+/// Coverage refusals the owner can act on, with their reason and message.
+fn coverage_refusal(outcome: &OwnedTeardownOutcome) -> Option<(&'static str, &'static str)> {
+    let failure = outcome.preparation_failure()?;
+    let TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(reader)) =
+        failure.refusal()
+    else {
+        return None;
+    };
+    match reader {
+        TeardownReaderRefusal::BackupOnlyHeld => Some(("backup_only_held", BACKUP_ONLY_HELD)),
+        TeardownReaderRefusal::BackupOnlyUnplaced => {
+            Some(("backup_only_unplaced", BACKUP_ONLY_UNPLACED))
+        }
+        TeardownReaderRefusal::CatalogUnavailable => {
+            Some(("offload_record_unavailable", OFFLOAD_RECORD_UNAVAILABLE))
+        }
+        TeardownReaderRefusal::RecoveryUnavailable | TeardownReaderRefusal::RecoveryHeld => None,
+    }
+}
+
+fn reason(outcome: &OwnedTeardownOutcome) -> &'static str {
+    if let Some((reason, _)) = coverage_refusal(outcome) {
+        return reason;
+    }
+    match outcome.refusal() {
         Some(TeardownRunRefusal::UnsupportedPlatform) => "platform_unavailable",
         Some(TeardownRunRefusal::UnsupportedDestination) => "destination_unavailable",
         Some(TeardownRunRefusal::Root(_)) => "journal_unavailable",
@@ -85,10 +116,7 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
         OwnedTeardownOutcome::Held(_) => ("held", 1),
         OwnedTeardownOutcome::Unknown(_) => ("unknown", 1),
     };
-    let mut stdout = format!(
-        "teardown_status={status} reason={}\n",
-        reason(outcome.refusal())
-    );
+    let mut stdout = format!("teardown_status={status} reason={}\n", reason(outcome));
     if let Some(remote) = outcome.remote() {
         writeln!(stdout, "delete_attempts={} delete_confirmations={} abort_attempts={} abort_confirmations={} objects_empty={} uploads_empty={}",
             remote.delete_attempts(), remote.delete_confirmations(), remote.abort_attempts(),
@@ -128,6 +156,18 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
         String::new()
     } else if outcome.phase() == solstone_core_offload::teardown::TeardownRunPhase::Prelaunch {
         format!("{PRELAUNCH_HELD}\n")
+    } else if outcome.refused_before_effects() {
+        let message = if let Some((_, message)) = coverage_refusal(outcome) {
+            message
+        } else if matches!(
+            outcome.refusal(),
+            Some(TeardownRunRefusal::UnsupportedDestination)
+        ) {
+            DESTINATION_UNSUPPORTED
+        } else {
+            NOT_STARTED
+        };
+        format!("{message}\n")
     } else {
         "backup teardown did not finish. keep recovery files and review the recorded effects before retrying.\n".into()
     };
@@ -145,7 +185,7 @@ mod tests {
     use solstone_core_offload::teardown::TeardownRunPhase;
 
     #[test]
-    fn off_yes_retains_whole_prelaunch_result_without_root_or_tools() {
+    fn off_yes_retains_whole_unstarted_result_without_root_or_tools() {
         for args in [
             vec!["off".into(), "--yes".into()],
             vec![
@@ -162,25 +202,115 @@ mod tests {
                 panic!("whole teardown outcome required")
             };
             let native = owned.outcome();
-            assert_eq!(native.phase(), TeardownRunPhase::Prelaunch);
-            assert!(matches!(
-                native.refusal(),
-                Some(
-                    TeardownRunRefusal::NamespaceCooperationHeld
-                        | TeardownRunRefusal::UnsupportedPlatform
-                )
-            ));
+            if cfg!(target_os = "linux") {
+                assert_eq!(native.phase(), TeardownRunPhase::Admission);
+                assert!(matches!(
+                    native.refusal(),
+                    Some(TeardownRunRefusal::Root(_))
+                ));
+                assert!(!native.remote().unwrap().broker_attempted());
+                assert!(run.output().0.contains("reason=journal_unavailable"));
+                assert!(run.output().1.contains(NOT_STARTED));
+            } else {
+                assert_eq!(native.phase(), TeardownRunPhase::Prelaunch);
+                assert!(matches!(
+                    native.refusal(),
+                    Some(TeardownRunRefusal::UnsupportedPlatform)
+                ));
+                assert!(native.remote().is_none());
+                assert!(run.output().1.contains(PRELAUNCH_HELD));
+            }
+            assert!(native.refused_before_effects());
             assert!(native.journal_root().is_none());
             assert!(native.teardown_lease().is_none());
-            assert!(native.remote().is_none());
             assert!(native.publication().is_none());
             assert!(native.retirement().is_none());
             assert!(!native.attempts().clear());
             assert!(!native.attempts().binding());
             assert!(!native.attempts().retirement());
             assert_ne!(run.output().2, 0);
-            assert!(run.output().1.contains(PRELAUNCH_HELD));
         }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_yes_names_backup_only_media_and_unsupported_destinations() {
+        use solstone_core_backup::{HostedBinding, save_hosted_binding};
+        use solstone_core_retention::archive_catalog::OffloadFile;
+        let journal = tempfile::tempdir().unwrap();
+        std::fs::create_dir(journal.path().join("config")).unwrap();
+        let config = journal.path().join("config/journal.json");
+        std::fs::write(&config, br#"{"backup":{"enabled":true,"mode":"operated"}}"#).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        save_hosted_binding(
+            journal.path(),
+            &HostedBinding {
+                broker_endpoint: format!("http://{}", listener.local_addr().unwrap()),
+                account_id: "account".into(),
+                instance_id: "instance".into(),
+                bucket: "bucket".into(),
+                prefix: "owner/".into(),
+                broker_token: "fixture-token".into(),
+            },
+        )
+        .unwrap();
+        solstone_core_offload::ledger::append_offload_event(
+            journal.path(),
+            "20260101",
+            "_default",
+            "010000_001",
+            "legacy-snapshot",
+            &[OffloadFile {
+                name: "clip.webm".into(),
+                bytes: 3,
+                sha256: "a".repeat(64),
+            }],
+            1,
+        )
+        .unwrap();
+        let args = vec!["off".into(), "--yes".into()];
+        let refuses = |reason: &str, message: &str| {
+            let before = std::fs::read(&config).unwrap();
+            let run = run_cli(&args, journal.path());
+            let (stdout, stderr, code) = run.output();
+            assert_eq!(code, 1);
+            assert!(stdout.contains(&format!("reason={reason}")), "{stdout}");
+            assert_eq!(stderr, format!("{message}\n"));
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            assert_eq!(std::fs::read(&config).unwrap(), before);
+        };
+        // The recording this historical media belongs to is not on this device.
+        refuses("backup_only_unplaced", BACKUP_ONLY_UNPLACED);
+        let segment = journal.path().join("chronicle/20260101/010000_001");
+        std::fs::create_dir_all(&segment).unwrap();
+        refuses("backup_only_held", BACKUP_ONLY_HELD);
+        // Offload was on, but its record is gone.
+        std::fs::remove_dir_all(journal.path().join("health/offload")).unwrap();
+        std::fs::write(
+            &config,
+            br#"{"backup":{"enabled":true,"mode":"operated","offload":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        refuses("offload_record_unavailable", OFFLOAD_RECORD_UNAVAILABLE);
+
+        std::fs::write(
+            &config,
+            br#"{"backup":{"enabled":true,"destination":{"repository":"s3:bucket/prefix","backend":"s3"}}}"#,
+        )
+        .unwrap();
+        let run = run_cli(&args, journal.path());
+        let (stdout, stderr, code) = run.output();
+        assert_eq!(code, 1);
+        assert!(
+            stdout.contains("reason=destination_unavailable"),
+            "{stdout}"
+        );
+        assert_eq!(stderr, format!("{DESTINATION_UNSUPPORTED}\n"));
     }
 
     #[test]

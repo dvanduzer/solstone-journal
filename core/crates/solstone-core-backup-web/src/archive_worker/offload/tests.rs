@@ -100,6 +100,19 @@ fn blocked(slot: &SharedOperationSlot, root: &Arc<JournalRoot>, clock: &super::s
     assert!(ActivityLease::try_acquire(Arc::clone(root)).is_err());
     assert!(TeardownLease::try_acquire(Arc::clone(root)).is_err());
 }
+fn released(slot: &SharedOperationSlot, root: &Arc<JournalRoot>, clock: &super::super::OwnedClock) {
+    assert!(!operation::is_busy(slot));
+    assert!(slot.lock().unwrap().archive.retained.is_empty());
+    assert!(
+        solstone_core_journal_io::activity_obligations::observe_obligations(root)
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    drop(ActivityLease::try_acquire(Arc::clone(root)).unwrap());
+    drop(TeardownLease::try_acquire(Arc::clone(root)).unwrap());
+    drop(begin_owned(slot, "offload", Arc::clone(root), Arc::clone(clock)).unwrap());
+}
 fn config(journal: &Path, floor: Option<u64>) {
     fs::create_dir_all(journal.join("config")).unwrap();
     fs::write(journal.join("config/journal.json"), serde_json::to_vec(&json!({"retention":{"empty_audio":"keep"},"backup":{"enabled":true,"mode":"byo","daily_key":"synthetic-readback-password","recovery_key":"0".repeat(64),"offload":{"enabled":true,"floor_bytes":floor,"budget_bytes":0},"destination":{"backend":"s3","repository":"s3:bucket/prefix","credentials":{"access_key_id":"synthetic-access","secret_access_key":"synthetic-secret"}}}})).unwrap()).unwrap();
@@ -203,7 +216,7 @@ fn seed_offer(
 }
 
 #[test]
-fn offload_preflight_and_ready_admission_refusals_keep_original_owners() {
+fn offload_preflight_and_ready_admission_refusals_release_without_effects() {
     for case in ["selected", "planner_floor", "ready_cancel"] {
         let dir = tempfile::tempdir().unwrap();
         config(
@@ -260,50 +273,20 @@ fn offload_preflight_and_ready_admission_refusals_keep_original_owners() {
         })
         .join()
         .unwrap();
-        blocked(&slot, &root, &clock);
-        let state = slot.lock().unwrap();
-        assert_eq!(state.archive.retained.len(), 1);
-        let retained = &state.archive.retained[0];
-        let guard = retained.custody().unwrap();
-        assert!(Arc::ptr_eq(guard.journal_root(), &root));
-        assert!(Arc::ptr_eq(guard.owned_clock(), &clock));
-        let ArchivePayload::Offload(owner) = retained.payload() else {
-            panic!(
-                "whole actual offload return: {:?}",
-                retained.terminal().report
-            )
-        };
-        assert!(owner.runtime().is_none());
+        let view = operation::current(&slot).unwrap();
+        assert!(operation::is_terminal(&view.phase), "{case}");
+        // Refused before any archive writer, copy or record: nothing is held.
+        released(&slot, &root, &clock);
+        let report = view.report.unwrap();
         match case {
-            "selected" => assert!(owner.selected_input_failure().is_some()),
-            "planner_floor" => assert!(owner.planned_input_failure().is_some()),
-            "ready_cancel" => {
-                let ready = owner
-                    .planned_ready()
-                    .expect("actual ready survives normal admission Err");
-                let failure = owner
-                    .admission_failure()
-                    .expect("whole actual admission failure");
-                assert_eq!(
-                    failure.error(),
-                    solstone_core_backup_runtime::ArchiveError::Cancelled
-                );
-                assert!(Arc::ptr_eq(ready.carrier(), failure.carrier().unwrap()));
-                assert!(Arc::ptr_eq(failure.journal_root(), &root));
-                assert!(Arc::ptr_eq(failure.owned_clock().unwrap(), &clock));
-                assert!(
-                    !failure.effects().broker_requested
-                        && !failure.effects().write_repository_requested
-                        && !failure.effects().read_repository_requested
-                );
-            }
+            "selected" | "planner_floor" => assert!(report.get("admission").is_none()),
+            "ready_cancel" => assert!(report.get("admission").is_some()),
             _ => unreachable!(),
         }
         if let Some(id) = id {
             let register = solstone_core_retention::review_context::load_at_root(&root).unwrap();
             assert!(!register.marks.contains_key(&id));
-            let groups = retained.terminal().report.as_ref().unwrap()["planning"]["reconciliation"]
-                ["groups"]
+            let groups = report["planning"]["reconciliation"]["groups"]
                 .as_array()
                 .unwrap();
             assert!(

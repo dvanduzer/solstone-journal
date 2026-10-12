@@ -38,9 +38,9 @@ use crate::restore::owned::read::RestoreRead;
 use crate::restore_prepared::PreparedRestore;
 use solstone_core_backup_runtime::engine::QualifiedArchiveRecoveryBinding;
 use solstone_core_retention::restore_intent::{
-    AttemptEffects, CurrentContent, Obligation, PublicationDecision, RecoveryDecision,
-    RegisterDecision, RepairHold, RestoreIntent, StageEvidence, content_observation,
-    inspect_recovery, selected_name,
+    AttemptEffects, CurrentContent, Obligation, PublicationDecision, RESTORE_DOWNLOAD_LEAF,
+    RecoveryDecision, RegisterDecision, RepairHold, RestoreIntent, StageEvidence,
+    content_observation, inspect_recovery, selected_name,
 };
 
 #[derive(Debug)]
@@ -179,7 +179,10 @@ enum StagingEvidence {
     Stage(OwnedMediaFailure<Option<MediaStage>>),
     Target(OwnedMediaFailure<MediaStage>),
     Unconsumed(MediaStage),
-    Readback(ReadbackFailure),
+    Readback {
+        failure: ReadbackFailure,
+        cleanup: Cleanup,
+    },
     Prepared(PreparedMedia),
     ReadyTarget(OwnedMediaTarget),
 }
@@ -503,7 +506,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 ));
             }
         };
-        let target = match stage.create_target() {
+        let target = match stage.create_named_target(OsStr::new(RESTORE_DOWNLOAD_LEAF)) {
             Ok(target) => target,
             Err(error) => {
                 return Err(fail(
@@ -525,12 +528,15 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
         } = owner;
         let media = match operation.read_exact(&exact, target) {
             Ok(media) => media,
-            Err(error) => {
+            Err(mut failure) => {
+                // Nothing was published from this unpublished copy. Its cleanup
+                // refuses unless the writer is known to have been reaped.
+                let cleanup = failure.cleanup();
                 return Err(Box::new(StagingFailure {
                     carrier,
                     destination,
-                    hold: Hold::Admission(error.to_string()),
-                    evidence: StagingEvidence::Readback(error),
+                    hold: Hold::Admission(failure.to_string()),
+                    evidence: StagingEvidence::Readback { failure, cleanup },
                 }));
             }
         };
@@ -539,7 +545,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             directory: observation.directory_identity,
             leaf: media.identity(),
             stage_name: observation.directory_name,
-            leaf_name: "payload".into(),
+            leaf_name: RESTORE_DOWNLOAD_LEAF.into(),
             boot_id: None,
         };
         let owner = Owner {

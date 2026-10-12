@@ -477,8 +477,11 @@ fn local_restore() -> (
 fn public_restore_preselection_uses_complete_unique_bound_catalog() {
     let (journal, deps, _, _) = local_restore();
     let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
-    assert_eq!(repository(&root, Some("20261009")).unwrap(), "a".repeat(64));
-    assert_eq!(repository(&root, None).unwrap(), "a".repeat(64));
+    assert_eq!(
+        repository(&root, Some("20261009")),
+        Ok(Some("a".repeat(64)))
+    );
+    assert_eq!(repository(&root, None), Ok(Some("a".repeat(64))));
     assert_eq!(
         repository(&root, Some("20261008")),
         Err("nothing_to_restore")
@@ -503,6 +506,82 @@ fn public_restore_preselection_uses_complete_unique_bound_catalog() {
     assert_eq!(repository(&root, None), Err("ledger_degraded"));
     assert!(start(&deps, None).is_err());
     assert!(!operation::is_busy(&deps.operations));
+}
+
+fn historical(journal: &std::path::Path, dir: &str) {
+    fs::create_dir_all(journal.join("chronicle/20261009").join(dir)).unwrap();
+    solstone_core_offload::append_offload_event(
+        journal,
+        "20261009",
+        "_default",
+        dir,
+        "legacy-snapshot",
+        &[solstone_core_retention::archive_catalog::OffloadFile {
+            name: "raw.webm".into(),
+            bytes: 8,
+            sha256: "e".repeat(64),
+        }],
+        1,
+    )
+    .unwrap();
+}
+
+#[test]
+fn historical_files_without_a_repository_never_refuse_the_whole_request() {
+    // Mixed: bound files name the repository; historical files ride the same read.
+    let (journal, deps, _, _) = local_restore();
+    historical(journal.path(), "130000_60_fixture");
+    let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+    assert_eq!(repository(&root, None), Ok(Some("a".repeat(64))));
+    assert_eq!(
+        repository(&root, Some("20261009")),
+        Ok(Some("a".repeat(64)))
+    );
+    // Historical only: the configured repository is observed at admission.
+    let only = crate::test_support::root("healthy");
+    historical(only.path(), "120000_60_fixture");
+    let only_root = Arc::new(JournalRoot::open(only.path()).unwrap());
+    assert_eq!(repository(&only_root, None), Ok(None));
+    assert_eq!(repository(&only_root, Some("20261009")), Ok(None));
+    assert_eq!(
+        repository(&only_root, Some("20261008")),
+        Err("nothing_to_restore")
+    );
+    let mut only_deps = crate::BackupWebDeps::new(only.path().to_path_buf());
+    only_deps.clock = deps.clock.clone();
+    only_deps.executable = only.path().join("missing-package/bin/solstone");
+    for (deps, journal) in [(&deps, journal.path()), (&only_deps, only.path())] {
+        let ledger = fs::read(journal.join("health/offload/20261009.jsonl")).unwrap();
+        let generation = start(deps, None).unwrap();
+        join_pending(&deps.operations);
+        assert!(
+            response(deps, Some(generation))
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        let state = deps.operations.lock().unwrap();
+        let view = &state.current.as_ref().unwrap().view;
+        assert_eq!(view.phase, "refused");
+        assert_eq!(view.reason_code.as_deref(), Some("restic_unavailable"));
+        assert_eq!(view.report.as_ref().unwrap()["scope"], "all");
+        drop(state);
+        assert!(!operation::is_busy(&deps.operations));
+        assert_eq!(
+            fs::read(journal.join("health/offload/20261009.jsonl")).unwrap(),
+            ledger
+        );
+        assert!(
+            !journal
+                .join("chronicle/20261009/120000_60_fixture/raw.webm")
+                .exists()
+        );
+        assert!(
+            !journal
+                .join("chronicle/20261009/130000_60_fixture/raw.webm")
+                .exists()
+        );
+    }
 }
 
 #[test]
@@ -531,7 +610,7 @@ fn pending_restore_preserves_original_input_and_matching_response_authority() {
             {
                 let mut state = deps.operations.lock().unwrap();
                 let input = state.archive.restore.input.as_ref().unwrap();
-                assert_eq!(input.repository, "a".repeat(64));
+                assert_eq!(input.repository, Some("a".repeat(64)));
                 assert!(input.day.is_none());
                 assert!(Arc::ptr_eq(&input.begin.ticket.0.clock, &deps.clock));
                 assert_eq!(input.begin.generation(), generation);

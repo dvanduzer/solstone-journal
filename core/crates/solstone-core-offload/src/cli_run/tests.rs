@@ -75,7 +75,7 @@ mod retained {
         let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
         PANIC_AT.with(|cut| cut.set(Some(CliUnwindPhase::Preparation)));
         let clock = Arc::new(CountClock(AtomicUsize::new(0)));
-        let run = run_cli_offload_qualified(temp.path(), clock.clone(), false);
+        let run = run_cli_offload(temp.path(), clock.clone(), false);
         assert_eq!(
             run.phase(),
             CliRunPhase::Unknown(CliUnwindPhase::Preparation)
@@ -97,7 +97,7 @@ mod retained {
 }
 
 #[test]
-fn production_refuses_before_root_clock_and_preparation() {
+fn missing_root_or_unsupported_platform_refuses_before_clock_and_preparation() {
     let clock = Arc::new(CountClock(AtomicUsize::new(0)));
     let run = run_cli_offload(
         Path::new("/does-not-exist/offload-cli"),
@@ -108,7 +108,7 @@ fn production_refuses_before_root_clock_and_preparation() {
     assert!(
         matches!(
             run.prelaunch_refusal(),
-            Some(CliPrelaunchRefusal::NamespaceCooperationHeld)
+            Some(CliPrelaunchRefusal::Root(_))
                 if cfg!(target_os = "linux")
         ) || matches!(
             run.prelaunch_refusal(),

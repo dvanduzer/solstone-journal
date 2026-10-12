@@ -24,6 +24,7 @@ pub mod queue_hold_store;
 pub use queue_hold_store::{
     HoldPlatform, TaskQueueHoldFinding, classify_task_queue_holds, current_boot_identity,
 };
+pub mod priority;
 pub mod request;
 pub mod schedule;
 #[cfg(any(unix, windows))]

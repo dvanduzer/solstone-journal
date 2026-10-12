@@ -251,6 +251,9 @@
         "failed": "media restore could not finish.",
         "insufficient_free_space": "this device needs more free space before restoring media.",
         "ledger_degraded": "some of the record of what's in your backup couldn't be read, so a restore can't be trusted to be complete. try again after the next backup runs.",
+        "legacy_read_failed": "the backup copy of media offloaded by an earlier version of your journal couldn't be read, so it wasn't restored.",
+        "legacy_review_held": "media offloaded by an earlier version of your journal couldn't be checked against your backup, so it wasn't restored.",
+        "legacy_verification_failed": "the backup copy of media offloaded by an earlier version of your journal didn't match its record, so it wasn't restored.",
         "locked": "media restore is waiting for backup maintenance to finish.",
         "missing_file_after_restore": "media restore finished, but a file was still missing.",
         "nothing_to_restore": "nothing to restore for that day.",
@@ -301,7 +304,11 @@
       "network_error": "the services portal couldn't be reached. check your connection, then try again.",
       "broker_unreachable": "encrypted backup couldn't be reached. check your connection, then try again.",
       "broker_error": "encrypted backup didn't return usable settings. try again shortly.",
-      "hosted_entitlement_inactive": "turn on encrypted backup in the services portal, then try again."
+      "hosted_entitlement_inactive": "turn on encrypted backup in the services portal, then try again.",
+      "backup_only_held": "your backup holds the only copy of some of your media, so no backup changes were made. restore everything first, then try again.",
+      "destination_unsupported": "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made.",
+      "backup_only_unplaced": "your backup holds the only copy of some older media that can't be matched to a recording on this device, so it can't be restored and no backup changes were made. if your journal was moved or copied, bring back its missing days, then try again.",
+      "offload_record_unavailable": "the record of what media offload moved into your backup is missing or can't be read, so no backup changes were made. if your journal was moved or copied, bring back its health folder, then try again."
     },
     "action_labels": {
       "finish_cleanup": "finish stopping backup",

@@ -109,7 +109,7 @@ fn reads<'a>(reads: impl Iterator<Item = ArchiveReadState<'a>>) -> Value {
         ArchiveReadState::Stage(stage) => json!({"state":"stage","retained_stage":stage.is_some()}),
         ArchiveReadState::Target(_) => json!({"state":"target"}),
         ArchiveReadState::Prepared { file, target_identity, media, cleanup } => json!({"state":"prepared","name":file.name,"bytes":file.bytes,"repository_id":file.repository_id,"snapshot_id":file.snapshot_id,"archive_path":file.archive_path,"identity":target_identity,"digest":media.digest(),"cleanup":cleanup}),
-        ArchiveReadState::Readback { file, target_identity, failure } => json!({"state":"readback","name":file.name,"bytes":file.bytes,"repository_id":file.repository_id,"snapshot_id":file.snapshot_id,"archive_path":file.archive_path,"identity":target_identity,"reason":failure.reason().to_string()}),
+        ArchiveReadState::Readback { file, target_identity, failure, cleanup } => json!({"state":"readback","name":file.name,"bytes":file.bytes,"repository_id":file.repository_id,"snapshot_id":file.snapshot_id,"archive_path":file.archive_path,"identity":target_identity,"reason":failure.reason().to_string(),"cleanup":cleanup}),
     }).collect::<Vec<_>>())
 }
 fn settled_reads(reads: &[ReviewedArchiveReadReport]) -> Value {
@@ -184,7 +184,6 @@ pub(crate) fn plan_settled(report: &SettledOffloadPlanReport) -> Value {
 fn groups(groups: &[OffloadReconciliationGroup]) -> Value {
     json!(groups.iter().map(|group| json!({"selection":group.selection().map(selection),"expected":group.expected(),"disposition":match group.disposition() {
         OffloadReconciliationDisposition::Unchanged => json!({"state":"unchanged"}),
-        OffloadReconciliationDisposition::Unbound => json!({"state":"unbound"}),
         OffloadReconciliationDisposition::Busy => json!({"state":"busy"}),
         OffloadReconciliationDisposition::Refused(error) => json!({"state":"refused","reason":offer_reason(error)}),
         OffloadReconciliationDisposition::WriteRefused(_) => json!({"state":"write_refused","detail_available":true}),

@@ -8,13 +8,14 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
 use solstone_core_backup::archive_readback::{
     ExactArchiveFile, OwnedReadOperation, OwnedSettledDirectRead, ReadOperation, ReadbackError,
-    ReadbackFailure,
+    ReadbackFailure, RefusedDirectRead,
 };
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity::ActivityLease;
@@ -24,6 +25,11 @@ use solstone_core_journal_io::media::{
 };
 
 use crate::marks::{Mark, MarkState, Register, RemovalClass, validate};
+
+/// The leaf of an approval or offer readback stage at the journal root, which
+/// holds only bytes read back from the backup. No other producer creates it,
+/// and with no extension it can never be an archived media name.
+pub(crate) const READBACK_DOWNLOAD_LEAF: &str = "readback-download";
 
 #[derive(Debug)]
 pub(crate) enum ArchiveApprovalError {
@@ -47,6 +53,7 @@ struct FailedRead {
     file: ExactArchiveFile,
     target_identity: MediaIdentity,
     failure: ReadbackFailure,
+    cleanup: Cleanup,
 }
 
 enum HeldResource {
@@ -84,6 +91,7 @@ impl<'a> Iterator for ArchiveReadStates<'a> {
                 file: &failed.file,
                 target_identity: &failed.target_identity,
                 failure: &failed.failure,
+                cleanup: failed.cleanup,
             },
         })
     }
@@ -267,6 +275,43 @@ impl OwnedArchiveApproval {
             ClosedApprovalRead::Read(_) => None,
             ClosedApprovalRead::Held(read) => Some(read.reason()),
         }
+    }
+    /// End a refused approval whose every stage is already removed and whose
+    /// read launched no child still unreaped. Nothing here grants removal.
+    pub(crate) fn release_refused(self) -> Result<RefusedDirectRead, Box<Self>> {
+        let removed = self.held.iter().all(|held| match held {
+            HeldResource::Stage(stage) => stage.is_none(),
+            HeldResource::Target(_) => false,
+            HeldResource::Prepared(read) => read.cleanup == Some(Cleanup::Complete),
+            HeldResource::Readback(read) => read.cleanup == Cleanup::Complete,
+        });
+        if !removed {
+            return Err(Box::new(self));
+        }
+        let Self {
+            read,
+            _carrier,
+            expected,
+            held,
+            reason,
+        } = self;
+        let released = match read {
+            ClosedApprovalRead::Read(read) => {
+                (*read).release_refused().map_err(ClosedApprovalRead::Read)
+            }
+            ClosedApprovalRead::Held(read) => read
+                .release_refused()
+                .map_err(|read| ClosedApprovalRead::Held(*read)),
+        };
+        released.map_err(|read| {
+            Box::new(Self {
+                read,
+                _carrier,
+                expected,
+                held,
+                reason,
+            })
+        })
     }
 }
 
@@ -492,8 +537,9 @@ fn selected_files(
 
 /// The parent owns real namespace cooperation and child/HTTP settlement before
 /// entering this composition. Only actual readback success permits explicit
-/// sequential disposal. This module never cleans a failed writer or retires a
-/// carrier, and both return variants keep the original admission and resources.
+/// sequential disposal. A failed read's stage is cleaned only once its writer
+/// was reaped. This module never retires a carrier, and both return variants
+/// keep the original admission and resources.
 enum ApprovalReadMut<'a, 'clock> {
     Generic(&'a mut ReadOperation<'clock>),
     Owned(&'a mut OwnedReadOperation),
@@ -542,7 +588,7 @@ fn fill_approval(
             resources.held.push(HeldResource::Stage(Some(stage)));
             return Err(reason);
         }
-        let target = match stage.create_target() {
+        let target = match stage.create_named_target(OsStr::new(READBACK_DOWNLOAD_LEAF)) {
             Ok(target) => target,
             Err(failure) => {
                 resources
@@ -558,14 +604,18 @@ fn fill_approval(
         let target_identity = target.identity();
         let media = match read.read_exact(&file, target) {
             Ok(media) => media,
-            Err(failure) => {
+            Err(mut failure) => {
                 let reason = ArchiveApprovalError::Readback(failure.reason());
+                // Nothing was published from this unpublished copy. Its cleanup
+                // refuses unless the writer is known to have been reaped.
+                let cleanup = failure.cleanup();
                 resources
                     .held
                     .push(HeldResource::Readback(Box::new(FailedRead {
                         file,
                         target_identity,
                         failure,
+                        cleanup,
                     })));
                 return Err(reason);
             }

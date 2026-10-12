@@ -15,7 +15,7 @@ use solstone_core_journal_io::media::{
 use solstone_core_journal_io::paths::{PathOrDay, Segment, iter_segments};
 use solstone_core_journal_io::{JournalRoot, LockOptions, check_record_identities};
 use solstone_core_retention::archive_catalog::{
-    ArchiveWitness, RestoreDisposition, SegmentCatalog, read_complete_catalog,
+    ArchiveWitness, LegacyRestoreBinding, RestoreDisposition, SegmentCatalog, read_complete_catalog,
 };
 use solstone_core_retention::mark_mutation::{
     BoundMutationOutcome, BoundMutationRefusal, RestoredMarkRefusal,
@@ -140,6 +140,8 @@ pub enum FileEvidence<'a> {
     NotAttempted,
     Staging(StagingFacts<'a>),
     Transaction(Box<TransactionFacts<'a>>),
+    /// A refused historical review whose probe or binding write is still owned.
+    LegacyReview(legacy::LegacyReviewFacts<'a>),
 }
 
 pub struct RestoreFileFacts<'a> {
@@ -159,6 +161,7 @@ enum FileOwner {
     None,
     Staging(Box<StagingFailure>),
     Transaction(Box<DetachedTransaction>),
+    Review(Box<legacy::ReviewRemnant>),
 }
 
 struct FileRecord {
@@ -201,6 +204,7 @@ pub struct RestoreExecution<R> {
     _operation: R,
     _binding: Option<QualifiedArchiveRecoveryBinding>,
     files: Vec<FileRecord>,
+    legacy: Vec<legacy::LegacyEvidence>,
 }
 
 pub type RestoreRunOutcome<'clock> = RestoreExecution<ReadOperation<'clock>>;
@@ -228,8 +232,14 @@ impl<R> RestoreExecution<R> {
                 FileOwner::Transaction(outcome) => {
                     FileEvidence::Transaction(Box::new(outcome.facts()))
                 }
+                FileOwner::Review(review) => FileEvidence::LegacyReview(review.facts()),
             },
         })
+    }
+
+    /// Historical bindings this execution confirmed in the ledger before reading.
+    pub fn legacy_bindings(&self) -> impl ExactSizeIterator<Item = &LegacyRestoreBinding> {
+        self.legacy.iter().map(|evidence| &evidence.binding)
     }
 }
 
@@ -255,6 +265,20 @@ pub fn restore_owned_bound_day(
 
 pub fn restore_owned_bound_all(operation: OwnedReadOperation, time: u64) -> OwnedRestoreRunOutcome {
     run(operation, None, "all", None, time)
+}
+
+/// Restores bound files, then reviews each historical manifest in the selection
+/// on the same read and approves exactly the candidate that review produced.
+pub fn restore_owned_day(
+    operation: OwnedReadOperation,
+    day: &str,
+    time: u64,
+) -> OwnedRestoreRunOutcome {
+    legacy::continue_with_legacy(run(operation, None, "day", Some(day), time), time)
+}
+
+pub fn restore_owned_all(operation: OwnedReadOperation, time: u64) -> OwnedRestoreRunOutcome {
+    legacy::continue_with_legacy(run(operation, None, "all", None, time), time)
 }
 
 /// Retains the actual original recovery owner through execution and consuming finish.
@@ -299,6 +323,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
             _operation: operation,
             _binding: binding,
             files: Vec::new(),
+            legacy: Vec::new(),
         };
     }
     let (mut report, mut files) = match select(operation.as_read().journal_root(), scope, day) {
@@ -309,6 +334,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
                 _operation: operation,
                 _binding: binding,
                 files: Vec::new(),
+                legacy: Vec::new(),
             };
         }
     };
@@ -318,6 +344,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
             _operation: operation,
             _binding: binding,
             files,
+            legacy: Vec::new(),
         };
     }
     let Some(largest) = bound_maximum(&mut files) else {
@@ -327,6 +354,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
             _operation: operation,
             _binding: binding,
             files,
+            legacy: Vec::new(),
         };
     };
     let required = metadata_allowance()
@@ -350,6 +378,7 @@ fn run<'clock, R: RestoreRead<'clock>>(
                 _operation: operation,
                 _binding: binding,
                 files,
+                legacy: Vec::new(),
             }
         }
     }
@@ -423,7 +452,8 @@ fn select(
     Ok((report, files))
 }
 
-fn discover(root: &Arc<JournalRoot>, day: &str) -> Result<Vec<Segment>, String> {
+/// Every segment of one day, refusing unrepresentable or duplicate identities.
+pub(crate) fn discover(root: &Arc<JournalRoot>, day: &str) -> Result<Vec<Segment>, String> {
     let directory = MediaDirectory::open(Arc::clone(root), &Path::new("chronicle").join(day))
         .map_err(|error| error.to_string())?;
     let segments = iter_segments(root.canonical_path(), PathOrDay::Day(day))
@@ -606,6 +636,7 @@ fn execute<'clock, R: RestoreRead<'clock>>(
         _operation: operation,
         _binding: binding,
         files,
+        legacy: Vec::new(),
     }
 }
 

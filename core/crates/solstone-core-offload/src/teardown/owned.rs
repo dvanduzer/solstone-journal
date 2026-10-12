@@ -46,7 +46,6 @@ pub enum TeardownRunPhase {
 }
 
 pub enum TeardownRunRefusal {
-    NamespaceCooperationHeld,
     UnsupportedPlatform,
     UnsupportedDestination,
     Root(JournalRootError),
@@ -329,6 +328,39 @@ impl OwnedTeardownOutcome {
             _ => None,
         }
     }
+    /// Held before any carrier reservation, remote request or local effect.
+    /// Dropping such an outcome only releases its admission; nothing needs recovery.
+    pub fn refused_before_effects(&self) -> bool {
+        use solstone_core_backup_runtime::teardown::owned::RemoteTeardownPhase;
+        let Self::Held(held) = self else {
+            return false;
+        };
+        let owner_unreserved = match held.owner.as_ref() {
+            None | Some(PhaseOwner::Admission(_)) => true,
+            Some(PhaseOwner::CarrierFailure(failure)) => {
+                failure.preparation().is_none()
+                    && failure.preparation_error().is_none()
+                    && failure.reservation_path().is_none()
+            }
+            Some(_) => false,
+        };
+        let remote_untouched = self.remote().is_none_or(|remote| {
+            remote.phase() == RemoteTeardownPhase::NotStarted && !remote.broker_attempted()
+        });
+        #[cfg(unix)]
+        let no_binding = held.outside.binding.is_none();
+        #[cfg(not(unix))]
+        let no_binding = true;
+        owner_unreserved
+            && remote_untouched
+            && no_binding
+            && held.outside.carrier.is_none()
+            && held.outside.publication.is_none()
+            && held.outside.retirement.is_none()
+            && !held.outside.attempts.clear
+            && !held.outside.attempts.binding
+            && !held.outside.attempts.retirement
+    }
     fn held(&self) -> Option<&HeldTeardown> {
         match self {
             Self::Held(held) | Self::Unknown(held) => Some(held),
@@ -365,8 +397,9 @@ fn unknown(
     }))
 }
 
-/// Production remains refused before root admission or WAN until the conductor's
-/// supported-writer cooperation inventory is accepted. No caller flag can lift it.
+/// Every journal writer that could change cataloged media takes the same exclusive
+/// activity lock this teardown holds, and the coverage reader runs again at each
+/// destructive boundary. Other platforms are refused before root admission or WAN.
 pub fn run_owned_teardown(
     journal: &Path,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -374,33 +407,20 @@ pub fn run_owned_teardown(
     version: &str,
 ) -> OwnedTeardownOutcome {
     let outside = Outside::new(clock, cancellation);
-    if !cfg!(target_os = "linux") {
-        return held(
+    #[cfg(target_os = "linux")]
+    {
+        execute(journal, outside, version)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (journal, version);
+        held(
             outside,
             None,
             TeardownRunPhase::Prelaunch,
             TeardownRunRefusal::UnsupportedPlatform,
-        );
+        )
     }
-    match production_cooperation() {
-        Err(refusal) => held(outside, None, TeardownRunPhase::Prelaunch, refusal),
-        #[cfg(target_os = "linux")]
-        Ok(()) => execute(journal, outside, version),
-        #[cfg(not(target_os = "linux"))]
-        Ok(()) => {
-            let _ = (journal, version);
-            held(
-                outside,
-                None,
-                TeardownRunPhase::Prelaunch,
-                TeardownRunRefusal::UnsupportedPlatform,
-            )
-        }
-    }
-}
-
-fn production_cooperation() -> Result<(), TeardownRunRefusal> {
-    Err(TeardownRunRefusal::NamespaceCooperationHeld)
 }
 
 #[cfg(target_os = "linux")]
@@ -446,19 +466,26 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
         }
     };
     outside.lease = Some(admitted.teardown_lease().clone());
-    if admitted.configuration().binding().is_none()
-        || admitted
-            .configuration()
-            .backup()
-            .get("mode")
-            .and_then(serde_json::Value::as_str)
-            != Some("operated")
+    if admitted
+        .configuration()
+        .backup()
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("operated")
     {
         return held(
             outside,
             Some(PhaseOwner::Admission(Box::new(admitted))),
             TeardownRunPhase::Admission,
             TeardownRunRefusal::UnsupportedDestination,
+        );
+    }
+    if admitted.configuration().binding().is_none() {
+        return held(
+            outside,
+            Some(PhaseOwner::Admission(Box::new(admitted))),
+            TeardownRunPhase::Admission,
+            TeardownRunRefusal::Binding,
         );
     }
     if let Err(refusal) = outside.remaining() {

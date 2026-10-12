@@ -217,6 +217,7 @@ fn request(
         day: day.map(str::to_owned),
         scheduler_name: scheduler_name.map(str::to_owned),
         queue_if_active_cmd_differs: false,
+        priority: None,
         daily_catchup_provenance: None,
     })
 }
@@ -456,7 +457,7 @@ fn ac13_distinct_queued_commands_start_in_submission_order() {
 }
 
 #[test]
-fn ac14_pre_ready_identical_requests_deterministically_make_two_runs() {
+fn ac14_pre_ready_identical_requests_coalesce_before_selection() {
     let bed = Bed::new("ac14");
     let sink = Arc::new(QueueCollector::default());
     let queue = queue(
@@ -472,9 +473,9 @@ fn ac14_pre_ready_identical_requests_deterministically_make_two_runs() {
     }
     assert_eq!(queue.collect_queue_counts().get("pending"), Some(&4));
     queue.set_ready();
-    wait_for_history(&queue, 2);
-    wait_until(|| started_references(&sink).len() == 2 && stopped_references(&sink).len() == 4);
-    assert_eq!(started_references(&sink).len(), 2);
+    wait_for_history(&queue, 1);
+    wait_until(|| started_references(&sink).len() == 1 && stopped_references(&sink).len() == 4);
+    assert_eq!(started_references(&sink).len(), 1);
     assert_eq!(stopped_references(&sink).len(), 4);
 }
 

@@ -89,6 +89,8 @@ mod unix {
             TeardownReaderRefusal::CatalogUnavailable,
             TeardownReaderRefusal::RecoveryUnavailable,
             TeardownReaderRefusal::RecoveryHeld,
+            TeardownReaderRefusal::BackupOnlyHeld,
+            TeardownReaderRefusal::BackupOnlyUnplaced,
         ] {
             let mut calls = 0;
             assert_eq!(

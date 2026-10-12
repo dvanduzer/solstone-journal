@@ -592,6 +592,210 @@ pub(crate) fn retire_recovered(
     receipt
 }
 
+/// Retire empty root reservations left by owners that no longer exist, such as
+/// after a crash or restart. Call only with a freshly acquired lease, before
+/// creating anything: holding it excludes every cooperating owner, but only on
+/// local storage, so other filesystems retire nothing. Any restore intent holds
+/// every reservation, since an interrupted restore may name one. Removal is
+/// rmdir, so a reservation holding anything stays an unresolved obligation.
+pub fn retire_orphan_root_carriers(activity: &Arc<ActivityLease>) -> usize {
+    let mut retired = 0;
+    // A refusal or error retires nothing further; the caller's census decides.
+    #[cfg(target_os = "linux")]
+    retire_orphans(activity, &mut retired).unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let _ = activity;
+    retired
+}
+
+#[cfg(target_os = "linux")]
+fn retire_orphans(activity: &Arc<ActivityLease>, retired: &mut usize) -> io::Result<()> {
+    use crate::activity_obligations::{NativeObligation, observe_obligations};
+    use crate::journal_root::JournalEntryKind;
+
+    activity
+        .revalidate()
+        .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+    if !exclusive_local_activity(activity)? {
+        return Ok(());
+    }
+    let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
+    let census = observe_obligations(activity.journal_root()).map_err(io::Error::other)?;
+    let entries = census.entries();
+    if entries
+        .iter()
+        .any(|entry| matches!(entry, NativeObligation::Intent { .. }))
+    {
+        return Ok(());
+    }
+    for obligation in entries {
+        let NativeObligation::Stage { relative, entry } = obligation else {
+            continue;
+        };
+        if relative != Path::new(&entry.name) || entry.kind != JournalEntryKind::Directory {
+            continue;
+        }
+        activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        let removed = root
+            .inner
+            .open_child(&entry.name)
+            .and_then(|child| match child {
+                Some(child) if child.identity() == entry.identity => {
+                    platform::remove_directory(&root.inner, &entry.name, &child).map(|()| true)
+                }
+                _ => Ok(false),
+            });
+        if matches!(removed, Ok(true)) {
+            *retired += 1;
+        }
+    }
+    if *retired > 0 {
+        root.sync()?;
+    }
+    Ok(())
+}
+
+/// Whether holding this lease excludes every writer of its journal: Linux, on
+/// local storage only. Elsewhere nothing an ended owner left may be retired.
+pub fn exclusive_local_activity(activity: &Arc<ActivityLease>) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
+        Ok(local_storage(
+            nix::sys::statfs::fstatfs(&root.inner)?.filesystem_type(),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = activity;
+        Ok(false)
+    }
+}
+
+/// Remove one recorded stage whose owner ended: `name` under `parent`, holding
+/// nothing but `leaf_name` with exactly the recorded identity. Its caller must
+/// know that nothing was published from it. Returns false when it is already
+/// absent; anything unexpected refuses and leaves the stage in place.
+pub fn retire_recorded_stage(
+    activity: &Arc<ActivityLease>,
+    parent: &Arc<MediaDirectory>,
+    name: &OsStr,
+    directory: MediaIdentity,
+    leaf_name: &OsStr,
+    leaf: MediaIdentity,
+) -> io::Result<bool> {
+    retire_stage(activity, parent, name, directory, leaf_name, Some(leaf))
+}
+
+/// Remove one stage nothing records, which is empty or holds exactly one
+/// regular file named `leaf_name`: the observed file, then the directory. Its
+/// caller must know that name is made only by a producer whose unpublished
+/// copies are disposable. Anything else refuses.
+pub fn retire_unrecorded_stage(
+    activity: &Arc<ActivityLease>,
+    parent: &Arc<MediaDirectory>,
+    name: &OsStr,
+    directory: MediaIdentity,
+    leaf_name: &OsStr,
+) -> io::Result<bool> {
+    retire_stage(activity, parent, name, directory, leaf_name, None)
+}
+
+fn retire_stage(
+    activity: &Arc<ActivityLease>,
+    parent: &Arc<MediaDirectory>,
+    name: &OsStr,
+    directory: MediaIdentity,
+    leaf_name: &OsStr,
+    recorded: Option<MediaIdentity>,
+) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        plain_name(name)?;
+        plain_name(leaf_name)?;
+        if !crate::activity_obligations::is_stage_namespace_name(name)
+            || !Arc::ptr_eq(parent.inner.journal_root(), activity.journal_root())
+        {
+            return Err(invalid("not a stage of this journal"));
+        }
+        if !exclusive_local_activity(activity)? {
+            return Err(shared_storage());
+        }
+        let Some(stage) = parent.inner.open_child(name)? else {
+            return Ok(false);
+        };
+        if stage.identity() != directory {
+            return Err(changed());
+        }
+        let entries = platform::entries(&stage, 2)?.ok_or_else(changed)?;
+        match (entries.as_slice(), recorded) {
+            // An empty directory holds no data.
+            ([], _) => {}
+            ([entry], _)
+                if entry.name == leaf_name
+                    && recorded.is_none_or(|leaf| entry.identity == leaf)
+                    && entry.kind == crate::journal_root::JournalEntryKind::RegularFile =>
+            {
+                let leaf = entry.identity;
+                activity
+                    .revalidate()
+                    .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+                let file = platform::open_plain(&stage, leaf_name)?.ok_or_else(changed)?;
+                if platform::identity(&file)? != leaf {
+                    return Err(changed());
+                }
+                platform::check_leaf(&stage, leaf_name, leaf)?;
+                platform::remove_leaf(&stage, leaf_name, &file)?;
+            }
+            _ => return Err(changed()),
+        }
+        activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        platform::remove_directory(&parent.inner, name, &stage)?;
+        parent.sync()?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (activity, parent, name, directory, leaf_name, recorded);
+        Err(shared_storage())
+    }
+}
+
+pub(super) fn shared_storage() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the activity lease does not exclude every writer here",
+    )
+}
+
+/// Filesystems where this host's lock excludes every writer. Anything else,
+/// including network, FUSE and virtual-machine shares, is refused.
+#[cfg(target_os = "linux")]
+fn local_storage(kind: nix::sys::statfs::FsType) -> bool {
+    use nix::sys::statfs::{
+        BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, F2FS_SUPER_MAGIC, FsType, OVERLAYFS_SUPER_MAGIC,
+        TMPFS_MAGIC, XFS_SUPER_MAGIC,
+    };
+    const ZFS_SUPER_MAGIC: FsType = FsType(0x2fc1_2fc1);
+    [
+        EXT4_SUPER_MAGIC,
+        XFS_SUPER_MAGIC,
+        BTRFS_SUPER_MAGIC,
+        F2FS_SUPER_MAGIC,
+        ZFS_SUPER_MAGIC,
+        TMPFS_MAGIC,
+        OVERLAYFS_SUPER_MAGIC,
+    ]
+    .contains(&kind)
+}
+
 /// Keeps the original capability and lease even after a known removal.
 #[must_use = "Handle retirement facts and retained ownership independently"]
 pub struct ActivityCarrierRetirement<T> {
@@ -601,3 +805,31 @@ pub struct ActivityCarrierRetirement<T> {
 
 #[cfg(all(test, feature = "full-tests"))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod storage_tests {
+    use nix::sys::statfs::{
+        EXT4_SUPER_MAGIC, FUSE_SUPER_MAGIC, FsType, NFS_SUPER_MAGIC, SMB_SUPER_MAGIC, TMPFS_MAGIC,
+        XFS_SUPER_MAGIC,
+    };
+
+    #[test]
+    fn shared_and_network_filesystems_refuse_orphan_retirement() {
+        for local in [EXT4_SUPER_MAGIC, XFS_SUPER_MAGIC, TMPFS_MAGIC] {
+            assert!(super::local_storage(local));
+        }
+        // CIFS, SMB2, 9p, Ceph and an unknown type; virtiofs reports FUSE.
+        for shared in [
+            NFS_SUPER_MAGIC,
+            SMB_SUPER_MAGIC,
+            FUSE_SUPER_MAGIC,
+            FsType(0xff53_4d42),
+            FsType(0xfe53_4d42),
+            FsType(0x0102_1997),
+            FsType(0x00c3_6400),
+            FsType(0x1234_5678),
+        ] {
+            assert!(!super::local_storage(shared));
+        }
+    }
+}

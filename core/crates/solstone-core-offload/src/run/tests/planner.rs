@@ -149,6 +149,43 @@ fn owning_planner_partial_credit_preserves_whole_existing_mark_capture() {
 }
 
 #[test]
+fn owning_planner_withdraws_legacy_unbound_mark_and_offers_its_files_again() {
+    let mut fixture = CurrentFixture::new(SegmentLayout::Direct);
+    // An offload mark from before archive offers: same files, no offer, version 1.
+    let mut legacy = fixture.marks[0].clone();
+    legacy.offload = None;
+    fixture.marks = vec![legacy.clone()];
+    fixture.save(&fixture.marks);
+    fixture.change_config(|config| config["backup"]["offload"]["budget_bytes"] = json!(16));
+    let media =
+        ["first.webm", "second.webm"].map(|name| fs::read(fixture.segment.join(name)).unwrap());
+    let clock = TestClock { now: CURRENT_NOW };
+    let operation = prepare(&fixture, &clock);
+    let runner = runner();
+    let services = services(&runner, &Http, &clock, &Maintenance);
+    let result = create_planned_offload_offers(operation, &services, at());
+    let report = result.planning().unwrap();
+    let reconciled = report
+        .reconciliation()
+        .unwrap()
+        .as_ref()
+        .unwrap_or_else(|failure| panic!("{:?}", failure.reason()));
+    assert!(reconciled.register().marks.is_empty());
+    assert_eq!(reconciled.register().version, 1);
+    // The withdrawn row earned no credit, so its files are offered afresh,
+    // as a new archive offer rather than an in-place replacement.
+    let observed = result.observed().unwrap();
+    assert_eq!(observed.groups().len(), 1);
+    let group = &observed.groups()[0];
+    assert_eq!(group.selection().target, legacy.target);
+    assert_eq!(group.selection().names, legacy.proposal.names);
+    assert_eq!(group.expected_mark(), None);
+    for (name, bytes) in ["first.webm", "second.webm"].iter().zip(&media) {
+        assert_eq!(&fs::read(fixture.segment.join(name)).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn owning_planner_reconciles_kept_empty_before_unset_budget() {
     let mut fixture = CurrentFixture::new(SegmentLayout::Direct);
     let directory = fixture.journal.path().join("chronicle/20260101/030000_001");

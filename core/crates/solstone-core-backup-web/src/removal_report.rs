@@ -223,13 +223,13 @@ impl Serialize for SettledOrdinaryView<'_> {
             #[serde(flatten)]
             common: Common<'a>,
             finish_refusal: Option<Value>,
-            retirement: Value,
+            retirement: Option<Value>,
         }
         let report = self.0;
         View {
             common: Common {
                 outcome: report.outcome(),
-                refusal: None,
+                refusal: report.refusal().map(refusal_facts),
                 attempts: report
                     .attempts()
                     .iter()
@@ -239,7 +239,7 @@ impl Serialize for SettledOrdinaryView<'_> {
                 mutation: report.mutation().map(mutation_facts),
             },
             finish_refusal: None,
-            retirement: retirement_facts(report.retirement()),
+            retirement: report.retirement().map(retirement_facts),
         }
         .serialize(serializer)
     }
@@ -265,9 +265,14 @@ fn read_facts(read: ArchiveReadState<'_>) -> Value {
         ArchiveReadState::Prepared { file, cleanup, .. } => json!({
             "state":"prepared", "name":file.name, "bytes":file.bytes, "cleanup":cleanup,
         }),
-        ArchiveReadState::Readback { file, failure, .. } => json!({
+        ArchiveReadState::Readback {
+            file,
+            failure,
+            cleanup,
+            ..
+        } => json!({
             "state":"readback", "name":file.name, "bytes":file.bytes,
-            "reason":failure.reason().to_string(),
+            "reason":failure.reason().to_string(), "cleanup":cleanup,
         }),
     }
 }

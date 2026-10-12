@@ -98,6 +98,10 @@ impl ArchivePredecessorCustody {
     pub(super) fn creator_executor(&self) -> bool {
         !matches!(self.state, CreatorState::Unknown)
     }
+    /// This creator never submitted an archive writer, and owes no earlier one.
+    pub(super) fn unwritten(&self) -> bool {
+        self.creator_executor() && self.pending == 0 && self.capture.archives.is_empty()
+    }
     #[cfg(unix)]
     pub(super) fn validate_input(&self, input: &ReadAdmission<'_>) -> Result<(), ReadbackError> {
         if !self.creator_executor() {

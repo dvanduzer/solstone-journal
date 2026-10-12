@@ -1433,6 +1433,15 @@ fn offload_restore_failure_reason(reason: &str) -> String {
         "ledger_degraded" => {
             "the record of what was offloaded is damaged and can't be used to restore".into()
         }
+        "legacy_read_failed" => "the backup copy of media offloaded by an earlier version of \
+             your journal couldn't be read, so it wasn't restored"
+            .into(),
+        "legacy_review_held" => "media offloaded by an earlier version of your journal couldn't \
+             be checked against your backup, so it wasn't restored"
+            .into(),
+        "legacy_verification_failed" => "the backup copy of media offloaded by an earlier \
+             version of your journal didn't match its record, so it wasn't restored"
+            .into(),
         "locked" => {
             "the backup at the destination is locked, usually by a run that's still going or one \
              that was interrupted"
@@ -2077,6 +2086,9 @@ mod tests {
             "failed",
             "insufficient_free_space",
             "ledger_degraded",
+            "legacy_read_failed",
+            "legacy_review_held",
+            "legacy_verification_failed",
             "locked",
             "missing_file_after_restore",
             "nothing_to_restore",
@@ -2090,6 +2102,10 @@ mod tests {
             "timeout",
             "verification_failed",
         ];
+        assert_eq!(
+            EVERY_REASON,
+            solstone_core_offload::restore::OFFLOAD_RESTORE_REASONS
+        );
         for reason in EVERY_REASON {
             let rendered = offload_restore_failure_reason(reason);
             assert_ne!(rendered, *reason, "{reason} reaches the owner verbatim");

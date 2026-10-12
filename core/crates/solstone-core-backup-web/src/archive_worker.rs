@@ -25,11 +25,17 @@ use solstone_core_backup::archive_admission::{ArchiveBudget, ArchiveCancellation
 use solstone_core_backup::archive_readback::{OwnedDirectReadHold, OwnedReadOperation};
 use solstone_core_backup_runtime::{
     DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
-    OwnedDirectReadFinish, UreqHttpTransport, admit_prepared_archive_owned_read_installed,
+    OwnedDirectReadFinish, UreqHttpTransport, admit_prepared_archive_owned_current_read_installed,
+    admit_prepared_archive_owned_read_installed,
 };
+use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_offload::restore::owned::{OwnedRestoreFinishHold, SettledRestoreReport};
-use solstone_core_retention::remove_marked::{OwnedReviewedArchiveRemoval, ReviewedArchiveReport};
+use solstone_core_retention::remove_marked::recover_interrupted_removals;
+use solstone_core_retention::remove_marked::{
+    OwnedReviewedArchiveRemoval, OwnedReviewedRemoval, ReviewedArchiveReport, ReviewedRemovalReport,
+};
+use solstone_core_retention::restore_intent::recover_abandoned_restores;
 
 use crate::archive_operation::ArchiveBeginRefusal;
 use crate::operation::{self, SharedOperationSlot, Terminal};
@@ -174,6 +180,14 @@ pub enum ArchivePayload {
         runtime: OwnedDirectReadFinish,
         report: Option<SettledRestoreReport>,
     },
+    /// Every owner ended with nothing outstanding. Never retained.
+    Released,
+    /// A local policy release keeping its original activity and effects.
+    OrdinaryHeld(Box<OwnedReviewedRemoval>),
+    /// A local policy release whose own activity carrier was retired.
+    OrdinarySettled(Box<ReviewedRemovalReport>),
+    /// A local policy release that unwound; its effects are not known.
+    OrdinaryUnknown,
 }
 
 impl ArchivePayload {
@@ -183,8 +197,63 @@ impl ArchivePayload {
                 .runtime()
                 .is_some_and(|runtime| runtime.state() == DirectReadFinishState::Completed);
         }
-        matches!(self, Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
+        matches!(self, Self::OrdinarySettled(_))
+            || matches!(self, Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
             if runtime.state() == DirectReadFinishState::Completed)
+    }
+
+    /// End every owner of a return that provably leaves nothing outstanding: no
+    /// live child, no stage of its own, nothing published or pending. Anything
+    /// uncertain comes back whole. This never reports success.
+    fn release(self) -> Result<(), Self> {
+        match self {
+            Self::Released | Self::BeginHeld(_) => Ok(()),
+            Self::Prepared(owner) => {
+                owner.release_unused();
+                Ok(())
+            }
+            Self::PreparationFailure(failure) => {
+                failure.release();
+                Ok(())
+            }
+            Self::AdmissionFailure(failure) => failure
+                .release()
+                .map_err(|failure| Self::AdmissionFailure(*failure)),
+            Self::ReadHeld { read, outside } => match (*read).release_unused() {
+                Ok(()) => {
+                    outside.release_unused();
+                    Ok(())
+                }
+                Err(read) => Err(Self::ReadHeld { read, outside }),
+            },
+            Self::NativeHeld { native, outside } => match (*native).release_refused() {
+                Ok((read, _report)) => {
+                    drop(outside.finish_refused(read));
+                    Ok(())
+                }
+                Err(native) => Err(Self::NativeHeld { native, outside }),
+            },
+            Self::ProofHeld { proof, outside } => match (*proof).release_refused() {
+                Ok((read, _report)) => {
+                    drop(outside.finish_refused(read));
+                    Ok(())
+                }
+                Err(proof) => Err(Self::ProofHeld { proof, outside }),
+            },
+            Self::NativeFinished { runtime, .. } | Self::ProofFinished { runtime, .. }
+                if runtime.released() =>
+            {
+                Ok(())
+            }
+            Self::Offload(owner) => (*owner).release().map_err(Self::Offload),
+            // A settled local release completes through handoff, which frees
+            // the slot once and records its success; a held or unknown local
+            // release keeps its owner parked.
+            local @ (Self::OrdinarySettled(_) | Self::OrdinaryHeld(_) | Self::OrdinaryUnknown) => {
+                Err(local)
+            }
+            other => Err(other),
+        }
     }
 
     fn matches(
@@ -199,7 +268,14 @@ impl ArchivePayload {
             return false;
         }
         let (root, clock) = match self {
+            Self::Released => return true,
             Self::Offload(owner) => return owner.matches(reservation, custody),
+            // Local releases never take archive preparation custody.
+            Self::OrdinaryHeld(owner) => {
+                return custody.is_none()
+                    && std::ptr::eq(owner.removal().journal_root(), &*reservation.root);
+            }
+            Self::OrdinarySettled(_) | Self::OrdinaryUnknown => return custody.is_none(),
             Self::BeginHeld(owner) => (&owner.ticket.0.root, Some(&owner.ticket.0.clock)),
             Self::EarlyUnknown
             | Self::NativeFinishUnknown { .. }
@@ -401,33 +477,41 @@ pub fn handoff(
             Some(_) => None,
         }
     };
+    if matches!(returned.payload, ArchivePayload::Released) {
+        discharge_released(&mut state, &returned);
+        return Ok(());
+    }
     if let Some(reason) = reason {
         returned.reason = Some(reason);
         return Err(returned);
     }
     if returned.payload.completed() {
-        let Some(custody) = returned.custody.as_ref() else {
-            returned.reason = Some(ArchiveHandoffRefusal::CustodyMissing);
-            return Err(returned);
-        };
-        let runtime = match &returned.payload {
-            ArchivePayload::Offload(owner) => {
-                owner.runtime().expect("actual completed offload runtime")
+        // A settled local release confirmed retirement of its own carrier
+        // before returning; only archive owners carry runtime custody.
+        if !matches!(returned.payload, ArchivePayload::OrdinarySettled(_)) {
+            let Some(custody) = returned.custody.as_ref() else {
+                returned.reason = Some(ArchiveHandoffRefusal::CustodyMissing);
+                return Err(returned);
+            };
+            let runtime = match &returned.payload {
+                ArchivePayload::Offload(owner) => {
+                    owner.runtime().expect("actual completed offload runtime")
+                }
+                ArchivePayload::NativeFinished { runtime, .. }
+                | ArchivePayload::ProofFinished { runtime, .. } => runtime,
+                _ => unreachable!("only actual finished owners can complete"),
+            };
+            if !runtime.retirement().is_some_and(|retirement| {
+                std::ptr::eq(custody.activity(), retirement.owned.activity().as_ref())
+            }) {
+                returned.reason = Some(ArchiveHandoffRefusal::OwnerChanged);
+                return Err(returned);
             }
-            ArchivePayload::NativeFinished { runtime, .. }
-            | ArchivePayload::ProofFinished { runtime, .. } => runtime,
-            _ => unreachable!("only actual finished owners can complete"),
-        };
-        if !runtime.retirement().is_some_and(|retirement| {
-            std::ptr::eq(custody.activity(), retirement.owned.activity().as_ref())
-        }) {
-            returned.reason = Some(ArchiveHandoffRefusal::OwnerChanged);
-            return Err(returned);
-        }
-        if let Err(error) = custody.revalidate() {
-            returned.reason = Some(ArchiveHandoffRefusal::BindingChanged);
-            returned.binding_error = Some(error);
-            return Err(returned);
+            if let Err(error) = custody.revalidate() {
+                returned.reason = Some(ArchiveHandoffRefusal::BindingChanged);
+                returned.binding_error = Some(error);
+                return Err(returned);
+            }
         }
         let current = state.current.as_mut().expect("checked current");
         current.worker_active = false;
@@ -450,12 +534,41 @@ pub fn handoff(
     Ok(())
 }
 
+/// A released return owns nothing, so it is never retained. Its own reservation
+/// ends; a still-current view takes its refused or failed terminal.
+fn discharge_released(state: &mut operation::OperationState, returned: &RejectedArchiveReturn) {
+    if !state.archive.matches(&returned.ticket) {
+        return;
+    }
+    state.archive.reservation = None;
+    if let Some(current) = state.current.as_mut()
+        && current.generation == returned.generation()
+        && current.handoff_poll.is_none()
+        && current.pending_handoff_terminal.is_none()
+        && (current.worker_active || !operation::is_terminal(&current.view.phase))
+    {
+        current.worker_active = false;
+        operation::apply_terminal(current, returned.terminal.clone());
+        if state.archive.approval.generation == Some(returned.generation()) {
+            state.archive.approval.discharge(&returned.terminal);
+        }
+    }
+}
+
 /// Retention alone may recover a poisoned mutex. It never applies success.
 pub fn park_rejected(slot: &SharedOperationSlot, rejected: Box<RejectedArchiveReturn>) {
     let (mut state, poisoned) = match slot.lock() {
         Ok(state) => (state, false),
         Err(poison) => (poison.into_inner(), true),
     };
+    if matches!(rejected.payload, ArchivePayload::Released) {
+        if !poisoned {
+            discharge_released(&mut state, &rejected);
+        } else if state.archive.matches(&rejected.ticket) {
+            state.archive.reservation = None;
+        }
+        return;
+    }
     if !poisoned
         && rejected.reason == Some(ArchiveHandoffRefusal::BindingChanged)
         && state.archive.matches(&rejected.ticket)
@@ -558,8 +671,19 @@ pub(super) fn return_owned(
     ticket: ArchiveTicket,
     custody: Option<ArchivePreparationCustody>,
     payload: ArchivePayload,
-    terminal: Terminal,
+    mut terminal: Terminal,
 ) {
+    // Release while the original lease custody still excludes a successor.
+    let payload = match payload.release() {
+        Ok(()) => {
+            if terminal.phase == "done" {
+                terminal.phase = "error".into();
+                terminal.reason_code = Some("failed".into());
+            }
+            ArchivePayload::Released
+        }
+        Err(payload) => payload,
+    };
     if let Err(rejected) = handoff(slot, ticket, custody, payload, terminal) {
         park_rejected(slot, rejected);
     }
@@ -581,6 +705,17 @@ pub fn prepare_read(
     repository_id: String,
     restic_path: &Path,
 ) -> Option<PreparedArchiveWorker> {
+    prepare_read_in(slot, begin, Some(repository_id), restic_path)
+}
+
+/// Without an expected identity, the read binds to the configured repository
+/// as observed at admission.
+pub(crate) fn prepare_read_in(
+    slot: &SharedOperationSlot,
+    begin: OwnedArchiveBegin,
+    repository_id: Option<String>,
+    restic_path: &Path,
+) -> Option<PreparedArchiveWorker> {
     if !start_owned_worker(slot, &begin.ticket) {
         let ticket = ArchiveTicket(Arc::clone(&begin.ticket.0));
         return_owned(
@@ -593,6 +728,11 @@ pub fn prepare_read(
         return None;
     }
     let (ticket, root, budget, clock) = begin.into_parts();
+    // A removal or restore interrupted by a crash would refuse this admission.
+    if let Ok(activity) = ActivityLease::try_acquire(Arc::clone(&root)) {
+        recover_interrupted_removals(&activity);
+        recover_abandoned_restores(&activity);
+    }
     let (input, custody) = match OwnedArchivePreparationInput::capture(root, budget, clock) {
         Ok(pair) => pair,
         Err(failure) => {
@@ -620,13 +760,21 @@ pub fn prepare_read(
             ArchivePayload::PreparationFailure(Box::new(failure))
         })?;
         phase = "admission";
-        admit_prepared_archive_owned_read_installed(
-            prepared,
-            repository_id,
-            restic_path,
-            env!("CARGO_PKG_VERSION"),
-            &UreqHttpTransport,
-        )
+        match repository_id {
+            Some(repository_id) => admit_prepared_archive_owned_read_installed(
+                prepared,
+                repository_id,
+                restic_path,
+                env!("CARGO_PKG_VERSION"),
+                &UreqHttpTransport,
+            ),
+            None => admit_prepared_archive_owned_current_read_installed(
+                prepared,
+                restic_path,
+                env!("CARGO_PKG_VERSION"),
+                &UreqHttpTransport,
+            ),
+        }
         .map_err(|failure| {
             terminal.report = Some(
                 json!({"admission":{"state":"refused","reason":failure.error().to_string(),

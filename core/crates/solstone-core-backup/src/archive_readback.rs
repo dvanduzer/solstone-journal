@@ -271,6 +271,16 @@ impl DirectExecution {
     fn fail(&mut self, reason: ReadbackError) {
         self.failure.get_or_insert(reason);
     }
+    /// Every child this read launched was reaped and no archive writer was ever
+    /// submitted. This is not readback success.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn quiescent(&self) -> bool {
+        self.pending == 0
+            && self
+                .predecessor
+                .as_ref()
+                .is_none_or(ArchivePredecessorCustody::unwritten)
+    }
     #[cfg(unix)]
     fn attempt(&mut self) {
         if let Some(next) = self.pending.checked_add(1) {
@@ -279,13 +289,22 @@ impl DirectExecution {
             self.fail(ReadbackError::ToolFailed);
         }
     }
+    /// The bounded runner returned only after killing the group and reaping the
+    /// root, whatever its exit status. Failed or unknown runs stay pending.
+    #[cfg(unix)]
+    fn reaped(&mut self) {
+        if let Some(next) = self.pending.checked_sub(1) {
+            self.pending = next;
+        } else {
+            self.fail(ReadbackError::ToolFailed);
+        }
+    }
     #[cfg(unix)]
     fn accept(&mut self, kind: DirectInvocation, child: CompletedChild) {
-        if !child.successful() || self.pending == 0 {
+        if !child.successful() {
             self.fail(ReadbackError::ToolFailed);
             return;
         }
-        self.pending -= 1;
         let index = kind as usize;
         if let Some(next) = self.completed[index].checked_add(1) {
             self.completed[index] = next;
@@ -412,7 +431,92 @@ impl OwnedDirectReadHold {
     pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
         self.operation.owned_clock()
     }
+
+    /// End a refused read once every child it launched was reaped and the
+    /// pinned tool is unchanged. The caller must already have removed every
+    /// stage it created. This releases the activity, never the carrier.
+    pub fn release_refused(self) -> Result<RefusedDirectRead, Box<Self>> {
+        if self.qualify_release().is_err() {
+            return Err(Box::new(self));
+        }
+        let Self {
+            operation,
+            _root: root,
+            _execution: execution,
+            ..
+        } = self;
+        let OwnedPreparedArchiveHold {
+            activity, clock, ..
+        } = operation;
+        drop(activity);
+        Ok(RefusedDirectRead {
+            reason: execution.failure.unwrap_or(ReadbackError::ToolFailed),
+            root,
+            clock,
+            _execution: execution,
+        })
+    }
+
+    /// End a refused read with no outside finish owner, under the same
+    /// conditions as `release_refused`. Its unshared carrier retires.
+    pub fn release_unused(self) -> Result<(), Box<Self>> {
+        if self.qualify_release().is_err() {
+            return Err(Box::new(self));
+        }
+        self.operation.release_unused();
+        Ok(())
+    }
+
+    fn qualify_release(&self) -> Result<(), ReadbackError> {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            pinned_member(&self._member)?;
+            revalidate_member(&self._member)?;
+            if !self._execution.quiescent() {
+                return Err(ReadbackError::ToolFailed);
+            }
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            Err(ReadbackError::Unsupported)
+        }
+    }
 }
+
+/// A refused read whose activity has ended. It never qualifies readback; only
+/// the outside finish owner may retire the empty carrier it leaves.
+#[must_use]
+pub struct RefusedDirectRead {
+    reason: ReadbackError,
+    root: Arc<JournalRoot>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    _execution: DirectExecution,
+}
+impl RefusedDirectRead {
+    pub fn reason(&self) -> ReadbackError {
+        self.reason
+    }
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+
+    /// A released read for finish-owner tests that cannot run an installed tool.
+    #[cfg(feature = "full-tests")]
+    #[doc(hidden)]
+    pub fn for_test(root: Arc<JournalRoot>, clock: Arc<dyn Clock + Send + Sync>) -> Self {
+        Self {
+            reason: ReadbackError::ToolFailed,
+            root,
+            clock,
+            _execution: DirectExecution::default(),
+        }
+    }
+}
+
 #[must_use]
 pub struct OwnedHeldDirectRead {
     reason: ReadbackError,
@@ -427,6 +531,12 @@ impl OwnedHeldDirectRead {
     }
     pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
         self.read.owned_clock()
+    }
+    pub fn release_refused(self) -> Result<RefusedDirectRead, Box<Self>> {
+        let Self { reason, read } = self;
+        (*read)
+            .release_refused()
+            .map_err(|read| Box::new(Self { reason, read }))
     }
 }
 
@@ -464,6 +574,30 @@ impl OwnedReadbackAdmissionError {
         match &self.owned {
             ClosedAdmissionOwner::Input(input) => input.operation.owned_clock(),
             ClosedAdmissionOwner::Admitted(read) => read.owned_clock(),
+        }
+    }
+    /// End a refused admission that leaves nothing running: unlaunched input,
+    /// or an admitted read whose every child was reaped. A retained earlier
+    /// archive of unknown outcome always holds.
+    pub fn release(self) -> Result<(), Box<Self>> {
+        let Self { reason, owned } = self;
+        match owned {
+            ClosedAdmissionOwner::Input(input)
+                if input
+                    ._predecessor
+                    .as_ref()
+                    .is_none_or(ArchivePredecessorCustody::unwritten) =>
+            {
+                input.operation.release_unused();
+                Ok(())
+            }
+            ClosedAdmissionOwner::Admitted(read) => (*read).release_unused().map_err(|read| {
+                Box::new(Self {
+                    reason,
+                    owned: ClosedAdmissionOwner::Admitted(read),
+                })
+            }),
+            owned => Err(Box::new(Self { reason, owned })),
         }
     }
 }
@@ -1037,12 +1171,7 @@ impl<'a> ReadOperation<'a> {
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            if self.member.bytes() != 30_924_962
-                || self.member.sha256()
-                    != "ae7fe58ab3511f830fd31d157158620b209522ff1332b119199d2e938d72338c"
-            {
-                return Err(ReadbackError::UnsupportedToolVersion);
-            }
+            pinned_member(&self.member)?;
             let execution = self.execution.borrow();
             if let Some(predecessor) = &execution.predecessor {
                 predecessor.qualify_settlement()?;
@@ -1243,18 +1372,20 @@ impl<'a> ReadOperation<'a> {
         revalidate_member(&self.member)
     }
 
+    /// A failure reports whether nothing of the run is still alive.
     #[cfg(unix)]
     fn run_child(
         &self,
         request: &Request<'_>,
         capture_limit: usize,
-    ) -> Result<CompletedChild, ReadbackError> {
+    ) -> Result<CompletedChild, (ReadbackError, bool)> {
         let creator = self
             .execution
             .borrow()
             .predecessor
             .as_ref()
             .is_some_and(ArchivePredecessorCustody::creator_executor);
+        self.execution.borrow_mut().attempt();
         let completed = if creator {
             bounded_child::run_owned_archive_creator(
                 request,
@@ -1268,12 +1399,22 @@ impl<'a> ReadOperation<'a> {
                 self.operation.budget().cancellation(),
             )
         };
-        completed.map_err(|_| self.execution_error())
+        match completed {
+            Ok(completed) => {
+                self.execution.borrow_mut().reaped();
+                Ok(completed)
+            }
+            Err(failure) => {
+                if failure.settled() {
+                    self.execution.borrow_mut().reaped();
+                }
+                Err((self.execution_error(), failure.settled()))
+            }
+        }
     }
 
     #[cfg(unix)]
     fn query(&self, argv: Vec<std::ffi::OsString>) -> Result<CompletedChild, ReadbackError> {
-        self.execution.borrow_mut().attempt();
         self.query_inner(argv)
             .inspect_err(|reason| self.execution.borrow_mut().fail(*reason))
     }
@@ -1285,16 +1426,18 @@ impl<'a> ReadOperation<'a> {
             .budget()
             .remaining(self.operation.clock())?
             .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
-        let output = self.run_child(
-            &Request {
-                program: self.member.path().as_os_str().to_owned(),
-                argv,
-                env: self.env.clone(),
-                timeout: Some(timeout),
-                pass_fds: vec![],
-            },
-            MAX_QUERY_BYTES,
-        )?;
+        let output = self
+            .run_child(
+                &Request {
+                    program: self.member.path().as_os_str().to_owned(),
+                    argv,
+                    env: self.env.clone(),
+                    timeout: Some(timeout),
+                    pass_fds: vec![],
+                },
+                MAX_QUERY_BYTES,
+            )
+            .map_err(|(reason, _)| reason)?;
         self.revalidate_local()?;
         if !output.successful() {
             return Err(ReadbackError::ToolFailed);
@@ -1587,18 +1730,29 @@ impl<'a> ReadOperation<'a> {
                     pass_fds: vec![transport.descriptor],
                 };
                 writer = WriterState::Unknown;
-                self.execution.borrow_mut().attempt();
-                let completed = self.run_child(&request, MAX_QUERY_BYTES)?;
-                self.operation.budget().remaining(self.operation.clock())?;
-                if !completed.successful() {
-                    return Err(ReadbackError::ToolFailed);
-                }
+                let completed = match self.run_child(&request, MAX_QUERY_BYTES) {
+                    Ok(completed) => completed,
+                    Err((reason, settled)) => {
+                        // A cancelled or refused run that was reaped, or never
+                        // spawned, leaves no writer either.
+                        if settled && self.member.revalidate().is_ok() {
+                            writer = WriterState::QualifiedCompletion;
+                        }
+                        return Err(reason);
+                    }
+                };
                 self.member
                     .revalidate()
                     .map_err(|_| ReadbackError::ToolChanged)?;
                 // Qualification is restricted to this admitted direct restic
                 // profile; killpg alone does not prove descendant cessation.
+                // The runner returns only after reaping the root, so this holds
+                // for a failed or timed-out dump as for a successful one.
                 writer = WriterState::QualifiedCompletion;
+                self.operation.budget().remaining(self.operation.clock())?;
+                if !completed.successful() {
+                    return Err(ReadbackError::ToolFailed);
+                }
                 self.check_repository()?;
                 self.revalidate_local()?;
                 Ok(completed)
@@ -1648,6 +1802,16 @@ impl<'a> ReadOperation<'a> {
 #[cfg(unix)]
 fn revalidate_member(member: &CurrentInstalledMember) -> Result<(), ReadbackError> {
     member.revalidate().map_err(|_| ReadbackError::ToolChanged)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn pinned_member(member: &CurrentInstalledMember) -> Result<(), ReadbackError> {
+    if member.bytes() != 30_924_962
+        || member.sha256() != "ae7fe58ab3511f830fd31d157158620b209522ff1332b119199d2e938d72338c"
+    {
+        return Err(ReadbackError::UnsupportedToolVersion);
+    }
+    Ok(())
 }
 
 #[cfg(any(unix, test))]
@@ -1765,6 +1929,63 @@ mod tests {
             state.qualify_read_state(),
             Err(ReadbackError::Admission(AdmissionError::Cancelled))
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn refused_release_requires_every_launched_child_reaped_and_never_qualifies() {
+        let mut state = DirectExecution::default();
+        assert!(state.quiescent());
+        state.attempt();
+        assert!(!state.quiescent());
+        // A reaped child releases whatever its exit status; it never qualifies.
+        state.reaped();
+        state.fail(ReadbackError::ToolFailed);
+        assert!(state.quiescent());
+        assert_eq!(state.qualify_read_state(), Err(ReadbackError::ToolFailed));
+        // A run that errored (cancel, kill or reap failure) stays pending.
+        state.attempt();
+        state.fail(ReadbackError::Admission(AdmissionError::Cancelled));
+        assert!(!state.quiescent());
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn reaped_writer_failure_removes_its_unpublished_copy_and_unknown_keeps_it() {
+        use solstone_core_journal_io::media::{MediaDirectory, MediaStage};
+        let temp = tempfile::tempdir().unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let activity = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+        let carrier = Arc::new(RootActivityCarrier::prepare(Arc::clone(&activity)).unwrap());
+        let parent = MediaDirectory::open(Arc::clone(&root), std::path::Path::new("")).unwrap();
+        let issued = || {
+            let stage = MediaStage::create(Arc::clone(&parent), Arc::clone(&activity)).unwrap();
+            let path = stage.diagnostic_path();
+            let mut target = stage.create_target().unwrap();
+            let transport = target.helper_transport().unwrap();
+            std::fs::write(&transport.target, b"partial archive bytes").unwrap();
+            (path, target)
+        };
+        for writer in [WriterState::QualifiedCompletion, WriterState::Unknown] {
+            let (stage, target) = issued();
+            let mut failure = ReadbackFailure::target(
+                ReadbackError::ToolFailed,
+                writer,
+                target,
+                Arc::clone(&carrier),
+            );
+            if matches!(writer, WriterState::QualifiedCompletion) {
+                assert_eq!(failure.cleanup(), Cleanup::Complete);
+                assert!(!stage.exists());
+            } else {
+                assert_eq!(failure.cleanup(), Cleanup::Refused);
+                assert_eq!(
+                    std::fs::read(stage.join("payload")).unwrap(),
+                    b"partial archive bytes"
+                );
+            }
+        }
+        assert!(carrier.diagnostic_path().is_dir());
     }
 
     // Reduced output captured from restic 0.19.0 with a two-file local
