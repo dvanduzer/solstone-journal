@@ -55,9 +55,6 @@
     .field-group input:not([type="checkbox"]):not([type="radio"]):disabled { background: var(--cream); color: var(--ink-faint-paper); }
     .field-status { display: block; font-size: 0.8rem; min-height: 1.2em; margin-top: 0.25rem; }
     p.field-status { margin-bottom: 0; }
-    .status-saved { color: var(--success-ink); }
-    .status-error { color: var(--danger); }
-    .status-fade { opacity: 0; transition: opacity 0.3s; }
     .error-message {
       margin-top: 0.75rem;
       padding: 0.75rem 0.9rem;
@@ -526,25 +523,6 @@
       loadLocalCapability();
     });
 
-    function showFieldStatus(el, type, message) {
-      const group = el.closest('.field-group');
-      if (!group) return;
-      const small = group.querySelector('.field-status');
-      if (!small) return;
-      small.classList.remove('status-saved', 'status-error', 'status-fade');
-      if (type === 'saved') {
-        small.textContent = message || 'saved';
-        small.classList.add('status-saved');
-        setTimeout(() => {
-          small.classList.add('status-fade');
-          setTimeout(() => { small.textContent = '\u00a0'; small.classList.remove('status-saved', 'status-fade'); }, 300);
-        }, 1500);
-      } else {
-        small.textContent = message || 'error';
-        small.classList.add('status-error');
-      }
-    }
-
     let detectedTimezone = '';
     const RESULT_DISPLAY_MS = 1200;
 
@@ -585,14 +563,6 @@
 
     document.addEventListener('DOMContentLoaded', () => {
       detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-
-      ['name', 'preferred'].forEach(field => {
-        document.getElementById(field).addEventListener('blur', function() {
-          const value = this.value.trim();
-          if (!value) return;
-          showFieldStatus(this, 'saved');
-        });
-      });
 
       const deferProvider = document.getElementById('provider-skip');
 

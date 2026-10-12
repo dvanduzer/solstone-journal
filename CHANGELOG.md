@@ -19,6 +19,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - on a large journal, 2.0.42 could keep one processor core busy for as long as your journal ran while it checked your recorded days for unfinished thinking. the larger your journal, the longer each check took, and a new one started a minute after the last. your journal now rests between checks, so checking takes a small share of one core. health also no longer calls the check incomplete because of import records saved by earlier versions, or a long web page in your journal.
 - 2.0.42 set aside redoing the thinking an earlier version did for many recordings, and never went back to it. your journal now redoes that thinking in the background with your other older work, after newer work, and health no longer lists those recordings as set aside.
 - the first-run setup page said it couldn't check whether this computer can run local thinking, and let you choose local on a computer where the install then stopped. it now checks, and says so when local thinking won't run here.
+- the first-run setup page said your name was "saved" as soon as you left the field. it is saved when you finish setup, and the page no longer says otherwise.
 
 ## [2.0.42] - 2026-10-12
 
