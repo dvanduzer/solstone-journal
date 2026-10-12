@@ -168,12 +168,20 @@ pub fn start(
         ..Default::default()
     };
     let slot = Arc::clone(&deps.operations);
-    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+    #[cfg(all(
+        test,
+        feature = "full-tests",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     let control = tests::take_dispatch();
     // Keep the input in this same mutex through thread creation. The spawned
     // closure cannot take it until its real JoinHandle is installed here.
     match operation::spawn_thread(move || {
-        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        #[cfg(all(
+            test,
+            feature = "full-tests",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         tests::install_dispatch(control);
         run_pending(&slot, &ticket);
     }) {
@@ -228,7 +236,11 @@ fn retain_unused(slot: &SharedOperationSlot, input: ApprovalInput, refusal: Unus
 }
 
 fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
-    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+    #[cfg(all(
+        test,
+        feature = "full-tests",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     tests::before_pending();
     let input = {
         let mut state = match slot.lock() {
@@ -282,7 +294,11 @@ fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
         if input.repository.is_none() {
             return Ok(None);
         }
-        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        #[cfg(all(
+            test,
+            feature = "full-tests",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         tests::before_resolver();
         resolve_restic_member(&input.executable)
             .map(Some)
@@ -531,7 +547,11 @@ fn locked_response(
 ) -> Result<Response, ApprovalStatusRefusal> {
     let snapshot = snapshot(state, generation)?;
     let serialized = catch_unwind(AssertUnwindSafe(|| {
-        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        #[cfg(all(
+            test,
+            feature = "full-tests",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         tests::before_response();
         Json(&snapshot).into_response()
     }))
@@ -603,7 +623,11 @@ pub fn remove(
             serde_json::to_value(removal_report::owned_archive(&proof))
                 .expect("borrowed removal facts serialize"),
         );
-        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        #[cfg(all(
+            test,
+            feature = "full-tests",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         tests::after_actor(&proof);
         match proof.finish() {
             OwnedReviewedArchiveFinish::Held(proof) => {
@@ -671,7 +695,11 @@ pub fn remove(
             }
         }
         Ok(Ok(Actor::Settled(read, report))) => {
-            #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+            #[cfg(all(
+                test,
+                feature = "full-tests",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             tests::before_finish(slot);
             // Keep the genuine settled report and original custody outside
             // consuming Runtime finish; an unwind cannot certify retirement.
@@ -680,7 +708,11 @@ pub fn remove(
                     if let Some(view) = terminal.report.as_mut() {
                         view["runtime"] = runtime_facts(&runtime);
                     }
-                    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+                    #[cfg(all(
+                        test,
+                        feature = "full-tests",
+                        any(target_os = "linux", target_os = "macos")
+                    ))]
                     tests::before_handoff(slot);
                     ArchivePayload::ProofFinished { report, runtime }
                 }
@@ -806,5 +838,5 @@ fn project(terminal: &mut Terminal, outcome: &Outcome, report: Value) {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod tests;

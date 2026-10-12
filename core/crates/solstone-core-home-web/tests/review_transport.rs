@@ -742,7 +742,7 @@ mod tests {
             }
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn public_approval_refuses_invalid_current_selection_before_admission() {
         for cut in [
@@ -842,7 +842,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn public_policy_only_approval_starts_and_settles_locally() {
         let root = journal();
