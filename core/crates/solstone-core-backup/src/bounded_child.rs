@@ -598,10 +598,12 @@ fn execute_tracked(
             inherit_in_child(&mut command, &request.pass_fds)?;
         }
     }
+    // Scrub every extra descriptor first, then allow only the passed ones.
     #[cfg(target_os = "macos")]
     match setup {
         ChildSetup::Dns(_) => prepare_dns_child(&mut command),
         ChildSetup::Creator | ChildSetup::Ordinary => {
+            prepare_dns_child(&mut command);
             inherit_in_child(&mut command, &request.pass_fds)?;
         }
     }
@@ -770,6 +772,32 @@ mod tests {
         assert_eq!(completed.output().stdout, b"done\n");
         // The parent's own descriptors are untouched.
         assert_eq!(fcntl(read.as_fd(), FcntlArg::F_GETFD).unwrap(), 0);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ordinary_child_sees_only_its_passed_descriptor() {
+        let (read, write) = pipe().unwrap();
+        for fd in [read.as_fd(), write.as_fd()] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        }
+        let probe = format!(
+            "[ -e /dev/fd/{} ] && echo leaked; [ -e /dev/fd/{} ] && echo passed; echo done",
+            read.as_raw_fd(),
+            write.as_raw_fd()
+        );
+        let request = Request {
+            program: "/bin/sh".into(),
+            argv: vec!["-c".into(), probe.into()],
+            env: BTreeMap::new(),
+            timeout: Some(Duration::from_secs(30)),
+            pass_fds: vec![write.as_fd()],
+        };
+        let completed = execute_request(&request, Some(4096), None, ChildSetup::Ordinary)
+            .map_err(ChildFailure::into_error)
+            .unwrap();
+        assert_eq!(completed.output().stdout, b"passed\ndone\n");
     }
 
     #[cfg(all(test, feature = "full-tests"))]

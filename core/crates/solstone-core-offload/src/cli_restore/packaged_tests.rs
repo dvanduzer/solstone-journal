@@ -173,6 +173,19 @@ fn residue(journal: &Path) -> Vec<String> {
     out
 }
 
+/// Live `restic dump` processes started by this harness's copied package.
+fn restic_dumps() -> Vec<String> {
+    let listing = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter(|line| line.contains("solstone-restic/restic") && line.contains(" dump "))
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
 #[test]
 #[ignore = "requires a copied package carrying this tree's CLI and a synthetic S3 fixture"]
 fn packaged_cli_restore_entry() {
@@ -192,12 +205,57 @@ fn packaged_cli_restore_entry() {
     let mut selection = vec![DAY.to_owned()];
     match input.mode.as_str() {
         "cli_day" => {}
-        "cli_all" => selection = vec!["--all".into()],
+        "cli_all" | "cli_killed" => selection = vec!["--all".into()],
         "cli_conflict" => fs::write(bound.join(&input.bound.name), b"different raw").unwrap(),
         "cli_busy" => held = Some(ActivityLease::try_acquire(Arc::clone(&root)).unwrap()),
         other => panic!("unknown CLI restore mode {other}"),
     }
     let marks = fs::read(input.journal.join("health/retention-marks.json")).unwrap();
+    if input.mode == "cli_killed" {
+        // A crash mid-download: the command dies while its restic child, in its own
+        // process group, keeps writing. The next run must recover and finish.
+        let mut first = Command::new(&input.cli)
+            .args(["backup", "offload", "restore", "--all", "--json"])
+            .env_clear()
+            .env("HOME", input.journal.parent().unwrap())
+            .env("SOLSTONE_JOURNAL", &input.journal)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Kill only once restic is actually writing the file: partly downloaded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut partial = None;
+        while std::time::Instant::now() < deadline && partial.is_none() {
+            partial = residue(&input.journal)
+                .iter()
+                .filter(|entry| entry.ends_with("restore-download"))
+                .filter_map(|entry| fs::metadata(input.journal.join(entry)).ok())
+                .map(|metadata| metadata.len())
+                .find(|bytes| *bytes > 0 && *bytes < input.bound.bytes);
+            if first.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let partial = partial.expect("the first restore never partly wrote its download");
+        first.kill().unwrap();
+        first.wait().unwrap();
+        let orphans = restic_dumps();
+        // Linux ends restic with its parent; macOS has no parent-death signal.
+        if cfg!(target_os = "linux") {
+            assert!(
+                orphans.is_empty(),
+                "restic outlived its parent on Linux: {orphans:?}"
+            );
+        } else {
+            assert!(!orphans.is_empty(), "no restic outlived the killed command");
+        }
+        println!(
+            "CLI_RESTORE_KILLED {}",
+            json!({"partial_bytes": partial, "orphans": orphans, "residue_after_kill": residue(&input.journal)})
+        );
+    }
     let output = Command::new(&input.cli)
         .args(["backup", "offload", "restore"])
         .args(&selection)
@@ -231,7 +289,7 @@ fn packaged_cli_restore_entry() {
     assert!(!stderr.contains('_'), "{stderr}");
     let restored = |fixture: &Fixture| json!({"bytes":fixture.bytes, "sha256":fixture.sha256});
     match input.mode.as_str() {
-        "cli_day" | "cli_all" => {
+        "cli_day" | "cli_all" | "cli_killed" => {
             assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
             assert_eq!(report["status"], "ok");
             assert_eq!(report["settlement"], "settled");
@@ -247,6 +305,23 @@ fn packaged_cli_restore_entry() {
                     .iter()
                     .all(|segment| segment.active.is_empty())
             );
+            if input.mode == "cli_killed" {
+                // Published files keep their bytes after every orphan has exited.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+                while !restic_dumps().is_empty() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "orphaned restic never exited"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                assert_eq!(file(&bound.join(&input.bound.name)), restored(&input.bound));
+                assert_eq!(
+                    file(&historical.join(&input.historical.name)),
+                    restored(&input.historical)
+                );
+                println!("CLI_RESTORE_ORPHANS_EXITED");
+            }
             // A second run finds nothing left to restore.
             let again = Command::new(&input.cli)
                 .args(["backup", "offload", "restore", "--all", "--json"])

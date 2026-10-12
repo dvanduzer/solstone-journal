@@ -258,7 +258,7 @@ enum DirectInvocation {
     Dump,
 }
 impl DirectExecution {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
     fn qualify_read_state(&self) -> Result<(), ReadbackError> {
         if let Some(reason) = self.failure {
             return Err(reason);
@@ -273,7 +273,7 @@ impl DirectExecution {
     }
     /// Every child this read launched was reaped and no archive writer was ever
     /// submitted. This is not readback success.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
     fn quiescent(&self) -> bool {
         self.pending == 0
             && self
@@ -468,7 +468,7 @@ impl OwnedDirectReadHold {
     }
 
     fn qualify_release(&self) -> Result<(), ReadbackError> {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
         {
             pinned_member(&self._member)?;
             revalidate_member(&self._member)?;
@@ -477,7 +477,7 @@ impl OwnedDirectReadHold {
             }
             Ok(())
         }
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -1169,7 +1169,7 @@ impl<'a> ReadOperation<'a> {
         if self.operation.owned_clock().is_none() {
             return Err(ReadbackError::Unsupported);
         }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
         {
             pinned_member(&self.member)?;
             let execution = self.execution.borrow();
@@ -1178,7 +1178,7 @@ impl<'a> ReadOperation<'a> {
             }
             execution.qualify_read_state()
         }
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -1812,6 +1812,14 @@ fn pinned_member(member: &CurrentInstalledMember) -> Result<(), ReadbackError> {
         return Err(ReadbackError::UnsupportedToolVersion);
     }
     Ok(())
+}
+
+/// Signing rewrites the macOS restic's bytes every release, so there is no byte
+/// pin there: the member is the signed package's own manifest record, revalidated
+/// around every use, and it reported the supported version at admission.
+#[cfg(target_os = "macos")]
+fn pinned_member(member: &CurrentInstalledMember) -> Result<(), ReadbackError> {
+    revalidate_member(member)
 }
 
 #[cfg(any(unix, test))]

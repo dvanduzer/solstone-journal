@@ -599,18 +599,18 @@ pub(crate) fn retire_recovered(
 /// every reservation, since an interrupted restore may name one. Removal is
 /// rmdir, so a reservation holding anything stays an unresolved obligation.
 pub fn retire_orphan_root_carriers(activity: &Arc<ActivityLease>) -> usize {
-    // Only the Linux retirement below mutates the count.
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    // Only the local-storage retirement below mutates the count.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
     let mut retired = 0;
     // A refusal or error retires nothing further; the caller's census decides.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     retire_orphans(activity, &mut retired).unwrap_or_default();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = activity;
     retired
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn retire_orphans(activity: &Arc<ActivityLease>, retired: &mut usize) -> io::Result<()> {
     use crate::activity_obligations::{NativeObligation, observe_obligations};
     use crate::journal_root::JournalEntryKind;
@@ -672,7 +672,25 @@ pub fn exclusive_local_activity(activity: &Arc<ActivityLease>) -> io::Result<boo
             nix::sys::statfs::fstatfs(&root.inner)?.filesystem_type(),
         ))
     }
-    #[cfg(not(target_os = "linux"))]
+    // APFS and HFS+ are the local macOS filesystems; network and FUSE mounts
+    // (smbfs, nfs, afpfs, webdav, macfuse) can hold another host's writers.
+    #[cfg(target_os = "macos")]
+    {
+        activity
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        // A synced folder is APFS here, but another Mac may write it too.
+        let canonical = activity.journal_root().canonical_path().to_string_lossy();
+        if canonical.contains("/Library/CloudStorage/")
+            || canonical.contains("/Library/Mobile Documents/")
+        {
+            return Ok(false);
+        }
+        let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
+        let stat = nix::sys::statfs::fstatfs(&root.inner)?;
+        Ok(matches!(stat.filesystem_type_name(), "apfs" | "hfs"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = activity;
         Ok(false)
@@ -716,7 +734,7 @@ fn retire_stage(
     leaf_name: &OsStr,
     recorded: Option<MediaIdentity>,
 ) -> io::Result<bool> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         plain_name(name)?;
         plain_name(leaf_name)?;
@@ -763,7 +781,7 @@ fn retire_stage(
         parent.sync()?;
         Ok(true)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (activity, parent, name, directory, leaf_name, recorded);
         Err(shared_storage())

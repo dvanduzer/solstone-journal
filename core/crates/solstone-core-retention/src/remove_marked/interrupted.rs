@@ -26,19 +26,19 @@ pub struct InterruptedRemoval {
 /// before creating anything: holding it proves no live owner, and only on
 /// local storage, so elsewhere nothing is done. Other stages are untouched.
 pub fn recover_interrupted_removals(activity: &Arc<ActivityLease>) -> Vec<InterruptedRemoval> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        linux::recover(activity)
+        local::recover(activity)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = activity;
         Vec::new()
     }
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod local {
     use std::path::Path;
 
     use solstone_core_journal_io::activity_obligations::{NativeObligation, observe_obligations};
@@ -105,6 +105,10 @@ mod linux {
     }
 }
 
-#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[cfg(all(
+    test,
+    feature = "full-tests",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[path = "../../tests/support/interrupted_removal.rs"]
 mod tests;

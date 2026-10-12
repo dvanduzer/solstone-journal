@@ -2314,7 +2314,7 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
             assert_eq!(status, 200);
             assert_eq!(teardown["operation"]["kind"], "teardown");
             let refused = wait_terminal(&deps).await;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 assert_eq!(refused["operation"]["phase"], "error");
                 assert_eq!(refused["operation"]["reason_code"], "backup_only_held");
@@ -2327,7 +2327,7 @@ async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_
                 );
                 assert_eq!(report["remote"]["broker_attempted"], false);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 assert_eq!(refused["operation"]["phase"], "refused");
                 assert_eq!(refused["operation"]["report"]["phase"], "prelaunch");
@@ -2625,7 +2625,7 @@ mod held_restore_tests {
                     post_json(&deps, "/app/backup/offload/restore", Some(request)).await;
                 // Historical files without a recorded repository are reviewed
                 // inside the same admitted restore, so neither kind refuses early.
-                if cfg!(target_os = "linux") {
+                if cfg!(any(target_os = "linux", target_os = "macos")) {
                     assert_eq!(status, 200);
                     let terminal = wait_terminal(&deps).await;
                     assert_eq!(terminal["operation"]["kind"], "offload_restore");
@@ -2666,7 +2666,7 @@ mod held_restore_tests {
                 assert_eq!(status, 400);
                 assert_eq!(
                     value["reason_code"],
-                    if cfg!(target_os = "linux") {
+                    if cfg!(any(target_os = "linux", target_os = "macos")) {
                         reason
                     } else {
                         "restore_held"

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use solstone_core_journal_io::activity::ActivityLease;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::RestoreIntent;
 
 /// Why an interrupted restore stays an unresolved obligation.
@@ -56,19 +56,19 @@ pub struct AbandonedRestore {
 /// freshly acquired lease, before creating anything: holding it proves no live
 /// owner, and only on local storage, so elsewhere nothing is done.
 pub fn recover_abandoned_restores(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        linux::recover(activity)
+        local::recover(activity)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = activity;
         Vec::new()
     }
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod local {
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
     use std::path::{Component, Path, PathBuf};
@@ -319,7 +319,11 @@ mod linux {
     }
 }
 
-#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[cfg(all(
+    test,
+    feature = "full-tests",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[allow(
     clippy::unwrap_used,
     clippy::panic,
