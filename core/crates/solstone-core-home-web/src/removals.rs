@@ -116,12 +116,12 @@ pub async fn approve(
         Err((status, state)) => return uncached(request_response(status, state)),
     };
     let count = context.marks().len();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (deps, clock);
         uncached(write_response(count, refused_before_start()))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let Some(Extension(deps)) = deps else {
             return uncached(write_response(count, refused_before_start()));
@@ -231,7 +231,7 @@ pub async fn cancel_approval(
 
 // Direct fixture entry for the same retained worker used by the public handler.
 #[cfg(all(test, feature = "full-tests"))]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn dispatch_approval(
     deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
@@ -244,7 +244,7 @@ fn dispatch_approval(
 }
 
 #[cfg(all(test, feature = "full-tests"))]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod approval_tests;
 
 pub async fn decline(

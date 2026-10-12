@@ -89,8 +89,8 @@
       "status_labels": {
         "last_backup": "latest backup attempt",
         "last_successful_backup": "last successful backup",
-        "backup_attempt_unknown": "the latest backup attempt isn't known on this computer.",
-        "backup_history_unknown": "the last successful backup isn't known on this computer.",
+        "backup_attempt_unknown": "the latest backup attempt isn't known.",
+        "backup_history_unknown": "the last successful backup isn't known.",
         "backup_history_note": "this is a past result. it doesn't confirm what's stored at your current backup destination or whether it has been verified.",
         "last_prune": "last cleanup",
         "last_verification": "last verification",

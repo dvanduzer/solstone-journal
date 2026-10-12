@@ -83,8 +83,8 @@ pub use store::{
 };
 pub use trust_lock::{
     EntityTrustLock, EntityTrustLockError, FacetTrustLock, FacetTrustLockError,
-    hold_entity_trust_lock, hold_entity_trust_lock_raw_for_test, hold_facet_trust_lock,
-    hold_facet_trust_lock_raw_for_test, hold_facet_trust_lock_with_options,
+    after_entity_trust_released, hold_entity_trust_lock, hold_entity_trust_lock_raw_for_test,
+    hold_facet_trust_lock, hold_facet_trust_lock_raw_for_test, hold_facet_trust_lock_with_options,
 };
 
 #[cfg(test)]
