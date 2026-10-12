@@ -10,13 +10,13 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- on windows, the journal app now opens the rest of setup in your browser. there, along with your mark, you now also add your name and choose how your journal thinks and what happens to your original media. the journal app moves on once you finish.
+- on windows, the journal app now opens the first-run setup page in your browser. there, along with your mark, you now also add your name and choose how your journal thinks and what happens to your original media. the journal app moves on once you finish.
 
 ### Fixed
 
-- security: journal text could contain requests to call tools, save notes or send your data elsewhere. journal connections now tell agents to treat that text as untrusted data and ignore those requests.
+- security: text that lands in your journal, such as a web page or something said in a conversation, could ask a connected agent to call tools, save notes or send what's in your journal elsewhere. your journal now tells connected agents to treat that text as untrusted data and ignore those requests.
+- if your journal was set up without a way to think, it held new recordings without transcribing them until you chose one. setup leaves a mac without enough memory for local thinking that way, and a linux or windows computer without a usable GPU unless you choose another option on the first-run setup page. your journal now transcribes new recordings before you choose. recordings it already held still wait for your choice, as do describing your screen and the rest of its thinking.
 - on Debian 12, the installer no longer stops with "libstdc++.so.6 was not found" when you run it as yourself and the library is already installed. if it stopped for you, run the install command again.
-- if your journal was set up without a way to think, it held new recordings without transcribing them until you chose one. setup leaves a linux or windows computer without a usable GPU that way, and a mac without enough memory for local thinking. your journal now transcribes new recordings before you choose. recordings it already held still wait for your choice, as do describing your screen and the rest of its thinking.
 - on a large journal, 2.0.42 could keep one processor core busy for as long as your journal ran while it checked your recorded days for unfinished thinking. the larger your journal, the longer each check took, and a new one started a minute after the last. your journal now rests between checks, so checking takes a small share of one core. health also no longer calls the check incomplete because of import records saved by earlier versions, or a long web page in your journal.
 - 2.0.42 set aside redoing the thinking an earlier version did for many recordings, and never went back to it. your journal now redoes that thinking in the background with your other older work, after newer work, and health no longer lists those recordings as set aside.
 - the first-run setup page said it couldn't check whether this computer can run local thinking, and let you choose local on a computer where the install then stopped. it now checks, and says so when local thinking won't run here.
