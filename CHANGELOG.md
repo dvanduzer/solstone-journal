@@ -6,12 +6,12 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.0.42] - 2026-10-12
+
 ### Added
 
 - imports now show how many recordings they will add or update, and how many days they cover, before they start. the import page keeps showing how many are ready to find, still waiting or set aside after the recordings are saved.
-
 - health now brings set-aside work into one list, with a reason and a try-again for each failed step. your request joins the priority order and keeps accepted results and your edits. a retry also becomes possible when its input changes or an update contains a declared fix for that failure. an update alone does not retry it.
-
 - searching your journal now finds a day by the towns your phone's location was near, and your journal's own thinking, and an agent that may see transcripts across your whole journal, can read those town names, never the coordinates.
 - a new map app shows the location your phone sends, a day at a time. each record is named after the town it was near, like "near Golden, Colorado". visits your iphone reported show when you arrived and left. a small map draws the towns and borders around them. the town and border names come with your journal, so no map service is asked for anything, and streets aren't shown. every record opens in transcripts, where you can delete the segments it came from.
 - your journal now works out stays from your iphone's precise readings: when they keep within 100 m of the first of them for at least five minutes, the day shows one stay instead of a run of readings. approximate location never makes a stay.
