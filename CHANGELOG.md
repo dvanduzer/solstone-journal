@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- on Debian 12, the installer no longer stops with "libstdc++.so.6 was not found" when you run it as yourself and the library is already installed. if it stopped for you, run the install command again.
 - if your journal was set up without a way to think, it held new recordings without transcribing them until you chose one. setup leaves a linux or windows computer without a usable GPU that way, and a mac without enough memory for local thinking. your journal now transcribes new recordings before you choose. recordings it already held still wait for your choice, as do describing your screen and the rest of its thinking.
 
 ## [2.0.42] - 2026-10-12
