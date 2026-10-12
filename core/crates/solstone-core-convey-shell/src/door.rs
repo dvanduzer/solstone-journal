@@ -109,6 +109,7 @@ impl PairingAdmission {
 pub(super) struct DoorStartOptions {
     pub journal_root: std::path::PathBuf,
     pub port: u16,
+    pub network_ipv4: Option<Ipv4Addr>,
     pub handshake_timeout: Duration,
     pub stream_stall_timeout: Duration,
     pub router: Router,
@@ -165,6 +166,7 @@ pub(super) struct DoorLifecycle {
 struct DoorStartParts {
     journal_root: PathBuf,
     port: u16,
+    network_ipv4: Option<Ipv4Addr>,
     handshake_timeout: Duration,
     stream_stall_timeout: Duration,
     router: Router,
@@ -179,6 +181,7 @@ impl DoorStartParts {
         Self {
             journal_root: options.journal_root,
             port: options.port,
+            network_ipv4: options.network_ipv4,
             handshake_timeout: options.handshake_timeout,
             stream_stall_timeout: options.stream_stall_timeout,
             router: options.router,
@@ -193,6 +196,7 @@ impl DoorStartParts {
         DoorStartOptions {
             journal_root: self.journal_root.clone(),
             port: self.port,
+            network_ipv4: self.network_ipv4,
             handshake_timeout: self.handshake_timeout,
             stream_stall_timeout: self.stream_stall_timeout,
             router: self.router.clone(),
@@ -746,7 +750,7 @@ pub(super) async fn start(options: DoorStartOptions) -> DoorStart {
     // On Windows the door listens on this computer alone until the owner opens it
     // to the network; listening wider is what raises the firewall prompt.
     let bind_ip = if crate::local_network::resolve_for_door(&options.journal_root).open {
-        Ipv4Addr::UNSPECIFIED
+        options.network_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED)
     } else {
         Ipv4Addr::LOCALHOST
     };
@@ -1696,6 +1700,7 @@ mod tests {
         let lifecycle = DoorLifecycle::new(DoorStartOptions {
             journal_root: root.to_path_buf(),
             port,
+            network_ipv4: None,
             handshake_timeout: Duration::from_secs(1),
             stream_stall_timeout: Duration::from_secs(1),
             router: Router::new(),
@@ -1764,6 +1769,7 @@ mod tests {
         let lifecycle = DoorLifecycle::new(DoorStartOptions {
             journal_root: PathBuf::from("/var/tmp/solstone-door-stopped-unit"),
             port: 0,
+            network_ipv4: None,
             handshake_timeout: Duration::from_secs(1),
             stream_stall_timeout: Duration::from_secs(1),
             router: Router::new(),
@@ -1797,6 +1803,7 @@ mod tests {
         let lifecycle = DoorLifecycle::new(DoorStartOptions {
             journal_root: journal.path().to_path_buf(),
             port,
+            network_ipv4: None,
             handshake_timeout: Duration::from_secs(1),
             stream_stall_timeout: Duration::from_secs(1),
             router: Router::new(),
@@ -1839,6 +1846,7 @@ mod tests {
         let lifecycle = DoorLifecycle::new(DoorStartOptions {
             journal_root: PathBuf::from("/var/tmp/solstone-door-concurrent-start-unit"),
             port: 0,
+            network_ipv4: None,
             handshake_timeout: Duration::from_secs(1),
             stream_stall_timeout: Duration::from_secs(1),
             router: Router::new(),

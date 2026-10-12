@@ -1736,6 +1736,75 @@ fn ledger_posture(fixture: &Fixture) -> AuthorizedClientsRead {
 }
 
 #[tokio::test]
+async fn embedded_door_composes_production_auth_and_refuses_replaced_root() {
+    let fixture = Fixture::established(1);
+    let handle = solstone_core_convey_shell::bind_embedded_device_door(
+        fixture.root.clone(),
+        std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+    )
+    .await
+    .expect("embedded door");
+    let address = handle.live_door_addr().expect("established door");
+    assert_eq!(address.ip(), Ipv4Addr::LOCALHOST);
+    let owner = || {
+        axum::http::Request::builder()
+            .uri("/api/system/status")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    assert_eq!(handle.request_owner(owner()).await.status(), StatusCode::OK);
+    let mut carrier = live_carrier(&fixture, address.port()).await;
+    let mut decoder = FrameDecoder::new();
+    let mut ids = FrameDialer::default();
+    assert_eq!(
+        get_over_carrier(&mut carrier, &mut decoder, &mut ids, "/api/system/status")
+            .await
+            .status,
+        200
+    );
+
+    // Pairing admission never grants access to journal or unmatched routes.
+    open_pairing_window(&fixture, "embedded-window");
+    let mut pairing = live_certless_carrier(address.port())
+        .await
+        .expect("pairing carrier");
+    let forbidden = exchange_over_carrier(
+        &mut pairing,
+        &mut FrameDecoder::new(),
+        FrameDialer::default().allocate(),
+        "GET",
+        "/api/system/status",
+        &[],
+        &[],
+    )
+    .await
+    .expect("confined response");
+    assert_eq!(forbidden.status, 403);
+
+    let original = fixture.root.with_extension("retained");
+    fs::rename(&fixture.root, &original).unwrap();
+    fs::create_dir(&fixture.root).unwrap();
+    assert_eq!(
+        handle.request_owner(owner()).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        get_over_carrier(&mut carrier, &mut decoder, &mut ids, "/api/system/status")
+            .await
+            .status,
+        503
+    );
+    handle.shutdown();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        TcpStream::connect(address).await.is_err(),
+        "shutdown closes listener"
+    );
+    fs::remove_dir(&fixture.root).unwrap();
+    fs::rename(&original, &fixture.root).unwrap();
+}
+
+#[tokio::test]
 async fn ac1_carrier_loop_counter_advances() {
     let fixture = Fixture::established(1);
     let carrier_loop_iterations = Arc::new(AtomicU64::new(0));

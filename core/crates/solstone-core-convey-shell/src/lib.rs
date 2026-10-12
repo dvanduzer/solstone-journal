@@ -306,6 +306,7 @@ impl ConveyServeHandle {
 pub enum ConveyServeError {
     LoopbackBind { port: u16, source: io::Error },
     PairingWindowCleanup(solstone_core_sol_link::pairing::nonces::NonceStoreError),
+    EmbeddedRoot(solstone_core_journal_io::JournalRootError),
 }
 
 #[cfg(feature = "host")]
@@ -316,6 +317,7 @@ impl std::fmt::Display for ConveyServeError {
                 formatter,
                 "could not bind loopback port {port}: {source}. convey may already be running, including under another login. the default port is shared across logins"
             ),
+            Self::EmbeddedRoot(error) => write!(formatter, "embedded journal root: {error}"),
             Self::PairingWindowCleanup(error) => {
                 write!(
                     formatter,
@@ -328,6 +330,131 @@ impl std::fmt::Display for ConveyServeError {
 
 #[cfg(feature = "host")]
 impl std::error::Error for ConveyServeError {}
+
+/// App-owned serving lifecycle. There is no unauthenticated loopback listener:
+/// local owner requests must arrive through the embedding app's private IPC.
+#[cfg(feature = "host")]
+pub struct EmbeddedConveyHandle {
+    owner_router: Router,
+    door: Arc<door::DoorLifecycle>,
+    local_network_task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "host")]
+impl EmbeddedConveyHandle {
+    /// Execute a request already admitted by the embedding app's owner boundary.
+    /// Never expose this method through a network listener or public IPC endpoint.
+    pub async fn request_owner(
+        &self,
+        mut request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use solstone_core_convey_http::identity::AccessBasis;
+        use tower::ServiceExt;
+        request.extensions_mut().insert(AccessBasis::Localhost);
+        self.owner_router.clone().oneshot(request).await.unwrap()
+    }
+
+    pub fn live_door_addr(&self) -> Option<SocketAddr> {
+        self.door.bound_addr()
+    }
+
+    pub fn shutdown(&self) {
+        self.local_network_task.abort();
+        self.door.shutdown();
+    }
+}
+
+#[cfg(feature = "host")]
+impl Drop for EmbeddedConveyHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Serve the existing authenticated device protocol inside an app process.
+/// Setup, pairing, authorization, revocation and route semantics are shared
+/// with desktop Convey; only the local owner transport is supplied by the app.
+#[cfg(feature = "host")]
+pub async fn bind_embedded_device_door(
+    journal_root: PathBuf,
+    address: std::net::SocketAddrV4,
+) -> Result<EmbeddedConveyHandle, ConveyServeError> {
+    use solstone_core_sol_link::ledger::AuthorizedClientsRead;
+    use tokio::sync::watch;
+
+    let relay_admissions = relay_admission::admission_registry_for(&journal_root);
+    relay_admissions.clear();
+    pair_window_manager::cleanup_relay_windows_on_startup(
+        &journal_root,
+        pair_window_manager::unix_seconds(),
+    )
+    .map_err(ConveyServeError::PairingWindowCleanup)?;
+    let (sender, receiver) = watch::channel(DeviceDoorAuthorization::from(
+        AuthorizedClientsRead::Missing,
+    ));
+    let binding = Arc::new(
+        solstone_core_journal_io::JournalRoot::open(&journal_root)
+            .map_err(ConveyServeError::EmbeddedRoot)?,
+    );
+    let cache: link_health_cache::RelayHealthCacheStore = Arc::new(std::sync::Mutex::new(None));
+    let router = router(journal_root.clone()).layer(Extension(cache));
+    let door_router = authorization_gate::authorized_router_with_router(
+        router.clone(),
+        journal_root.clone(),
+        receiver,
+    );
+    let door = Arc::new(door::DoorLifecycle::new(door::DoorStartOptions {
+        journal_root,
+        port: address.port(),
+        network_ipv4: Some(*address.ip()),
+        handshake_timeout: Duration::from_secs(10),
+        stream_stall_timeout: Duration::from_secs(60),
+        router: door_router
+            .into_inner()
+            .layer(axum::middleware::from_fn_with_state(
+                binding.clone(),
+                embedded_root_gate,
+            )),
+        carrier_loop_iterations: Arc::new(AtomicU64::new(0)),
+        handshake_authorization_read_ticks: Arc::new(AtomicU64::new(0)),
+        authorization_sender: sender,
+        relay_admissions,
+    }));
+    let owner_router = router
+        .merge(local_network::routes(door.clone()))
+        .layer(axum::middleware::from_fn_with_state(
+            door.clone(),
+            door::open_after_finalize,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            binding,
+            embedded_root_gate,
+        ));
+    let _ = door.ensure_started().await;
+    let local_network_task = tokio::spawn(local_network::watch(door.clone()));
+    Ok(EmbeddedConveyHandle {
+        owner_router,
+        door,
+        local_network_task,
+    })
+}
+
+#[cfg(feature = "host")]
+async fn embedded_root_gate(
+    axum::extract::State(root): axum::extract::State<Arc<solstone_core_journal_io::JournalRoot>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if root.revalidate_canonical_binding().is_err() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error":"journal_root_changed"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
 
 /// Bind loopback and, when available, the paired-device door.
 ///
@@ -396,6 +523,7 @@ pub async fn bind_with_authorization(
     let door = Arc::new(door::DoorLifecycle::new(door::DoorStartOptions {
         journal_root: options.journal_root,
         port: options.door_port,
+        network_ipv4: None,
         handshake_timeout: options.handshake_timeout,
         stream_stall_timeout: options.stream_stall_timeout,
         router: door_router

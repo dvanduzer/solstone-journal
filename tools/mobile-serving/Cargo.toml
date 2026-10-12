@@ -1,0 +1,17 @@
+[package]
+name = "journal-mobile-serving"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace]
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false }
+serde_json = "1"
+solstone-core-convey-shell = { path = "../../core/crates/solstone-core-convey-shell" }
+solstone-core-indexer-store = { path = "../../core/crates/solstone-core-indexer-store" }
+solstone-core-journal-io = { path = "../../core/crates/solstone-core-journal-io" }
+solstone-core-journal-config-write = { path = "../../core/crates/solstone-core-journal-config-write" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
