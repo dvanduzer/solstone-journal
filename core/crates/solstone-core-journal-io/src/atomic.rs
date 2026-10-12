@@ -64,7 +64,7 @@ pub enum BoundPublicationPrimitive {
     ParentSync,
     /// Removing a stage name after it has been linked into its final name.
     StageUnlink,
-    /// Create-only `linkat` of the filled stage into the destination name.
+    /// Create-only publication of the filled stage into the destination name.
     ExclusivePublish,
     /// First no-follow identity and byte observation after exclusive publication.
     PostPublishObserve,
@@ -729,10 +729,66 @@ pub fn atomic_replace_bound(
     }
 }
 
+// Android app policy denies hard links. A no-replace rename publishes the synced
+// inode atomically and consumes the stage name. Unsupported kernels/filesystems
+// return their error; an overwrite-capable fallback would violate the contract.
+#[cfg(target_os = "android")]
+fn publish_exclusive_stage(
+    directory: &impl AsFd,
+    stage: &OsStr,
+    name: &OsStr,
+) -> Result<(), Errno> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let from = CString::new(stage.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let to = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    // SAFETY: the retained directory and both NUL-terminated names live for this call.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory.as_fd().as_raw_fd(),
+            from.as_ptr(),
+            directory.as_fd().as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn publish_exclusive_stage(
+    directory: &impl AsFd,
+    stage: &OsStr,
+    name: &OsStr,
+) -> Result<(), Errno> {
+    linkat(directory, stage, directory, name, AtFlags::empty())
+}
+
+#[cfg(unix)]
+fn remove_published_stage(directory: &impl AsFd, stage: &OsStr) -> Result<(), Errno> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (directory, stage);
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        unlinkat(directory, stage, UnlinkatFlags::NoRemoveDir)
+    }
+}
+
 /// Publish `contents` only when `name` does not yet exist in `directory`.
 ///
 /// Contents are written and synced to an exclusive stage inode first, then
-/// published with `linkat(2)`. The destination name is never visible with
+/// published create-only (`RENAME_NOREPLACE` on Android, `linkat(2)` elsewhere).
+/// The destination name is never visible with
 /// partial content.
 #[cfg(unix)]
 pub fn write_bytes_exclusive_bound(
@@ -784,13 +840,7 @@ pub fn write_bytes_exclusive_bound(
         );
         return Err(io_error(path, source));
     }
-    if let Err(source) = linkat(
-        directory,
-        stage_name.as_os_str(),
-        directory,
-        name,
-        AtFlags::empty(),
-    ) {
+    if let Err(source) = publish_exclusive_stage(directory, stage_name.as_os_str(), name) {
         let _ = unlinkat(
             directory,
             stage_name.as_os_str(),
@@ -799,14 +849,11 @@ pub fn write_bytes_exclusive_bound(
         return Err(io_error(path, errno_io(source)));
     }
     let stage_path = Path::new(stage_name.as_os_str());
+    #[cfg(not(target_os = "android"))]
     checkpoint(BoundPublicationPrimitive::StageUnlink)
         .map_err(|source| io_error(stage_path, source))?;
-    unlinkat(
-        directory,
-        stage_name.as_os_str(),
-        UnlinkatFlags::NoRemoveDir,
-    )
-    .map_err(|source| io_error(stage_path, errno_io(source)))?;
+    remove_published_stage(directory, stage_name.as_os_str())
+        .map_err(|source| io_error(stage_path, errno_io(source)))?;
     fsync(directory).map_err(|source| io_error(path, errno_io(source)))?;
     Ok(())
 }
@@ -1098,13 +1145,7 @@ fn publish_exclusive_into_bound_directory_detailed(
             source,
         )
     })?;
-    if let Err(source) = linkat(
-        directory,
-        stage_name.as_os_str(),
-        directory,
-        name,
-        AtFlags::empty(),
-    ) {
+    if let Err(source) = publish_exclusive_stage(directory, stage_name.as_os_str(), name) {
         return Err(cleanup_stage_error(
             directory,
             error_path,
@@ -1118,16 +1159,15 @@ fn publish_exclusive_into_bound_directory_detailed(
         Err(source) => Err(source),
         Ok(()) => observe_exclusive_dest(directory, name, &expected),
     };
+    #[cfg(target_os = "android")]
+    let cleanup = StageCleanup::Removed;
+    #[cfg(not(target_os = "android"))]
     let cleanup = match checkpoint(BoundPublicationPrimitive::StageUnlink) {
         Err(source) => StageCleanup::Retained {
             stage: stage_name.clone(),
             source,
         },
-        Ok(()) => match unlinkat(
-            directory,
-            stage_name.as_os_str(),
-            UnlinkatFlags::NoRemoveDir,
-        ) {
+        Ok(()) => match remove_published_stage(directory, stage_name.as_os_str()) {
             Ok(()) => StageCleanup::Removed,
             Err(source) => StageCleanup::Retained {
                 stage: stage_name.clone(),
@@ -2335,6 +2375,8 @@ mod tests {
         );
     }
 
+    // No separate post-publication stage unlink exists on Android.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn write_bytes_exclusive_bound_reports_post_link_stage_unlink_failure() {
         let temporary = TempDir::new();
@@ -2704,6 +2746,8 @@ mod tests {
         assert_no_exclusive_stage(temporary.path());
     }
 
+    // No separate post-publication stage unlink exists on Android.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn detailed_exclusive_publication_forced_cleanup_failure_is_retained() {
         let temporary = TempDir::new();
@@ -2779,6 +2823,8 @@ mod tests {
         assert_no_exclusive_stage(temporary.path());
     }
 
+    // No separate post-publication stage unlink exists on Android.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn detailed_exclusive_publication_observation_one_race_and_cleanup_failure() {
         let temporary = TempDir::new();
@@ -2810,6 +2856,8 @@ mod tests {
         assert_eq!(exclusive_stage_names(temporary.path()).len(), 1);
     }
 
+    // No separate post-publication stage unlink exists on Android.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn detailed_exclusive_publication_durability_and_cleanup_failure() {
         let temporary = TempDir::new();
@@ -2845,6 +2893,8 @@ mod tests {
         assert_eq!(exclusive_stage_names(temporary.path()).len(), 1);
     }
 
+    // No separate post-publication stage unlink exists on Android.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn detailed_exclusive_publication_all_three_facts_fail() {
         let temporary = TempDir::new();

@@ -15,7 +15,21 @@ use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
 use super::backend::Backend;
 use super::{JournalEntryKind, JournalRootError, ObjectIdentity};
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const DIRECTORY_FLAGS: OFlag = OFlag::O_RDONLY
+    .union(OFlag::O_DIRECTORY)
+    .union(OFlag::O_CLOEXEC)
+    .union(OFlag::O_NOFOLLOW);
+// Android allows ancestor lookup without directory-listing authority. Requested
+// root admission stays readable below, including its directory-sync authority.
+#[cfg(target_os = "android")]
+const DIRECTORY_FLAGS: OFlag = OFlag::O_PATH
+    .union(OFlag::O_DIRECTORY)
+    .union(OFlag::O_CLOEXEC)
+    .union(OFlag::O_NOFOLLOW);
+// iOS sandbox ancestors likewise permit search without directory listing.
+#[cfg(target_os = "ios")]
+const DIRECTORY_FLAGS: OFlag = OFlag::O_SEARCH
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_CLOEXEC)
     .union(OFlag::O_NOFOLLOW);
