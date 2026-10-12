@@ -427,8 +427,11 @@ talent_orchestration_rung() {
 	printf '%s\n' \
 		'{"density":"active","content_type":"work","activity_summary":"Held synthetic cleanroom activity.","facets":[]}' \
 		>"$target_segment/talents/sense.json"
-	# The retained sense output is a negative control: --mark-updated forces
-	# production orchestration to replace it through the live fixture.
+	# The retained sense output is a negative control: --from-scratch must
+	# replace it through the live fixture. --mark-updated is not the route here:
+	# it queues the segment first and leaves the daily batch to the next
+	# automatic discovery pass, which --no-daily turns off, so the day never
+	# finishes inside this rung.
 	printf '%s (%s):\n  03:17 - 03:28 (11m)' "$day" "$weekday" >"$journal/expected-fragment"
 	: >"$journal/generation-evidence"
 	: >"$journal/generation.addr"
@@ -458,14 +461,14 @@ talent_orchestration_rung() {
 	[ ! -e "$journal/config/schedules.json" ] \
 		|| refuse "orchestration schedule metadata was pre-seeded"
 	start_supervisor yes
-	if ! solstone journal reprocess "$target_day" --mark-updated >"$journal/reprocess.out" \
+	if ! solstone journal reprocess "$target_day" --from-scratch >"$journal/reprocess.out" \
 		2>"$journal/reprocess.err"; then
 		cat "$journal/reprocess.out" "$journal/reprocess.err" \
 			"$journal/supervisor.log" >&2 || true
 		refuse "supervisor daily reprocess request failed"
 	fi
 	cat "$journal/reprocess.out"
-	grep -Fqx "reprocess (mark-updated) submitted for $target_day" \
+	grep -Fqx "reprocess (from-scratch) submitted for $target_day" \
 		"$journal/reprocess.out" || {
 			cat "$journal/reprocess.out" "$journal/reprocess.err" >&2 || true
 			refuse "supervisor daily reprocess request was not accepted"
