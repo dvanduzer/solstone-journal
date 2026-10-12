@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- when a 5 minute recording of a screen comes down to a single frame, your journal no longer asks the thinking model which frames to read in detail, so it spends fewer tokens. what it keeps is the same.
+
 ### Fixed
 
 - on mac and windows, turning on encrypted backup operated by sol pbc and restoring your journal from it work again. since 2.0.41 both stopped as soon as they started.
@@ -14,6 +18,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - when bringing back offloaded media left a file out because a different file was already where one belongs, or because a file couldn't be put back, the backup page didn't say why. it now does.
 - your journal's home page no longer offers to delete originals for offload proposals made by an earlier version, which it couldn't do. your originals stay on this computer.
 - when you redo a past day with `solstone journal reprocess`, your journal now remakes that day's daily results soon after it finishes redoing its recordings. before, they could wait for your journal's next check of its recorded days, close to an hour on a large journal.
+- a screen category in the ignored group in settings was still read in detail when it was the first thing on screen in a recording, or when it was on screen beside another app. it's now never read in detail, and your journal still keeps a short description of it.
+- the help under "frames read in detail" in settings said the number counted frames across your whole screen segment. it counts for each screen separately, and the help now says so.
 
 ## [2.0.43] - 2026-10-12
 
