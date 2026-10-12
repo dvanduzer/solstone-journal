@@ -492,8 +492,12 @@ impl SenseDispatcher {
     /// finally acquires it.
     fn admit_after_lease(&self, context: SegmentContext, paths: Vec<PathBuf>) {
         let config = read_config(&self.journal);
-        let deferred =
-            !context.batch && (processing_deferred(&config) || no_thinking_engine(&config));
+        let deferred = !context.batch && processing_deferred(&config);
+        // With no thinking engine chosen, a live segment still gets the work
+        // that needs none (transcription); describe and depict ask the engine
+        // and wait, and the daily sense repair picks them up once an engine is
+        // chosen, because it re-enters every file that has no output yet.
+        let engine_hold = !context.batch && no_thinking_engine(&config);
         let describe_workers = self
             .batch
             .describe_workers
@@ -506,19 +510,20 @@ impl SenseDispatcher {
         if deferred {
             self.emit_observed(
                 &context.key,
-                Some(if no_thinking_engine(&config) {
-                    "no_engine"
-                } else {
-                    "deferred"
-                }),
+                Some(if engine_hold { "no_engine" } else { "deferred" }),
             );
             return;
         }
         let mut admitted = Vec::new();
+        let mut held = false;
         for path in paths {
             let Some(spec) = match_handler(&self.journal, &path, &registry) else {
                 continue;
             };
+            if engine_hold && !runs_without_thinking_engine(spec.name) {
+                held = true;
+                continue;
+            }
             let pending_key = (spec.name.to_owned(), path.clone());
             let mut state = self.state.lock().expect("sense state");
             if !state.pending_files.insert(pending_key) {
@@ -531,6 +536,16 @@ impl SenseDispatcher {
                 .pending
                 .insert(path.clone());
             admitted.push((path, spec));
+        }
+        if held
+            && let Some(segment) = self
+                .state
+                .lock()
+                .expect("sense state")
+                .segments
+                .get_mut(&context.key)
+        {
+            segment.hold_note = Some("no_engine");
         }
         for (path, spec) in admitted {
             let handler = spec.name;
@@ -577,7 +592,14 @@ impl SenseDispatcher {
             .get(&context.key)
             .is_some_and(|v| v.pending.is_empty())
         {
-            self.emit_observed(&context.key, Some("no handlers"));
+            self.emit_observed(
+                &context.key,
+                Some(if engine_hold {
+                    "no_engine"
+                } else {
+                    "no handlers"
+                }),
+            );
         }
     }
 
@@ -1227,6 +1249,13 @@ fn icon(handler: &str) -> &'static str {
     }
 }
 
+/// Whether a handler's work needs no thinking engine, so a live segment runs
+/// it even while none is chosen. Transcription picks its own speech-to-text
+/// backend; describe and depict ask the chosen engine.
+fn runs_without_thinking_engine(handler: &str) -> bool {
+    handler == "transcribe"
+}
+
 #[allow(clippy::too_many_arguments)] // One explicit call carries the full segment-completion boundary.
 fn complete(
     state: &Arc<Mutex<State>>,
@@ -1285,7 +1314,7 @@ fn complete(
         let _ = outbound.send(Outbound {
             tract: "observe",
             event: "observed",
-            fields: events::observed(&segment, note),
+            fields: events::observed(&segment, note.or(segment.hold_note)),
         });
     }
     marker_succeeded
@@ -1808,6 +1837,102 @@ mod tests {
                 .map_or(true, |event| event.event != "observed"),
             "segment emits observed exactly once"
         );
+    }
+
+    /// A fresh journal with no thinking engine chosen (an Apple Silicon Mac
+    /// under the local bar, or a computer without a usable GPU) still
+    /// transcribes a new live segment. Screen work, which asks the engine,
+    /// waits for the daily sense repair once an engine is chosen.
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn no_engine_live_segment_is_transcribed_and_screen_work_waits() {
+        let temp = tempfile::tempdir().expect("temp journal");
+        let segment = temp.path().join("chronicle/20260812/one/120000_1");
+        std::fs::create_dir_all(&segment).expect("segment");
+        std::fs::write(segment.join("audio.flac"), b"audio").expect("audio");
+        std::fs::write(segment.join("screen.webm"), b"screen").expect("screen");
+        assert!(crate::config::no_thinking_engine(&read_config(temp.path())));
+        let (outbound, receiver) = mpsc::channel();
+        let dispatcher = SenseDispatcher::new_with_fixture_program(
+            temp.path().to_path_buf(),
+            false,
+            false,
+            outbound,
+            PathBuf::from("/usr/bin/true"),
+        );
+        let mut message = observing("one", "120000_1");
+        message
+            .extra
+            .insert("files".into(), json!(["audio.flac", "screen.webm"]));
+        dispatcher.handle(&message);
+        let mut detected = Vec::new();
+        let observed = loop {
+            let event = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("segment completes");
+            if event.event == "detected" {
+                detected.push(event.fields["handler"].clone());
+            }
+            if event.event == "observed" {
+                break event;
+            }
+        };
+        assert_eq!(detected, vec![json!("transcribe")]);
+        assert!(!observed.fields.contains_key("error"), "{observed:?}");
+        assert_eq!(observed.fields["note"], "no_engine");
+        let waiting = crate::batch::scan_unprocessed(
+            temp.path(),
+            &temp.path().join("chronicle/20260812"),
+            Some("120000_1"),
+            None,
+            None,
+        )
+        .expect("scan");
+        assert!(
+            waiting
+                .iter()
+                .any(|work| work.handler == "describe" && work.path.ends_with("screen.webm")),
+            "screen work stays for the sense repair: {waiting:?}"
+        );
+        assert!(dispatcher.stop_and_wait());
+    }
+
+    /// The owner's deferred-processing choice still holds every handler,
+    /// transcription included, whether or not an engine is chosen.
+    #[test]
+    fn deferred_processing_still_holds_transcription_without_an_engine() {
+        let temp = tempfile::tempdir().expect("temp journal");
+        std::fs::create_dir_all(temp.path().join("config")).expect("config");
+        std::fs::write(
+            temp.path().join("config/journal.json"),
+            br#"{"processing":{"mode":"deferred"}}"#,
+        )
+        .expect("settings");
+        let segment = temp.path().join("chronicle/20260812/one/120000_1");
+        std::fs::create_dir_all(&segment).expect("segment");
+        std::fs::write(segment.join("audio.flac"), b"audio").expect("audio");
+        let (outbound, receiver) = mpsc::channel();
+        let dispatcher = SenseDispatcher::new(temp.path().to_path_buf(), false, false, outbound);
+        let mut message = observing("one", "120000_1");
+        message.extra.insert("files".into(), json!(["audio.flac"]));
+        dispatcher.handle(&message);
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().all(|event| event.event != "detected"));
+        let observed = events
+            .iter()
+            .find(|event| event.event == "observed")
+            .expect("observed");
+        assert_eq!(observed.fields["note"], "no_engine");
+        assert!(dispatcher.state.lock().unwrap().pending_files.is_empty());
+        assert!(dispatcher.stop_and_wait());
+    }
+
+    #[test]
+    fn only_transcription_runs_without_a_thinking_engine() {
+        assert!(runs_without_thinking_engine("transcribe"));
+        assert!(!runs_without_thinking_engine("describe"));
+        assert!(!runs_without_thinking_engine("depict"));
     }
 
     #[test]

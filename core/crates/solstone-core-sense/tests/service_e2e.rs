@@ -381,6 +381,37 @@ async fn real_socket_event_spawns_built_audio_and_screen_handlers_once() {
 }
 
 #[tokio::test]
+async fn fresh_journal_without_an_engine_transcribes_and_holds_screen_work() {
+    let root = tempfile::tempdir().expect("journal");
+    let segment = root.path().join("chronicle/20260812/default/120000_2");
+    std::fs::create_dir_all(&segment).expect("segment");
+    std::fs::write(segment.join("audio.flac"), b"audio").expect("audio");
+    std::fs::write(segment.join("screen.webm"), b"screen").expect("screen");
+    let socket = root.path().join("health/callosum.sock");
+    let server = CallosumSocketServer::bind(&socket).await.expect("server");
+    let (mut peer, _dispatcher, stop) = start_service(
+        root.path().to_path_buf(),
+        PathBuf::from(env!("CARGO_BIN_EXE_solstone-core-sense-test-handler")),
+    )
+    .await;
+    wait_for_clients(&server).await;
+    assert!(peer.emit(
+        "observe",
+        "observing",
+        observing(&["audio.flac", "screen.webm"])
+    ));
+    let observed = next_event(&mut peer, "observe", "observed").await;
+    assert_eq!(observed.extra["segment"], "120000_2");
+    assert_eq!(observed.extra["note"], "no_engine");
+    assert!(!observed.extra.contains_key("error"));
+    assert!(segment.join("audio.flac.handler").is_file());
+    assert!(!segment.join("screen.webm.handler").exists());
+    no_second_observed_for(&mut peer, "120000_2").await;
+    let _ = stop.send(());
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn provider_blocked_is_observed_without_error_and_is_redeliverable() {
     let root = tempfile::tempdir().expect("journal");
     std::fs::create_dir_all(root.path().join("config")).expect("config");

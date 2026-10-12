@@ -38,6 +38,9 @@ pub struct SegmentState {
     pub pending: HashSet<PathBuf>,
     pub started_at: Instant,
     pub errors: Vec<String>,
+    /// Why some of this segment's files were held rather than dispatched,
+    /// carried onto its `observed` event when the dispatched rest completes.
+    pub hold_note: Option<&'static str>,
 }
 
 impl SegmentState {
@@ -47,6 +50,7 @@ impl SegmentState {
             pending: HashSet::new(),
             started_at: Instant::now(),
             errors: Vec::new(),
+            hold_note: None,
         }
     }
 }
