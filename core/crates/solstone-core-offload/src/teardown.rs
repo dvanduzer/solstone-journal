@@ -27,6 +27,29 @@ pub use owned::{
     TeardownRunRefusal, run_owned_teardown,
 };
 
+/// The plain sentence an owner gets after their own storage was emptied, when
+/// that storage may still keep what was deleted.
+pub fn storage_retention_sentence(
+    retention: solstone_core_backup_runtime::teardown::owned::StorageRetention,
+) -> Option<&'static str> {
+    use solstone_core_backup_runtime::teardown::owned::{StorageKeeps, StorageRetention};
+    match retention {
+        StorageRetention::Removes => None,
+        StorageRetention::Keeps(StorageKeeps::Versions) => Some(
+            "your storage keeps earlier versions of deleted files, so copies of this backup stay in your bucket until you delete those versions or your provider's own rules remove them.",
+        ),
+        StorageRetention::Keeps(StorageKeeps::ObjectLock | StorageKeeps::FileLock) => Some(
+            "your bucket can lock files against deletion, so copies of this backup stay there until any lock ends and you delete those versions or your provider's own rules remove them.",
+        ),
+        StorageRetention::Keeps(StorageKeeps::HiddenFiles) => Some(
+            "your B2 bucket only hides deleted files unless a lifecycle rule for the whole bucket removes them, so copies of this backup stay there until you add one or delete them yourself.",
+        ),
+        StorageRetention::Unknown => Some(
+            "your journal couldn't check whether your storage keeps deleted files, so check your bucket's versioning, lifecycle and lock settings to make sure this backup is gone.",
+        ),
+    }
+}
+
 /// Read both owning sources afresh inside `TeardownAdmission::check`.
 /// A successful observation grants no deletion, cleanup or crash-safety authority.
 /// Call again at each destructive boundary; config and lease checks stay in admission.

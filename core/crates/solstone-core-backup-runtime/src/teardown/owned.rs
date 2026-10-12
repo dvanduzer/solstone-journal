@@ -41,6 +41,8 @@ pub struct RemoteTeardownReport {
     pub(crate) abort_confirmations: u64,
     pub(crate) objects_empty: bool,
     pub(crate) uploads_empty: bool,
+    /// Own storage only: whether the owner's bucket keeps what was deleted.
+    pub(crate) storage_retention: Option<StorageRetention>,
 }
 
 impl RemoteTeardownReport {
@@ -68,6 +70,9 @@ impl RemoteTeardownReport {
     pub fn uploads_empty(&self) -> bool {
         self.uploads_empty
     }
+    pub fn storage_retention(&self) -> Option<StorageRetention> {
+        self.storage_retention
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +97,10 @@ pub enum TeardownRemoteRefusal {
     Protocol(TeardownProtocolRefusal),
     Residual,
     AlreadyAttempted,
+    /// Own storage only: no destination or key to address the repository with.
+    DestinationUnavailable,
+    /// Own storage only: restic stopped with this reason.
+    Restic(&'static str),
 }
 
 /// Returned only by the real joined remote path; descriptive, not a cleanup token.
@@ -139,6 +148,7 @@ impl TeardownOperation {
                 abort_confirmations: 0,
                 objects_empty: false,
                 uploads_empty: false,
+                storage_retention: None,
             },
         })
     }
@@ -257,6 +267,10 @@ impl TeardownOperation {
         &mut self.report
     }
 }
+
+mod own_storage;
+mod retention;
+pub use retention::{StorageKeeps, StorageRetention};
 
 #[cfg(test)]
 mod tests;

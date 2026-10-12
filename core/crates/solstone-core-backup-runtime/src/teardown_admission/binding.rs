@@ -39,7 +39,10 @@ pub struct TeardownBindingFailure {
 }
 
 impl TeardownBindingFailure {
-    fn cleared(owner: ClearedTeardownAdmission, refusal: TeardownBindingRefusal) -> Self {
+    pub(super) fn cleared(
+        owner: ClearedTeardownAdmission,
+        refusal: TeardownBindingRefusal,
+    ) -> Self {
         Self {
             owner: BindingFailureOwner::Cleared(Box::new(owner)),
             refusal,

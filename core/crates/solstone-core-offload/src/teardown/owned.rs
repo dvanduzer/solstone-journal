@@ -9,6 +9,8 @@ use std::sync::Arc;
 use solstone_core_backup::archive_admission::{AdmissionError, ArchiveCancellation, Clock};
 #[cfg(unix)]
 use solstone_core_backup::teardown_configuration::BindingRemovalReceipt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use solstone_core_backup_runtime::resolve_restic_member;
 use solstone_core_backup_runtime::teardown::owned::{
     RemoteTeardownReport, TeardownOperation, TeardownRemoteRefusal,
 };
@@ -48,6 +50,8 @@ pub enum TeardownRunPhase {
 pub enum TeardownRunRefusal {
     UnsupportedPlatform,
     UnsupportedDestination,
+    /// Own storage only: the package's restic could not be found.
+    ToolUnavailable,
     Root(JournalRootError),
     Budget(AdmissionError),
     Admission(TeardownAdmissionRefusal),
@@ -87,8 +91,9 @@ pub struct SettledTeardownReport {
     remote: RemoteTeardownReport,
     attempts: TeardownAttemptJournal,
     publication: Arc<BoundConfigPublication>,
+    /// None for own storage, which has no hosted binding.
     #[cfg(unix)]
-    binding: Arc<BindingRemovalReceipt>,
+    binding: Option<Arc<BindingRemovalReceipt>>,
     retirement: ActivityCarrierRetirementReceipt,
 }
 
@@ -103,8 +108,8 @@ impl SettledTeardownReport {
         &self.publication
     }
     #[cfg(unix)]
-    pub fn binding(&self) -> &BindingRemovalReceipt {
-        &self.binding
+    pub fn binding(&self) -> Option<&BindingRemovalReceipt> {
+        self.binding.as_deref()
     }
     pub fn retirement(&self) -> &ActivityCarrierRetirementReceipt {
         &self.retirement
@@ -235,7 +240,7 @@ impl OwnedTeardownOutcome {
     #[cfg(unix)]
     pub fn binding(&self) -> Option<&BindingRemovalReceipt> {
         match self {
-            Self::Finished(report) => Some(report.binding()),
+            Self::Finished(report) => report.binding(),
             _ => self.held()?.outside.binding.as_deref(),
         }
     }
@@ -466,28 +471,50 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
         }
     };
     outside.lease = Some(admitted.teardown_lease().clone());
-    if admitted
+    let operated = admitted
         .configuration()
         .backup()
         .get("mode")
         .and_then(serde_json::Value::as_str)
-        != Some("operated")
-    {
-        return held(
-            outside,
-            Some(PhaseOwner::Admission(Box::new(admitted))),
-            TeardownRunPhase::Admission,
-            TeardownRunRefusal::UnsupportedDestination,
-        );
-    }
-    if admitted.configuration().binding().is_none() {
-        return held(
-            outside,
-            Some(PhaseOwner::Admission(Box::new(admitted))),
-            TeardownRunPhase::Admission,
-            TeardownRunRefusal::Binding,
-        );
-    }
+        == Some("operated");
+    // Own storage is addressed by its destination and key; operated storage by its binding.
+    let own_storage = if operated {
+        if admitted.configuration().binding().is_none() {
+            return held(
+                outside,
+                Some(PhaseOwner::Admission(Box::new(admitted))),
+                TeardownRunPhase::Admission,
+                TeardownRunRefusal::Binding,
+            );
+        }
+        None
+    } else {
+        let addressable = admitted.configuration().binding().is_none()
+            && admitted.configuration().destination().is_some()
+            && admitted.configuration().keys().is_some();
+        if !addressable {
+            return held(
+                outside,
+                Some(PhaseOwner::Admission(Box::new(admitted))),
+                TeardownRunPhase::Admission,
+                TeardownRunRefusal::UnsupportedDestination,
+            );
+        }
+        let restic = std::env::current_exe()
+            .ok()
+            .and_then(|executable| resolve_restic_member(&executable).ok());
+        match restic {
+            Some(restic) => Some(restic),
+            None => {
+                return held(
+                    outside,
+                    Some(PhaseOwner::Admission(Box::new(admitted))),
+                    TeardownRunPhase::Admission,
+                    TeardownRunRefusal::ToolUnavailable,
+                );
+            }
+        }
+    };
     if let Err(refusal) = outside.remaining() {
         return held(
             outside,
@@ -514,7 +541,7 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
             .operation
             .as_mut()
             .expect("original operation")
-            .run_remote(&carrier, &mut reader, version)
+            .run_remote_for(&carrier, &mut reader, version, own_storage.as_deref())
     }));
     match remote {
         Ok(Ok(_)) => {}
@@ -574,52 +601,67 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
             refusal,
         );
     }
-    let guarded = match catch_unwind(AssertUnwindSafe(|| {
-        cleared.begin_binding_finalization(&mut reader)
-    })) {
-        Ok(Ok(guarded)) => guarded,
-        Ok(Err(failure)) => {
+    let (finish, operational) = if own_storage.is_some() {
+        match catch_unwind(AssertUnwindSafe(|| {
+            cleared.into_finish_without_binding(&mut reader)
+        })) {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(failure)) => {
+                return held(
+                    outside,
+                    Some(PhaseOwner::BindingFailure(Box::new(failure))),
+                    TeardownRunPhase::FinishAdmission,
+                    TeardownRunRefusal::Binding,
+                );
+            }
+            Err(_) => return unknown(outside, None, TeardownRunPhase::FinishAdmission),
+        }
+    } else {
+        let guarded = match catch_unwind(AssertUnwindSafe(|| {
+            cleared.begin_binding_finalization(&mut reader)
+        })) {
+            Ok(Ok(guarded)) => guarded,
+            Ok(Err(failure)) => {
+                return held(
+                    outside,
+                    Some(PhaseOwner::BindingFailure(Box::new(failure))),
+                    TeardownRunPhase::Binding,
+                    TeardownRunRefusal::Binding,
+                );
+            }
+            Err(_) => return unknown(outside, None, TeardownRunPhase::Binding),
+        };
+        if let Err(refusal) = outside.remaining() {
             return held(
                 outside,
-                Some(PhaseOwner::BindingFailure(Box::new(failure))),
+                Some(PhaseOwner::Guarded(Box::new(guarded))),
                 TeardownRunPhase::Binding,
-                TeardownRunRefusal::Binding,
+                refusal,
             );
         }
-        Err(_) => return unknown(outside, None, TeardownRunPhase::Binding),
-    };
-    if let Err(refusal) = outside.remaining() {
-        return held(
-            outside,
-            Some(PhaseOwner::Guarded(Box::new(guarded))),
-            TeardownRunPhase::Binding,
-            refusal,
-        );
-    }
-    outside.attempts.binding = true;
-    let bound = match catch_unwind(AssertUnwindSafe(|| guarded.remove_binding(&mut reader))) {
-        Ok(Ok(bound)) => bound,
-        Ok(Err(failure)) => {
-            outside.binding = failure.binding_receipt().cloned();
+        outside.attempts.binding = true;
+        let bound = match catch_unwind(AssertUnwindSafe(|| guarded.remove_binding(&mut reader))) {
+            Ok(Ok(bound)) => bound,
+            Ok(Err(failure)) => {
+                outside.binding = failure.binding_receipt().cloned();
+                return held(
+                    outside,
+                    Some(PhaseOwner::BindingFailure(Box::new(failure))),
+                    TeardownRunPhase::Binding,
+                    TeardownRunRefusal::Binding,
+                );
+            }
+            Err(_) => return unknown(outside, None, TeardownRunPhase::Binding),
+        };
+        outside.binding = Some(bound.binding_receipt().clone());
+        if let Err(refusal) = outside.remaining() {
             return held(
                 outside,
-                Some(PhaseOwner::BindingFailure(Box::new(failure))),
-                TeardownRunPhase::Binding,
-                TeardownRunRefusal::Binding,
+                Some(PhaseOwner::Bound(Box::new(bound))),
+                TeardownRunPhase::FinishAdmission,
+                refusal,
             );
         }
-        Err(_) => return unknown(outside, None, TeardownRunPhase::Binding),
-    };
-    outside.binding = Some(bound.binding_receipt().clone());
-    if let Err(refusal) = outside.remaining() {
-        return held(
-            outside,
-            Some(PhaseOwner::Bound(Box::new(bound))),
-            TeardownRunPhase::FinishAdmission,
-            refusal,
-        );
-    }
-    let (finish, operational) =
         match catch_unwind(AssertUnwindSafe(|| bound.into_finish(&mut reader))) {
             Ok(Ok(pair)) => pair,
             Ok(Err(failure)) => {
@@ -631,7 +673,8 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
                 );
             }
             Err(_) => return unknown(outside, None, TeardownRunPhase::FinishAdmission),
-        };
+        }
+    };
     if !Arc::ptr_eq(
         &operational,
         outside.carrier.as_ref().expect("original carrier"),
@@ -753,7 +796,7 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
             .into_report(),
         attempts: std::mem::take(&mut outside.attempts),
         publication: outside.publication.take().expect("actual publication"),
-        binding: outside.binding.take().expect("actual binding removal"),
+        binding: outside.binding.take(),
         retirement: retirement.receipt,
     };
     drop(retirement.owned);

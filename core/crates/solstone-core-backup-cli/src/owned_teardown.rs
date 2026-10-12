@@ -6,11 +6,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use solstone_core_backup::archive_admission::ArchiveCancellation;
+use solstone_core_backup_runtime::teardown::owned::{StorageKeeps, StorageRetention};
 use solstone_core_backup_runtime::teardown_admission::{
     TeardownAdmissionRefusal, TeardownCarrierRefusal, TeardownReaderRefusal,
 };
 use solstone_core_offload::teardown::{
-    OwnedTeardownOutcome, TeardownRunRefusal, run_owned_teardown,
+    OwnedTeardownOutcome, TeardownRunRefusal, run_owned_teardown, storage_retention_sentence,
 };
 
 use super::{CliRun, ProductionClock};
@@ -18,9 +19,12 @@ use super::{CliRun, ProductionClock};
 pub(super) const PRELAUNCH_HELD: &str =
     "turning off and deleting your backup isn't available here. no backup changes were made.";
 pub(super) const BACKUP_ONLY_HELD: &str = "your backup holds the only copy of some of your media, so no backup changes were made. restore everything from the backup page first, then try again.";
-pub(super) const DESTINATION_UNSUPPORTED: &str = "turning off and deleting your backup here only works for encrypted backup operated by sol pbc. no backup changes were made.";
+pub(super) const DESTINATION_UNSUPPORTED: &str = "your backup's settings are incomplete, so your journal can't reach it, and no backup changes were made.";
+pub(super) const TOOL_UNAVAILABLE: &str =
+    "the backup program that comes with your journal is missing, so no backup changes were made.";
 pub(super) const BACKUP_ONLY_UNPLACED: &str = "your backup holds the only copy of some older media that can't be matched to a recording on this device, so it can't be restored and no backup changes were made. if your journal was moved or copied, bring back its missing days, then try again.";
 pub(super) const OFFLOAD_RECORD_UNAVAILABLE: &str = "the record of what media offload moved into your backup is missing or can't be read, so no backup changes were made. if your journal was moved or copied, bring back its health folder, then try again.";
+pub(super) const STORAGE_UNREACHED: &str = "turning off and deleting your backup stopped before anything was deleted, so it's safe to try again.";
 pub(super) const NOT_STARTED: &str =
     "turning off and deleting your backup couldn't start. no backup changes were made.";
 
@@ -88,6 +92,29 @@ fn coverage_refusal(outcome: &OwnedTeardownOutcome) -> Option<(&'static str, &'s
     }
 }
 
+/// The remote leg stopped before any delete, and no local phase ran.
+pub(super) fn nothing_deleted(outcome: &OwnedTeardownOutcome) -> bool {
+    let attempts = outcome.attempts();
+    matches!(outcome.refusal(), Some(TeardownRunRefusal::Remote(_)))
+        && outcome
+            .remote()
+            .is_some_and(|remote| remote.delete_attempts() == 0 && remote.abort_attempts() == 0)
+        && !attempts.clear()
+        && !attempts.binding()
+        && !attempts.retirement()
+}
+
+fn retention_code(retention: StorageRetention) -> &'static str {
+    match retention {
+        StorageRetention::Removes => "removes",
+        StorageRetention::Keeps(StorageKeeps::Versions) => "keeps_versions",
+        StorageRetention::Keeps(StorageKeeps::ObjectLock) => "keeps_object_lock",
+        StorageRetention::Keeps(StorageKeeps::FileLock) => "keeps_file_lock",
+        StorageRetention::Keeps(StorageKeeps::HiddenFiles) => "keeps_hidden_files",
+        StorageRetention::Unknown => "unknown",
+    }
+}
+
 fn reason(outcome: &OwnedTeardownOutcome) -> &'static str {
     if let Some((reason, _)) = coverage_refusal(outcome) {
         return reason;
@@ -95,6 +122,7 @@ fn reason(outcome: &OwnedTeardownOutcome) -> &'static str {
     match outcome.refusal() {
         Some(TeardownRunRefusal::UnsupportedPlatform) => "platform_unavailable",
         Some(TeardownRunRefusal::UnsupportedDestination) => "destination_unavailable",
+        Some(TeardownRunRefusal::ToolUnavailable) => "restic_unavailable",
         Some(TeardownRunRefusal::Root(_)) => "journal_unavailable",
         Some(TeardownRunRefusal::Budget(_)) => "deadline_unavailable",
         Some(TeardownRunRefusal::Admission(_)) => "admission_refused",
@@ -121,6 +149,9 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
         writeln!(stdout, "delete_attempts={} delete_confirmations={} abort_attempts={} abort_confirmations={} objects_empty={} uploads_empty={}",
             remote.delete_attempts(), remote.delete_confirmations(), remote.abort_attempts(),
             remote.abort_confirmations(), remote.objects_empty(), remote.uploads_empty()).unwrap();
+        if let Some(retention) = remote.storage_retention() {
+            writeln!(stdout, "storage_retention={}", retention_code(retention)).unwrap();
+        }
     }
     let attempts = outcome.attempts();
     writeln!(
@@ -153,7 +184,13 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
         .unwrap();
     }
     let stderr = if exit_code == 0 {
-        String::new()
+        // Own storage was emptied, but the owner's bucket may still keep it.
+        outcome
+            .remote()
+            .and_then(|remote| remote.storage_retention())
+            .and_then(storage_retention_sentence)
+            .map(|sentence| format!("{sentence}\n"))
+            .unwrap_or_default()
     } else if outcome.phase() == solstone_core_offload::teardown::TeardownRunPhase::Prelaunch {
         format!("{PRELAUNCH_HELD}\n")
     } else if outcome.refused_before_effects() {
@@ -164,10 +201,14 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
             Some(TeardownRunRefusal::UnsupportedDestination)
         ) {
             DESTINATION_UNSUPPORTED
+        } else if matches!(outcome.refusal(), Some(TeardownRunRefusal::ToolUnavailable)) {
+            TOOL_UNAVAILABLE
         } else {
             NOT_STARTED
         };
         format!("{message}\n")
+    } else if nothing_deleted(outcome) {
+        format!("{STORAGE_UNREACHED}\n")
     } else {
         "backup teardown did not finish. keep recovery files and review the recorded effects before retrying.\n".into()
     };

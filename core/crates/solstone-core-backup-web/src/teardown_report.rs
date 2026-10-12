@@ -42,6 +42,7 @@ pub(crate) fn outcome(owner: &OwnedTeardownOutcome) -> Value {
             "delete_attempts":remote.delete_attempts(), "delete_confirmations":remote.delete_confirmations(),
             "abort_attempts":remote.abort_attempts(), "abort_confirmations":remote.abort_confirmations(),
             "objects_empty":remote.objects_empty(), "uploads_empty":remote.uploads_empty(),
+            "storage_retention":remote.storage_retention().map(|retention| format!("{retention:?}")),
         })),
         "attempts":{"clear":owner.attempts().clear(), "binding":owner.attempts().binding(), "retirement":owner.attempts().retirement()},
         "publication":owner.publication().map(|receipt| json!({
@@ -98,6 +99,7 @@ fn run_refusal(value: &TeardownRunRefusal) -> Value {
     match value {
         TeardownRunRefusal::UnsupportedPlatform => json!({"kind":"unsupported_platform"}),
         TeardownRunRefusal::UnsupportedDestination => json!({"kind":"unsupported_destination"}),
+        TeardownRunRefusal::ToolUnavailable => json!({"kind":"tool_unavailable"}),
         TeardownRunRefusal::Root(_) => json!({"kind":"root"}),
         TeardownRunRefusal::Budget(reason) => json!({"kind":"budget", "reason":budget(*reason)}),
         TeardownRunRefusal::Admission(reason) => admission(*reason),
@@ -173,6 +175,8 @@ fn remote_refusal(value: &TeardownRemoteRefusal) -> Value {
             solstone_core_backup_runtime::hosted_runtime::HttpError::Other => "other",
         }}),
         TeardownRemoteRefusal::HttpStatus(status) => json!({"kind":"http_status", "status":status}),
+        TeardownRemoteRefusal::DestinationUnavailable => json!({"kind":"destination_unavailable"}),
+        TeardownRemoteRefusal::Restic(reason) => json!({"kind":"restic", "reason":reason}),
         TeardownRemoteRefusal::Protocol(reason) => {
             json!({"kind":"protocol", "reason":match reason {
                 TeardownProtocolRefusal::Malformed => "malformed", TeardownProtocolRefusal::Limit => "limit", TeardownProtocolRefusal::Namespace => "namespace", TeardownProtocolRefusal::Pagination => "pagination", TeardownProtocolRefusal::Acknowledgment => "acknowledgment",

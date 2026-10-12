@@ -10,7 +10,8 @@ use super::*;
 pub struct TeardownFinishAdmission {
     lease: Arc<TeardownLease>,
     configuration: TeardownConfiguration,
-    binding: BindingFinalization,
+    /// None for own storage, which never had a hosted binding.
+    binding: Option<BindingFinalization>,
     publication: Arc<BoundConfigPublication>,
 }
 
@@ -39,7 +40,56 @@ impl BoundTeardownAdmission {
             TeardownFinishAdmission {
                 lease,
                 configuration,
-                binding,
+                binding: Some(binding),
+                publication,
+            },
+            carrier,
+        ))
+    }
+}
+
+impl ClearedTeardownAdmission {
+    /// Own storage carries no hosted binding to remove. Finish directly, once the
+    /// configuration captured without one is still the published clear.
+    pub fn into_finish_without_binding(
+        self,
+        reader: &mut TeardownReader<'_>,
+    ) -> Result<(TeardownFinishAdmission, Arc<RootTeardownCarrier>), TeardownBindingFailure> {
+        if self.configuration().binding().is_some() {
+            return Err(TeardownBindingFailure::cleared(
+                self,
+                TeardownBindingRefusal::Binding(BindingFinalizationRefusal::BindingChanged),
+            ));
+        }
+        if let Err(refusal) = self.check(reader) {
+            return Err(TeardownBindingFailure::cleared(
+                self,
+                TeardownBindingRefusal::Admission(refusal),
+            ));
+        }
+        if let Err(refusal) = self
+            .configuration()
+            .revalidate_published_clear(self.publication())
+        {
+            return Err(TeardownBindingFailure::cleared(
+                self,
+                TeardownBindingRefusal::Binding(BindingFinalizationRefusal::Configuration(refusal)),
+            ));
+        }
+        let ClearedTeardownAdmission {
+            admission,
+            publication,
+        } = self;
+        let CarrierTeardownAdmission { admission, carrier } = admission;
+        let TeardownAdmission {
+            lease,
+            configuration,
+        } = admission;
+        Ok((
+            TeardownFinishAdmission {
+                lease,
+                configuration,
+                binding: None,
                 publication,
             },
             carrier,
@@ -57,19 +107,30 @@ impl TeardownFinishAdmission {
     pub fn publication(&self) -> &Arc<BoundConfigPublication> {
         &self.publication
     }
-    pub fn binding_receipt(&self) -> &Arc<BindingRemovalReceipt> {
+    /// The confirmed removal, or None for own storage.
+    pub fn binding_receipt(&self) -> Option<&Arc<BindingRemovalReceipt>> {
         self.binding
-            .receipt()
-            .expect("confirmed binding transition")
+            .as_ref()
+            .map(|binding| binding.receipt().expect("confirmed binding transition"))
     }
 
     pub fn revalidate(&self) -> Result<(), TeardownBindingRefusal> {
         self.lease
             .revalidate()
             .map_err(|error| TeardownBindingRefusal::Admission(activity_refusal(error)))?;
-        self.binding
-            .revalidate_removed()
-            .map_err(TeardownBindingRefusal::Binding)?;
+        match &self.binding {
+            Some(binding) => binding
+                .revalidate_removed()
+                .map_err(TeardownBindingRefusal::Binding)?,
+            None => self
+                .configuration
+                .revalidate_published_clear(&self.publication)
+                .map_err(|refusal| {
+                    TeardownBindingRefusal::Binding(BindingFinalizationRefusal::Configuration(
+                        refusal,
+                    ))
+                })?,
+        }
         self.lease
             .revalidate()
             .map_err(|error| TeardownBindingRefusal::Admission(activity_refusal(error)))

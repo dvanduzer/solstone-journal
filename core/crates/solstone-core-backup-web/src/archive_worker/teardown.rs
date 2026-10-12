@@ -280,9 +280,19 @@ fn execute(
     } else {
         let actual = outcome.as_ref().expect("coordinator returned");
         match actual {
-            OwnedTeardownOutcome::Finished(_) => Terminal::done(),
+            OwnedTeardownOutcome::Finished(settled) => {
+                let mut done = Terminal::done();
+                // Own storage was emptied, but the owner's bucket may still keep it.
+                done.guidance = settled
+                    .remote()
+                    .storage_retention()
+                    .and_then(solstone_core_offload::teardown::storage_retention_sentence)
+                    .map(str::to_owned);
+                done
+            }
             OwnedTeardownOutcome::Held(_) => match unstarted_reason(actual) {
                 Some(reason) => Terminal::error(reason),
+                None if nothing_deleted(actual) => Terminal::error("storage_unreached"),
                 None => Terminal::phase("refused", Some("failed".into())),
             },
             OwnedTeardownOutcome::Unknown(_) => Terminal::error("unknown"),
@@ -297,6 +307,18 @@ fn execute(
         terminal,
         projected: result.is_ok(),
     }
+}
+
+/// The remote leg stopped before any delete, and no local phase ran.
+fn nothing_deleted(outcome: &OwnedTeardownOutcome) -> bool {
+    let attempts = outcome.attempts();
+    matches!(outcome.refusal(), Some(TeardownRunRefusal::Remote(_)))
+        && outcome
+            .remote()
+            .is_some_and(|remote| remote.delete_attempts() == 0 && remote.abort_attempts() == 0)
+        && !attempts.clear()
+        && !attempts.binding()
+        && !attempts.retirement()
 }
 
 /// Owner-actionable refusals that happened before any effect.
@@ -324,6 +346,8 @@ fn unstarted_reason(outcome: &OwnedTeardownOutcome) -> Option<&'static str> {
         Some(TeardownRunRefusal::UnsupportedDestination)
     ) {
         Some("destination_unsupported")
+    } else if matches!(outcome.refusal(), Some(TeardownRunRefusal::ToolUnavailable)) {
+        Some("teardown_tool_unavailable")
     } else {
         None
     }

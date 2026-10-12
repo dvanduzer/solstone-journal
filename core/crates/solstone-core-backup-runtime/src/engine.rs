@@ -499,7 +499,7 @@ enum BackupAdmissionTerminal {
     },
 }
 
-fn value_env(destination: &Destination) -> Option<BTreeMap<String, Option<String>>> {
+pub(crate) fn value_env(destination: &Destination) -> Option<BTreeMap<String, Option<String>>> {
     assemble_backend_env(destination).ok().map(|env| {
         env.into_iter()
             .map(|(key, value)| (key, value.as_str().map(str::to_owned)))
