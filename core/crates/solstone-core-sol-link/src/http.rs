@@ -14,6 +14,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use solstone_core_check::{CheckReport, Severity, build_check_report, gather_host_inputs};
 use solstone_core_convey_http::envelope::{error_envelope, not_found_fallback};
 use solstone_core_convey_http::gate::require_access;
 use solstone_core_convey_http::identity::AccessBasis;
@@ -21,7 +22,9 @@ use solstone_core_journal_config::load_mutation_base;
 use solstone_core_journal_config_write::{
     ConfigMutationError, JournalConfigMutation, mutate_journal_config,
 };
-use solstone_core_thinking_copy::{CONFIDENTIAL_LANE_DETAIL, ConfidentialLaneDetail, LANES, Lane};
+use solstone_core_thinking_copy::{
+    CONFIDENTIAL_LANE_DETAIL, ConfidentialLaneDetail, LANES, Lane, thinking_copy_payload,
+};
 
 use crate::establish::{self, EstablishError};
 use crate::ledger::{AuthorizedClientsRead, read_authorized_clients};
@@ -80,10 +83,17 @@ struct MarkResponse {
     availability: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 struct LocalCapabilityResponse {
     overall: &'static str,
-    checks: [Value; 0],
+    checks: Vec<LocalCapabilityCheck>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct LocalCapabilityCheck {
+    name: &'static str,
+    severity: &'static str,
+    detail: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -237,15 +247,80 @@ async fn init_state(
     .into_response()
 }
 
-async fn init_local_capability(Extension(basis): Extension<AccessBasis>) -> Response {
+async fn init_local_capability(
+    Extension(basis): Extension<AccessBasis>,
+    State(state): State<LinkHttpState>,
+) -> Response {
     if !is_local(&basis) {
         return init_local_only();
     }
-    Json(LocalCapabilityResponse {
-        overall: "unknown",
-        checks: [],
+    let journal_root = state.journal_root.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        build_check_report(&gather_host_inputs(
+            &journal_root,
+            env!("CARGO_PKG_VERSION"),
+        ))
     })
-    .into_response()
+    .await;
+    let capability = match report {
+        Ok(report) => local_capability(&report),
+        Err(error) => {
+            log::warn!("init local capability check did not finish: {error}");
+            LocalCapabilityResponse {
+                overall: "unknown",
+                checks: Vec::new(),
+            }
+        }
+    };
+    Json(capability).into_response()
+}
+
+/// Answer "can this computer run local thinking" from the same platform, GPU and
+/// Mac memory rows `journal setup` reads before it chooses local. Those rows use
+/// the same memory bars the local model install refuses below.
+fn local_capability(report: &CheckReport) -> LocalCapabilityResponse {
+    let rows = || {
+        report
+            .checks
+            .iter()
+            .filter(|check| matches!(check.name, "platform" | "gpu" | "memory"))
+    };
+    if let Some(row) = rows().find(|check| check.severity == Severity::Blocked) {
+        return LocalCapabilityResponse {
+            overall: "blocked",
+            checks: vec![LocalCapabilityCheck {
+                name: "local",
+                severity: "blocked",
+                detail: local_unavailable_reason(row.name),
+            }],
+        };
+    }
+    let overall = if rows().any(|check| check.severity == Severity::Unknown) {
+        "unknown"
+    } else {
+        "ok"
+    };
+    LocalCapabilityResponse {
+        overall,
+        checks: Vec::new(),
+    }
+}
+
+/// The thinking page's own owner copy for the refusal this row predicts.
+fn local_unavailable_reason(row: &str) -> String {
+    let pointer = match row {
+        "gpu" => "/local_recovery/states/gpu_memory_insufficient/reason",
+        "memory" => "/local_install/memory_failed",
+        _ => "/local_recovery/states/unsupported/reason",
+    };
+    serde_json::to_value(thinking_copy_payload())
+        .ok()
+        .and_then(|copy| {
+            copy.pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 async fn init(
@@ -644,5 +719,110 @@ mod access_tests {
         assert!(!is_local(&AccessBasis::PairingPeer {
             carrier: Carrier::Direct,
         }));
+    }
+}
+
+#[cfg(test)]
+mod local_capability_tests {
+    use super::local_capability;
+    use solstone_core_check::{
+        CheckInputs, DiskInput, MemoryInput, NvidiaInput, PlatformInput, RfdetrCheckInput,
+        VulkanInput, build_check_report,
+    };
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn inputs(os: &str, arch: &str, memory_bytes: Option<u64>) -> CheckInputs {
+        CheckInputs {
+            platform: PlatformInput {
+                os: os.into(),
+                os_version: "x".into(),
+                arch: arch.into(),
+            },
+            memory: MemoryInput {
+                total_bytes: memory_bytes,
+                available_bytes: memory_bytes,
+            },
+            disk: DiskInput::Ok {
+                free_bytes: 100 * GIB,
+            },
+            journal_path: "/journal".into(),
+            nvidia: NvidiaInput {
+                detected: false,
+                vram_mib: None,
+                tiering_memory_mib: None,
+                memory_source: "unavailable".into(),
+            },
+            vulkan: VulkanInput {
+                probe_ok: true,
+                devices: vec![],
+            },
+            render_nodes_present_but_inaccessible: false,
+            gpu_evaluation_error: None,
+            version: "x".into(),
+            ced: None,
+            rfdetr: RfdetrCheckInput::Omit,
+        }
+    }
+
+    fn linux_with_nvidia(vram_mib: Option<u64>) -> CheckInputs {
+        let mut inputs = inputs("Linux", "x86_64", Some(32 * GIB));
+        inputs.nvidia = NvidiaInput {
+            detected: true,
+            vram_mib,
+            tiering_memory_mib: vram_mib,
+            memory_source: "nvidia_vram".into(),
+        };
+        inputs
+    }
+
+    fn verdict(inputs: &CheckInputs) -> &'static str {
+        local_capability(&build_check_report(inputs)).overall
+    }
+
+    #[test]
+    fn a_mac_below_the_memory_bar_is_refused_with_a_reason() {
+        let capability = local_capability(&build_check_report(&inputs(
+            "Darwin",
+            "arm64",
+            Some(8 * GIB),
+        )));
+        assert_eq!(capability.overall, "blocked");
+        assert!(
+            capability
+                .checks
+                .iter()
+                .any(|check| check.severity == "blocked" && !check.detail.is_empty()),
+            "a refusal carries the reason the page shows: {capability:?}"
+        );
+        assert_eq!(verdict(&inputs("Darwin", "arm64", Some(32 * GIB))), "ok");
+    }
+
+    #[test]
+    fn a_gpu_below_the_memory_bar_is_refused_with_a_reason() {
+        let capability = local_capability(&build_check_report(&linux_with_nvidia(Some(4096))));
+        assert_eq!(capability.overall, "blocked");
+        assert!(
+            capability
+                .checks
+                .iter()
+                .any(|check| check.severity == "blocked" && !check.detail.is_empty()),
+            "a refusal carries the reason the page shows: {capability:?}"
+        );
+        assert_eq!(verdict(&linux_with_nvidia(Some(12 * 1024))), "ok");
+    }
+
+    #[test]
+    fn a_host_without_a_hardware_gpu_is_refused() {
+        assert_eq!(
+            verdict(&inputs("Linux", "x86_64", Some(32 * GIB))),
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn unreadable_hardware_stays_unknown() {
+        assert_eq!(verdict(&linux_with_nvidia(None)), "unknown");
+        assert_eq!(verdict(&inputs("Darwin", "arm64", None)), "unknown");
     }
 }
