@@ -490,9 +490,17 @@ fn run_depict(
         .map_err(|error| DepictError::Output(error.to_string()))?;
     let input = InputObservation::capture(&claims, image_path)
         .map_err(|error| DepictError::Output(error.to_string()))?;
+    let admitted = !redo
+        && solstone_core_system::work_retry::raw::consume_for_output(
+            &output_path,
+            vocab::HANDLER_DEPICT,
+        )
+        .map_err(DepictError::Output)?;
     if !redo && output_path.exists() {
         let record = read_processing_record_header(&output_path);
-        if !should_reenter_analysis_output(record.as_ref(), &output_path, vocab::HANDLER_DEPICT) {
+        if !admitted
+            && !should_reenter_analysis_output(record.as_ref(), &output_path, vocab::HANDLER_DEPICT)
+        {
             return Ok(RunOutcome::Skipped);
         }
     }
@@ -567,6 +575,12 @@ fn run_depict(
             "input_size": source.len() as u64,
         }),
     );
+    solstone_core_system::work_retry::raw::stamp_attempt(
+        header
+            .get_mut("_solstone_processing")
+            .expect("processing record"),
+    )
+    .map_err(DepictError::Output)?;
     let mut entry = Map::new();
     entry.insert("start".to_owned(), Value::String("00:00:00".to_owned()));
     entry.insert("text".to_owned(), Value::String(description));
@@ -685,6 +699,13 @@ fn failure_document(
             "attempts": attempts,
         }),
     );
+    solstone_core_system::work_retry::raw::stamp_failed_input(
+        header
+            .get_mut("_solstone_processing")
+            .expect("failed record"),
+        image_path,
+    )
+    .map_err(DepictError::Output)?;
     Ok(header)
 }
 
@@ -1628,6 +1649,108 @@ mod tests {
         );
         assert_eq!(wire.calls.load(Ordering::SeqCst), 0);
         assert_eq!(processing_record(&output)["attempts"], 1);
+    }
+
+    #[test]
+    fn owner_readmission_reaches_native_vision_once_without_resetting_failed_output() {
+        use solstone_core_system::work_retry::{self, raw};
+        let _env = lock_depict_env();
+        let root = tempfile::tempdir().unwrap();
+        let segment = root.path().join("chronicle/20260101/photos/123456_300");
+        fs::create_dir_all(&segment).unwrap();
+        let image = segment.join("photo.png");
+        ImageBuffer::<Rgb<u8>, _>::from_pixel(4, 4, Rgb([255, 0, 0]))
+            .save(&image)
+            .unwrap();
+        let output = image.with_extension("jsonl");
+        let wire = CountingFailWire::new();
+        for _ in 0..3 {
+            assert!(run_with_clients(&image, false, &wire, &NoDetector).is_err());
+        }
+        assert_eq!(
+            run_with_clients(&image, false, &wire, &NoDetector).unwrap(),
+            RunOutcome::Skipped
+        );
+        let evidence = raw::inspect_output(root.path(), &output).unwrap().unwrap();
+        raw::observe(root.path(), &evidence).unwrap();
+        let id = evidence.unit.id().unwrap();
+        assert!(
+            work_retry::read(root.path(), &id)
+                .unwrap()
+                .unwrap()
+                .permission(&evidence.input, &[])
+                .is_none()
+        );
+        work_retry::request(root.path(), &evidence.unit).unwrap();
+        let attempt = work_retry::read(root.path(), &id)
+            .unwrap()
+            .unwrap()
+            .permission(&evidence.input, &[])
+            .unwrap();
+        temp_env::with_vars(
+            [
+                (raw::JOURNAL_ENV, Some(root.path().to_str().unwrap())),
+                (raw::UNIT_ENV, Some(id.as_str())),
+                (raw::CAUSE_ENV, Some(attempt.cause.as_str())),
+                (
+                    raw::ATTEMPT_ENV,
+                    Some(serde_json::to_string(&attempt).unwrap().as_str()),
+                ),
+            ],
+            || {
+                let selected_output = fs::read(&output).unwrap();
+                fs::remove_file(&output).unwrap();
+                assert!(run_with_clients(&image, false, &wire, &NoDetector).is_err());
+                assert_eq!(wire.calls.load(Ordering::SeqCst), 3);
+                assert!(
+                    work_retry::read(root.path(), &id)
+                        .unwrap()
+                        .unwrap()
+                        .attempt
+                        .is_none()
+                );
+                fs::write(&output, selected_output).unwrap();
+                let selected_bytes = fs::read(&image).unwrap();
+                fs::write(&image, b"changed after selection").unwrap();
+                assert!(run_with_clients(&image, false, &wire, &NoDetector).is_err());
+                assert_eq!(wire.calls.load(Ordering::SeqCst), 3);
+                assert!(
+                    work_retry::read(root.path(), &id)
+                        .unwrap()
+                        .unwrap()
+                        .attempt
+                        .is_none()
+                );
+                fs::write(&image, selected_bytes).unwrap();
+                assert!(run_with_clients(&image, false, &wire, &NoDetector).is_err());
+                assert_eq!(wire.calls.load(Ordering::SeqCst), 4);
+                assert_eq!(processing_record(&output)["attempts"], 4);
+                assert!(run_with_clients(&image, false, &wire, &NoDetector).is_err());
+                assert_eq!(wire.calls.load(Ordering::SeqCst), 4);
+            },
+        );
+        assert!(
+            work_retry::read(root.path(), &id)
+                .unwrap()
+                .unwrap()
+                .attempt
+                .is_some(),
+            "a missing terminal receipt remains interrupted, not fresh permission"
+        );
+        assert!(
+            work_retry::read(root.path(), &id)
+                .unwrap()
+                .unwrap()
+                .permission(&evidence.input, &[])
+                .is_none()
+        );
+        raw::finish_output(root.path(), &evidence.unit, &attempt).unwrap();
+        let finished = work_retry::read(root.path(), &id).unwrap().unwrap();
+        assert!(finished.held);
+        assert!(
+            finished.attempt.is_none(),
+            "a failed native publication is a terminal receipt too"
+        );
     }
 
     #[test]

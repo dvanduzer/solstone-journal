@@ -20,7 +20,7 @@ pub(crate) fn run(
     from_scratch: bool,
     max_concurrency: i64,
 ) -> Result<ModeResult, String> {
-    let configs = load_talent_configs(
+    let mut configs = load_talent_configs(
         &context.talent_root,
         &context.apps_root,
         solstone_core_talent_config::read_talent_overrides(&context.journal)?.as_ref(),
@@ -30,6 +30,10 @@ pub(crate) fn run(
             include_disabled: false,
         },
     )?;
+    if let Some((solstone_core_system::work_retry::Unit::Daily { talent, .. }, _)) = &context.retry
+    {
+        configs.retain(|config| &config.key == talent);
+    }
     if configs.is_empty() {
         return Ok(ModeResult::default());
     }
@@ -81,6 +85,12 @@ pub(crate) fn run(
                     .cloned(),
             );
         }
+    }
+    if let Some((solstone_core_system::work_retry::Unit::Daily { talent, facet, .. }, _)) =
+        &context.retry
+        && talent != "daily_schedule"
+    {
+        write_facets.retain(|name| facet.as_ref() == Some(name));
     }
     for facet in write_facets {
         solstone_core_facets::ensure_daily_facet_id(&context.journal, &facet)?;
@@ -245,6 +255,19 @@ fn queue_daily(
     pending: &mut Vec<PendingUse>,
     result: &mut ModeResult,
 ) -> Result<(), String> {
+    let retry_unit = solstone_core_system::work_retry::Unit::Daily {
+        day: context.day.clone(),
+        talent: config.key.clone(),
+        facet: facet.map(str::to_owned),
+    };
+    if context
+        .retry
+        .as_ref()
+        .is_some_and(|(unit, _)| unit.id().ok() != retry_unit.id().ok())
+    {
+        return Ok(());
+    }
+    let grant = context.retry.as_ref().map(|(_, attempt)| attempt);
     let unit = (config.key.clone(), facet.map(ToOwned::to_owned));
     if config.key != "daily_schedule" {
         result.applicable_units.insert(unit.clone());
@@ -267,7 +290,7 @@ fn queue_daily(
     let existing_record =
         solstone_core_journal_io::load_daily_unit_record(&context.journal, &identity)
             .map_err(|e| e.to_string())?;
-    let retry = config.metadata.get("retry_on_deterministic_failure") == Some(&Value::Bool(true));
+    let retry = grant.is_some();
     if let Some(record) = &existing_record {
         if record.has_uncommitted_started_receipt() {
             // An in-doubt started write cannot be automatically retried, reset, or wiped.
@@ -300,15 +323,10 @@ fn queue_daily(
                 log_skip(log, context, &config.key, reason, facet);
                 return Ok(());
             }
-            if !retry
-                && record.evidence_revision == evidence_rev
-                && record.contract_digest == contract_dig
-                && record.status == solstone_core_journal_io::DailyUnitStatus::Capped
-                && !(record
-                    .reason_code
-                    .as_deref()
-                    .is_some_and(solstone_core_system::daily_coverage::environmental_failure)
-                    && record.environmental_retry_day.as_deref() != Some(&today))
+            if (record.status == solstone_core_journal_io::DailyUnitStatus::Capped
+                || solstone_core_system::work_retry::read(&context.journal, &retry_unit.id()?)?
+                    .is_some_and(|r| r.held))
+                && grant.is_none()
             {
                 result.terminal_units.insert(unit.clone());
                 result.capped_units.insert(unit);
@@ -350,6 +368,17 @@ fn queue_daily(
             Value::String(contract_dig.clone()),
         ),
     ]);
+    if let Some(attempt) = grant {
+        if evidence.retry_revision_under(solstone_core_system::work_retry::daily::INPUT_CONTRACT)
+            != attempt.input
+        {
+            return Err("daily retry input changed".into());
+        }
+        extra.insert(
+            "_work_retry".into(),
+            serde_json::to_value((&retry_unit, attempt)).map_err(|e| e.to_string())?,
+        );
+    }
     if config.key == "daily_schedule" {
         extra.insert("day".to_owned(), Value::String(today.clone()));
     }
@@ -508,6 +537,7 @@ pub(crate) fn reserve_daily_attempt(
     retry: bool,
     now_ms: i64,
 ) -> Result<(), solstone_core_journal_io::DailyUnitError> {
+    let _execution = solstone_core_journal_io::claim_daily_execution(journal, identity)?;
     solstone_core_journal_io::with_locked_daily_unit_record(journal, identity, |slot| {
         let mut record = slot.take().unwrap_or_else(|| {
             solstone_core_journal_io::DailyUnitRecord::new(
@@ -559,8 +589,7 @@ pub(crate) fn reserve_daily_attempt(
             }
         }
 
-        if same
-            && !from_scratch
+        if !from_scratch
             && !retry
             && (record.status == solstone_core_journal_io::DailyUnitStatus::Capped
                 || record.reason_code.as_deref().is_some_and(|reason| {
@@ -570,16 +599,9 @@ pub(crate) fn reserve_daily_attempt(
                     )
                 }))
         {
-            let environmental = record
-                .reason_code
-                .as_deref()
-                .is_some_and(solstone_core_system::daily_coverage::environmental_failure);
-            if !environmental || record.environmental_retry_day.as_deref() == Some(today) {
-                return Err(solstone_core_journal_io::DailyUnitError::Malformed(
-                    "daily retry allowance already consumed".to_owned(),
-                ));
-            }
-            record.environmental_retry_day = Some(today.to_owned());
+            return Err(solstone_core_journal_io::DailyUnitError::Malformed(
+                "daily retry allowance already consumed".to_owned(),
+            ));
         }
         if identity.name == "daily_schedule"
             && record
@@ -883,93 +905,123 @@ mod tests {
     }
 
     #[test]
-    fn capped_environmental_retry_is_one_durable_reservation_per_day_even_concurrently() {
+    fn calendar_contract_and_concurrent_reservations_never_reset_a_cap() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let identity = DailyUnitIdentity::new("20260910", "schedule", None);
-        let mut record = DailyUnitRecord::new(identity.clone(), "E", "C");
-        record.status = DailyUnitStatus::Capped;
-        record.failure_count = 1;
-        record.reason_code = Some("model_not_found".to_owned());
-        save_daily_unit_record(root, &record).unwrap();
-        let successes = std::thread::scope(|scope| {
-            let handles = (0..2)
-                .map(|i| {
+        for reason in [
+            "model_not_found",
+            "provider_request_rejected",
+            "schema_invalid",
+        ] {
+            let mut record = DailyUnitRecord::new(identity.clone(), "E", "C");
+            record.status = DailyUnitStatus::Capped;
+            record.reason_code = Some(reason.into());
+            record.failure_count = 3;
+            save_daily_unit_record(root, &record).unwrap();
+            std::thread::scope(|scope| {
+                for contract in ["C", "new-contract"] {
                     let identity = &identity;
                     scope.spawn(move || {
-                        reserve_daily_attempt(
-                            root,
-                            identity,
-                            "E",
-                            "C",
-                            &json!({"packet":"original"}),
-                            "20260914",
-                            &format!("use-{i}"),
-                            false,
-                            false,
-                            1,
-                        )
-                        .is_ok()
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap() as usize)
-                .sum::<usize>()
-        });
-        assert_eq!(successes, 1);
-        assert!(
-            reserve_daily_attempt(
-                root,
-                &identity,
-                "E",
-                "C",
-                &json!({}),
-                "20260914",
-                "restart",
-                false,
-                false,
-                2
-            )
-            .is_err()
+                        assert!(
+                            reserve_daily_attempt(
+                                root,
+                                identity,
+                                "E",
+                                contract,
+                                &json!({}),
+                                "20261011",
+                                "new",
+                                false,
+                                false,
+                                1
+                            )
+                            .is_err()
+                        );
+                    });
+                }
+            });
+            let held = load_daily_unit_record(root, &identity).unwrap().unwrap();
+            assert_eq!(held.status, DailyUnitStatus::Capped);
+            assert_eq!(held.failure_count, 3);
+        }
+    }
+
+    fn permit_owner_daily(context: &ThinkContext, identity: &DailyUnitIdentity) -> ThinkContext {
+        use solstone_core_system::work_retry::{self, Unit};
+        let unit = Unit::Daily {
+            day: context.day.clone(),
+            talent: identity.name.clone(),
+            facet: identity.facet.clone(),
+        };
+        let record = load_daily_unit_record(&context.journal, identity)
+            .unwrap()
+            .unwrap();
+        let evidence = work_retry::daily::evidence_with_roots(
+            &context.journal,
+            &unit,
+            &context.talent_root,
+            &context.apps_root,
+        )
+        .unwrap();
+        let input = evidence.retry_revision_under(work_retry::daily::INPUT_CONTRACT);
+        work_retry::observe_held(
+            &context.journal,
+            &unit,
+            record.reason_code.as_deref().unwrap(),
+            &input,
+        )
+        .unwrap();
+        work_retry::request(&context.journal, &unit).unwrap();
+        let grant = work_retry::read(&context.journal, &unit.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .unwrap();
+        assert!(grant.cause.starts_with("owner:"));
+        let mut context = context.clone();
+        context.retry = Some((unit, grant));
+        context
+    }
+
+    fn permit_changed_daily(context: &ThinkContext, identity: &DailyUnitIdentity) -> ThinkContext {
+        use solstone_core_system::work_retry::{self, Unit};
+        let unit = Unit::Daily {
+            day: context.day.clone(),
+            talent: identity.name.clone(),
+            facet: identity.facet.clone(),
+        };
+        let record = load_daily_unit_record(&context.journal, identity)
+            .unwrap()
+            .unwrap();
+        let evidence = work_retry::daily::evidence_with_roots(
+            &context.journal,
+            &unit,
+            &context.talent_root,
+            &context.apps_root,
+        )
+        .unwrap();
+        assert_ne!(
+            evidence.revision_under(&record.contract_digest),
+            record.evidence_revision
         );
-        assert!(
-            reserve_daily_attempt(
-                root,
-                &identity,
-                "E",
-                "C",
-                &json!({}),
-                "20260915",
-                "tomorrow",
-                false,
-                false,
-                3
-            )
-            .is_ok()
-        );
-        let loaded = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(loaded.environmental_retry_day.as_deref(), Some("20260915"));
-        assert_eq!(loaded.frozen_packet, Some(json!({"packet":"original"})));
-        assert!(
-            reserve_daily_attempt(
-                root,
-                &identity,
-                "E",
-                "new-contract",
-                &json!({"packet":"new"}),
-                "20260915",
-                "new",
-                false,
-                false,
-                4
-            )
-            .is_ok()
-        );
-        let loaded = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(loaded.failure_count, 0);
-        assert_eq!(loaded.frozen_packet, Some(json!({"packet":"new"})));
+        work_retry::observe_held(
+            &context.journal,
+            &unit,
+            record.reason_code.as_deref().unwrap(),
+            &record.evidence_revision,
+        )
+        .unwrap();
+        let current = evidence.retry_revision_under(work_retry::daily::INPUT_CONTRACT);
+        let grant = work_retry::read(&context.journal, &unit.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .permission(&current, work_retry::DECLARED_FIXES)
+            .unwrap();
+        assert!(grant.cause.starts_with("input:"));
+        let mut context = context.clone();
+        context.retry = Some((unit, grant));
+        context
     }
 
     // AC: 2026-09-21, a real suze `morning_briefing` failure. Before this fix, the
@@ -1119,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_request_rejected_multi_day_fold_preserves_reservation_day_and_allows_next_day() {
+    fn provider_request_rejected_multi_day_fold_preserves_cap_across_days() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("config")).unwrap();
@@ -1173,7 +1225,7 @@ mod tests {
         assert_eq!(loaded.attempt_day.as_deref(), Some(day1));
         assert_eq!(loaded.environmental_retry_day.as_deref(), Some(day1));
 
-        // One reserve on "20260915" succeeds
+        // A new calendar day does not grant retry permission.
         let second = reserve_daily_attempt(
             root,
             &identity,
@@ -1186,7 +1238,10 @@ mod tests {
             false,
             2,
         );
-        assert!(second.is_ok(), "reservation on next day failed: {second:?}");
+        assert!(
+            second.is_err(),
+            "calendar day minted permission: {second:?}"
+        );
 
         // A second reserve on "20260915" fails
         let third = reserve_daily_attempt(
@@ -1417,117 +1472,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_request_rejected_concurrent_reserves_on_next_day_yield_one_winner() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let day = "20260914";
-        let next_day = "20260915";
-        let identity = DailyUnitIdentity::new(day, "schedule", None);
-        let mut record = DailyUnitRecord::new(identity.clone(), "E", "C");
-        record.status = DailyUnitStatus::Capped;
-        record.failure_count = 1;
-        record.reason_code = Some("provider_request_rejected".to_owned());
-        record.attempt_day = Some(day.to_owned());
-        record.environmental_retry_day = Some(day.to_owned());
-        save_daily_unit_record(root, &record).unwrap();
-
-        let results = std::thread::scope(|scope| {
-            let handles = (0..2)
-                .map(|i| {
-                    let identity = &identity;
-                    let use_id = format!("use-next-{i}");
-                    scope.spawn(move || {
-                        (
-                            use_id.clone(),
-                            reserve_daily_attempt(
-                                root,
-                                identity,
-                                "E",
-                                "C",
-                                &json!({"packet":"retry"}),
-                                next_day,
-                                &use_id,
-                                false,
-                                false,
-                                2,
-                            )
-                            .is_ok(),
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        let success_count = results.iter().filter(|(_, ok)| *ok).count();
-        assert_eq!(success_count, 1);
-        let (winner_use_id, _) = results.iter().find(|(_, ok)| *ok).unwrap().clone();
-        let (loser_use_id, _) = results.iter().find(|(_, ok)| !*ok).unwrap().clone();
-
-        assert!(
-            reserve_daily_attempt(
-                root,
-                &identity,
-                "E",
-                "C",
-                &json!({"packet":"retry"}),
-                next_day,
-                "use-later",
-                false,
-                false,
-                2,
-            )
-            .is_err()
-        );
-
-        let loaded = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(loaded.use_id.as_deref(), Some(winner_use_id.as_str()));
-
-        let context = ThinkContext::new(
-            root,
-            day.to_owned(),
-            root.join("chronicle").join(day),
-            1_000_000,
-        )
-        .unwrap();
-        let mut log = RunLogWriter::open(root, day, "daily");
-        let loser_pending = PendingUse {
-            name: "schedule".to_owned(),
-            facet: None,
-            use_id: loser_use_id,
-        };
-        log_daily_terminal(
-            &mut log,
-            &context,
-            &loser_pending,
-            DrainOutcome::fail("error", "provider_request_rejected"),
-        );
-
-        let winner_pending = PendingUse {
-            name: "schedule".to_owned(),
-            facet: None,
-            use_id: winner_use_id.clone(),
-        };
-        log_daily_terminal(
-            &mut log,
-            &context,
-            &winner_pending,
-            DrainOutcome::fail("error", "provider_request_rejected"),
-        );
-        log.finish().unwrap();
-
-        let final_loaded = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(final_loaded.use_id.as_deref(), Some(winner_use_id.as_str()));
-        assert_eq!(final_loaded.attempt_day.as_deref(), Some(next_day));
-        assert_eq!(
-            final_loaded.environmental_retry_day.as_deref(),
-            Some(next_day)
-        );
-    }
-
-    #[test]
     fn failed_record_retry_on_next_day_stamps_attempt_day_and_caps_on_rejection() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1598,164 +1542,6 @@ mod tests {
                 false,
                 false,
                 2,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn capped_record_new_contract_digest_resets_failure_count_and_stamps_attempt_day() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let day = "20260914";
-        let next_day = "20260915";
-        let identity = DailyUnitIdentity::new(day, "schedule", None);
-        let mut record = DailyUnitRecord::new(identity.clone(), "E", "C1");
-        record.status = DailyUnitStatus::Capped;
-        record.failure_count = 1;
-        record.reason_code = Some("provider_request_rejected".to_owned());
-        record.attempt_day = Some(day.to_owned());
-        record.environmental_retry_day = Some(day.to_owned());
-        save_daily_unit_record(root, &record).unwrap();
-
-        reserve_daily_attempt(
-            root,
-            &identity,
-            "E",
-            "C2",
-            &json!({"packet":"new_contract"}),
-            next_day,
-            "use-c2-1",
-            false,
-            false,
-            1,
-        )
-        .unwrap();
-
-        let loaded = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(loaded.failure_count, 0);
-        assert_eq!(loaded.environmental_retry_day, None);
-        assert_eq!(loaded.attempt_day.as_deref(), Some(next_day));
-
-        let context = ThinkContext::new(
-            root,
-            day.to_owned(),
-            root.join("chronicle").join(day),
-            1_000_000,
-        )
-        .unwrap();
-        let mut log = RunLogWriter::open(root, day, "daily");
-        let pending = PendingUse {
-            name: "schedule".to_owned(),
-            facet: None,
-            use_id: "use-c2-1".to_owned(),
-        };
-        log_daily_terminal(
-            &mut log,
-            &context,
-            &pending,
-            DrainOutcome::fail("error", "provider_request_rejected"),
-        );
-        log.finish().unwrap();
-
-        let folded = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(folded.status, DailyUnitStatus::Capped);
-        assert_eq!(folded.attempt_day.as_deref(), Some(next_day));
-        assert_eq!(folded.environmental_retry_day.as_deref(), Some(next_day));
-
-        assert!(
-            reserve_daily_attempt(
-                root,
-                &identity,
-                "E",
-                "C2",
-                &json!({"packet":"new_contract"}),
-                next_day,
-                "use-c2-2",
-                false,
-                false,
-                2,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn model_not_found_sets_environmental_retry_day_on_next_reservation() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let day = "20260914";
-        let identity = DailyUnitIdentity::new(day, "schedule", None);
-        reserve_daily_attempt(
-            root,
-            &identity,
-            "E",
-            "C",
-            &json!({"packet":"original"}),
-            day,
-            "use-mnf-1",
-            false,
-            false,
-            1,
-        )
-        .unwrap();
-
-        let context = ThinkContext::new(
-            root,
-            day.to_owned(),
-            root.join("chronicle").join(day),
-            1_000_000,
-        )
-        .unwrap();
-        let mut log = RunLogWriter::open(root, day, "daily");
-        let pending = PendingUse {
-            name: "schedule".to_owned(),
-            facet: None,
-            use_id: "use-mnf-1".to_owned(),
-        };
-        log_daily_terminal(
-            &mut log,
-            &context,
-            &pending,
-            DrainOutcome::fail("error", "model_not_found"),
-        );
-        log.finish().unwrap();
-
-        let loaded = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(loaded.status, DailyUnitStatus::Capped);
-        assert_eq!(loaded.failure_count, 1);
-        assert_eq!(loaded.environmental_retry_day, None);
-
-        assert!(
-            reserve_daily_attempt(
-                root,
-                &identity,
-                "E",
-                "C",
-                &json!({"packet":"retry"}),
-                day,
-                "use-mnf-2",
-                false,
-                false,
-                2,
-            )
-            .is_ok()
-        );
-        let loaded2 = load_daily_unit_record(root, &identity).unwrap().unwrap();
-        assert_eq!(loaded2.environmental_retry_day.as_deref(), Some(day));
-
-        assert!(
-            reserve_daily_attempt(
-                root,
-                &identity,
-                "E",
-                "C",
-                &json!({"packet":"retry"}),
-                day,
-                "use-mnf-3",
-                false,
-                false,
-                3,
             )
             .is_err()
         );
@@ -1955,7 +1741,7 @@ mod tests {
                 false,
                 3
             )
-            .is_ok()
+            .is_err()
         );
     }
     #[cfg(all(test, feature = "full-tests"))]
@@ -2505,8 +2291,23 @@ fi
         let dispatched = worker.outcomes.lock().unwrap().len();
         run(&context, &mut log, None, false, 1).unwrap();
         assert_eq!(worker.outcomes.lock().unwrap().len(), dispatched);
+        for owner_attempt in 1..=2 {
+            let retry_context = permit_owner_daily(&context, &identity);
+            run(&retry_context, &mut log, None, false, 1).unwrap();
+            assert_eq!(
+                worker.outcomes.lock().unwrap().len(),
+                dispatched + owner_attempt
+            );
+            run(&context, &mut log, None, false, 1).unwrap();
+            assert_eq!(
+                worker.outcomes.lock().unwrap().len(),
+                dispatched + owner_attempt
+            );
+        }
+        let dispatched = worker.outcomes.lock().unwrap().len();
         std::fs::write(&source, "# Imported note\nA changed event.").unwrap();
-        run(&context, &mut log, None, false, 1).unwrap();
+        let retry_context = permit_changed_daily(&context, &identity);
+        run(&retry_context, &mut log, None, false, 1).unwrap();
         assert_eq!(worker.outcomes.lock().unwrap().len(), dispatched + 1);
         let record = solstone_core_journal_io::load_daily_unit_record(root, &identity)
             .unwrap()
@@ -2675,7 +2476,8 @@ cat "${0%/*}/response-$mode.json"
             "# Imported note\nAda confirmed concise weekly updates today.",
         )
         .unwrap();
-        let result = run(&context, &mut log, None, false, 1).unwrap();
+        let retry_context = permit_changed_daily(&context, &identity);
+        let result = run(&retry_context, &mut log, None, false, 1).unwrap();
         assert_eq!(result.failed, 0, "{result:?}");
         assert_eq!(std::fs::read(&calls).unwrap().len(), 4);
         let accepted = solstone_core_journal_io::load_daily_unit_record(root, &identity)
@@ -3264,19 +3066,40 @@ cat "${0%/*}/response-$kind.json"
         );
         let newer_identity = DailyUnitIdentity::new("20200201", "daily_schedule", None);
         assert_eq!(identity, newer_identity);
-        reserve_daily_attempt(
-            root,
-            &newer_identity,
-            "current-window-E",
-            "C",
-            &current_packet,
-            &today,
-            "new-worker",
-            false,
-            false,
-            2,
-        )
-        .unwrap();
+        assert!(
+            reserve_daily_attempt(
+                root,
+                &newer_identity,
+                "current-window-E",
+                "C",
+                &current_packet,
+                &today,
+                "new-worker",
+                false,
+                false,
+                2,
+            )
+            .is_err()
+        );
+        // A lower-level external replacement still fences the old token.
+        let mut replacement = DailyUnitRecord::new(newer_identity.clone(), "current-window-E", "C");
+        replacement.frozen_packet = Some(current_packet.clone());
+        replacement.packet_digest = Some(
+            solstone_core_talent_runtime::daily_prepare::packet_digest(&current_packet),
+        );
+        replacement.lock_token = Some("new-worker".into());
+        replacement.use_id = Some("new-worker".into());
+        replacement.attempt_day = Some(today.clone());
+        save_daily_unit_record(root, &replacement).unwrap();
+        std::fs::write(&release, b"resume").unwrap();
+        let old_outcome = old.join().unwrap();
+        let solstone_core_talent_runtime::RuntimeOutcome::StageFailed(error) = old_outcome else {
+            panic!("old worker retained authority: {old_outcome:?}");
+        };
+        assert!(
+            error.detail.contains("publication token was replaced"),
+            "{error:?}"
+        );
         let newer = solstone_core_talent_runtime::execute_request(
             json!({"name":"daily_schedule","day":"20200201","lock_token":"new-worker"})
                 .as_object()
@@ -3298,21 +3121,6 @@ cat "${0%/*}/response-$kind.json"
         assert_eq!(
             serde_json::from_slice::<Value>(&committed).unwrap()["daily_time"],
             "04:00"
-        );
-        std::fs::write(release, b"resume").unwrap();
-        let old_outcome = old.join().unwrap();
-        let solstone_core_talent_runtime::RuntimeOutcome::StageFailed(error) = old_outcome else {
-            panic!("old maintenance worker must lose publication authority: {old_outcome:?}");
-        };
-        assert_eq!(error.phase, "write");
-        assert_eq!(error.stage, "daily_publication");
-        assert!(
-            error.detail.contains("publication token was replaced"),
-            "{error:?}"
-        );
-        assert_eq!(
-            std::fs::read(root.join("config/schedules.json")).unwrap(),
-            committed
         );
         let refused = reserve_daily_attempt(
             root,
@@ -3733,6 +3541,7 @@ cat "${0%/*}/response-$kind.json"
             matches!(
                 first_err,
                 solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted
+                    | solstone_core_journal_io::DailyUnitError::Lock(_)
             ),
             "{first_err}"
         );
@@ -3740,6 +3549,7 @@ cat "${0%/*}/response-$kind.json"
             matches!(
                 second_err,
                 solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted
+                    | solstone_core_journal_io::DailyUnitError::Lock(_)
             ),
             "{second_err}"
         );

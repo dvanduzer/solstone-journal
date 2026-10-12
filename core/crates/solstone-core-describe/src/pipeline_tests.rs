@@ -1197,3 +1197,80 @@ fn writer_commit_admits_unchanged_success_and_empty_but_refuses_stale_or_deleted
         }
     }
 }
+
+#[test]
+fn owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows() {
+    use solstone_core_processing_record::vocab;
+    use solstone_core_system::work_retry::{self, raw};
+    if std::env::var_os("DESCRIBE_RETRY_TEST_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pipeline::pipeline_tests::owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows", "--nocapture"])
+            .env("DESCRIBE_RETRY_TEST_CHILD", "1").output().unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&status.stdout).contains("1 passed"),
+            "{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        return;
+    }
+    let mut run = TestRun::new("owner-retry");
+    run.video = run
+        .journal
+        .join("chronicle/20260101/desktop/120000_300/screen.webm");
+    fs::create_dir_all(run.video.parent().unwrap()).unwrap();
+    fs::write(&run.video, "synthetic video bytes").unwrap();
+    let factory = ScriptedFactory::new(default_response);
+    let header = json!({"raw":"screen.webm","_solstone_processing":{"schema":"solstone.processing.v1","state":"failed","handler":"describe","reason_code":"analysis_failed","attempts":3}});
+    fs::write(run.artifact(), format!("{header}\n")).unwrap();
+    // Use the owning vocabulary, so this fixture detects schema drift.
+    rewrite_header(&run.artifact(), |h| {
+        h["_solstone_processing"]["schema"] = json!(vocab::SCHEMA)
+    });
+    run_decoded(run.options(false, vec![]), &factory, decoded(&[1])).unwrap();
+    assert!(factory.requests().is_empty());
+    let evidence = raw::inspect_output(&run.journal, &run.artifact())
+        .unwrap()
+        .unwrap();
+    raw::observe(&run.journal, &evidence).unwrap();
+    work_retry::request(&run.journal, &evidence.unit).unwrap();
+    let id = evidence.unit.id().unwrap();
+    let attempt = work_retry::read(&run.journal, &id)
+        .unwrap()
+        .unwrap()
+        .permission(&evidence.input, &[])
+        .unwrap();
+    temp_env::with_vars(
+        [
+            (raw::JOURNAL_ENV, Some(run.journal.to_str().unwrap())),
+            (raw::UNIT_ENV, Some(id.as_str())),
+            (raw::CAUSE_ENV, Some(attempt.cause.as_str())),
+            (
+                raw::ATTEMPT_ENV,
+                Some(serde_json::to_string(&attempt).unwrap().as_str()),
+            ),
+        ],
+        || {
+            let original = fs::read(run.artifact()).unwrap();
+            let mut edited = original.clone();
+            edited.extend_from_slice(b"{\"text\":\"owner text\"}\n");
+            fs::write(run.artifact(), &edited).unwrap();
+            assert!(run_decoded(run.options(false, vec![]), &factory, decoded(&[1])).is_err());
+            assert_eq!(fs::read(run.artifact()).unwrap(), edited);
+            assert!(factory.requests().is_empty());
+            fs::write(run.artifact(), original).unwrap();
+            run_decoded(run.options(false, vec![]), &factory, decoded(&[1])).unwrap();
+            assert!(!factory.requests().is_empty());
+        },
+    );
+    assert_eq!(run.rows()[0]["_solstone_processing"]["state"], "analyzed");
+    raw::finish_output(&run.journal, &evidence.unit, &attempt).unwrap();
+    assert!(!work_retry::read(&run.journal, &id).unwrap().unwrap().held);
+    let calls = factory.requests().len();
+    run_decoded(run.options(false, vec![]), &factory, decoded(&[1])).unwrap();
+    assert_eq!(factory.requests().len(), calls);
+}

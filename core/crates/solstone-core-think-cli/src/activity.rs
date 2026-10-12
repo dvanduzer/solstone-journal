@@ -310,7 +310,7 @@ pub(crate) fn run_held(
         }
     }
 
-    if !work.due(context.event_now_ms()) {
+    if context.retry.is_none() && !work.due(context.event_now_ms()) {
         return Ok(failed("activity retry pending"));
     }
     work.start_attempt(context.event_now_ms())?;
@@ -353,7 +353,9 @@ pub(crate) fn run_held(
             if !work.contains(&config.key) {
                 continue;
             }
-            if work.parked(&config.key) {
+            if context.retry.as_ref().is_some_and(|(unit, _)| !matches!(unit,
+                solstone_core_system::work_retry::Unit::Activity { talent, .. } if talent == &config.key)) { continue; }
+            if work.parked(&config.key) && context.retry.is_none() {
                 group.failed += 1;
                 group
                     .failed_names
@@ -646,6 +648,25 @@ fn queue(
             ),
         ),
     ]);
+    let unit = solstone_core_system::work_retry::Unit::Activity {
+        day: context.day.clone(),
+        facet: facet.into(),
+        activity: activity_id.into(),
+        talent: config.key.clone(),
+    };
+    request.insert(
+        "_work_unit".into(),
+        serde_json::to_value(&unit).map_err(|_| DispatchFailure::Unavailable)?,
+    );
+    if let Some((selected, attempt)) = &context.retry {
+        if selected != &unit {
+            return Err(DispatchFailure::Unavailable);
+        }
+        request.insert(
+            "_work_retry".into(),
+            serde_json::to_value(attempt).map_err(|_| DispatchFailure::Unavailable)?,
+        );
+    }
     if let Some(span) = record.get("segments") {
         request.insert("span".to_owned(), span.clone());
     }
@@ -744,7 +765,7 @@ fn drain_activity(
                                     .is_some_and(|e| e["retryable"] == false)
                             })
                     {
-                        work.park(&item.name)
+                        work.park(&item.name, cause.as_deref().unwrap_or(state), context)
                     } else {
                         Ok(())
                     }

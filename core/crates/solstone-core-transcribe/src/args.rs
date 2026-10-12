@@ -308,6 +308,9 @@ fn already_processed(audio_path: &Path, redo: bool) -> bool {
         record.as_ref(),
         &jsonl,
         solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
+    ) && !solstone_core_system::work_retry::raw::waiting_from_environment(
+        &jsonl,
+        solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
     )
 }
 

@@ -822,3 +822,64 @@ async fn ac14_and_ac15_reprocess_handler_seam_submits_despite_backoff() {
     assert_eq!(body, json!({"status":"queued","day":day}));
     assert_eq!(calls.get(), 1);
 }
+
+#[tokio::test]
+async fn retry_work_saves_one_unit_and_refuses_stale_or_malformed_evidence() {
+    use solstone_core_system::work_retry;
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("chronicle/20260101/photos/120000_300");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("photo.png"), b"source bytes").unwrap();
+    let output = directory.join("photo.jsonl");
+    let failed = json!({"raw":"photo.png", "_solstone_processing":{
+        "schema":"solstone.processing.v1", "handler":"depict", "state":"failed", "reason_code":"analysis_failed", "attempts":3
+    }});
+    std::fs::write(&output, format!("{failed}\n")).unwrap();
+    let evidence = work_retry::raw::inspect_output(root.path(), &output)
+        .unwrap()
+        .unwrap();
+    work_retry::raw::observe(root.path(), &evidence).unwrap();
+    let id = evidence.unit.id().unwrap();
+    let post =
+        || crate::actions::retry_work(root.path().into(), Some(axum::Json(json!({"unit":id}))));
+    let response = post().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["status"], "saved");
+    let saved = work_retry::read(root.path(), &id).unwrap().unwrap();
+    assert!(saved.owner.is_some());
+    assert!(saved.attempt.is_none());
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        format!("{failed}\n")
+    );
+    let mut complete = failed.clone();
+    complete["_solstone_processing"]["state"] = json!("analyzed");
+    std::fs::write(&output, format!("{complete}\n")).unwrap();
+    let response = post().await;
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["status"], "changed");
+    assert_eq!(
+        work_retry::read(root.path(), &id).unwrap().unwrap().owner,
+        saved.owner
+    );
+    std::fs::write(&output, format!("{failed}\n")).unwrap();
+    let permission_path = root
+        .path()
+        .join("health/work-retry")
+        .join(format!("{id}.json"));
+    std::fs::write(&permission_path, "unreadable permission").unwrap();
+    assert_eq!(post().await.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(permission_path).unwrap(),
+        "unreadable permission"
+    );
+    let response =
+        crate::actions::retry_work(root.path().into(), Some(axum::Json(json!({"safety":true}))))
+            .await;
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["status"], "held");
+}

@@ -481,10 +481,8 @@ mod tests {
             parakeet,
             flush: FlushState::default(),
             daily: DailyState { last_day: None },
-            last_activity_retry_drain: Instant::now(),
             last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
             last_scratch_sweep: None,
-            activity_retry_seed_day: None,
             wedge: WedgeState::default(),
             timing: SupervisorTiming {
                 tick_interval: Duration::from_secs(1),

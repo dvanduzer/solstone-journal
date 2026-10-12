@@ -632,9 +632,25 @@ where
         request.stream.as_deref(),
         modality_filter,
     )?;
+    process_work_with_dispatcher(journal, request, work, make_dispatcher, deadline)
+}
+
+fn process_work_with_dispatcher<F>(
+    journal: &Path,
+    request: &BatchRequest,
+    work: Vec<BatchWork>,
+    make_dispatcher: F,
+    deadline: Option<BatchDeadline>,
+) -> Result<(), BatchError>
+where
+    F: FnOnce(mpsc::Sender<Outbound>, usize) -> SenseDispatcher,
+{
     check_deadline(deadline)?;
     if work.is_empty() {
-        println!("No unprocessed files found in {}", day_dir.display());
+        println!(
+            "No unprocessed files found in {}",
+            journal.join("chronicle").join(&request.day).display()
+        );
         return Ok(());
     }
     print_processing_summary(&work);
@@ -680,6 +696,112 @@ where
     }
     println!("Batch processing complete");
     Ok(())
+}
+
+/// Dispatch exactly one held native output without deleting any prior rows.
+/// Permission consumption belongs to the native writer under OutputClaims.
+pub fn retry_file(
+    journal: &Path,
+    unit: &solstone_core_system::work_retry::Unit,
+    attempt: &solstone_core_system::work_retry::Attempt,
+    child_environment: &solstone_core_system::process::ChildLaunchContext,
+    timeout: Duration,
+) -> Result<(), BatchError> {
+    use solstone_core_system::work_retry::{Unit, raw};
+    let refuse = |reason| BatchError::Unrepresentable { reason };
+    let Unit::Raw {
+        day,
+        stream,
+        segment,
+        handler,
+        output,
+        ..
+    } = unit
+    else {
+        return Err(refuse("retry is not native analysis".into()));
+    };
+    let output = unit
+        .segment_directory(journal)
+        .map_err(refuse)?
+        .join(output);
+    let evidence = raw::inspect_output(journal, &output)
+        .map_err(refuse)?
+        .ok_or_else(|| refuse("native output is no longer held".into()))?;
+    if &evidence.unit != unit
+        || evidence.input != attempt.input
+        || evidence.reason != attempt.reason
+    {
+        return Err(refuse("native retry inputs changed".into()));
+    }
+    let handler = match handler.as_str() {
+        "describe" => "describe",
+        "depict" => "depict",
+        "transcribe" => "transcribe",
+        _ => return Err(refuse("unknown native retry handler".into())),
+    };
+    if crate::registry::match_handler(
+        journal,
+        &evidence.input_path,
+        &crate::registry::default_registry(1),
+    )
+    .is_none_or(|spec| spec.name != handler)
+    {
+        return Err(refuse(
+            "native failure handler does not match its source".into(),
+        ));
+    }
+    let _lease = crate::lease::acquire_sense_day_lease(journal, day)?
+        .ok_or_else(|| BatchError::LeaseContended { day: day.clone() })?;
+    let listed = iter_segments(journal, PathOrDay::Day(day))?;
+    check_record_identities(selected_segments(&listed, Some(segment), Some(stream)))?;
+    let mut environment = child_environment.clone();
+    environment
+        .environment
+        .insert(raw::JOURNAL_ENV.into(), journal.as_os_str().into());
+    environment
+        .environment
+        .insert(raw::UNIT_ENV.into(), unit.id().map_err(refuse)?.into());
+    environment
+        .environment
+        .insert(raw::CAUSE_ENV.into(), attempt.cause.clone().into());
+    environment.environment.insert(
+        raw::ATTEMPT_ENV.into(),
+        serde_json::to_string(attempt)
+            .map_err(|e| refuse(e.to_string()))?
+            .into(),
+    );
+    let request = BatchRequest {
+        day: day.clone(),
+        jobs: 1,
+        reprocess: None,
+        segment: Some(segment.clone()),
+        stream: Some(stream.clone()),
+        dry_run: false,
+        verbose: false,
+        debug: false,
+    };
+    process_work_with_dispatcher(
+        journal,
+        &request,
+        vec![BatchWork {
+            path: evidence.input_path,
+            handler,
+            stream: stream.clone(),
+            segment: segment.clone(),
+        }],
+        |outbound, workers| {
+            SenseDispatcher::new_batch_with_environment(
+                journal.to_path_buf(),
+                false,
+                false,
+                outbound,
+                workers,
+                environment,
+                BatchMarkerPolicy::AdvanceStream,
+            )
+        },
+        Some(BatchDeadline::new(timeout)),
+    )
 }
 
 fn run_batch_dispatcher(

@@ -55,6 +55,7 @@ pub fn routes_with_clock(journal_root: PathBuf, clock: Clock) -> Router {
     let info_root = journal_root.clone();
     let brain_root = journal_root.clone();
     let retry_root = journal_root.clone();
+    let work_retry_root = journal_root.clone();
     Router::new()
         .route("/app/health/", get(assets::shell))
         .route("/app/health/workspace", get(assets::workspace))
@@ -76,6 +77,10 @@ pub fn routes_with_clock(journal_root: PathBuf, clock: Clock) -> Router {
         .route(
             "/app/health/api/reprocess",
             post(move |body| actions::reprocess(retry_root.clone(), body)),
+        )
+        .route(
+            "/app/health/api/retry-work",
+            post(move |body| actions::retry_work(work_retry_root.clone(), body)),
         )
         .merge(api_router(journal_root))
 }
@@ -123,6 +128,7 @@ async fn state(root: PathBuf, clock: Clock) -> Response {
         let work = solstone_core_system::work_inventory::read(&root);
         let policy = solstone_core_system::work_policy::WorkPolicy::read(&root);
         let work_error = work.as_ref().err().cloned();
+        let (retry_records, retry_errors) = solstone_core_system::work_retry::list(&root);
         let (history_confirmed, confirmation_available) = policy
             .map(|p| {
                 (
@@ -141,6 +147,8 @@ async fn state(root: PathBuf, clock: Clock) -> Response {
             "work": {
                 "inventory": work.ok().flatten(),
                 "error": work_error,
+                "retry_records": retry_records.into_iter().filter_map(|record| record.unit.id().ok().map(|id| json!({"id": id, "unit": record.unit, "reason": record.reason, "attempt": record.attempt}))).collect::<Vec<_>>(),
+                "retry_errors": retry_errors,
                 "history_confirmed": history_confirmed,
                 "confirmation_available": confirmation_available,
             },

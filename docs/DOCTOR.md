@@ -278,6 +278,8 @@ After midnight the daily run of the day that just ended waits at least ten minut
 
 Today's work goes first, followed by owner requests and yesterday, recent days, imports, older recordings, and older day updates. Health shows the inspected date range and whether inspection is complete. With your own keys, older recordings and day updates wait for one Health confirmation. Confidential processing also waits for that confirmation for historical work; an import permits its own scope. Local thinking runs every priority automatically.
 
+Health brings set-aside work into one list with a reason and a try-again. Trying again saves a request for that step; it does not erase previous results or override owner edits. Doctor includes held work when reporting what remains across the journal.
+
 ### SPL relay / scheduled backup never run on a convey-only setup
 
 **Symptoms:** SPL private link is enabled but the relay never dials; cloud backup shows "enabled" but has never recorded a completed run. This is expected on a **convey-only** setup — a supervisor deliberately started with only the convey component (Cortex and full-think processing excluded from the automatic loop).

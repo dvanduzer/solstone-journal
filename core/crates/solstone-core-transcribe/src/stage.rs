@@ -142,13 +142,29 @@ pub(crate) fn process_one(
     if should_skip_process_one_processed(audio_path, redo) {
         return Ok(ProcessOutcome::Skipped);
     }
-    let started = Instant::now();
     let observation = InputObservation::capture(&claim, audio_path).map_err(|error| {
         TranscribeError::ProcessingClaim {
             path: audio_path.to_path_buf(),
             detail: error.to_string(),
         }
     })?;
+    let started = Instant::now();
+    let admitted_retry = if !redo {
+        solstone_core_system::work_retry::raw::consume_from_environment(
+            journal_path,
+            &audio_path.with_extension("jsonl"),
+            solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
+        )
+        .map_err(|detail| TranscribeError::ProcessingClaim {
+            path: audio_path.to_path_buf(),
+            detail,
+        })?
+    } else {
+        false
+    };
+    // The existing failed artifact was validated under the output claim. Keep
+    // that narrow replacement authority through successful/empty publication.
+    let redo = redo || admitted_retry;
     let facts = InputFacts {
         path: audio_path.to_path_buf(),
         input_size: observation.input_size(),
@@ -432,7 +448,13 @@ pub(crate) fn process_one(
     };
     timings.add_ms("speakers_analyze", elapsed_ms(speakers_at));
     let (jsonl_path, npz_path) = transcript_paths(audio_path);
-    let processing = analyzed_record(facts.input_size);
+    let mut processing = analyzed_record(facts.input_size);
+    solstone_core_system::work_retry::raw::stamp_attempt(&mut processing).map_err(|detail| {
+        TranscribeError::ProcessingClaim {
+            path: audio_path.to_path_buf(),
+            detail,
+        }
+    })?;
     let write_at = Instant::now();
     let commit = commit_input(&observation, &claim, audio_path)?;
     write_full_transcript(FullTranscriptWrite {
@@ -941,6 +963,123 @@ mod tests {
     use crate::TranscribeError;
     use crate::event::Timings;
     use crate::terminal::TerminalWriteFailure;
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn admitted_transcript_retry_can_publish_through_the_real_writer() {
+        use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
+        use solstone_core_system::work_retry::{self, raw};
+        if std::env::var_os("TRANSCRIBE_RETRY_TEST_CHILD").is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stage::tests::admitted_transcript_retry_can_publish_through_the_real_writer",
+                    "--nocapture",
+                ])
+                .env("TRANSCRIBE_RETRY_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+                "{}",
+                String::from_utf8_lossy(&child.stdout)
+            );
+            return;
+        }
+        for empty in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let segment = root.path().join("chronicle/20260101/desktop/120000_300");
+            fs::create_dir_all(&segment).unwrap();
+            let facts = input(&segment);
+            let (jsonl, npz) = transcript_paths(&facts.path);
+            let raw_name = facts.path.file_name().unwrap().to_str().unwrap();
+            let header = json!({"raw":raw_name,"_solstone_processing":{"schema":vocab::SCHEMA,"state":"failed","handler":"transcribe","reason_code":"analysis_failed","attempts":3}});
+            fs::write(&jsonl, format!("{header}\n")).unwrap();
+            let evidence = raw::inspect_output(root.path(), &jsonl).unwrap().unwrap();
+            raw::observe(root.path(), &evidence).unwrap();
+            work_retry::request(root.path(), &evidence.unit).unwrap();
+            let id = evidence.unit.id().unwrap();
+            let attempt = work_retry::read(root.path(), &id)
+                .unwrap()
+                .unwrap()
+                .permission(&evidence.input, &[])
+                .unwrap();
+            temp_env::with_vars(
+                [
+                    (raw::JOURNAL_ENV, Some(root.path().to_str().unwrap())),
+                    (raw::UNIT_ENV, Some(id.as_str())),
+                    (raw::CAUSE_ENV, Some(attempt.cause.as_str())),
+                    (
+                        raw::ATTEMPT_ENV,
+                        Some(serde_json::to_string(&attempt).unwrap().as_str()),
+                    ),
+                ],
+                || {
+                    let claims =
+                        OutputClaims::acquire([jsonl.clone()], Default::default()).unwrap();
+                    let input = InputObservation::capture(&claims, &facts.path).unwrap();
+                    let admitted =
+                        raw::consume_from_environment(root.path(), &jsonl, "transcribe").unwrap();
+                    assert!(admitted);
+                    // A consumed attempt without a new native publication is interrupted.
+                    assert!(raw::finish_output(root.path(), &evidence.unit, &attempt).is_err());
+                    let _commit = input.commit(&claims).unwrap();
+                    if empty {
+                        vad_no_speech(&facts, admitted, None, None).unwrap();
+                    } else {
+                        let result = crate::speakers::SpeakerAnalyzeResult {
+                            statements: vec![
+                                json!({"id":1,"start":0.0,"end":1.0,"text":"recovered words"})
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                            ],
+                            embedding_payload: None,
+                            speaker_evidence: "none".into(),
+                            speaker_evidence_multi_fraction: 0.0,
+                            overlap_fraction: 0.0,
+                            statement_labels: None,
+                        };
+                        let mut processing = crate::processing::analyzed_record(facts.input_size);
+                        raw::stamp_attempt(&mut processing).unwrap();
+                        super::write_full_transcript(super::FullTranscriptWrite {
+                            raw_path: &facts.path,
+                            jsonl_path: &jsonl,
+                            npz_path: &npz,
+                            base_time_us_of_day: 0,
+                            source: None,
+                            speaker_result: &result,
+                            backend: Some("parakeet-cpp"),
+                            model: Some("parakeet"),
+                            device: Some("cpu"),
+                            compute_type: None,
+                            observer: None,
+                            vad_result: None,
+                            segment_meta: None,
+                            overlap_detector: None,
+                            speaker_evidence_version: "windowed-slots-v1",
+                            processing: &processing,
+                            sound_tags: None,
+                            sound_tag_status: None,
+                            speaker_analysis_producer: None,
+                            redo: admitted,
+                        })
+                        .unwrap();
+                    }
+                },
+            );
+            raw::finish_output(root.path(), &evidence.unit, &attempt).unwrap();
+            assert!(!work_retry::read(root.path(), &id).unwrap().unwrap().held);
+            let header =
+                solstone_core_processing_record::read_processing_record_header(&jsonl).unwrap();
+            assert_eq!(header["state"], if empty { "empty" } else { "analyzed" });
+        }
+    }
 
     #[cfg(feature = "full-tests")]
     #[test]

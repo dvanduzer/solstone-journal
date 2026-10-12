@@ -37,6 +37,7 @@ pub mod work_intent;
 pub mod work_inventory;
 #[cfg(any(unix, windows))]
 pub mod work_policy;
+pub mod work_retry;
 
 #[cfg(any(unix, windows))]
 pub use solstone_core_journal_config::no_thinking_engine_chosen;

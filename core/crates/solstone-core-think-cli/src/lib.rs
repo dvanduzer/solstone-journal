@@ -5,7 +5,11 @@
 
 mod activity;
 mod activity_work;
-pub use activity_work::{ActivityRetry, due_activity_retries, seed_activity_retries};
+pub use activity_work::{
+    ActivityRetry, activity_retry_due, discover_activity_retries, due_activity_retries,
+    seed_activity_retries,
+};
+pub use activity_work::{activity_held_input, discover_held_activities};
 mod args;
 mod cadence;
 mod cadence_state;
@@ -20,6 +24,7 @@ mod gate;
 mod helpers;
 mod phase_process;
 mod repair;
+mod retry;
 mod run_log;
 mod segment;
 mod settle;
@@ -434,6 +439,20 @@ where
             return logged_mode_outcome(log, run, result);
         }
 
+        if let Some(id) = parsed.retry_unit.as_deref() {
+            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
+            let result = retry::run(
+                &context,
+                &mut log,
+                id,
+                parsed
+                    .retry_cause
+                    .as_deref()
+                    .expect("validated retry cause"),
+                sense_child_environment,
+            );
+            return logged_mode_outcome(log, run, result);
+        }
         if let Some(activity_id) = parsed.activity.as_deref() {
             let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
             let result = activity::run(
@@ -750,6 +769,34 @@ fn validate(
             message: message.to_owned(),
         })
     };
+    if (args.retry_unit.is_some() || args.retry_cause.is_some())
+        && (args.retry_unit.is_none()
+            || args.retry_cause.is_none()
+            || args.day.is_none()
+            || args.segment.is_some()
+            || args.stream.is_some()
+            || args.activity.is_some()
+            || args.facet.is_some()
+            || args.refresh
+            || args.from_scratch
+            || args.segments
+            || args.flush
+            || args.settle
+            || args.live
+            || args.updated
+            || args.weekly
+            || args.cadence
+            || args.dry_run
+            || args.sense_batch
+            || args.repair_segment
+            || args.daily_only
+            || args.work_intent.is_some()
+            || args.reactivate)
+    {
+        return usage(
+            "--retry-unit requires --day and --retry-cause without another thinking mode",
+        );
+    }
     if args.work_intent.is_some()
         && (!args.from_scratch
             || args.day.is_none()
@@ -4365,6 +4412,32 @@ mod tests {
                 without_sibling
             }),
             "a record without a stream still reads every stream, as before"
+        );
+    }
+
+    #[test]
+    fn unreadable_activity_input_never_becomes_a_changed_input_digest() {
+        let journal = tempdir().unwrap();
+        let (context, _) = recorder_context(journal.path(), "20260813", 9);
+        let directory = segment_dir(journal.path(), "20260813", "090000_300").join("talents");
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("sense.json");
+        fs::write(&source, b"same input").unwrap();
+        let record = serde_json::json!({"id":"work_090000_300", "activity":"work", "facet":"work", "stream":"default", "segments":["090000_300"]}).as_object().unwrap().clone();
+        let before = segment::compute_activity_input_hash(&context, "20260813", &record).unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::create_dir(&source).unwrap();
+        assert!(segment::compute_activity_input_hash(&context, "20260813", &record).is_none());
+        fs::remove_dir(&source).unwrap();
+        fs::write(&source, b"same input").unwrap();
+        assert_eq!(
+            segment::compute_activity_input_hash(&context, "20260813", &record).as_deref(),
+            Some(before.as_str())
+        );
+        fs::write(&source, b"changed input").unwrap();
+        assert_ne!(
+            segment::compute_activity_input_hash(&context, "20260813", &record).as_deref(),
+            Some(before.as_str())
         );
     }
 

@@ -458,8 +458,135 @@ pub fn execute_request(
     writer: &mut impl Write,
 ) -> RuntimeOutcome {
     if request.contains_key("lock_token") {
-        return daily_execution::execute(request, context, generate, writer);
+        return daily_execution::execute_with_paths(
+            request,
+            context,
+            generate,
+            writer,
+            Some(paths),
+        );
     }
+    let Some(value) = request.get("_work_unit") else {
+        return execute_unclaimed(request, paths, context, generate, writer);
+    };
+    use solstone_core_system::work_retry::{self, Attempt, Unit};
+    let refused = |error| {
+        RuntimeOutcome::StageFailed(StageError::new("retry", "permission", "talent", error))
+    };
+    let unit: Unit = match serde_json::from_value(value.clone()) {
+        Ok(unit) => unit,
+        Err(error) => return refused(error.to_string()),
+    };
+    let expected_name = match &unit {
+        Unit::Segment { talent, .. } | Unit::Activity { talent, .. } => talent,
+        _ => return refused("invalid talent retry unit".into()),
+    };
+    if request.get("name").and_then(Value::as_str) != Some(expected_name.as_str())
+        || request.get("day").and_then(Value::as_str) != Some(unit.day())
+    {
+        return refused("talent retry scope changed".into());
+    }
+    let scope_matches = match &unit {
+        Unit::Segment {
+            segment, stream, ..
+        } => {
+            request.get("segment").and_then(Value::as_str) == Some(segment.as_str())
+                && request
+                    .get("stream")
+                    .and_then(Value::as_str)
+                    .unwrap_or(solstone_core_journal_io::DEFAULT_STREAM)
+                    == stream
+        }
+        Unit::Activity {
+            facet, activity, ..
+        } => {
+            request.get("facet").and_then(Value::as_str) == Some(facet.as_str())
+                && request
+                    .get("activity")
+                    .and_then(|v| v.get("id"))
+                    .and_then(Value::as_str)
+                    == Some(activity.as_str())
+        }
+        _ => false,
+    };
+    if !scope_matches {
+        return refused("talent retry coordinates changed".into());
+    }
+    let _claim = match work_retry::execution_claim(&context.journal, &unit) {
+        Ok(claim) => claim,
+        Err(error) => return refused(error),
+    };
+    let input = match work_retry::input::current(&context.journal, &unit) {
+        Ok(input) => input,
+        Err(error) => return refused(error),
+    };
+    let attempt: Option<Attempt> = match request
+        .get("_work_retry")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+    {
+        Ok(attempt) => attempt,
+        Err(error) => return refused(error.to_string()),
+    };
+    if let Some(attempt) = &attempt {
+        if let Err(error) = work_retry::consume(
+            &context.journal,
+            &unit,
+            attempt,
+            &attempt.reason,
+            &input,
+            work_retry::DECLARED_FIXES,
+        ) {
+            return refused(error);
+        }
+    } else {
+        match work_retry::read(&context.journal, &unit.id().unwrap_or_default()) {
+            Ok(Some(record)) if record.held => {
+                return refused("this talent is set aside until a new retry permission".into());
+            }
+            Err(error) => return refused(error),
+            _ => {}
+        }
+    }
+    let outcome = execute_unclaimed(request, paths, context, generate, writer);
+    let failure = match &outcome {
+        RuntimeOutcome::Finished { .. } => None,
+        RuntimeOutcome::StageFailed(error) | RuntimeOutcome::GenerateRefused { error, .. } => {
+            Some(error.reason_code())
+        }
+        RuntimeOutcome::SchemaValidationFailed { .. } => Some("schema_invalid"),
+        _ => Some("talent_unfinished"),
+    };
+    if let Some(attempt) = attempt {
+        if let Err(error) = work_retry::finish(&context.journal, &unit, &attempt, failure) {
+            return refused(error);
+        }
+    } else if matches!(unit, Unit::Segment { .. })
+        && !failure.is_some_and(|reason| {
+            reason == "confidential_access_ended"
+                || solstone_core_generate::is_attestation_family_reason(reason)
+        })
+        && let Err(error) = work_retry::record_floor_outcome(
+            &context.journal,
+            &unit,
+            &input,
+            failure,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    {
+        return refused(error);
+    }
+    outcome
+}
+
+fn execute_unclaimed(
+    request: Map<String, Value>,
+    paths: &prepare::RuntimePaths,
+    context: &ExecutionContext,
+    generate: &OneShotClient,
+    writer: &mut impl Write,
+) -> RuntimeOutcome {
     let mut prepared =
         match prepare::prepare(request, paths, context, prepare::PrepareMode::Execute) {
             Ok(prepared) => prepared,
@@ -1374,6 +1501,153 @@ mod tests {
         )
         .unwrap();
         (root, paths, context)
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn held_floor_permission_reaches_the_real_model_once_and_preserves_owner_output() {
+        use solstone_core_system::work_retry::{self, Unit};
+        let (root, paths, context) = fixture(
+            "documents",
+            "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"segment\",\"output\":\"md\"\n}",
+        );
+        let unit = Unit::Segment {
+            day: "20260101".into(),
+            stream: "desktop".into(),
+            segment: "120000_300".into(),
+            talent: "documents".into(),
+            direct: false,
+        };
+        let directory = unit.segment_directory(&context.journal).unwrap();
+        fs::create_dir_all(directory.join("talents")).unwrap();
+        let sense = directory.join("talents/sense.json");
+        let bytes = br#"{"density":"active","content_type":"work"}"#;
+        solstone_core_system::segment_output::commit(&sense, bytes, false, || {
+            fs::write(&sense, bytes).map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let input = work_retry::input::current(&context.journal, &unit).unwrap();
+        work_retry::observe_held(&context.journal, &unit, "analysis_failed", &input).unwrap();
+        let stub = test_support::one_shot_stub(root.path(), "Recovered text");
+        let script = fs::read_to_string(&stub).unwrap().replace(
+            "cat >/dev/null",
+            "printf x >> \"${0%/*}/calls\"\ncat >/dev/null",
+        );
+        test_support::install_stub(&stub, &script);
+        let client = OneShotClient::at_path(stub);
+        let output = directory.join("talents/documents.md");
+        let base = json!({"name":"documents", "day":"20260101", "segment":"120000_300", "stream":"desktop", "output_path":output, "_protect_segment_outputs":true, "_work_unit":unit});
+        let run = |request: Value| {
+            execute_request(
+                request.as_object().unwrap().clone(),
+                &paths,
+                &context,
+                &client,
+                &mut Vec::new(),
+            )
+        };
+        assert!(matches!(run(base.clone()), RuntimeOutcome::StageFailed(_)));
+        assert!(!root.path().join("calls").exists());
+        work_retry::request(&context.journal, &unit).unwrap();
+        let grant = work_retry::read(&context.journal, &unit.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .unwrap();
+        let mut request = base.clone();
+        request["_work_retry"] = serde_json::to_value(&grant).unwrap();
+        let outcome = run(request.clone());
+        assert!(
+            matches!(outcome, RuntimeOutcome::Finished { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(root.path().join("calls")).unwrap(), b"x");
+        assert!(matches!(run(request), RuntimeOutcome::StageFailed(_)));
+        assert_eq!(fs::read(root.path().join("calls")).unwrap(), b"x");
+        assert!(
+            !work_retry::read(&context.journal, &unit.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .held
+        );
+        // New failure, followed by an owner edit: an owner retry is not overwrite permission.
+        work_retry::observe_held(&context.journal, &unit, "analysis_failed", &input).unwrap();
+        fs::write(&output, "Owner correction").unwrap();
+        work_retry::request(&context.journal, &unit).unwrap();
+        let grant = work_retry::read(&context.journal, &unit.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .unwrap();
+        let mut request = base;
+        request["_work_retry"] = serde_json::to_value(grant).unwrap();
+        let _ = run(request);
+        assert_eq!(fs::read_to_string(output).unwrap(), "Owner correction");
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn held_activity_permission_reaches_the_real_writer_once() {
+        use solstone_core_system::work_retry::{self, Unit};
+        let (root, paths, context) = fixture(
+            "participation",
+            "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"activity\",\"output\":\"md\"\n}",
+        );
+        let unit = Unit::Activity {
+            day: "20260101".into(),
+            facet: "work".into(),
+            activity: "work_120000_300".into(),
+            talent: "participation".into(),
+        };
+        solstone_core_facets::create_facet(&context.journal, "work", "Work", "", "", "", None)
+            .unwrap();
+        let record = json!({"id":"work_120000_300", "activity":"work", "facet":"work", "segments":["120000_300"]});
+        let records = context
+            .journal
+            .join("facets/work/activities/20260101.jsonl");
+        fs::create_dir_all(records.parent().unwrap()).unwrap();
+        fs::write(records, format!("{record}\n")).unwrap();
+        let input = work_retry::input::current(&context.journal, &unit).unwrap();
+        work_retry::observe_held(&context.journal, &unit, "schema_invalid", &input).unwrap();
+        let stub = test_support::one_shot_stub(root.path(), "Recovered activity");
+        let script = fs::read_to_string(&stub).unwrap().replace(
+            "cat >/dev/null",
+            "printf x >> \"${0%/*}/calls\"\ncat >/dev/null",
+        );
+        test_support::install_stub(&stub, &script);
+        let client = OneShotClient::at_path(stub);
+        let output = context
+            .journal
+            .join("facets/work/activities/20260101/work_120000_300/participation.md");
+        let base = json!({"name":"participation", "day":"20260101", "facet":"work", "activity":record, "output_path":output, "_work_unit":unit});
+        let run = |request: Value| {
+            execute_request(
+                request.as_object().unwrap().clone(),
+                &paths,
+                &context,
+                &client,
+                &mut Vec::new(),
+            )
+        };
+        assert!(matches!(run(base.clone()), RuntimeOutcome::StageFailed(_)));
+        assert!(!root.path().join("calls").exists());
+        work_retry::request(&context.journal, &unit).unwrap();
+        let grant = work_retry::read(&context.journal, &unit.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .unwrap();
+        let mut request = base;
+        request["_work_retry"] = serde_json::to_value(grant).unwrap();
+        let outcome = run(request.clone());
+        assert!(
+            matches!(outcome, RuntimeOutcome::Finished { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(root.path().join("calls")).unwrap(), b"x");
+        assert_eq!(fs::read_to_string(output).unwrap(), "Recovered activity");
+        assert!(matches!(run(request), RuntimeOutcome::StageFailed(_)));
+        assert_eq!(fs::read(root.path().join("calls")).unwrap(), b"x");
     }
 
     fn events(bytes: &[u8]) -> Vec<Value> {

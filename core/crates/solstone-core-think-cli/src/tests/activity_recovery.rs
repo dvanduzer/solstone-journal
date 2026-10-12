@@ -1528,3 +1528,134 @@ fn work_an_earlier_version_blocked_for_a_merged_facet_runs_once_the_row_is_adopt
     .unwrap();
     assert_eq!((result.success, result.failed), (1, 0));
 }
+
+#[test]
+fn malformed_activity_sibling_does_not_hide_a_valid_due_retry() {
+    let (_journal, _roots, context, recorder) = fixture();
+    fail_first(&context, &recorder);
+    assert!(replay(&context, &["090000_300", "090500_300"], true).is_err());
+    fs::write(
+        context.journal.join("health/activity-work/broken.json"),
+        "{",
+    )
+    .unwrap();
+    let (due, gaps) =
+        crate::activity_work::discover_activity_retries(&context.journal, context.now_ms + 60_001);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].activity, "work_090000_300");
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].contains("broken.json"));
+}
+
+#[test]
+fn changed_input_readmission_preserves_completed_and_unresolved_siblings() {
+    use crate::activity_work::ActivityWork;
+    use solstone_core_system::work_retry::{Attempt, Unit};
+    let (_journal, _roots, context, _recorder) = fixture();
+    let names = ["participation", "completed", "unresolved"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut work = ActivityWork::begin_held(
+        &context,
+        "work",
+        "work_090000_300",
+        "old".into(),
+        names,
+        false,
+        None,
+    )
+    .unwrap();
+    work.complete("completed").unwrap();
+    work.park("participation", "schema_invalid", &context)
+        .unwrap();
+    work.dispatched("unresolved", "owner-action-in-doubt")
+        .unwrap();
+    drop(work);
+    let mut retry = context.clone();
+    retry.retry = Some((
+        Unit::Activity {
+            day: context.day.clone(),
+            facet: "work".into(),
+            activity: "work_090000_300".into(),
+            talent: "participation".into(),
+        },
+        Attempt {
+            cause: "input:new".into(),
+            input: "new".into(),
+            reason: "schema_invalid".into(),
+        },
+    ));
+    let names = ["participation", "completed", "unresolved"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut work = ActivityWork::begin_held(
+        &retry,
+        "work",
+        "work_090000_300",
+        "new".into(),
+        names,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(!work.contains("completed"));
+    assert_eq!(work.use_id("unresolved"), Some("owner-action-in-doubt"));
+    work.complete("participation").unwrap();
+    assert!(!work.is_complete());
+    // Only a later accepted receipt permits finishing the unresolved sibling.
+    work.complete("unresolved").unwrap();
+    work.finish(&retry).unwrap();
+    drop(work);
+    let names = ["participation", "completed", "unresolved"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let work = ActivityWork::begin_held(
+        &context,
+        "work",
+        "work_090000_300",
+        "new".into(),
+        names,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(
+        work.is_complete(),
+        "new provenance must prevent an ordinary enqueue from replaying any sibling"
+    );
+}
+
+#[test]
+fn parked_success_after_thinker_crash_is_due_for_receipt_reconciliation() {
+    use crate::activity_work::ActivityWork;
+    let (_journal, _roots, context, _recorder) = fixture();
+    let mut work = ActivityWork::begin_held(
+        &context,
+        "work",
+        "work_090000_300",
+        "input".into(),
+        ["participation".into()].into_iter().collect(),
+        false,
+        None,
+    )
+    .unwrap();
+    work.park("participation", "schema_invalid", &context)
+        .unwrap();
+    work.dispatched("participation", "finished-retry").unwrap();
+    work.start_attempt(i64::MAX - 1000).unwrap();
+    drop(work);
+    let use_path = context
+        .journal
+        .join("talents/participation/finished-retry.jsonl");
+    fs::create_dir_all(use_path.parent().unwrap()).unwrap();
+    fs::write(&use_path, "{\"event\":\"start\",\"use_id\":\"finished-retry\"}\n{\"event\":\"finish\",\"use_id\":\"finished-retry\"}\n").unwrap();
+    assert_eq!(due_activity_retries(&context.journal, 0).unwrap().len(), 1);
+    assert!(
+        crate::activity_work::discover_held_activities(&context.journal)
+            .0
+            .is_empty()
+    );
+}

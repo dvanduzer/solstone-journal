@@ -14,6 +14,8 @@ pub struct BandProgress {
     pub segments_owed: u64,
     pub daily_units_complete: u64,
     pub daily_units_owed: u64,
+    #[serde(default)]
+    pub activities_owed: u64,
     pub eligible: u64,
     pub permission_held: u64,
     pub prerequisite_held: u64,
@@ -26,6 +28,7 @@ impl BandProgress {
         self.segments_owed += other.segments_owed;
         self.daily_units_complete += other.daily_units_complete;
         self.daily_units_owed += other.daily_units_owed;
+        self.activities_owed += other.activities_owed;
         self.eligible += other.eligible;
         self.permission_held += other.permission_held;
         self.prerequisite_held += other.prerequisite_held;
@@ -34,6 +37,8 @@ impl BandProgress {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkHold {
+    #[serde(default)]
+    pub retry_unit: Option<String>,
     pub day: String,
     pub segment: Option<String>,
     pub stream: Option<String>,

@@ -204,15 +204,11 @@ pub(crate) struct SupervisorState {
     pub parakeet: ParakeetProvider,
     pub flush: FlushState,
     pub daily: DailyState,
-    /// Last completed retry-expiry scan; kept per supervisor instance so a
-    /// restart cannot inherit another instance's throttle state.
-    pub last_activity_retry_drain: Instant,
     /// Last read of when each stream's activities next need a settle check.
     pub last_activity_settle_scan: Instant,
     /// Last sweep for analysis scratch a killed process left behind; `None` until
     /// the first tick, so a boot sweeps at once.
     pub last_scratch_sweep: Option<Instant>,
-    pub activity_retry_seed_day: Option<String>,
     pub wedge: WedgeState,
     pub timing: SupervisorTiming,
     pub parent_loss_coordinator: Option<ParentLossCoordinatorSession>,
@@ -2113,11 +2109,8 @@ pub(crate) async fn boot_and_tick(
         daily: DailyState {
             last_day: Some(wall.date_naive()),
         },
-        // Startup reconciliation/drain below seeds the retry watermark.
-        last_activity_retry_drain: Instant::now() - Duration::from_secs(60),
         last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
         last_scratch_sweep: None,
-        activity_retry_seed_day: None,
         wedge: WedgeState::default(),
         timing: SupervisorTiming::for_app_fixture(fast_fixture_timing),
         parent_loss_coordinator,

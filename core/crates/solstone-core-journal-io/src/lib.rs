@@ -130,9 +130,9 @@ pub use claim_remove::{claim_and_remove_observed, claim_and_remove_observed_boun
 pub use daily_unit::{
     AcceptedDailyResult, DAILY_UNIT_RECORD_VERSION, DailyUnitAuthority, DailyUnitError,
     DailyUnitIdentity, DailyUnitRecord, DailyUnitStatus, OWNER_REPROCESS_SENTINEL,
-    accepted_daily_artifacts_valid, daily_unit_record_dir, daily_unit_record_path,
-    list_daily_unit_records, load_daily_unit_record, maintenance_unit_record_path,
-    observe_daily_unit_record, read_daily_unit_record, reset_daily_unit_for_reprocess,
+    accepted_daily_artifacts_valid, claim_daily_execution, daily_unit_record_dir,
+    daily_unit_record_path, list_daily_unit_records, load_daily_unit_record,
+    maintenance_unit_record_path, observe_daily_unit_record, read_daily_unit_record,
     save_daily_unit_record, with_daily_unit_authority, with_locked_daily_unit_record,
     write_daily_unit_record,
 };

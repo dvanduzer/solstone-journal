@@ -11,7 +11,7 @@ use chrono_tz::Tz;
 use serde_json::{Map, json};
 use solstone_core_callosum::{CallosumEnvelope, CallosumOneShotSender};
 use solstone_core_segment::{PathOrDay, day_path, iter_segments, touch_stream_health_marker};
-use solstone_core_system_health::{FilesystemSegmentSource, day_is_complete, scan_day};
+use solstone_core_system_health::{FilesystemSegmentSource, scan_day};
 
 // ⛔ `journal up`, not `journal start`. `journal start` runs the supervisor
 // in the FOREGROUND (SKILL.md: "starts the supervisor runtime only"), so an
@@ -67,8 +67,6 @@ pub enum DayOutcome {
     PastOnly,
     NoData,
     Submitted(Flavor),
-    AlreadyComplete,
-    CurrentDegraded,
     NoThinkingEngine,
     WaitingForSupervisor,
     Failed(String),
@@ -107,37 +105,20 @@ where
         if day_date >= today {
             return failure("reprocess is past-only (cannot reprocess today or a future day)");
         }
-        let today_str = today.format("%Y%m%d").to_string();
-        let identity = solstone_core_journal_io::DailyUnitIdentity::new(
-            &parsed.day,
-            unit_name,
-            parsed.facet.clone(),
-        );
-        match solstone_core_journal_io::reset_daily_unit_for_reprocess(
-            journal_path,
-            &identity,
-            &today_str,
-            now.timestamp_millis(),
-        ) {
-            Ok(()) => {
-                let line = match parsed.facet.as_deref() {
-                    Some(facet) if !facet.is_empty() => {
-                        format!(
-                            "{unit_name} ({facet}) on {} was reset for the next eligible run\n",
-                            parsed.day
-                        )
-                    }
-                    _ => format!(
-                        "{unit_name} on {} was reset for the next eligible run\n",
-                        parsed.day
-                    ),
-                };
-                return success(line);
-            }
-            Err(error) => {
-                return failure(&format!("reprocess unit failed: {error}"));
-            }
+        let unit = solstone_core_system::work_retry::Unit::Daily {
+            day: parsed.day.clone(),
+            talent: unit_name.into(),
+            facet: parsed.facet.clone(),
+        };
+        let requested = solstone_core_system::work_retry::daily::request(journal_path, &unit);
+        if let Err(error) = requested {
+            return failure(&format!("reprocess unit failed: {error}"));
         }
+        let _ = transport(&drain_envelope(&parsed.day));
+        return success(format!(
+            "retry request saved for {unit_name} on {}\n",
+            parsed.day
+        ));
     }
 
     if parsed.flavor == Flavor::Owed {
@@ -398,22 +379,8 @@ where
             DayOutcome::WaitingForSupervisor
         };
     }
-    match day_is_complete(journal, day) {
-        Ok(true) => match solstone_core_system::daily_coverage::read_daily_coverage(journal, day) {
-            Ok(coverage) => match coverage.state {
-                solstone_core_system::daily_coverage::CoverageState::Current => {
-                    return DayOutcome::AlreadyComplete;
-                }
-                solstone_core_system::daily_coverage::CoverageState::CurrentDegraded => {
-                    return DayOutcome::CurrentDegraded;
-                }
-                _ => {}
-            },
-            Err(error) => return DayOutcome::Failed(error),
-        },
-        Ok(false) => {}
-        Err(error) => return DayOutcome::Failed(error.to_string()),
-    }
+    // A current daily summary does not prove that native or activity work is
+    // complete. Discovery expands this durable ask against every owning source.
     if let Err(error) = solstone_core_system::work_intent::register(journal, day, false) {
         return DayOutcome::Failed(error);
     }
@@ -443,12 +410,6 @@ fn render_day_outcome(day: &str, outcome: DayOutcome) -> CliRun {
         DayOutcome::Submitted(Flavor::Owed) => {
             failure("--owed only reports; nothing was submitted")
         }
-        DayOutcome::AlreadyComplete => success(format!(
-            "day {day} already complete; use --from-scratch to force a full re-run\n"
-        )),
-        DayOutcome::CurrentDegraded => success(format!(
-            "day {day}: some daily processing is still unresolved. use --from-scratch to retry.\n"
-        )),
         DayOutcome::NoThinkingEngine => {
             failure("no model is chosen yet. choose one in thinking, then retry")
         }
@@ -770,7 +731,7 @@ mod tests {
     use super::*;
 
     const DAY: &str = "20260101";
-    const HELP: &str = "usage: solstone journal reprocess [-h] [--through THROUGH] [--yes] [--unit UNIT]\n                         [--facet FACET] [--from-scratch | --mark-updated |\n                         --owed] [--json] [-v] [-d]\n                         day\n\nSubmit a past journal day for reprocessing\n\npositional arguments:\n  day                Past day in YYYYMMDD format\n\noptions:\n  -h, --help         show this help message and exit\n  --through THROUGH  Inclusive range end in YYYYMMDD format\n  --yes\n  --unit UNIT        Reset one failed daily unit for the next eligible run\n  --facet FACET      Facet of that unit; required when the unit has a facet\n  --from-scratch     Force a full daily re-run, preserving markers (does not\n                     flag the day as updated)\n  --mark-updated     Flag the day as having new raw data so daily processing\n                     re-queues it, then nudge a drain\n  --owed             List the daily outputs owed on the day or range and why,\n                     without submitting anything\n  --json             With --owed, report each day as states and counts: its\n                     markers, its coverage, how many daily outputs it has and\n                     how many are owed, by cause\n  -v, --verbose      Enable verbose output\n  -d, --debug        Enable debug logging\n";
+    const HELP: &str = "usage: solstone journal reprocess [-h] [--through THROUGH] [--yes] [--unit UNIT]\n                         [--facet FACET] [--from-scratch | --mark-updated |\n                         --owed] [--json] [-v] [-d]\n                         day\n\nSubmit a past journal day for reprocessing\n\npositional arguments:\n  day                Past day in YYYYMMDD format\n\noptions:\n  -h, --help         show this help message and exit\n  --through THROUGH  Inclusive range end in YYYYMMDD format\n  --yes\n  --unit UNIT        Request a retry of one failed daily processing step\n  --facet FACET      Facet of that unit; required when the unit has a facet\n  --from-scratch     Force a full daily re-run, preserving markers (does not\n                     flag the day as updated)\n  --mark-updated     Flag the day as having new raw data so daily processing\n                     re-queues it, then nudge a drain\n  --owed             List the daily outputs owed on the day or range and why,\n                     without submitting anything\n  --json             With --owed, report each day as states and counts: its\n                     markers, its coverage, how many daily outputs it has and\n                     how many are owed, by cause\n  -v, --verbose      Enable verbose output\n  -d, --debug        Enable debug logging\n";
     const MISSING_DAY_STDERR: &str = "usage: solstone journal reprocess [-h] [--through THROUGH] [--yes] [--unit UNIT]\n                         [--facet FACET] [--from-scratch | --mark-updated |\n                         --owed] [--json] [-v] [-d]\n                         day\nsolstone journal reprocess: error: the following arguments are required: day\n";
 
     fn words(values: &[&str]) -> Vec<String> {
@@ -1270,8 +1231,8 @@ mod tests {
                 true
             },
         );
-        assert!(matches!(result, DayOutcome::CurrentDegraded));
-        assert_eq!(calls, 0);
+        assert!(matches!(result, DayOutcome::Submitted(Flavor::ProcessNow)));
+        assert_eq!(calls, 1);
         let forced = reprocess_day_with(
             root.path(),
             DAY,
@@ -1302,7 +1263,7 @@ mod tests {
             conflict,
             DayOutcome::Submitted(Flavor::ProcessNow)
         ));
-        assert_eq!(calls, 2);
+        assert_eq!(calls, 3);
     }
 
     #[test]
@@ -1702,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_reprocess_resets_record_without_transport() {
+    fn unit_reprocess_saves_intent_without_resetting_output_or_conflicts() {
         let root = TempDir::new().unwrap();
         write_test_provider(root.path());
         fs::write(
@@ -1743,11 +1704,11 @@ mod tests {
                 true
             },
         );
-        assert_eq!(transport_calls, 0);
+        assert_eq!(transport_calls, 1);
         assert_eq!(result.exit_code, 0);
         assert_eq!(
             result.stdout,
-            format!("schedule on {DAY} was reset for the next eligible run\n")
+            format!("retry request saved for schedule on {DAY}\n")
         );
 
         let loaded = solstone_core_journal_io::load_daily_unit_record(root.path(), &identity)
@@ -1755,13 +1716,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             loaded.status,
-            solstone_core_journal_io::DailyUnitStatus::Unfinished
+            solstone_core_journal_io::DailyUnitStatus::Failed
         );
-        assert_eq!(
-            loaded.evidence_revision,
-            solstone_core_journal_io::OWNER_REPROCESS_SENTINEL
-        );
-        assert_eq!(loaded.failure_count, 0);
+        assert_eq!(loaded.evidence_revision, "rev-1");
+        assert_eq!(loaded.failure_count, 2);
+        let (held, errors) = solstone_core_system::work_retry::list(root.path());
+        assert!(errors.is_empty());
+        assert_eq!(held.len(), 1);
+        assert!(held[0].owner.is_some());
 
         // Assert sibling bytes are unchanged
         let sibling_bytes_after = fs::read(&sibling_path).unwrap();
@@ -1789,25 +1751,18 @@ mod tests {
                 true
             },
         );
-        assert_eq!(transport_calls, 0);
-        assert_eq!(result_facet.exit_code, 0);
-        assert_eq!(
-            result_facet.stdout,
-            format!("entities (work) on {DAY} was reset for the next eligible run\n")
-        );
+        assert_eq!(transport_calls, 1);
+        assert_eq!(result_facet.exit_code, 1);
         let loaded_facet =
             solstone_core_journal_io::load_daily_unit_record(root.path(), &facet_identity)
                 .unwrap()
                 .unwrap();
         assert_eq!(
             loaded_facet.status,
-            solstone_core_journal_io::DailyUnitStatus::Unfinished
+            solstone_core_journal_io::DailyUnitStatus::Conflicting
         );
-        assert_eq!(
-            loaded_facet.evidence_revision,
-            solstone_core_journal_io::OWNER_REPROCESS_SENTINEL
-        );
-        assert_eq!(loaded_facet.failure_count, 0);
+        assert_eq!(loaded_facet.evidence_revision, "rev-2");
+        assert_eq!(loaded_facet.failure_count, 1);
     }
 
     #[test]

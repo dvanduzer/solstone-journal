@@ -31,7 +31,6 @@ solstone-core-callosum.workspace = true
 base64 = "0.22.1"
 chrono.workspace = true
 
-[target.'cfg(windows)'.dependencies]
 solstone-core-system.workspace = true
 
 [features]
@@ -57,6 +56,7 @@ path = "tests/cli.rs"
 required-features = ["test-stubs"]
 
 [dev-dependencies]
+temp-env = "0.3.6"
 sha2.workspace = true
 solstone-core-distribution.workspace = true
 solstone-core-generate-wire.workspace = true

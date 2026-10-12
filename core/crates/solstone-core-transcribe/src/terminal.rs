@@ -140,6 +140,13 @@ fn build_terminal_request(
             request.processing.clone(),
         ),
     ]);
+    solstone_core_system::work_retry::raw::stamp_failed_input(
+        header
+            .get_mut("_solstone_processing")
+            .expect("processing record"),
+        request.raw_path,
+    )
+    .map_err(|detail| TranscribeError::TerminalWrite { detail })?;
     if let Some(sound_tags) = request.sound_tags {
         header.insert("sound_tags".to_owned(), sound_tags.clone());
     } else if let Some(sound_tag_status) = request.sound_tag_status {

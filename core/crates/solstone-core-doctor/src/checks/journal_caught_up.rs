@@ -51,18 +51,21 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
         Ok(Some(report)) => {
             let age = context.now.timestamp_millis() - report.as_of_ms;
             let fresh = (0..180_000).contains(&age);
-            let owed = report
-                .bands
-                .iter()
-                .any(|band| band.segments_owed + band.daily_units_owed + band.owner_requests > 0);
+            let owed = report.bands.iter().any(|band| {
+                band.segments_owed
+                    + band.daily_units_owed
+                    + band.activities_owed
+                    + band.owner_requests
+                    > 0
+            });
             let bands = report.bands.iter().enumerate().map(|(i, band)| format!(
-                "band {}: {} recordings ready / {} left, {} daily outputs ready / {} left, {} owner requests, {} waiting for permission, {} waiting for prerequisites",
+                "band {}: {} recordings ready / {} left, {} daily outputs ready / {} left, {} activities left, {} owner requests, {} waiting for permission, {} waiting for prerequisites",
                 i + 1, band.segments_complete, band.segments_owed, band.daily_units_complete,
-                band.daily_units_owed, band.owner_requests, band.permission_held, band.prerequisite_held,
+                band.daily_units_owed, band.activities_owed, band.owner_requests, band.permission_held, band.prerequisite_held,
             )).collect::<Vec<_>>().join("; ");
             (
                 format!(
-                    "inspected {} of {} days, {} through {}, as of {}; {}; {}{}",
+                    "inspected {} of {} days, {} through {}, as of {}; {}; {}{}; set aside: {}",
                     report.days_inspected,
                     report.days_total,
                     report.oldest_day.as_deref().unwrap_or("none"),
@@ -75,6 +78,20 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
                         "incomplete inspection"
                     },
                     if fresh { "" } else { "; last known progress" },
+                    report
+                        .holds
+                        .iter()
+                        .map(|hold| format!(
+                            "{}: {}{}",
+                            hold.day,
+                            hold.reason,
+                            hold.retry_unit
+                                .as_ref()
+                                .map(|id| format!(" (retry {id})"))
+                                .unwrap_or_default()
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; "),
                 ),
                 fresh
                     && report.complete

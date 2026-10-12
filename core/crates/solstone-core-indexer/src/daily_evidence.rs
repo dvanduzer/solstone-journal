@@ -635,6 +635,20 @@ impl DailyEvidence {
     pub fn revision_under(&self, contract: &str) -> String {
         revision_digest(contract, &self.evidence)
     }
+
+    /// Retry permission follows source changes, not a maintenance window's
+    /// calendar anchor or newly named empty days. Ordinary acceptance retains
+    /// the full calendar evidence above.
+    pub fn retry_revision_under(&self, contract: &str) -> String {
+        let Some(windows) = self.evidence.get("windows").and_then(Value::as_object) else {
+            return self.revision_under(contract);
+        };
+        let sources = windows
+            .iter()
+            .filter(|(_, entries)| entries.as_array().is_none_or(|entries| !entries.is_empty()))
+            .collect::<BTreeMap<_, _>>();
+        revision_digest(contract, &json!({"windows": sources}))
+    }
 }
 
 fn revision_digest(contract: &str, evidence: &Value) -> String {
@@ -1574,4 +1588,35 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn retry_maintenance_fingerprint_ignores_midnight_without_new_sources() {
+    let evidence = |anchor: &str, windows: Value| DailyEvidence {
+        revision: "unused".into(),
+        contract: "contract".into(),
+        evidence: json!({"anchor":anchor,"windows":windows}),
+    };
+    let before = evidence(
+        "2026-01-01",
+        json!({"20260101":[],"20251231":["120000_300"]}),
+    );
+    let after = evidence(
+        "2026-01-02",
+        json!({"20260102":[],"20260101":[],"20251231":["120000_300"]}),
+    );
+    assert_ne!(before.revision_under("same"), after.revision_under("same"));
+    assert_eq!(
+        before.retry_revision_under("same"),
+        after.retry_revision_under("same")
+    );
+    let changed = evidence(
+        "2026-01-02",
+        json!({"20260102":["090000_300"],"20260101":[],"20251231":["120000_300"]}),
+    );
+    assert_ne!(
+        before.retry_revision_under("same"),
+        changed.retry_revision_under("same")
+    );
 }

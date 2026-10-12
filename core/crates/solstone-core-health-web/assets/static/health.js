@@ -284,6 +284,8 @@
     const host = document.querySelector('[data-backlog-stuck-rows]');
     const rowsHost = host && host.querySelector('[data-backlog-rows]');
     const rows = Array.isArray(data.stuck_rows) ? data.stuck_rows : [];
+    state.legacyHolds = rows;
+    renderHeldWork();
     const verdictLine = document.querySelector('#backlogVerdict .backlog-verdict-line');
     if (verdictLine) renderBacklogVerdict(verdictLine, data, rows.length);
     // Before the nightly run's first chance: calm, not a warning (the day-0 rule).
@@ -341,93 +343,8 @@
 
     clearHealthStateError();
 
-    if (!host) return;
-    if (!rowsHost || rows.length === 0) {
-      host.hidden = true;
-      if (rowsHost) rowsHost.replaceChildren();
-      return;
-    }
-
-    host.hidden = false;
-    const heading = host.querySelector('[data-backlog-heading]');
-    const description = host.querySelector('[data-backlog-description]');
-    if (heading) heading.textContent = backlogCopy.bucket_heading || '';
-    if (description) description.textContent = backlogCopy.bucket_description || '';
-    rowsHost.replaceChildren();
-    rows.forEach((row) => {
-      const rowEl = document.createElement('div');
-      rowEl.className = 'backlog-row';
-
-      const main = document.createElement('div');
-      main.className = 'backlog-row-main';
-
-      const day = document.createElement('span');
-      day.className = 'backlog-row-day';
-      day.textContent = window.JournalFormat.day(row.day || '');
-      main.appendChild(day);
-
-      const badge = document.createElement('span');
-      badge.className = 'backlog-badge';
-      badge.textContent = backlogCopy.day_badge || '';
-      main.appendChild(badge);
-
-      const reason = document.createElement('span');
-      reason.className = 'backlog-row-reason';
-      reason.textContent = row.reason || '';
-      main.appendChild(reason);
-
-      const detailFields = ['reason_code', 'provider', 'model'].filter(field => row[field]);
-      if (detailFields.length > 0) {
-        const details = document.createElement('details');
-        details.className = 'backlog-row-details';
-        const summary = document.createElement('summary');
-        summary.textContent = 'details';
-        details.appendChild(summary);
-        detailFields.forEach((field) => {
-          const detail = document.createElement('span');
-          detail.textContent = `${field}=${row[field]}`;
-          details.appendChild(detail);
-        });
-        main.appendChild(details);
-      }
-
-      rowEl.appendChild(main);
-
-      if (row.depth) {
-        const depth = document.createElement('span');
-        depth.className = 'backlog-depth';
-        depth.textContent = String(row.depth);
-        rowEl.appendChild(depth);
-      }
-
-      const actions = document.createElement('div');
-      actions.className = 'backlog-row-actions';
-
-      const process = document.createElement('button');
-      process.type = 'button';
-      process.className = 'backlog-action';
-      process.dataset.day = row.day || '';
-      process.dataset.flavor = 'process-now';
-      process.textContent = backlogCopy.action_process_now || '';
-      actions.appendChild(process);
-
-      const redo = document.createElement('button');
-      redo.type = 'button';
-      redo.className = 'backlog-action';
-      redo.dataset.day = row.day || '';
-      redo.dataset.flavor = 'from-scratch';
-      redo.dataset.confirm = backlogCopy.confirm_redo_scratch || '';
-      redo.textContent = backlogCopy.action_redo_scratch || '';
-      actions.appendChild(redo);
-
-      const status = document.createElement('span');
-      status.className = 'backlog-action-status';
-      actions.appendChild(status);
-
-      rowEl.appendChild(actions);
-      rowsHost.appendChild(rowEl);
-    });
-    wireBacklogReprocessActions();
+    if (host) host.hidden = true;
+    if (rowsHost) rowsHost.replaceChildren();
   }
 
   function renderAgentErrorsState(agentErrors) {
@@ -488,6 +405,8 @@
   function renderWorkProgress(work) {
     const section = document.getElementById('workProgress');
     if (!section) return;
+    state.work = work;
+    renderHeldWork();
     const inventory = work?.inventory;
     const reach = section.querySelector('[data-work-reach]');
     const rows = section.querySelector('[data-work-bands]');
@@ -507,6 +426,7 @@
         row.textContent = names[i] + ': ' + band.segments_complete + ' recordings ready, '
           + band.segments_owed + ' left; ' + band.daily_units_complete + ' daily outputs ready, '
           + band.daily_units_owed + ' left'
+          + (band.activities_owed ? '; ' + band.activities_owed + ' activities left' : '')
           + (band.owner_requests ? '; ' + band.owner_requests + ' requests to redo a day' : '')
           + (band.permission_held ? '; ' + band.permission_held + ' waiting for permission' : '')
           + (band.prerequisite_held ? '; ' + band.prerequisite_held + ' waiting for recordings' : '') + '.';
@@ -515,7 +435,7 @@
     }
     section.querySelector('[data-work-confirm]').hidden = !work?.confirmation_available || work.history_confirmed;
     const details = section.querySelector('[data-work-details]');
-    const errors = work?.error ? [work.error] : inventory?.unreadable || [];
+    const errors = [...(work?.error ? [work.error] : inventory?.unreadable || []), ...(work?.retry_errors || [])];
     details.hidden = errors.length === 0;
     details.querySelector('pre').textContent = errors.join('\n');
     const button = section.querySelector('[data-work-allow]');
@@ -877,12 +797,47 @@
     return holds;
   }
 
+  function setAsideHolds() {
+    const inventory = state.work?.inventory;
+    const records = new Map((state.work?.retry_records || []).map(record => [record.id, record]));
+    const holds = (inventory?.holds || []).map((hold, index) => ({
+      key: hold.retry_unit ? 'unit:' + hold.retry_unit : 'work:' + [hold.day, hold.stream, hold.segment, hold.reason].join(':'),
+      unit: hold.retry_unit, day: hold.day, reason: hold.reason,
+      label: [hold.day, hold.segment, talentName(records.get(hold.retry_unit)?.unit?.talent)].filter(Boolean).join(' · '),
+      evidence: records.get(hold.retry_unit) || hold,
+    }));
+    const days = new Set(holds.map(hold => hold.day));
+    for (const row of state.legacyHolds || []) {
+      if (!days.has(row.day)) holds.push({ key: 'day:' + row.day, day: row.day,
+        reason: row.reason, label: row.day, evidence: row });
+    }
+    return [...new Map(holds.map(hold => [hold.key, hold])).values()];
+  }
+
+  function heldReason(reason) {
+    const reasons = {
+      corrupt_input: 'the recording could not be read. replace its source before trying again.',
+      no_audio_stream: 'the recording has no audio stream.',
+      owner_output_protected: 'this output may have been edited. retry keeps it; replacing it requires an explicit from-scratch request.',
+      segment_prerequisites: 'waiting for the recordings on this day.',
+      spending_confirmation: 'waiting for permission to process older work.',
+      thinking_unavailable: 'choose a model in thinking before this work can run.',
+      retry_wait: 'waiting before another attempt.',
+      analysis_failed: 'analysis has failed repeatedly.',
+      schema_invalid: 'the model repeatedly returned an unusable result.',
+      schema_validation_failed: 'the model repeatedly returned an unusable result.',
+    };
+    return reasons[reason] || (reason && reason.includes(' ') ? reason : 'this processing step has been set aside.');
+  }
+
   function heldWorkVerdict() {
     const action = { href: '#processingHolds', label: 'view queued work' };
-    if (!state.heldWorkCurrent) {
+    const inventory = state.work?.inventory;
+    const workStale = inventory && (Date.now() - inventory.as_of_ms < 0 || Date.now() - inventory.as_of_ms >= 180000);
+    if (!state.heldWorkCurrent || workStale || state.work?.error) {
       return { key: 'HEALTH_GLANCE_WORK_UNAVAILABLE', vars: {}, action };
     }
-    return queuedWorkHolds(state.heldWorkSnapshot).length
+    return (queuedWorkHolds(state.heldWorkSnapshot).length + setAsideHolds().length)
       ? { key: 'HEALTH_GLANCE_WORK_HELD', vars: {}, action } : null;
   }
 
@@ -891,15 +846,18 @@
   function renderHeldWork() {
     const section = document.getElementById('processingHolds');
     if (!section) return;
-    const holds = queuedWorkHolds(state.heldWorkSnapshot);
-    section.hidden = state.heldWorkCurrent && holds.length === 0;
-    section.dataset.current = String(state.heldWorkCurrent);
+    const holds = [...queuedWorkHolds(state.heldWorkSnapshot), ...setAsideHolds()];
+    const inventory = state.work?.inventory;
+    const workStale = inventory && (Date.now() - inventory.as_of_ms < 0 || Date.now() - inventory.as_of_ms >= 180000);
+    const current = state.heldWorkCurrent && !workStale && !state.work?.error;
+    section.hidden = current && holds.length === 0;
+    section.dataset.current = String(current);
     const notice = section.querySelector('[data-held-work-notice]');
-    notice.textContent = state.heldWorkCurrent ? '' : state.heldWorkSnapshot
+    notice.textContent = workStale ? 'set-aside work was last checked ' + new Date(inventory.as_of_ms).toLocaleString() + '. checking its status again.' : current ? '' : state.heldWorkSnapshot
       ? 'queued work status is unavailable. last known status, checked '
         + new Date(state.heldWorkSnapshot.observedAt).toLocaleString() + '.'
       : 'queued work status is unavailable.';
-    notice.hidden = state.heldWorkCurrent;
+    notice.hidden = current;
     const rows = section.querySelector('[data-held-work-rows]');
     const keys = new Set(holds.map(hold => hold.key));
     for (const row of Array.from(rows.children)) {
@@ -916,7 +874,13 @@
         const summary = document.createElement('summary');
         summary.textContent = 'technical details';
         details.append(summary, document.createElement('pre'));
-        row.append(line, details);
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.textContent = 'try again';
+        const feedback = document.createElement('p');
+        feedback.dataset.retryFeedback = '';
+        feedback.setAttribute('role', 'status');
+        row.append(line, retry, feedback, details);
         rows.appendChild(row);
       }
       const names = { daily: 'daily processing', activity: 'activity processing',
@@ -925,10 +889,26 @@
       const scope = hold.partition
         ? names[hold.partition] || scheduleName(hold.partition) || 'queued processing'
         : 'all queued work';
-      row.querySelector('p').textContent = scope + ': ' + hold.count
+      row.querySelector('p').textContent = hold.label ? hold.label + ': ' + heldReason(hold.reason) : scope + ': ' + hold.count
         + (hold.count === 1 ? ' task' : ' tasks')
         + (state.heldWorkCurrent ? ' on hold for a safety check.' : ' on hold at the last check.');
       row.querySelector('pre').textContent = JSON.stringify(hold.evidence, null, 2);
+      const retry = row.querySelector('button');
+      retry.onclick = async () => {
+        const feedback = row.querySelector('[data-retry-feedback]');
+        retry.disabled = true;
+        feedback.textContent = 'checking this work…';
+        try {
+          const endpoint = hold.unit || !hold.day ? '/app/health/api/retry-work' : '/app/health/api/reprocess';
+          const body = hold.unit ? { unit: hold.unit } : hold.day ? { day: hold.day, flavor: 'process-now' } : { safety: true };
+          const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const result = await response.json();
+          feedback.textContent = result.message || (response.ok ? 'your request is saved.' : 'this work could not be retried.');
+          await loadHealthState();
+        } catch {
+          feedback.textContent = 'the retry could not be saved. try again.';
+        } finally { retry.disabled = false; }
+      };
     }
     section.querySelector('[data-held-work-support]').hidden = holds.length === 0;
     if (!section.hidden && !heldWorkDeepLinkScrolled && window.location.hash === '#processingHolds') {

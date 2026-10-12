@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- health now brings set-aside work into one list, with a reason and a try-again for each failed step. your request joins the priority order and keeps accepted results and your edits. a retry also becomes possible when its input changes or an update contains a declared fix for that failure. an update alone does not retry it.
+
 - searching your journal now finds a day by the towns your phone's location was near, and your journal's own thinking, and an agent that may see transcripts across your whole journal, can read those town names, never the coordinates.
 - a new map app shows the location your phone sends, a day at a time. each record is named after the town it was near, like "near Golden, Colorado". visits your iphone reported show when you arrived and left. a small map draws the towns and borders around them. the town and border names come with your journal, so no map service is asked for anything, and streets aren't shown. every record opens in transcripts, where you can delete the segments it came from.
 - your journal now works out stays from your iphone's precise readings: when they keep within 100 m of the first of them for at least five minutes, the day shows one stay instead of a run of readings. approximate location never makes a stay.
@@ -34,7 +36,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - the local model's dropdown label no longer says "8 GB", which could be mistaken for its graphics memory requirement.
 - your weekly page is written again on large journals. in 2.0.41, putting the week together could take longer than the ten minutes your journal allows, so no page was written for that week, and it isn't written later on its own.
 - if you delete or edit something your journal made for a day, your journal now leaves it as you left it and counts the day as done. before, it kept treating that day as unfinished and processing it again. to have it made again, run `solstone journal reprocess DAY --from-scratch`. it redoes that whole day.
-- when your journal can't get a usable story for an activity even after trying again, it now waits until the activity changes before it asks again. before, it kept asking again, at least once an hour, with no end, and each try used your thinking provider.
+- when your journal can't get a usable story for an activity even after trying again, it now waits until the activity changes, you request a retry in health, or an update names that failure as fixed before it asks again. before, it kept asking again, at least once an hour, with no end, and each try used your thinking provider.
 - importing the same AI conversation export, calendar file or notes again with `solstone journal import` now skips it, as the import page already does. before, it wrote everything again and your journal processed every day it covered again. to import it again on purpose, add `--force`.
 
 ## [2.0.41] - 2026-10-11

@@ -94,8 +94,6 @@ where
 pub fn response(day: &str, outcome: DayOutcome) -> axum::response::Response {
     match outcome {
         DayOutcome::Submitted(_) => Json(json!({"status":"queued","day":day})).into_response(),
-        DayOutcome::AlreadyComplete => Json(json!({"status":"already_complete","day":day,"message":"this day's already done. want to redo it from scratch?","reason_code":"reprocess_already_complete"})).into_response(),
-        DayOutcome::CurrentDegraded => Json(json!({"status":"current_degraded","day":day,"message":"some daily processing is still unresolved. you can retry it from scratch.","reason_code":"reprocess_current_degraded"})).into_response(),
         DayOutcome::NoThinkingEngine => error_envelope("reprocess_no_thinking_engine","no model is chosen yet. choose one in thinking, then try again.","",StatusCode::BAD_REQUEST).into_response(),
         DayOutcome::PastOnly => error_envelope("reprocess_past_only","you can only reprocess past days — today and future days aren't ready yet.","",StatusCode::BAD_REQUEST).into_response(),
         DayOutcome::WaitingForSupervisor => Json(json!({"status":"saved","day":day,"message":"your request is saved. it will run when your journal's background service starts."})).into_response(),
@@ -133,4 +131,105 @@ fn invalid(detail: &str) -> axum::response::Response {
         StatusCode::BAD_REQUEST,
     )
     .into_response()
+}
+
+/// Save only a source-validated unit intent. Queue delivery is a wakeup, not a
+/// claim that the unit has started or that a process safety hold was cleared.
+pub async fn retry_work(
+    root: std::path::PathBuf,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    match tokio::task::spawn_blocking(move || retry_work_blocking(root, body)).await {
+        Ok(response) => response,
+        Err(error) => error_envelope(
+            "retry_unavailable",
+            "the retry could not be checked.",
+            error.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .into_response(),
+    }
+}
+
+fn retry_work_blocking(
+    root: std::path::PathBuf,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    use solstone_core_system::work_retry::{self, Unit};
+    let body = body.map(|v| v.0).unwrap_or_default();
+    if body.get("safety") == Some(&Value::Bool(true)) {
+        let sent = send(
+            &root,
+            &solstone_core_callosum::CallosumEnvelope {
+                tract: "supervisor".into(),
+                event: "drain".into(),
+                ts: None,
+                extra: Default::default(),
+            },
+        );
+        return Json(json!({"status": "held", "message": if sent {
+            "the safety hold is still in place. checking the journal's status again."
+        } else { "the background service could not be reached. the safety hold is still in place." }})).into_response();
+    }
+    let Some(id) = body.get("unit").and_then(Value::as_str) else {
+        return missing("Missing unit");
+    };
+    let result = (|| -> Result<Option<String>, String> {
+        let record = work_retry::read(&root, id)?.ok_or("that work is no longer set aside")?;
+        let input = match &record.unit {
+            Unit::Raw { output, .. } => {
+                let output = record.unit.segment_directory(&root)?.join(output);
+                let Some(evidence) = work_retry::raw::inspect_output(&root, &output)? else {
+                    return Ok(None);
+                };
+                work_retry::raw::observe(&root, &evidence)?;
+                if evidence.protected {
+                    return Err("this output has changes that retry will preserve. replacing it requires an explicit from-scratch request".into());
+                }
+                if matches!(
+                    evidence.reason.as_str(),
+                    "corrupt_input" | "no_audio_stream"
+                ) && evidence.input == record.input
+                {
+                    return Err("the source still cannot be read as usable media. replace it before trying again".into());
+                }
+                evidence.input
+            }
+            Unit::Daily { .. } => {
+                let Some(input) = work_retry::daily::observe(&root, &record.unit)? else {
+                    return Ok(None);
+                };
+                input
+            }
+            Unit::Segment { .. } | Unit::Activity { .. } => {
+                work_retry::input::current(&root, &record.unit)?
+            }
+        };
+        work_retry::request(&root, &record.unit)?;
+        let current = work_retry::read(&root, id)?.ok_or("saved request could not be read")?;
+        if current
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .is_none()
+        {
+            return Err("this work is still held after checking its source".into());
+        }
+        let _ = send(
+            &root,
+            &solstone_core_callosum::CallosumEnvelope {
+                tract: "supervisor".into(),
+                event: "drain".into(),
+                ts: None,
+                extra: serde_json::Map::from_iter([("day".into(), json!(record.unit.day()))]),
+            },
+        );
+        Ok(Some(
+            "your retry request is saved. the journal will check this work before retrying it."
+                .into(),
+        ))
+    })();
+    match result {
+        Ok(Some(message)) => Json(json!({"status":"saved", "message":message})).into_response(),
+        Ok(None) => Json(json!({"status":"changed", "message":"that work has changed since this list was checked. refreshing its status."})).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(json!({"status":"held", "message":error}))).into_response(),
+    }
 }

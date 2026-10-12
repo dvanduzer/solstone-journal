@@ -22,6 +22,7 @@ use solstone_core_system::{
     work_intent::{self, IntentState, OwnerIntent},
     work_inventory::{WorkHold, WorkInventory},
     work_policy::WorkPolicy,
+    work_retry::{self, Unit},
 };
 
 pub(crate) struct WorkDiscovery {
@@ -197,12 +198,355 @@ fn held(
     reason: &str,
 ) {
     report.holds.push(WorkHold {
+        retry_unit: None,
         day: day.into(),
         segment: segment.map(|(s, _)| s.into()),
         stream: segment.map(|(_, s)| s.into()),
         band,
         reason: reason.into(),
     });
+}
+
+fn retry_imported(unit: &Unit, imports: &[ImportThinking]) -> bool {
+    imports.iter().any(|import| match unit {
+        Unit::Raw {
+            day,
+            segment,
+            stream,
+            ..
+        }
+        | Unit::Segment {
+            day,
+            segment,
+            stream,
+            ..
+        } => import.segments.contains(&Coordinate {
+            day: day.clone(),
+            segment: segment.clone(),
+            stream: stream.clone(),
+        }),
+        Unit::Daily { day, talent, .. } if talent != "daily_schedule" => import.days.contains(day),
+        _ => false,
+    })
+}
+
+/// Read native writer evidence on the discovery worker. The permission ledger
+/// keeps the original failed input; it does not make this scan authoritative.
+#[allow(clippy::too_many_arguments)]
+fn raw_retries(
+    journal: &Path,
+    day: &str,
+    segment: &solstone_core_system_health::DaySegment,
+    intent: Option<&OwnerIntent>,
+    imports: &[ImportThinking],
+    policy: WorkPolicy,
+    report: &mut WorkInventory,
+) -> Result<Vec<DiscoveredTask>, String> {
+    let directory = match segment.stream_layout {
+        solstone_core_journal_io::SegmentLayout::Direct => {
+            journal.join("chronicle").join(day).join(&segment.key)
+        }
+        solstone_core_journal_io::SegmentLayout::Named => journal
+            .join("chronicle")
+            .join(day)
+            .join(&segment.stream)
+            .join(&segment.key),
+    };
+    let today = chrono::Utc::now()
+        .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+        .date_naive();
+    let mut tasks = Vec::new();
+    for talent in solstone_core_system_health::SEGMENT_FLOOR_TALENTS {
+        let unit = Unit::Segment {
+            day: day.into(),
+            stream: segment.stream.clone(),
+            segment: segment.key.clone(),
+            talent: (*talent).into(),
+            direct: matches!(
+                segment.stream_layout,
+                solstone_core_journal_io::SegmentLayout::Direct
+            ),
+        };
+        if work_retry::read(journal, &unit.id()?)?.is_some() {
+            continue;
+        }
+        let capped = solstone_core_system_health::is_floor_talent_capped(
+            &solstone_core_system_health::FilesystemHealthLogSource::new(journal),
+            day,
+            Some(&segment.stream),
+            &segment.key,
+            talent,
+        )
+        .map_err(|e| e.to_string())?;
+        if capped.malformed_line_count != 0 {
+            return Err("floor failure evidence is unreadable".into());
+        }
+        if capped.value {
+            match work_retry::input::current(journal, &unit) {
+                Ok(input) => work_retry::observe_held(journal, &unit, "floor_failed", &input)?,
+                Err(error) => report.unreadable.push(error),
+            }
+        }
+    }
+    for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|p| p.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let evidence = match work_retry::raw::inspect_output(journal, &path) {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) => continue,
+            Err(error) => {
+                report
+                    .unreadable
+                    .push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        work_retry::raw::observe(journal, &evidence)?;
+        let id = evidence.unit.id()?;
+        // A durable day ask is expanded idempotently, never renewed by ticks.
+        if let Some(intent) = intent {
+            work_retry::request_with_id(journal, &evidence.unit, &intent.id)?;
+        }
+        let record = work_retry::read(journal, &id)?.ok_or("missing native hold")?;
+        let grant = (!evidence.protected)
+            .then(|| record.permission(&evidence.input, work_retry::DECLARED_FIXES))
+            .flatten();
+        let imported = retry_imported(&record.unit, imports);
+        let explicit = match grant.as_ref().map(|a| a.cause.as_str()) {
+            Some(cause) if cause.starts_with("owner:") => Some(WorkBand::Waiting),
+            Some(cause) if cause.starts_with("fix:") => Some(WorkBand::Completing),
+            _ => imported.then_some(WorkBand::Import),
+        };
+        let p = priority(day, Some(&segment.key), today, explicit);
+        report.holds.push(WorkHold {
+            retry_unit: Some(id.clone()),
+            day: day.into(),
+            segment: Some(segment.key.clone()),
+            stream: Some(segment.stream.clone()),
+            band: p.band,
+            reason: record.reason.clone(),
+        });
+        let Some(grant) = grant else {
+            continue;
+        };
+        if !policy.permits(p.band, imported) {
+            report.band(p.band).permission_held += 1;
+            continue;
+        }
+        report.band(p.band).eligible += 1;
+        tasks.push(DiscoveredTask {
+            guard: None,
+            confirmed_import: imported,
+            request: BusTaskRequest {
+                cmd: TaskArgv::from_wire(canonical_journal_command([
+                    "think",
+                    "--day",
+                    day,
+                    "--retry-unit",
+                    &id,
+                    "--retry-cause",
+                    &grant.cause,
+                ]))
+                .expect("native retry command"),
+                reference: format!("supervisor-retry-raw-{day}-{id}"),
+                day: Some(day.into()),
+                scheduler_name: None,
+                queue_if_active_cmd_differs: false,
+                priority: Some(p),
+                daily_catchup_provenance: None,
+            },
+        });
+    }
+    Ok(tasks)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn daily_retries(
+    journal: &Path,
+    day: &str,
+    coverage: &daily_coverage::DailyCoverage,
+    intent: Option<&OwnerIntent>,
+    imports: &[ImportThinking],
+    policy: WorkPolicy,
+    ready: bool,
+    report: &mut WorkInventory,
+) -> Result<Vec<DiscoveredTask>, String> {
+    let today = chrono::Utc::now()
+        .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+        .date_naive();
+    let mut candidates = Vec::new();
+    let maintenance = coverage
+        .maintenance
+        .as_ref()
+        .filter(|_| day == today.format("%Y%m%d").to_string());
+    for covered in coverage.units.iter().chain(maintenance) {
+        let unit = Unit::Daily {
+            day: day.into(),
+            talent: covered.identity.name.clone(),
+            facet: covered.identity.facet.clone(),
+        };
+        let Some(input) = work_retry::daily::observe(journal, &unit)? else {
+            continue;
+        };
+        let id = unit.id()?;
+        if let Some(intent) = intent {
+            work_retry::request_with_id(journal, &unit, &intent.id)?;
+        }
+        let record = work_retry::read(journal, &id)?.ok_or("daily permission missing")?;
+        let grant = record.permission(&input, work_retry::DECLARED_FIXES);
+        let imported = retry_imported(&record.unit, imports);
+        let explicit = match grant.as_ref().map(|a| a.cause.as_str()) {
+            Some(cause) if cause.starts_with("owner:") => Some(WorkBand::Waiting),
+            Some(cause) if cause.starts_with("fix:") => Some(WorkBand::Completing),
+            _ => imported.then_some(WorkBand::Import),
+        };
+        let p = priority(day, None, today, explicit);
+        if !covered.state.is_owed() {
+            report.band(p.band).daily_units_owed += 1;
+        }
+        report.holds.push(WorkHold {
+            retry_unit: Some(id.clone()),
+            day: day.into(),
+            segment: None,
+            stream: None,
+            band: p.band,
+            reason: record.reason.clone(),
+        });
+        let Some(grant) = grant else {
+            continue;
+        };
+        if !ready {
+            report.band(p.band).prerequisite_held += 1;
+            continue;
+        }
+        if !policy.permits(p.band, imported) {
+            report.band(p.band).permission_held += 1;
+            continue;
+        }
+        report.band(p.band).eligible += 1;
+        candidates.push(DiscoveredTask {
+            guard: None,
+            confirmed_import: imported,
+            request: BusTaskRequest {
+                cmd: TaskArgv::from_wire(canonical_journal_command([
+                    "think",
+                    "--day",
+                    day,
+                    "--retry-unit",
+                    &id,
+                    "--retry-cause",
+                    &grant.cause,
+                ]))
+                .expect("daily retry command"),
+                reference: format!("supervisor-retry-daily-{day}-{id}"),
+                day: Some(day.into()),
+                scheduler_name: None,
+                queue_if_active_cmd_differs: false,
+                priority: Some(p),
+                daily_catchup_provenance: None,
+            },
+        });
+    }
+    Ok(candidates)
+}
+
+fn talent_retries(
+    journal: &Path,
+    day: &str,
+    intent: Option<&OwnerIntent>,
+    imports: &[ImportThinking],
+    policy: WorkPolicy,
+    report: &mut WorkInventory,
+) -> Result<Vec<DiscoveredTask>, String> {
+    let (records, errors) = work_retry::list(journal);
+    report.unreadable.extend(errors);
+    let today = chrono::Utc::now()
+        .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+        .date_naive();
+    let mut candidates = Vec::new();
+    for record in records.into_iter().filter(|r| {
+        r.unit.day() == day && matches!(r.unit, Unit::Segment { .. } | Unit::Activity { .. })
+    }) {
+        let id = record.unit.id()?;
+        let current = match &record.unit {
+            Unit::Activity { .. } => {
+                solstone_core_think_cli::activity_held_input(journal, &record.unit)
+            }
+            _ => work_retry::input::current(journal, &record.unit).map(Some),
+        };
+        let input = match current {
+            Ok(Some(input)) => Some(input),
+            Ok(None) => continue,
+            Err(error) => {
+                report.unreadable.push(format!("{day}: {error}"));
+                None
+            }
+        };
+        if let Some(intent) = intent {
+            work_retry::request_with_id(journal, &record.unit, &intent.id)?;
+        }
+        let record = work_retry::read(journal, &id)?.ok_or("missing talent retry")?;
+        let grant = input
+            .as_ref()
+            .and_then(|input| record.permission(input, work_retry::DECLARED_FIXES));
+        let imported = retry_imported(&record.unit, imports);
+        let explicit = match grant.as_ref().map(|a| a.cause.as_str()) {
+            Some(cause) if cause.starts_with("owner:") => Some(WorkBand::Waiting),
+            Some(cause) if cause.starts_with("fix:") => Some(WorkBand::Completing),
+            _ => imported.then_some(WorkBand::Import),
+        };
+        let (segment, stream) = match &record.unit {
+            Unit::Segment {
+                segment, stream, ..
+            } => (Some(segment.clone()), Some(stream.clone())),
+            _ => (None, None),
+        };
+        let p = priority(day, segment.as_deref(), today, explicit);
+        report.holds.push(WorkHold {
+            retry_unit: Some(id.clone()),
+            day: day.into(),
+            segment,
+            stream,
+            band: p.band,
+            reason: record.reason.clone(),
+        });
+        if matches!(record.unit, Unit::Activity { .. }) {
+            report.band(p.band).activities_owed += 1;
+        }
+        let Some(grant) = grant else {
+            continue;
+        };
+        if !policy.permits(p.band, imported) {
+            report.band(p.band).permission_held += 1;
+            continue;
+        }
+        report.band(p.band).eligible += 1;
+        candidates.push(DiscoveredTask {
+            guard: None,
+            confirmed_import: imported,
+            request: BusTaskRequest {
+                cmd: TaskArgv::from_wire(canonical_journal_command([
+                    "think",
+                    "--day",
+                    day,
+                    "--retry-unit",
+                    &id,
+                    "--retry-cause",
+                    &grant.cause,
+                ]))
+                .expect("talent retry command"),
+                reference: format!("supervisor-retry-talent-{day}-{id}"),
+                day: Some(day.into()),
+                scheduler_name: None,
+                queue_if_active_cmd_differs: false,
+                priority: Some(p),
+                daily_catchup_provenance: None,
+            },
+        });
+    }
+    Ok(candidates)
 }
 
 fn inspect_day(
@@ -270,6 +614,9 @@ fn inspect_day(
         if super::tick::is_mcp_audit_segment(Some(&segment.stream)) {
             continue;
         }
+        work.candidates.extend(raw_retries(
+            journal, day, segment, intent, imports, policy, report,
+        )?);
         let coordinate = Coordinate {
             day: day.into(),
             stream: segment.stream.clone(),
@@ -323,15 +670,27 @@ fn inspect_day(
             );
         }
     }
-    if day >= today.format("%Y%m%d").to_string().as_str() {
-        return Ok(work);
-    }
     let imported = imports.iter().any(|import| import.days.contains(day));
     let explicit = intent
         .map(|_| WorkBand::Waiting)
         .or_else(|| imported.then_some(WorkBand::Import));
     let p = priority(day, None, today, explicit);
     let coverage = daily_coverage::read_daily_coverage(journal, day)?;
+    work.candidates.extend(daily_retries(
+        journal,
+        day,
+        &coverage,
+        intent,
+        imports,
+        policy,
+        prerequisites_ready
+            && super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref()
+                != Some(day),
+        report,
+    )?);
+    if day >= today.format("%Y%m%d").to_string().as_str() {
+        return Ok(work);
+    }
     let owed = coverage
         .units
         .iter()
@@ -352,7 +711,9 @@ fn inspect_day(
             .push(format!("{day}: unsupported daily evidence contract"));
     }
     report.band(p.band).daily_units_owed += owed;
-    work.daily_current = coverage.state.is_current() && prerequisites_ready;
+    work.daily_current = coverage.state.is_current()
+        && prerequisites_ready
+        && !report.holds.iter().any(|hold| hold.retry_unit.is_some());
     if coverage.state == CoverageState::Unreadable {
         return Err("daily coverage is unreadable".into());
     }
@@ -403,6 +764,63 @@ fn still_owed(
             .find(|pair| pair[0] == flag)
             .map(|pair| pair[1].as_str())
     };
+    if let Some(id) = argument("--retry-unit") {
+        let Some(record) = work_retry::read(journal, id)? else {
+            return Ok(false);
+        };
+        if candidate.confirmed_import && !retry_imported(&record.unit, imports) {
+            return Ok(false);
+        }
+        let (input, reason) = match &record.unit {
+            Unit::Raw { output, .. } => {
+                let output = record.unit.segment_directory(journal)?.join(output);
+                let Some(evidence) = work_retry::raw::inspect_output(journal, &output)? else {
+                    return Ok(false);
+                };
+                if evidence.protected {
+                    return Ok(false);
+                }
+                (evidence.input, evidence.reason)
+            }
+            Unit::Daily { .. } => {
+                if !solstone_core_system_health::day_segments_ready(journal, day)? {
+                    return Ok(false);
+                }
+                let Some(input) = work_retry::daily::observe(journal, &record.unit)? else {
+                    return Ok(false);
+                };
+                (input, record.reason.clone())
+            }
+            Unit::Segment { .. } => (
+                work_retry::input::current(journal, &record.unit)?,
+                record.reason.clone(),
+            ),
+            Unit::Activity { .. } => {
+                let Some(input) =
+                    solstone_core_think_cli::activity_held_input(journal, &record.unit)?
+                else {
+                    return Ok(false);
+                };
+                (input, record.reason.clone())
+            }
+        };
+        return Ok(record
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .is_some_and(|a| {
+                Some(a.cause.as_str()) == argument("--retry-cause") && a.reason == reason
+            }));
+    }
+    if let Some(activity) = argument("--activity") {
+        return solstone_core_think_cli::activity_retry_due(
+            journal,
+            &solstone_core_think_cli::ActivityRetry {
+                day: day.into(),
+                facet: argument("--facet").ok_or("activity has no facet")?.into(),
+                activity: activity.into(),
+            },
+            chrono::Utc::now().timestamp_millis(),
+        );
+    }
     if let Some(id) = argument("--work-intent") {
         return Ok(work_intent::read(journal)?.get(day).is_some_and(|intent| {
             intent.id == id && intent.from_scratch && intent.state == IntentState::Queued
@@ -486,7 +904,21 @@ fn admit(
                     let argv = candidate.request.cmd.as_wire();
                     let argument =
                         |flag: &str| argv.windows(2).find(|p| p[0] == flag).map(|p| p[1].clone());
-                    let segment = argument("--segment").zip(argument("--stream"));
+                    let segment = if let Some(id) = argument("--retry-unit") {
+                        match work_retry::read(journal, &id)?.map(|r| r.unit) {
+                            Some(
+                                Unit::Raw {
+                                    segment, stream, ..
+                                }
+                                | Unit::Segment {
+                                    segment, stream, ..
+                                },
+                            ) => Some((segment, stream)),
+                            _ => None,
+                        }
+                    } else {
+                        argument("--segment").zip(argument("--stream"))
+                    };
                     let grants = imports
                         .imports
                         .iter()
@@ -535,6 +967,34 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let imports = solstone_core_import::thinking::read(journal)?;
+    let (activities, activity_errors) = solstone_core_think_cli::discover_activity_retries(
+        journal,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    let (held_activities, held_errors) = solstone_core_think_cli::discover_held_activities(journal);
+    let (held_records, retry_errors) = work_retry::list(journal);
+    let today = daily_coverage::local_day(journal, chrono::Utc::now());
+    let maintenance =
+        solstone_core_journal_io::DailyUnitIdentity::new(&today, "daily_schedule", None);
+    if solstone_core_journal_io::load_daily_unit_record(journal, &maintenance)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|record| record.status == solstone_core_journal_io::DailyUnitStatus::Capped)
+    {
+        days.entry(today.clone())
+            .or_insert_with(|| journal.join("chronicle").join(today));
+    }
+
+    for unit in held_activities
+        .iter()
+        .chain(held_records.iter().map(|r| &r.unit))
+    {
+        days.entry(unit.day().into())
+            .or_insert_with(|| journal.join("chronicle").join(unit.day()));
+    }
+    for activity in &activities {
+        days.entry(activity.day.clone())
+            .or_insert_with(|| journal.join("chronicle").join(&activity.day));
+    }
     let mut report = WorkInventory {
         days_total: days.len(),
         oldest_day: days.keys().next().cloned(),
@@ -542,6 +1002,9 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
         unreadable: imports.unreadable,
         ..WorkInventory::default()
     };
+    report.unreadable.extend(activity_errors);
+    report.unreadable.extend(held_errors);
+    report.unreadable.extend(retry_errors);
     report.publish(journal)?;
     let mut candidates = Vec::new();
     let mut day_reports = BTreeMap::<String, WorkInventory>::new();
@@ -587,6 +1050,13 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
         days.entry(day.clone())
             .or_insert_with(|| journal.join("chronicle").join(&day));
         let mut day_report = WorkInventory::default();
+        if let Err(error) = solstone_core_think_cli::seed_activity_retries(
+            journal,
+            &day,
+            chrono::Utc::now().timestamp_millis(),
+        ) {
+            day_report.unreadable.push(format!("{day}: {error}"));
+        }
         match inspect_day(
             journal,
             &day,
@@ -600,13 +1070,86 @@ fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<
                 fulfilled_segments.extend(work.completed_segments);
                 if work.daily_current {
                     fulfilled_days.insert(day.clone());
-                    if let Some(intent) = intents.get(&day).filter(|intent| !intent.from_scratch) {
-                        work_intent::retire_current(journal, &day, &intent.id)?;
-                    }
                 }
                 retain_best(&mut candidates, work.candidates);
             }
             Err(error) => day_report.unreadable.push(format!("{day}: {error}")),
+        }
+        if !intents.get(&day).is_some_and(|intent| intent.from_scratch) {
+            match talent_retries(
+                journal,
+                &day,
+                intents.get(&day),
+                &imports.imports,
+                policy,
+                &mut day_report,
+            ) {
+                Ok(work) => retain_best(&mut candidates, work),
+                Err(error) => day_report.unreadable.push(format!("{day}: {error}")),
+            }
+        }
+        if day_report
+            .holds
+            .iter()
+            .any(|hold| hold.retry_unit.is_some())
+        {
+            fulfilled_days.remove(&day);
+        }
+        if fulfilled_days.contains(&day)
+            && !activities.iter().any(|a| a.day == day)
+            && let Some(intent) = intents.get(&day).filter(|intent| !intent.from_scratch)
+        {
+            work_intent::retire_current(journal, &day, &intent.id)?;
+        }
+        for activity in activities.iter().filter(|a| {
+            a.day == day && !intents.get(&day).is_some_and(|intent| intent.from_scratch)
+        }) {
+            let today = chrono::Utc::now()
+                .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+                .date_naive();
+            let p = priority(
+                &day,
+                None,
+                today,
+                intents.get(&day).map(|_| WorkBand::Waiting),
+            );
+            day_report.band(p.band).activities_owed += 1;
+            if !policy.permits(p.band, false) {
+                day_report.band(p.band).permission_held += 1;
+                held(&mut day_report, &day, None, p.band, "spending_confirmation");
+                continue;
+            }
+            day_report.band(p.band).eligible += 1;
+            let identity = solstone_core_system::work_retry::Unit::Activity {
+                day: day.clone(),
+                facet: activity.facet.clone(),
+                activity: activity.activity.clone(),
+                talent: "activity".into(),
+            };
+            let reference = format!("supervisor-activity-{day}-{}", identity.id()?);
+            let candidate = DiscoveredTask {
+                guard: None,
+                confirmed_import: false,
+                request: BusTaskRequest {
+                    cmd: TaskArgv::from_wire(canonical_journal_command([
+                        "think",
+                        "--day",
+                        &day,
+                        "--facet",
+                        &activity.facet,
+                        "--activity",
+                        &activity.activity,
+                    ]))
+                    .expect("activity command"),
+                    reference,
+                    day: Some(day.clone()),
+                    scheduler_name: None,
+                    queue_if_active_cmd_differs: false,
+                    priority: Some(p),
+                    daily_catchup_provenance: None,
+                },
+            };
+            retain_best(&mut candidates, vec![candidate]);
         }
         inspected.insert(day.clone());
         day_reports.insert(day, day_report);
@@ -725,6 +1268,137 @@ mod tests {
     }
 
     #[test]
+    fn capped_global_maintenance_is_discovered_on_today_without_recordings() {
+        let root = fixture("local");
+        let today = daily_coverage::local_day(root.path(), chrono::Utc::now());
+        let unit = Unit::Daily {
+            day: today.clone(),
+            talent: "daily_schedule".into(),
+            facet: None,
+        };
+        let evidence = work_retry::daily::evidence(root.path(), &unit).unwrap();
+        let mut record = solstone_core_journal_io::DailyUnitRecord::new(
+            work_retry::daily::identity(&unit).unwrap(),
+            &evidence.revision,
+            &evidence.contract,
+        );
+        record.status = solstone_core_journal_io::DailyUnitStatus::Capped;
+        record.reason_code = Some("schema_invalid".into());
+        solstone_core_journal_io::save_daily_unit_record(root.path(), &record).unwrap();
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        let id = unit.id().unwrap();
+        assert!(work_retry::read(root.path(), &id).unwrap().unwrap().held);
+        work_retry::request(root.path(), &unit).unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference(&format!("supervisor-retry-daily-{today}-{id}")));
+        assert!(!queue.contains_reference(&format!("supervisor-work-{today}-daily")));
+    }
+
+    #[test]
+    fn native_readmissions_keep_today_owner_and_background_priority_and_spend() {
+        use solstone_core_system::work_policy::ThinkingLane;
+        let root = fixture("local");
+        let today = daily_coverage::local_day(root.path(), chrono::Utc::now());
+        let local = WorkPolicy {
+            lane: ThinkingLane::Bundled,
+            history_confirmed: false,
+        };
+        let own_keys = WorkPolicy {
+            lane: ThinkingLane::OwnKeys,
+            history_confirmed: false,
+        };
+        let confidential = WorkPolicy {
+            lane: ThinkingLane::Confidential,
+            history_confirmed: false,
+        };
+        let mut selected = Vec::new();
+        for (day, expected) in [
+            (today.as_str(), WorkBand::Now),
+            ("19990101", WorkBand::Completing),
+        ] {
+            let directory = root
+                .path()
+                .join("chronicle")
+                .join(day)
+                .join("notes/120000_60");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("audio.wav"), "changed source").unwrap();
+            std::fs::write(directory.join("audio.jsonl"), format!("{}\n", serde_json::json!({
+                "raw":"audio.wav", "_solstone_processing": {
+                    "schema":"solstone.processing.v1",
+                    "handler":"transcribe", "state":"failed", "reason_code":"analysis_failed", "attempts":3,
+                    "input_sha256":"a".repeat(64)
+                }
+            }))).unwrap();
+            let (_, _, segments) = solstone_core_system_health::scan_day(
+                &solstone_core_system_health::FilesystemSegmentSource,
+                root.path(),
+                day,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            assert_eq!(segments.len(), 1);
+            let mut report = WorkInventory::default();
+            let tasks = raw_retries(
+                root.path(),
+                day,
+                &segments[0],
+                None,
+                &[],
+                local,
+                &mut report,
+            )
+            .unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].request.priority.unwrap().band, expected);
+            selected.extend(tasks);
+            if day != today {
+                for policy in [own_keys, confidential] {
+                    let mut report = WorkInventory::default();
+                    assert!(
+                        raw_retries(
+                            root.path(),
+                            day,
+                            &segments[0],
+                            None,
+                            &[],
+                            policy,
+                            &mut report
+                        )
+                        .unwrap()
+                        .is_empty()
+                    );
+                    assert_eq!(report.bands[4].permission_held, 1);
+                }
+                let intent = work_intent::register(root.path(), day, false).unwrap();
+                let tasks = raw_retries(
+                    root.path(),
+                    day,
+                    &segments[0],
+                    Some(&intent),
+                    &[],
+                    own_keys,
+                    &mut WorkInventory::default(),
+                )
+                .unwrap();
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].request.priority.unwrap().band, WorkBand::Waiting);
+                selected.extend(tasks);
+            }
+        }
+        let mut ranked = Vec::new();
+        retain_best(&mut ranked, selected);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|task| task.request.priority.unwrap().band)
+                .collect::<Vec<_>>(),
+            [WorkBand::Now, WorkBand::Waiting, WorkBand::Completing]
+        );
+    }
+
+    #[test]
     fn discovery_reaches_old_segments_with_no_adoption_and_never_queues_their_day_first() {
         let root = fixture("local");
         for day in [
@@ -754,6 +1428,65 @@ mod tests {
             assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
             assert!(!queue.contains_reference("supervisor-work-20040101-daily"));
         }
+    }
+
+    #[test]
+    fn historical_activity_retries_share_the_bound_and_survive_a_malformed_sibling() {
+        use sha2::{Digest, Sha256};
+        let root = fixture("local");
+        let directory = root.path().join("health/activity-work");
+        std::fs::create_dir_all(&directory).unwrap();
+        for day in [
+            "19990101", "20000101", "20010101", "20020101", "20030101", "20040101",
+        ] {
+            let identity = solstone_core_think_cli::ActivityRetry {
+                day: day.into(),
+                facet: "work".into(),
+                activity: "reading_090000".into(),
+            };
+            let path = directory.join(format!(
+                "{:x}.json",
+                Sha256::digest(serde_json::to_vec(&identity).unwrap())
+            ));
+            std::fs::write(path, serde_json::json!({"version":1,"identity":identity,"input_hash":"fixture","remaining":["participation"],"uses":{},"attempts":1,"next_attempt_ms":0}).to_string()).unwrap();
+        }
+        std::fs::write(directory.join("broken.json"), "{").unwrap();
+        let queue = queue(root.path());
+        for _ in 0..3 {
+            reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+            assert_eq!(queue.collect_queue_counts()["pending"], 4);
+            let report = solstone_core_system::work_inventory::read(root.path())
+                .unwrap()
+                .unwrap();
+            assert!(!report.complete);
+            assert!(
+                report
+                    .unreadable
+                    .iter()
+                    .any(|error| error.contains("broken.json"))
+            );
+            assert_eq!(report.bands[5].activities_owed, 6);
+            assert!(
+                queue.any_reference(
+                    |reference| reference.starts_with("supervisor-activity-20040101-")
+                )
+            );
+            assert!(
+                !queue.any_reference(
+                    |reference| reference.starts_with("supervisor-activity-19990101-")
+                )
+            );
+        }
+        work_intent::register(root.path(), "19990101", false).unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(
+            queue.any_reference(|reference| reference.starts_with("supervisor-activity-19990101-"))
+        );
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.bands[1].activities_owed, 1);
+        assert_eq!(queue.collect_queue_counts()["pending"], 4);
     }
 
     #[test]

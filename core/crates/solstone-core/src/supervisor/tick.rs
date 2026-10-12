@@ -45,7 +45,6 @@ use super::runtime::{
 
 const MAX_INBOUND_PER_TICK: usize = 256;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(3600);
-pub(crate) const RETRY_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the supervisor reaps decoded-audio scratch a killed analysis or
 /// merge left behind. With the transcribe crate's age floor, a leftover outlives
 /// its writer by about two hours at most while the journal runs.
@@ -360,34 +359,6 @@ pub(crate) async fn run(
             wall.timestamp_millis(),
             &today,
         );
-        let (seed_outcome, drain_outcome) = activity_retry_drain_with(
-            state.no_daily,
-            !solstone_core_system::processing::processing_allowed(&state.journal),
-            no_thinking_engine_chosen(&state.journal),
-            &mut state.activity_retry_seed_day,
-            &mut state.last_activity_retry_drain,
-            &today,
-            tick,
-            || {
-                let yesterday = (wall.date_naive() - chrono::Duration::days(1))
-                    .format("%Y%m%d")
-                    .to_string();
-                [yesterday, today.clone()].iter().try_for_each(|day| {
-                    solstone_core_think_cli::seed_activity_retries(
-                        &state.journal,
-                        day,
-                        wall.timestamp_millis(),
-                    )
-                })
-            },
-            || run_activity_retry_drain(&state.journal, &state.queue, wall.timestamp_millis()),
-        );
-        if let Some(Err(error)) = seed_outcome {
-            log::warn!("supervisor: activity retry recovery failed: {error}");
-        }
-        if let Some(Err(error)) = drain_outcome {
-            log::warn!("supervisor: activity retry drain failed: {error}");
-        }
         if !state.no_daily && state.daily.last_day != Some(wall.date_naive()) {
             if let Some(previous) = state.daily.last_day {
                 check_segment_flush(
@@ -589,50 +560,6 @@ fn settle_think_argv(stream: &str) -> Vec<String> {
     canonical_journal_command(["think", "-v", "--settle", "--stream", stream])
 }
 
-type ActivityRetryDrainOutcome = (Option<Result<(), String>>, Option<Result<(), String>>);
-
-#[allow(clippy::too_many_arguments)] // The tick's clock/watermark seams remain explicitly injectable.
-fn activity_retry_drain_with(
-    no_daily: bool,
-    is_deferred: bool,
-    no_engine: bool,
-    seed_day: &mut Option<String>,
-    last_drain: &mut Instant,
-    today: &str,
-    tick: Instant,
-    seed: impl FnOnce() -> Result<(), String>,
-    drain: impl FnOnce() -> Result<(), String>,
-) -> ActivityRetryDrainOutcome {
-    if no_daily
-        || is_deferred
-        || no_engine
-        || tick.saturating_duration_since(*last_drain) < RETRY_EXPIRY_INTERVAL
-    {
-        return (None, None);
-    }
-
-    let seed_result = if seed_day.as_deref() != Some(today) {
-        let res = seed();
-        if res.is_ok() {
-            *seed_day = Some(today.to_owned());
-        }
-        Some(res)
-    } else {
-        None
-    };
-
-    let drain_result = Some(drain());
-    *last_drain = scan_finished(tick);
-    (seed_result, drain_result)
-}
-
-/// The instant a catch-up scan that began at `tick` counts as having finished, for throttling.
-/// `tick` is the loop-top instant, so a scan that took time ends later; a `tick` already in
-/// the future (a synthetic tick) is kept.
-fn scan_finished(tick: Instant) -> Instant {
-    tick.max(Instant::now())
-}
-
 /// How long after a day ends its daily run waits at least: a segment that
 /// began before midnight is sealed and delivered after it.
 const DAY_CLOSE_GRACE: Duration = Duration::from_secs(10 * 60);
@@ -671,41 +598,14 @@ pub(super) fn day_still_closing(
             reference.starts_with(&flush)
                 || reference.starts_with(&observed)
                 || reference.starts_with("supervisor-settle-")
+                || reference.starts_with(&format!("supervisor-retry-raw-{day}-"))
+                || reference.starts_with(&format!("supervisor-retry-talent-{day}-"))
+                || reference.starts_with(&format!("supervisor-activity-{day}-"))
                 || (reference.starts_with("supervisor-activity-") && reference.contains(&activity))
         })
     };
     (within_grace || busy() || solstone_core_think_cli::activity_settle_holds_day(journal, &day))
         .then_some(day)
-}
-
-fn run_activity_retry_drain(journal: &Path, queue: &TaskQueue, now_ms: i64) -> Result<(), String> {
-    for retry in solstone_core_think_cli::due_activity_retries(journal, now_ms)?
-        .into_iter()
-        .take(8)
-    {
-        let reference = format!(
-            "supervisor-activity-{}",
-            serde_json::to_string(&retry).map_err(|e| e.to_string())?
-        );
-        if queue.contains_reference(&reference) {
-            continue;
-        }
-        let argv = activity_retry_argv(&retry);
-        let _ = submit_think(queue, argv, &retry.day, reference);
-    }
-    Ok(())
-}
-
-fn activity_retry_argv(retry: &solstone_core_think_cli::ActivityRetry) -> Vec<String> {
-    canonical_journal_command([
-        "think",
-        "--day",
-        &retry.day,
-        "--facet",
-        &retry.facet,
-        "--activity",
-        &retry.activity,
-    ])
 }
 
 fn flush_think_argv(day: &str, segment: &str, stream: Option<&str>) -> Vec<String> {
@@ -1752,10 +1652,8 @@ mod tests {
             parakeet,
             flush: FlushState::default(),
             daily: super::super::runtime::DailyState { last_day: None },
-            last_activity_retry_drain: Instant::now(),
             last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
             last_scratch_sweep: None,
-            activity_retry_seed_day: None,
             wedge: solstone_core_system::provider_runtime::WedgeState::default(),
             timing: super::super::runtime::SupervisorTiming {
                 tick_interval: Duration::from_secs(1),
@@ -2573,45 +2471,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    #[test]
-    fn activity_retry_drain_queues_old_source_identity_once_independent_of_daily_markers() {
-        use sha2::{Digest, Sha256};
-        let bed = Bed::new("activity-retry");
-        let queue = queue(&bed.root);
-        let identity = solstone_core_think_cli::ActivityRetry {
-            day: "20200101".to_owned(),
-            facet: "personal".to_owned(),
-            activity: "reading_090000".to_owned(),
-        };
-        let directory = bed.root.join("health/activity-work");
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(format!(
-            "{:x}.json",
-            Sha256::digest(serde_json::to_vec(&identity).unwrap())
-        ));
-        fs::write(&path, serde_json::to_vec(&json!({"version":1,"identity":identity,"input_hash":"fixture","remaining":["participation"],"uses":{},"attempts":1,"next_attempt_ms":1000})).unwrap()).unwrap();
-        run_activity_retry_drain(&bed.root, &queue, 999).unwrap();
-        assert_eq!(pending(&queue), 0);
-        run_activity_retry_drain(&bed.root, &queue, 1000).unwrap();
-        assert_eq!(pending(&queue), 1);
-        run_activity_retry_drain(&bed.root, &queue, 1001).unwrap();
-        assert_eq!(pending(&queue), 1);
-        assert_eq!(
-            activity_retry_argv(&identity),
-            vec![
-                "solstone",
-                "journal",
-                "think",
-                "--day",
-                "20200101",
-                "--facet",
-                "personal",
-                "--activity",
-                "reading_090000"
-            ]
-        );
-    }
-
     fn date(day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 1, day).expect("fixture date")
     }
@@ -2619,233 +2478,6 @@ mod tests {
     fn wall_time(day: u32, seconds: u64) -> SystemTime {
         let midnight = date(day).and_hms_opt(0, 0, 0).unwrap().and_utc();
         SystemTime::from(midnight) + Duration::from_secs(seconds)
-    }
-
-    #[test]
-    fn scan_finished_moves_a_past_tick_forward_and_keeps_a_future_one() {
-        let past = Instant::now()
-            .checked_sub(Duration::from_secs(5))
-            .expect("host uptime exceeds five seconds");
-        let before = Instant::now();
-        assert!(
-            scan_finished(past) >= before,
-            "a scan that took time ends later"
-        );
-        let future = Instant::now() + Duration::from_secs(30);
-        assert_eq!(scan_finished(future), future, "a synthetic tick is kept");
-    }
-
-    #[test]
-    fn activity_retry_drain_all_outcomes_and_timing() {
-        for seed_succeeds in [true, false] {
-            for drain_succeeds in [true, false] {
-                let tick = Instant::now()
-                    .checked_sub(Duration::from_secs(5))
-                    .expect("host uptime exceeds five seconds");
-                let mut last_drain = tick
-                    .checked_sub(RETRY_EXPIRY_INTERVAL)
-                    .expect("host uptime exceeds the interval");
-                let mut seed_day = None;
-                let mut seed_calls = 0;
-                let mut drain_calls = 0;
-                let mut drain_ended = None;
-
-                let (seed_outcome, drain_outcome) = activity_retry_drain_with(
-                    false,
-                    false,
-                    false,
-                    &mut seed_day,
-                    &mut last_drain,
-                    "20260102",
-                    tick,
-                    || {
-                        seed_calls += 1;
-                        if seed_succeeds {
-                            Ok(())
-                        } else {
-                            Err("seed-failed".to_owned())
-                        }
-                    },
-                    || {
-                        drain_calls += 1;
-                        std::thread::sleep(Duration::from_millis(20));
-                        drain_ended = Some(Instant::now());
-                        if drain_succeeds {
-                            Ok(())
-                        } else {
-                            Err("drain-failed".to_owned())
-                        }
-                    },
-                );
-                let after = Instant::now();
-
-                assert_eq!(seed_calls, 1);
-                assert_eq!(drain_calls, 1);
-                assert_eq!(
-                    seed_outcome.as_ref().map(Result::is_ok),
-                    Some(seed_succeeds)
-                );
-                assert_eq!(
-                    drain_outcome.as_ref().map(Result::is_ok),
-                    Some(drain_succeeds)
-                );
-
-                if seed_succeeds {
-                    assert_eq!(seed_day.as_deref(), Some("20260102"));
-                } else {
-                    assert_eq!(seed_day, None);
-                }
-
-                let drain_ended = drain_ended.expect("drain ran");
-                assert!(
-                    drain_ended <= last_drain && last_drain <= after,
-                    "D <= M <= A bound holds (seed_ok: {seed_succeeds}, drain_ok: {drain_succeeds})"
-                );
-
-                let marker = last_drain;
-
-                // Tick just before M + INTERVAL is throttled (0 calls, marker unchanged)
-                let before_interval_tick =
-                    marker + RETRY_EXPIRY_INTERVAL - Duration::from_millis(5);
-                let mut seed_again = 0;
-                let mut drain_again = 0;
-                let (s2, d2) = activity_retry_drain_with(
-                    false,
-                    false,
-                    false,
-                    &mut seed_day,
-                    &mut last_drain,
-                    "20260102",
-                    before_interval_tick,
-                    || {
-                        seed_again += 1;
-                        Ok(())
-                    },
-                    || {
-                        drain_again += 1;
-                        Ok(())
-                    },
-                );
-                assert_eq!(seed_again, 0);
-                assert_eq!(drain_again, 0);
-                assert_eq!(s2, None);
-                assert_eq!(d2, None);
-                assert_eq!(last_drain, marker, "marker must not change when throttled");
-
-                // Tick at M + INTERVAL runs
-                let at_interval_tick = marker + RETRY_EXPIRY_INTERVAL;
-                let (s3, d3) = activity_retry_drain_with(
-                    false,
-                    false,
-                    false,
-                    &mut seed_day,
-                    &mut last_drain,
-                    "20260102",
-                    at_interval_tick,
-                    || {
-                        seed_again += 1;
-                        Ok(())
-                    },
-                    || {
-                        drain_again += 1;
-                        Ok(())
-                    },
-                );
-                assert_eq!(drain_again, 1);
-                assert!(d3.is_some());
-                if seed_succeeds {
-                    // Already marked, seed skipped
-                    assert_eq!(seed_again, 0);
-                    assert_eq!(s3, None);
-                } else {
-                    // Was not marked on previous failure, so retries seed
-                    assert_eq!(seed_again, 1);
-                    assert!(s3.is_some());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn activity_retry_drain_skip_predicates_and_already_seeded() {
-        let tick = Instant::now()
-            .checked_sub(Duration::from_secs(5))
-            .expect("host uptime exceeds five seconds");
-        let initial_drain = tick
-            .checked_sub(RETRY_EXPIRY_INTERVAL)
-            .expect("host uptime exceeds the interval");
-
-        // 1. Already seeded today -> seed 0, drain 1, marker follows drain (D <= M <= A)
-        let mut seed_day = Some("20260102".to_owned());
-        let mut last_drain = initial_drain;
-        let mut seed_calls = 0;
-        let mut drain_calls = 0;
-        let mut drain_ended = None;
-        let (s, d) = activity_retry_drain_with(
-            false,
-            false,
-            false,
-            &mut seed_day,
-            &mut last_drain,
-            "20260102",
-            tick,
-            || {
-                seed_calls += 1;
-                Ok(())
-            },
-            || {
-                drain_calls += 1;
-                std::thread::sleep(Duration::from_millis(20));
-                drain_ended = Some(Instant::now());
-                Ok(())
-            },
-        );
-        let after = Instant::now();
-        assert_eq!(seed_calls, 0);
-        assert_eq!(drain_calls, 1);
-        assert_eq!(s, None);
-        assert_eq!(d, Some(Ok(())));
-        assert_eq!(seed_day.as_deref(), Some("20260102"));
-        let drain_ended = drain_ended.expect("drain ran");
-        assert!(drain_ended <= last_drain && last_drain <= after);
-
-        // 2. Skip twins: no_daily, deferred, no_engine, not-yet-due
-        let skip_cases = [
-            (true, false, false, initial_drain), // no_daily
-            (false, true, false, initial_drain), // deferred
-            (false, false, true, initial_drain), // no_engine
-            (false, false, false, tick),         // not-yet-due (last_drain = tick)
-        ];
-
-        for (no_daily, deferred, no_engine, drain_ts) in skip_cases {
-            let mut s_day = None;
-            let mut l_drain = drain_ts;
-            let mut s_count = 0;
-            let mut d_count = 0;
-            let (s_res, d_res) = activity_retry_drain_with(
-                no_daily,
-                deferred,
-                no_engine,
-                &mut s_day,
-                &mut l_drain,
-                "20260102",
-                tick,
-                || {
-                    s_count += 1;
-                    Ok(())
-                },
-                || {
-                    d_count += 1;
-                    Ok(())
-                },
-            );
-            assert_eq!(s_count, 0);
-            assert_eq!(d_count, 0);
-            assert_eq!(s_res, None);
-            assert_eq!(d_res, None);
-            assert_eq!(s_day, None);
-            assert_eq!(l_drain, drain_ts);
-        }
     }
 
     fn pending_flush(at: Instant, day: &str, segment: &str) -> PendingFlush {

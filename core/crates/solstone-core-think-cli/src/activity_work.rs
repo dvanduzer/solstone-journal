@@ -38,6 +38,8 @@ struct Record {
     uses: BTreeMap<String, String>,
     #[serde(default)]
     parked: BTreeSet<String>,
+    #[serde(default)]
+    reasons: BTreeMap<String, String>,
     attempts: u32,
     next_attempt_ms: i64,
     #[serde(default)]
@@ -220,13 +222,18 @@ impl ActivityWork {
             }
         }
         let record = match old {
-            Some(mut record) if !refresh && record.input_hash == input_hash => {
+            Some(mut record)
+                if !refresh && (record.input_hash == input_hash || !record.parked.is_empty()) =>
+            {
                 if record.identity != identity {
                     return Err("activity work identity mismatch".to_owned());
                 }
                 // Disabled/removed talents stop being eligible; completed siblings
                 // stay absent. A new input revision starts a fresh unit set.
                 record.remaining.retain(|name| names.contains(name));
+                if context.retry.is_some() {
+                    record.input_hash = input_hash;
+                }
                 record
             }
             _ => Record {
@@ -236,6 +243,7 @@ impl ActivityWork {
                 remaining: names,
                 uses: BTreeMap::new(),
                 parked: BTreeSet::new(),
+                reasons: BTreeMap::new(),
                 attempts: 0,
                 next_attempt_ms: 0,
                 destination_id: None,
@@ -302,8 +310,20 @@ impl ActivityWork {
     pub(crate) fn parked(&self, name: &str) -> bool {
         self.record.parked.contains(name)
     }
-    pub(crate) fn park(&mut self, name: &str) -> Result<(), String> {
+    pub(crate) fn park(
+        &mut self,
+        name: &str,
+        reason: &str,
+        context: &ThinkContext,
+    ) -> Result<(), String> {
         self.record.parked.insert(name.to_owned());
+        self.record.reasons.insert(name.into(), reason.into());
+        solstone_core_system::work_retry::observe_held(
+            &context.journal,
+            &retry_unit(&self.record.identity, name),
+            reason,
+            &self.record.input_hash,
+        )?;
         self.save()
     }
     pub(crate) fn contains(&self, name: &str) -> bool {
@@ -322,8 +342,19 @@ impl ActivityWork {
         self.save()
     }
     pub(crate) fn complete(&mut self, name: &str) -> Result<(), String> {
+        let journal = self
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .ok_or("activity work has no journal root")?;
+        let unit = retry_unit(&self.record.identity, name);
+        let _execution = solstone_core_system::work_retry::execution_claim(journal, &unit)?;
+        solstone_core_system::work_retry::reconcile_accepted(journal, &unit)?;
         self.record.remaining.remove(name);
         self.record.uses.remove(name);
+        self.record.parked.remove(name);
+        self.record.reasons.remove(name);
         self.save()
     }
     pub(crate) fn finish(&mut self, context: &ThinkContext) -> Result<(), String> {
@@ -354,18 +385,167 @@ impl ActivityWork {
 
 /// Read-only discovery has no date horizon: an interrupted older activity stays
 /// eligible until it succeeds, even after restart or a prolonged outage.
-pub fn due_activity_retries(journal: &Path, now_ms: i64) -> Result<Vec<ActivityRetry>, String> {
+fn retry_unit(identity: &ActivityRetry, talent: &str) -> solstone_core_system::work_retry::Unit {
+    solstone_core_system::work_retry::Unit::Activity {
+        day: identity.day.clone(),
+        facet: identity.facet.clone(),
+        activity: identity.activity.clone(),
+        talent: talent.into(),
+    }
+}
+
+fn legacy_retry_baseline(journal: &Path, record: &Record) -> Result<String, String> {
+    use solstone_core_system::work_retry::input;
+    let Some(activity) = solstone_core_facets::get_activity_record(
+        journal,
+        &record.identity.facet,
+        &record.identity.day,
+        &record.identity.activity,
+    )
+    .map_err(|e| e.to_string())?
+    else {
+        return Ok(record.input_hash.clone());
+    };
+    if input::legacy_activity_hash(journal, &record.identity.day, &activity).as_deref()
+        == Some(&record.input_hash)
+    {
+        input::activity_hash(journal, &record.identity.day, &activity)
+            .ok_or("activity input cannot be read".into())
+    } else {
+        Ok(record.input_hash.clone())
+    }
+}
+
+pub fn activity_held_input(
+    journal: &Path,
+    unit: &solstone_core_system::work_retry::Unit,
+) -> Result<Option<String>, String> {
+    use solstone_core_system::work_retry::{self, Unit};
+    let Unit::Activity {
+        day,
+        facet,
+        activity,
+        talent,
+    } = unit
+    else {
+        return Err("not activity work".into());
+    };
+    let identity = ActivityRetry {
+        day: day.clone(),
+        facet: facet.clone(),
+        activity: activity.clone(),
+    };
+    let Some(record) = read(&path(journal, &identity)?)? else {
+        return Ok(None);
+    };
+    if record.identity != identity {
+        return Err("activity work identity mismatch".into());
+    }
+    if !record.remaining.contains(talent) || !record.parked.contains(talent) {
+        return Ok(None);
+    }
+    work_retry::observe_held(
+        journal,
+        unit,
+        record
+            .reasons
+            .get(talent)
+            .map(String::as_str)
+            .unwrap_or("activity_failed"),
+        &legacy_retry_baseline(journal, &record)?,
+    )?;
+    if let Some(blocked) = record.blocked {
+        return Err(blocked.message);
+    }
+    if record.muted_pause {
+        return Err("the activity's facet is muted".into());
+    }
+    work_retry::input::current(journal, unit).map(Some)
+}
+
+pub fn discover_held_activities(
+    journal: &Path,
+) -> (Vec<solstone_core_system::work_retry::Unit>, Vec<String>) {
     let entries = match std::fs::read_dir(directory(journal)) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (vec![], vec![]),
+        Err(e) => return (vec![], vec![e.to_string()]),
+    };
+    let mut units = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let result = (|| -> Result<(), String> {
+            let entry_path = entry.map_err(|e| e.to_string())?.path();
+            if entry_path.extension().and_then(|s| s.to_str()) != Some("json") {
+                return Ok(());
+            }
+            let Some(record) = read(&entry_path)? else {
+                return Ok(());
+            };
+            if path(journal, &record.identity)? != entry_path {
+                return Err("activity work filename mismatch".into());
+            }
+            for talent in record.parked.intersection(&record.remaining) {
+                let unit = retry_unit(&record.identity, talent);
+                unit.validate()?;
+                if let Some(id) = record.uses.get(talent)
+                    && solstone_core_cortex_client::get_use_end_state(journal, id)
+                        .map_err(|e| e.to_string())?
+                        == solstone_core_cortex_client::UseEndState::Finish
+                {
+                    continue;
+                }
+                let baseline = legacy_retry_baseline(journal, &record)?;
+                solstone_core_system::work_retry::observe_held(
+                    journal,
+                    &unit,
+                    record
+                        .reasons
+                        .get(talent)
+                        .map(String::as_str)
+                        .unwrap_or("activity_failed"),
+                    &baseline,
+                )?;
+                units.push(unit);
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    (units, errors)
+}
+
+pub fn due_activity_retries(journal: &Path, now_ms: i64) -> Result<Vec<ActivityRetry>, String> {
+    let (due, errors) = discover_activity_retries(journal, now_ms);
+    if errors.is_empty() {
+        Ok(due)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// A broken sibling is a visible gap, not a reason to suppress all valid work.
+pub fn discover_activity_retries(journal: &Path, now_ms: i64) -> (Vec<ActivityRetry>, Vec<String>) {
+    let entries = match std::fs::read_dir(directory(journal)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (vec![], vec![]),
+        Err(e) => return (vec![], vec![e.to_string()]),
     };
     let mut due = Vec::new();
+    let mut errors = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if entry.path().extension().and_then(|x| x.to_str()) != Some("json")
-            || entry
-                .path()
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(e.to_string());
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json")
+            || path
                 .file_name()
                 .and_then(|x| x.to_str())
                 .is_some_and(|name| {
@@ -374,51 +554,71 @@ pub fn due_activity_retries(journal: &Path, now_ms: i64) -> Result<Vec<ActivityR
         {
             continue;
         }
-        let Some(record) = read(&entry.path())? else {
-            continue;
-        };
-        if path(journal, &record.identity)? != entry.path() {
-            return Err("activity work filename mismatch".to_owned());
-        }
-        let has_finished_use = record
-            .uses
-            .iter()
-            .filter(|(name, _)| record.remaining.contains(*name))
-            .map(|(_, id)| {
-                solstone_core_cortex_client::get_use_end_state(journal, id)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .contains(&solstone_core_cortex_client::UseEndState::Finish);
-        if record.blocked.is_some() && !has_finished_use {
-            continue;
-        }
-        if record.muted_pause && !has_finished_use {
-            let still_muted = match solstone_core_facets::observe_facet_destination(
-                journal,
-                &record.identity.facet,
-            ) {
-                Ok(solstone_core_facets::DestinationObservation::Ready { id, muted: true }) => {
-                    record
-                        .destination_id
-                        .as_deref()
-                        .is_some_and(|stored| stored == id)
-                }
-                _ => false,
-            };
-            if still_muted {
-                continue;
-            }
-        }
-        if record.next_attempt_ms <= now_ms
-            && (record.remaining.is_empty()
-                || record.remaining.iter().any(|n| !record.parked.contains(n)))
-        {
-            due.push(record.identity);
+        match due_activity_record(journal, &path, now_ms) {
+            Ok(Some(identity)) => due.push(identity),
+            Ok(None) => {}
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
     }
-    due.sort_by(|a, b| (&a.day, &a.facet, &a.activity).cmp(&(&b.day, &b.facet, &b.activity)));
-    Ok(due)
+    due.sort_by(|a, b| (&b.day, &a.facet, &a.activity).cmp(&(&a.day, &b.facet, &b.activity)));
+    (due, errors)
+}
+
+fn due_activity_record(
+    journal: &Path,
+    entry: &Path,
+    now_ms: i64,
+) -> Result<Option<ActivityRetry>, String> {
+    let Some(record) = read(entry)? else {
+        return Ok(None);
+    };
+    if path(journal, &record.identity)? != entry {
+        return Err("activity work filename mismatch".to_owned());
+    }
+    let has_finished_use = record
+        .uses
+        .iter()
+        .filter(|(name, _)| record.remaining.contains(*name))
+        .map(|(_, id)| {
+            solstone_core_cortex_client::get_use_end_state(journal, id)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .contains(&solstone_core_cortex_client::UseEndState::Finish);
+    if record.blocked.is_some() && !has_finished_use {
+        return Ok(None);
+    }
+    if record.muted_pause && !has_finished_use {
+        let still_muted = match solstone_core_facets::observe_facet_destination(
+            journal,
+            &record.identity.facet,
+        ) {
+            Ok(solstone_core_facets::DestinationObservation::Ready { id, muted: true }) => record
+                .destination_id
+                .as_deref()
+                .is_some_and(|stored| stored == id),
+            _ => false,
+        };
+        if still_muted {
+            return Ok(None);
+        }
+    }
+    if has_finished_use
+        || (record.next_attempt_ms <= now_ms
+            && (record.remaining.is_empty()
+                || record.remaining.iter().any(|n| !record.parked.contains(n))))
+    {
+        return Ok(Some(record.identity));
+    }
+    Ok(None)
+}
+
+pub fn activity_retry_due(
+    journal: &Path,
+    identity: &ActivityRetry,
+    now_ms: i64,
+) -> Result<bool, String> {
+    Ok(due_activity_record(journal, &path(journal, identity)?, now_ms)?.as_ref() == Some(identity))
 }
 
 /// Adopt unfinished connection failures from a supplied recent source day on
@@ -505,6 +705,7 @@ pub fn seed_activity_retries(journal: &Path, day: &str, now_ms: i64) -> Result<(
                 remaining: uses.keys().cloned().collect(),
                 uses: uses.into_iter().filter(|(_, id)| !id.is_empty()).collect(),
                 parked: BTreeSet::new(),
+                reasons: BTreeMap::new(),
                 destination_id: None,
                 muted_pause: false,
                 blocked: None,

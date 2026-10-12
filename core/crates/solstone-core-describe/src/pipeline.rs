@@ -174,9 +174,18 @@ fn run_with_decoder(
         .map_err(|error| RunError::Internal(error.to_string()))?;
     let mut previous_attempts = 0;
     let mut incremental_source = None;
+    let admitted = !options.redo
+        && solstone_core_system::work_retry::raw::consume_from_environment(
+            options.journal,
+            &output,
+            vocab::HANDLER_DESCRIBE,
+        )
+        .map_err(RunError::Internal)?;
     if !options.redo && output.exists() {
         let record = read_processing_record_header(&output);
-        if !should_reenter_analysis_output(record.as_ref(), &output, vocab::HANDLER_DESCRIBE) {
+        if !admitted
+            && !should_reenter_analysis_output(record.as_ref(), &output, vocab::HANDLER_DESCRIBE)
+        {
             return Ok(());
         }
         previous_attempts = record.as_ref().map(record_attempts).unwrap_or(0);
@@ -955,8 +964,16 @@ fn promote(promotion: Promotion<'_>) -> Result<(), RunError> {
             header.insert("_solstone_thinking".to_owned(), json!({"model":model}));
         }
         let mut record = json!({"schema":vocab::SCHEMA,"state":promotion.state,"reason_code":promotion.reason,"handler":vocab::HANDLER_DESCRIBE,"attempted_at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),"input_size":promotion.input_size});
+        solstone_core_system::work_retry::raw::stamp_attempt(&mut record)
+            .map_err(RunError::Internal)?;
         if promotion.state == vocab::STATE_FAILED {
             record["attempts"] = json!(promotion.previous_attempts + 1);
+            solstone_core_system::work_retry::raw::stamp_failed_input(&mut record, promotion.video)
+                .map_err(RunError::Internal)?;
+            record["body_sha256"] = json!(
+                solstone_core_system::work_retry::file_fingerprint(promotion.rows)
+                    .map_err(RunError::Internal)?
+            );
         }
         header.insert("_solstone_processing".to_owned(), record);
         let mut final_file =

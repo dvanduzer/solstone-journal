@@ -108,11 +108,22 @@ fn finished(record: &DailyUnitRecord) -> Result<RuntimeOutcome, String> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn execute(
     request: Map<String, Value>,
     context: &ExecutionContext,
     generate: &OneShotClient,
     writer: &mut impl Write,
+) -> RuntimeOutcome {
+    execute_with_paths(request, context, generate, writer, None)
+}
+
+pub(crate) fn execute_with_paths(
+    request: Map<String, Value>,
+    context: &ExecutionContext,
+    generate: &OneShotClient,
+    writer: &mut impl Write,
+    paths: Option<&crate::prepare::RuntimePaths>,
 ) -> RuntimeOutcome {
     let name = request
         .get("name")
@@ -136,6 +147,11 @@ pub(crate) fn execute(
         .and_then(Value::as_str)
         .map(str::to_owned);
     let identity = DailyUnitIdentity::new(day, name, facet);
+    let _execution =
+        match solstone_core_journal_io::claim_daily_execution(&context.journal, &identity) {
+            Ok(claim) => claim,
+            Err(error) => return RuntimeOutcome::StageFailed(failure(name, error)),
+        };
     let record = match with_daily_unit_authority(&context.journal, &identity, |authority| {
         authority.require_token(token)?;
         Ok(authority.record().expect("token requires record").clone())
@@ -186,6 +202,37 @@ pub(crate) fn execute(
     {
         return finished(&record)
             .unwrap_or_else(|error| RuntimeOutcome::StageFailed(failure(name, error)));
+    }
+    if let Some(value) = request.get("_work_retry") {
+        let permission = (|| -> Result<(), String> {
+            use solstone_core_system::work_retry::{self, Attempt, Unit};
+            let (unit, attempt): (Unit, Attempt) =
+                serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+            if work_retry::daily::identity(&unit)? != identity {
+                return Err("daily retry scope changed".into());
+            }
+            let evidence = match paths {
+                Some(paths) => work_retry::daily::evidence_with_roots(
+                    &context.journal,
+                    &unit,
+                    &paths.talent_root,
+                    &paths.apps_root,
+                )?,
+                None => work_retry::daily::evidence(&context.journal, &unit)?,
+            };
+            let input = evidence.retry_revision_under(work_retry::daily::INPUT_CONTRACT);
+            work_retry::consume(
+                &context.journal,
+                &unit,
+                &attempt,
+                &attempt.reason,
+                &input,
+                work_retry::DECLARED_FIXES,
+            )
+        })();
+        if let Err(error) = permission {
+            return RuntimeOutcome::StageFailed(failure(name, error));
+        }
     }
     let skip = prepared
         .config
@@ -290,7 +337,30 @@ pub(crate) fn execute(
         })
     });
     match result {
-        Ok(Ok(outcome)) => outcome,
+        Ok(Ok(outcome)) => {
+            if matches!(outcome, RuntimeOutcome::Finished { .. })
+                && let Some(value) = request.get("_work_retry")
+            {
+                let permission: Result<
+                    (
+                        solstone_core_system::work_retry::Unit,
+                        solstone_core_system::work_retry::Attempt,
+                    ),
+                    _,
+                > = serde_json::from_value(value.clone());
+                if let Ok((unit, attempt)) = permission
+                    && let Err(error) = solstone_core_system::work_retry::finish(
+                        &context.journal,
+                        &unit,
+                        &attempt,
+                        None,
+                    )
+                {
+                    return RuntimeOutcome::StageFailed(failure(name, error));
+                }
+            }
+            outcome
+        }
         Ok(Err(error)) => RuntimeOutcome::StageFailed(error),
         Err(error) => RuntimeOutcome::StageFailed(failure(name, error)),
     }
@@ -1353,6 +1423,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(started.exists(), "old worker did not reach model barrier");
+        assert!(
+            solstone_core_journal_io::claim_daily_execution(&context.journal, &identity).is_err(),
+            "another cause must not replace the reservation during model execution"
+        );
         // Cortex can terminalize a timed-out use while its model child survives.
         // Closing that use must not confer authority on the surviving worker.
         let active = context

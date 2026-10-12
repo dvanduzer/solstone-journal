@@ -14,7 +14,6 @@ use crate::helpers;
 use crate::run_log::RunLogWriter;
 use chrono::{TimeZone, Utc};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use solstone_core_facets::{
     ActivityRecordStoreError, AppendOutcome, DeclaredFacetInventory, append_activity_record,
     get_activity_record, observe_declared_facet_inventory,
@@ -615,6 +614,71 @@ fn thinking_is_current(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A held floor talent reuses the verified Sense output. No Sense rerun,
+/// activity replay, successful sibling or whole-day work is hidden here.
+pub(crate) fn retry_talent(
+    context: &ThinkContext,
+    log: &mut RunLogWriter,
+    segment: &str,
+    stream: &str,
+    talent: &str,
+) -> Result<ModeResult, String> {
+    if !SEGMENT_FLOOR_TALENTS.contains(&talent) {
+        return Err("not a retryable floor talent".into());
+    }
+    let configs = load_talent_configs(
+        &context.talent_root,
+        &context.apps_root,
+        solstone_core_talent_config::read_talent_overrides(&context.journal)?.as_ref(),
+        TalentFilter {
+            r#type: None,
+            schedule: Some("segment"),
+            include_disabled: false,
+        },
+    )?;
+    let config = configs
+        .iter()
+        .find(|c| c.key == talent)
+        .ok_or("floor talent is no longer enabled")?;
+    let runtime = crate::dispatch::runtime()?;
+    let item = match dispatch_agent(
+        context,
+        &runtime,
+        config,
+        segment,
+        false,
+        Some(stream),
+        false,
+        &[],
+        log,
+    ) {
+        Ok(AgentDispatch::Pending(item)) => item,
+        Ok(AgentDispatch::Skipped) => return Err("floor talent could not be retried".into()),
+        Err(_) => return Err("floor talent could not be dispatched".into()),
+    };
+    let result = drain_with_deadline_observed(
+        context,
+        &runtime,
+        vec![item],
+        Some(crate::dispatch::DEFAULT_THINK_TIMEOUT),
+        &mut |item, outcome| log_use_terminal(log, context, segment, Some(stream), item, outcome),
+    );
+    if result.failed == 0 {
+        let directory = find_segment_dir(&context.journal, &context.day, segment, Some(stream))
+            .ok_or("segment no longer exists")?;
+        let newest = solstone_core_system_health::newest_segment_input_ms(&directory)
+            .map_err(|e| e.to_string())?;
+        solstone_core_system::segment_publication::publish(
+            &context.journal,
+            &directory,
+            newest,
+            |journal, path| context.index.rescan_file(journal, path),
+        )?;
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn select_agents<'a>(
     context: &ThinkContext,
     log: &mut RunLogWriter,
@@ -632,13 +696,33 @@ fn select_agents<'a>(
             log_skip(log, context, name, segment, "no_config", stream);
             continue;
         };
-        if !refresh
-            && is_floor_talent_capped(&source, &context.day, stream, segment, name)
-                .map_err(|error| error.to_string())?
-                .value
+        let unit = solstone_core_system::work_retry::Unit::Segment {
+            day: context.day.clone(),
+            stream: stream.unwrap_or(DEFAULT_STREAM).into(),
+            segment: segment.into(),
+            talent: (*name).into(),
+            direct: segment_dir.parent() == Some(context.day_dir.as_path()),
+        };
+        let legacy = is_floor_talent_capped(&source, &context.day, stream, segment, name)
+            .map_err(|e| e.to_string())?;
+        if legacy.malformed_line_count != 0 {
+            return Err("floor failure evidence is unreadable".into());
+        }
+        if legacy.value
+            && solstone_core_system::work_retry::read(&context.journal, &unit.id()?)?.is_none()
         {
-            // Source-derived, not measured: thinking.py:1824-1838 skips a
-            // repeatedly failed floor talent unless an explicit refresh retries it.
+            let input = solstone_core_system::work_retry::input::current(&context.journal, &unit)?;
+            solstone_core_system::work_retry::observe_held(
+                &context.journal,
+                &unit,
+                "floor_failed",
+                &input,
+            )?;
+        }
+        if !refresh
+            && solstone_core_system::work_retry::read(&context.journal, &unit.id()?)?
+                .is_some_and(|r| r.held)
+        {
             log_skip(log, context, name, segment, "capped", stream);
             continue;
         }
@@ -827,6 +911,34 @@ enum AgentDispatch {
     Pending(PendingUse),
 }
 
+/// An admitted from-scratch request is one owner cause, even when dispatch
+/// retries internally. Its durable id prevents those retries minting a budget.
+fn floor_retry_attempt(
+    context: &ThinkContext,
+    unit: &solstone_core_system::work_retry::Unit,
+    refresh: bool,
+) -> Result<Option<solstone_core_system::work_retry::Attempt>, String> {
+    use solstone_core_system::{work_intent, work_retry};
+    if let Some((selected, attempt)) = &context.retry {
+        if selected != unit {
+            return Err("floor retry scope changed".into());
+        }
+        return Ok(Some(attempt.clone()));
+    }
+    if refresh
+        && let Some(intent) = work_intent::read(&context.journal)?.get(&context.day)
+        && intent.from_scratch
+        && intent.state == work_intent::IntentState::Claimed
+        && work_retry::read(&context.journal, &unit.id()?)?.is_some_and(|r| r.held)
+    {
+        work_retry::request_with_id(&context.journal, unit, &intent.id)?;
+        let input = work_retry::input::current(&context.journal, unit)?;
+        return Ok(work_retry::read(&context.journal, &unit.id()?)?
+            .and_then(|r| r.permission(&input, work_retry::DECLARED_FIXES)));
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_agent(
     context: &ThinkContext,
@@ -865,6 +977,21 @@ fn dispatch_agent(
         );
         return Ok(AgentDispatch::Skipped);
     }
+    let retry_unit = if SEGMENT_FLOOR_TALENTS.contains(&config.key.as_str()) {
+        let directory = find_segment_dir(&context.journal, &context.day, segment, stream)
+            .ok_or(DispatchFailure::Unavailable)?;
+        Some(solstone_core_system::work_retry::Unit::Segment {
+            day: context.day.clone(),
+            stream: stream
+                .unwrap_or(solstone_core_journal_io::DEFAULT_STREAM)
+                .into(),
+            segment: segment.into(),
+            talent: config.key.clone(),
+            direct: directory.parent() == Some(context.day_dir.as_path()),
+        })
+    } else {
+        None
+    };
     let generate = config.metadata.get("type").and_then(Value::as_str) == Some("generate");
     let mut request = Map::from_iter([
         (
@@ -875,6 +1002,20 @@ fn dispatch_agent(
         ("segment".to_owned(), Value::String(segment.to_owned())),
         ("schedule".to_owned(), Value::String("segment".to_owned())),
     ]);
+    if let Some(unit) = &retry_unit {
+        request.insert(
+            "_work_unit".into(),
+            serde_json::to_value(unit).map_err(|_| DispatchFailure::Unavailable)?,
+        );
+        if let Some(attempt) =
+            floor_retry_attempt(context, unit, refresh).map_err(|_| DispatchFailure::Unavailable)?
+        {
+            request.insert(
+                "_work_retry".into(),
+                serde_json::to_value(attempt).map_err(|_| DispatchFailure::Unavailable)?,
+            );
+        }
+    }
     let output_format = if generate {
         let format = config
             .metadata
@@ -2370,81 +2511,7 @@ pub(crate) fn compute_activity_input_hash(
     day: &str,
     record: &Map<String, Value>,
 ) -> Option<String> {
-    let spans = record
-        .get("segments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let day_dir = context.journal.join("chronicle").join(day);
-    let only_stream = record.get("stream").and_then(Value::as_str);
-    let mut inputs = Vec::new();
-    for segment in &spans {
-        let mut sense = Vec::new();
-        let mut entries = match std::fs::read_dir(&day_dir) {
-            Ok(entries) => entries
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(_) => return None,
-        };
-        entries.sort();
-        for direct in entries {
-            let name = direct.file_name().and_then(|name| name.to_str());
-            if only_stream.is_some_and(|stream| name != Some(stream)) {
-                continue;
-            }
-            let segment_dir = if name == Some(segment) && direct.is_dir() {
-                direct
-            } else {
-                let nested = direct.join(segment);
-                if !nested.is_dir() {
-                    continue;
-                }
-                nested
-            };
-            let path = segment_dir.join("talents/sense.json");
-            let relative = path
-                .strip_prefix(&context.journal)
-                .ok()?
-                .display()
-                .to_string();
-            match std::fs::read(&path) {
-                Ok(bytes) => sense.push(serde_json::json!({"path":relative,"sha256":format!("{:x}", Sha256::digest(&bytes)),"size":bytes.len()})),
-                Err(_) => sense.push(serde_json::json!({"path":relative,"missing":true})),
-            }
-        }
-        if sense.is_empty() {
-            sense.push(serde_json::json!({"segment":segment,"missing":true}));
-        }
-        inputs.push(serde_json::json!({"segment":segment,"sense":sense}));
-    }
-    let identity = serde_json::json!({
-        "activity_id": record.get("id"), "activity": record.get("activity"),
-        "facet": record.get("facet"), "segments": spans, "segment_inputs": inputs,
-    });
-    serde_json::to_string(&canonical_json(identity))
-        .ok()
-        .map(|text| format!("{:x}", Sha256::digest(text.as_bytes())))
-}
-
-fn canonical_json(value: Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(canonical_json).collect()),
-        Value::Object(values) => Value::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, canonical_json(value)))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .collect(),
-        ),
-        primitive => primitive,
-    }
+    solstone_core_system::work_retry::input::activity_hash(&context.journal, day, record)
 }
 
 pub(crate) fn activity_provenance_path(
@@ -3426,5 +3493,60 @@ mod activity_date_tests {
             assert_eq!(row["segment_day"], current);
             assert_eq!(row["activity"], "terminal_233333_304");
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn from_scratch_floor_retry_consumes_one_durable_owner_cause() {
+    use solstone_core_system::{work_intent, work_retry};
+    let root = tempfile::tempdir().unwrap();
+    let day = "20260101";
+    let unit = work_retry::Unit::Segment {
+        day: day.into(),
+        stream: "desktop".into(),
+        segment: "120000_300".into(),
+        talent: "documents".into(),
+        direct: false,
+    };
+    let directory = unit.segment_directory(root.path()).unwrap();
+    std::fs::create_dir_all(directory.join("talents")).unwrap();
+    let sense = directory.join("talents/sense.json");
+    solstone_core_system::segment_output::commit(&sense, b"{}", false, || {
+        std::fs::write(&sense, b"{}").map_err(|e| e.to_string())
+    })
+    .unwrap();
+    let context = ThinkContext::new(
+        root.path(),
+        day.into(),
+        root.path().join("chronicle").join(day),
+        1,
+    )
+    .unwrap();
+    let input = work_retry::input::current(root.path(), &unit).unwrap();
+    work_retry::observe_held(root.path(), &unit, "floor_failed", &input).unwrap();
+    assert!(
+        floor_retry_attempt(&context, &unit, true)
+            .unwrap()
+            .is_none()
+    );
+    for _ in 0..2 {
+        let intent = work_intent::register(root.path(), day, true).unwrap();
+        work_intent::claim_from_scratch(root.path(), day, &intent.id).unwrap();
+        assert!(
+            floor_retry_attempt(&context, &unit, false)
+                .unwrap()
+                .is_none()
+        );
+        let attempt = floor_retry_attempt(&context, &unit, true).unwrap().unwrap();
+        assert_eq!(attempt.cause, format!("owner:{}", intent.id));
+        work_retry::consume(root.path(), &unit, &attempt, "floor_failed", &input, &[]).unwrap();
+        work_retry::finish(root.path(), &unit, &attempt, Some("floor_failed")).unwrap();
+        assert!(
+            floor_retry_attempt(&context, &unit, true)
+                .unwrap()
+                .is_none()
+        );
+        work_intent::finish_from_scratch(root.path(), day, &intent.id, false).unwrap();
     }
 }

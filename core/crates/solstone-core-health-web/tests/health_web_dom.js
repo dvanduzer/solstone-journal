@@ -283,6 +283,8 @@ function createEnvironment() {
   const doc = createHealthDOM();
   const context = vm.createContext({
     document: doc,
+    state: {},
+    renderHeldWork: () => {},
     window: {
       JournalFormat: { day: (d) => `Apr 3, 2026` },
       location: { href: '' },
@@ -760,6 +762,7 @@ function createHeldWorkEnvironment() {
     'updateObserve', 'updateConnectionHealth']) context[name] = () => {};
   state.schedules = [];
   const source = loadHealthSource();
+  vm.runInContext(sourceBlock(source, 'const TALENT_NAMES =', 'const SCHEDULE_NAMES ='), context);
   vm.runInContext(sourceBlock(source, 'function handleSupervisorEvent(', 'function handleCortexEvent(')
     + sourceBlock(source, 'function invalidateRealtime(', 'function initHealthRealtime(')
     + sourceBlock(source, 'function updateConnectionHealth(', '// Sweep stale agents')
@@ -824,6 +827,34 @@ test('failed or expired status retains dated hold evidence and only a snapshot c
   vm.runInContext('expireRealtime()', env.context);
   assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
   assert.strictEqual(env.state.heldWorkCurrent, false);
+});
+
+test('set-aside units share one list, retain focus, and render retry errors as text', async () => {
+  const env = createHeldWorkEnvironment();
+  const id = 'a'.repeat(64);
+  env.state.work = { inventory: { as_of_ms: env.clock.now, holds: [{ retry_unit: id, day: '20260101', reason: 'schema_invalid' }] },
+    retry_records: [{ id, unit: { talent: 'documents' }, reason: 'schema_invalid' }] };
+  env.state.legacyHolds = [{ day: '20260101', reason: 'legacy duplicate' }];
+  env.receive({ held: [{ partition: 'daily', reasons: ['root_live'] }], queues: { daily: 1 } });
+  assert.strictEqual(env.doc.querySelectorAll('.held-work-row').length, 2);
+  const row = env.doc.querySelectorAll('.held-work-row')[1];
+  const button = row.querySelector('button');
+  button.focus();
+  row.querySelector('details').open = true;
+  let posted;
+  env.context.fetch = async (url, options) => {
+    posted = [url, JSON.parse(options.body)];
+    return { ok: false, json: async () => ({ message: '<script>held</script>' }) };
+  };
+  env.context.loadHealthState = async () => vm.runInContext('renderHeldWork()', env.context);
+  await button.onclick();
+  assert.strictEqual(posted[0], '/app/health/api/retry-work');
+  assert.strictEqual(posted[1].unit, id);
+  assert.strictEqual(row.querySelector('[data-retry-feedback]').textContent, '<script>held</script>');
+  assert.strictEqual(env.doc.querySelector('script'), null);
+  assert.strictEqual(env.doc.activeElement, button);
+  assert.strictEqual(row.querySelector('details').open, true);
+  assert.strictEqual(button.disabled, false);
 });
 
 test('known service device brain and index faults retain priority over held work', async () => {

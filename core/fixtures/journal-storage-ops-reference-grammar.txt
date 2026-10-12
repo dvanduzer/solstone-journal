@@ -118,7 +118,7 @@ options:
   -h, --help         show this help message and exit
   --through THROUGH  Inclusive range end in YYYYMMDD format
   --yes
-  --unit UNIT        Reset one failed daily unit for the next eligible run
+  --unit UNIT        Request a retry of one failed daily processing step
   --facet FACET      Facet of that unit; required when the unit has a facet
   --from-scratch     Force a full daily re-run, preserving markers (does not
                      flag the day as updated)
