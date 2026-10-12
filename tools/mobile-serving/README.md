@@ -33,3 +33,5 @@ cargo check --locked --manifest-path tools/mobile-serving/Cargo.toml
 Platform packaging and physical qualification belong to the adapters. This
 library does not establish background execution, unattended endurance or release
 support.
+
+The [synthetic LAN qualification client](client/README.md) uses the same production SPL pairing and request transport. Platform harnesses use its held-carrier and connection-loss controls to check revocation and reconciliation.
