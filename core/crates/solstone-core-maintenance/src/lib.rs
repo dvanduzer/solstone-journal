@@ -127,11 +127,11 @@ mod owned_offload_tests {
             assert_eq!(run.phase(), CliRunPhase::Prelaunch);
             assert!(
                 matches!(run.prelaunch_refusal(), Some(CliPrelaunchRefusal::Root(_)))
-                    && cfg!(target_os = "linux")
+                    && cfg!(any(target_os = "linux", target_os = "macos"))
                     || matches!(
                         run.prelaunch_refusal(),
                         Some(CliPrelaunchRefusal::UnsupportedPlatform)
-                    ) && !cfg!(target_os = "linux")
+                    ) && !cfg!(any(target_os = "linux", target_os = "macos"))
             );
             assert!(run.preparation_custody().is_none());
             assert!(run.observed().planning_phase.is_none());

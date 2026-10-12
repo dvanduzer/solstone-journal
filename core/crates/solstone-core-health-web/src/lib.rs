@@ -136,7 +136,6 @@ async fn state(root: PathBuf, clock: Clock) -> Response {
                     matches!(
                         p.lane,
                         solstone_core_system::work_policy::ThinkingLane::OwnKeys
-                            | solstone_core_system::work_policy::ThinkingLane::Confidential
                     ),
                 )
             })

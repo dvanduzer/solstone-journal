@@ -254,11 +254,21 @@ fn any_other_stage_without_intent_is_held_untouched() {
         ("chronicle/20261009/.tmp-offload-a", vec!["payload"]),
         ("chronicle/20261009/.tmp-offload-b", vec!["audio.flac"]),
         ("chronicle/20261009/.tmp-offload-c", vec![leaf, "extra"]),
-        // The root holds only readback stages, and only by their own leaf;
-        // an older readback stage with the shared leaf stays held.
+        // The root holds only readback stages, by their own leaf, and offload
+        // copies; an older readback stage with the shared leaf, and anything
+        // named like a restore or removal, stays held.
         (".tmp-offload-d", vec![leaf]),
         (".tmp-offload-r", vec!["payload"]),
         (".tmp-offload-s", vec![readback, "extra"]),
+        (".tmp-offload-u", vec!["audio.flac", "video.webm"]),
+        (
+            ".tmp-offload-v",
+            vec![solstone_core_journal_io::media::REMOVAL_ORIGINAL_LEAF],
+        ),
+        (
+            ".tmp-offload-w",
+            vec![solstone_core_journal_io::media::REMOVAL_RECORD_LEAF],
+        ),
         ("chronicle/20261009/.tmp-offload-t", vec![readback]),
         // Never inside a segment.
         ("chronicle/20261009/120000_60/.tmp-offload-e", vec![leaf]),
@@ -310,5 +320,22 @@ fn readback_stage_without_intent_at_the_root_is_recovered() {
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].outcome, Ok(AbandonedRestoreRelease::Undone));
     assert!(!readback.exists());
+    assert!(observe_obligations(&root).unwrap().entries().is_empty());
+}
+
+#[test]
+fn offload_copy_stage_without_intent_at_the_root_is_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let copy = unrecorded(
+        temp.path(),
+        ".tmp-offload-0123456789abcdef0123456789abcdef",
+        &["audio.flac"],
+    );
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+    let activity = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+    let recovered = recover_abandoned_restores(&activity);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].outcome, Ok(AbandonedRestoreRelease::Undone));
+    assert!(!copy.exists());
     assert!(observe_obligations(&root).unwrap().entries().is_empty());
 }

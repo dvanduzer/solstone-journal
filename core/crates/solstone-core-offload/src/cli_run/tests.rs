@@ -109,11 +109,11 @@ fn missing_root_or_unsupported_platform_refuses_before_clock_and_preparation() {
         matches!(
             run.prelaunch_refusal(),
             Some(CliPrelaunchRefusal::Root(_))
-                if cfg!(target_os = "linux")
+                if PRODUCER_SUPPORTED
         ) || matches!(
             run.prelaunch_refusal(),
             Some(CliPrelaunchRefusal::UnsupportedPlatform)
-                if !cfg!(target_os = "linux")
+                if !PRODUCER_SUPPORTED
         )
     );
     assert_eq!(clock.0.load(Ordering::Relaxed), 0);

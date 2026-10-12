@@ -78,17 +78,10 @@ impl WorkPolicy {
         })
     }
 
-    /// `confirmed_import` is established from a published import's own scope,
-    /// never supplied by a wire request or inferred merely from band 4.
-    pub fn permits(self, band: WorkBand, confirmed_import: bool) -> bool {
+    pub fn permits(self, band: WorkBand) -> bool {
         match self.lane {
-            ThinkingLane::Bundled => true,
+            ThinkingLane::Bundled | ThinkingLane::Confidential => true,
             ThinkingLane::OwnKeys => band <= WorkBand::Import || self.history_confirmed,
-            ThinkingLane::Confidential => {
-                band <= WorkBand::Recent
-                    || self.history_confirmed
-                    || (band == WorkBand::Import && confirmed_import)
-            }
             ThinkingLane::Unavailable => false,
         }
     }
@@ -126,7 +119,7 @@ mod tests {
 
     #[test]
     fn each_real_lane_has_the_required_spending_boundary() {
-        let mut confidential = json!({"providers":{"active":{"provider":"local"},"local":{"endpoint_url":"https://example.test/v1","served_model_id":"model","credential":"test"}},"services":{"confidential":{"endpoint_url":"https://example.test","served_model_id":"model","credential_fingerprint_sha256":format!("{:x}", Sha256::digest(b"test"))}}});
+        let confidential = json!({"providers":{"active":{"provider":"local"},"local":{"endpoint_url":"https://example.test/v1","served_model_id":"model","credential":"test"}},"services":{"confidential":{"endpoint_url":"https://example.test","served_model_id":"model","credential_fingerprint_sha256":format!("{:x}", Sha256::digest(b"test"))}}});
         let own_endpoint = json!({"providers":{"active":{"provider":"local"},"local":{"endpoint_url":"https://example.test","served_model_id":"model"}}});
         for (config, lane, automatic) in [
             (
@@ -140,7 +133,7 @@ mod tests {
                 4,
             ),
             (own_endpoint, ThinkingLane::OwnKeys, 4),
-            (confidential.clone(), ThinkingLane::Confidential, 3),
+            (confidential.clone(), ThinkingLane::Confidential, 6),
             (json!({}), ThinkingLane::Unavailable, 0),
         ] {
             let mut policy = WorkPolicy::from_config(config.as_object().unwrap()).unwrap();
@@ -153,23 +146,14 @@ mod tests {
                 WorkBand::Completing,
                 WorkBand::Remake,
             ] {
-                assert_eq!(policy.permits(band, false), band as u8 <= automatic);
+                assert_eq!(policy.permits(band), band as u8 <= automatic);
             }
             policy.history_confirmed = true;
             assert_eq!(
-                policy.permits(WorkBand::Remake, false),
+                policy.permits(WorkBand::Remake),
                 lane != ThinkingLane::Unavailable
             );
         }
-        let policy = WorkPolicy::from_config(confidential.as_object().unwrap()).unwrap();
-        assert!(policy.permits(WorkBand::Import, true));
-        assert!(!policy.permits(WorkBand::Completing, true));
-        confidential["processing"] = json!({"history_confirmed":true});
-        assert!(
-            WorkPolicy::from_config(confidential.as_object().unwrap())
-                .unwrap()
-                .permits(WorkBand::Remake, false)
-        );
     }
 
     #[test]
@@ -195,7 +179,7 @@ mod tests {
         assert!(
             !WorkPolicy::from_config(partial.as_object().unwrap())
                 .unwrap()
-                .permits(WorkBand::Now, true)
+                .permits(WorkBand::Now)
         );
     }
 }

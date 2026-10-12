@@ -137,52 +137,13 @@ fn parent_death_armed() -> bool {
     death_signal_armed()
 }
 
-/// macOS has no parent-death signal: the parent's exit is watched from here, and
-/// a parent that already left (reparented to launchd) is refused.
+/// macOS has no parent-death signal: the parent's exit is watched from here.
 #[cfg(target_os = "macos")]
 fn parent_death_armed() -> bool {
-    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-    let parent = nix::unistd::getppid();
-    if parent.as_raw() <= 1 {
-        return false;
+    fn exit() -> ! {
+        std::process::exit(90)
     }
-    let Ok(queue) = Kqueue::new() else {
-        return false;
-    };
-    let registration = KEvent::new(
-        parent.as_raw() as usize,
-        EventFilter::EVFILT_PROC,
-        EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_CLEAR | EvFlags::EV_RECEIPT,
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
-    let mut receipt = [KEvent::new(
-        0,
-        EventFilter::EVFILT_PROC,
-        EvFlags::empty(),
-        FilterFlag::empty(),
-        0,
-        0,
-    )];
-    match queue.kevent(&[registration], &mut receipt, None) {
-        Ok(1) if receipt[0].data() == 0 => {}
-        _ => return false,
-    }
-    // Registered first, then rechecked: an exit in between is either seen here
-    // or delivered to the watch.
-    if nix::unistd::getppid() != parent {
-        return false;
-    }
-    std::thread::Builder::new()
-        .name("owned-dns-parent".into())
-        .spawn(move || {
-            let mut event = receipt;
-            if queue.kevent(&[], &mut event, None).is_ok() {
-                std::process::exit(90);
-            }
-        })
-        .is_ok()
+    crate::parent_watch::armed("owned-dns-parent", exit)
 }
 
 #[cfg(target_os = "linux")]

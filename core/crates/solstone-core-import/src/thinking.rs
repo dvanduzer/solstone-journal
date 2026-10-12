@@ -203,35 +203,6 @@ pub fn read(journal: &Path) -> Result<ThinkingInventory, String> {
     Ok(inventory)
 }
 
-/// A queued grant is valid only while the same publication still grants its scope.
-pub fn grant_current(
-    journal: &Path,
-    grants: &BTreeSet<(String, String)>,
-    day: &str,
-    segment: Option<(&str, &str)>,
-) -> Result<bool, String> {
-    for (id, publication) in grants {
-        let Some(current) = inspect(journal, id)? else {
-            continue;
-        };
-        if current.publication != *publication {
-            continue;
-        }
-        let authorized = match segment {
-            Some((segment, stream)) => current.segments.contains(&Coordinate {
-                day: day.into(),
-                stream: stream.into(),
-                segment: segment.into(),
-            }),
-            None => current.days.contains(day),
-        };
-        if authorized {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 pub fn fulfill(
     journal: &Path,
     import: &ImportThinking,
@@ -397,18 +368,7 @@ mod tests {
         let renewed = read(root.path()).unwrap().imports.pop().unwrap();
         assert_eq!(renewed.segments.len(), 1);
         assert_eq!(renewed.segments.first().unwrap().segment, "130000_60");
-        let grants = BTreeSet::from([(renewed.id.clone(), renewed.publication.clone())]);
-        assert!(
-            grant_current(
-                root.path(),
-                &grants,
-                "20260101",
-                Some(("130000_60", "import.notes"))
-            )
-            .unwrap()
-        );
         std::fs::remove_file(directory.join("thinking.json")).unwrap();
-        assert!(grant_current(root.path(), &grants, "20260101", None).is_err());
         assert!(write_publication_record(Some(&directory), &record).is_err());
         std::fs::write(directory.join("thinking.json"), "{").unwrap();
         let inventory = read(root.path()).unwrap();

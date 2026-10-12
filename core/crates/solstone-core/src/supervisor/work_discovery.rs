@@ -313,7 +313,6 @@ fn task(
     segment: Option<(&str, &str)>,
     priority: WorkPriority,
     intent: Option<&OwnerIntent>,
-    confirmed_import: bool,
 ) -> DiscoveredTask {
     let mut tail = vec!["think".to_owned(), "--day".into(), day.into()];
     let from_scratch = intent.is_some_and(|intent| intent.from_scratch);
@@ -343,7 +342,6 @@ fn task(
                 .unwrap_or_else(|| "daily".into())
         });
     DiscoveredTask {
-        guard: None,
         request: BusTaskRequest {
             cmd: TaskArgv::from_wire(canonical_journal_command(tail))
                 .expect("nonempty journal command"),
@@ -355,7 +353,6 @@ fn task(
             daily_catchup_provenance: (segment.is_none() && !from_scratch)
                 .then(|| DailyCatchupProvenance { day: day.into() }),
         },
-        confirmed_import,
     }
 }
 
@@ -496,14 +493,12 @@ fn raw_retries(
         let Some(grant) = grant else {
             continue;
         };
-        if !policy.permits(p.band, imported) {
+        if !policy.permits(p.band) {
             report.band(p.band).permission_held += 1;
             continue;
         }
         report.band(p.band).eligible += 1;
         tasks.push(DiscoveredTask {
-            guard: None,
-            confirmed_import: imported,
             request: BusTaskRequest {
                 cmd: TaskArgv::from_wire(canonical_journal_command([
                     "think",
@@ -586,14 +581,12 @@ fn daily_retries(
             report.band(p.band).prerequisite_held += 1;
             continue;
         }
-        if !policy.permits(p.band, imported) {
+        if !policy.permits(p.band) {
             report.band(p.band).permission_held += 1;
             continue;
         }
         report.band(p.band).eligible += 1;
         candidates.push(DiscoveredTask {
-            guard: None,
-            confirmed_import: imported,
             request: BusTaskRequest {
                 cmd: TaskArgv::from_wire(canonical_journal_command([
                     "think",
@@ -683,14 +676,12 @@ fn talent_retries(
         let Some(grant) = grant else {
             continue;
         };
-        if !policy.permits(p.band, imported) {
+        if !policy.permits(p.band) {
             report.band(p.band).permission_held += 1;
             continue;
         }
         report.band(p.band).eligible += 1;
         candidates.push(DiscoveredTask {
-            guard: None,
-            confirmed_import: imported,
             request: BusTaskRequest {
                 cmd: TaskArgv::from_wire(canonical_journal_command([
                     "think",
@@ -736,9 +727,8 @@ fn inspect_day(
         if intent.state == IntentState::Queued {
             let p = priority(day, None, today, Some(WorkBand::Waiting));
             report.band(p.band).owner_requests += 1;
-            if policy.permits(p.band, false) {
-                work.candidates
-                    .push(task(day, None, p, Some(intent), false));
+            if policy.permits(p.band) {
+                work.candidates.push(task(day, None, p, Some(intent)));
                 report.band(p.band).eligible += 1;
             } else {
                 report.band(p.band).permission_held += 1;
@@ -825,7 +815,7 @@ fn inspect_day(
         if readiness == SegmentReadiness::Owed {
             segments_thought = false;
         }
-        owed_segments.push((segment, p, imported, readiness));
+        owed_segments.push((segment, p, readiness));
     }
     let closing =
         super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref() == Some(day);
@@ -853,27 +843,21 @@ fn inspect_day(
             segments_thought && !closing,
             prerequisites_ready,
             intent,
-            imported,
             p,
             policy,
             &mut work,
             report,
         )?;
-    for (segment, p, imported, readiness) in owed_segments {
+    for (segment, p, readiness) in owed_segments {
         report.band(p.band).segments_owed += 1;
         // The day's daily work publishes the segments only owed publication.
         if closes_day && readiness == SegmentReadiness::Unpublished {
             continue;
         }
-        if policy.permits(p.band, imported) {
+        if policy.permits(p.band) {
             report.band(p.band).eligible += 1;
-            work.candidates.push(task(
-                day,
-                Some((&segment.key, &segment.stream)),
-                p,
-                None,
-                imported,
-            ));
+            work.candidates
+                .push(task(day, Some((&segment.key, &segment.stream)), p, None));
         } else {
             report.band(p.band).permission_held += 1;
             held(
@@ -898,7 +882,6 @@ fn queue_daily(
     segments_thought: bool,
     prerequisites_ready: bool,
     intent: Option<&OwnerIntent>,
-    imported: bool,
     p: WorkPriority,
     policy: WorkPolicy,
     work: &mut DayWork,
@@ -936,7 +919,7 @@ fn queue_daily(
     if !segments_thought {
         report.band(p.band).prerequisite_held += owed;
         held(report, day, None, p.band, "segment_prerequisites");
-    } else if !policy.permits(p.band, imported) {
+    } else if !policy.permits(p.band) {
         report.band(p.band).permission_held += owed;
         held(report, day, None, p.band, "spending_confirmation");
     } else if intent.is_none()
@@ -945,7 +928,7 @@ fn queue_daily(
         held(report, day, None, p.band, "retry_wait");
     } else {
         report.band(p.band).eligible += owed;
-        work.candidates.push(task(day, None, p, None, imported));
+        work.candidates.push(task(day, None, p, None));
         return Ok(true);
     }
     Ok(false)
@@ -964,11 +947,7 @@ fn retain_best(candidates: &mut Vec<DiscoveredTask>, new: Vec<DiscoveredTask>) {
     candidates.truncate(RANKED);
 }
 
-fn still_owed(
-    journal: &Path,
-    candidate: &DiscoveredTask,
-    imports: &[ImportThinking],
-) -> Result<bool, String> {
+fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String> {
     let day = candidate.request.day.as_deref().ok_or("work has no day")?;
     let argv = candidate.request.cmd.as_wire();
     let argument = |flag: &str| {
@@ -980,9 +959,6 @@ fn still_owed(
         let Some(record) = work_retry::read(journal, id)? else {
             return Ok(false);
         };
-        if candidate.confirmed_import && !retry_imported(&record.unit, imports) {
-            return Ok(false);
-        }
         let (input, reason) = match &record.unit {
             Unit::Raw { output, .. } => {
                 let output = record.unit.segment_directory(journal)?.join(output);
@@ -1037,17 +1013,6 @@ fn still_owed(
     }
     if let Some(segment) = argument("--segment") {
         let stream = argument("--stream").ok_or("work has no stream")?;
-        if candidate.confirmed_import
-            && !imports.iter().any(|import| {
-                import.segments.contains(&Coordinate {
-                    day: day.into(),
-                    stream: stream.into(),
-                    segment: segment.into(),
-                })
-            })
-        {
-            return Ok(false);
-        }
         let (_, _, segments) = solstone_core_system_health::scan_day(
             &solstone_core_system_health::FilesystemSegmentSource,
             journal,
@@ -1077,9 +1042,6 @@ fn still_owed(
         )
         .map(|ready| !ready);
     }
-    if candidate.confirmed_import && !imports.iter().any(|import| import.days.contains(day)) {
-        return Ok(false);
-    }
     Ok(daily_coverage::read_daily_coverage(journal, day)?
         .state
         .is_owed()
@@ -1100,68 +1062,14 @@ fn admit(
     if stopped.load(Ordering::Acquire) {
         return Ok(Vec::new());
     }
-    let imports = solstone_core_import::thinking::read(journal)?;
-    for error in &imports.unreadable {
-        if !report.unreadable.contains(error) {
-            report.unreadable.push(error.clone());
-        }
-    }
-    if !imports.unreadable.is_empty() {
-        report.complete = false;
-    }
     while current.len() < DISCOVERED_ADMISSION
-        && let Some(mut candidate) = ranked.pop_front()
+        && let Some(candidate) = ranked.pop_front()
     {
         if stopped.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        match still_owed(journal, &candidate, &imports.imports) {
+        match still_owed(journal, &candidate) {
             Ok(true) => {
-                if candidate.confirmed_import {
-                    let day = candidate.request.day.clone().expect("discovered day");
-                    let argv = candidate.request.cmd.as_wire();
-                    let argument =
-                        |flag: &str| argv.windows(2).find(|p| p[0] == flag).map(|p| p[1].clone());
-                    let segment = if let Some(id) = argument("--retry-unit") {
-                        match work_retry::read(journal, &id)?.map(|r| r.unit) {
-                            Some(
-                                Unit::Raw {
-                                    segment, stream, ..
-                                }
-                                | Unit::Segment {
-                                    segment, stream, ..
-                                },
-                            ) => Some((segment, stream)),
-                            _ => None,
-                        }
-                    } else {
-                        argument("--segment").zip(argument("--stream"))
-                    };
-                    let grants = imports
-                        .imports
-                        .iter()
-                        .filter(|import| match &segment {
-                            Some((segment, stream)) => import.segments.contains(&Coordinate {
-                                day: day.clone(),
-                                segment: segment.clone(),
-                                stream: stream.clone(),
-                            }),
-                            None => import.days.contains(&day),
-                        })
-                        .map(|import| (import.id.clone(), import.publication.clone()))
-                        .collect::<BTreeSet<_>>();
-                    let root = journal.to_path_buf();
-                    candidate.guard = Some(Arc::new(move || {
-                        solstone_core_import::thinking::grant_current(
-                            &root,
-                            &grants,
-                            &day,
-                            segment
-                                .as_ref()
-                                .map(|(segment, stream)| (segment.as_str(), stream.as_str())),
-                        )
-                    }));
-                }
                 current.push(candidate);
             }
             Ok(false) => {}
@@ -1374,7 +1282,7 @@ fn reconcile_pass(
                 intents.get(&day).map(|_| WorkBand::Waiting),
             );
             day_report.band(p.band).activities_owed += 1;
-            if !policy.permits(p.band, false) {
+            if !policy.permits(p.band) {
                 day_report.band(p.band).permission_held += 1;
                 held(&mut day_report, &day, None, p.band, "spending_confirmation");
                 continue;
@@ -1388,8 +1296,6 @@ fn reconcile_pass(
             };
             let reference = format!("supervisor-activity-{day}-{}", identity.id()?);
             let candidate = DiscoveredTask {
-                guard: None,
-                confirmed_import: false,
                 request: BusTaskRequest {
                     cmd: TaskArgv::from_wire(canonical_journal_command([
                         "think",
@@ -1622,24 +1528,37 @@ mod tests {
             assert_eq!(tasks[0].request.priority.unwrap().band, expected);
             selected.extend(tasks);
             if day != today {
-                for policy in [own_keys, confidential] {
-                    let mut report = WorkInventory::default();
-                    assert!(
-                        raw_retries(
-                            root.path(),
-                            day,
-                            &segments[0],
-                            None,
-                            &[],
-                            policy,
-                            &BTreeSet::new(),
-                            &mut report
-                        )
-                        .unwrap()
-                        .is_empty()
-                    );
-                    assert_eq!(report.bands[4].permission_held, 1);
-                }
+                let mut report = WorkInventory::default();
+                assert!(
+                    raw_retries(
+                        root.path(),
+                        day,
+                        &segments[0],
+                        None,
+                        &[],
+                        own_keys,
+                        &BTreeSet::new(),
+                        &mut report
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+                assert_eq!(report.bands[4].permission_held, 1);
+                let mut report = WorkInventory::default();
+                let tasks = raw_retries(
+                    root.path(),
+                    day,
+                    &segments[0],
+                    None,
+                    &[],
+                    confidential,
+                    &BTreeSet::new(),
+                    &mut report,
+                )
+                .unwrap();
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].request.priority.unwrap().band, expected);
+                assert_eq!(report.bands[4].permission_held, 0);
                 let intent = work_intent::register(root.path(), day, false).unwrap();
                 let tasks = raw_retries(
                     root.path(),
@@ -1858,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_import_does_not_authorize_an_unrelated_segment_on_the_same_day() {
+    fn import_priority_does_not_authorize_an_unrelated_segment_on_the_same_day() {
         use solstone_core_import::publish::*;
         let root = fixture("openai");
         let day = "19990101";
@@ -2115,7 +2034,6 @@ mod tests {
                             source_time: 19990101120000,
                         },
                         None,
-                        false,
                     );
                     work.request.cmd =
                         TaskArgv::from_wire(vec!["/bin/sleep".into(), "0.5".into()]).unwrap();
@@ -2276,7 +2194,6 @@ mod tests {
                 source_time: 20261011120000,
             },
             None,
-            false,
         );
         // A real bounded child reaches the worker while the discovery read is
         // blocked. The separate supervisor race harness covers capture routing.

@@ -216,3 +216,142 @@ fn accepted_but_silent_times_out() {
     server.join().expect("join");
     let _ = std::fs::remove_dir_all(path);
 }
+
+fn paced_success() -> solstone_core_generate_wire::ConfidentialResult {
+    solstone_core_generate_wire::ConfidentialResult::Generated(
+        solstone_core_generate_wire::EndpointGenerated {
+            text: "ok".into(),
+            model: "fixture".into(),
+            usage: None,
+            finish_reason: "stop".into(),
+            input_budget: None,
+            request_budget: None,
+        },
+    )
+}
+
+#[test]
+fn confidential_background_child() {
+    use solstone_core_generate_wire::{
+        ConfidentialResult, test_support::confidential_generate_attested_with_readiness,
+    };
+    use solstone_core_spp_attest::CpuBundle;
+    use solstone_core_spp_ratls::{
+        CompositeVerdict, CompositeVerificationError, CompositeVerificationInput,
+        CompositeVerifier, NvattestEnsureStatus,
+    };
+    struct NeverVerify;
+    impl CompositeVerifier for NeverVerify {
+        fn verify(
+            &self,
+            _: CpuBundle<'_>,
+            _: CompositeVerificationInput<'_>,
+        ) -> Result<CompositeVerdict, CompositeVerificationError> {
+            panic!("another process owns the older-work slot");
+        }
+    }
+    let Some(root) = std::env::var_os("CONFIDENTIAL_PACING_CHILD_ROOT") else {
+        return;
+    };
+    let result = confidential_generate_attested_with_readiness(
+        &request(Some(0.05)),
+        std::path::Path::new(&root),
+        &endpoint(1),
+        &Map::new(),
+        &EndpointRuntime::default(),
+        &NeverVerify,
+        NvattestEnsureStatus::Unavailable,
+    );
+    assert!(matches!(
+        result,
+        ConfidentialResult::Failed(failure)
+            if failure.reason_code.as_deref() == Some("local_capacity_exhausted")
+    ));
+    println!("background-child-held");
+}
+
+#[test]
+fn older_confidential_calls_share_a_process_safe_slot_while_foreground_bypasses_it() {
+    use solstone_core_generate_wire::{
+        ConfidentialResult, test_support::confidential_background_call,
+    };
+    use std::time::Duration;
+    let root = journal("pacing-slot");
+    let result = confidential_background_call(
+        &root,
+        "4:0".parse().unwrap(),
+        Duration::from_secs(5),
+        |_| {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "confidential_background_child", "--nocapture"])
+                .env("CONFIDENTIAL_PACING_CHILD_ROOT", &root)
+                .env("SOLSTONE_WORK_PRIORITY", "5:0")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(String::from_utf8_lossy(&child.stdout).contains("background-child-held"));
+            for band in 1..=3 {
+                let foreground = confidential_background_call(
+                    &root,
+                    format!("{band}:0").parse().unwrap(),
+                    Duration::from_millis(1),
+                    |_| paced_success(),
+                );
+                assert!(matches!(foreground, ConfidentialResult::Generated(_)));
+            }
+            paced_success()
+        },
+    );
+    assert!(matches!(result, ConfidentialResult::Generated(_)));
+    // The cooldown survives the first worker returning, across every older band.
+    for band in 4..=6 {
+        let result = confidential_background_call(
+            &root,
+            format!("{band}:0").parse().unwrap(),
+            Duration::from_millis(1),
+            |_| panic!("cooldown must survive the completed call"),
+        );
+        assert!(matches!(result, ConfidentialResult::Failed(_)));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn older_confidential_failure_leaves_a_shared_backoff() {
+    use solstone_core_generate_wire::{
+        ConfidentialResult, test_support::confidential_background_call,
+    };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let root = journal("pacing-failure");
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let result = confidential_background_call(
+        &root,
+        "6:0".parse().unwrap(),
+        Duration::from_secs(1),
+        |_| ConfidentialResult::AttestationFailed("gateway_unreachable"),
+    );
+    assert!(matches!(
+        result,
+        ConfidentialResult::AttestationFailed("gateway_unreachable")
+    ));
+    let next: u64 = serde_json::from_slice(
+        &std::fs::read(root.join("health/confidential-background/next-call.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(next >= before + 60_000);
+    let result = confidential_background_call(
+        &root,
+        "4:0".parse().unwrap(),
+        Duration::from_millis(1),
+        |_| panic!("failed engine must get a shared pause"),
+    );
+    assert!(matches!(result, ConfidentialResult::Failed(_)));
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -683,7 +683,7 @@ fn actual_claim_config_contention_and_native_obligations_refuse() {
             // An occupied stage is an outstanding obligation; an empty one an
             // ended owner left behind is retired at admission instead.
             fs::create_dir(f.path(".tmp-offload-held")).unwrap();
-            fs::write(f.path(".tmp-offload-held/audio.flac"), b"held").unwrap();
+            fs::write(f.path(".tmp-offload-held/payload"), b"held").unwrap();
         }
         let result = f.run(checked);
         assert!(result.refusal().is_some());
@@ -1025,7 +1025,7 @@ fn known_unremoved_files_settle_and_an_uncertain_remnant_holds() {
         RemovalClass::PolicyRawRelease,
     );
     fs::create_dir(f.path(".tmp-offload-held")).unwrap();
-    fs::write(f.path(".tmp-offload-held/audio.flac"), b"held").unwrap();
+    fs::write(f.path(".tmp-offload-held/payload"), b"held").unwrap();
     let result = f.run(f.checked(std::slice::from_ref(&mark)));
     let ReviewedRemovalFinish::Settled(report) = result.finish() else {
         panic!("a refusal before staging must not hold the run");

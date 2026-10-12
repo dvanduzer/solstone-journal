@@ -127,20 +127,48 @@ pub(crate) fn run_owned(
 }
 
 /// Fixed creator requests retain the same private completion and owned joins.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn run_owned_archive_creator(
     request: &Request<'_>,
     capture_limit: Option<usize>,
     cancellation: Option<&ArchiveCancellation>,
 ) -> Result<CompletedChild, ChildFailure> {
-    execute_request(request, capture_limit, cancellation, ChildSetup::Creator)
+    execute_request(
+        request,
+        capture_limit,
+        cancellation,
+        ChildSetup::Creator(()),
+    )
 }
+
+/// The creator starts inside `anchor`, a held directory, and reads its
+/// sources relative to it. No descriptor is passed.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_owned_archive_creator_at(
+    request: &Request<'_>,
+    anchor: BorrowedFd<'_>,
+    capture_limit: Option<usize>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<CompletedChild, ChildFailure> {
+    execute_request(
+        request,
+        capture_limit,
+        cancellation,
+        ChildSetup::Creator(anchor.as_raw_fd()),
+    )
+}
+
+#[cfg(target_os = "macos")]
+type CreatorAnchor = std::os::fd::RawFd;
+#[cfg(not(target_os = "macos"))]
+type CreatorAnchor = ();
 
 #[derive(Clone, Copy)]
 enum ChildSetup {
     Ordinary,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Dns(Instant),
-    Creator,
+    Creator(CreatorAnchor),
 }
 
 /// The DNS leaf supplies only an admitted executable, fixed DNS arguments and
@@ -570,8 +598,8 @@ fn execute_tracked(
         ChildSetup::Dns(deadline) => Some(deadline),
         _ => None,
     };
-    #[cfg(not(target_os = "linux"))]
-    if matches!(setup, ChildSetup::Creator) {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if matches!(setup, ChildSetup::Creator(_)) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "archive creator containment is unavailable",
@@ -603,7 +631,7 @@ fn execute_tracked(
     #[cfg(target_os = "linux")]
     match setup {
         ChildSetup::Dns(_) => prepare_dns_child(&mut command),
-        ChildSetup::Creator => {
+        ChildSetup::Creator(()) => {
             let mut seen = std::collections::BTreeSet::new();
             let mut allowed = Vec::new();
             for descriptor in &request.pass_fds {
@@ -630,7 +658,27 @@ fn execute_tracked(
     #[cfg(target_os = "macos")]
     match setup {
         ChildSetup::Dns(_) => prepare_dns_child(&mut command),
-        ChildSetup::Creator | ChildSetup::Ordinary => {
+        ChildSetup::Creator(anchor) => {
+            if anchor < 3 || !request.pass_fds.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid archive anchor",
+                ));
+            }
+            prepare_dns_child(&mut command);
+            // SAFETY: fchdir is async-signal-safe and allocates nothing. The
+            // anchor stays open in the parent until this synchronous call returns.
+            #[allow(unsafe_code)]
+            unsafe {
+                command.pre_exec(move || {
+                    if nix::libc::fchdir(anchor) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        ChildSetup::Ordinary => {
             prepare_dns_child(&mut command);
             inherit_in_child(&mut command, &request.pass_fds)?;
         }
@@ -685,6 +733,12 @@ fn execute_tracked(
         session.stop_readers();
     }
     let (status, stdout, stderr) = complete_session(&mut session, None)?;
+    // A restic that joined the creator entry's group while that group was being
+    // stopped outlives its reaped leader; the group id stays its own until it exits.
+    #[cfg(target_os = "macos")]
+    if matches!(setup, ChildSetup::Creator(_)) {
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+    }
     // The group was killed and the root reaped; later refusals leave nothing alive.
     *settled = true;
     let stopped = stopped?;
@@ -828,6 +882,38 @@ mod tests {
             .map_err(ChildFailure::into_error)
             .unwrap();
         assert_eq!(completed.output().stdout, b"passed\ndone\n");
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn creator_child_starts_in_its_anchor_and_inherits_no_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = File::open(temp.path()).unwrap();
+        fcntl(anchor.as_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+        let probe = format!(
+            "[ -e /dev/fd/{} ] && echo leaked; /bin/pwd -P",
+            anchor.as_raw_fd()
+        );
+        let request = Request {
+            program: "/bin/sh".into(),
+            argv: vec!["-c".into(), probe.into()],
+            env: BTreeMap::new(),
+            timeout: Some(Duration::from_secs(30)),
+            pass_fds: Vec::new(),
+        };
+        let completed = run_owned_archive_creator_at(&request, anchor.as_fd(), Some(4096), None)
+            .map_err(ChildFailure::into_error)
+            .unwrap();
+        let expected = format!("{}\n", temp.path().canonicalize().unwrap().display());
+        assert_eq!(completed.output().stdout, expected.as_bytes());
+        // A creator that would pass descriptors is refused before spawn.
+        let mut passing = request;
+        passing.pass_fds = vec![anchor.as_fd()];
+        let refused = run_owned_archive_creator_at(&passing, anchor.as_fd(), Some(4096), None)
+            .err()
+            .expect("descriptors are refused");
+        assert!(refused.settled());
     }
 
     /// Run in its own process: the stop is process-wide.

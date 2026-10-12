@@ -319,7 +319,7 @@ fn completion_ceiling(
     .ok()
 }
 
-fn thinking_headroom(endpoint: &ByoEndpoint, config: &Map<String, Value>) -> u64 {
+pub(crate) fn thinking_headroom(endpoint: &ByoEndpoint, config: &Map<String, Value>) -> u64 {
     if endpoint.is_bundled || endpoint.is_confidential {
         0
     } else {
@@ -642,7 +642,7 @@ fn request_contents(request: &GenerateRequest) -> Value {
 }
 
 /// The caller's timeout, else the lane default plus time for any thinking room.
-fn request_timeout(timeout_s: Option<f64>, thinking_room: u64) -> Duration {
+pub(crate) fn request_timeout(timeout_s: Option<f64>, thinking_room: u64) -> Duration {
     timeout_s
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
         .map(Duration::from_secs_f64)

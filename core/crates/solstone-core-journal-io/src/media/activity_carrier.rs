@@ -709,7 +709,13 @@ pub fn retire_recorded_stage(
     leaf_name: &OsStr,
     leaf: MediaIdentity,
 ) -> io::Result<bool> {
-    retire_stage(activity, parent, name, directory, leaf_name, Some(leaf))
+    retire_stage(
+        activity,
+        parent,
+        name,
+        directory,
+        Leaf::Exact(leaf_name, Some(leaf)),
+    )
 }
 
 /// Remove one stage nothing records, which is empty or holds exactly one
@@ -723,7 +729,33 @@ pub fn retire_unrecorded_stage(
     directory: MediaIdentity,
     leaf_name: &OsStr,
 ) -> io::Result<bool> {
-    retire_stage(activity, parent, name, directory, leaf_name, None)
+    retire_stage(
+        activity,
+        parent,
+        name,
+        directory,
+        Leaf::Exact(leaf_name, None),
+    )
+}
+
+/// Remove one stage nothing records, which is empty or holds exactly one
+/// regular file whose name `accept` allows. Its caller must know that every
+/// such stage there is made by a producer whose unpublished copies are
+/// disposable. Anything else refuses.
+pub fn retire_unrecorded_stage_where(
+    activity: &Arc<ActivityLease>,
+    parent: &Arc<MediaDirectory>,
+    name: &OsStr,
+    directory: MediaIdentity,
+    accept: &dyn Fn(&OsStr) -> bool,
+) -> io::Result<bool> {
+    retire_stage(activity, parent, name, directory, Leaf::Accepted(accept))
+}
+
+enum Leaf<'a> {
+    Exact(&'a OsStr, Option<MediaIdentity>),
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    Accepted(&'a dyn Fn(&OsStr) -> bool),
 }
 
 fn retire_stage(
@@ -731,13 +763,14 @@ fn retire_stage(
     parent: &Arc<MediaDirectory>,
     name: &OsStr,
     directory: MediaIdentity,
-    leaf_name: &OsStr,
-    recorded: Option<MediaIdentity>,
+    leaf: Leaf<'_>,
 ) -> io::Result<bool> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         plain_name(name)?;
-        plain_name(leaf_name)?;
+        if let Leaf::Exact(leaf_name, _) = leaf {
+            plain_name(leaf_name)?;
+        }
         if !crate::activity_obligations::is_stage_namespace_name(name)
             || !Arc::ptr_eq(parent.inner.journal_root(), activity.journal_root())
         {
@@ -753,14 +786,22 @@ fn retire_stage(
             return Err(changed());
         }
         let entries = platform::entries(&stage, 2)?.ok_or_else(changed)?;
-        match (entries.as_slice(), recorded) {
+        match entries.as_slice() {
             // An empty directory holds no data.
-            ([], _) => {}
-            ([entry], _)
-                if entry.name == leaf_name
-                    && recorded.is_none_or(|leaf| entry.identity == leaf)
-                    && entry.kind == crate::journal_root::JournalEntryKind::RegularFile =>
+            [] => {}
+            [entry]
+                if entry.kind == crate::journal_root::JournalEntryKind::RegularFile
+                    && match leaf {
+                        Leaf::Exact(leaf_name, recorded) => {
+                            entry.name == leaf_name
+                                && recorded.is_none_or(|leaf| entry.identity == leaf)
+                        }
+                        Leaf::Accepted(accept) => {
+                            plain_name(&entry.name).is_ok() && accept(&entry.name)
+                        }
+                    } =>
             {
+                let leaf_name = entry.name.as_os_str();
                 let leaf = entry.identity;
                 activity
                     .revalidate()
@@ -783,7 +824,7 @@ fn retire_stage(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (activity, parent, name, directory, leaf_name, recorded);
+        let _ = (activity, parent, name, directory, leaf);
         Err(shared_storage())
     }
 }

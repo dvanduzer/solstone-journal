@@ -17,8 +17,12 @@ mod destination;
 mod hosted;
 mod keys;
 mod merge;
+#[cfg(target_os = "macos")]
+pub mod owned_creator;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod owned_dns;
+#[cfg(target_os = "macos")]
+mod parent_watch;
 mod state;
 pub mod teardown_configuration;
 

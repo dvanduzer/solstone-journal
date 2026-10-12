@@ -233,6 +233,10 @@ fn owning_planner_reconciles_kept_empty_before_unset_budget() {
 #[test]
 fn owning_planner_invalid_settings_and_incomplete_local_stop_before_wan() {
     for case in ["budget", "floor", "local", "drift"] {
+        // APFS refuses the non-UTF-8 name that makes local media incomplete here.
+        if case == "local" && cfg!(target_os = "macos") {
+            continue;
+        }
         let fixture = CurrentFixture::new(SegmentLayout::Direct);
         match case {
             "budget" => fixture
@@ -352,6 +356,10 @@ fn owned_planner_preflight_refusals_retain_original_before_admission() {
     use solstone_core_backup::archive_activity::OwnedPreparedArchiveOperation;
     use std::sync::Arc;
     for case in ["budget", "floor", "local", "drift", "disabled"] {
+        // APFS refuses the non-UTF-8 name that makes local media incomplete here.
+        if case == "local" && cfg!(target_os = "macos") {
+            continue;
+        }
         let fixture = CurrentFixture::new(SegmentLayout::Direct);
         match case {
             "budget" => fixture
