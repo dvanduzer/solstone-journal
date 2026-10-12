@@ -27,6 +27,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - the help under "frames read in detail" in settings said the number counted frames across your whole screen segment. it counts for each screen separately, and the help now says so.
 - on mac and windows, the health page no longer lists "original media cleanup" as scheduled, and your journal no longer starts it every day. offload isn't available there in this version, so each run stopped without doing anything.
 - your activities, and the people and things your journal detects in each facet, now show up in search as soon as they're saved. before, they waited for your journal's daily search update, and until then the health page said search was catching up.
+- when two of your journal's thinking runs finished at the same moment, their entries in that day's record of runs could get mixed together. `solstone call health` then warned that the record couldn't be fully read and stopped counting the runs that failed in the last day, for good. each entry is now written whole, and a mixed-up entry in a record that hasn't changed in the last day no longer stops the count.
 
 ## [2.0.43] - 2026-10-12
 
