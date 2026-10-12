@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use solstone_core_journal_config::work_priority::WorkPriority;
 
 use crate::cap::CapResolver;
 use crate::error::WireRequestError;
@@ -118,6 +119,7 @@ pub struct WireTaskRequest {
     pub scheduler_name: Option<String>,
     #[serde(default)]
     pub queue_if_active_cmd_differs: bool,
+    pub priority: Option<WorkPriority>,
 }
 
 /// Internal provenance attached only to automatic whole-day catchup dispatches.
@@ -137,6 +139,7 @@ pub struct BusTaskRequest {
     pub day: Option<String>,
     pub scheduler_name: Option<String>,
     pub queue_if_active_cmd_differs: bool,
+    pub priority: Option<WorkPriority>,
     pub daily_catchup_provenance: Option<DailyCatchupProvenance>,
 }
 
@@ -156,6 +159,7 @@ impl BusTaskRequest {
             scheduler_name: wire.scheduler_name,
             queue_if_active_cmd_differs: wire.queue_if_active_cmd_differs,
             daily_catchup_provenance: None,
+            priority: wire.priority,
         })
     }
 }
@@ -296,6 +300,31 @@ mod tests {
     use serde_json::json;
 
     use super::{BusTaskRequest, WireTaskRequest};
+
+    #[test]
+    fn malformed_priority_never_decodes_as_live_work() {
+        for value in [
+            json!({"band":"wrong","source_time":1}),
+            json!({"band":"now","source_time":-1}),
+            json!("1:0"),
+        ] {
+            assert!(
+                serde_json::from_value::<WireTaskRequest>(
+                    json!({"cmd":["journal","think"],"priority":value})
+                )
+                .is_err()
+            );
+        }
+        let wire: WireTaskRequest = serde_json::from_value(json!({"cmd":["journal","think"],"priority":{"band":"import","source_time":20260101120000u64}})).unwrap();
+        assert_eq!(
+            BusTaskRequest::decode(wire, "valid")
+                .unwrap()
+                .priority
+                .unwrap()
+                .to_string(),
+            "4:20260101120000"
+        );
+    }
 
     #[test]
     fn wire_decode_cannot_supply_daily_catchup_provenance() {

@@ -231,6 +231,7 @@ fn ac9_refusal_carries_all_supervisor_skipped_fields() {
             day: Some("20260807".to_owned()),
             scheduler_name: Some("scheduled-name".to_owned()),
             queue_if_active_cmd_differs: false,
+            priority: None,
         },
         "fallback",
         true,

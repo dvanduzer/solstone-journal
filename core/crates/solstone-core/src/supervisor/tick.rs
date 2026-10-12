@@ -1103,6 +1103,7 @@ fn submit_task(
         day: day.map(str::to_owned),
         scheduler_name: None,
         queue_if_active_cmd_differs: false,
+        priority: None,
         daily_catchup_provenance,
     }))
 }
@@ -1558,69 +1559,24 @@ fn handle_sense_status(retained: &mut Option<RetainedSenseStatus>, message: &Cal
     }
 }
 
-enum SupervisorRequestError {
-    MissingCmd,
-    NonStringElement,
-    EmptyCmd,
-}
-
-impl std::fmt::Display for SupervisorRequestError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self {
-            Self::MissingCmd => "request missing cmd array",
-            Self::NonStringElement => "request cmd contains a non-string element",
-            Self::EmptyCmd => "request cmd is empty",
-        };
-        write!(formatter, "{msg}")
-    }
-}
-
-fn decode_supervisor_cmd(message: &CallosumEnvelope) -> Result<TaskArgv, SupervisorRequestError> {
-    let Some(Value::Array(command)) = message.extra.get("cmd") else {
-        return Err(SupervisorRequestError::MissingCmd);
-    };
-    let Some(command) = command
-        .iter()
-        .map(Value::as_str)
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Err(SupervisorRequestError::NonStringElement);
-    };
-    TaskArgv::from_wire(command.into_iter().map(str::to_owned).collect())
-        .map_err(|_| SupervisorRequestError::EmptyCmd)
+fn decode_supervisor_request(message: &CallosumEnvelope) -> Result<BusTaskRequest, String> {
+    let wire = serde_json::from_value::<solstone_core_system::request::WireTaskRequest>(
+        Value::Object(message.extra.clone()),
+    )
+    .map_err(|error| error.to_string())?;
+    BusTaskRequest::decode(wire, "native-supervisor").map_err(|error| error.to_string())
 }
 
 fn handle_supervisor_request(state: &mut SupervisorState, message: &CallosumEnvelope) {
     if message.tract != "supervisor" || message.event != "request" {
         return;
     }
-    let cmd = match decode_supervisor_cmd(message) {
-        Ok(cmd) => cmd,
+    let request = match decode_supervisor_request(message) {
+        Ok(request) => request,
         Err(error) => {
             log::warn!("supervisor: {error}");
             return;
         }
-    };
-    let request = BusTaskRequest {
-        cmd,
-        reference: message
-            .extra
-            .get("ref")
-            .and_then(Value::as_str)
-            .unwrap_or("native-supervisor")
-            .to_owned(),
-        day: message
-            .extra
-            .get("day")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        scheduler_name: message
-            .extra
-            .get("scheduler_name")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        queue_if_active_cmd_differs: false,
-        daily_catchup_provenance: None,
     };
     if state.queue.submit(ExecutionRequest::Bus(request)) == SubmitOutcome::Rejected {
         log::warn!("supervisor: request rejected");
@@ -4329,44 +4285,49 @@ mod tests {
     }
 
     #[test]
-    fn decode_supervisor_cmd_names_malformed_requests() {
-        let missing = CallosumEnvelope {
-            tract: "supervisor".into(),
-            event: "request".into(),
-            ts: None,
-            extra: Map::new(),
-        };
-        assert!(matches!(
-            decode_supervisor_cmd(&missing),
-            Err(SupervisorRequestError::MissingCmd)
-        ));
-        assert!(matches!(
-            decode_supervisor_cmd(&request_with_cmd(json!("journal"))),
-            Err(SupervisorRequestError::MissingCmd)
-        ));
-        assert!(matches!(
-            decode_supervisor_cmd(&request_with_cmd(json!([1, "brain"]))),
-            Err(SupervisorRequestError::NonStringElement)
-        ));
-        assert!(matches!(
-            decode_supervisor_cmd(&request_with_cmd(json!([]))),
-            Err(SupervisorRequestError::EmptyCmd)
-        ));
+    fn supervisor_wire_boundary_rejects_malformed_commands_and_priority() {
+        let mut missing = request_with_cmd(json!([]));
+        missing.extra.clear();
+        assert!(decode_supervisor_request(&missing).is_err());
+        for cmd in [json!("journal"), json!([1, "brain"]), json!([])] {
+            assert!(decode_supervisor_request(&request_with_cmd(cmd)).is_err());
+        }
+        for priority in [json!({"band":"wrong","source_time":1}), json!("4:1")] {
+            let mut message = request_with_cmd(json!(["journal", "think"]));
+            message.extra.insert("priority".into(), priority);
+            assert!(decode_supervisor_request(&message).is_err());
+        }
     }
 
     #[test]
-    fn decode_supervisor_cmd_accepts_literal_and_resolved_journal_argv() {
+    fn supervisor_wire_boundary_retains_priority_and_never_accepts_internal_provenance() {
+        let mut message = request_with_cmd(json!(["journal", "think", "--day", "20260101"]));
+        message.extra.insert(
+            "priority".into(),
+            json!({"band":"import","source_time":20260101120000u64}),
+        );
+        message
+            .extra
+            .insert("daily_catchup_provenance".into(), json!({"day":"20260101"}));
+        let request = decode_supervisor_request(&message).unwrap();
+        assert_eq!(request.priority.unwrap().to_string(), "4:20260101120000");
+        assert!(request.daily_catchup_provenance.is_none());
+        assert_eq!(request.reference, "native-supervisor");
         assert!(matches!(
-            decode_supervisor_cmd(&request_with_cmd(json!(["journal", "brain", "refresh"]))),
-            Ok(TaskArgv::Brain(_))
+            decode_supervisor_request(&request_with_cmd(json!(["journal", "brain", "refresh"])))
+                .unwrap()
+                .cmd,
+            TaskArgv::Brain(_)
         ));
         assert!(matches!(
-            decode_supervisor_cmd(&request_with_cmd(json!([
+            decode_supervisor_request(&request_with_cmd(json!([
                 "/opt/sol/solstone-core-journal",
                 "brain",
                 "refresh"
-            ]))),
-            Ok(TaskArgv::Unknown { .. })
+            ])))
+            .unwrap()
+            .cmd,
+            TaskArgv::Unknown { .. }
         ));
     }
 

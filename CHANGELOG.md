@@ -14,6 +14,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- when today's thinking and older work are both waiting, your journal now starts today's work first. local model calls follow the same order, with newer recordings first within each priority. work already running can finish.
+
 - on a mac or linux computer, a local thinking install now stops before downloading when that computer is known to be below the memory bar or has no usable GPU. when that memory cannot be read, the install still starts and the thinking page keeps a warning for that attempt.
 - each tool your journal offers a connected agent now has a short name. saving a note, the one tool that doesn't only read, now says it adds without changing anything already in your journal. when an agent's call has arguments your journal can't use, it's told what to fix.
 

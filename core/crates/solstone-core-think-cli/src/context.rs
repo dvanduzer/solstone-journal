@@ -61,7 +61,30 @@ impl IndexBoundary for NativeIndexBoundary {
     }
 }
 
-struct NativeCortexBoundary(CortexRequestClient);
+struct NativeCortexBoundary {
+    client: CortexRequestClient,
+    priority: solstone_core_journal_config::work_priority::WorkPriority,
+}
+
+impl NativeCortexBoundary {
+    fn contextual_request(
+        &self,
+        request: &CortexRequest,
+    ) -> Result<CortexRequest, DispatchFailure> {
+        let mut request = request.clone();
+        let env = request
+            .config
+            .entry("env")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or(DispatchFailure::Unavailable)?;
+        env.insert(
+            solstone_core_journal_config::work_priority::WORK_PRIORITY_ENV.to_owned(),
+            serde_json::Value::String(self.priority.to_string()),
+        );
+        Ok(request)
+    }
+}
 
 impl CortexBoundary for NativeCortexBoundary {
     fn dispatch(
@@ -69,8 +92,9 @@ impl CortexBoundary for NativeCortexBoundary {
         runtime: &tokio::runtime::Runtime,
         request: &CortexRequest,
     ) -> Result<String, DispatchFailure> {
+        let request = self.contextual_request(request)?;
         runtime
-            .block_on(self.0.dispatch(request))
+            .block_on(self.client.dispatch(&request))
             .map_err(|error| match error {
                 DispatchError::Unavailable => DispatchFailure::Unavailable,
                 DispatchError::NotClaimed { use_id } => DispatchFailure::NotClaimed { use_id },
@@ -84,14 +108,18 @@ impl CortexBoundary for NativeCortexBoundary {
         reserved: Option<&str>,
         prepare: &mut (dyn FnMut(&str) -> std::io::Result<()> + Send),
     ) -> Result<String, DispatchFailure> {
+        let request = self.contextual_request(request)?;
         let result = if let Some(id) = reserved {
             let ts = id
                 .parse::<i64>()
                 .map_err(|_| DispatchFailure::Unavailable)?;
             prepare(id).map_err(|_| DispatchFailure::Unavailable)?;
-            runtime.block_on(self.0.dispatch_with_use_id(request, ts, id.to_owned()))
+            runtime.block_on(
+                self.client
+                    .dispatch_with_use_id(&request, ts, id.to_owned()),
+            )
         } else {
-            runtime.block_on(self.0.dispatch_prepared(request, prepare))
+            runtime.block_on(self.client.dispatch_prepared(&request, prepare))
         };
         result.map_err(|error| match error {
             DispatchError::Unavailable => DispatchFailure::Unavailable,
@@ -106,7 +134,7 @@ impl CortexBoundary for NativeCortexBoundary {
         deadline: Option<Duration>,
     ) -> Result<WaitForUsesReport, String> {
         runtime
-            .block_on(self.0.wait_for_uses_with_deadline(use_ids, deadline))
+            .block_on(self.client.wait_for_uses_with_deadline(use_ids, deadline))
             .map_err(|error| format!("cortex wait failed: {error:?}"))
     }
 }
@@ -153,11 +181,15 @@ impl ThinkContext {
             event_clock,
             talent_root,
             apps_root,
-            cortex: Arc::new(NativeCortexBoundary(CortexRequestClient::with_allocator(
-                journal,
-                CortexRequestPolicy::think(),
-                UseIdAllocator::new(move || Some(allocator_now)),
-            ))),
+            cortex: Arc::new(NativeCortexBoundary {
+                client: CortexRequestClient::with_allocator(
+                    journal,
+                    CortexRequestPolicy::think(),
+                    UseIdAllocator::new(move || Some(allocator_now)),
+                ),
+                priority:
+                    solstone_core_journal_config::work_priority::WorkPriority::from_environment()?,
+            }),
             index: Arc::new(NativeIndexBoundary),
             status: ThinkStatus::default(),
         })
@@ -221,6 +253,101 @@ fn package_roots_from_executable_dir(executable_dir: &Path) -> Option<(PathBuf, 
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn ordinary_and_prepared_cortex_requests_preserve_each_callers_priority() {
+        use solstone_core_journal_config::work_priority::WORK_PRIORITY_ENV;
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        let journal = tempfile::tempdir().unwrap();
+        fs::create_dir_all(journal.path().join("health")).unwrap();
+        let listener = UnixListener::bind(journal.path().join("health/callosum.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let root = journal.path().to_owned();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut requests = Vec::new();
+            while requests.len() < 3 {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "Cortex request not sent"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = String::new();
+                stream.read_to_string(&mut bytes).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+                let name = request["name"].as_str().unwrap();
+                let id = request["use_id"].as_str().unwrap();
+                let directory = root.join("talents").join(name);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(
+                    directory.join(format!("{id}_active.jsonl")),
+                    serde_json::json!({"event":"request","name":name,"use_id":id}).to_string(),
+                )
+                .unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        std::thread::scope(|scope| {
+            for (index, priority) in ["1:20261011120000", "4:20261009120000", "6:20260101000000"]
+                .into_iter()
+                .enumerate()
+            {
+                let root = journal.path();
+                scope.spawn(move || {
+                    let boundary = NativeCortexBoundary {
+                        client: CortexRequestClient::new(root, CortexRequestPolicy::think()),
+                        priority: priority.parse().unwrap(),
+                    };
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let request = CortexRequest::new("test", format!("priority{index}"))
+                        .with_config(
+                            serde_json::json!({"env":{"SOL_DAY":"20260101"}})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        );
+                    let result = match index {
+                        0 => boundary.dispatch(&runtime, &request),
+                        1 => boundary.dispatch_prepared(&runtime, &request, None, &mut |_| Ok(())),
+                        _ => {
+                            boundary
+                                .dispatch_prepared(&runtime, &request, Some("42"), &mut |_| Ok(()))
+                        }
+                    };
+                    assert!(result.is_ok(), "{result:?}");
+                    assert!(request.config["env"].get(WORK_PRIORITY_ENV).is_none());
+                });
+            }
+        });
+        let mut requests = server.join().unwrap();
+        requests.sort_by_key(|request| request["name"].as_str().unwrap().to_owned());
+        for (request, priority) in
+            requests
+                .iter()
+                .zip(["1:20261011120000", "4:20261009120000", "6:20260101000000"])
+        {
+            assert_eq!(request["env"][WORK_PRIORITY_ENV], priority);
+            assert_eq!(request["env"]["SOL_DAY"], "20260101");
+        }
+    }
 
     #[test]
     fn share_layout_requires_both_roots_and_fails_when_anchor_removed() {

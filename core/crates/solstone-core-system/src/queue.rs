@@ -3,6 +3,9 @@
 
 //! Per-partition task admission, lifecycle, and deadline enforcement.
 
+use crate::priority::PriorityIntent;
+use solstone_core_journal_config::work_priority::{WORK_PRIORITY_ENV, WorkPriority};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::io;
@@ -857,6 +860,7 @@ struct Submission {
     day: Option<String>,
     scheduler_name: Option<String>,
     daily_catchup_provenance: Option<DailyCatchupProvenance>,
+    priority: PriorityIntent,
 }
 
 #[derive(Clone)]
@@ -867,10 +871,12 @@ struct QueuedEntry {
     day: Option<String>,
     scheduler_name: Option<String>,
     daily_catchup_provenance: Option<DailyCatchupProvenance>,
+    priority: PriorityIntent,
 }
 
 #[derive(Clone)]
 struct Dispatch {
+    priority: WorkPriority,
     submission: Submission,
     references: Vec<String>,
     daily_catchup_admission: Option<DailyCatchupAdmission>,
@@ -927,7 +933,7 @@ struct WorkerLease {
 impl Drop for WorkerLease {
     fn drop(&mut self) {
         let dispatch = finish_worker(&self.inner, &self.partition, &self.reference);
-        if let Some(dispatch) = dispatch {
+        for dispatch in dispatch {
             start_dispatch(Arc::clone(&self.inner), dispatch);
         }
     }
@@ -964,9 +970,11 @@ fn insert_loaded_record(
                 day: rec_state.day.clone(),
                 scheduler_name: rec_state.scheduler_name.clone(),
                 daily_catchup_provenance: None,
+                priority: PriorityIntent::default(),
             },
             references: rec_state.references.clone(),
             daily_catchup_admission: None,
+            priority: WorkPriority::default(),
         };
         let reasons = rec_state.reasons.clone();
         let first_held_at_unix = rec_state.created_unix;
@@ -1285,22 +1293,31 @@ impl TaskQueue {
     }
 
     pub fn submit(&self, request: ExecutionRequest) -> SubmitOutcome {
+        let today = selection_day(&self.inner.options.journal_root);
         let submission = normalize_request(request, self.inner.options.cap_resolver.as_ref());
+        let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
         let partition = submission.partition.clone();
         let (outcome, dispatch, event) = {
             let mut state = self.inner.state.lock().expect("queue state lock poisoned");
             if !state.ready {
                 state.pending.push(submission);
-                (SubmitOutcome::Pending, None, None)
+                (SubmitOutcome::Pending, Vec::new(), None)
             } else if state.shutdown {
-                (SubmitOutcome::Rejected, None, None)
+                (SubmitOutcome::Rejected, Vec::new(), None)
             } else {
-                let (outcome, dispatch) = admit_locked(&mut state, submission);
+                let reference = submission.reference.clone();
+                let outcome = enqueue_locked(&mut state, submission);
+                let dispatch = take_ready(&mut state, allowed, today);
+                let outcome = if dispatch.iter().any(|d| d.references.contains(&reference)) {
+                    SubmitOutcome::Dispatched
+                } else {
+                    outcome
+                };
                 let event = Some(queue_changed_event(&state, &partition));
                 (outcome, dispatch, event)
             }
         };
-        if let Some(dispatch) = dispatch {
+        for dispatch in dispatch {
             start_dispatch(Arc::clone(&self.inner), dispatch);
         }
         emit_queue_event(&self.inner.options.queue_sink, event);
@@ -1330,6 +1347,8 @@ impl TaskQueue {
     }
 
     pub fn set_ready(&self) {
+        let today = selection_day(&self.inner.options.journal_root);
+        let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
         let (dispatches, events) = {
             let mut state = self.inner.state.lock().expect("queue state lock poisoned");
             if state.ready {
@@ -1340,15 +1359,12 @@ impl TaskQueue {
                 return;
             }
             let pending = std::mem::take(&mut state.pending);
-            let mut dispatches = Vec::new();
             let mut changed = BTreeSet::new();
             for submission in pending {
-                let (_, dispatch) = admit_locked(&mut state, submission);
-                if let Some(dispatch) = dispatch {
-                    changed.insert(dispatch.submission.partition.clone());
-                    dispatches.push(dispatch);
-                }
+                changed.insert(submission.partition.clone());
+                enqueue_locked(&mut state, submission);
             }
+            let dispatches = take_ready(&mut state, allowed, today);
             let events: Vec<_> = changed
                 .iter()
                 .map(|partition| queue_changed_event(&state, partition))
@@ -1366,54 +1382,11 @@ impl TaskQueue {
     /// Resume work held by the owner's processing window without disturbing
     /// shutdown or the queue's independent process-tree safety holds.
     pub fn resume_processing(&self) {
+        let today = selection_day(&self.inner.options.journal_root);
         let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
         let dispatches = {
             let mut state = self.inner.state.lock().expect("queue state");
-            if !state.ready || state.shutdown || state.queue_hold.is_some() {
-                return;
-            }
-            let partitions = state
-                .queues
-                .keys()
-                .filter(|partition| {
-                    !state.running.contains_key(*partition)
-                        && !state.held.contains_key(*partition)
-                        && state.queues[*partition]
-                            .front()
-                            .is_some_and(|entry| allowed || !is_analysis_command(&entry.command))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut dispatches = Vec::new();
-            for partition in partitions {
-                let entry = state
-                    .queues
-                    .get_mut(&partition)
-                    .expect("queue")
-                    .pop_front()
-                    .expect("front");
-                let submission = Submission {
-                    partition: partition.clone(),
-                    cap: entry.cap,
-                    command: entry.command,
-                    reference: entry.references[0].clone(),
-                    day: entry.day,
-                    scheduler_name: entry.scheduler_name,
-                    daily_catchup_provenance: entry.daily_catchup_provenance,
-                };
-                state.running.insert(
-                    partition,
-                    RunningSlot {
-                        reference: submission.reference.clone(),
-                    },
-                );
-                dispatches.push(Dispatch {
-                    submission,
-                    references: entry.references,
-                    daily_catchup_admission: None,
-                });
-            }
-            dispatches
+            take_ready(&mut state, allowed, today)
         };
         for dispatch in dispatches {
             start_dispatch(Arc::clone(&self.inner), dispatch);
@@ -1421,6 +1394,7 @@ impl TaskQueue {
     }
 
     pub fn enforce_deadlines(&self, now: Instant) {
+        let today = selection_day(&self.inner.options.journal_root);
         let (has_held, has_queue_hold) = {
             let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
             (!state.held.is_empty(), state.queue_hold.is_some())
@@ -1705,44 +1679,13 @@ impl TaskQueue {
                                         }
                                     }
                                     state.queue_hold = None;
-                                    let mut dispatches = Vec::new();
-                                    let eligible_partitions: Vec<Partition> = state
-                                        .queues
-                                        .keys()
-                                        .filter(|p| {
-                                            !state.running.contains_key(*p)
-                                                && !state.held.contains_key(*p)
-                                        })
-                                        .cloned()
-                                        .collect();
-                                    for partition in eligible_partitions {
-                                        if let Some(queue) = state.queues.get_mut(&partition)
-                                            && let Some(entry) = queue.pop_front()
-                                        {
-                                            let submission = Submission {
-                                                cap: entry.cap,
-                                                partition: partition.clone(),
-                                                command: entry.command,
-                                                reference: entry.references[0].clone(),
-                                                day: entry.day,
-                                                scheduler_name: entry.scheduler_name,
-                                                daily_catchup_provenance: entry
-                                                    .daily_catchup_provenance,
-                                            };
-                                            state.running.insert(
-                                                partition.clone(),
-                                                RunningSlot {
-                                                    reference: submission.reference.clone(),
-                                                },
-                                            );
-                                            dispatches.push(Dispatch {
-                                                references: entry.references,
-                                                submission,
-                                                daily_catchup_admission: None,
-                                            });
-                                        }
-                                    }
-                                    dispatches
+                                    take_ready(
+                                        &mut state,
+                                        crate::processing::processing_allowed(
+                                            &self.inner.options.journal_root,
+                                        ),
+                                        today,
+                                    )
                                 };
                                 for dispatch in dispatches {
                                     start_dispatch(Arc::clone(&self.inner), dispatch);
@@ -1947,7 +1890,7 @@ impl TaskQueue {
                                     &partition,
                                     &dispatch.submission.reference,
                                 );
-                                if let Some(next) = next {
+                                for next in next {
                                     start_dispatch(Arc::clone(&self.inner), next);
                                 }
                             }
@@ -2203,7 +2146,7 @@ impl TaskQueue {
                                 &partition,
                                 &dispatch.submission.reference,
                             );
-                            if let Some(next) = next {
+                            for next in next {
                                 start_dispatch(Arc::clone(&self.inner), next);
                             }
                         } else {
@@ -2688,81 +2631,153 @@ fn task_status_flags(duration_seconds: u64, cap_seconds: u64) -> (bool, bool) {
     )
 }
 
-fn normalize_request(request: ExecutionRequest, caps: &dyn CapResolver) -> Submission {
-    match request {
-        ExecutionRequest::Bus(request) => Submission {
-            cap: caps.cap_for(&request.cmd.partition()),
-            partition: request.cmd.partition(),
-            command: request.cmd.as_wire().to_vec(),
-            reference: request.reference,
-            day: request.day,
-            scheduler_name: request.scheduler_name,
-            daily_catchup_provenance: request.daily_catchup_provenance,
-        },
-        ExecutionRequest::Scheduled(request) => Submission {
-            cap: request
-                .max_runtime
-                .filter(|cap| !cap.is_zero())
-                .unwrap_or_else(|| caps.cap_for(&request.cmd.partition())),
-            partition: request.cmd.partition(),
-            command: request.cmd.as_wire().to_vec(),
-            reference: request.reference,
-            day: request.day,
-            scheduler_name: request.scheduler_name,
-            daily_catchup_provenance: None,
-        },
-    }
+fn selection_day(journal: &Path) -> chrono::NaiveDate {
+    chrono::Utc::now()
+        .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+        .date_naive()
 }
 
-fn admit_locked(
-    state: &mut QueueState,
-    submission: Submission,
-) -> (SubmitOutcome, Option<Dispatch>) {
-    if state.running.contains_key(&submission.partition)
-        || state.held.contains_key(&submission.partition)
-        || state
-            .queues
-            .get(&submission.partition)
-            .is_some_and(|queue| !queue.is_empty())
+fn normalize_request(request: ExecutionRequest, caps: &dyn CapResolver) -> Submission {
+    let (mut submission, explicit) = match request {
+        ExecutionRequest::Bus(request) => (
+            Submission {
+                cap: caps.cap_for(&request.cmd.partition()),
+                partition: request.cmd.partition(),
+                command: request.cmd.as_wire().to_vec(),
+                reference: request.reference,
+                day: request.day,
+                scheduler_name: request.scheduler_name,
+                daily_catchup_provenance: request.daily_catchup_provenance,
+                priority: PriorityIntent::default(),
+            },
+            request.priority,
+        ),
+        ExecutionRequest::Scheduled(request) => (
+            Submission {
+                cap: request
+                    .max_runtime
+                    .filter(|cap| !cap.is_zero())
+                    .unwrap_or_else(|| caps.cap_for(&request.cmd.partition())),
+                partition: request.cmd.partition(),
+                command: request.cmd.as_wire().to_vec(),
+                reference: request.reference,
+                day: request.day,
+                scheduler_name: request.scheduler_name,
+                daily_catchup_provenance: None,
+                priority: PriorityIntent::default(),
+            },
+            None,
+        ),
+    };
+    submission.priority = PriorityIntent::new(explicit);
+    submission
+}
+
+fn enqueue_locked(state: &mut QueueState, submission: Submission) -> SubmitOutcome {
+    let queue = state.queues.entry(submission.partition).or_default();
+    if let Some(entry) = queue
+        .iter_mut()
+        .find(|entry| entry.command == submission.command && entry.cap == submission.cap)
     {
-        let queue = state
-            .queues
-            .entry(submission.partition.clone())
-            .or_default();
-        if let Some(entry) = queue
-            .iter_mut()
-            .find(|entry| entry.command == submission.command && entry.cap == submission.cap)
-        {
-            if entry.references.contains(&submission.reference) {
-                return (SubmitOutcome::DuplicateQueuedReference, None);
-            }
-            entry.references.push(submission.reference);
-            return (SubmitOutcome::Coalesced, None);
+        entry.priority.merge(submission.priority);
+        if entry.references.contains(&submission.reference) {
+            return SubmitOutcome::DuplicateQueuedReference;
         }
-        queue.push_back(QueuedEntry {
-            cap: submission.cap,
-            references: vec![submission.reference.clone()],
-            command: submission.command.clone(),
-            day: submission.day.clone(),
-            scheduler_name: submission.scheduler_name.clone(),
-            daily_catchup_provenance: submission.daily_catchup_provenance.clone(),
-        });
-        return (SubmitOutcome::Queued, None);
+        entry.references.push(submission.reference);
+        return SubmitOutcome::Coalesced;
     }
-    state.running.insert(
-        submission.partition.clone(),
-        RunningSlot {
-            reference: submission.reference.clone(),
-        },
-    );
-    (
-        SubmitOutcome::Dispatched,
-        Some(Dispatch {
-            references: vec![submission.reference.clone()],
+    queue.push_back(QueuedEntry {
+        cap: submission.cap,
+        references: vec![submission.reference],
+        command: submission.command,
+        day: submission.day,
+        scheduler_name: submission.scheduler_name,
+        daily_catchup_provenance: submission.daily_catchup_provenance,
+        priority: submission.priority,
+    });
+    SubmitOutcome::Queued
+}
+
+// One selector for every wakeup. Held lanes are not candidates. A busy lane's
+// highest waiting analysis is a barrier: lower work cannot reserve other lanes
+// ahead of it. Independent maintenance remains runnable during that wait.
+fn take_ready(state: &mut QueueState, allowed: bool, today: chrono::NaiveDate) -> Vec<Dispatch> {
+    let mut dispatches = Vec::new();
+    if !state.ready || state.shutdown || state.queue_hold.is_some() {
+        return dispatches;
+    }
+    loop {
+        let analysis = allowed
+            .then(|| {
+                state
+                    .queues
+                    .iter()
+                    .filter(|(partition, _)| !state.held.contains_key(*partition))
+                    .flat_map(|(partition, queue)| {
+                        queue
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, entry)| is_analysis_command(&entry.command))
+                            .map(move |(index, entry)| {
+                                (
+                                    partition.clone(),
+                                    index,
+                                    entry.priority.resolve(&entry.command, today),
+                                )
+                            })
+                    })
+                    .min_by_key(|(_, _, priority)| priority.sort_key())
+            })
+            .flatten();
+        let candidate = analysis
+            .filter(|(partition, _, _)| !state.running.contains_key(partition))
+            .map(|(partition, index, _)| (partition, index))
+            .or_else(|| {
+                state.queues.iter().find_map(|(partition, queue)| {
+                    (!state.running.contains_key(partition)
+                        && !state.held.contains_key(partition)
+                        && queue
+                            .front()
+                            .is_some_and(|entry| !is_analysis_command(&entry.command)))
+                    .then(|| (partition.clone(), 0))
+                })
+            });
+        let Some((partition, index)) = candidate else {
+            break;
+        };
+        let entry = state
+            .queues
+            .get_mut(&partition)
+            .expect("selected queue")
+            .remove(index)
+            .expect("selected entry");
+        if state.queues[&partition].is_empty() {
+            state.queues.remove(&partition);
+        }
+        let submission = Submission {
+            partition: partition.clone(),
+            cap: entry.cap,
+            command: entry.command,
+            reference: entry.references[0].clone(),
+            day: entry.day,
+            scheduler_name: entry.scheduler_name,
+            daily_catchup_provenance: entry.daily_catchup_provenance,
+            priority: entry.priority,
+        };
+        state.running.insert(
+            partition,
+            RunningSlot {
+                reference: submission.reference.clone(),
+            },
+        );
+        dispatches.push(Dispatch {
+            priority: submission.priority.resolve(&submission.command, today),
             submission,
+            references: entry.references,
             daily_catchup_admission: None,
-        }),
-    )
+        });
+    }
+    dispatches
 }
 
 fn is_analysis_command(command: &[String]) -> bool {
@@ -2830,8 +2845,8 @@ fn start_dispatch(inner: Arc<QueueInner>, mut dispatch: Dispatch) {
                     &dispatch.submission.partition,
                     &dispatch.submission.reference,
                 );
-                if let Some(next) = next {
-                    start_dispatch(inner, next);
+                for next in next {
+                    start_dispatch(Arc::clone(&inner), next);
                 }
                 return;
             }
@@ -2847,8 +2862,8 @@ fn start_dispatch(inner: Arc<QueueInner>, mut dispatch: Dispatch) {
                     &dispatch.submission.partition,
                     &dispatch.submission.reference,
                 );
-                if let Some(next) = next {
-                    start_dispatch(inner, next);
+                for next in next {
+                    start_dispatch(Arc::clone(&inner), next);
                 }
                 return;
             }
@@ -2943,8 +2958,8 @@ fn start_dispatch(inner: Arc<QueueInner>, mut dispatch: Dispatch) {
                 &rollback.submission.partition,
                 &rollback.submission.reference,
             );
-            if let Some(next) = next {
-                start_dispatch(inner, next);
+            for next in next {
+                start_dispatch(Arc::clone(&inner), next);
             }
         }
     }
@@ -3141,6 +3156,7 @@ fn requeue_dispatch_at_head(inner: &QueueInner, dispatch: Dispatch) {
             day: dispatch.submission.day,
             scheduler_name: dispatch.submission.scheduler_name,
             daily_catchup_provenance: dispatch.submission.daily_catchup_provenance,
+            priority: dispatch.submission.priority,
         });
     state.running.remove(&dispatch.submission.partition);
 }
@@ -3504,7 +3520,16 @@ fn run_worker(inner: Arc<QueueInner>, dispatch: Dispatch) {
             reference: primary.clone(),
             day: dispatch.submission.day.clone(),
             sink: inner.options.process_sink.clone(),
-            environment: inner.options.child_environment.clone(),
+            environment: {
+                let mut environment = inner.options.child_environment.clone();
+                if is_analysis_command(&dispatch.submission.command) {
+                    environment.insert(
+                        WORK_PRIORITY_ENV.into(),
+                        dispatch.priority.to_string().into(),
+                    );
+                }
+                environment
+            },
         },
         timeout,
     );
@@ -3804,58 +3829,34 @@ fn record_completion(
     }
 }
 
-fn finish_worker(inner: &QueueInner, partition: &Partition, reference: &str) -> Option<Dispatch> {
-    let (dispatch, event) = {
+fn finish_worker(inner: &QueueInner, partition: &Partition, reference: &str) -> Vec<Dispatch> {
+    let today = selection_day(&inner.options.journal_root);
+    let allowed = crate::processing::processing_allowed(&inner.options.journal_root);
+    let (dispatches, events) = {
         let mut state = inner.state.lock().expect("queue state lock poisoned");
-        if state.held.contains_key(partition) {
-            return None;
-        }
-        if state
-            .running
-            .get(partition)
-            .map(|slot| slot.reference.as_str())
-            != Some(reference)
+        if state.held.contains_key(partition)
+            || state
+                .running
+                .get(partition)
+                .map(|slot| slot.reference.as_str())
+                != Some(reference)
         {
-            return None;
+            return Vec::new();
         }
         state.running.remove(partition);
-        if state.shutdown || state.queue_hold.is_some() {
-            return None;
-        }
-        let dispatch = state
-            .queues
-            .get_mut(partition)
-            .and_then(VecDeque::pop_front)
-            .map(|entry| {
-                let submission = Submission {
-                    cap: entry.cap,
-                    partition: partition.clone(),
-                    command: entry.command,
-                    reference: entry.references[0].clone(),
-                    day: entry.day,
-                    scheduler_name: entry.scheduler_name,
-                    daily_catchup_provenance: entry.daily_catchup_provenance,
-                };
-                state.running.insert(
-                    partition.clone(),
-                    RunningSlot {
-                        reference: submission.reference.clone(),
-                    },
-                );
-                Dispatch {
-                    references: entry.references,
-                    submission,
-                    daily_catchup_admission: None,
-                }
-            });
-        if state.queues.get(partition).is_some_and(VecDeque::is_empty) {
-            state.queues.remove(partition);
-        }
-        let event = Some(queue_changed_event(&state, partition));
-        (dispatch, event)
+        let dispatches = take_ready(&mut state, allowed, today);
+        let mut changed = BTreeSet::from([partition.clone()]);
+        changed.extend(dispatches.iter().map(|d| d.submission.partition.clone()));
+        let events = changed
+            .iter()
+            .map(|p| queue_changed_event(&state, p))
+            .collect::<Vec<_>>();
+        (dispatches, events)
     };
-    emit_queue_event(&inner.options.queue_sink, event);
-    dispatch
+    for event in events {
+        emit_queue_event(&inner.options.queue_sink, Some(event));
+    }
+    dispatches
 }
 
 fn queue_changed_event(state: &QueueState, partition: &Partition) -> TaskQueueEvent {
@@ -4682,9 +4683,11 @@ mod tests {
                 day: None,
                 scheduler_name: None,
                 daily_catchup_provenance: None,
+                priority: PriorityIntent::default(),
             },
             references: vec![reference.to_owned()],
             daily_catchup_admission: None,
+            priority: WorkPriority::default(),
         }
     }
 
@@ -4722,6 +4725,247 @@ mod tests {
                     bound_identities: Vec::new(),
                 },
             );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    fn ranked_request(reference: &str, mode: &str, priority: &str) -> ExecutionRequest {
+        let mut command = vec!["journal", "think", "--day", "20260101"];
+        if !mode.is_empty() {
+            command.extend([mode, reference]);
+        }
+        let ExecutionRequest::Bus(mut request) = command_request(&command, reference, None) else {
+            unreachable!()
+        };
+        request.priority = Some(priority.parse().unwrap());
+        ExecutionRequest::Bus(request)
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn ladder_selects_globally_and_completion_wakes_other_lanes() {
+        let queue = queue(false, 10, VecDeque::new());
+        for (reference, mode, priority) in [
+            ("old", "", "6:1"),
+            ("missing", "--segment", "5:1"),
+            ("import", "--activity", "4:1"),
+            ("recent", "--segment", "3:1"),
+            ("owner", "--activity", "2:1"),
+            ("live-older", "--segment", "1:1"),
+            ("live-newer", "--segment", "1:2"),
+        ] {
+            queue.submit(ranked_request(reference, mode, priority));
+        }
+        let first = {
+            let mut state = queue.inner.state.lock().unwrap();
+            for submission in std::mem::take(&mut state.pending) {
+                enqueue_locked(&mut state, submission);
+            }
+            state.ready = true;
+            take_ready(&mut state, true, selection_day(Path::new("")))
+        };
+        assert_eq!(
+            first
+                .iter()
+                .map(|d| d.submission.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["live-newer"]
+        );
+        let second = finish_worker(&queue.inner, &Partition::new("segment"), "live-newer");
+        assert_eq!(
+            second
+                .iter()
+                .map(|d| d.submission.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["live-older", "owner"]
+        );
+        // The next segment is waiting behind its running task. Import cannot pass it.
+        let third = finish_worker(&queue.inner, &Partition::new("activity"), "owner");
+        assert!(third.is_empty());
+        let fourth = finish_worker(&queue.inner, &Partition::new("segment"), "live-older");
+        assert_eq!(
+            fourth
+                .iter()
+                .map(|d| d.submission.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["recent", "import"]
+        );
+        assert!(finish_worker(&queue.inner, &Partition::new("activity"), "import").is_empty());
+        let fifth = finish_worker(&queue.inner, &Partition::new("segment"), "recent");
+        assert_eq!(
+            fifth
+                .iter()
+                .map(|d| d.submission.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["missing", "old"]
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn requeued_dispatch_recomputes_derived_priority_and_keeps_owner_intent() {
+        let queue = queue(false, 10, VecDeque::new());
+        let command = [
+            "journal",
+            "think",
+            "--day",
+            "20261011",
+            "--segment",
+            "120000_300",
+        ];
+        queue.submit(command_request(&command, "derived", None));
+        let date = |day| chrono::NaiveDate::from_ymd_opt(2026, 10, day).unwrap();
+        let selected = {
+            let mut state = queue.inner.state.lock().unwrap();
+            for submission in std::mem::take(&mut state.pending) {
+                enqueue_locked(&mut state, submission);
+            }
+            state.ready = true;
+            take_ready(&mut state, true, date(11)).pop().unwrap()
+        };
+        assert_eq!(selected.priority.to_string(), "1:20261011120000");
+        requeue_dispatch_at_head(&queue.inner, selected);
+        let mut state = queue.inner.state.lock().unwrap();
+        let ExecutionRequest::Bus(mut owner) = command_request(&command, "derived", None) else {
+            unreachable!()
+        };
+        owner.priority = Some("2:20261011120000".parse().unwrap());
+        assert_eq!(
+            enqueue_locked(
+                &mut state,
+                normalize_request(
+                    ExecutionRequest::Bus(owner),
+                    queue.inner.options.cap_resolver.as_ref()
+                )
+            ),
+            SubmitOutcome::DuplicateQueuedReference
+        );
+        let newer = normalize_request(
+            command_request(
+                &[
+                    "journal",
+                    "think",
+                    "--day",
+                    "20261019",
+                    "--segment",
+                    "120000_300",
+                ],
+                "today",
+                None,
+            ),
+            queue.inner.options.cap_resolver.as_ref(),
+        );
+        enqueue_locked(&mut state, newer);
+        let first = take_ready(&mut state, true, date(19));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].submission.reference, "today");
+        assert_eq!(first[0].priority.to_string(), "1:20261019120000");
+        state.running.clear();
+        let second = take_ready(&mut state, true, date(19));
+        assert_eq!(second[0].priority.to_string(), "2:20261011120000");
+        assert_eq!(second[0].references, ["derived"]);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn safety_held_analysis_is_not_a_priority_barrier_for_other_lanes() {
+        let queue = queue(false, 10, VecDeque::new());
+        queue.submit(ranked_request("held-live", "--segment", "1:1"));
+        queue.submit(ranked_request("old-day", "", "6:1"));
+        let mut state = queue.inner.state.lock().unwrap();
+        for submission in std::mem::take(&mut state.pending) {
+            enqueue_locked(&mut state, submission);
+        }
+        state.ready = true;
+        state.held.insert(
+            Partition::new("segment"),
+            HeldEntry {
+                dispatch: dispatch("safety-held"),
+                process: None,
+                owner_uid: current_task_uid(),
+                bound_identities: Vec::new(),
+                bound_first_terminate_at: BTreeMap::new(),
+                first_held_at: Instant::now(),
+                first_held_at_unix: 0,
+                reasons: vec![ReasonCode::RootLive],
+                exit_code: 0,
+                termination_error: None,
+                snapshot_unavailable: true,
+                persisted: false,
+                records: Vec::new(),
+            },
+        );
+        let selected = take_ready(&mut state, true, selection_day(Path::new("")));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].submission.reference, "old-day");
+        assert!(state.held.contains_key(&Partition::new("segment")));
+        assert_eq!(
+            state.queues[&Partition::new("segment")][0].references,
+            ["held-live"]
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn pending_priority_promotion_deduplicates_before_real_worker_spawn() {
+        let queue = queue(false, 10, VecDeque::new());
+        let (sent, received) = mpsc::channel();
+        queue.set_worker_spawner(Arc::new(move |_, options, _| {
+            sent.send((
+                options.reference,
+                options.environment[std::ffi::OsStr::new(WORK_PRIORITY_ENV)].clone(),
+            ))
+            .unwrap();
+            Err(QueueSpawnFailure::Clean(SpawnError::EmptyCommand))
+        }));
+        queue.submit(ranked_request("older", "--segment", "6:1"));
+        queue.submit(ranked_request("newer", "--segment", "5:2"));
+        // Same queued command and reference, now explicitly requested by owner.
+        queue.submit(ranked_request("older", "--segment", "2:1"));
+        queue.set_ready();
+        let first = received.recv_timeout(TEST_TRANSITION_TIMEOUT).unwrap();
+        let second = received.recv_timeout(TEST_TRANSITION_TIMEOUT).unwrap();
+        assert_eq!(first, ("older".into(), "2:1".into()));
+        assert_eq!(second, ("newer".into(), "5:2".into()));
+        queue.join_test_workers(2, TEST_TRANSITION_TIMEOUT).unwrap();
+        assert_eq!(queue.history().len(), 2);
+        assert!(
+            queue
+                .collect_queue_counts()
+                .values()
+                .all(|count| *count == 0)
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn startup_derives_newest_segment_first_and_retains_child_context() {
+        let queue = queue(false, 10, VecDeque::new());
+        let (sent, received) = mpsc::channel();
+        queue.set_worker_spawner(Arc::new(move |_, options, _| {
+            sent.send((
+                options.reference,
+                options.environment[std::ffi::OsStr::new(WORK_PRIORITY_ENV)].clone(),
+            ))
+            .unwrap();
+            Err(QueueSpawnFailure::Clean(SpawnError::EmptyCommand))
+        }));
+        for time in ["090000_300", "120000_300"] {
+            queue.submit(command_request(
+                &["journal", "think", "--day", "20260101", "--segment", time],
+                time,
+                None,
+            ));
+        }
+        queue.set_ready();
+        assert_eq!(
+            received.recv_timeout(TEST_TRANSITION_TIMEOUT).unwrap(),
+            ("120000_300".into(), "5:20260101120000".into())
+        );
+        assert_eq!(
+            received.recv_timeout(TEST_TRANSITION_TIMEOUT).unwrap(),
+            ("090000_300".into(), "5:20260101090000".into())
+        );
+        queue.join_test_workers(2, TEST_TRANSITION_TIMEOUT).unwrap();
     }
 
     #[test]
@@ -4763,6 +5007,7 @@ mod tests {
             day: None,
             scheduler_name: None,
             queue_if_active_cmd_differs: false,
+            priority: None,
             daily_catchup_provenance: None,
         })
     }
@@ -4779,6 +5024,7 @@ mod tests {
             day: provenance.as_ref().map(|value| value.day.clone()),
             scheduler_name: None,
             queue_if_active_cmd_differs: false,
+            priority: None,
             daily_catchup_provenance: provenance,
         })
     }
@@ -4813,6 +5059,7 @@ mod tests {
                     day: None,
                     scheduler_name: None,
                     daily_catchup_provenance: None,
+                    priority: PriorityIntent::default(),
                 }]),
             );
         let now = Instant::now();
@@ -5509,6 +5756,7 @@ mod tests {
                 // The live supervisor submits directly to this queue without
                 // the older request classifier or its wire flag.
                 queue_if_active_cmd_differs: false,
+                priority: None,
                 daily_catchup_provenance: None,
             })
         };
@@ -5663,7 +5911,7 @@ mod tests {
     }
 
     #[test]
-    fn processing_gate_preserves_pending_fifo_deduplication_and_safety_holds() {
+    fn processing_gate_preserves_priority_deduplication_and_safety_holds() {
         for ready in [false, true] {
             let root = tempfile::tempdir().unwrap();
             set_processing(root.path(), true);
@@ -5739,7 +5987,7 @@ mod tests {
                     .iter()
                     .map(|task| task.reference.as_str())
                     .collect::<Vec<_>>(),
-                vec!["maintenance", "first", "second"]
+                vec!["maintenance", "second", "first"]
             );
             assert!(!queue.contains_reference("coalesced"));
         }
