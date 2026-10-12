@@ -1607,6 +1607,69 @@ mod tests {
         assert_eq!(unit.owed_by.as_deref(), Some("evidence_changed"));
     }
 
+    /// 2.0.42's first start wrote the derived `location.md` into every past day holding
+    /// phone location, and each such day's outputs read as owed by changed evidence,
+    /// however old (the 2026-10-12 Suze burn-in red). No daily packet reads the
+    /// document, so neither its backfill nor a later rewrite re-owes any day; a day's
+    /// own material still does.
+    #[test]
+    fn a_location_backfill_reowes_no_day_and_the_days_own_material_still_does() {
+        let (dir, talent, apps) = fixture();
+        let root = dir.path();
+        utc_journal(root, serde_json::json!({}));
+        let days = closed_days(root, 12);
+        for day in &days {
+            source(root, day, "# Flow\nMeeting.");
+            accept(root, day, &talent, &apps);
+        }
+        let location = |day: &str, text: &str| {
+            let chronicle = root.join("chronicle").join(day);
+            fs::write(chronicle.join("location.md"), text).unwrap();
+            fs::create_dir_all(chronicle.join("health")).unwrap();
+            fs::write(chronicle.join("health/location.json"), "{\"version\":1}").unwrap();
+        };
+        // The upgrade's backfill, into days both older than and inside the window.
+        for day in &days {
+            location(
+                day,
+                "# location\n\n- readings near Golden, 14:00 to 14:09.\n",
+            );
+        }
+        for day in &days {
+            let unit = unit_state(root, day, &talent, &apps);
+            assert_eq!(unit.state, CoverageState::Current, "{day} keeps its output");
+            assert_eq!(unit.earlier_version, None, "{day} is an exact match");
+            assert_eq!(unit.owed_by, None);
+        }
+        // Late phone location for an old day: its segment arrives and the document
+        // is rebuilt. Neither is anything a daily packet reads.
+        let segment = root
+            .join("chronicle")
+            .join(&days[0])
+            .join("phone/140000_300");
+        fs::create_dir_all(&segment).unwrap();
+        fs::write(
+            segment.join("location.jsonl"),
+            "{\"type\":\"reading\",\"latitude\":39.75,\"longitude\":-105.22}\n",
+        )
+        .unwrap();
+        location(
+            &days[0],
+            "# location\n\n- readings near Golden, 14:00 to 14:30.\n",
+        );
+        assert_eq!(
+            unit_state(root, &days[0], &talent, &apps).state,
+            CoverageState::Current
+        );
+        // Late material the day's outputs are made from re-owes it, old or recent.
+        for day in [&days[0], &days[days.len() - 1]] {
+            source(root, day, "# Flow\nA different meeting.");
+            let unit = unit_state(root, day, &talent, &apps);
+            assert_eq!(unit.state, CoverageState::Outstanding, "{day}");
+            assert_eq!(unit.owed_by.as_deref(), Some("evidence_changed"), "{day}");
+        }
+    }
+
     /// Operator approval, 2026-09-30: once its morning has passed a briefing is a record
     /// of what the owner was told, and nothing regenerates it on its own.
     #[test]

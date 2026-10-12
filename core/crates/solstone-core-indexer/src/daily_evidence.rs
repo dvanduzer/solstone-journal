@@ -158,8 +158,27 @@ fn strict_text(path: &Path) -> Result<String, String> {
     Ok(text)
 }
 
+/// Day documents the journal derives for search, at `chronicle/<day>/<name>`.
+///
+/// ⛔ Not daily evidence: no daily hook's packet reads them, and they are rewritten
+/// from inputs that are not the day's own material. `location.md` is rebuilt from the
+/// phone location already in the day's segments whenever the bundled area names, the
+/// location-accuracy download, the owner's place names or its own wording change, and
+/// its first write backfills every past day that holds location. Counted as evidence,
+/// each of those re-owed every such day's outputs, however old (2.0.42's Suze burn-in).
+/// If a daily hook ever reads one, remove it here and bump
+/// [`SEMANTIC_EVIDENCE_VERSION`], which re-owes only the recent window.
+const DERIVED_DAY_DOCUMENTS: &[&str] = &["location.md"];
+
 fn output_path(rel: &str) -> bool {
     let parts = rel.split('/').collect::<Vec<_>>();
+    if let [day, name] = parts.as_slice()
+        && day.len() == 8
+        && day.bytes().all(|b| b.is_ascii_digit())
+        && DERIVED_DAY_DOCUMENTS.contains(name)
+    {
+        return true;
+    }
     let stem = Path::new(rel)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -941,6 +960,46 @@ mod tests {
         )
         .unwrap();
         assert_ne!(changed.revision_under(&old.contract), old.revision);
+    }
+
+    /// 2.0.42's first start wrote `location.md` into every past day holding phone
+    /// location, and every such day's outputs read as owed by changed evidence.
+    #[test]
+    fn the_derived_location_document_is_not_daily_evidence() {
+        let root = root("derived-location-document");
+        write(
+            &root,
+            "chronicle/20260910/talents/flow.md",
+            "# Flow\nMeeting.",
+        );
+        let names = ["schedule", "facet_newsletter", "entities:entity_observer"];
+        let before = names.map(|name| revision(&root, name, Some("work")));
+        for text in [
+            "# location on Thursday, September 10, 2026\n\n- readings near Golden, 14:00 to 14:09: 3 readings from your iphone.\n",
+            "# location on Thursday, September 10, 2026\n\n- a visit your iphone reported at a place you named.\n",
+        ] {
+            write(&root, "chronicle/20260910/location.md", text);
+            assert_eq!(
+                names.map(|name| revision(&root, name, Some("work"))),
+                before
+            );
+        }
+        assert!(
+            capture_day_sources(&root, "20260910")
+                .unwrap()
+                .iter()
+                .all(|chunk| chunk.path != "20260910/location.md")
+        );
+        // Control: the day's own material still moves every revision.
+        write(
+            &root,
+            "chronicle/20260910/talents/flow.md",
+            "# Flow\nAnother meeting.",
+        );
+        for (name, before) in names.iter().zip(before) {
+            assert_ne!(revision(&root, name, Some("work")), before, "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
