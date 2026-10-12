@@ -138,7 +138,11 @@ struct TalentHealthScan {
     failures: u64,
     degraded: u64,
     degraded_rows: Vec<(i64, Map<String, Value>)>,
+    /// Problems in files that may hold rows from the last 24h.
     problems: BTreeMap<String, Vec<String>>,
+    /// Problems in files not modified in the last 24h. Rows are appended when a
+    /// talent run ends, after its `ts`, so these files hold no row the counts read.
+    unchanged_problems: BTreeMap<String, Vec<String>>,
 }
 
 pub(crate) fn resolve_day(value: &str) -> Result<NaiveDate, HealthError> {
@@ -499,6 +503,25 @@ pub(crate) fn build_synthesis_health(
             None,
         ));
     }
+    if !scan.unchanged_problems.is_empty() {
+        let mut files = scan
+            .unchanged_problems
+            .keys()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if scan.unchanged_problems.len() > 10 {
+            files.push_str(&format!(" and {} more", scan.unchanged_problems.len() - 10));
+        }
+        notes.push(note(
+            "info",
+            "synthesis",
+            &format!("talent day-index logs unchanged in the last 24h could not be fully read: {files}; last-24h talent counts are unaffected."),
+            generated_at,
+            None,
+        ));
+    }
     let (failures, degraded) = if missing.is_empty() && scan.problems.is_empty() {
         for (_, row) in scan.degraded_rows.iter().take(10) {
             let degraded = row.get("degraded").and_then(Value::as_object);
@@ -601,87 +624,96 @@ fn scan_talent_indexes(talents: &Path, generated_at: i64) -> Result<TalentHealth
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_owned();
-        let contents = match fs::read(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                scan.problems
-                    .entry(filename)
-                    .or_default()
-                    .push("file vanished during scan".to_owned());
-                continue;
-            }
-            Err(error) => {
-                scan.problems
-                    .entry(filename)
-                    .or_default()
-                    .push(format!("unreadable file: {error}"));
-                continue;
-            }
-        };
-        let text = match String::from_utf8(contents) {
-            Ok(text) => text,
-            Err(_) => {
-                scan.problems
-                    .entry(filename)
-                    .or_default()
-                    .push("invalid UTF-8".to_owned());
-                continue;
-            }
-        };
-        for (line_number, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let row = match serde_json::from_str::<Value>(line) {
-                Ok(Value::Object(value)) => value,
-                Ok(_) => {
-                    scan.problems
-                        .entry(filename.clone())
-                        .or_default()
-                        .push(format!("line {}: non-object row", line_number + 1));
-                    continue;
-                }
-                Err(_) => {
-                    scan.problems
-                        .entry(filename.clone())
-                        .or_default()
-                        .push(format!("line {}: malformed JSON", line_number + 1));
-                    continue;
-                }
-            };
-            let Some(timestamp) = row.get("ts").and_then(Value::as_i64) else {
-                let detail = if row.contains_key("ts") {
-                    "non-integer ts"
-                } else {
-                    "missing ts"
-                };
-                scan.problems
-                    .entry(filename.clone())
-                    .or_default()
-                    .push(format!("line {}: {detail}", line_number + 1));
-                continue;
-            };
-            if timestamp < cutoff || timestamp > generated_at {
-                continue;
-            }
-            let succeeded = !row.contains_key("status")
-                || matches!(
-                    row.get("status").and_then(Value::as_str),
-                    Some("ok" | "completed")
-                );
-            if !succeeded {
-                scan.failures += 1;
-            }
-            if row.get("degraded").is_some_and(truthy) {
-                scan.degraded += 1;
-                scan.degraded_rows.push((timestamp, row));
-            }
+        let problems = scan_talent_index(&path, cutoff, generated_at, &mut scan);
+        if problems.is_empty() {
+            continue;
+        }
+        let unchanged = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|modified| i64::try_from(modified.as_millis()).ok())
+            .is_some_and(|modified| modified < cutoff);
+        if unchanged {
+            scan.unchanged_problems.insert(filename, problems);
+        } else {
+            scan.problems.insert(filename, problems);
         }
     }
     scan.degraded_rows
         .sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
     Ok(scan)
+}
+
+/// Scans one talent day index into the counts and returns what kept it from
+/// being fully read.
+fn scan_talent_index(
+    path: &Path,
+    cutoff: i64,
+    generated_at: i64,
+    scan: &mut TalentHealthScan,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            problems.push("file vanished during scan".to_owned());
+            return problems;
+        }
+        Err(error) => {
+            problems.push(format!("unreadable file: {error}"));
+            return problems;
+        }
+    };
+    let text = match String::from_utf8(contents) {
+        Ok(text) => text,
+        Err(_) => {
+            problems.push("invalid UTF-8".to_owned());
+            return problems;
+        }
+    };
+    for (line_number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let row = match serde_json::from_str::<Value>(line) {
+            Ok(Value::Object(value)) => value,
+            Ok(_) => {
+                problems.push(format!("line {}: non-object row", line_number + 1));
+                continue;
+            }
+            Err(_) => {
+                problems.push(format!("line {}: malformed JSON", line_number + 1));
+                continue;
+            }
+        };
+        let Some(timestamp) = row.get("ts").and_then(Value::as_i64) else {
+            let detail = if row.contains_key("ts") {
+                "non-integer ts"
+            } else {
+                "missing ts"
+            };
+            problems.push(format!("line {}: {detail}", line_number + 1));
+            continue;
+        };
+        if timestamp < cutoff || timestamp > generated_at {
+            continue;
+        }
+        let succeeded = !row.contains_key("status")
+            || matches!(
+                row.get("status").and_then(Value::as_str),
+                Some("ok" | "completed")
+            );
+        if !succeeded {
+            scan.failures += 1;
+        }
+        if row.get("degraded").is_some_and(truthy) {
+            scan.degraded += 1;
+            scan.degraded_rows.push((timestamp, row));
+        }
+    }
+    problems
 }
 
 fn build_consumer_signal_health(journal_root: &Path) -> Result<ConsumerSignalHealth, HealthError> {
@@ -1782,6 +1814,54 @@ mod tests {
         assert!(notes.iter().any(
             |note| note.severity == "warn" && note.message.contains("could not be fully read")
         ));
+    }
+
+    fn torn_talent_index(root: &Path, day: &str, modified: chrono::DateTime<Utc>) {
+        let path = root.join("talents").join(format!("{day}.jsonl"));
+        fs::write(
+            &path,
+            "{\"ts\":1,\"status\":\"ok\"}\n{\"ts\":2,\"pro{\"ts\":3,\"status\":\"ok\"}mpt\":\"x\"}\n",
+        )
+        .unwrap();
+        set_file_mtime(&path, FileTime::from_unix_time(modified.timestamp(), 0)).unwrap();
+    }
+
+    #[test]
+    fn torn_row_in_an_index_unchanged_for_a_day_keeps_last_24h_counts() {
+        let temporary = temporary();
+        healthy_talent_guards(temporary.path(), now());
+        talent_rows(
+            temporary.path(),
+            "20260410",
+            &[json!({"ts":now().timestamp_millis(),"status":"failed"})],
+        );
+        torn_talent_index(temporary.path(), "20260401", now() - Duration::days(9));
+        let (health, notes) =
+            build_synthesis_health(temporary.path(), &ScanAggregate::default(), now()).unwrap();
+        assert_eq!(health.talent_run_failures_24h, Some(1));
+        assert_eq!(health.talent_degraded_outputs_24h, Some(0));
+        let mentions = notes
+            .iter()
+            .filter(|note| note.message.contains("20260401.jsonl"))
+            .collect::<Vec<_>>();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].severity, "info");
+    }
+
+    #[test]
+    fn torn_row_in_an_older_day_index_changed_within_a_day_fails_closed() {
+        let temporary = temporary();
+        healthy_talent_guards(temporary.path(), now());
+        torn_talent_index(temporary.path(), "20260401", now() - Duration::hours(1));
+        let (health, notes) =
+            build_synthesis_health(temporary.path(), &ScanAggregate::default(), now()).unwrap();
+        assert_eq!(health.talent_run_failures_24h, None);
+        assert_eq!(health.talent_degraded_outputs_24h, None);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.severity == "warn" && note.message.contains("20260401.jsonl"))
+        );
     }
 
     #[test]
