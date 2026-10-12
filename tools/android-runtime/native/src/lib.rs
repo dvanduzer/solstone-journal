@@ -12,6 +12,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
+static SERVING: std::sync::Mutex<Option<journal_mobile_serving::MobileServing>> =
+    std::sync::Mutex::new(None);
+
+fn serving(root: &Path, command: &str) -> Result<Value, String> {
+    let command: Value = serde_json::from_str(command).map_err(|e| e.to_string())?;
+    let mut server = SERVING.lock().map_err(|_| "serving lock poisoned")?;
+    match command["op"].as_str().ok_or("serving op required")? {
+        "start" => {
+            if server.is_some() {
+                return Err("server already started".into());
+            }
+            let address = command["address"]
+                .as_str()
+                .ok_or("interface address required")?
+                .parse()
+                .map_err(|e: std::net::AddrParseError| e.to_string())?;
+            *server = Some(journal_mobile_serving::MobileServing::start_with_payload(
+                root.to_path_buf(),
+                address,
+                root.parent()
+                    .ok_or("app directory missing")?
+                    .join("journal-payload"),
+            )?);
+            Ok(server.as_ref().unwrap().status())
+        }
+        "stop" => {
+            *server = None;
+            Ok(json!({"stopped":true}))
+        }
+        "status" => Ok(server.as_ref().ok_or("server stopped")?.status()),
+        "index" => server.as_ref().ok_or("server stopped")?.index(),
+        "owner" => {
+            let response = server.as_ref().ok_or("server stopped")?.request_owner(
+                command["method"].as_str().ok_or("method required")?,
+                command["uri"].as_str().ok_or("uri required")?,
+                command["body"].as_str().unwrap_or(""),
+            )?;
+            Ok(json!({"status":response.status,"body":response.body}))
+        }
+        _ => Err("unknown serving operation".into()),
+    }
+}
 
 fn seed_mixed(root: &Path, turn: usize) -> Result<(), Box<dyn std::error::Error>> {
     // Synthetic fixture generation belongs only to this development harness.
@@ -248,6 +290,9 @@ fn run(root: &Path, op: &str, count: usize) -> Result<Value, Box<dyn std::error:
         CANCEL.store(false, Ordering::Release);
         return Ok(json!({"cancel_reset":true}));
     }
+    if let Some(command) = op.strip_prefix("serve:") {
+        return serving(root, command).map_err(Into::into);
+    }
     fs::create_dir_all(root)?;
     match op {
         "resources" => resources(root),
@@ -468,7 +513,9 @@ pub unsafe extern "C" fn journal_run(
     let value = match output {
         Ok(Ok(v)) => json!({"ok":true,"value":v}),
         Ok(Err(e)) => json!({"ok":false,"error":e}),
-        Err(_) => json!({"ok":false,"error":"native panic"}),
+        Err(panic) => {
+            json!({"ok":false,"error":format!("native panic: {}", panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("unknown payload"))})
+        }
     };
     CString::new(value.to_string()).unwrap().into_raw()
 }

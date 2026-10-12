@@ -7,7 +7,10 @@ SPL device door and index scanner inside an app-owned worker. The
 
 `MobileServing::start(root, address)` retains an admitted journal root and binds
 the device door to the supplied IPv4 interface and port. The app creates and
-owns that directory. Setup may withhold the door until the owner completes the
+owns that directory. Phone adapters use
+`MobileServing::start_with_payload(root, address, payload_root)` with the
+maintained `core/payload` files packaged by the app. The library validates the
+payload contracts and template directories before starting. Setup may withhold the door until the owner completes the
 existing mark, lock and finalize flow. `status()` reports the live address.
 `request_owner(method, path, body)` dispatches a request admitted by the app's
 private IPC; never forward network headers or public IPC into this method.

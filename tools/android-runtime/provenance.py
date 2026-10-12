@@ -8,7 +8,7 @@ import subprocess
 
 def source_manifest(repo):
     repo = pathlib.Path(repo)
-    scope = ['core', 'tools/android-runtime', 'rust-toolchain.toml', '.cargo']
+    scope = ['core', 'tools/android-runtime', 'tools/mobile-serving', 'rust-toolchain.toml', '.cargo']
     def git(*args):
         return subprocess.check_output(['git', *args], cwd=repo)
     names = git('ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', *scope)

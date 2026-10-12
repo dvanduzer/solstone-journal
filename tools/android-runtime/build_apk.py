@@ -27,6 +27,9 @@ with zipfile.ZipFile(unsigned,'a',compression=zipfile.ZIP_DEFLATED) as z:
   for native in sorted((root/'lib').rglob('*.so')): z.write(native,str(native.relative_to(root)))
   for asset in sorted((root/'assets').rglob('*')):
     if asset.is_file(): z.write(asset,str(asset.relative_to(root)))
+  payload=root.parents[1]/'core/payload'
+  for asset in sorted((payload/'solstone').rglob('*')):
+    if asset.is_file(): z.write(asset,'assets/journal-payload/'+str(asset.relative_to(payload)))
 aligned=build/'aligned.apk'; run([tools/'zipalign','-P','16','-f','4',unsigned,aligned])
 key=build/'debug-keystore.p12'
 if not key.exists(): run([java/'bin/keytool','-genkeypair','-keystore',key,'-storepass','android','-keypass','android','-alias','androiddebugkey','-keyalg','RSA','-keysize','2048','-validity','365','-dname','CN=Journal Development'])

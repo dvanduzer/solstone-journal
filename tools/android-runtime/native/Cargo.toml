@@ -10,6 +10,7 @@ license = "AGPL-3.0-only"
 crate-type = ["cdylib"]
 
 [dependencies]
+journal-mobile-serving = { path = "../../mobile-serving" }
 solstone-core-journal-io = { path = "../../../core/crates/solstone-core-journal-io", features = ["test-hooks"] }
 solstone-core-indexer-store = { path = "../../../core/crates/solstone-core-indexer-store" }
 solstone-core-indexer-query = { path = "../../../core/crates/solstone-core-indexer-query" }
