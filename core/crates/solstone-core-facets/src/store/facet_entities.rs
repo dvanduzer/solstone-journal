@@ -3,7 +3,7 @@
 
 //! Facet-scoped entity reads and write-owner operations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use chrono::{SecondsFormat, Utc};
@@ -503,6 +503,11 @@ pub struct PreparedReviewPromotion {
     pub identity: Option<solstone_core_entity::PreparedIdentityChange>,
     pub attachment: PreparedReviewAttachment,
     pub aliases: Option<solstone_core_entity::PreparedIdentityChange>,
+    /// The name and aliases the promoted entity answers to once this
+    /// promotion publishes, in resolution form. A later promotion in the
+    /// same batch cannot take one of them as an alias.
+    #[serde(skip)]
+    pub claims: BTreeSet<String>,
 }
 
 /// Owner state relevant to resolving one promotion name, captured alongside
@@ -545,6 +550,7 @@ pub fn review_promotion_snapshot(root: &Path, facet: &str, name: &str) -> Result
     Ok(json!({"identities":identities,"relationships":links}))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_review_promotion(
     root: &Path,
     facet: &str,
@@ -553,6 +559,7 @@ pub fn prepare_review_promotion(
     description: &str,
     aliases: &[String],
     batch_principal_taken: bool,
+    batch_claims: &BTreeMap<String, String>,
 ) -> Result<PreparedReviewPromotion, ReviewOwnerError> {
     let _facet = hold_facet_trust_lock(root).map_err(|e| e.to_string())?;
     let _entity = solstone_core_entity::hold_entity_trust_lock(root).map_err(|e| e.to_string())?;
@@ -749,6 +756,15 @@ pub fn prepare_review_promotion(
         }) {
             continue;
         }
+        // An earlier promotion in this batch is not in the facet yet, but it
+        // will be by the time this alias publishes, and publication refuses
+        // an alias another entity holds.
+        if batch_claims
+            .get(&query)
+            .is_some_and(|holder| *holder != entity_id)
+        {
+            continue;
+        }
         desired.insert(alias.clone());
     }
     if !desired.is_empty() {
@@ -774,6 +790,13 @@ pub fn prepare_review_promotion(
     } else {
         None
     };
+    let claims = std::iter::once(identity_name(&identity))
+        .chain(
+            identity_aliases(&identity)
+                .iter()
+                .map(|alias| normalize_resolution_query(alias)),
+        )
+        .collect();
     Ok(PreparedReviewPromotion {
         identity: identity_change,
         attachment: PreparedReviewAttachment {
@@ -786,6 +809,7 @@ pub fn prepare_review_promotion(
             adopt_folder,
         },
         aliases,
+        claims,
     })
 }
 

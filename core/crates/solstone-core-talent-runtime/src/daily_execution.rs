@@ -2708,4 +2708,150 @@ mod tests {
             .unwrap();
         assert_eq!(loaded_rec2.action_plan, Some(frozen_plan));
     }
+
+    /// Publishes one retained review response for people detected on two days.
+    fn publish_review_batch(
+        root: &Path,
+        names: &[&str],
+        promotions: Value,
+    ) -> (ExecutionContext, RuntimeOutcome, DailyUnitRecord) {
+        let context = ExecutionContext {
+            journal: root.join("journal"),
+        };
+        fs::create_dir_all(&context.journal).unwrap();
+        solstone_core_facets::create_facet(&context.journal, "work", "Work", "", "", "", None)
+            .unwrap();
+        let detected = names
+            .iter()
+            .map(|name| solstone_core_facets::DetectedEntityInput {
+                entity_type: "Person".to_owned(),
+                name: (*name).to_owned(),
+                description: "Collaborator.".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        for day in ["20260106", "20260107"] {
+            solstone_core_facets::upsert_detection_segment(
+                &context.journal,
+                "work",
+                day,
+                "090000_300",
+                &detected,
+            )
+            .unwrap();
+        }
+        let prepared = PreparedTalent {
+            name: "entities:entities_review".to_owned(),
+            config: json!({
+                "day":"20260108", "facet":"work", "type":"generate", "max_output_tokens":1024,
+                "prompt":"review", "model":"test-model", "provider":"test",
+                "hook":{"pre":"entities:entities_review", "post":"entities:entities_review"},
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let packet = crate::daily_prepare::freeze(prepared, &context).unwrap();
+        let identity =
+            DailyUnitIdentity::new("20260108", "entities:entities_review", Some("work".into()));
+        let mut record = DailyUnitRecord::new(identity.clone(), "E", "C");
+        record.lock_token = Some("attempt".to_owned());
+        record.packet_digest = Some(crate::daily_prepare::packet_digest(&packet));
+        record.frozen_packet = Some(packet);
+        record.generated_result =
+            Some(json!({"response":json!({"promotions":promotions,"merges":[]}).to_string()}));
+        save_daily_unit_record(&context.journal, &record).unwrap();
+        let outcome = execute(
+            json!({"name":"entities:entities_review","day":"20260108","facet":"work","lock_token":"attempt"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            &context,
+            &OneShotClient::at_path(root.join("no-model")),
+            &mut Vec::new(),
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        (context, outcome, record)
+    }
+
+    fn assert_every_action_committed(outcome: &RuntimeOutcome, record: &DailyUnitRecord) {
+        assert!(
+            matches!(outcome, RuntimeOutcome::Finished { .. }),
+            "expected the batch to publish, got {outcome:?}"
+        );
+        assert_eq!(record.status, DailyUnitStatus::Committed);
+        let plan: PreparedDailyPublication =
+            serde_json::from_value(record.action_plan.clone().unwrap()).unwrap();
+        let owner_actions = record
+            .receipts
+            .iter()
+            .filter(|receipt| receipt["kind"] == "owner_action")
+            .collect::<Vec<_>>();
+        assert_eq!(owner_actions.len(), plan.actions.len());
+        assert!(
+            owner_actions
+                .iter()
+                .all(|receipt| receipt["state"] == "committed")
+        );
+    }
+
+    fn aliases_of(journal: &Path, entity_id: &str) -> Vec<String> {
+        solstone_core_entity::read_entity_identity(journal, entity_id)
+            .unwrap()
+            .unwrap()
+            .value()
+            .get("aka")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_later_promotion_skips_an_alias_an_earlier_promotion_names() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, outcome, record) = publish_review_batch(
+            root.path(),
+            &["Ali", "Alice Smith"],
+            json!([
+                {"name":"Ali", "description":"Designer.", "promote":true, "aliases":[]},
+                {"name":"Alice Smith", "description":"Engineer.", "promote":true,
+                    "aliases":["Ali", "Ally"]},
+            ]),
+        );
+        assert_every_action_committed(&outcome, &record);
+        let attached = solstone_core_facets::list_scoped_facet_entities(
+            &context.journal,
+            "work",
+            false,
+            false,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entity| entity.entity_id)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert!(attached.contains("ali") && attached.contains("alice_smith"));
+        assert_eq!(aliases_of(&context.journal, "alice_smith"), ["Ally"]);
+    }
+
+    #[test]
+    fn two_promotions_sharing_an_alias_give_it_to_the_first() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, outcome, record) = publish_review_batch(
+            root.path(),
+            &["Alice Smith", "Alan Shore"],
+            json!([
+                {"name":"Alice Smith", "description":"Engineer.", "promote":true,
+                    "aliases":["AS"]},
+                {"name":"Alan Shore", "description":"Counsel.", "promote":true,
+                    "aliases":["as", "Shore"]},
+            ]),
+        );
+        assert_every_action_committed(&outcome, &record);
+        assert_eq!(aliases_of(&context.journal, "alice_smith"), ["AS"]);
+        assert_eq!(aliases_of(&context.journal, "alan_shore"), ["Shore"]);
+    }
 }
