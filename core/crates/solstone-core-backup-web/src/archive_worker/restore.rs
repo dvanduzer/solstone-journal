@@ -31,7 +31,7 @@ use {
     solstone_core_backup_runtime::ClosedToolError,
     solstone_core_backup_runtime::resolve::resolve_restic_member,
     solstone_core_journal_io::JournalRoot,
-    solstone_core_retention::archive_catalog::read_complete_catalog,
+    solstone_core_offload::restore::selected_repository as repository,
     std::{path::PathBuf, thread::JoinHandle},
 };
 
@@ -115,39 +115,6 @@ fn refuse(reason: &str) -> axum::response::Response {
         reason,
         "",
     )
-}
-
-/// The repository bound files name, or `None` when only historical files without
-/// one are selected; those are reviewed against the configured repository.
-#[cfg(target_os = "linux")]
-fn repository(root: &Arc<JournalRoot>, day: Option<&str>) -> Result<Option<String>, &'static str> {
-    let catalog = read_complete_catalog(root).map_err(|_| "ledger_degraded")?;
-    let mut selected = None;
-    let mut unbound = false;
-    for witness in catalog
-        .days
-        .iter()
-        .filter(|entry| day.is_none_or(|day| entry.day == day))
-        .flat_map(|entry| &entry.segments)
-        .flat_map(|segment| &segment.active)
-    {
-        let Some(candidate) = witness.repository_id.as_deref() else {
-            unbound = true;
-            continue;
-        };
-        if candidate.is_empty() {
-            return Err("archive_unbound");
-        }
-        if selected.is_some_and(|id| id != candidate) {
-            return Err("repository_mismatch");
-        }
-        selected = Some(candidate);
-    }
-    match selected {
-        Some(id) => Ok(Some(id.to_owned())),
-        None if unbound => Ok(None),
-        None => Err("nothing_to_restore"),
-    }
 }
 
 /// Reserve the original input before an installed restore worker can start.

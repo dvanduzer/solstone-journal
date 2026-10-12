@@ -3,6 +3,7 @@
 
 //! Native media-offload runtime authorities.
 
+pub mod cli_restore;
 pub mod cli_run;
 pub mod ledger;
 pub mod marks;

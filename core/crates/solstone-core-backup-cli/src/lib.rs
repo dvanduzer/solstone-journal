@@ -35,7 +35,9 @@ use solstone_core_offload::{
     status::build_checked_offload_status,
 };
 
+mod owned_restore;
 mod owned_teardown;
+pub use owned_restore::OwnedRestoreCliOutcome;
 pub use owned_teardown::OwnedTeardownCliRun;
 
 pub const USAGE: &str = "usage: solstone journal backup <command> [options]\n";
@@ -68,6 +70,7 @@ impl std::fmt::Debug for CliRun {
 pub enum CliOutcome {
     Rendered(CliRun),
     Offload(Box<OwnedOffloadCliRun>),
+    Restore(Box<OwnedRestoreCliOutcome>),
     Teardown(Box<OwnedTeardownCliRun>),
 }
 impl CliOutcome {
@@ -75,6 +78,7 @@ impl CliOutcome {
         match self {
             Self::Rendered(run) => (&run.stdout, &run.stderr, run.exit_code),
             Self::Offload(run) => run.output(),
+            Self::Restore(run) => run.output(),
             Self::Teardown(run) => run.output(),
         }
     }
@@ -91,7 +95,50 @@ pub fn run_cli(args: &[String], journal: &Path) -> CliOutcome {
     if owned_teardown_options(args) {
         return CliOutcome::Teardown(Box::new(owned_teardown::run(journal)));
     }
+    if let Some((day, json_output)) = owned_restore_options(args) {
+        return CliOutcome::Restore(Box::new(owned_restore::run(
+            journal,
+            day.as_deref(),
+            json_output,
+        )));
+    }
     CliOutcome::Rendered(run_rendered_cli(args, journal))
+}
+
+/// A well-formed `offload restore` on a platform where the owned restore runs.
+/// Anything else keeps the rendered path and its usage and selection answers.
+fn owned_restore_options(args: &[String]) -> Option<(Option<String>, bool)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let args = normalize_global_flags(args);
+    if has_help(&args) {
+        return None;
+    }
+    let options = args.strip_prefix(&["offload".into(), "restore".into()])?;
+    let (flags, positionals) = split_terminator(options);
+    let mut json_output = false;
+    let mut all = false;
+    let mut day = None;
+    for argument in flags {
+        match argument.as_str() {
+            "--json" => json_output = true,
+            "--all" => all = true,
+            option if option.starts_with('-') => return None,
+            _ if day.is_none() => day = Some(argument.clone()),
+            _ => return None,
+        }
+    }
+    for argument in positionals {
+        if day.replace(argument.clone()).is_some() {
+            return None;
+        }
+    }
+    match (all, day) {
+        (true, None) => Some((None, json_output)),
+        (false, Some(day)) if valid_day(&day) => Some((Some(day), json_output)),
+        _ => None,
+    }
 }
 
 fn owned_teardown_options(args: &[String]) -> bool {
@@ -1455,7 +1502,13 @@ fn offload_restore_failure_reason(reason: &str) -> String {
         "nothing_to_restore" => "there was nothing offloaded to restore".into(),
         "repo_missing" => "there's no backup at the destination yet".into(),
         "restic_unavailable" => "the restic backup program isn't available".into(),
+        "restore_conflict" => "a different file is already where at least one of these files \
+             belongs, so the file already there was kept and the backup copy wasn't restored"
+            .into(),
         "restore_held" => "restoring offloaded files is temporarily unavailable".into(),
+        "restore_not_published" => "at least one file couldn't be put back in your journal this \
+             time and nothing was put in its place, so try again later"
+            .into(),
         "rclone_unavailable" => "the rclone program isn't available".into(),
         "segment_identity" => "one of your journal's recordings couldn't be verified against \
              its own identity record"
@@ -2094,7 +2147,9 @@ mod tests {
             "nothing_to_restore",
             "repo_missing",
             "restic_unavailable",
+            "restore_conflict",
             "restore_held",
+            "restore_not_published",
             "rclone_unavailable",
             "segment_identity",
             "segment_missing",

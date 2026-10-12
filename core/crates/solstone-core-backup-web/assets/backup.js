@@ -258,7 +258,9 @@
         "missing_file_after_restore": "media restore finished, but a file was still missing.",
         "nothing_to_restore": "nothing to restore for that day.",
         "repo_missing": "encrypted backup could not find the repository.",
+        "restore_conflict": "a different file is already where some of this media belongs, so the file already there was kept and the backup copy wasn't restored.",
         "restore_held": "restoring offloaded files is temporarily unavailable.",
+        "restore_not_published": "some media couldn't be put back in your journal this time and nothing was put in its place, so try again later.",
         "segment_missing": "that day is no longer available locally.",
         "timeout": "media restore took too long. try again later.",
         "verification_failed": "restored media did not match the backup checksum."

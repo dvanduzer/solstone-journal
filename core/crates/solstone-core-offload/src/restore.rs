@@ -20,7 +20,7 @@ use solstone_core_retention::archive_catalog::{SegmentCatalog, read_complete_cat
 pub const RESTORE_RESERVE_BYTES: u64 = 1_000_000_000;
 pub const OFFLOAD_RESTORE_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
 pub const OFFLOAD_RESTORE_STATUSES: [&str; 5] = ["ok", "no_op", "refused", "degraded", "error"];
-pub const OFFLOAD_RESTORE_REASONS: [&str; 22] = [
+pub const OFFLOAD_RESTORE_REASONS: [&str; 24] = [
     "archive_unbound",
     "auth_failed",
     "backup_not_ready",
@@ -36,7 +36,9 @@ pub const OFFLOAD_RESTORE_REASONS: [&str; 22] = [
     "nothing_to_restore",
     "repo_missing",
     "restic_unavailable",
+    "restore_conflict",
     "restore_held",
+    "restore_not_published",
     "rclone_unavailable",
     "segment_identity",
     "segment_missing",
@@ -221,6 +223,42 @@ fn run(journal: &Path, scope: &str, day: Option<&str>) -> RestoreResult {
             .with_reason_detail(error.to_string());
     }
     result
+}
+
+/// The repository the selected bound files name, or `None` when only historical
+/// files without one are selected; those are reviewed against the configured
+/// repository at admission.
+pub fn selected_repository(
+    root: &Arc<JournalRoot>,
+    day: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let catalog = read_complete_catalog(root).map_err(|_| "ledger_degraded")?;
+    let mut selected = None;
+    let mut unbound = false;
+    for witness in catalog
+        .days
+        .iter()
+        .filter(|entry| day.is_none_or(|day| entry.day == day))
+        .flat_map(|entry| &entry.segments)
+        .flat_map(|segment| &segment.active)
+    {
+        let Some(candidate) = witness.repository_id.as_deref() else {
+            unbound = true;
+            continue;
+        };
+        if candidate.is_empty() {
+            return Err("archive_unbound");
+        }
+        if selected.is_some_and(|id| id != candidate) {
+            return Err("repository_mismatch");
+        }
+        selected = Some(candidate);
+    }
+    match selected {
+        Some(id) => Ok(Some(id.to_owned())),
+        None if unbound => Ok(None),
+        None => Err("nothing_to_restore"),
+    }
 }
 
 pub fn restore_offload_day(
