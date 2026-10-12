@@ -317,6 +317,12 @@ mod tests {
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
+    /// Deadline for an acquisition the test expects to succeed. A loaded
+    /// Windows runner can take well over 100 ms to create and lock the first
+    /// files of a fresh admission root at test-binary start
+    /// (winci-overnight-261012-j42-b1); only the expected-timeout probes stay short.
+    const ACQUIRE_DEADLINE: Duration = Duration::from_secs(5);
+
     fn root() -> PathBuf {
         let suffix = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -337,7 +343,7 @@ mod tests {
         let first = acquire_local_slot(
             &root,
             2,
-            Some(Duration::from_millis(50)),
+            Some(ACQUIRE_DEADLINE),
             false,
             WorkPriority::default(),
         )
@@ -345,7 +351,7 @@ mod tests {
         let second = acquire_local_slot(
             &root,
             2,
-            Some(Duration::from_millis(50)),
+            Some(ACQUIRE_DEADLINE),
             false,
             WorkPriority::default(),
         )
@@ -365,7 +371,7 @@ mod tests {
         let replacement = acquire_local_slot(
             &root,
             2,
-            Some(Duration::from_millis(50)),
+            Some(ACQUIRE_DEADLINE),
             false,
             WorkPriority::default(),
         )
@@ -384,7 +390,7 @@ mod tests {
         let permit = acquire_local_slot(
             &root,
             1,
-            Some(Duration::from_millis(100)),
+            Some(ACQUIRE_DEADLINE),
             false,
             WorkPriority::default(),
         )
@@ -405,7 +411,7 @@ mod tests {
         let exclusive = acquire_local_slot(
             &root,
             2,
-            Some(Duration::from_millis(50)),
+            Some(ACQUIRE_DEADLINE),
             true,
             WorkPriority::default(),
         )
@@ -425,7 +431,7 @@ mod tests {
         let normal = acquire_local_slot(
             &root,
             2,
-            Some(Duration::from_millis(50)),
+            Some(ACQUIRE_DEADLINE),
             false,
             WorkPriority::default(),
         )
@@ -433,7 +439,7 @@ mod tests {
         let concurrent = acquire_local_slot(
             &root,
             2,
-            Some(Duration::from_millis(50)),
+            Some(ACQUIRE_DEADLINE),
             false,
             WorkPriority::default(),
         )
@@ -482,7 +488,7 @@ mod tests {
         let held = acquire_local_slot(
             &root,
             1,
-            Some(Duration::from_millis(50)),
+            Some(ACQUIRE_DEADLINE),
             false,
             WorkPriority::default(),
         )
