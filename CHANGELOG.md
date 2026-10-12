@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- when your journal's thinking runs on a local model, on confidential processing or at your own endpoint, it now settles which kind of app is in a screen frame consistently, rather than sometimes landing on a different kind for the same frame. that choice decides what it reads in detail.
 - when a 5 minute recording of a screen comes down to a single frame, your journal no longer asks the thinking model which frames to read in detail, so it spends fewer tokens. what it keeps is the same.
 
 ### Fixed
