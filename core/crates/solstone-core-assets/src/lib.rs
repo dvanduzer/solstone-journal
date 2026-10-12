@@ -317,8 +317,20 @@ static ARTIFACTS: &[Artifact] = &[
     },
     // Location accuracy: built by scripts/build_location_accuracy_packs.py from
     // the Overture Maps release named in `version`, and fetched only when the
-    // owner chooses it in the map app. The containment file joins this unit
-    // once its publication is cleared.
+    // owner chooses it in the map app.
+    Artifact {
+        unit: "location-accuracy",
+        version: "overture-2026-09-23.1-r2",
+        filename: "containment.slpk",
+        sha256: "0f8f4c7270c5938ebd395e1a879a9b23ce265db10af952a0af1f79682f319063",
+        size_bytes: 993757214,
+        upstream_url: "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/release/2026-09-23.1/",
+        origin_key: "assets/location-accuracy/overture-2026-09-23.1-r2/containment.slpk",
+        artifact_key: None,
+        platform: None,
+        backend: None,
+        extracted_binary_sha256: None,
+    },
     Artifact {
         unit: "location-accuracy",
         version: "overture-2026-09-23.1-r2",

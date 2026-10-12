@@ -22,7 +22,7 @@ const MAGIC: &[u8; 4] = b"SLPK";
 const FORMAT_VERSION: u16 = 1;
 const MAX_ZOOM: u32 = 16;
 const DIRECTORY_ENTRY: usize = 20;
-const CACHED_BLOCKS: usize = 48;
+const CACHED_BLOCKS: usize = 256;
 const METRES_PER_DEGREE: f64 = 111_195.0;
 
 /// A pack could not be read.
@@ -207,9 +207,21 @@ pub fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * 6_371_008.8 * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
+/// An outline's header, kept per cached block; its geometry stays encoded
+/// in the block until a lookup needs it.
+struct FeatureHead {
+    class: usize,
+    name: String,
+    bounds: [f64; 4],
+    geometry: std::ops::Range<usize>,
+}
+
 enum Block {
     Venues(Vec<Venue>),
-    Features(Vec<Feature>),
+    Features {
+        raw: Vec<u8>,
+        heads: Vec<FeatureHead>,
+    },
 }
 
 enum Source {
@@ -468,7 +480,10 @@ impl Pack {
         let raw = self.read_raw(offset, size)?;
         let block = Arc::new(match self.kind {
             PackKind::Venues => Block::Venues(self.parse_venues(&raw)?),
-            PackKind::Containment => Block::Features(self.parse_features(&raw)?),
+            PackKind::Containment => {
+                let heads = self.parse_heads(&raw)?;
+                Block::Features { raw, heads }
+            }
         });
         let mut cache = self
             .cache
@@ -519,56 +534,77 @@ impl Pack {
         Ok(venues)
     }
 
-    fn parse_features(&self, raw: &[u8]) -> Result<Vec<Feature>, PackError> {
+    /// Read each outline's class, name and bounds, and step over its
+    /// geometry without decoding it.
+    fn parse_heads(&self, raw: &[u8]) -> Result<Vec<FeatureHead>, PackError> {
         let mut cursor = Cursor::new(raw);
         let count = cursor.count()?;
-        let mut features = Vec::with_capacity(count);
+        let mut heads = Vec::with_capacity(count);
         for _ in 0..count {
-            let class = self
-                .header
-                .classes
-                .get(cursor.count()?)
-                .ok_or_else(|| malformed("unknown class"))?;
-            let layer = Layer::parse(&class[0]).ok_or_else(|| malformed("unknown layer"))?;
+            let class = cursor.count()?;
+            if class >= self.header.classes.len() {
+                return Err(malformed("unknown class"));
+            }
             let name = cursor.text()?;
             let mut bounds = [0.0; 4];
             for value in &mut bounds {
                 *value = degrees(cursor.zigzag()?);
             }
-            let polygon_count = cursor.count()?;
-            let mut polygons = Vec::with_capacity(polygon_count);
-            for _ in 0..polygon_count {
-                let ring_count = cursor.count()?;
-                let mut rings = Vec::with_capacity(ring_count);
-                for _ in 0..ring_count {
-                    let points = cursor.count()?;
-                    let mut ring = Vec::with_capacity(points);
-                    let (mut longitude, mut latitude) = (0i64, 0i64);
-                    for _ in 0..points {
-                        longitude += cursor.zigzag()?;
-                        latitude += cursor.zigzag()?;
-                        ring.push([degrees(longitude), degrees(latitude)]);
+            let start = cursor.at;
+            for _ in 0..cursor.count()? {
+                for _ in 0..cursor.count()? {
+                    for _ in 0..cursor.count()? {
+                        cursor.varint()?;
+                        cursor.varint()?;
                     }
-                    rings.push(ring);
                 }
-                polygons.push(rings);
             }
-            features.push(Feature {
-                layer,
-                subtype: class[1].clone(),
-                class: class[2].clone(),
+            heads.push(FeatureHead {
+                class,
                 name,
                 bounds,
-                polygons,
-                tolerance_m: self
-                    .header
-                    .tolerance_m
-                    .get(layer.as_str())
-                    .copied()
-                    .unwrap_or(0.0),
+                geometry: start..cursor.at,
             });
         }
-        Ok(features)
+        Ok(heads)
+    }
+
+    fn feature(&self, raw: &[u8], head: &FeatureHead) -> Result<Feature, PackError> {
+        let class = &self.header.classes[head.class];
+        let layer = Layer::parse(&class[0]).ok_or_else(|| malformed("unknown layer"))?;
+        let mut cursor = Cursor::new(&raw[head.geometry.clone()]);
+        let polygon_count = cursor.count()?;
+        let mut polygons = Vec::with_capacity(polygon_count);
+        for _ in 0..polygon_count {
+            let ring_count = cursor.count()?;
+            let mut rings = Vec::with_capacity(ring_count);
+            for _ in 0..ring_count {
+                let points = cursor.count()?;
+                let mut ring = Vec::with_capacity(points);
+                let (mut longitude, mut latitude) = (0i64, 0i64);
+                for _ in 0..points {
+                    longitude += cursor.zigzag()?;
+                    latitude += cursor.zigzag()?;
+                    ring.push([degrees(longitude), degrees(latitude)]);
+                }
+                rings.push(ring);
+            }
+            polygons.push(rings);
+        }
+        Ok(Feature {
+            layer,
+            subtype: class[1].clone(),
+            class: class[2].clone(),
+            name: head.name.clone(),
+            bounds: head.bounds,
+            polygons,
+            tolerance_m: self
+                .header
+                .tolerance_m
+                .get(layer.as_str())
+                .copied()
+                .unwrap_or(0.0),
+        })
     }
 
     fn query_box(latitude: f64, longitude: f64, radius_m: f64) -> [f64; 4] {
@@ -625,16 +661,17 @@ impl Pack {
         let mut found: Vec<Feature> = Vec::new();
         for index in self.blocks_touching(west, south, east, north) {
             let block = self.block(index)?;
-            let Block::Features(features) = block.as_ref() else {
+            let Block::Features { raw, heads } = block.as_ref() else {
                 continue;
             };
-            for feature in features {
-                let [f_west, f_south, f_east, f_north] = feature.bounds;
+            for head in heads {
+                let [f_west, f_south, f_east, f_north] = head.bounds;
                 if west < f_west || east > f_east || south < f_south || north > f_north {
                     continue;
                 }
+                let feature = self.feature(raw, head)?;
                 if feature.contains_disc(latitude, longitude, radius_m) {
-                    found.push(feature.clone());
+                    found.push(feature);
                 }
             }
         }

@@ -636,6 +636,7 @@ mod tests {
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-x64.tar.gz",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/containment.slpk",
         "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
         "assets/parakeet-model/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q8_0.gguf",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-cpu-x64.tar.gz",
@@ -647,6 +648,7 @@ mod tests {
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-arm64.tar.gz",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/containment.slpk",
         "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
         "assets/parakeet-model/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q8_0.gguf",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-cpu-arm64.tar.gz",
@@ -658,6 +660,7 @@ mod tests {
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-macos-arm64.tar.gz",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/containment.slpk",
         "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
         "assets/parakeet-coreml/aed02740059203c4a87495924f685de3722ae9ce/Decoder.mlmodelc/analytics/coremldata.bin",
         "assets/parakeet-coreml/aed02740059203c4a87495924f685de3722ae9ce/Decoder.mlmodelc/coremldata.bin",
@@ -687,6 +690,7 @@ mod tests {
     const ORACLE_WINDOWS_X86_64: &[&str] = &[
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
+        "assets/location-accuracy/overture-2026-09-23.1-r2/containment.slpk",
         "assets/location-accuracy/overture-2026-09-23.1-r2/venues.slpk",
     ];
 

@@ -3,7 +3,8 @@
 The optional "location accuracy" download is two files an owner fetches from
 the update origin when they choose it in the map app. They are not bundled with
 the journal and are not in this directory; only their pins are in the source
-(`solstone-core-assets` catalog unit `location-accuracy`).
+(`solstone-core-assets` catalog unit `location-accuracy`, version
+`overture-2026-09-23.1-r2`, both files).
 
 - `venues.slpk`: named places from Overture Maps Places, with name, category,
   confidence and position. Kept: confidence of at least 0.5, not permanently
