@@ -15,6 +15,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - some long conversations you imported from ChatGPT, Claude, Gemini or a text file were never read. your journal kept waiting on them, so that day's daily results never finished, and nothing said why. they're now read like any other conversation, and when a day's daily results can't finish, your journal's log names the recordings or conversations holding it up.
+- on linux, media offload could stop proposing anything to move into your backup when one screen or audio recording had a long description or transcript. that no longer stops it.
 - on mac and windows, turning on encrypted backup operated by sol pbc and restoring your journal from it work again. since 2.0.41 both stopped as soon as they started.
 - on mac, you can turn off and delete encrypted backup operated by sol pbc again. as on linux, your journal won't delete it while your backup holds the only copy of some of your media.
 - on linux and mac, you can turn off and delete a backup you set up in your own storage again. your journal deletes every snapshot in it, but not while your backup holds the only copy of some of your media. if your storage may keep deleted files anyway, for example when versioning or object lock is on, or a B2 bucket has no rule that removes hidden files, your journal says so, and also says when it couldn't check.

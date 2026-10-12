@@ -29,24 +29,25 @@
 //!
 //! ⚠ A truncated final line cannot parse, so exceeding the bound can only lose
 //! evidence, never manufacture it.
+//!
+//! Each of the two rows is judged on its own bytes ([`read_leading_rows`]): a
+//! character cut by the bound, or anything past the second row, never refuses
+//! or hides them. Bytes in those two rows that are not UTF-8 still refuse a
+//! checked observation, and still yield no evidence to a path scan.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 
-use serde_json::Value;
 use solstone_core_journal_io::journal_root::JournalEntryKind;
 use solstone_core_journal_io::media::{MediaDirectory, MediaEntry};
 use solstone_core_journal_io::paths::{DirEntryKind, list_dir_entries};
-use solstone_core_processing_record::{analysis_row_key, vocab};
+use solstone_core_processing_record::{LeadingRow, analysis_row_key, read_leading_rows, vocab};
 
 use crate::content::{ContentName, HandlerRegistry, MediaClassifier};
 use crate::eligibility::{FoundContent, SidecarFacts};
-
-/// The record key a sidecar header carries.
-const RECORD_KEY: &str = "_solstone_processing";
 
 /// The extension every sidecar wears.
 const SIDECAR_EXTENSION: &str = "jsonl";
@@ -66,28 +67,13 @@ pub fn sidecar_name(content: &ContentName) -> Option<String> {
     Some(format!("{stem}.{SIDECAR_EXTENSION}"))
 }
 
-/// The first two non-blank lines of a file, within a fixed byte budget.
-fn first_two_rows(path: &Path) -> Vec<String> {
-    let Ok(mut file) = File::open(path) else {
-        return Vec::new();
-    };
-    let mut buffer = Vec::new();
-    if file
-        .by_ref()
-        .take(READ_BOUND)
-        .read_to_end(&mut buffer)
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Ok(text) = std::str::from_utf8(&buffer) else {
-        return Vec::new();
-    };
-    text.split('\n')
-        .filter(|line| !line.trim().is_empty())
-        .take(2)
-        .map(str::to_owned)
-        .collect()
+/// The first two nonblank rows of a file, within a fixed byte budget.
+///
+/// `None` when the file cannot be read, or those rows are not UTF-8.
+fn first_two_rows(path: &Path, marker_key: Option<&str>) -> Option<Vec<LeadingRow>> {
+    let file = File::open(path).ok()?;
+    let rows = read_leading_rows(BufReader::new(file.take(READ_BOUND)), marker_key).ok()?;
+    (!rows.contains(&LeadingRow::NotUtf8)).then_some(rows)
 }
 
 /// Read one sidecar into the facts the predicate needs.
@@ -95,29 +81,22 @@ fn first_two_rows(path: &Path) -> Vec<String> {
 /// `marker_key` is the row key that proves this modality's analysis rows exist;
 /// `None` means no handler claims the content, so no row can prove anything.
 pub fn read_sidecar(path: &Path, marker_key: Option<&str>) -> SidecarFacts {
-    sidecar_facts(&first_two_rows(path), marker_key)
+    first_two_rows(path, marker_key)
+        .map(|rows| sidecar_facts(&rows, marker_key))
+        .unwrap_or_default()
 }
 
-fn sidecar_facts(rows: &[String], marker_key: Option<&str>) -> SidecarFacts {
-    let header = rows
-        .first()
-        .and_then(|line| serde_json::from_str::<Value>(line).ok());
-    let record = header
-        .as_ref()
-        .and_then(|row| row.get(RECORD_KEY))
-        .filter(|value| value.is_object())
-        .cloned();
+fn sidecar_facts(rows: &[LeadingRow], marker_key: Option<&str>) -> SidecarFacts {
+    let record = match rows.first() {
+        Some(LeadingRow::Object { record, .. }) => record.clone(),
+        _ => None,
+    };
 
     // ⛔ Row 1 is the header and is never consulted for the marker key. See the
     // module note: a stray key there would make a header-only file look
     // chunk-bearing.
-    let has_analysis_row = match (marker_key, rows.get(1)) {
-        (Some(key), Some(line)) => serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|row| row.as_object().map(|row| row.contains_key(key)))
-            .unwrap_or(false),
-        _ => false,
-    };
+    let has_analysis_row = marker_key.is_some()
+        && matches!(rows.get(1), Some(LeadingRow::Object { has_key: true, .. }));
 
     SidecarFacts {
         record,
@@ -219,13 +198,10 @@ fn checked_sidecar(path: &Path, marker: Option<&str>) -> io::Result<SidecarFacts
 }
 
 fn checked_sidecar_facts(buffer: &[u8], marker: Option<&str>) -> io::Result<SidecarFacts> {
-    let text = std::str::from_utf8(buffer).map_err(|_| invalid_observation())?;
-    let rows = text
-        .split('\n')
-        .filter(|line| !line.trim().is_empty())
-        .take(2)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let rows = read_leading_rows(buffer, marker)?;
+    if rows.contains(&LeadingRow::NotUtf8) {
+        return Err(invalid_observation());
+    }
     Ok(sidecar_facts(&rows, marker))
 }
 
