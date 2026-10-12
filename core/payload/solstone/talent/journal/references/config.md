@@ -187,7 +187,7 @@ The `describe` block configures screen analysis settings for `solstone journal d
 ```
 
 **Fields:**
-- `max_extractions` (integer) – Maximum number of frames to run detailed content extraction on per video. The first qualified frame is always extracted regardless of this limit. When more frames are eligible, selection uses AI-based prioritization (falling back to random selection). Default: `20`.
+- `max_extractions` (integer) – About how many frames to run detailed content extraction on per video; each screen is its own video. Whenever a video has more than one frame, a model chooses which, aiming for about this many: it may pick fewer, or up to twice as many. The first qualified frame is always kept. Default: `20`.
 - `categories` (object) – Per-category overrides for importance and extraction guidance.
 - `scene_cut_threshold` (integer) – Scene-change sensitivity for screen frame analysis. Frames at or above this perceptual-distance threshold bypass the stride floor. Default: `25`.
 - `min_stride_seconds` (number) – Minimum seconds between analyzed frames when the frame is not a scene cut. Default: `5.0`.
@@ -202,10 +202,10 @@ Each category (e.g., `code`, `meeting`, `browsing`, `social`) can have:
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `importance` | `high`, `normal`, `low`, `ignore` | Advisory priority hint for AI frame selection. `high` prioritizes these frames, `low` deprioritizes unless unique, `ignore` suggests skipping unless categorization seems wrong. Default: `normal`. |
+| `importance` | `high`, `normal`, `low`, `ignore` | How a category's frames are treated when choosing what to read in detail. `high` and `normal` have no cap of their own, and `high` is listed first to the selection model. Each `low` category keeps at most two frames per video where it is the main category; as a second category beside another it is still read. `ignore` is never read in detail, as the main category or a second one beside it; its frames are still categorized and described. Default: `normal`. |
 | `extraction` | string | Custom guidance for when to extract content from this category. Overrides the default from the category's `.md` frontmatter. |
 
-Importance levels are advisory hints passed to the AI selection process, not hard filters. The AI may still select frames from `ignore` categories if it determines the content is valuable or the categorization may be incorrect.
+`low` and `ignore` apply after the selection model answers, so the model cannot override them. The first frame of each video is always kept for context, but an `ignore` category on it is still not read in detail.
 
 ## Providers configuration
 

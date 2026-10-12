@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::extraction;
 use crate::hash::format_dhash;
+use crate::selection::CategoryOverride;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExistingDescribeRow {
@@ -84,6 +85,7 @@ pub(crate) fn build_incremental_merge_plan(
     current_first_hash: Option<u64>,
     current_last_hash: Option<u64>,
     current_qualified_count: usize,
+    overrides: &BTreeMap<String, CategoryOverride>,
 ) -> Option<IncrementalMergePlan> {
     let artifact = artifact?;
     let rows = artifact.rows.as_ref()?;
@@ -140,7 +142,7 @@ pub(crate) fn build_incremental_merge_plan(
             continue;
         }
 
-        let expected = extraction::categories_for_analysis(analysis)
+        let expected = extraction::categories_for_analysis(analysis, overrides)
             .into_iter()
             .map(|category| category.name)
             .collect::<BTreeSet<_>>();
@@ -179,7 +181,7 @@ pub(crate) fn build_incremental_merge_plan(
 
 #[cfg(all(test, feature = "full-tests"))]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
     use serde_json::{Value, json};
@@ -229,6 +231,7 @@ mod tests {
             Some(FIRST_HASH),
             Some(LAST_HASH),
             1,
+            &BTreeMap::new(),
         )
     }
 
@@ -253,6 +256,7 @@ mod tests {
                 Some(FIRST_HASH),
                 None,
                 1,
+                &BTreeMap::new(),
             )
             .is_some()
         );
@@ -368,6 +372,7 @@ mod tests {
                     first_hash,
                     Some(LAST_HASH),
                     current_count,
+                    &BTreeMap::new(),
                 )
                 .is_none(),
                 "{name}"

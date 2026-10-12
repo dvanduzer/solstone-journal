@@ -67,6 +67,11 @@ pub fn select(
     max_extractions: u32,
     overrides: &BTreeMap<String, CategoryOverride>,
 ) -> Result<Vec<u64>, SelectionError> {
+    // With one categorized frame every answer, fallback and refusal resolves to
+    // that frame through the first-frame anchor, so there is nothing to ask.
+    if frames.len() == 1 {
+        return Ok(finalize_selection(Vec::new(), frames, overrides));
+    }
     let request = request(frames, max_extractions, overrides);
     session
         .submit(request)
@@ -277,7 +282,7 @@ fn fallback_with_category_caps(
     ids
 }
 
-fn resolved_importance(
+pub(crate) fn resolved_importance(
     category: Option<&str>,
     overrides: &BTreeMap<String, CategoryOverride>,
 ) -> Importance {
@@ -664,6 +669,34 @@ mod tests {
             select(&generated("invalid JSON"), &categorized, 0, &overrides).unwrap(),
             vec![1]
         );
+    }
+
+    struct NoCall;
+
+    impl DescribeSession for NoCall {
+        fn submit(&self, _: GenerateRequest) -> Result<(), SessionSubmitError> {
+            panic!("a single categorized frame must not reach the selection model");
+        }
+
+        fn recv_timeout(&self, _: Duration) -> Result<SessionCompletion, SessionReceiveError> {
+            panic!("a single categorized frame must not reach the selection model");
+        }
+
+        fn close(&self) -> Result<(), SessionCloseError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_single_categorized_frame_is_chosen_without_a_model_call() {
+        for (primary, max_extractions) in [("code", 20), ("gaming", 20), ("reading", 0)] {
+            let categorized = frames(&[(7, 3.0, primary)]);
+            assert_eq!(
+                select(&NoCall, &categorized, max_extractions, &BTreeMap::new()).unwrap(),
+                vec![7],
+                "{primary} at K{max_extractions}"
+            );
+        }
     }
 
     #[test]

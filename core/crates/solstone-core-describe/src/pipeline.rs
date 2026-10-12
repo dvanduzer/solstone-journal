@@ -225,6 +225,7 @@ fn run_with_decoder(
         decoded.first_hash,
         decoded.last_hash,
         decoded.qualified_count,
+        &options.category_overrides,
     );
     if decoded.qualified_frames.is_empty() {
         let (state, reason) = if decoded.decode_failed {
@@ -489,7 +490,7 @@ fn run_with_decoder(
             final_rows.push(result);
             continue;
         }
-        let categories = extraction::categories_for_analysis(analysis);
+        let categories = extraction::categories_for_analysis(analysis, &options.category_overrides);
         if categories.is_empty() {
             result["enhanced"] = json!(false);
             emit_value(&mut rows, &mut incremental_rows, result.clone())?;
@@ -555,7 +556,8 @@ fn run_with_decoder(
                 .get(frame_id)
                 .ok_or_else(|| RunError::Internal("missing merge frame".to_owned()))?;
             let analysis = result.get("analysis").expect("merge rows have analysis");
-            let categories = extraction::categories_for_analysis(analysis);
+            let categories =
+                extraction::categories_for_analysis(analysis, &options.category_overrides);
             for name in missing_categories {
                 let category = categories
                     .iter()

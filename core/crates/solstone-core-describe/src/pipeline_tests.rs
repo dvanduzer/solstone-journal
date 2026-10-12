@@ -391,6 +391,61 @@ fn synthetic_decode_covers_pipeline_contracts_without_native_media() {
 }
 
 #[test]
+fn synthetic_decode_reads_a_single_frame_without_asking_the_selection_model() {
+    let test = TestRun::new("single-frame");
+    let factory = ScriptedFactory::new(default_response);
+
+    run_decoded(test.options(false, Vec::new()), &factory, decoded(&[1]))
+        .expect("synthetic pipeline succeeds");
+
+    let rows = test.rows();
+    assert_eq!(rows[0]["_solstone_processing"]["state"], "analyzed");
+    assert_eq!(rows[1..].len(), 1);
+    assert_eq!(rows[1]["enhanced"], true);
+    assert_eq!(rows[1]["content"]["code"], "# extracted markdown");
+    let requests = factory.requests();
+    assert!(phase_requests(&requests, "observe.extract.selection").is_empty());
+    assert_eq!(phase_requests(&requests, "observe.describe.code").len(), 1);
+}
+
+#[test]
+fn synthetic_decode_never_reads_an_ignored_category_in_detail() {
+    let test = TestRun::new("ignored-category");
+    // Frame 1 is gaming (built-in importance ignore) and is kept as the first
+    // frame; frame 2 is code with a visible gaming secondary.
+    let factory = ScriptedFactory::new(|request| match request.id.as_deref() {
+        Some(id) if id.starts_with("frame:1:") => {
+            generated(request, category("gaming", "none", true))
+        }
+        Some(id) if id.starts_with("frame:2:") => {
+            generated(request, category("code", "gaming", false))
+        }
+        _ => default_response(request),
+    });
+
+    run_decoded(test.options(false, Vec::new()), &factory, decoded(&[1, 2]))
+        .expect("synthetic pipeline succeeds");
+
+    let rows = test.rows();
+    assert_eq!(rows[0]["_solstone_processing"]["state"], "analyzed");
+    let row = |frame_id: u64| {
+        rows[1..]
+            .iter()
+            .find(|row| row["frame_id"] == frame_id)
+            .expect("row for frame")
+    };
+    assert_eq!(row(1)["analysis"]["primary"], "gaming");
+    assert_eq!(row(1)["enhanced"], false);
+    assert!(row(1).get("content").is_none());
+    assert_eq!(row(2)["enhanced"], true);
+    assert_eq!(row(2)["content"]["code"], "# extracted markdown");
+    assert!(row(2)["content"].get("gaming").is_none());
+    let requests = factory.requests();
+    assert!(phase_requests(&requests, "observe.describe.gaming").is_empty());
+    assert_eq!(phase_requests(&requests, "observe.describe.code").len(), 1);
+}
+
+#[test]
 fn synthetic_screen_detection_failure_is_recorded_for_each_eligible_frame() {
     let test = TestRun::new("screen-detection-failure");
     let factory = ScriptedFactory::new(|request| {
@@ -859,7 +914,7 @@ fn synthetic_decode_handles_session_and_phase_blockers_without_artifacts() {
         run_decoded(
             selection_test.options(false, Vec::new()),
             &selection_factory,
-            decoded(&[1])
+            decoded(&[1, 2])
         ),
         Err(RunError::Blocked(Some(code))) if code == "binary_missing"
     ));
