@@ -106,6 +106,8 @@ fn legacy_sequential_native_publication_records_adoption_and_preserves_whole_mar
             assert!(intent.witness.processing.is_none());
             if first_conflict && index == 0 {
                 assert_eq!(outcome.effects, AttemptEffects::default());
+                // Create-only: a differing local file is kept byte for byte.
+                assert_eq!(fs::read(f.raw()).unwrap(), b"old");
                 assert!(outcome.marker.is_none());
                 assert!(outcome.no_effect_cleanup.as_ref().unwrap().confirmed());
                 assert!(!f.marker().exists());

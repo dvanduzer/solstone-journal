@@ -240,8 +240,8 @@ fn reconciliation_kept_and_eligible_empty_use_same_canonical_handler_evidence() 
 }
 
 #[test]
-fn reconciliation_legacy_mixed_withdraws_whole_but_ambiguous_key_stays() {
-    for ambiguous in [false, true] {
+fn reconciliation_withdraws_every_legacy_unbound_mark_and_keeps_media() {
+    for case in ["kept", "eligible", "ambiguous", "missing_day", "failed"] {
         let (_journal, root) = fixture();
         let operation = operation(&root);
         let selected = selection(SegmentLayout::Direct, &["empty.flac", "ordinary.flac"]);
@@ -250,26 +250,77 @@ fn reconciliation_legacy_mixed_withdraws_whole_but_ambiguous_key_stays() {
         let mut legacy = reconciliation_mark(&operation, &selected);
         legacy.offload = None;
         legacy.target.dir = "120000_60".into();
+        if case == "missing_day" {
+            legacy.target.day = "20250101".into();
+        }
+        if case == "failed" {
+            legacy.state = crate::marks::MarkState::Failed(crate::marks::Failure {
+                at: "before".into(),
+                reason: "held".into(),
+                staged: None,
+            });
+        }
         legacy.id = MarkId::derive(legacy.class, &legacy.target, &legacy.proposal.names);
         reconciliation_register(&root, std::slice::from_ref(&legacy));
-        if ambiguous {
+        if case == "ambiguous" {
             let mut other = selected.clone();
             other.target.dir = "120000_60_other".into();
             seed(&root, &other, "empty.flac", "empty");
         }
-        reconciliation_keep(&root);
-        let result = reconcile(&operation);
-        assert_eq!(result.register().version, 1);
-        if ambiguous {
-            assert_eq!(result.register().marks.get(&legacy.id), Some(&legacy));
-            assert!(matches!(
-                result.groups()[0].disposition(),
-                OffloadReconciliationDisposition::Unbound
-            ));
-        } else {
-            assert!(result.register().marks.is_empty());
+        if case != "eligible" {
+            reconciliation_keep(&root);
         }
+        let directory = root.canonical_path().join(selection_path(&selected));
+        let media =
+            ["empty.flac", "ordinary.flac"].map(|name| fs::read(directory.join(name)).unwrap());
+        let result = reconcile(&operation);
+        assert_eq!(result.register().version, 1, "{case}");
+        for (name, bytes) in ["empty.flac", "ordinary.flac"].iter().zip(&media) {
+            assert_eq!(&fs::read(directory.join(name)).unwrap(), bytes, "{case}");
+        }
+        if case == "failed" {
+            // An unfinished deletion keeps its record for recovery.
+            assert_eq!(result.register().marks.get(&legacy.id), Some(&legacy));
+            assert!(result.groups().is_empty());
+            continue;
+        }
+        assert!(result.register().marks.is_empty(), "{case}");
+        assert_eq!(result.groups().len(), 1);
+        assert_eq!(result.groups()[0].expected(), std::slice::from_ref(&legacy));
+        assert!(
+            matches!(result.groups()[0].disposition(), OffloadReconciliationDisposition::Publication { outcome, observation: None }
+                if matches!(outcome.as_ref(), crate::mark_mutation::BoundMutationOutcome::Published(_))),
+            "{case}"
+        );
     }
+}
+
+#[test]
+fn reconciliation_legacy_withdrawal_lets_the_first_offer_switch_the_register() {
+    let (_journal, root) = fixture();
+    let operation = operation(&root);
+    let selected = selection(SegmentLayout::Direct, &["ordinary.flac"]);
+    seed(&root, &selected, "ordinary.flac", "analyzed");
+    let offer = reconciliation_mark(&operation, &selected);
+    let mut legacy = offer.clone();
+    legacy.offload = None;
+    legacy.target.dir = "120000_60".into();
+    legacy.id = MarkId::derive(legacy.class, &legacy.target, &legacy.proposal.names);
+    reconciliation_register(&root, std::slice::from_ref(&legacy));
+    // A legacy row cannot exist in a version 2 register, so no offer publishes.
+    assert!(crate::mark_mutation::OfferMarkGuard::begin(&root, &[(None, &offer)]).is_err());
+    assert!(reconcile(&operation).register().marks.is_empty());
+    let published = crate::mark_mutation::OfferMarkGuard::begin(&root, &[(None, &offer)])
+        .unwrap()
+        .publish()
+        .unwrap();
+    assert!(matches!(
+        published,
+        crate::mark_mutation::BoundMutationOutcome::Published(_)
+    ));
+    let register = crate::review_context::load_at_root(&root).unwrap();
+    assert_eq!(register.version, 2);
+    assert_eq!(register.marks.get(&offer.id), Some(&offer));
 }
 
 #[test]
@@ -384,19 +435,12 @@ fn reconciliation_busy_segment_does_not_block_unrelated_group() {
     reason = "root substitution and teardown affect only disposable fixtures"
 )]
 fn reconciliation_final_cut_preserves_newer_marks_and_refuses_changed_inputs() {
-    for drift in [
-        "nonce", "state", "config", "raw", "sidecar", "root", "legacy",
-    ] {
+    for drift in ["nonce", "state", "config", "raw", "sidecar", "root"] {
         let (journal, root) = fixture();
         let operation = operation(&root);
         let selected = selection(SegmentLayout::Direct, &["empty.flac"]);
         seed(&root, &selected, "empty.flac", "empty");
-        let mut mark = reconciliation_mark(&operation, &selected);
-        if drift == "legacy" {
-            mark.offload = None;
-            mark.target.dir = "120000_60".into();
-            mark.id = MarkId::derive(mark.class, &mark.target, &mark.proposal.names);
-        }
+        let mark = reconciliation_mark(&operation, &selected);
         reconciliation_register(&root, std::slice::from_ref(&mark));
         reconciliation_keep(&root);
 
@@ -449,11 +493,6 @@ fn reconciliation_final_cut_preserves_newer_marks_and_refuses_changed_inputs() {
                     let old = root_hook.canonical_path().with_extension("moved");
                     fs::rename(root_hook.canonical_path(), &old).unwrap();
                     fs::create_dir(root_hook.canonical_path()).unwrap();
-                }
-                "legacy" => {
-                    let mut other = selected_hook.clone();
-                    other.target.dir = "120000_60_new".into();
-                    seed(&root_hook, &other, "empty.flac", "empty");
                 }
                 _ => panic!("unknown fixture"),
             }),

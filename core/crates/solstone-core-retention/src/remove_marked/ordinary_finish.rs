@@ -2,8 +2,8 @@
 // Copyright (c) 2026 sol pbc
 
 //! Consuming settlement for the synchronous local checked executor. Local return
-//! settles only this operation's writers. Unqualified stage-namespace cooperation
-//! holds production invocation, as required by native carrier retirement.
+//! settles only this operation's writers. Its production caller retains the whole
+//! owner, including any hold, in the single admitted operation slot.
 
 use super::*;
 use solstone_core_journal_io::media::ActivityCarrierRetirementReceipt;
@@ -47,7 +47,8 @@ pub struct ReviewedRemovalReport {
             crate::mark_mutation::BoundMutationRefusal,
         >,
     >,
-    retirement: ActivityCarrierRetirementReceipt,
+    refusal: Option<ReviewedRemovalRefusal>,
+    retirement: Option<ActivityCarrierRetirementReceipt>,
 }
 
 impl ReviewedRemovalReport {
@@ -70,8 +71,13 @@ impl ReviewedRemovalReport {
     > {
         self.mutation.as_ref()
     }
-    pub fn retirement(&self) -> &ActivityCarrierRetirementReceipt {
-        &self.retirement
+    /// Why the run stopped short, when every unremoved file is still known.
+    pub fn refusal(&self) -> Option<&ReviewedRemovalRefusal> {
+        self.refusal.as_ref()
+    }
+    /// Absent only when the run refused before preparing its carrier.
+    pub fn retirement(&self) -> Option<&ActivityCarrierRetirementReceipt> {
+        self.retirement.as_ref()
     }
 }
 
@@ -115,11 +121,12 @@ impl ReviewedRemoval {
             ActivityCarrierRetirementEffect, Confirmation, Durability,
         };
 
-        if !archive_finish::complete_selected_files(&self.checked, &self.execution) {
+        if !known_selected_files(&self.execution) {
             return self.hold_local(ReviewedRemovalFinishRefusal::IncompleteSelection);
         }
         let Some(carrier) = self.execution.carrier.take() else {
-            return self.hold_local(ReviewedRemovalFinishRefusal::IncompleteSelection);
+            // Refused before preparing a carrier: nothing was staged or removed.
+            return self.settle(None);
         };
         if let Err(reason) = archive_finish::finish_native(&mut self.execution, &carrier) {
             self.execution.carrier = Some(carrier);
@@ -139,6 +146,11 @@ impl ReviewedRemoval {
             held.retirement = Some(retired.receipt);
             return ReviewedRemovalFinish::Held(Box::new(held));
         }
+        self.settle(Some(retired.receipt))
+    }
+
+    #[cfg(unix)]
+    fn settle(self, retirement: Option<ActivityCarrierRetirementReceipt>) -> ReviewedRemovalFinish {
         let selected = self.checked.marks().to_vec();
         let attempts = self
             .execution
@@ -151,7 +163,39 @@ impl ReviewedRemoval {
             selected,
             attempts,
             mutation: self.execution.mutation,
-            retirement: retired.receipt,
+            refusal: self.execution.refusal,
+            retirement,
         }))
     }
+}
+
+/// Every selected file has a known outcome and nothing is left owned: each
+/// attempt was a confirmed, recorded deletion; nothing else was staged; and
+/// the register recorded those deletions. A file that was already gone, kept
+/// by the current policy or refused before staging is known and untouched,
+/// so it does not hold the run.
+#[cfg(unix)]
+fn known_selected_files(execution: &ReviewedExecution) -> bool {
+    use crate::mark_mutation::BoundMutationOutcome;
+    use solstone_core_journal_io::media::{Cleanup, Confirmation, OriginalName, RemovalEffect};
+    let remnant = execution.carrier_failure.is_some()
+        || !execution.stage_failures.is_empty()
+        || execution.outcome.targets.iter().any(|row| {
+            row.post_commit_failure.is_some()
+                || row.not_removed.iter().any(|item| item.staged.is_some())
+        });
+    let deletions_known = execution.attempts.iter().all(|attempt| {
+        let receipt = attempt.native.receipt();
+        attempt.settled
+            && receipt.effect == RemovalEffect::Deleted
+            && receipt.original_name == OriginalName::Absent
+            && receipt.claim_confirmation == Confirmation::Confirmed
+            && receipt.cleanup == Cleanup::Complete
+    });
+    let recorded = match &execution.mutation {
+        None => execution.attempts.is_empty(),
+        Some(Ok(BoundMutationOutcome::Published(_) | BoundMutationOutcome::Unchanged(_))) => true,
+        Some(_) => false,
+    };
+    !remnant && deletions_known && recorded
 }

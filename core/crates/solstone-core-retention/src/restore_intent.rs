@@ -26,7 +26,19 @@ use crate::archive_catalog::{
     RestoreFileV2, RestoreOperation, SegmentCatalog,
 };
 
+mod abandoned;
+pub use abandoned::{
+    AbandonedRestore, AbandonedRestoreHold, AbandonedRestoreRelease, recover_abandoned_restores,
+};
+
 const INTENT_VERSION: u32 = 1;
+
+/// The leaf of a restore's or legacy probe's download stage, which holds only
+/// backup bytes. No other producer creates it, and
+/// with no extension it can never be an archived media name, so a stage
+/// holding only this file is a restore's unpublished copy even without an
+/// intent. Earlier restores recorded the shared `payload` leaf.
+pub const RESTORE_DOWNLOAD_LEAF: &str = "restore-download";
 
 struct BoundedDocument {
     bytes: Vec<u8>,
@@ -511,7 +523,10 @@ impl RestoreIntent {
             || self.stage.parent != self.destination.parent
             || !plain_name(&self.stage.stage_name)
             || !self.stage.stage_name.starts_with(".tmp-offload-")
-            || self.stage.leaf_name != "payload"
+            || !matches!(
+                self.stage.leaf_name.as_str(),
+                RESTORE_DOWNLOAD_LEAF | "payload"
+            )
             || self
                 .stage
                 .boot_id

@@ -35,7 +35,7 @@ use solstone_core_journal_io::activity_obligations::{
 };
 use solstone_core_journal_io::atomic::atomic_replace;
 use solstone_core_journal_io::entry::{Removed, remove_file, rename_within, sync_dir};
-use solstone_core_journal_io::media::RootActivityCarrier;
+use solstone_core_journal_io::media::{RootActivityCarrier, retire_orphan_root_carriers};
 use solstone_core_journal_io::operational_log::{
     LeaseProbe, catalog_oplogs, probe_retained_oplog_lease,
 };
@@ -707,10 +707,17 @@ const WHOLE_RESERVATION_HOLD: &str =
 
 fn admit_whole_segment_activity(journal: &Path) -> Result<Arc<ActivityLease>, String> {
     let root = JournalRoot::open(journal).map_err(|_| WHOLE_BINDING_HOLD.to_owned())?;
-    ActivityLease::try_acquire(Arc::new(root)).map_err(|error| match error {
+    let activity = ActivityLease::try_acquire(Arc::new(root)).map_err(|error| match error {
         ActivityAdmissionError::Busy => WHOLE_ACTIVITY_HOLD.to_owned(),
         ActivityAdmissionError::Unavailable(_) => WHOLE_BINDING_HOLD.to_owned(),
-    })
+    })?;
+    // An owner deletion must not wait on what an ended owner left behind: an
+    // interrupted removal, a restore that never published, then empty
+    // reservations. Each phase's fresh census still decides.
+    crate::remove_marked::recover_interrupted_removals(&activity);
+    crate::restore_intent::recover_abandoned_restores(&activity);
+    retire_orphan_root_carriers(&activity);
+    Ok(activity)
 }
 
 pub(crate) fn admit_legacy_raw_activity(journal: &Path) -> Result<Arc<ActivityLease>, String> {

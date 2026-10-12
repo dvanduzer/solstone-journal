@@ -10,7 +10,9 @@ use std::sync::Arc;
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::activity_obligations::observe_obligations;
-use solstone_core_journal_io::media::{ActivityCarrierPreparationFailure, RootActivityCarrier};
+use solstone_core_journal_io::media::{
+    ActivityCarrierPreparationFailure, RootActivityCarrier, retire_orphan_root_carriers,
+};
 
 use crate::archive_admission::{AdmissionError, ArchiveBudget, ArchiveConfiguration, Clock};
 
@@ -106,6 +108,9 @@ impl ArchiveActivity {
                 inner: Box::new(failure),
             });
         }
+        // Reservations an ended owner left behind would otherwise hold every
+        // later operation. The fresh census below still decides admission.
+        retire_orphan_root_carriers(&lease);
         let census = match observe_obligations(&root) {
             Ok(census) => census,
             Err(error) => {
@@ -162,6 +167,23 @@ impl ArchiveActivity {
         self.activity().revalidate().map_err(io::Error::other)?;
         self.carrier.revalidate()
     }
+
+    /// End an activity whose operation launched nothing still running and holds
+    /// no stage. Its empty carrier retires if no other owner shares it; any
+    /// reservation left behind is retired by the next admission.
+    pub(crate) fn release_unused(self) {
+        if let Ok(carrier) = Arc::try_unwrap(self.carrier) {
+            drop(carrier.retire_after_settlement());
+        }
+    }
+}
+
+impl ActivityPreparationFailure {
+    fn release_unused(self) {
+        if let Some(partial) = self.inner.partial {
+            drop(partial.retire_after_settlement());
+        }
+    }
 }
 
 pub(crate) enum ArchiveOperationClock<'a> {
@@ -194,6 +216,10 @@ impl OwnedPreparedArchiveHold {
     }
     pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
         &self.clock
+    }
+    /// End a prepared operation that launched no child and staged nothing.
+    pub fn release_unused(self) {
+        self.activity.release_unused();
     }
     #[cfg(unix)]
     pub(crate) fn revalidate(&self) -> Result<(), AdmissionError> {
@@ -234,6 +260,16 @@ impl OwnedArchivePreparationFailure {
     }
     pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
         &self.clock
+    }
+    /// A refused preparation launched no child and staged nothing beyond its
+    /// own reservation, so it always ends without leaving an effect.
+    pub fn release(self) {
+        if let Some(activity) = self.activity {
+            activity.release_unused();
+        }
+        if let Some(preparation) = self.preparation {
+            preparation.release_unused();
+        }
     }
 }
 

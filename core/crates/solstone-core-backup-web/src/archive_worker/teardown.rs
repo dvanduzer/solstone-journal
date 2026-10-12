@@ -13,8 +13,11 @@ use std::{
 use axum::response::Response;
 use serde_json::Value;
 use solstone_core_backup::archive_admission::{ArchiveCancellation, Clock};
+use solstone_core_backup_runtime::teardown_admission::{
+    TeardownAdmissionRefusal, TeardownCarrierRefusal, TeardownReaderRefusal,
+};
 use solstone_core_offload::teardown::{
-    OwnedTeardownOutcome, TeardownRunPhase, TeardownRunRefusal, run_owned_teardown,
+    OwnedTeardownOutcome, TeardownRunRefusal, run_owned_teardown,
 };
 
 use crate::{
@@ -275,9 +278,13 @@ fn execute(
     let mut terminal = if result.is_err() {
         Terminal::phase("error", Some("unknown".into()))
     } else {
-        match outcome.as_ref().expect("coordinator returned") {
+        let actual = outcome.as_ref().expect("coordinator returned");
+        match actual {
             OwnedTeardownOutcome::Finished(_) => Terminal::done(),
-            OwnedTeardownOutcome::Held(_) => Terminal::phase("refused", Some("failed".into())),
+            OwnedTeardownOutcome::Held(_) => match unstarted_reason(actual) {
+                Some(reason) => Terminal::error(reason),
+                None => Terminal::phase("refused", Some("failed".into())),
+            },
             OwnedTeardownOutcome::Unknown(_) => Terminal::error("unknown"),
         }
     };
@@ -292,30 +299,34 @@ fn execute(
     }
 }
 
-fn harmless_prelaunch(outcome: &OwnedTeardownOutcome) -> bool {
-    #[cfg(unix)]
-    let no_binding = outcome.binding().is_none();
-    #[cfg(not(unix))]
-    let no_binding = true;
-    matches!(outcome, OwnedTeardownOutcome::Held(_))
-        && outcome.phase() == TeardownRunPhase::Prelaunch
-        && matches!(
-            outcome.refusal(),
-            Some(
-                TeardownRunRefusal::NamespaceCooperationHeld
-                    | TeardownRunRefusal::UnsupportedPlatform
-            )
-        )
-        && outcome.journal_root().is_none()
-        && outcome.teardown_lease().is_none()
-        && outcome.carrier().is_none()
-        && outcome.remote().is_none()
-        && !outcome.attempts().clear()
-        && !outcome.attempts().binding()
-        && !outcome.attempts().retirement()
-        && outcome.publication().is_none()
-        && no_binding
-        && outcome.retirement().is_none()
+/// Owner-actionable refusals that happened before any effect.
+fn unstarted_reason(outcome: &OwnedTeardownOutcome) -> Option<&'static str> {
+    if !outcome.refused_before_effects() {
+        return None;
+    }
+    let reader = outcome
+        .preparation_failure()
+        .and_then(|failure| match failure.refusal() {
+            TeardownCarrierRefusal::Admission(TeardownAdmissionRefusal::Reader(reader)) => {
+                Some(reader)
+            }
+            _ => None,
+        });
+    if let Some(reason) = reader.and_then(|reader| match reader {
+        TeardownReaderRefusal::BackupOnlyHeld => Some("backup_only_held"),
+        TeardownReaderRefusal::BackupOnlyUnplaced => Some("backup_only_unplaced"),
+        TeardownReaderRefusal::CatalogUnavailable => Some("offload_record_unavailable"),
+        TeardownReaderRefusal::RecoveryUnavailable | TeardownReaderRefusal::RecoveryHeld => None,
+    }) {
+        Some(reason)
+    } else if matches!(
+        outcome.refusal(),
+        Some(TeardownRunRefusal::UnsupportedDestination)
+    ) {
+        Some("destination_unsupported")
+    } else {
+        None
+    }
 }
 
 impl Returned {
@@ -323,7 +334,8 @@ impl Returned {
         self.projected
             && match &self.payload {
                 Payload::Outcome(OwnedTeardownOutcome::Finished(_)) => true,
-                Payload::Outcome(outcome) => harmless_prelaunch(outcome),
+                // Dropping an unstarted refusal only releases its admission.
+                Payload::Outcome(outcome) => outcome.refused_before_effects(),
                 Payload::Unused(input) => Arc::ptr_eq(&input.ticket.0, &self.ticket.0),
                 Payload::Unknown(input) => {
                     let _original = &input.ticket;
@@ -427,21 +439,20 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    struct NoIo(AtomicUsize);
-    impl Clock for NoIo {
+    struct FixedClock;
+    impl Clock for FixedClock {
         fn now_unix(&self) -> i64 {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            panic!("prelaunch observed clock")
+            1_700_000_000
         }
         fn iso_week(&self) -> u8 {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            panic!("prelaunch observed week")
+            1
         }
     }
+    struct NoIo(AtomicUsize);
     impl ToolRunner for NoIo {
         fn run(&self, _: &ToolRequest<'_>) -> std::io::Result<ToolOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            panic!("prelaunch launched helper")
+            panic!("unstarted teardown launched helper")
         }
     }
     impl HttpTransport for NoIo {
@@ -450,19 +461,44 @@ mod tests {
             _: &HttpRequest,
         ) -> Result<HttpResponse, solstone_core_backup_runtime::hosted_runtime::HttpError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            panic!("prelaunch HTTP")
+            panic!("unstarted teardown HTTP")
         }
     }
 
+    /// A hosted journal whose catalog records media that exists only in the backup.
     fn fixture() -> (tempfile::TempDir, BackupWebDeps, Arc<NoIo>) {
         let root = crate::test_support::hosted_bound_root();
+        solstone_core_backup::save_hosted_binding(
+            root.path(),
+            &solstone_core_backup::HostedBinding {
+                // Never reached: coverage refuses first. A closed local port keeps it so.
+                broker_endpoint: "http://127.0.0.1:9".into(),
+                ..crate::test_support::hosted_binding()
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("chronicle/20260101/010000_001")).unwrap();
+        solstone_core_offload::append_offload_event(
+            root.path(),
+            "20260101",
+            "_default",
+            "010000_001",
+            "snapshot-a",
+            &[solstone_core_retention::archive_catalog::OffloadFile {
+                name: "clip.webm".into(),
+                bytes: 3,
+                sha256: "a".repeat(64),
+            }],
+            1,
+        )
+        .unwrap();
         let cache = crate::measurement::with_geometry(crate::measurement::DeviceGeometry {
             free_bytes: None,
             total_bytes: None,
         });
         let mut deps = BackupWebDeps::production(root.path().to_path_buf(), cache);
         let io = Arc::new(NoIo(AtomicUsize::new(0)));
-        deps.clock = io.clone();
+        deps.clock = Arc::new(FixedClock);
         deps.runner = io.clone();
         deps.http = io.clone();
         deps.executable = root.path().join("missing/bin/solstone");
@@ -482,7 +518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teardown_route_retains_real_prelaunch_until_serialized_without_tools() {
+    async fn teardown_route_discharges_backup_only_refusal_without_effects() {
         let (root, deps, io) = fixture();
         let raw = root.path().join("raw.webm");
         fs::write(&raw, b"owner raw bytes").unwrap();
@@ -519,19 +555,33 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
                 .unwrap();
-        assert_eq!(body["operation"]["phase"], "refused");
-        assert_eq!(body["operation"]["report"]["phase"], "prelaunch");
         assert_eq!(body["operation"]["report"]["state"], "held");
         #[cfg(target_os = "linux")]
-        assert_eq!(
-            body["operation"]["report"]["refusal"]["kind"],
-            "namespace_cooperation_held"
-        );
+        {
+            assert_eq!(body["operation"]["phase"], "error");
+            assert_eq!(body["operation"]["reason_code"], "backup_only_held");
+            assert_eq!(body["operation"]["report"]["phase"], "preparation");
+            assert_eq!(
+                body["operation"]["report"]["preparation_failure"]["refusal"],
+                serde_json::json!({"kind":"reader","reason":"backup_only_held"})
+            );
+            // The discharged refusal no longer holds the journal activity lock.
+            drop(
+                solstone_core_journal_io::activity::ActivityLease::try_acquire(Arc::new(
+                    solstone_core_journal_io::JournalRoot::open(root.path()).unwrap(),
+                ))
+                .unwrap(),
+            );
+        }
         #[cfg(not(target_os = "linux"))]
-        assert_eq!(
-            body["operation"]["report"]["refusal"]["kind"],
-            "unsupported_platform"
-        );
+        {
+            assert_eq!(body["operation"]["phase"], "refused");
+            assert_eq!(body["operation"]["report"]["phase"], "prelaunch");
+            assert_eq!(
+                body["operation"]["report"]["refusal"]["kind"],
+                "unsupported_platform"
+            );
+        }
         assert_eq!(
             before,
             [
@@ -635,7 +685,7 @@ mod tests {
                 &ticket,
                 || {},
                 |actual| {
-                    assert!(harmless_prelaunch(actual));
+                    assert!(actual.refused_before_effects());
                     panic!("projection after actual outcome")
                 },
             )
@@ -645,7 +695,9 @@ mod tests {
         let state = deps.operations.lock().unwrap();
         let held = &state.archive.teardown.retained[0];
         assert!(!held.projected);
-        assert!(matches!(&held.payload, Payload::Outcome(actual) if harmless_prelaunch(actual)));
+        assert!(
+            matches!(&held.payload, Payload::Outcome(actual) if actual.refused_before_effects())
+        );
         assert_eq!(
             state.current.as_ref().unwrap().view.reason_code.as_deref(),
             Some("unknown")
@@ -721,7 +773,7 @@ mod tests {
             let held = &state.archive.teardown.retained[0];
             assert_eq!(held.terminal.report, expected_report);
             assert!(
-                matches!(&held.payload, Payload::Outcome(actual) if harmless_prelaunch(actual))
+                matches!(&held.payload, Payload::Outcome(actual) if actual.refused_before_effects())
             );
             drop(state);
             assert!(operation::is_busy(&deps.operations));
@@ -750,6 +802,34 @@ mod tests {
         successor(&deps);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_names_unplaced_media_and_a_missing_offload_record() {
+        let (root, deps, io) = fixture();
+        fs::remove_dir(root.path().join("chronicle/20260101/010000_001")).unwrap();
+        let returned = actual_return(&deps);
+        assert_eq!(
+            returned.terminal.reason_code.as_deref(),
+            Some("backup_only_unplaced")
+        );
+        assert!(returned.dischargeable());
+        drop(returned);
+
+        let (root, deps, _) = fixture();
+        fs::remove_dir_all(root.path().join("health/offload")).unwrap();
+        let config = root.path().join("config/journal.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        value["backup"]["offload"] = serde_json::json!({"enabled": true});
+        fs::write(&config, serde_json::to_vec(&value).unwrap()).unwrap();
+        let returned = actual_return(&deps);
+        assert_eq!(
+            returned.terminal.reason_code.as_deref(),
+            Some("offload_record_unavailable")
+        );
+        assert!(returned.dischargeable());
+        assert_eq!(io.0.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn teardown_closed_types_and_borrowed_codec_preserve_absence_and_redact_errors() {
         fn closed<T: Send + 'static>() {}
@@ -763,14 +843,23 @@ mod tests {
         };
         let report = crate::teardown_report::outcome(actual);
         for field in [
-            "remote",
             "publication",
             "binding",
             "retirement",
-            "preparation_failure",
             "clear_failure",
             "binding_failure",
         ] {
+            assert!(report[field].is_null(), "{field}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(report["remote"]["phase"], "not_started");
+            assert_eq!(report["remote"]["broker_attempted"], false);
+            assert!(report["preparation_failure"]["receipt"].is_null());
+            assert!(report["preparation_failure"]["error"].is_null());
+        }
+        #[cfg(not(target_os = "linux"))]
+        for field in ["remote", "preparation_failure"] {
             assert!(report[field].is_null(), "{field}");
         }
         assert_eq!(

@@ -138,7 +138,73 @@ pub struct OffloadReturn {
     state: ReturnState,
 }
 
+fn retire_unshared(carrier: Arc<RootActivityCarrier>) {
+    if let Ok(carrier) = Arc::try_unwrap(carrier) {
+        drop(carrier.retire_after_settlement());
+    }
+}
+
+impl Inputs {
+    fn unstaged(&self) -> bool {
+        match self {
+            Self::Selected { ready, .. } => ready.unstaged(),
+            Self::Planned(_) => true,
+        }
+    }
+}
+
 impl OffloadReturn {
+    /// End a creation refused before any archive writer, copy or record: the
+    /// preflight, admission and entry refusals. Every later state holds.
+    pub(super) fn release(self) -> Result<(), Box<Self>> {
+        let held = |state| Err(Box::new(Self { state }));
+        match self.state {
+            ReturnState::Preflight { prepared, failure } => {
+                let unstaged = match &failure {
+                    InputFailure::Selected(failure) => failure.unstaged(),
+                    InputFailure::Planned(_) => true,
+                };
+                if !unstaged {
+                    return held(ReturnState::Preflight { prepared, failure });
+                }
+                drop(failure);
+                prepared.release_unused();
+                Ok(())
+            }
+            ReturnState::Admission { input, failure } if input.unstaged() => {
+                let carrier = Arc::clone(input.carrier());
+                match failure.release() {
+                    Ok(()) => {
+                        drop(input);
+                        retire_unshared(carrier);
+                        Ok(())
+                    }
+                    Err(failure) => held(ReturnState::Admission {
+                        input,
+                        failure: *failure,
+                    }),
+                }
+            }
+            ReturnState::Entry {
+                input,
+                admitted,
+                outside,
+            } if input.unstaged() => match (*admitted).release_unused() {
+                Ok(()) => {
+                    drop(input);
+                    outside.release_unused();
+                    Ok(())
+                }
+                Err(admitted) => held(ReturnState::Entry {
+                    input,
+                    admitted,
+                    outside,
+                }),
+            },
+            state => held(state),
+        }
+    }
+
     pub fn runtime(&self) -> Option<&OwnedDirectReadFinish> {
         match &self.state {
             ReturnState::Finished { runtime, .. } | ReturnState::ActorUnknown { runtime } => {

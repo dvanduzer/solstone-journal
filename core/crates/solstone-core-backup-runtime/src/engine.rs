@@ -38,7 +38,7 @@ use solstone_core_backup::archive_readback::{
     ArchiveWriterSourceObservation, DirectArchiveEffects, DirectReadCompletion,
     OFFLOAD_ARCHIVE_TAG, OwnedArchiveCreator, OwnedDirectReadHold, OwnedReadOperation,
     OwnedReadbackAdmissionError, OwnedSettledDirectRead, ReadAdmission, ReadOperation,
-    ReadbackAdmissionError, ReadbackError, SettledDirectRead,
+    ReadbackAdmissionError, ReadbackError, RefusedDirectRead, SettledDirectRead,
 };
 // Repository contention is coordinated by Restic, within each operation’s deadline.
 const REPOSITORY_RETRY_LOCK: &str = "30m";
@@ -1930,6 +1930,42 @@ impl OwnedArchiveAdmissionFailure {
             ClosedArchiveAdmissionOwner::Admitted(admitted) => Some(admitted.owned_clock()),
         }
     }
+    /// End a refused admission that leaves nothing running or written. Its
+    /// broker request already returned; a read whose children are not all
+    /// known reaped, or a captured archive of unknown outcome, still holds.
+    pub fn release(self) -> Result<(), Box<Self>> {
+        let OwnedArchiveAdmissionFailureInner {
+            error,
+            effects,
+            owned,
+        } = *self.inner;
+        let held = |owned| {
+            Box::new(Self {
+                inner: Box::new(OwnedArchiveAdmissionFailureInner {
+                    error,
+                    effects,
+                    owned,
+                }),
+            })
+        };
+        match owned {
+            ClosedArchiveAdmissionOwner::BeforePreparation(_) => Ok(()),
+            ClosedArchiveAdmissionOwner::Prepared(operation) => {
+                operation.release_unused();
+                Ok(())
+            }
+            ClosedArchiveAdmissionOwner::Preparation(preparation) => {
+                preparation.release();
+                Ok(())
+            }
+            ClosedArchiveAdmissionOwner::Readback(readback) => readback
+                .release()
+                .map_err(|readback| held(ClosedArchiveAdmissionOwner::Readback(readback))),
+            ClosedArchiveAdmissionOwner::Admitted(admitted) => admitted
+                .release_unused()
+                .map_err(|admitted| held(ClosedArchiveAdmissionOwner::Admitted(admitted))),
+        }
+    }
 }
 
 /// Prepare one original activity before admitting paired archive transports.
@@ -2638,6 +2674,58 @@ impl DirectReadFinishOwner {
             inner: Box::new(inner),
         }
     }
+
+    /// After its operation was released with nothing outstanding, retire the
+    /// carrier if no other owner shares it. Anything left is retired by the
+    /// next admission.
+    pub fn release_unused(self) {
+        if let Ok(carrier) = Arc::try_unwrap(self.carrier) {
+            drop(carrier.retire_after_settlement());
+        }
+    }
+
+    /// Retire the empty carrier left by a refused read whose children were all
+    /// reaped. The caller has removed its own stages. This never completes.
+    pub fn finish_refused(self, read: RefusedDirectRead) -> OwnedDirectReadFinish {
+        let reason = read.reason();
+        if !Arc::ptr_eq(self.carrier.journal_root(), read.journal_root())
+            || !Arc::ptr_eq(&self.clock, read.owned_clock())
+        {
+            return OwnedDirectReadFinish {
+                inner: Box::new(OwnedDirectReadFinishInner::Refused {
+                    owner: self,
+                    _read: read,
+                    reason,
+                }),
+            };
+        }
+        let Self {
+            carrier,
+            clock,
+            broker,
+        } = self;
+        let inner = match Arc::try_unwrap(carrier) {
+            Err(carrier) => OwnedDirectReadFinishInner::Refused {
+                owner: Self {
+                    carrier,
+                    clock,
+                    broker,
+                },
+                _read: read,
+                reason,
+            },
+            Ok(carrier) => OwnedDirectReadFinishInner::Released {
+                retirement: carrier.retire_after_settlement(),
+                clock,
+                _broker: broker,
+                _read: read,
+                reason,
+            },
+        };
+        OwnedDirectReadFinish {
+            inner: Box::new(inner),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2718,6 +2806,20 @@ enum OwnedDirectReadFinishInner {
         _completion: DirectReadCompletion,
         lifetime_failure: Option<ReadbackError>,
     },
+    Refused {
+        owner: DirectReadFinishOwner,
+        _read: RefusedDirectRead,
+        reason: ReadbackError,
+    },
+    Released {
+        retirement: solstone_core_journal_io::media::ActivityCarrierRetirement<
+            solstone_core_journal_io::media::RootActivityCarrier,
+        >,
+        clock: Arc<dyn Clock + Send + Sync>,
+        _broker: DirectBrokerCompletion,
+        _read: RefusedDirectRead,
+        reason: ReadbackError,
+    },
 }
 impl OwnedDirectReadFinish {
     pub fn state(&self) -> DirectReadFinishState {
@@ -2740,10 +2842,24 @@ impl OwnedDirectReadFinish {
             _ => DirectReadFinishState::Held,
         }
     }
+    /// A refused read ended and its carrier removal was confirmed. This is
+    /// never completion; it only means nothing of this operation remains.
+    pub fn released(&self) -> bool {
+        use solstone_core_journal_io::media::{
+            ActivityCarrierRetirementEffect, Confirmation, Durability,
+        };
+        matches!(&*self.inner, OwnedDirectReadFinishInner::Released { retirement, .. }
+            if retirement.receipt.effect() == ActivityCarrierRetirementEffect::Removed
+                && retirement.receipt.root_durability() == Durability::Synced
+                && retirement.receipt.confirmation() == Confirmation::Confirmed
+                && retirement.receipt.failures().is_empty())
+    }
     pub fn reason(&self) -> Option<ReadbackError> {
         match &*self.inner {
             OwnedDirectReadFinishInner::BeforeRelease { reason, .. } => Some(*reason),
             OwnedDirectReadFinishInner::Shared { reason, .. } => Some(*reason),
+            OwnedDirectReadFinishInner::Refused { reason, .. }
+            | OwnedDirectReadFinishInner::Released { reason, .. } => Some(*reason),
             OwnedDirectReadFinishInner::Retired {
                 lifetime_failure: Some(reason),
                 ..
@@ -2760,8 +2876,10 @@ impl OwnedDirectReadFinish {
         match &*self.inner {
             OwnedDirectReadFinishInner::Unknown(owner)
             | OwnedDirectReadFinishInner::BeforeRelease { owner, .. }
-            | OwnedDirectReadFinishInner::Shared { owner, .. } => owner.journal_root(),
-            OwnedDirectReadFinishInner::Retired { retirement, .. } => {
+            | OwnedDirectReadFinishInner::Shared { owner, .. }
+            | OwnedDirectReadFinishInner::Refused { owner, .. } => owner.journal_root(),
+            OwnedDirectReadFinishInner::Retired { retirement, .. }
+            | OwnedDirectReadFinishInner::Released { retirement, .. } => {
                 retirement.owned.journal_root()
             }
         }
@@ -2770,8 +2888,10 @@ impl OwnedDirectReadFinish {
         match &*self.inner {
             OwnedDirectReadFinishInner::Unknown(owner)
             | OwnedDirectReadFinishInner::BeforeRelease { owner, .. }
-            | OwnedDirectReadFinishInner::Shared { owner, .. } => owner.owned_clock(),
-            OwnedDirectReadFinishInner::Retired { clock, .. } => clock,
+            | OwnedDirectReadFinishInner::Shared { owner, .. }
+            | OwnedDirectReadFinishInner::Refused { owner, .. } => owner.owned_clock(),
+            OwnedDirectReadFinishInner::Retired { clock, .. }
+            | OwnedDirectReadFinishInner::Released { clock, .. } => clock,
         }
     }
     pub fn retirement(
@@ -2782,7 +2902,8 @@ impl OwnedDirectReadFinish {
         >,
     > {
         match &*self.inner {
-            OwnedDirectReadFinishInner::Retired { retirement, .. } => Some(retirement),
+            OwnedDirectReadFinishInner::Retired { retirement, .. }
+            | OwnedDirectReadFinishInner::Released { retirement, .. } => Some(retirement),
             _ => None,
         }
     }
@@ -2847,6 +2968,23 @@ impl OwnedAdmittedArchiveHold {
         match &*self.inner {
             OwnedAdmittedArchiveHoldInner::Captured(capture) => capture.operation.owned_clock(),
             OwnedAdmittedArchiveHoldInner::Direct(read) => read.owned_clock(),
+        }
+    }
+    /// End an admitted creator that never submitted an archive writer and whose
+    /// every child was reaped. A captured runner archive holds: its children
+    /// carry no reap evidence.
+    pub fn release_unused(self) -> Result<(), Box<Self>> {
+        match *self.inner {
+            OwnedAdmittedArchiveHoldInner::Direct(read) => {
+                (*read).release_unused().map_err(|read| {
+                    Box::new(Self {
+                        inner: Box::new(OwnedAdmittedArchiveHoldInner::Direct(read)),
+                    })
+                })
+            }
+            inner => Err(Box::new(Self {
+                inner: Box::new(inner),
+            })),
         }
     }
 }
@@ -4261,6 +4399,59 @@ mod tests {
             // Dropping closed custody never certifies or retires the reservation.
             assert!(
                 !solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+                    .unwrap()
+                    .entries()
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn refused_finish_retires_only_an_unshared_carrier_and_never_completes() {
+            use solstone_core_backup::archive_readback::RefusedDirectRead;
+            let (_journal, root) = fixture();
+            let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+            let operation = PreparedArchiveOperation::prepare_owned(
+                Arc::clone(&root),
+                ArchiveBudget::new(clock.as_ref()).unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap();
+            let outside = |clock: &Arc<dyn Clock + Send + Sync>| DirectReadFinishOwner {
+                carrier: Arc::clone(operation.carrier()),
+                clock: Arc::clone(clock),
+                broker: DirectBrokerCompletion::CapturedByo,
+            };
+            let refused = || RefusedDirectRead::for_test(Arc::clone(&root), Arc::clone(&clock));
+            let path = operation.carrier().diagnostic_path();
+            // The read's own activity still shares the carrier.
+            let shared = outside(&clock).finish_refused(refused());
+            assert!(!shared.released());
+            assert_eq!(shared.state(), DirectReadFinishState::Held);
+            assert!(shared.retirement().is_none());
+            drop(shared);
+            // Another operation's clock never retires this carrier.
+            let other: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock);
+            let foreign = outside(&other).finish_refused(refused());
+            assert!(!foreign.released());
+            drop(foreign);
+            assert!(path.is_dir());
+            // Once the refused read's activity ended, its empty carrier retires.
+            let owner = outside(&clock);
+            drop(operation);
+            let released = owner.finish_refused(refused());
+            assert!(released.released());
+            assert_eq!(released.state(), DirectReadFinishState::Held);
+            assert_eq!(released.reason(), Some(ReadbackError::ToolFailed));
+            assert!(!path.exists());
+            assert!(matches!(
+                solstone_core_journal_io::activity::ActivityLease::try_acquire(Arc::clone(&root)),
+                Err(solstone_core_journal_io::activity::ActivityAdmissionError::Busy)
+            ));
+            drop(released);
+            solstone_core_journal_io::activity::ActivityLease::try_acquire(Arc::clone(&root))
+                .unwrap();
+            assert!(
+                solstone_core_journal_io::activity_obligations::observe_obligations(&root)
                     .unwrap()
                     .entries()
                     .is_empty()

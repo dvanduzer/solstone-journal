@@ -690,23 +690,21 @@ fn packaged_cancellation_entry() {
             ),
             Err(nix::errno::Errno::ECHILD)
         );
-        if mode == "dump" {
-            assert_eq!(failure.cleanup(), Cleanup::Refused);
-            let expected = match identity {
-                MediaIdentity::Unix { device, inode } => (device, inode),
-                _ => unreachable!(),
-            };
-            let media = operation.journal_root().canonical_path().join("media");
-            let retained = fs::read_dir(media).unwrap().any(|stage| {
-                fs::read_dir(stage.unwrap().path()).unwrap().any(|entry| {
-                    let metadata = entry.unwrap().metadata().unwrap();
-                    (metadata.dev(), metadata.ino()) == expected
-                })
-            });
-            assert!(retained, "cancelled dump retains the exact owned target");
-        } else {
-            assert_eq!(failure.cleanup(), Cleanup::Complete);
-        }
+        // The cancelled root was killed and reaped before the run returned, so
+        // even a launched dump's unpublished target is removed.
+        assert_eq!(failure.cleanup(), Cleanup::Complete);
+        let expected = match identity {
+            MediaIdentity::Unix { device, inode } => (device, inode),
+            _ => unreachable!(),
+        };
+        let media = operation.journal_root().canonical_path().join("media");
+        let retained = fs::read_dir(media).unwrap().any(|stage| {
+            fs::read_dir(stage.unwrap().path()).unwrap().any(|entry| {
+                let metadata = entry.unwrap().metadata().unwrap();
+                (metadata.dev(), metadata.ino()) == expected
+            })
+        });
+        assert!(!retained, "cancelled {mode} leaves no owned target");
         // The server remains blocked until after read_exact and root reap returned.
         control.write_all(b"r").unwrap();
         control.read_exact(&mut armed).unwrap();

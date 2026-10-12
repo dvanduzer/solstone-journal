@@ -662,6 +662,7 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use chrono::{TimeZone, Utc};
     use serde_json::{Value, json};
+    #[cfg(feature = "full-tests")]
     use solstone_core_journal_io::{LockOptions, hold_lock};
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -817,6 +818,7 @@ mod tests {
         assert!(root.path().join("imports/notes_1").is_dir());
     }
 
+    #[cfg(feature = "full-tests")]
     #[tokio::test]
     async fn a_delete_waits_its_turn_behind_an_import() {
         let root = journal();

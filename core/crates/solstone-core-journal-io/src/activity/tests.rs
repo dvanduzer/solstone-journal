@@ -419,7 +419,10 @@ fn entry_loss_after_raw_claim_preserves_effect_and_only_raw_copy() {
         Confirmation::Unverified
     );
     assert_eq!(removal.cleanup(), Cleanup::Refused);
-    assert_eq!(fs::read(path.join("source.flac")).unwrap(), b"abc");
+    assert_eq!(
+        fs::read(path.join(crate::media::REMOVAL_ORIGINAL_LEAF)).unwrap(),
+        b"abc"
+    );
     assert!(!f.live.diagnostic_path().join("source.flac").exists());
 }
 
@@ -455,7 +458,10 @@ fn entry_loss_during_claim_sync_refuses_the_following_delete() {
         Confirmation::Unverified
     );
     assert_eq!(removal.cleanup(), Cleanup::Refused);
-    assert_eq!(fs::read(path.join("source.flac")).unwrap(), b"abc");
+    assert_eq!(
+        fs::read(path.join(crate::media::REMOVAL_ORIGINAL_LEAF)).unwrap(),
+        b"abc"
+    );
 }
 
 #[cfg(unix)]

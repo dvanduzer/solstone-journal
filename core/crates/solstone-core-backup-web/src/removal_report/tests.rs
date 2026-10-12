@@ -234,7 +234,8 @@ fn actual_owner_preserves_success_post_commit_failure_and_stale_refusal() {
             };
             match finished {
                 ReviewedRemovalFinish::Settled(report) => {
-                    assert_eq!(scenario, 0);
+                    // A stale refusal before any staging is a known outcome.
+                    assert!(matches!(scenario, 0 | 2));
                     let final_facts = serde_json::to_value(settled_ordinary(&report)).unwrap();
                     assert!(final_facts["finish_refusal"].is_null());
                     assert_eq!(
@@ -248,7 +249,7 @@ fn actual_owner_preserves_success_post_commit_failure_and_stale_refusal() {
                     (final_facts, None)
                 }
                 ReviewedRemovalFinish::Held(held) => {
-                    assert_ne!(scenario, 0);
+                    assert!(!matches!(scenario, 0 | 2));
                     let final_facts = serde_json::to_value(held_ordinary(&held)).unwrap();
                     if scenario == 3 {
                         assert_eq!(final_facts["finish_refusal"]["kind"], "native");

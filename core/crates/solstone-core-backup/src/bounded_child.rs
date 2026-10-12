@@ -58,15 +58,18 @@ impl CompletedChild {
 
 pub(crate) struct ChildFailure {
     error: io::Error,
+    settled: bool,
 }
 
 impl ChildFailure {
-    fn new(error: io::Error) -> Self {
-        Self { error }
-    }
-
     fn into_error(self) -> io::Error {
         self.error
+    }
+
+    /// No child of this run is alive: none was spawned, or the failure came
+    /// after the group was killed and the root reaped.
+    pub(crate) fn settled(&self) -> bool {
+        self.settled
     }
 }
 
@@ -92,7 +95,7 @@ pub(crate) fn run_owned(
     capture_limit: Option<usize>,
     cancellation: Option<&ArchiveCancellation>,
 ) -> Result<CompletedChild, ChildFailure> {
-    execute(request, capture_limit, cancellation).map_err(ChildFailure::new)
+    execute(request, capture_limit, cancellation)
 }
 
 /// Fixed creator requests retain the same private completion and owned joins.
@@ -102,7 +105,6 @@ pub(crate) fn run_owned_archive_creator(
     cancellation: Option<&ArchiveCancellation>,
 ) -> Result<CompletedChild, ChildFailure> {
     execute_request(request, capture_limit, cancellation, ChildSetup::Creator)
-        .map_err(ChildFailure::new)
 }
 
 #[derive(Clone, Copy)]
@@ -136,6 +138,7 @@ pub(crate) fn run_owned_dns(
         Some(cancellation),
         ChildSetup::Dns(deadline),
     )
+    .map_err(ChildFailure::into_error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,7 +478,7 @@ fn execute(
     request: &Request<'_>,
     capture_limit: Option<usize>,
     cancellation: Option<&ArchiveCancellation>,
-) -> io::Result<CompletedChild> {
+) -> Result<CompletedChild, ChildFailure> {
     execute_request(request, capture_limit, cancellation, ChildSetup::Ordinary)
 }
 
@@ -484,6 +487,18 @@ fn execute_request(
     capture_limit: Option<usize>,
     cancellation: Option<&ArchiveCancellation>,
     setup: ChildSetup,
+) -> Result<CompletedChild, ChildFailure> {
+    let mut settled = true;
+    execute_tracked(request, capture_limit, cancellation, setup, &mut settled)
+        .map_err(|error| ChildFailure { error, settled })
+}
+
+fn execute_tracked(
+    request: &Request<'_>,
+    capture_limit: Option<usize>,
+    cancellation: Option<&ArchiveCancellation>,
+    setup: ChildSetup,
+    settled: &mut bool,
 ) -> io::Result<CompletedChild> {
     let dns_deadline: Option<Instant> = match setup {
         #[cfg(target_os = "linux")]
@@ -558,6 +573,7 @@ fn execute_request(
         ));
     }
     let child = command.spawn()?;
+    *settled = false;
     let pgid = Pid::from_raw(child.id() as i32);
     let mut session = SpawnedChild {
         child,
@@ -593,6 +609,8 @@ fn execute_request(
         session.stop_readers();
     }
     let (status, stdout, stderr) = complete_session(&mut session, None)?;
+    // The group was killed and the root reaped; later refusals leave nothing alive.
+    *settled = true;
     let stopped = stopped?;
     if cancellation.is_some_and(ArchiveCancellation::is_cancelled) {
         return Err(cancelled());
@@ -819,5 +837,36 @@ mod tests {
             fcntl(second.as_fd(), FcntlArg::F_GETFD).unwrap(),
             second_flags
         );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn unspawned_and_cancelled_reaped_runs_report_nothing_alive() {
+        let request = |program: &str, argv: &[&str]| Request {
+            program: program.into(),
+            argv: argv.iter().map(|value| (*value).into()).collect(),
+            env: BTreeMap::new(),
+            timeout: Some(Duration::from_secs(30)),
+            pass_fds: Vec::new(),
+        };
+        let missing = run_owned(&request("/nonexistent/program", &[]), None, None)
+            .err()
+            .unwrap();
+        assert!(missing.settled());
+        let cancellation = ArchiveCancellation::new();
+        let signal = cancellation.clone();
+        let started = Instant::now();
+        let cancelled = thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                signal.cancel();
+            });
+            run_owned(&request("/bin/sleep", &["30"]), None, Some(&cancellation))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(cancelled.error.kind(), io::ErrorKind::Interrupted);
+        assert!(cancelled.settled());
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

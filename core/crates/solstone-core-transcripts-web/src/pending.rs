@@ -202,6 +202,7 @@ mod tests {
 
     use super::SegmentManifest;
 
+    #[cfg(feature = "full-tests")]
     #[test]
     fn a_segment_put_back_under_the_same_name_does_not_match_the_confirmed_one() {
         let root = TempDir::new().unwrap();

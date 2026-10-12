@@ -96,9 +96,6 @@ fn phase(value: TeardownRunPhase) -> &'static str {
 
 fn run_refusal(value: &TeardownRunRefusal) -> Value {
     match value {
-        TeardownRunRefusal::NamespaceCooperationHeld => {
-            json!({"kind":"namespace_cooperation_held"})
-        }
         TeardownRunRefusal::UnsupportedPlatform => json!({"kind":"unsupported_platform"}),
         TeardownRunRefusal::UnsupportedDestination => json!({"kind":"unsupported_destination"}),
         TeardownRunRefusal::Root(_) => json!({"kind":"root"}),
@@ -154,6 +151,8 @@ fn admission(value: TeardownAdmissionRefusal) -> Value {
         }
         TeardownAdmissionRefusal::Reader(reason) => json!({"kind":"reader", "reason":match reason {
             TeardownReaderRefusal::CatalogUnavailable => "catalog_unavailable", TeardownReaderRefusal::RecoveryUnavailable => "recovery_unavailable", TeardownReaderRefusal::RecoveryHeld => "recovery_held",
+            TeardownReaderRefusal::BackupOnlyHeld => "backup_only_held",
+            TeardownReaderRefusal::BackupOnlyUnplaced => "backup_only_unplaced",
         }}),
     }
 }

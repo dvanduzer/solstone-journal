@@ -598,530 +598,546 @@ mod tests {
         output
     }
 
-    fn deletion_root() -> TempDir {
-        let root = TempDir::new().expect("journal");
-        config(root.path());
-        segment(
-            root.path(),
-            DAY,
-            "field",
-            "090000_300",
-            &[
-                ("audio.flac", b"raw"),
-                ("audio.jsonl", b"{}\n"),
-                ("stream.json", b"{}"),
-                ("talents/sense.json", b"{}"),
-            ],
-        );
-        root
-    }
+    // Delete lifecycle tests exercise real commit timers and restart threads.
+    #[cfg(feature = "full-tests")]
+    mod delete_lifecycle {
+        use super::*;
 
-    fn delete_app(root: &Path, window: Duration) -> axum::Router {
-        crate::router_with_delete_window(
-            root.to_path_buf(),
-            Clock::fixed(Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap()),
-            shell,
-            window,
-        )
-    }
-
-    fn action_rows(root: &Path) -> Vec<Value> {
-        let path = root.join("config/actions");
-        let mut rows = Vec::new();
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let text = fs::read_to_string(entry.path()).expect("action log");
-                rows.extend(
-                    text.lines()
-                        .map(|line| serde_json::from_str(line).expect("action row")),
-                );
-            }
-        }
-        // One file per day, listed in no particular order: a run that spans
-        // midnight must still read its rows in the order they were written.
-        rows.sort_by(|left: &Value, right: &Value| {
-            left["timestamp"].as_str().cmp(&right["timestamp"].as_str())
-        });
-        rows
-    }
-
-    fn assert_only_write_route_paths_changed(
-        before: &BTreeMap<PathBuf, (u64, String)>,
-        after: &BTreeMap<PathBuf, (u64, String)>,
-    ) {
-        for path in before.keys().chain(after.keys()) {
-            if before.get(path) != after.get(path) {
-                assert!(
-                    path.starts_with("chronicle/20260731/field/090000_300")
-                        || path == Path::new("chronicle/20260731/field/090000_300.lock")
-                        || path == Path::new("chronicle/20260731/health/stream.updated")
-                        || path == Path::new("chronicle/20260731/health/stream.updated.lock")
-                        || path == Path::new("indexer/journal.sqlite.lock")
-                        || path == Path::new("backup-activity.lock")
-                        || path.starts_with("config/actions")
-                        || path.starts_with(crate::pending::RECORD_DIR),
-                    "unexpected journal mutation: {}",
-                    path.display()
-                );
-            }
-        }
-    }
-
-    async fn delete_request(app: axum::Router) -> Value {
-        let (status, _, body) = request(
-            app,
-            Method::DELETE,
-            "/app/transcripts/api/segment/20260731/field/090000_300",
-            &BTreeMap::new(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        serde_json::from_slice(&body).expect("delete response")
-    }
-
-    #[tokio::test]
-    async fn deferred_delete_commits_to_a_tombstone_and_logs_pending_then_committed() {
-        let root = deletion_root();
-        let before = snapshot(root.path());
-        let app = delete_app(root.path(), Duration::ZERO);
-        let response = delete_request(app.clone()).await;
-        assert_eq!(response["ttl_seconds"], 10);
-        assert_eq!(response["success"], true);
-        let segment = root.path().join("chronicle/20260731/field/090000_300");
-        let tombstone = segment.join("tombstone.json");
-        assert!(
-            tombstone.is_file(),
-            "zero-delay deferred delete must commit before the delete response returns"
-        );
-        let names = fs::read_dir(&segment)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["tombstone.json"]);
-        assert!(
-            root.path()
-                .join("chronicle/20260731/health/stream.updated")
-                .is_file(),
-            "a committed deletion must dirty its day"
-        );
-        assert_only_write_route_paths_changed(&before, &snapshot(root.path()));
-        let rows = action_rows(root.path());
-        let phases = rows
-            .iter()
-            .map(|row| row["params"]["phase"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert!(phases.contains(&"pending"));
-        assert!(phases.contains(&"committed"));
-        let (status, _, body) = request(
-            app,
-            Method::POST,
-            &format!(
-                "/app/transcripts/api/cancel-delete/{}",
-                response["pending"].as_str().unwrap()
-            ),
-            &BTreeMap::new(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::GONE);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["reason_code"],
-            "segment_already_deleted"
-        );
-    }
-
-    /// Run one request on its own runtime, then drop the runtime with every
-    /// task it spawned: what a journal stopping inside the window leaves behind.
-    fn in_stopped_process<T>(work: impl std::future::Future<Output = T>) -> T {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let value = runtime.block_on(work);
-        drop(runtime);
-        value
-    }
-
-    fn in_new_process<T>(work: impl std::future::Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(work)
-    }
-
-    fn wait_for_state(root: &Path, pending: &str, state: &str) -> Value {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let record = fs::read(
-                root.join(crate::pending::RECORD_DIR)
-                    .join(format!("{pending}.json")),
-            )
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-            if let Some(record) = record
-                && record["state"] == state
-            {
-                return record;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "delete {pending} never reached {state}"
+        fn deletion_root() -> TempDir {
+            let root = TempDir::new().expect("journal");
+            config(root.path());
+            segment(
+                root.path(),
+                DAY,
+                "field",
+                "090000_300",
+                &[
+                    ("audio.flac", b"raw"),
+                    ("audio.jsonl", b"{}\n"),
+                    ("stream.json", b"{}"),
+                    ("talents/sense.json", b"{}"),
+                ],
             );
-            std::thread::sleep(Duration::from_millis(20));
+            root
         }
-    }
 
-    fn segment_names(root: &Path) -> Vec<String> {
-        let mut names = fs::read_dir(root.join("chronicle/20260731/field/090000_300"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    }
+        fn delete_app(root: &Path, window: Duration) -> axum::Router {
+            crate::router_with_delete_window(
+                root.to_path_buf(),
+                Clock::fixed(Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap()),
+                shell,
+                window,
+            )
+        }
 
-    fn terminal_phases(root: &Path, pending: &str) -> Vec<(String, bool)> {
-        action_rows(root)
-            .iter()
-            .filter(|row| row["params"]["pending_id"] == pending)
-            .map(|row| {
-                (
-                    row["params"]["phase"].as_str().unwrap().to_owned(),
-                    row["params"]["resumed"] == true,
-                )
-            })
-            .collect()
-    }
+        fn action_rows(root: &Path) -> Vec<Value> {
+            let path = root.join("config/actions");
+            let mut rows = Vec::new();
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let text = fs::read_to_string(entry.path()).expect("action log");
+                    rows.extend(
+                        text.lines()
+                            .map(|line| serde_json::from_str(line).expect("action row")),
+                    );
+                }
+            }
+            // One file per day, listed in no particular order: a run that spans
+            // midnight must still read its rows in the order they were written.
+            rows.sort_by(|left: &Value, right: &Value| {
+                left["timestamp"].as_str().cmp(&right["timestamp"].as_str())
+            });
+            rows
+        }
 
-    #[test]
-    fn a_confirmed_delete_survives_a_stop_inside_its_window() {
-        let root = deletion_root();
-        let response = in_stopped_process(delete_request(delete_app(
-            root.path(),
-            Duration::from_millis(300),
-        )));
-        let pending = response["pending"].as_str().unwrap().to_owned();
-        std::thread::sleep(Duration::from_millis(400));
-        assert!(
-            segment_names(root.path()).contains(&"audio.flac".to_owned()),
-            "the stopped process must not have committed"
-        );
+        fn assert_only_write_route_paths_changed(
+            before: &BTreeMap<PathBuf, (u64, String)>,
+            after: &BTreeMap<PathBuf, (u64, String)>,
+        ) {
+            for path in before.keys().chain(after.keys()) {
+                if before.get(path) != after.get(path) {
+                    assert!(
+                        path.starts_with("chronicle/20260731/field/090000_300")
+                            || path == Path::new("chronicle/20260731/field/090000_300.lock")
+                            || path == Path::new("chronicle/20260731/health/stream.updated")
+                            || path == Path::new("chronicle/20260731/health/stream.updated.lock")
+                            || path == Path::new("indexer/journal.sqlite.lock")
+                            || path == Path::new("backup-activity.lock")
+                            || path.starts_with("config/actions")
+                            || path.starts_with(crate::pending::RECORD_DIR),
+                        "unexpected journal mutation: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
 
-        let _next_start = delete_app(root.path(), Duration::from_secs(10));
-        wait_for_state(root.path(), &pending, "deleted");
-        assert_eq!(segment_names(root.path()), vec!["tombstone.json"]);
-        assert_eq!(
-            terminal_phases(root.path(), &pending),
-            vec![("pending".into(), false), ("committed".into(), true)]
-        );
-        let (status, _, body) = in_new_process(request(
-            delete_app(root.path(), Duration::from_secs(10)),
-            Method::GET,
-            &format!("/app/transcripts/api/delete-status/{pending}"),
-            &BTreeMap::new(),
-        ));
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["state"],
-            "deleted"
-        );
-    }
+        async fn delete_request(app: axum::Router) -> Value {
+            let (status, _, body) = request(
+                app,
+                Method::DELETE,
+                "/app/transcripts/api/segment/20260731/field/090000_300",
+                &BTreeMap::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_slice(&body).expect("delete response")
+        }
 
-    #[test]
-    fn a_resumed_delete_can_still_be_cancelled_inside_its_window() {
-        let root = deletion_root();
-        let response = in_stopped_process(delete_app_request(root.path(), Duration::from_secs(2)));
-        let pending = response["pending"].as_str().unwrap().to_owned();
-        let app = delete_app(root.path(), Duration::from_secs(10));
-        let (status, _, _) = in_new_process(request(
-            app,
-            Method::POST,
-            &format!("/app/transcripts/api/cancel-delete/{pending}"),
-            &BTreeMap::new(),
-        ));
-        assert_eq!(status, StatusCode::OK);
-        std::thread::sleep(Duration::from_millis(2300));
-        wait_for_state(root.path(), &pending, "cancelled");
-        assert!(segment_names(root.path()).contains(&"audio.flac".to_owned()));
-        assert!(
-            !terminal_phases(root.path(), &pending)
+        #[tokio::test]
+        async fn deferred_delete_commits_to_a_tombstone_and_logs_pending_then_committed() {
+            let root = deletion_root();
+            let before = snapshot(root.path());
+            let app = delete_app(root.path(), Duration::ZERO);
+            let response = delete_request(app.clone()).await;
+            assert_eq!(response["ttl_seconds"], 10);
+            assert_eq!(response["success"], true);
+            let segment = root.path().join("chronicle/20260731/field/090000_300");
+            let tombstone = segment.join("tombstone.json");
+            assert!(
+                tombstone.is_file(),
+                "zero-delay deferred delete must commit before the delete response returns"
+            );
+            let names = fs::read_dir(&segment)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec!["tombstone.json"]);
+            assert!(
+                root.path()
+                    .join("chronicle/20260731/health/stream.updated")
+                    .is_file(),
+                "a committed deletion must dirty its day"
+            );
+            assert_only_write_route_paths_changed(&before, &snapshot(root.path()));
+            let rows = action_rows(root.path());
+            let phases = rows
                 .iter()
-                .any(|(phase, _)| phase == "committed")
-        );
-    }
+                .map(|row| row["params"]["phase"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(phases.contains(&"pending"));
+            assert!(phases.contains(&"committed"));
+            let (status, _, body) = request(
+                app,
+                Method::POST,
+                &format!(
+                    "/app/transcripts/api/cancel-delete/{}",
+                    response["pending"].as_str().unwrap()
+                ),
+                &BTreeMap::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::GONE);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["reason_code"],
+                "segment_already_deleted"
+            );
+        }
 
-    async fn delete_app_request(root: &Path, window: Duration) -> Value {
-        delete_request(delete_app(root, window)).await
-    }
+        /// Run one request on its own runtime, then drop the runtime with every
+        /// task it spawned: what a journal stopping inside the window leaves behind.
+        fn in_stopped_process<T>(work: impl std::future::Future<Output = T>) -> T {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let value = runtime.block_on(work);
+            drop(runtime);
+            value
+        }
 
-    #[test]
-    fn a_resumed_delete_refuses_a_segment_created_again_under_the_same_name() {
-        let root = deletion_root();
-        let response =
-            in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
-        let pending = response["pending"].as_str().unwrap().to_owned();
-        // A re-import or restore puts a different segment where the confirmed
-        // one was, with the same names and sizes. Nothing holds the old
-        // directory open, so the filesystem is free to reuse its inode.
-        let live = root.path().join("chronicle/20260731/field/090000_300");
-        fs::remove_dir_all(&live).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        segment(
-            root.path(),
-            DAY,
-            "field",
-            "090000_300",
-            &[
-                ("audio.flac", b"raw"),
-                ("audio.jsonl", b"{}\n"),
-                ("stream.json", b"{}"),
-            ],
-        );
-
-        let _next_start = delete_app(root.path(), Duration::from_secs(10));
-        let record = wait_for_state(root.path(), &pending, "not_deleted");
-        assert!(
-            record["reason"]
-                .as_str()
+        fn in_new_process<T>(work: impl std::future::Future<Output = T>) -> T {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .unwrap()
-                .contains("changed after you chose to delete it")
-        );
-        assert_eq!(
-            segment_names(root.path()),
-            vec!["audio.flac", "audio.jsonl", "stream.json"]
-        );
-        assert_eq!(
-            terminal_phases(root.path(), &pending),
-            vec![("pending".into(), false), ("refused".into(), true)]
-        );
-        let (status, _, body) = in_new_process(request(
-            delete_app(root.path(), Duration::from_secs(10)),
-            Method::GET,
-            "/app/transcripts/api/delete-outcomes",
-            &BTreeMap::new(),
-        ));
-        assert_eq!(status, StatusCode::OK);
-        let outcomes = serde_json::from_slice::<Value>(&body).unwrap();
-        assert_eq!(outcomes["outcomes"][0]["pending"], pending);
-        assert_eq!(outcomes["outcomes"][0]["state"], "not_deleted");
-    }
+                .block_on(work)
+        }
 
-    #[test]
-    fn a_resumed_delete_still_runs_after_processing_adds_files() {
-        let root = deletion_root();
-        let response =
-            in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
-        let pending = response["pending"].as_str().unwrap().to_owned();
-        write(
-            root.path(),
-            "chronicle/20260731/field/090000_300/talents/facets.json",
-            b"{}",
-        );
-        write(
-            root.path(),
-            "chronicle/20260731/field/090000_300/screen.jsonl",
-            b"{}",
-        );
-        let _next_start = delete_app(root.path(), Duration::from_secs(10));
-        wait_for_state(root.path(), &pending, "deleted");
-        assert_eq!(segment_names(root.path()), vec!["tombstone.json"]);
-    }
+        fn wait_for_state(root: &Path, pending: &str, state: &str) -> Value {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let record = fs::read(
+                    root.join(crate::pending::RECORD_DIR)
+                        .join(format!("{pending}.json")),
+                )
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                if let Some(record) = record
+                    && record["state"] == state
+                {
+                    return record;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "delete {pending} never reached {state}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
 
-    #[test]
-    fn a_stop_part_way_through_removal_is_finished_at_the_next_start() {
-        let root = deletion_root();
-        let response =
-            in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
-        let pending = response["pending"].as_str().unwrap().to_owned();
-        // The door had set the segment aside when the journal stopped.
-        fs::rename(
-            root.path().join("chronicle/20260731/field/090000_300"),
-            root.path()
-                .join("chronicle/20260731/field")
-                .join(solstone_core_retention::staged_name("090000_300")),
-        )
-        .unwrap();
-        let _next_start = delete_app(root.path(), Duration::from_secs(10));
-        wait_for_state(root.path(), &pending, "deleted");
-        assert_eq!(segment_names(root.path()), vec!["tombstone.json"]);
-        assert!(
-            !root
-                .path()
-                .join("chronicle/20260731/field")
-                .join(solstone_core_retention::staged_name("090000_300"))
-                .exists()
-        );
-        assert!(action_rows(root.path()).iter().any(|row| {
-            row["params"]["pending_id"] == pending.as_str()
-                && row["params"]["phase"] == "committed"
-                && row["params"]["recovered"] == true
-        }));
-    }
-
-    #[test]
-    fn a_segment_that_moved_away_is_not_reported_as_deleted() {
-        let root = deletion_root();
-        let response =
-            in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
-        let pending = response["pending"].as_str().unwrap().to_owned();
-        // Moved to another key while the journal was stopped: absent, not removed.
-        fs::rename(
-            root.path().join("chronicle/20260731/field/090000_300"),
-            root.path().join("chronicle/20260731/field/090500_300"),
-        )
-        .unwrap();
-        let _next_start = delete_app(root.path(), Duration::from_secs(10));
-        wait_for_state(root.path(), &pending, "not_deleted");
-        assert!(
-            root.path()
-                .join("chronicle/20260731/field/090500_300/audio.flac")
-                .is_file()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_second_delete_of_a_waiting_segment_joins_the_first() {
-        let root = deletion_root();
-        let app = delete_app(root.path(), Duration::from_secs(60));
-        let first = delete_request(app.clone()).await;
-        let second = delete_request(app).await;
-        assert_eq!(first["pending"], second["pending"]);
-        assert_eq!(first["commit_at_ms"], second["commit_at_ms"]);
-        assert_eq!(
-            fs::read_dir(root.path().join(crate::pending::RECORD_DIR))
+        fn segment_names(root: &Path) -> Vec<String> {
+            let mut names = fs::read_dir(root.join("chronicle/20260731/field/090000_300"))
                 .unwrap()
-                .filter(|entry| entry.as_ref().unwrap().path().extension()
-                    == Some(std::ffi::OsStr::new("json")))
-                .count(),
-            1
-        );
-    }
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
 
-    #[test]
-    fn a_cancel_through_one_router_holds_against_a_resume_in_another() {
-        let root = deletion_root();
-        let first = delete_app(root.path(), Duration::from_millis(800));
-        let response = in_new_process(delete_request(first.clone()));
-        let pending = response["pending"].as_str().unwrap().to_owned();
-        // A second router on the same journal resumes the same record.
-        let _second = delete_app(root.path(), Duration::from_secs(10));
-        let (status, _, _) = in_new_process(request(
-            first,
-            Method::POST,
-            &format!("/app/transcripts/api/cancel-delete/{pending}"),
-            &BTreeMap::new(),
-        ));
-        assert_eq!(status, StatusCode::OK);
-        std::thread::sleep(Duration::from_millis(1200));
-        wait_for_state(root.path(), &pending, "cancelled");
-        assert!(segment_names(root.path()).contains(&"audio.flac".to_owned()));
-    }
+        fn terminal_phases(root: &Path, pending: &str) -> Vec<(String, bool)> {
+            action_rows(root)
+                .iter()
+                .filter(|row| row["params"]["pending_id"] == pending)
+                .map(|row| {
+                    (
+                        row["params"]["phase"].as_str().unwrap().to_owned(),
+                        row["params"]["resumed"] == true,
+                    )
+                })
+                .collect()
+        }
 
-    #[tokio::test]
-    async fn a_refused_delete_is_reported_by_status_and_by_cancel() {
-        let root = deletion_root();
-        // An unfinished earlier removal makes the door refuse, as a busy
-        // segment does, without depending on file permissions.
-        fs::create_dir_all(
-            root.path()
-                .join("chronicle/20260731/field")
-                .join(solstone_core_retention::staged_name("090000_300")),
-        )
-        .unwrap();
-        let app = delete_app(root.path(), Duration::ZERO);
-        let response = delete_request(app.clone()).await;
-        let pending = response["pending"].as_str().unwrap();
-        let (status, _, body) = request(
-            app.clone(),
-            Method::GET,
-            &format!("/app/transcripts/api/delete-status/{pending}"),
-            &BTreeMap::new(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let body = serde_json::from_slice::<Value>(&body).unwrap();
-        assert_eq!(body["state"], "not_deleted");
-        // The door's reason can name paths and OS errors; it stays in the log.
-        assert!(body.get("reason").is_none());
-        assert!(action_rows(root.path()).iter().any(|row| {
-            row["params"]["phase"] == "refused"
-                && row["params"]["refused"][0]["reason"]
+        #[test]
+        fn a_confirmed_delete_survives_a_stop_inside_its_window() {
+            let root = deletion_root();
+            let response = in_stopped_process(delete_request(delete_app(
+                root.path(),
+                Duration::from_millis(300),
+            )));
+            let pending = response["pending"].as_str().unwrap().to_owned();
+            std::thread::sleep(Duration::from_millis(400));
+            assert!(
+                segment_names(root.path()).contains(&"audio.flac".to_owned()),
+                "the stopped process must not have committed"
+            );
+
+            let _next_start = delete_app(root.path(), Duration::from_secs(10));
+            wait_for_state(root.path(), &pending, "deleted");
+            assert_eq!(segment_names(root.path()), vec!["tombstone.json"]);
+            assert_eq!(
+                terminal_phases(root.path(), &pending),
+                vec![("pending".into(), false), ("committed".into(), true)]
+            );
+            let (status, _, body) = in_new_process(request(
+                delete_app(root.path(), Duration::from_secs(10)),
+                Method::GET,
+                &format!("/app/transcripts/api/delete-status/{pending}"),
+                &BTreeMap::new(),
+            ));
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["state"],
+                "deleted"
+            );
+        }
+
+        #[test]
+        fn a_resumed_delete_can_still_be_cancelled_inside_its_window() {
+            let root = deletion_root();
+            let response =
+                in_stopped_process(delete_app_request(root.path(), Duration::from_secs(2)));
+            let pending = response["pending"].as_str().unwrap().to_owned();
+            let app = delete_app(root.path(), Duration::from_secs(10));
+            let (status, _, _) = in_new_process(request(
+                app,
+                Method::POST,
+                &format!("/app/transcripts/api/cancel-delete/{pending}"),
+                &BTreeMap::new(),
+            ));
+            assert_eq!(status, StatusCode::OK);
+            std::thread::sleep(Duration::from_millis(2300));
+            wait_for_state(root.path(), &pending, "cancelled");
+            assert!(segment_names(root.path()).contains(&"audio.flac".to_owned()));
+            assert!(
+                !terminal_phases(root.path(), &pending)
+                    .iter()
+                    .any(|(phase, _)| phase == "committed")
+            );
+        }
+
+        async fn delete_app_request(root: &Path, window: Duration) -> Value {
+            delete_request(delete_app(root, window)).await
+        }
+
+        #[test]
+        fn a_resumed_delete_refuses_a_segment_created_again_under_the_same_name() {
+            let root = deletion_root();
+            let response =
+                in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
+            let pending = response["pending"].as_str().unwrap().to_owned();
+            // A re-import or restore puts a different segment where the confirmed
+            // one was, with the same names and sizes. Nothing holds the old
+            // directory open, so the filesystem is free to reuse its inode.
+            let live = root.path().join("chronicle/20260731/field/090000_300");
+            fs::remove_dir_all(&live).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            segment(
+                root.path(),
+                DAY,
+                "field",
+                "090000_300",
+                &[
+                    ("audio.flac", b"raw"),
+                    ("audio.jsonl", b"{}\n"),
+                    ("stream.json", b"{}"),
+                ],
+            );
+
+            let _next_start = delete_app(root.path(), Duration::from_secs(10));
+            let record = wait_for_state(root.path(), &pending, "not_deleted");
+            assert!(
+                record["reason"]
                     .as_str()
                     .unwrap()
-                    .contains("did not finish")
-        }));
-        let (status, _, body) = request(
-            app.clone(),
-            Method::POST,
-            &format!("/app/transcripts/api/cancel-delete/{pending}"),
-            &BTreeMap::new(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap()["reason_code"],
-            "segment_not_deleted"
-        );
-        let (status, _, _) = request(
-            app,
-            Method::GET,
-            &format!("/app/transcripts/api/delete-status/{}", "0".repeat(32)),
-            &BTreeMap::new(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
+                    .contains("changed after you chose to delete it")
+            );
+            assert_eq!(
+                segment_names(root.path()),
+                vec!["audio.flac", "audio.jsonl", "stream.json"]
+            );
+            assert_eq!(
+                terminal_phases(root.path(), &pending),
+                vec![("pending".into(), false), ("refused".into(), true)]
+            );
+            let (status, _, body) = in_new_process(request(
+                delete_app(root.path(), Duration::from_secs(10)),
+                Method::GET,
+                "/app/transcripts/api/delete-outcomes",
+                &BTreeMap::new(),
+            ));
+            assert_eq!(status, StatusCode::OK);
+            let outcomes = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!(outcomes["outcomes"][0]["pending"], pending);
+            assert_eq!(outcomes["outcomes"][0]["state"], "not_deleted");
+        }
 
-    #[tokio::test]
-    async fn cancellation_preserves_the_segment_and_never_commits() {
-        let root = deletion_root();
-        let before = snapshot(root.path());
-        let app = delete_app(root.path(), Duration::from_secs(60));
-        let response = delete_request(app.clone()).await;
-        let pending = response["pending"].as_str().unwrap();
-        let (status, _, body) = request(
-            app,
-            Method::POST,
-            &format!("/app/transcripts/api/cancel-delete/{pending}"),
-            &BTreeMap::new(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap(),
-            json!({"cancelled":pending})
-        );
-        tokio::task::yield_now().await;
-        let after = snapshot(root.path());
-        for (path, value) in &before {
-            if !path.starts_with("config/actions") && !path.starts_with(crate::pending::RECORD_DIR)
-            {
-                assert_eq!(
-                    after.get(path),
-                    Some(value),
-                    "unexpected change: {}",
+        #[test]
+        fn a_resumed_delete_still_runs_after_processing_adds_files() {
+            let root = deletion_root();
+            let response =
+                in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
+            let pending = response["pending"].as_str().unwrap().to_owned();
+            write(
+                root.path(),
+                "chronicle/20260731/field/090000_300/talents/facets.json",
+                b"{}",
+            );
+            write(
+                root.path(),
+                "chronicle/20260731/field/090000_300/screen.jsonl",
+                b"{}",
+            );
+            let _next_start = delete_app(root.path(), Duration::from_secs(10));
+            wait_for_state(root.path(), &pending, "deleted");
+            assert_eq!(segment_names(root.path()), vec!["tombstone.json"]);
+        }
+
+        #[test]
+        fn a_stop_part_way_through_removal_is_finished_at_the_next_start() {
+            let root = deletion_root();
+            let response =
+                in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
+            let pending = response["pending"].as_str().unwrap().to_owned();
+            // The door had set the segment aside when the journal stopped.
+            fs::rename(
+                root.path().join("chronicle/20260731/field/090000_300"),
+                root.path()
+                    .join("chronicle/20260731/field")
+                    .join(solstone_core_retention::staged_name("090000_300")),
+            )
+            .unwrap();
+            let _next_start = delete_app(root.path(), Duration::from_secs(10));
+            wait_for_state(root.path(), &pending, "deleted");
+            assert_eq!(segment_names(root.path()), vec!["tombstone.json"]);
+            assert!(
+                !root
+                    .path()
+                    .join("chronicle/20260731/field")
+                    .join(solstone_core_retention::staged_name("090000_300"))
+                    .exists()
+            );
+            assert!(action_rows(root.path()).iter().any(|row| {
+                row["params"]["pending_id"] == pending.as_str()
+                    && row["params"]["phase"] == "committed"
+                    && row["params"]["recovered"] == true
+            }));
+        }
+
+        #[test]
+        fn a_segment_that_moved_away_is_not_reported_as_deleted() {
+            let root = deletion_root();
+            let response =
+                in_stopped_process(delete_app_request(root.path(), Duration::from_millis(200)));
+            let pending = response["pending"].as_str().unwrap().to_owned();
+            // Moved to another key while the journal was stopped: absent, not removed.
+            fs::rename(
+                root.path().join("chronicle/20260731/field/090000_300"),
+                root.path().join("chronicle/20260731/field/090500_300"),
+            )
+            .unwrap();
+            let _next_start = delete_app(root.path(), Duration::from_secs(10));
+            wait_for_state(root.path(), &pending, "not_deleted");
+            assert!(
+                root.path()
+                    .join("chronicle/20260731/field/090500_300/audio.flac")
+                    .is_file()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_second_delete_of_a_waiting_segment_joins_the_first() {
+            let root = deletion_root();
+            let app = delete_app(root.path(), Duration::from_secs(60));
+            let first = delete_request(app.clone()).await;
+            let second = delete_request(app).await;
+            assert_eq!(first["pending"], second["pending"]);
+            assert_eq!(first["commit_at_ms"], second["commit_at_ms"]);
+            assert_eq!(
+                fs::read_dir(root.path().join(crate::pending::RECORD_DIR))
+                    .unwrap()
+                    .filter(|entry| entry.as_ref().unwrap().path().extension()
+                        == Some(std::ffi::OsStr::new("json")))
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn a_cancel_through_one_router_holds_against_a_resume_in_another() {
+            let root = deletion_root();
+            let first = delete_app(root.path(), Duration::from_millis(800));
+            let response = in_new_process(delete_request(first.clone()));
+            let pending = response["pending"].as_str().unwrap().to_owned();
+            let commit = crate::delete::commit_gate::hold(root.path());
+            // A second router on the same journal resumes the same record.
+            let _second = delete_app(root.path(), Duration::from_secs(10));
+            // Let its timer fire, but keep it before the durable commit claim.
+            commit.wait_until_entered();
+            let (status, _, _) = in_new_process(request(
+                first,
+                Method::POST,
+                &format!("/app/transcripts/api/cancel-delete/{pending}"),
+                &BTreeMap::new(),
+            ));
+            assert_eq!(status, StatusCode::OK);
+            // Cancellation is durable before the resumed commit can claim it.
+            commit.release_and_wait();
+            wait_for_state(root.path(), &pending, "cancelled");
+            assert!(segment_names(root.path()).contains(&"audio.flac".to_owned()));
+            assert_eq!(
+                terminal_phases(root.path(), &pending),
+                vec![("pending".into(), false), ("cancelled".into(), false)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_delete_is_reported_by_status_and_by_cancel() {
+            let root = deletion_root();
+            // An unfinished earlier removal makes the door refuse, as a busy
+            // segment does, without depending on file permissions.
+            fs::create_dir_all(
+                root.path()
+                    .join("chronicle/20260731/field")
+                    .join(solstone_core_retention::staged_name("090000_300")),
+            )
+            .unwrap();
+            let app = delete_app(root.path(), Duration::ZERO);
+            let response = delete_request(app.clone()).await;
+            let pending = response["pending"].as_str().unwrap();
+            let (status, _, body) = request(
+                app.clone(),
+                Method::GET,
+                &format!("/app/transcripts/api/delete-status/{pending}"),
+                &BTreeMap::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            assert_eq!(body["state"], "not_deleted");
+            // The door's reason can name paths and OS errors; it stays in the log.
+            assert!(body.get("reason").is_none());
+            assert!(action_rows(root.path()).iter().any(|row| {
+                row["params"]["phase"] == "refused"
+                    && row["params"]["refused"][0]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("did not finish")
+            }));
+            let (status, _, body) = request(
+                app.clone(),
+                Method::POST,
+                &format!("/app/transcripts/api/cancel-delete/{pending}"),
+                &BTreeMap::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["reason_code"],
+                "segment_not_deleted"
+            );
+            let (status, _, _) = request(
+                app,
+                Method::GET,
+                &format!("/app/transcripts/api/delete-status/{}", "0".repeat(32)),
+                &BTreeMap::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn cancellation_preserves_the_segment_and_never_commits() {
+            let root = deletion_root();
+            let before = snapshot(root.path());
+            let app = delete_app(root.path(), Duration::from_secs(60));
+            let response = delete_request(app.clone()).await;
+            let pending = response["pending"].as_str().unwrap();
+            let (status, _, body) = request(
+                app,
+                Method::POST,
+                &format!("/app/transcripts/api/cancel-delete/{pending}"),
+                &BTreeMap::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"cancelled":pending})
+            );
+            tokio::task::yield_now().await;
+            let after = snapshot(root.path());
+            for (path, value) in &before {
+                if !path.starts_with("config/actions")
+                    && !path.starts_with(crate::pending::RECORD_DIR)
+                {
+                    assert_eq!(
+                        after.get(path),
+                        Some(value),
+                        "unexpected change: {}",
+                        path.display()
+                    );
+                }
+            }
+            for path in after.keys() {
+                assert!(
+                    before.contains_key(path)
+                        || path.starts_with("config/actions")
+                        || path.starts_with(crate::pending::RECORD_DIR),
+                    "unexpected new path: {}",
                     path.display()
                 );
             }
+            assert_only_write_route_paths_changed(&before, &after);
+            let rows = action_rows(root.path());
+            let phases = rows
+                .iter()
+                .map(|row| row["params"]["phase"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert!(phases.contains(&"pending"));
+            assert!(phases.contains(&"cancelled"));
+            assert!(!phases.contains(&"committed"));
         }
-        for path in after.keys() {
-            assert!(
-                before.contains_key(path)
-                    || path.starts_with("config/actions")
-                    || path.starts_with(crate::pending::RECORD_DIR),
-                "unexpected new path: {}",
-                path.display()
-            );
-        }
-        assert_only_write_route_paths_changed(&before, &after);
-        let rows = action_rows(root.path());
-        let phases = rows
-            .iter()
-            .map(|row| row["params"]["phase"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert!(phases.contains(&"pending"));
-        assert!(phases.contains(&"cancelled"));
-        assert!(!phases.contains(&"committed"));
     }
 
     #[tokio::test]

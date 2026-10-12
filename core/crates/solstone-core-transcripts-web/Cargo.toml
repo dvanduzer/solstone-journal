@@ -10,6 +10,9 @@ license.workspace = true
 publish = false
 build = "build.rs"
 
+[features]
+full-tests = []
+
 [lints]
 workspace = true
 

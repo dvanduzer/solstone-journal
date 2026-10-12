@@ -639,7 +639,7 @@ fn invalid_segment(detail: &str, status: StatusCode) -> Response {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;

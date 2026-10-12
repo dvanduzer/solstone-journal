@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Withdraw currently kept empty-audio offers through the retained register.
+//! Withdraw currently kept empty-audio offers and legacy unbound offload marks
+//! through the retained register.
 
 use std::sync::Arc;
 
@@ -16,7 +17,6 @@ use crate::marks::{Mark, Register};
 #[derive(Debug)]
 pub enum OffloadReconciliationDisposition {
     Unchanged,
-    Unbound,
     Busy,
     Refused(Box<OffloadOfferRefusal>),
     Publication {
@@ -123,7 +123,8 @@ impl OffloadReconciliationFailure {
 }
 
 /// Reconcile before considering the budget, using the original preparation.
-/// Only current kept empty audio is withdrawn; no archive or raw file changes.
+/// Only current kept empty audio and legacy unbound offload marks are
+/// withdrawn; no archive or raw file changes.
 pub fn reconcile_offload_empty(
     operation: &PreparedArchiveOperation<'_>,
     today: NaiveDate,
@@ -156,7 +157,6 @@ pub(crate) mod unix {
     use std::path::Path;
 
     use solstone_core_journal_io::media::MediaDirectory;
-    use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
     use solstone_core_segment::output_attempt::{OutputClaims, SegmentCommit};
     use solstone_core_segment::{OwnerDeletionState, RetainedOwnerDeletion};
 
@@ -186,7 +186,6 @@ pub(crate) mod unix {
     /// Only the retained canonical observation below constructs this value.
     pub(crate) struct ReconciliationObservation<'a, 'clock> {
         operation: &'a PreparedArchiveOperation<'clock>,
-        selection: &'a OffloadOfferSelection,
         directory: &'a MediaDirectory,
         owner: &'a RetainedOwnerDeletion,
         scan: &'a CheckedSegment,
@@ -215,17 +214,6 @@ pub(crate) mod unix {
                 .revalidate()
                 .map_err(|error| OffloadOfferRefusal::Policy(Box::new(error)))?;
             self.directory.revalidate()?;
-            for mark in self.expected.iter().filter(|mark| mark.offload.is_none()) {
-                if binding(self.operation.journal_root(), mark)?
-                    .as_ref()
-                    .is_none_or(|current| {
-                        current.target != self.selection.target
-                            || current.layout != self.selection.layout
-                    })
-                {
-                    return Err(OffloadOfferRefusal::Changed);
-                }
-            }
             if self.owner.state().map_err(io::Error::other)? != OwnerDeletionState::Live {
                 return Err(OffloadOfferRefusal::Changed);
             }
@@ -266,92 +254,85 @@ pub(crate) mod unix {
     fn binding(
         root: &Arc<JournalRoot>,
         mark: &Mark,
-    ) -> Result<Option<OffloadOfferSelection>, OffloadOfferRefusal> {
-        if let Some(offer) = &mark.offload {
-            if offer.proof.journal_id != root.identity().observation_id() {
-                return Err(OffloadOfferRefusal::Changed);
-            }
-            return Ok(Some(OffloadOfferSelection {
-                target: mark.target.clone(),
-                layout: offer.proof.layout,
-                names: mark.proposal.names.clone(),
-            }));
-        }
-        // Canonical enumeration supplies coordinates. Retained complete listings
-        // prevent its soft is_dir checks from certifying a unique missing binding.
-        let relative = crate::layout::stream_rel_with_layout(
-            &mark.target.day,
-            solstone_core_journal_io::paths::DEFAULT_STREAM,
-            solstone_core_journal_io::paths::SegmentLayout::Direct,
-        );
-        let day = MediaDirectory::open(Arc::clone(root), Path::new(&relative))?;
-        let entries = day.entries(4096)?.ok_or(OffloadOfferRefusal::Changed)?;
-        let mut children = Vec::new();
-        let mut total_entries = entries.len();
-        for entry in &entries {
-            use solstone_core_journal_io::journal_root::JournalEntryKind;
-            match entry.kind {
-                JournalEntryKind::RegularFile => {}
-                JournalEntryKind::Directory if entry.name == OsStr::new("health") => {}
-                JournalEntryKind::Directory => {
-                    let child = day
-                        .open_child(&entry.name)?
-                        .ok_or(OffloadOfferRefusal::Changed)?;
-                    if child.identity() != entry.identity {
-                        return Err(OffloadOfferRefusal::Changed);
-                    }
-                    let listed = child.entries(4096)?.ok_or(OffloadOfferRefusal::Changed)?;
-                    total_entries = total_entries
-                        .checked_add(listed.len())
-                        .filter(|total| *total <= 65_536)
-                        .ok_or(OffloadOfferRefusal::Metadata)?;
-                    if listed.iter().any(|entry| {
-                        !matches!(
-                            entry.kind,
-                            JournalEntryKind::Directory | JournalEntryKind::RegularFile
-                        )
-                    }) {
-                        return Err(OffloadOfferRefusal::Changed);
-                    }
-                    children.push((child, listed));
-                }
-                _ => return Err(OffloadOfferRefusal::Changed),
-            }
-        }
-        let segments = iter_segments(root.canonical_path(), PathOrDay::Day(&mark.target.day))
-            .map_err(io::Error::other)?;
-        let mut matches = Vec::new();
-        for segment in &segments {
-            let identity = segment.locator_identity().map_err(io::Error::other)?;
-            if identity.stream == mark.target.stream
-                && (identity.key == mark.target.dir || identity.name == mark.target.dir)
-            {
-                matches.push(OffloadOfferSelection {
-                    target: crate::receipt::Target {
-                        day: mark.target.day.clone(),
-                        stream: identity.stream.into(),
-                        dir: identity.name.into(),
-                    },
-                    layout: identity.layout,
-                    names: mark.proposal.names.clone(),
-                });
-            }
-        }
-        for (child, listed) in children {
-            if child.entries(4096)?.as_ref() != Some(&listed) {
-                return Err(OffloadOfferRefusal::Changed);
-            }
-            child.revalidate()?;
-        }
-        if day.entries(4096)?.as_ref() != Some(&entries) {
+    ) -> Result<OffloadOfferSelection, OffloadOfferRefusal> {
+        let offer = mark.offload.as_ref().ok_or(OffloadOfferRefusal::Changed)?;
+        if offer.proof.journal_id != root.identity().observation_id() {
             return Err(OffloadOfferRefusal::Changed);
         }
-        day.revalidate()?;
-        Ok(if matches.len() == 1 {
-            matches.pop()
-        } else {
-            None
+        Ok(OffloadOfferSelection {
+            target: mark.target.clone(),
+            layout: offer.proof.layout,
+            names: mark.proposal.names.clone(),
         })
+    }
+
+    /// An offload mark without an archive offer has no backup proof and can
+    /// never be approved, while it keeps the register from holding any offer.
+    /// Withdrawing it decides nothing about its files: only the exact observed
+    /// row is removed, under the register lock, so the planner can offer those
+    /// files again with proof.
+    fn withdraw_unbound(
+        operation: &PreparedArchiveOperation<'_>,
+        mark: &Mark,
+    ) -> OffloadReconciliationDisposition {
+        if let Err(error) = operation.revalidate() {
+            return OffloadReconciliationDisposition::Refused(Box::new(
+                OffloadOfferRefusal::Admission(error),
+            ));
+        }
+        let plan = match PlannedMarkMutation::resolve(mark) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return OffloadReconciliationDisposition::Refused(Box::new(
+                    OffloadOfferRefusal::Review(crate::review_context::ReviewRefusal::Register(
+                        error,
+                    )),
+                ));
+            }
+        };
+        match crate::mark_mutation::conditional_mutate_at_root(operation.journal_root(), &plan) {
+            Ok(outcome) => OffloadReconciliationDisposition::Publication {
+                outcome: Box::new(outcome),
+                observation: None,
+            },
+            Err(error) => OffloadReconciliationDisposition::WriteRefused(Box::new(error)),
+        }
+    }
+
+    /// Record one group; true when the run must stop after its write.
+    fn settle(
+        failure: &mut OffloadReconciliationFailure,
+        group: OffloadReconciliationGroup,
+    ) -> bool {
+        let disposition = &group.disposition;
+        let stop = matches!(
+            disposition,
+            OffloadReconciliationDisposition::WriteRefused(error)
+                if matches!(error.as_ref(), BoundMutationRefusal::Write(_))
+        ) || matches!(disposition, OffloadReconciliationDisposition::Publication { outcome, .. }
+                if matches!(outcome.as_ref(), BoundMutationOutcome::PublishedUncertain { .. }))
+            || matches!(
+                disposition,
+                OffloadReconciliationDisposition::Publication {
+                    observation: Some(_),
+                    ..
+                }
+            );
+        if let OffloadReconciliationDisposition::Publication {
+            outcome,
+            observation: None,
+        } = disposition
+        {
+            match outcome.as_ref() {
+                BoundMutationOutcome::Published(result)
+                | BoundMutationOutcome::Unchanged(result) => {
+                    failure.last_confirmed = Some(result.register.clone())
+                }
+                BoundMutationOutcome::PublishedUncertain { .. } => {}
+            }
+        }
+        failure.groups.push(group);
+        stop
     }
 
     fn plans(
@@ -410,7 +391,7 @@ pub(crate) mod unix {
                 .iter()
                 .filter(|name| kept.contains(name.as_str()))
                 .filter(|name| {
-                    mark.offload.as_ref().is_none_or(|offer| {
+                    mark.offload.as_ref().is_some_and(|offer| {
                         offer
                             .proof
                             .files
@@ -433,19 +414,14 @@ pub(crate) mod unix {
             if withdrawing.is_empty() {
                 continue;
             }
-            let plan = if mark.offload.is_none() {
-                PlannedMarkMutation::resolve(mark)
-            } else {
-                let remaining = mark
-                    .proposal
-                    .names
-                    .iter()
-                    .filter(|name| !withdrawing.contains(name))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                PlannedMarkMutation::remainder(mark, &remaining)
-            }
-            .map_err(|error| {
+            let remaining = mark
+                .proposal
+                .names
+                .iter()
+                .filter(|name| !withdrawing.contains(name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let plan = PlannedMarkMutation::remainder(mark, &remaining).map_err(|error| {
                 OffloadOfferRefusal::Review(crate::review_context::ReviewRefusal::Register(error))
             })?;
             plans.push(plan);
@@ -501,7 +477,6 @@ pub(crate) mod unix {
         let plans = plans(&scan, selection, &policy, marks, today, now)?;
         let observed = ReconciliationObservation {
             operation,
-            selection,
             directory: &segment.directory,
             owner: &owner,
             scan: &scan,
@@ -567,18 +542,24 @@ pub(crate) mod unix {
         for mark in initial.marks.values().filter(|mark| {
             mark.class == RemovalClass::OffloadRawRelease && matches!(mark.state, MarkState::Marked)
         }) {
+            if mark.offload.is_none() {
+                let withdrawn = OffloadReconciliationGroup {
+                    selection: None,
+                    expected: vec![mark.clone()],
+                    disposition: withdraw_unbound(operation, mark),
+                };
+                if settle(&mut failure, withdrawn) {
+                    return Err(failure);
+                }
+                continue;
+            }
             match binding(operation.journal_root(), mark) {
-                Ok(Some(selection)) => {
+                Ok(selection) => {
                     let group = groups
                         .entry(super::super::selection_path(&selection))
                         .or_insert_with(|| (selection.clone(), Vec::new()));
                     group.1.push(mark.clone());
                 }
-                Ok(None) => failure.groups.push(OffloadReconciliationGroup {
-                    selection: None,
-                    expected: vec![mark.clone()],
-                    disposition: OffloadReconciliationDisposition::Unbound,
-                }),
                 Err(error) => failure.groups.push(OffloadReconciliationGroup {
                     selection: None,
                     expected: vec![mark.clone()],
@@ -603,38 +584,12 @@ pub(crate) mod unix {
                     }
                     Err(error) => OffloadReconciliationDisposition::Refused(Box::new(error)),
                 };
-            let stop = matches!(
-                &disposition,
-                OffloadReconciliationDisposition::WriteRefused(error)
-                    if matches!(error.as_ref(), BoundMutationRefusal::Write(_))
-            ) || matches!(&disposition, OffloadReconciliationDisposition::Publication { outcome, .. }
-                    if matches!(outcome.as_ref(), BoundMutationOutcome::PublishedUncertain { .. }))
-                || matches!(
-                    &disposition,
-                    OffloadReconciliationDisposition::Publication {
-                        observation: Some(_),
-                        ..
-                    }
-                );
-            if let OffloadReconciliationDisposition::Publication {
-                outcome,
-                observation: None,
-            } = &disposition
-            {
-                match outcome.as_ref() {
-                    BoundMutationOutcome::Published(result)
-                    | BoundMutationOutcome::Unchanged(result) => {
-                        failure.last_confirmed = Some(result.register.clone())
-                    }
-                    BoundMutationOutcome::PublishedUncertain { .. } => {}
-                }
-            }
-            failure.groups.push(OffloadReconciliationGroup {
+            let group = OffloadReconciliationGroup {
                 selection: Some(selection),
                 expected: marks,
                 disposition,
-            });
-            if stop {
+            };
+            if settle(&mut failure, group) {
                 return Err(failure);
             }
         }

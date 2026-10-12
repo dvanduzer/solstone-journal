@@ -25,7 +25,7 @@ pub fn prepare_owned_legacy_restore_with_recovery(
     prepare(operation, Some(binding), selection)
 }
 
-fn prepare<'clock, R: RestoreRead<'clock>>(
+pub(super) fn prepare<'clock, R: RestoreRead<'clock>>(
     operation: R,
     recovery_binding: Option<QualifiedArchiveRecoveryBinding>,
     selection: LegacyRestoreSelection,
@@ -47,6 +47,11 @@ fn prepare<'clock, R: RestoreRead<'clock>>(
     };
     if let Err(error) = outcome.prepare() {
         outcome.refusal = Some(error);
+        release_probe(
+            &mut outcome.probe_owner,
+            &mut outcome.probes,
+            outcome.destination.as_ref(),
+        );
     }
     outcome
 }
@@ -282,7 +287,10 @@ impl<R> LegacyRestoreReview<R> {
                 return Err(refuse("legacy_stage_unavailable"));
             }
         };
-        let target = match stage.create_target() {
+        // Probes hold only backup bytes; the restore download leaf marks them so.
+        let target = match stage.create_named_target(std::ffi::OsStr::new(
+            solstone_core_retention::restore_intent::RESTORE_DOWNLOAD_LEAF,
+        )) {
             Ok(target) => target,
             Err(error) => {
                 self.probe_owner = Some(ProbeOwner::Target(error));

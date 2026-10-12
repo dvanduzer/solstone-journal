@@ -15,9 +15,11 @@ use solstone_core_offload::restore::RestoreResult;
 #[cfg(unix)]
 use solstone_core_offload::restore::owned::IntentPublication;
 use solstone_core_offload::restore::owned::{
-    FileEvidence, LedgerEffect, OwnedRestoreFinishHold, OwnedRestoreRunOutcome, RestoreFileFacts,
-    RestoreRegisterRefusal, RestoreRunOutcome, SettledRestoreReport, TransactionFacts,
+    FileEvidence, LedgerEffect, LedgerFacts, OwnedRestoreFinishHold, OwnedRestoreRunOutcome,
+    RestoreFileFacts, RestoreRegisterRefusal, RestoreRunOutcome, SettledRestoreReport,
+    TransactionFacts,
 };
+use solstone_core_retention::archive_catalog::LegacyRestoreBinding;
 use solstone_core_retention::mark_mutation::{
     BoundMutationOutcome, BoundMutationRefusal, RestoredMarkRefusal,
 };
@@ -54,15 +56,43 @@ impl Serialize for View<'_, '_> {
 }
 
 pub(crate) fn active(owner: &OwnedRestoreRunOutcome) -> Value {
-    complete(owner.report(), owner.files())
+    with_legacy(
+        complete(owner.report(), owner.files()),
+        owner.legacy_bindings(),
+    )
 }
 
 pub(crate) fn held(owner: &OwnedRestoreFinishHold) -> Value {
-    complete(owner.report(), owner.files())
+    with_legacy(
+        complete(owner.report(), owner.files()),
+        owner.legacy_bindings(),
+    )
 }
 
 pub(crate) fn settled(owner: &SettledRestoreReport) -> Value {
-    complete(owner.report(), owner.files())
+    with_legacy(
+        complete(owner.report(), owner.files()),
+        owner.legacy_bindings(),
+    )
+}
+
+/// Bindings confirmed in the ledger before any historical file was read.
+fn with_legacy<'a>(
+    mut report: Value,
+    bindings: impl Iterator<Item = &'a LegacyRestoreBinding>,
+) -> Value {
+    report["legacy_bindings"] = Value::Array(
+        bindings
+            .map(|binding| {
+                json!({
+                    "adoption_id":binding.adoption_id, "day":binding.target.day,
+                    "stream":binding.target.stream, "segment_dir":binding.target.dir,
+                    "snapshot_id":binding.snapshot_id, "files":binding.files.len(),
+                })
+            })
+            .collect(),
+    );
+    report
 }
 
 fn complete<'a>(
@@ -106,6 +136,14 @@ fn file_facts(file: RestoreFileFacts<'_>) -> Value {
                 "readback":facts.readback.map(|failure| failure.reason().to_string()),
             }),
             FileEvidence::Transaction(facts) => transaction_facts(&facts),
+            FileEvidence::LegacyReview(facts) => json!({
+                "state":"legacy_review", "hold":unavailable_detail(), "reason":facts.reason,
+                "readback":facts.readback.map(|error| error.to_string()),
+                "retained_probe":facts.retained_probe,
+                "binding_write":facts.binding_write.as_ref().map(ledger_facts),
+                "binding_refused":facts.binding_refused,
+                "probes":facts.probes.len(),
+            }),
         },
     })
 }
@@ -151,15 +189,7 @@ fn transaction_facts(facts: &TransactionFacts<'_>) -> Value {
             })
         }).collect::<Vec<_>>(),
         "marker":marker, "marker_ancestor_sync":marker_ancestor_sync,
-        "ledger":facts.ledger.as_ref().map(|ledger| {
-            let effect = ledger.effect.map(|effect| match effect {
-                LedgerEffect::AlreadyRecorded => json!({"effect":"already_recorded"}),
-                LedgerEffect::Appended {bytes} => json!({"effect":"appended", "bytes":bytes}),
-                LedgerEffect::Attempted {written} => json!({"effect":"attempted", "written":written}),
-            });
-            json!({"effect":effect, "durability":ledger.durability,
-                "confirmed":ledger.confirmed, "failures":unavailable_details(&ledger.failures)})
-        }),
+        "ledger":facts.ledger.as_ref().map(ledger_facts),
         "register":facts.register.map(mutation_facts),
         "no_effect_cleanup":facts.no_effect_cleanup.as_ref().map(|cleanup| json!({
             "cleanup":cleanup.cleanup, "parent_sync":cleanup.parent_sync.map(sync_facts),
@@ -181,6 +211,16 @@ fn transaction_facts(facts: &TransactionFacts<'_>) -> Value {
         "store_exclusion_retained":facts.store_exclusion_retained,
         "retained_media":facts.retained_media, "completed":facts.completed,
     })
+}
+
+fn ledger_facts(ledger: &LedgerFacts) -> Value {
+    let effect = ledger.effect.map(|effect| match effect {
+        LedgerEffect::AlreadyRecorded => json!({"effect":"already_recorded"}),
+        LedgerEffect::Appended { bytes } => json!({"effect":"appended", "bytes":bytes}),
+        LedgerEffect::Attempted { written } => json!({"effect":"attempted", "written":written}),
+    });
+    json!({"effect":effect, "durability":ledger.durability,
+        "confirmed":ledger.confirmed, "failures":unavailable_details(&ledger.failures)})
 }
 
 fn media_publication_facts(receipt: &PublicationReceipt) -> Value {

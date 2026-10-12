@@ -5,7 +5,9 @@
 
 use super::*;
 use crate::archive_approval::{ArchiveApprovalError, OwnedArchiveApproval};
-use solstone_core_backup::archive_readback::{ExactArchiveFile, ReadbackError, SettledDirectRead};
+use solstone_core_backup::archive_readback::{
+    ExactArchiveFile, ReadbackError, RefusedDirectRead, SettledDirectRead,
+};
 use solstone_core_journal_io::media::{Cleanup, MediaDigest, MediaIdentity, RemovalReceipt};
 
 /// Independent finish refusal. This is diagnostic, never cleanup authority.
@@ -122,6 +124,52 @@ impl OwnedReviewedArchiveRemoval {
         match approval.reason() {
             Some(ArchiveApprovalError::Native(error)) => Some(error),
             _ => None,
+        }
+    }
+
+    /// End a refused removal that changed nothing: no file, mark or stage of
+    /// its own remains and every child its read launched was reaped. Only the
+    /// empty carrier is left, for the outside finish owner to retire.
+    pub fn release_refused(self) -> Result<(RefusedDirectRead, ReviewedArchiveReport), Box<Self>> {
+        #[cfg(not(unix))]
+        {
+            Err(Box::new(self))
+        }
+        #[cfg(unix)]
+        {
+            let execution = &self.execution;
+            if !execution.attempts.is_empty()
+                || !execution.stage_failures.is_empty()
+                || execution.carrier.is_some()
+                || execution.carrier_failure.is_some()
+                || execution.mutation.is_some()
+                || execution.outcome.removed_paths().next().is_some()
+            {
+                return Err(Box::new(self));
+            }
+            let Self {
+                checked,
+                execution,
+                approval,
+                finish_refusal,
+            } = self;
+            let released = match approval {
+                ClosedReview::Pending(read) => {
+                    (*read).release_refused().map_err(ClosedReview::Pending)
+                }
+                ClosedReview::Approval(approval) => (*approval)
+                    .release_refused()
+                    .map_err(ClosedReview::Approval),
+            };
+            match released {
+                Ok(read) => Ok((read, release_report(checked, execution, Vec::new()))),
+                Err(approval) => Err(Box::new(Self {
+                    checked,
+                    execution,
+                    approval,
+                    finish_refusal,
+                })),
+            }
         }
     }
 }

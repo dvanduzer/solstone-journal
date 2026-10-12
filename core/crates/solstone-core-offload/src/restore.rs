@@ -20,7 +20,7 @@ use solstone_core_retention::archive_catalog::{SegmentCatalog, read_complete_cat
 pub const RESTORE_RESERVE_BYTES: u64 = 1_000_000_000;
 pub const OFFLOAD_RESTORE_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
 pub const OFFLOAD_RESTORE_STATUSES: [&str; 5] = ["ok", "no_op", "refused", "degraded", "error"];
-pub const OFFLOAD_RESTORE_REASONS: [&str; 19] = [
+pub const OFFLOAD_RESTORE_REASONS: [&str; 22] = [
     "archive_unbound",
     "auth_failed",
     "backup_not_ready",
@@ -28,6 +28,9 @@ pub const OFFLOAD_RESTORE_REASONS: [&str; 19] = [
     "failed",
     "insufficient_free_space",
     "ledger_degraded",
+    "legacy_read_failed",
+    "legacy_review_held",
+    "legacy_verification_failed",
     "locked",
     "missing_file_after_restore",
     "nothing_to_restore",

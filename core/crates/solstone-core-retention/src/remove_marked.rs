@@ -611,6 +611,8 @@ pub use archive_finish::{
     ReviewedArchiveReadReport, ReviewedArchiveReport, ReviewedRemovalFileReport,
     SettledReviewedArchiveRemoval, remove_reviewed_with_owned_archive,
 };
+mod interrupted;
+pub use interrupted::{InterruptedRemoval, recover_interrupted_removals};
 mod ordinary_finish;
 pub use ordinary_finish::{
     OwnedReviewedRemoval, ReviewedRemovalFinish, ReviewedRemovalFinishRefusal,
@@ -652,6 +654,7 @@ pub enum ArchiveReadState<'a> {
         file: &'a solstone_core_backup::archive_readback::ExactArchiveFile,
         target_identity: &'a solstone_core_journal_io::media::MediaIdentity,
         failure: &'a solstone_core_backup::archive_readback::ReadbackFailure,
+        cleanup: solstone_core_journal_io::media::Cleanup,
     },
 }
 
@@ -1135,7 +1138,7 @@ struct ReviewedGroup {
     refusals: BTreeMap<String, String>,
     archive_refusals: BTreeMap<String, String>,
     policy_names: BTreeSet<String>,
-    owner_deletion: Option<solstone_core_segment::RetainedOwnerDeletion>,
+    owner_deletion: solstone_core_segment::RetainedOwnerDeletion,
     deleted: BTreeSet<String>,
 }
 
@@ -1193,11 +1196,11 @@ fn reviewed_scan(
 fn revalidate_reviewed_group(group: &ReviewedGroup) -> Result<(), ReviewedRemovalRefusal> {
     group.directory.revalidate()?;
     group.parent.revalidate()?;
-    if let Some(owner) = &group.owner_deletion
-        && owner
-            .state()
-            .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?
-            != solstone_core_segment::OwnerDeletionState::Live
+    if group
+        .owner_deletion
+        .state()
+        .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?
+        != solstone_core_segment::OwnerDeletionState::Live
     {
         return Err(ReviewedRemovalRefusal::Changed);
     }
@@ -1266,10 +1269,11 @@ fn valid_reviewed_coordinates(marks: &[Mark]) -> bool {
     };
     !marks.is_empty()
         && marks.iter().all(|mark| {
-            matches!(
-                mark.class,
-                RemovalClass::PolicyRawRelease | RemovalClass::OffloadRawRelease
-            ) && mark.target.day.len() == 8
+            // An offload mark without its archive offer has no backup proof
+            // behind it; it must never fall through to the policy decision.
+            (mark.class == RemovalClass::PolicyRawRelease
+                || (mark.class == RemovalClass::OffloadRawRelease && mark.offload.is_some()))
+                && mark.target.day.len() == 8
                 && mark.target.day.bytes().all(|b| b.is_ascii_digit())
                 && NaiveDate::parse_from_str(&mark.target.day, "%Y%m%d").is_ok()
                 && plain(&mark.target.stream)
@@ -1539,6 +1543,11 @@ fn execute_reviewed_mode(
     } else {
         let activity = ActivityLease::try_acquire(Arc::clone(&root))
             .map_err(ReviewedRemovalRefusal::Activity)?;
+        // As at archive admission: first recover what an ended owner left
+        // behind, then let the fresh census decide.
+        recover_interrupted_removals(&activity);
+        crate::restore_intent::recover_abandoned_restores(&activity);
+        solstone_core_journal_io::media::retire_orphan_root_carriers(&activity);
         let obligations =
             solstone_core_journal_io::activity_obligations::observe_obligations(&root)
                 .map_err(ReviewedRemovalRefusal::Census)?;
@@ -1668,19 +1677,14 @@ fn execute_reviewed_mode(
                 ready.push(file);
             }
         }
-        let owner_deletion = if archive.is_some() {
-            Some(
-                solstone_core_segment::RetainedOwnerDeletion::open(
-                    Arc::clone(&parent),
-                    OsStr::new(&target.dir),
-                    Some(&directory),
-                    REVIEW_MAX_ENTRIES,
-                )
-                .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?,
-            )
-        } else {
-            None
-        };
+        // Every release, policy or archive, refuses a segment the owner deleted.
+        let owner_deletion = solstone_core_segment::RetainedOwnerDeletion::open(
+            Arc::clone(&parent),
+            OsStr::new(&target.dir),
+            Some(&directory),
+            REVIEW_MAX_ENTRIES,
+        )
+        .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?;
         let desired = checked
             .marks()
             .iter()

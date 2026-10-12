@@ -394,7 +394,7 @@ fn intact_original_begin_cancels_only_before_preparation_and_releases_reservatio
 }
 
 #[test]
-fn refused_prepare_start_retains_original_unused_begin_without_native_capture() {
+fn refused_prepare_start_releases_unused_begin_without_native_capture() {
     let (dir, root, clock, slot) = fixture();
     let begin = begin_owned(
         &slot,
@@ -414,27 +414,116 @@ fn refused_prepare_start_retains_original_unused_begin_without_native_capture() 
     })
     .join()
     .unwrap();
-    blocked(&slot, &root, &clock);
-    let state = slot.lock().unwrap();
-    let returned = &state.archive.retained[0];
-    assert_eq!(state.archive.retained.len(), 1);
-    assert_eq!(returned.generation(), generation);
-    assert!(returned.custody().is_none() && returned.binding_error().is_none());
-    let ArchivePayload::BeginHeld(begin) = returned.payload() else {
-        panic!("original unused begin");
-    };
-    assert!(Arc::ptr_eq(&begin.ticket.0.root, &root));
-    assert!(Arc::ptr_eq(&begin.ticket.0.clock, &clock));
-    assert!(begin.budget.cancellation().unwrap().is_cancelled());
+    // The unused begin owned nothing native, so cancellation ends it at once.
     assert!(!dir.path().join("backup-activity.lock").exists());
+    admitted_after(&slot, &root, dir.path());
+}
+
+/// Nothing of an effect-free return remains: the slot, lease and census are
+/// free, a following operation starts and an owner deletion proceeds.
+fn admitted_after(slot: &SharedOperationSlot, root: &Arc<JournalRoot>, journal: &Path) {
+    assert!(!operation::is_busy(slot));
+    assert!(slot.lock().unwrap().archive.retained.is_empty());
     assert!(
-        solstone_core_journal_io::activity_obligations::observe_obligations(&root)
+        solstone_core_journal_io::activity_obligations::observe_obligations(root)
             .unwrap()
             .entries()
             .is_empty()
     );
-    drop(state);
-    // No actual native lease was captured; only the keeper is Busy.
-    assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
-    assert!(TeardownLease::try_acquire(root).is_ok());
+    drop(ActivityLease::try_acquire(Arc::clone(root)).unwrap());
+    let target = solstone_core_retention::Target {
+        day: "20261011".into(),
+        stream: "audio".into(),
+        dir: "070000_17".into(),
+    };
+    let segment = journal.join("chronicle/20261011/audio/070000_17");
+    std::fs::create_dir_all(&segment).unwrap();
+    std::fs::write(segment.join("audio.flac"), b"sole raw bytes").unwrap();
+    let removed = solstone_core_retention::door::remove_segments(
+        journal,
+        std::slice::from_ref(&target),
+        "2026-10-11T00:00:00Z",
+        solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+        "fixture",
+    );
+    assert!(removed.targets[0].not_removed.is_empty(), "{removed:?}");
+    assert!(!segment.join("audio.flac").exists());
+    assert!(operation::begin(slot, "enable", None, None, None).is_ok());
+}
+
+#[test]
+fn admission_failure_releases_its_reservation_and_admits_followers() {
+    let (dir, root, clock, slot) = fixture();
+    let begin = begin_owned(
+        &slot,
+        "offload_restore",
+        Arc::clone(&root),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+    let worker_slot = Arc::clone(&slot);
+    thread::spawn(move || {
+        assert!(
+            prepare_read(
+                &worker_slot,
+                begin,
+                "a".repeat(64),
+                Path::new("/absent/restic")
+            )
+            .is_none()
+        );
+    })
+    .join()
+    .unwrap();
+    let view = operation::current(&slot).unwrap();
+    assert_eq!(view.phase, "error");
+    assert_eq!(view.report.unwrap()["admission"]["state"], "refused");
+    admitted_after(&slot, &root, dir.path());
+}
+
+#[test]
+fn cancellation_after_reservation_before_any_effect_releases_and_admits_followers() {
+    use solstone_core_journal_io::media::{MediaPrimitive, run_with_media_hook};
+    let (dir, root, clock, slot) = fixture();
+    let begin = begin_owned(
+        &slot,
+        "offload_restore",
+        Arc::clone(&root),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+    let generation = begin.generation();
+    let worker_slot = Arc::clone(&slot);
+    thread::spawn(move || {
+        let cancel_slot = Arc::clone(&worker_slot);
+        let (prepared, fired) = run_with_media_hook(
+            MediaPrimitive::CarrierConfirmation,
+            move || {
+                assert!(matches!(
+                    crate::archive_operation::request_cancellation(&cancel_slot, generation),
+                    crate::archive_operation::ArchiveCancellationRequest::Requested
+                ));
+                Ok(())
+            },
+            || {
+                prepare_read(
+                    &worker_slot,
+                    begin,
+                    "a".repeat(64),
+                    Path::new("/absent/restic"),
+                )
+            },
+        );
+        assert!(fired);
+        assert!(prepared.is_none());
+    })
+    .join()
+    .unwrap();
+    let view = operation::current(&slot).unwrap();
+    assert_eq!(view.phase, "error");
+    assert_eq!(
+        view.report.unwrap()["preparation"]["reason"],
+        solstone_core_backup::archive_admission::AdmissionError::Cancelled.to_string()
+    );
+    admitted_after(&slot, &root, dir.path());
 }

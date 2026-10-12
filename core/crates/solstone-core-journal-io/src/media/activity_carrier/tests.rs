@@ -605,3 +605,66 @@ fn uncooperating_empty_swap_at_native_rmdir_cut_is_explicitly_unsupported() {
     assert!(!path.exists());
     assert!(original.is_dir());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ended_owners_empty_reservation_is_retired_by_the_next_lease_holder() {
+    let (_temp, activity) = fixture();
+    let root = activity.journal_root().clone();
+    let carrier = RootActivityCarrier::prepare(activity).unwrap();
+    let path = carrier.diagnostic_path();
+    // While its owner lives, no other lease that could retire it exists.
+    assert!(matches!(
+        ActivityLease::try_acquire(root.clone()),
+        Err(ActivityAdmissionError::Busy)
+    ));
+    // The owner ends without retiring it, as on a crash or restart.
+    drop(carrier);
+    assert!(path.is_dir());
+    let next = ActivityLease::try_acquire(root.clone()).unwrap();
+    assert_eq!(retire_orphan_root_carriers(&next), 1);
+    assert!(!path.exists());
+    assert!(
+        crate::activity_obligations::observe_obligations(&root)
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn occupied_nested_and_intent_bound_reservations_stay_held() {
+    let (temp, activity) = fixture();
+    let root = activity.journal_root().clone();
+    let occupied = temp.path().join(".tmp-offload-occupied");
+    fs::create_dir(&occupied).unwrap();
+    fs::write(occupied.join("payload"), b"unpublished copy").unwrap();
+    let nested = temp.path().join("chronicle/20260101/.tmp-offload-nested");
+    fs::create_dir_all(&nested).unwrap();
+    let empty = temp.path().join(".tmp-offload-empty");
+    fs::create_dir(&empty).unwrap();
+    let intents = temp.path().join("health/offload/restore-intents");
+    fs::create_dir_all(&intents).unwrap();
+    let intent = intents.join(format!("{}.json", "a".repeat(32)));
+    fs::write(&intent, b"{}").unwrap();
+    // An interrupted restore may name any reservation, so all of them stay.
+    assert_eq!(retire_orphan_root_carriers(&activity), 0);
+    assert!(empty.is_dir());
+    fs::remove_file(&intent).unwrap();
+    // Only the empty root reservation goes; content and nested stages stay.
+    assert_eq!(retire_orphan_root_carriers(&activity), 1);
+    assert!(!empty.exists());
+    assert_eq!(
+        fs::read(occupied.join("payload")).unwrap(),
+        b"unpublished copy"
+    );
+    assert!(nested.is_dir());
+    assert_eq!(
+        crate::activity_obligations::observe_obligations(&root)
+            .unwrap()
+            .entries()
+            .len(),
+        2
+    );
+}

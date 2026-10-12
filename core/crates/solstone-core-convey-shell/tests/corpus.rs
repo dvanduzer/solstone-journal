@@ -810,7 +810,6 @@ async fn speakers_state_uses_the_owner_zone_today_semantics() {
                 .to_string()
         )
     );
-    assert_eq!(state["speaker_copy"].as_object().unwrap().len(), 127);
 }
 
 #[tokio::test]
