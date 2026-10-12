@@ -3,12 +3,16 @@
 
 //! Run an already admitted restore and retain its whole owning return.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::operation;
-#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+#[cfg(all(
+    test,
+    feature = "full-tests",
+    any(target_os = "linux", target_os = "macos")
+))]
 use solstone_core_backup_runtime::DirectReadFinishState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -23,7 +27,7 @@ use super::{ArchivePayload, PreparedArchiveWorker, entry, return_owned, runtime_
 use crate::operation::{SharedOperationSlot, Terminal};
 use crate::restore_report;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use {
     super::{ArchiveTicket, OwnedArchiveBegin, begin_owned_locked, prepare_read_in},
     crate::{BackupWebDeps, operation::OperationState},
@@ -35,7 +39,7 @@ use {
     std::{path::PathBuf, thread::JoinHandle},
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Input {
     begin: OwnedArchiveBegin,
     repository: Option<String>,
@@ -44,13 +48,13 @@ struct Input {
     executable: PathBuf,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Unused {
     input: Input,
     refusal: UnusedRefusal,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum UnusedRefusal {
     Start,
     Budget(AdmissionError),
@@ -58,7 +62,7 @@ enum UnusedRefusal {
     ResolverUnknown,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl UnusedRefusal {
     fn reason(&self) -> String {
         match self {
@@ -81,19 +85,19 @@ impl UnusedRefusal {
 
 #[derive(Default)]
 pub(super) struct Custody {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     ticket: Option<ArchiveTicket>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     input: Option<Input>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     unused: Vec<Unused>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     worker: Option<JoinHandle<()>>,
 }
 
 impl Custody {
     pub(super) fn is_busy(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             self.input.is_some()
                 || !self.unused.is_empty()
@@ -102,12 +106,12 @@ impl Custody {
                     .as_ref()
                     .is_some_and(|worker| !worker.is_finished())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         false
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn refuse(reason: &str) -> axum::response::Response {
     crate::response::error(
         axum::http::StatusCode::BAD_REQUEST,
@@ -118,7 +122,7 @@ fn refuse(reason: &str) -> axum::response::Response {
 }
 
 /// Reserve the original input before an installed restore worker can start.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn start(
     deps: &BackupWebDeps,
     day: Option<String>,
@@ -170,7 +174,7 @@ pub(crate) fn start(
     Ok(generation)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn current_matches(state: &OperationState, ticket: &ArchiveTicket) -> bool {
     state.archive.matches(ticket)
         && state
@@ -187,7 +191,7 @@ fn current_matches(state: &OperationState, ticket: &ArchiveTicket) -> bool {
         })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn retain_unused(slot: &SharedOperationSlot, input: Input, refusal: UnusedRefusal) {
     slot.lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -197,7 +201,7 @@ fn retain_unused(slot: &SharedOperationSlot, input: Input, refusal: UnusedRefusa
         .push(Unused { input, refusal });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
     #[cfg(all(test, feature = "full-tests"))]
     tests::before_pending();
@@ -264,12 +268,12 @@ pub(crate) fn response(
     deps: &crate::BackupWebDeps,
     expected: Option<u64>,
 ) -> Option<axum::response::Response> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (deps, expected);
         None
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut state = match deps.operations.lock() {
             Ok(state) => state,
@@ -390,7 +394,11 @@ fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&s
             native.report(),
             restore_report::active(&native),
         );
-        #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+        #[cfg(all(
+            test,
+            feature = "full-tests",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         tests::after_actor(&native);
         match settle(native) {
             Err(native) => {
@@ -454,7 +462,11 @@ fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&s
             }
         }
         Ok(Ok(Actor::Settled(settled, report))) => {
-            #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+            #[cfg(all(
+                test,
+                feature = "full-tests",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             tests::before_finish(slot);
             // The genuine settled report and original custody survive a
             // consuming Runtime-finish unwind independently of confirmation.
@@ -463,7 +475,11 @@ fn run(slot: &SharedOperationSlot, worker: PreparedArchiveWorker, day: Option<&s
                     if let Some(view) = terminal.report.as_mut() {
                         view["runtime"] = runtime_facts(&runtime);
                     }
-                    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+                    #[cfg(all(
+                        test,
+                        feature = "full-tests",
+                        any(target_os = "linux", target_os = "macos")
+                    ))]
                     tests::before_handoff(slot);
                     ArchivePayload::NativeFinished { report, runtime }
                 }
@@ -504,9 +520,17 @@ enum Actor {
 fn settle(
     native: OwnedRestoreRunOutcome,
 ) -> Result<(OwnedSettledDirectRead, SettledRestoreReport), Box<OwnedRestoreFinishHold>> {
-    #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+    #[cfg(all(
+        test,
+        feature = "full-tests",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     return tests::settle(native);
-    #[cfg(not(all(test, feature = "full-tests", target_os = "linux")))]
+    #[cfg(not(all(
+        test,
+        feature = "full-tests",
+        any(target_os = "linux", target_os = "macos")
+    )))]
     native.settle_direct()
 }
 
@@ -538,5 +562,5 @@ fn native_refusal(refusal: RestoreFinishRefusal<'_>) -> Value {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod tests;

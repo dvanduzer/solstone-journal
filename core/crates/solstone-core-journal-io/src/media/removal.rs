@@ -546,7 +546,7 @@ pub fn resolve_interrupted_removal(
     directory: MediaIdentity,
     deleted_by_owner: impl FnOnce(&OsStr) -> io::Result<bool>,
 ) -> io::Result<Option<InterruptedRemovalResolution>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use crate::journal_root::JournalEntryKind;
         const REMOVAL_RECORD_MAX: usize = 4096;
@@ -662,7 +662,7 @@ pub fn resolve_interrupted_removal(
         parent.sync()?;
         Ok(Some(resolution))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (activity, parent, name, directory, deleted_by_owner);
         Err(io::Error::new(

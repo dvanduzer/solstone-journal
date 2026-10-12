@@ -120,7 +120,7 @@ mod tests {
                 Some((Some("20261009".to_owned()), false)),
             ),
         ] {
-            let expected = expected.filter(|_| cfg!(target_os = "linux"));
+            let expected = expected.filter(|_| cfg!(any(target_os = "linux", target_os = "macos")));
             assert_eq!(owned_restore_options(&args(&given)), expected, "{given:?}");
         }
         for given in [
@@ -135,7 +135,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn nothing_offloaded_succeeds_and_a_missing_journal_refuses() {
         let journal = tempfile::tempdir().unwrap();

@@ -141,7 +141,7 @@ pub(super) fn before_handoff(slot: &SharedOperationSlot) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Deserialize)]
 struct Input {
     mode: Cut,
@@ -164,7 +164,7 @@ impl Clock for LiveClock {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn seed(input: &Input, root: &Arc<JournalRoot>) -> PathBuf {
     let proof = OffloadProof {
         journal_id: root.identity().observation_id(),
@@ -238,7 +238,7 @@ fn blocked(slot: &SharedOperationSlot, root: &Arc<JournalRoot>, clock: &super::s
     ));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[ignore = "requires a copied current package and synthetic direct restore fixture"]
 fn packaged_owned_restore_worker() {
