@@ -20,6 +20,7 @@ mod map;
 mod news;
 mod observations;
 mod paths;
+mod publication;
 mod recent_names;
 pub(crate) mod reference_scan;
 mod relationship_scans;

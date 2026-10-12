@@ -13,6 +13,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- some long conversations you imported from ChatGPT, Claude, Gemini or a text file were never read. your journal kept waiting on them, so that day's daily results never finished, and nothing said why. they're now read like any other conversation, and when a day's daily results can't finish, your journal's log names the recordings or conversations holding it up.
 - on mac and windows, turning on encrypted backup operated by sol pbc and restoring your journal from it work again. since 2.0.41 both stopped as soon as they started.
 - on mac, you can turn off and delete encrypted backup operated by sol pbc again. as on linux, your journal won't delete it while your backup holds the only copy of some of your media.
 - on linux and mac, you can turn off and delete a backup you set up in your own storage again. your journal deletes every snapshot in it, but not while your backup holds the only copy of some of your media. if your storage may keep deleted files anyway, for example when versioning or object lock is on, or a B2 bucket has no rule that removes hidden files, your journal says so, and also says when it couldn't check.
@@ -25,6 +26,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - a screen category in the ignored group in settings was still read in detail when it was the first thing on screen in a recording, or when it was on screen beside another app. it's now never read in detail, and your journal still keeps a short description of it.
 - the help under "frames read in detail" in settings said the number counted frames across your whole screen segment. it counts for each screen separately, and the help now says so.
 - on mac and windows, the health page no longer lists "original media cleanup" as scheduled, and your journal no longer starts it every day. offload isn't available there in this version, so each run stopped without doing anything.
+- your activities, and the people and things your journal detects in each facet, now show up in search as soon as they're saved. before, they waited for your journal's daily search update, and until then the health page said search was catching up.
 
 ## [2.0.43] - 2026-10-12
 
