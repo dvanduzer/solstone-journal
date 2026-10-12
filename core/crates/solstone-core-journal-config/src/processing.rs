@@ -172,6 +172,12 @@ fn parse_time(value: Option<&str>) -> Option<NaiveTime> {
 pub fn validate_processing(value: Option<&Value>) -> Result<(), String> {
     let Some(value) = value else { return Ok(()) };
     let obj = value.as_object().ok_or("processing must be an object")?;
+    if obj
+        .get("history_confirmed")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("processing history_confirmed must be a boolean".into());
+    }
     if let Some(mode) = obj.get("mode")
         && !matches!(mode.as_str(), Some("realtime" | "deferred"))
     {

@@ -484,7 +484,7 @@ not the codebase. See [APPS.md](APPS.md).
 
 `solstone journal install-provider local` and `solstone journal install-provider parakeet` are native.
 
-`reprocess` is the on-demand reprocess command: process-now by default; `--from-scratch` re-runs already-complete units and, with `--through`, can queue an inclusive past-day range.
+`reprocess DAY` saves a request to prioritize a past day after today's work. Requests survive a supervisor restart. `--from-scratch` permits one attempt that can replace owner-edited outputs; with `--through`, it requests an inclusive past-day range. An interrupted from-scratch attempt waits for review. `--owed` only reports daily-output coverage; it does not submit work or describe segment publication. Health and doctor report progress across the whole journal and any spending confirmation.
 
 `solstone journal maintenance list|sync|run <name>` runs native maintenance (`solstone-core-maintenance`). The supervisor performs the same `sync` at every start, so an upgrade that adds or retires a routine takes effect on the next boot; the verb remains for inspection and for applying a change without restarting.
 

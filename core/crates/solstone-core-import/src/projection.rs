@@ -104,7 +104,13 @@ impl ImportProjection {
                 .as_ref()
                 .and_then(|record| record.get("schema"))
                 .and_then(Value::as_str)
-                == Some(crate::publish::PUBLICATION_SCHEMA)
+                .is_some_and(|schema| {
+                    matches!(
+                        schema,
+                        crate::publish::PUBLICATION_SCHEMA
+                            | crate::publish::LEGACY_PUBLICATION_SCHEMA
+                    )
+                })
     }
 
     /// The facts a native row carries beyond the recorded legacy row shape. A measured

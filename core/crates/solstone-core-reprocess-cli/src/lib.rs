@@ -17,8 +17,8 @@ use solstone_core_system_health::{FilesystemSegmentSource, day_is_complete, scan
 // in the FOREGROUND (SKILL.md: "starts the supervisor runtime only"), so an
 // owner who follows it gets a process tied to that terminal and loses intake
 // when they close it. `journal up` is the alias for `journal service start`.
-const UNREACHABLE_MESSAGE: &str =
-    "supervisor not reachable - start it (solstone journal up), then retry";
+const WAITING_MESSAGE: &str =
+    "request saved; start the background service with solstone journal up to process it";
 const THROUGH_REQUIRES_FROM_SCRATCH: &str = "--through requires --from-scratch";
 const THROUGH_BEFORE_START: &str = "--through must be on or after the start day";
 const HELP_FIXTURE: &str =
@@ -70,7 +70,7 @@ pub enum DayOutcome {
     AlreadyComplete,
     CurrentDegraded,
     NoThinkingEngine,
-    Unreachable,
+    WaitingForSupervisor,
     Failed(String),
 }
 
@@ -375,10 +375,13 @@ where
         return DayOutcome::NoThinkingEngine;
     }
     if flavor == Flavor::FromScratch {
-        return if transport(&request_envelope(day)) {
+        if let Err(error) = solstone_core_system::work_intent::register(journal, day, true) {
+            return DayOutcome::Failed(error);
+        }
+        return if transport(&drain_envelope(day)) {
             DayOutcome::Submitted(flavor)
         } else {
-            DayOutcome::Unreachable
+            DayOutcome::WaitingForSupervisor
         };
     }
     if flavor == Flavor::MarkUpdated {
@@ -386,10 +389,13 @@ where
         if let Err(error) = touch_stream_health_marker(journal, day) {
             return DayOutcome::Failed(error.to_string());
         }
+        if let Err(error) = solstone_core_system::work_intent::register(journal, day, false) {
+            return DayOutcome::Failed(error);
+        }
         return if transport(&drain_envelope(day)) {
             DayOutcome::Submitted(flavor)
         } else {
-            DayOutcome::Unreachable
+            DayOutcome::WaitingForSupervisor
         };
     }
     match day_is_complete(journal, day) {
@@ -408,10 +414,13 @@ where
         Ok(false) => {}
         Err(error) => return DayOutcome::Failed(error.to_string()),
     }
+    if let Err(error) = solstone_core_system::work_intent::register(journal, day, false) {
+        return DayOutcome::Failed(error);
+    }
     if transport(&drain_envelope(day)) {
         DayOutcome::Submitted(flavor)
     } else {
-        DayOutcome::Unreachable
+        DayOutcome::WaitingForSupervisor
     }
 }
 
@@ -443,7 +452,7 @@ fn render_day_outcome(day: &str, outcome: DayOutcome) -> CliRun {
         DayOutcome::NoThinkingEngine => {
             failure("no model is chosen yet. choose one in thinking, then retry")
         }
-        DayOutcome::Unreachable => failure(UNREACHABLE_MESSAGE),
+        DayOutcome::WaitingForSupervisor => success(format!("{WAITING_MESSAGE}\n")),
         DayOutcome::Failed(error) => failure(&format!("reprocess failed: {error}")),
     }
 }
@@ -496,7 +505,7 @@ fn range_segment_count(days: &[RangeDay]) -> usize {
 fn range_plan(days: &[RangeDay]) -> String {
     let count = data_days(days).len();
     format!(
-        "from-scratch reprocess plan:\n{count} days with data ({} segments) will be queued. Progress will be visible in solstone journal top or solstone journal health. Queued days do not survive a supervisor restart.\nThese days run one at a time and can take hours; today's own journal processing waits until the whole range finishes.\nre-run with --yes to proceed\n",
+        "from-scratch reprocess plan:\n{count} days with data ({} segments) will be queued. Progress will be visible in solstone journal top or solstone journal health. Requests survive a supervisor restart; interrupted from-scratch attempts wait for your review.\nThese days can take hours; today's work goes first between tasks.\nre-run with --yes to proceed\n",
         range_segment_count(days)
     )
 }
@@ -513,6 +522,7 @@ where
 {
     let data_days = data_days(days);
     let mut queued = Vec::new();
+    let mut waiting = false;
     for entry in days {
         match reprocess_day_with(
             journal,
@@ -524,41 +534,23 @@ where
         ) {
             DayOutcome::NoData => {}
             DayOutcome::Submitted(_) => queued.push(entry.day.clone()),
-            DayOutcome::Unreachable => {
-                let not_queued = data_days[queued.len()..]
-                    .iter()
-                    .map(|day| day.day.as_str())
-                    .collect::<Vec<_>>();
-                return CliRun {
-                    stdout: String::new(),
-                    stderr: format!(
-                        "failed to queue day {} of {} ({}): {UNREACHABLE_MESSAGE}\nqueued day set: {}\nnot-queued day set: {}\n",
-                        queued.len() + 1,
-                        data_days.len(),
-                        entry.day,
-                        format_day_set(queued.iter().map(String::as_str)),
-                        format_day_set(not_queued),
-                    ),
-                    exit_code: 1,
-                };
+            DayOutcome::WaitingForSupervisor => {
+                waiting = true;
+                queued.push(entry.day.clone());
             }
             other => return render_day_outcome(&entry.day, other),
         }
     }
     success(format!(
-        "queued from-scratch reprocess for {} days ({} segments)\nprogress is visible in solstone journal top or solstone journal health\nqueued days do not survive a supervisor restart\n",
+        "saved from-scratch requests for {} days ({} segments)\nprogress is visible in health; today's work goes first\n{}",
         data_days.len(),
-        range_segment_count(days)
+        range_segment_count(days),
+        if waiting {
+            format!("{WAITING_MESSAGE}\n")
+        } else {
+            String::new()
+        }
     ))
-}
-
-fn format_day_set<'a>(days: impl IntoIterator<Item = &'a str>) -> String {
-    let values = days.into_iter().collect::<Vec<_>>();
-    if values.is_empty() {
-        "none".to_owned()
-    } else {
-        values.join(", ")
-    }
 }
 
 /// List every daily output owed on past days in the range, and why.
@@ -682,24 +674,6 @@ fn owed_report(
 fn parse_day(journal: &Path, day: &str) -> Option<NaiveDate> {
     day_path(journal, day, false).ok()?;
     NaiveDate::parse_from_str(day, "%Y%m%d").ok()
-}
-
-fn request_envelope(day: &str) -> CallosumEnvelope {
-    let mut extra = Map::new();
-    extra.insert(
-        "cmd".to_owned(),
-        serde_json::Value::from(solstone_core_system::partition::canonical_journal_command(
-            ["think", "-v", "--day", day, "--from-scratch"],
-        )),
-    );
-    extra.insert("day".to_owned(), json!(day));
-    extra.insert("queue_if_active_cmd_differs".to_owned(), json!(true));
-    CallosumEnvelope {
-        tract: "supervisor".to_owned(),
-        event: "request".to_owned(),
-        ts: None,
-        extra,
-    }
 }
 
 fn drain_envelope(day: &str) -> CallosumEnvelope {
@@ -1044,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn from_scratch_emits_literal_framed_request() {
+    fn from_scratch_saves_intent_before_waking_discovery() {
         let root = TempDir::new().unwrap();
         write_test_provider(root.path());
         fs::write(
@@ -1064,9 +1038,14 @@ mod tests {
             },
         );
         assert_eq!(result.exit_code, 0);
+        let envelope: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(envelope["event"], "drain");
+        assert!(envelope.get("cmd").is_none());
+        let intent = solstone_core_system::work_intent::read(root.path()).unwrap();
+        assert!(intent[DAY].from_scratch);
         assert_eq!(
-            sent,
-            "{\"tract\":\"supervisor\",\"event\":\"request\",\"cmd\":[\"solstone\",\"journal\",\"think\",\"-v\",\"--day\",\"20260101\",\"--from-scratch\"],\"day\":\"20260101\",\"queue_if_active_cmd_differs\":true}\n"
+            intent[DAY].state,
+            solstone_core_system::work_intent::IntentState::Queued
         );
     }
 
@@ -1191,8 +1170,13 @@ mod tests {
                 false
             },
         );
-        assert_eq!(result.exit_code, 1);
-        assert_eq!(result.stderr, format!("{UNREACHABLE_MESSAGE}\n"));
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stderr.is_empty());
+        assert!(
+            solstone_core_system::work_intent::read(root.path())
+                .unwrap()
+                .contains_key(DAY)
+        );
         assert!(marker.is_file());
     }
 
@@ -1343,7 +1327,7 @@ mod tests {
         assert_eq!(calls, 0);
         assert_eq!(
             result.stdout,
-            "from-scratch reprocess plan:\n1 days with data (0 segments) will be queued. Progress will be visible in solstone journal top or solstone journal health. Queued days do not survive a supervisor restart.\nThese days run one at a time and can take hours; today's own journal processing waits until the whole range finishes.\nre-run with --yes to proceed\n"
+            "from-scratch reprocess plan:\n1 days with data (0 segments) will be queued. Progress will be visible in solstone journal top or solstone journal health. Requests survive a supervisor restart; interrupted from-scratch attempts wait for your review.\nThese days can take hours; today's work goes first between tasks.\nre-run with --yes to proceed\n"
         );
     }
 
@@ -1381,12 +1365,12 @@ mod tests {
         assert_eq!(calls, 0);
         assert_eq!(
             range.stdout,
-            "from-scratch reprocess plan:\n1 days with data (1 segments) will be queued. Progress will be visible in solstone journal top or solstone journal health. Queued days do not survive a supervisor restart.\nThese days run one at a time and can take hours; today's own journal processing waits until the whole range finishes.\nre-run with --yes to proceed\n"
+            "from-scratch reprocess plan:\n1 days with data (1 segments) will be queued. Progress will be visible in solstone journal top or solstone journal health. Requests survive a supervisor restart; interrupted from-scratch attempts wait for your review.\nThese days can take hours; today's work goes first between tasks.\nre-run with --yes to proceed\n"
         );
     }
 
     #[test]
-    fn range_partial_failure_counts_only_data_days() {
+    fn range_disconnected_wake_still_saves_every_data_day() {
         let root = TempDir::new().unwrap();
         write_test_provider(root.path());
         for day in ["20251230", "20251231", "20260101"] {
@@ -1414,11 +1398,11 @@ mod tests {
             },
         );
         assert_eq!(calls, 3);
+        assert_eq!(result.exit_code, 0);
+        let intents = solstone_core_system::work_intent::read(root.path()).unwrap();
         assert_eq!(
-            result.stderr,
-            format!(
-                "failed to queue day 3 of 3 (20260101): {UNREACHABLE_MESSAGE}\nqueued day set: 20251230, 20251231\nnot-queued day set: 20260101\n"
-            )
+            intents.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["20251230", "20251231", "20260101"]
         );
     }
 
@@ -1460,9 +1444,11 @@ mod tests {
             },
         );
         assert_eq!(sent_days, ["20251231", "20260102"]);
+        assert_eq!(result.exit_code, 0);
+        let intents = solstone_core_system::work_intent::read(root.path()).unwrap();
         assert_eq!(
-            result.stdout,
-            "queued from-scratch reprocess for 2 days (2 segments)\nprogress is visible in solstone journal top or solstone journal health\nqueued days do not survive a supervisor restart\n"
+            intents.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["20251231", "20260102"]
         );
     }
 

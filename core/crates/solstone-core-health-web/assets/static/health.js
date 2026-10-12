@@ -261,7 +261,7 @@
     const pending = Number(data.pending_days) || 0;
     const label = day ? window.JournalFormat.day(day) : '';
     if (!day || !label) {
-      line.textContent = data.verdict || '';
+      line.textContent = (data.scope ? data.scope + ': ' : '') + (data.verdict || '');
       return;
     }
     const link = document.createElement('a');
@@ -485,11 +485,64 @@
     }
   }
 
+  function renderWorkProgress(work) {
+    const section = document.getElementById('workProgress');
+    if (!section) return;
+    const inventory = work?.inventory;
+    const reach = section.querySelector('[data-work-reach]');
+    const rows = section.querySelector('[data-work-bands]');
+    rows.replaceChildren();
+    const fresh = inventory && Date.now() - inventory.as_of_ms >= 0
+      && Date.now() - inventory.as_of_ms < 180000;
+    if (!inventory) {
+      reach.textContent = 'the journal has not finished checking its work. keep it running to see progress here.';
+    } else {
+      const range = inventory.oldest_day ? inventory.oldest_day + '–' + inventory.newest_day : 'no recorded days';
+      reach.textContent = `${inventory.days_inspected} of ${inventory.days_total} days checked (${range}). `
+        + (!fresh ? 'last known progress, checked ' + new Date(inventory.as_of_ms).toLocaleString() + '.'
+          : inventory.complete ? 'the inspection covers the whole journal.' : 'the inspection is incomplete.');
+      const names = ['today', 'your requests and yesterday', 'recent days', 'imports', 'older recordings', 'older day updates'];
+      inventory.bands.forEach((band, i) => {
+        const row = document.createElement('li');
+        row.textContent = names[i] + ': ' + band.segments_complete + ' recordings ready, '
+          + band.segments_owed + ' left; ' + band.daily_units_complete + ' daily outputs ready, '
+          + band.daily_units_owed + ' left'
+          + (band.owner_requests ? '; ' + band.owner_requests + ' requests to redo a day' : '')
+          + (band.permission_held ? '; ' + band.permission_held + ' waiting for permission' : '')
+          + (band.prerequisite_held ? '; ' + band.prerequisite_held + ' waiting for recordings' : '') + '.';
+        rows.appendChild(row);
+      });
+    }
+    section.querySelector('[data-work-confirm]').hidden = !work?.confirmation_available || work.history_confirmed;
+    const details = section.querySelector('[data-work-details]');
+    const errors = work?.error ? [work.error] : inventory?.unreadable || [];
+    details.hidden = errors.length === 0;
+    details.querySelector('pre').textContent = errors.join('\n');
+    const button = section.querySelector('[data-work-allow]');
+    button.onclick = async () => {
+      const result = section.querySelector('[data-work-action-result]');
+      result.hidden = false;
+      result.textContent = 'saving your choice…';
+      try {
+        const response = await fetch('/app/settings/api/config', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ section: 'processing', data: { history_confirmed: true } }),
+        });
+        if (!response.ok) throw new Error('save failed');
+        result.textContent = 'older work is allowed. it will run after higher-priority work.';
+        await loadHealthState();
+      } catch {
+        result.textContent = 'your choice could not be saved. try again.';
+      }
+    };
+  }
+
   async function loadHealthState() {
     clearHealthStateError();
     loadMediaBacklog();
     try {
       const payload = await getJson('/app/health/api/state');
+      renderWorkProgress(payload.work);
       state.searchIndex = payload.search_index || null;
       renderBacklogState(payload.backlog, payload.search_index);
       renderAgentErrorsState(payload.agent_errors);

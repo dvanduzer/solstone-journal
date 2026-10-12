@@ -1341,7 +1341,7 @@ pub(crate) mod tests {
         assert_eq!(body["imported_json"]["status"], "success");
         assert_eq!(
             body["imported_json"]["schema"],
-            "solstone.import.publication.v1"
+            solstone_core_import::publish::PUBLICATION_SCHEMA
         );
 
         let (c_status, c_body) =
@@ -1542,7 +1542,7 @@ pub(crate) mod tests {
         assert_eq!(body["imported_json"]["status"], "success");
         assert_eq!(
             body["imported_json"]["schema"],
-            "solstone.import.publication.v1"
+            solstone_core_import::publish::PUBLICATION_SCHEMA
         );
 
         let (c_status, c_body) =

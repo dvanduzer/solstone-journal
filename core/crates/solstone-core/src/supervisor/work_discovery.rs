@@ -1,0 +1,982 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+//! One coalescing discovery worker. It reconstructs work; TaskQueue executes it.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::time::{Duration, SystemTime};
+
+use solstone_core_import::thinking::{Coordinate, ImportThinking};
+use solstone_core_journal_config::work_priority::{WorkBand, WorkPriority};
+use solstone_core_system::{
+    daily_coverage::{self, CoverageState},
+    partition::canonical_journal_command,
+    queue::{DiscoveredTask, TaskQueue},
+    request::{BusTaskRequest, DailyCatchupProvenance, TaskArgv},
+    work_intent::{self, IntentState, OwnerIntent},
+    work_inventory::{WorkHold, WorkInventory},
+    work_policy::WorkPolicy,
+};
+
+pub(crate) struct WorkDiscovery {
+    stopped: Arc<AtomicBool>,
+    wake: mpsc::SyncSender<()>,
+}
+
+impl WorkDiscovery {
+    pub fn new(journal: PathBuf, queue: TaskQueue, automatic: bool) -> Self {
+        Self::with_reconciler(journal, queue, automatic, reconcile)
+    }
+
+    fn with_reconciler(
+        journal: PathBuf,
+        queue: TaskQueue,
+        automatic: bool,
+        mut reconcile_pass: impl FnMut(&Path, &TaskQueue, &AtomicBool) -> Result<(), String>
+        + Send
+        + 'static,
+    ) -> Self {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (wake, receiver) = mpsc::sync_channel(1);
+        let worker_stop = Arc::clone(&stopped);
+        let spawned = std::thread::Builder::new()
+            .name("journal-work-discovery".into())
+            .spawn(move || {
+                if receiver.recv().is_err() {
+                    return;
+                }
+                let mut initial = true;
+                loop {
+                    if worker_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if initial {
+                            solstone_core_system::catchup::reconcile_stale_catchup_attempts(
+                                &journal,
+                                SystemTime::now(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                            initial = false;
+                        }
+                        reconcile_pass(&journal, &queue, &worker_stop)
+                    }));
+                    let error = match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_) => Some("work discovery panicked".into()),
+                    };
+                    if let Some(error) = error {
+                        log::warn!("work discovery: {error}");
+                        if !worker_stop.load(Ordering::Acquire) {
+                            let mut report = WorkInventory::default();
+                            report.unreadable.push(error);
+                            let _ = report.publish(&journal);
+                        }
+                    }
+                    if worker_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if automatic {
+                        match receiver.recv_timeout(Duration::from_secs(60)) {
+                            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    } else if receiver.recv().is_err() {
+                        return;
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            stopped.store(true, Ordering::Release);
+            log::warn!("could not start work discovery: {error}");
+        }
+        Self { stopped, wake }
+    }
+
+    pub fn request(&self) {
+        let _ = self.wake.try_send(());
+    }
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.request();
+    }
+}
+
+impl Drop for WorkDiscovery {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct DayWork {
+    candidates: Vec<DiscoveredTask>,
+    completed_segments: BTreeSet<Coordinate>,
+    daily_current: bool,
+}
+
+fn priority(
+    day: &str,
+    segment: Option<&str>,
+    today: chrono::NaiveDate,
+    explicit: Option<WorkBand>,
+) -> WorkPriority {
+    let mut command = vec!["journal".into(), "think".into(), "--day".into(), day.into()];
+    if let Some(segment) = segment {
+        command.extend(["--segment".into(), segment.into()]);
+    }
+    let mut priority = solstone_core_system::priority::classify(&command, today);
+    if let Some(band) = explicit {
+        priority.band = band;
+    }
+    priority
+}
+
+fn task(
+    day: &str,
+    segment: Option<(&str, &str)>,
+    priority: WorkPriority,
+    intent: Option<&OwnerIntent>,
+    confirmed_import: bool,
+) -> DiscoveredTask {
+    let mut tail = vec!["think".to_owned(), "--day".into(), day.into()];
+    let from_scratch = intent.is_some_and(|intent| intent.from_scratch);
+    if let Some((segment, stream)) = segment {
+        tail.extend([
+            "--segment".into(),
+            segment.into(),
+            "--stream".into(),
+            stream.into(),
+            "--repair-segment".into(),
+        ]);
+    } else if let Some(intent) = intent.filter(|intent| intent.from_scratch) {
+        tail.extend([
+            "--from-scratch".into(),
+            "--work-intent".into(),
+            intent.id.clone(),
+        ]);
+    } else {
+        tail.push("--daily-only".into());
+    }
+    let suffix = segment
+        .map(|(segment, stream)| format!("{stream}-{segment}"))
+        .unwrap_or_else(|| {
+            intent
+                .filter(|i| i.from_scratch)
+                .map(|i| i.id.clone())
+                .unwrap_or_else(|| "daily".into())
+        });
+    DiscoveredTask {
+        guard: None,
+        request: BusTaskRequest {
+            cmd: TaskArgv::from_wire(canonical_journal_command(tail))
+                .expect("nonempty journal command"),
+            reference: format!("supervisor-work-{day}-{suffix}"),
+            day: Some(day.into()),
+            scheduler_name: None,
+            queue_if_active_cmd_differs: false,
+            priority: Some(priority),
+            daily_catchup_provenance: (segment.is_none() && !from_scratch)
+                .then(|| DailyCatchupProvenance { day: day.into() }),
+        },
+        confirmed_import,
+    }
+}
+
+fn held(
+    report: &mut WorkInventory,
+    day: &str,
+    segment: Option<(&str, &str)>,
+    band: WorkBand,
+    reason: &str,
+) {
+    report.holds.push(WorkHold {
+        day: day.into(),
+        segment: segment.map(|(s, _)| s.into()),
+        stream: segment.map(|(_, s)| s.into()),
+        band,
+        reason: reason.into(),
+    });
+}
+
+fn inspect_day(
+    journal: &Path,
+    day: &str,
+    queue: &TaskQueue,
+    intent: Option<&OwnerIntent>,
+    imports: &[ImportThinking],
+    policy: WorkPolicy,
+    report: &mut WorkInventory,
+) -> Result<DayWork, String> {
+    let now = chrono::Utc::now();
+    let today = now
+        .with_timezone(&solstone_core_journal_config::owner_zone(journal))
+        .date_naive();
+    let mut work = DayWork {
+        candidates: Vec::new(),
+        completed_segments: BTreeSet::new(),
+        daily_current: false,
+    };
+    if let Some(intent) = intent.filter(|intent| intent.from_scratch) {
+        if intent.state == IntentState::Queued {
+            let p = priority(day, None, today, Some(WorkBand::Waiting));
+            report.band(p.band).owner_requests += 1;
+            if policy.permits(p.band, false) {
+                work.candidates
+                    .push(task(day, None, p, Some(intent), false));
+                report.band(p.band).eligible += 1;
+            } else {
+                report.band(p.band).permission_held += 1;
+                held(report, day, None, p.band, "thinking_unavailable");
+            }
+        } else {
+            held(
+                report,
+                day,
+                None,
+                WorkBand::Waiting,
+                if intent.state == IntentState::Claimed {
+                    "interrupted_from_scratch"
+                } else {
+                    "failed_from_scratch"
+                },
+            );
+        }
+        return Ok(work);
+    }
+    let (_, _, segments) = solstone_core_system_health::scan_day(
+        &solstone_core_system_health::FilesystemSegmentSource,
+        journal,
+        day,
+        now,
+    )
+    .map_err(|error| error.to_string())?;
+    let progress = solstone_core_system_health::read_segment_progress(
+        &solstone_core_system_health::FilesystemHealthLogSource::new(journal),
+        day,
+    )
+    .map_err(|error| error.to_string())?;
+    if progress.malformed_line_count != 0 {
+        return Err("segment progress contains unreadable records".into());
+    }
+    let mut prerequisites_ready = true;
+    for segment in &segments {
+        if super::tick::is_mcp_audit_segment(Some(&segment.stream)) {
+            continue;
+        }
+        let coordinate = Coordinate {
+            day: day.into(),
+            stream: segment.stream.clone(),
+            segment: segment.key.clone(),
+        };
+        let imported = imports
+            .iter()
+            .any(|import| import.segments.contains(&coordinate));
+        let explicit = intent
+            .map(|_| WorkBand::Waiting)
+            .or_else(|| imported.then_some(WorkBand::Import));
+        let p = priority(day, Some(&segment.key), today, explicit);
+        if solstone_core_system_health::segment_work_ready(journal, day, segment, &progress.value)?
+        {
+            report.band(p.band).segments_complete += 1;
+            work.completed_segments.insert(coordinate);
+            continue;
+        }
+        prerequisites_ready = false;
+        report.band(p.band).segments_owed += 1;
+        if solstone_core_system_health::segment_repair_protected(
+            journal,
+            day,
+            segment,
+            &progress.value,
+        )? {
+            held(
+                report,
+                day,
+                Some((&segment.key, &segment.stream)),
+                p.band,
+                solstone_core_system::segment_output::PROTECTED,
+            );
+        } else if policy.permits(p.band, imported) {
+            report.band(p.band).eligible += 1;
+            work.candidates.push(task(
+                day,
+                Some((&segment.key, &segment.stream)),
+                p,
+                None,
+                imported,
+            ));
+        } else {
+            report.band(p.band).permission_held += 1;
+            held(
+                report,
+                day,
+                Some((&segment.key, &segment.stream)),
+                p.band,
+                "spending_confirmation",
+            );
+        }
+    }
+    if day >= today.format("%Y%m%d").to_string().as_str() {
+        return Ok(work);
+    }
+    let imported = imports.iter().any(|import| import.days.contains(day));
+    let explicit = intent
+        .map(|_| WorkBand::Waiting)
+        .or_else(|| imported.then_some(WorkBand::Import));
+    let p = priority(day, None, today, explicit);
+    let coverage = daily_coverage::read_daily_coverage(journal, day)?;
+    let owed = coverage
+        .units
+        .iter()
+        .filter(|unit| unit.state.is_owed())
+        .count() as u64;
+    report.band(p.band).daily_units_complete += coverage
+        .units
+        .iter()
+        .filter(|unit| unit.state.is_current())
+        .count() as u64;
+    if coverage
+        .units
+        .iter()
+        .any(|unit| unit.state == CoverageState::HistoricalUnverified)
+    {
+        report
+            .unreadable
+            .push(format!("{day}: unsupported daily evidence contract"));
+    }
+    report.band(p.band).daily_units_owed += owed;
+    work.daily_current = coverage.state.is_current() && prerequisites_ready;
+    if coverage.state == CoverageState::Unreadable {
+        return Err("daily coverage is unreadable".into());
+    }
+    if owed == 0 {
+        return Ok(work);
+    }
+    if !prerequisites_ready
+        || super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref() == Some(day)
+    {
+        report.band(p.band).prerequisite_held += owed;
+        held(report, day, None, p.band, "segment_prerequisites");
+    } else if !policy.permits(p.band, imported) {
+        report.band(p.band).permission_held += owed;
+        held(report, day, None, p.band, "spending_confirmation");
+    } else if intent.is_none()
+        && !solstone_core_system::catchup::eligible_or_fail_open(journal, day, SystemTime::now())
+    {
+        held(report, day, None, p.band, "retry_wait");
+    } else {
+        report.band(p.band).eligible += owed;
+        work.candidates.push(task(day, None, p, None, imported));
+    }
+    Ok(work)
+}
+
+fn retain_best(candidates: &mut Vec<DiscoveredTask>, new: Vec<DiscoveredTask>) {
+    candidates.extend(new);
+    candidates.sort_by_key(|candidate| {
+        candidate
+            .request
+            .priority
+            .expect("discovery priority")
+            .sort_key()
+    });
+    candidates.dedup_by(|a, b| a.request.cmd == b.request.cmd);
+    candidates.truncate(4);
+}
+
+fn still_owed(
+    journal: &Path,
+    candidate: &DiscoveredTask,
+    imports: &[ImportThinking],
+) -> Result<bool, String> {
+    let day = candidate.request.day.as_deref().ok_or("work has no day")?;
+    let argv = candidate.request.cmd.as_wire();
+    let argument = |flag: &str| {
+        argv.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    };
+    if let Some(id) = argument("--work-intent") {
+        return Ok(work_intent::read(journal)?.get(day).is_some_and(|intent| {
+            intent.id == id && intent.from_scratch && intent.state == IntentState::Queued
+        }));
+    }
+    if let Some(segment) = argument("--segment") {
+        let stream = argument("--stream").ok_or("work has no stream")?;
+        if candidate.confirmed_import
+            && !imports.iter().any(|import| {
+                import.segments.contains(&Coordinate {
+                    day: day.into(),
+                    stream: stream.into(),
+                    segment: segment.into(),
+                })
+            })
+        {
+            return Ok(false);
+        }
+        let (_, _, segments) = solstone_core_system_health::scan_day(
+            &solstone_core_system_health::FilesystemSegmentSource,
+            journal,
+            day,
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.to_string())?;
+        let Some(segment) = segments
+            .iter()
+            .find(|entry| entry.key == segment && entry.stream == stream)
+        else {
+            return Ok(false);
+        };
+        let progress = solstone_core_system_health::read_segment_progress(
+            &solstone_core_system_health::FilesystemHealthLogSource::new(journal),
+            day,
+        )
+        .map_err(|error| error.to_string())?;
+        if progress.malformed_line_count != 0 {
+            return Err("segment progress contains unreadable records".into());
+        }
+        return solstone_core_system_health::segment_work_ready(
+            journal,
+            day,
+            segment,
+            &progress.value,
+        )
+        .map(|ready| !ready);
+    }
+    if candidate.confirmed_import && !imports.iter().any(|import| import.days.contains(day)) {
+        return Ok(false);
+    }
+    Ok(daily_coverage::read_daily_coverage(journal, day)?
+        .state
+        .is_owed()
+        && solstone_core_system_health::day_segments_ready(journal, day)?)
+}
+
+fn admit(
+    journal: &Path,
+    queue: &TaskQueue,
+    stopped: &AtomicBool,
+    candidates: Vec<DiscoveredTask>,
+    report: &mut WorkInventory,
+) -> Result<(), String> {
+    if stopped.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let imports = solstone_core_import::thinking::read(journal)?;
+    let mut current = Vec::new();
+    report.unreadable.extend(imports.unreadable.clone());
+    if !imports.unreadable.is_empty() {
+        report.complete = false;
+    }
+    for mut candidate in candidates {
+        if stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match still_owed(journal, &candidate, &imports.imports) {
+            Ok(true) => {
+                if candidate.confirmed_import {
+                    let day = candidate.request.day.clone().expect("discovered day");
+                    let argv = candidate.request.cmd.as_wire();
+                    let argument =
+                        |flag: &str| argv.windows(2).find(|p| p[0] == flag).map(|p| p[1].clone());
+                    let segment = argument("--segment").zip(argument("--stream"));
+                    let grants = imports
+                        .imports
+                        .iter()
+                        .filter(|import| match &segment {
+                            Some((segment, stream)) => import.segments.contains(&Coordinate {
+                                day: day.clone(),
+                                segment: segment.clone(),
+                                stream: stream.clone(),
+                            }),
+                            None => import.days.contains(&day),
+                        })
+                        .map(|import| (import.id.clone(), import.publication.clone()))
+                        .collect::<BTreeSet<_>>();
+                    let root = journal.to_path_buf();
+                    candidate.guard = Some(Arc::new(move || {
+                        solstone_core_import::thinking::grant_current(
+                            &root,
+                            &grants,
+                            &day,
+                            segment
+                                .as_ref()
+                                .map(|(segment, stream)| (segment.as_str(), stream.as_str())),
+                        )
+                    }));
+                }
+                current.push(candidate);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                report.unreadable.push(error);
+                report.complete = false;
+            }
+        }
+    }
+    if !stopped.load(Ordering::Acquire) {
+        report.publish(journal)?;
+        queue.replace_discovered(current);
+    }
+    Ok(())
+}
+
+fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<(), String> {
+    let policy = WorkPolicy::read(journal)?;
+    let mut days = solstone_core_journal_io::day_dirs(journal)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let imports = solstone_core_import::thinking::read(journal)?;
+    let mut report = WorkInventory {
+        days_total: days.len(),
+        oldest_day: days.keys().next().cloned(),
+        newest_day: days.keys().next_back().cloned(),
+        unreadable: imports.unreadable,
+        ..WorkInventory::default()
+    };
+    report.publish(journal)?;
+    let mut candidates = Vec::new();
+    let mut day_reports = BTreeMap::<String, WorkInventory>::new();
+    let import_errors = report.unreadable.clone();
+    let mut inspected = BTreeSet::new();
+    let mut observed_intents = BTreeMap::new();
+    let mut fulfilled_segments = BTreeSet::new();
+    let mut fulfilled_days = BTreeSet::new();
+    // Check owner requests before the history pass and between days. Source
+    // reads run only here, never on the supervisor's event loop.
+    let mut ordered = days.keys().rev().cloned().collect::<VecDeque<_>>();
+    loop {
+        if stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let intents = work_intent::read(journal)?;
+        let owner_day = intents
+            .iter()
+            .rev()
+            .find(|(day, intent)| observed_intents.get(*day) != Some(&intent.id))
+            .map(|(day, _)| day.clone());
+        let owner_wakeup = owner_day.is_some();
+        let day = match owner_day.or_else(|| {
+            while let Some(day) = ordered.pop_front() {
+                if !inspected.contains(&day) {
+                    return Some(day);
+                }
+            }
+            None
+        }) {
+            Some(day) => day,
+            None => break,
+        };
+        if let Some(intent) = intents.get(&day) {
+            observed_intents.insert(day.clone(), intent.id.clone());
+        }
+        // An owner can replace an intent while its day is being inspected.
+        // Replace that day's snapshot and queued contribution; never add it twice.
+        candidates
+            .retain(|candidate: &DiscoveredTask| candidate.request.day.as_deref() != Some(&day));
+        fulfilled_segments.retain(|coordinate: &Coordinate| coordinate.day != day);
+        fulfilled_days.remove(&day);
+        days.entry(day.clone())
+            .or_insert_with(|| journal.join("chronicle").join(&day));
+        let mut day_report = WorkInventory::default();
+        match inspect_day(
+            journal,
+            &day,
+            queue,
+            intents.get(&day),
+            &imports.imports,
+            policy,
+            &mut day_report,
+        ) {
+            Ok(work) => {
+                fulfilled_segments.extend(work.completed_segments);
+                if work.daily_current {
+                    fulfilled_days.insert(day.clone());
+                    if let Some(intent) = intents.get(&day).filter(|intent| !intent.from_scratch) {
+                        work_intent::retire_current(journal, &day, &intent.id)?;
+                    }
+                }
+                retain_best(&mut candidates, work.candidates);
+            }
+            Err(error) => day_report.unreadable.push(format!("{day}: {error}")),
+        }
+        inspected.insert(day.clone());
+        day_reports.insert(day, day_report);
+        report.bands = std::array::from_fn(|_| Default::default());
+        report.holds.clear();
+        report.unreadable = import_errors.clone();
+        for day_report in day_reports.values() {
+            for (total, day) in report.bands.iter_mut().zip(&day_report.bands) {
+                total.add(day);
+            }
+            report.holds.extend(day_report.holds.iter().cloned());
+            report
+                .unreadable
+                .extend(day_report.unreadable.iter().cloned());
+        }
+        report.days_inspected = inspected.len();
+        report.days_total = days.len();
+        report.oldest_day = days.keys().next().cloned();
+        report.newest_day = days.keys().next_back().cloned();
+        report.as_of_ms = chrono::Utc::now().timestamp_millis();
+        if stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        report.publish(journal)?;
+        if owner_wakeup
+            || candidates.iter().any(|task| {
+                task.request
+                    .priority
+                    .is_some_and(|p| p.band <= WorkBand::Waiting)
+            })
+        {
+            // Reconstruct an independent copy; TaskQueue owns submissions.
+            let early = candidates
+                .iter()
+                .filter(|task| {
+                    task.request
+                        .priority
+                        .is_some_and(|p| p.band <= WorkBand::Waiting)
+                })
+                .map(|task| DiscoveredTask {
+                    guard: task.guard.clone(),
+                    request: task.request.clone(),
+                    confirmed_import: task.confirmed_import,
+                })
+                .collect();
+            admit(journal, queue, stopped, early, &mut report)?;
+        }
+    }
+    for import in imports.imports {
+        let segments = import
+            .segments
+            .intersection(&fulfilled_segments)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let days = import
+            .days
+            .intersection(&fulfilled_days)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !segments.is_empty() || !days.is_empty() {
+            solstone_core_import::thinking::fulfill(journal, &import, segments, days)?;
+        }
+    }
+    report.complete = report.unreadable.is_empty() && report.days_inspected == report.days_total;
+    report.as_of_ms = chrono::Utc::now().timestamp_millis();
+    if stopped.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    report.publish(journal)?;
+    admit(journal, queue, stopped, candidates, &mut report)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solstone_core_system::queue::{ProcessState, ProcessStateProbe, TaskQueueOptions};
+
+    struct NoProcesses;
+    impl ProcessStateProbe for NoProcesses {
+        fn state(&self, _: u32) -> ProcessState {
+            panic!("unready fixture must not launch")
+        }
+    }
+    fn queue(journal: &Path) -> TaskQueue {
+        TaskQueue::new(TaskQueueOptions {
+            #[cfg(windows)]
+            read_file_grants: Vec::new(),
+            journal_root: journal.into(),
+            cap_resolver: Arc::new(solstone_core_system::cap::DefaultCapResolver::default()),
+            process_state_probe: Arc::new(NoProcesses),
+            queue_sink: None,
+            process_sink: None,
+            ready: false,
+            before_deadline_commit: None,
+            child_environment: BTreeMap::new(),
+            task_binary: None,
+        })
+    }
+    fn fixture(provider: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(root.path().join("config/journal.json"), serde_json::json!({
+            "identity":{"timezone":"UTC"}, "providers":{"active":{"provider":provider,"model":"fixture"}}
+        }).to_string()).unwrap();
+        root
+    }
+    fn segment(root: &Path, day: &str, key: &str) {
+        let path = root.join("chronicle").join(day).join("notes").join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("audio.jsonl"),
+            "{\"text\":\"A meeting about a garden.\"}\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn discovery_reaches_old_segments_with_no_adoption_and_never_queues_their_day_first() {
+        let root = fixture("local");
+        for day in [
+            "19990101", "20000101", "20010101", "20020101", "20030101", "20040101",
+        ] {
+            segment(root.path(), day, "120000_60");
+        }
+        let queue = queue(root.path());
+        for state in [
+            None,
+            Some("{"),
+            Some("{\"version\":999,\"first_closed_day\":\"20990101\"}"),
+        ] {
+            if let Some(state) = state {
+                std::fs::write(root.path().join("health/daily-adoption.json"), state).unwrap();
+            }
+            reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+            let report = solstone_core_system::work_inventory::read(root.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.days_total, 6);
+            assert_eq!(report.days_inspected, 6);
+            assert_eq!(report.oldest_day.as_deref(), Some("19990101"));
+            assert_eq!(report.bands[4].segments_owed, 6);
+            assert_eq!(queue.collect_queue_counts()["pending"], 4);
+            assert!(queue.contains_reference("supervisor-work-20040101-notes-120000_60"));
+            assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+            assert!(!queue.contains_reference("supervisor-work-20040101-daily"));
+        }
+    }
+
+    #[test]
+    fn owner_request_replaces_old_waiting_work_and_own_key_history_waits_for_confirmation() {
+        let root = fixture("openai");
+        segment(root.path(), "19990101", "120000_60");
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            queue
+                .collect_queue_counts()
+                .get("pending")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.bands[4].permission_held, 1);
+        work_intent::register(root.path(), "19990101", false).unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.bands[1].segments_owed, 1);
+        assert_eq!(report.bands[4].segments_owed, 0);
+    }
+
+    #[test]
+    fn claimed_from_scratch_is_visible_and_shutdown_prevents_admission() {
+        let root = fixture("local");
+        segment(root.path(), "19990101", "120000_60");
+        let intent = work_intent::register(root.path(), "19990101", true).unwrap();
+        work_intent::claim_from_scratch(root.path(), "19990101", &intent.id).unwrap();
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            report
+                .holds
+                .iter()
+                .any(|hold| hold.reason == "interrupted_from_scratch")
+        );
+        assert_eq!(
+            queue
+                .collect_queue_counts()
+                .get("pending")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        work_intent::register(root.path(), "19990101", true).unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(true)).unwrap();
+        assert_eq!(
+            queue
+                .collect_queue_counts()
+                .get("pending")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn confirmed_import_does_not_authorize_an_unrelated_segment_on_the_same_day() {
+        use solstone_core_import::publish::*;
+        let root = fixture("openai");
+        let day = "19990101";
+        segment(root.path(), day, "120000_60");
+        segment(root.path(), day, "130000_60");
+        let directory = root.path().join("imports/fixture");
+        std::fs::create_dir_all(&directory).unwrap();
+        let record = PublicationRecord {
+            schema: PUBLICATION_SCHEMA.into(),
+            status: PublicationStatus::Success,
+            segments: vec![SegmentPublicationOutcome {
+                day: day.into(),
+                stream: "notes".into(),
+                segment: "120000_60".into(),
+                outcome: SegmentBindingOutcome::Bound {
+                    prev_day: None,
+                    prev_segment: None,
+                    seq: 1,
+                },
+            }],
+            indexing: IndexPublicationOutcomes::default(),
+            day_markers: Vec::new(),
+        };
+        write_publication_record(Some(&directory), &record).unwrap();
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+        assert!(!queue.contains_reference("supervisor-work-19990101-notes-130000_60"));
+        assert!(!queue.contains_reference("supervisor-work-19990101-daily"));
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.bands[3].segments_owed, 1);
+        assert_eq!(report.bands[4].permission_held, 1);
+        // Unknown existing output is protected even after spending permission.
+        let protected = root
+            .path()
+            .join("chronicle/19990101/notes/120000_60/talents/activity.md");
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(&protected, "owner text without generated evidence").unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            report
+                .holds
+                .iter()
+                .any(|h| h.segment.as_deref() == Some("120000_60")
+                    && h.reason == "owner_output_protected")
+        );
+        assert_eq!(
+            std::fs::read_to_string(protected).unwrap(),
+            "owner text without generated evidence"
+        );
+    }
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn blocked_discovery_coalesces_wakes_and_does_not_hold_task_admission_or_status() {
+        use solstone_core_system::request::ExecutionRequest;
+        let root = fixture("local");
+        use solstone_core_system::lifecycle::{
+            CoordinatorBootstrap, DeclaredParent, ParentLossCoordinator,
+        };
+        let parent = DeclaredParent::capture_current().unwrap();
+        let (_coordinator, _) = ParentLossCoordinator::bootstrap(CoordinatorBootstrap {
+            journal: root.path().into(),
+            supervisor: parent.instance(),
+            enabled: Vec::new(),
+            supervisor_heartbeat_filename: format!(
+                "solstone-v2-discovery-test-{}.check",
+                std::process::id()
+            ),
+            capability: format!("discovery-test-{}", root.path().display()).into_bytes(),
+        })
+        .unwrap();
+        use solstone_core_system::queue::{
+            SystemProcessStateProbe, TaskQueueEvent, TaskQueueEventSink,
+        };
+        struct Events(mpsc::Sender<TaskQueueEvent>);
+        impl TaskQueueEventSink for Events {
+            fn emit(&self, event: TaskQueueEvent) {
+                let _ = self.0.send(event);
+            }
+        }
+        let (events, observed) = mpsc::channel();
+        let queue = TaskQueue::new(TaskQueueOptions {
+            journal_root: root.path().into(),
+            cap_resolver: Arc::new(solstone_core_system::cap::DefaultCapResolver::default()),
+            process_state_probe: Arc::new(SystemProcessStateProbe),
+            queue_sink: Some(Arc::new(Events(events))),
+            process_sink: None,
+            ready: true,
+            before_deadline_commit: None,
+            child_environment: BTreeMap::new(),
+            task_binary: None,
+        });
+        let (entered, received) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let worker = WorkDiscovery::with_reconciler(
+            root.path().into(),
+            queue.clone(),
+            false,
+            move |_, _, _| {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                Ok(())
+            },
+        );
+        worker.request();
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..100 {
+            worker.request();
+        }
+        let mut live = task(
+            "20261011",
+            Some(("120000_60", "desktop")),
+            WorkPriority {
+                band: WorkBand::Now,
+                source_time: 20261011120000,
+            },
+            None,
+            false,
+        );
+        // A real bounded child reaches the worker while the discovery read is
+        // blocked. The separate supervisor race harness covers capture routing.
+        live.request.cmd = TaskArgv::from_wire(vec!["/bin/sleep".into(), "0.1".into()]).unwrap();
+        let reference = live.request.reference.clone();
+        assert_eq!(
+            queue.submit(ExecutionRequest::Bus(live.request)),
+            solstone_core_system::queue::SubmitOutcome::Dispatched,
+            "{:?}",
+            queue.collect_status_snapshot(std::time::Instant::now())
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match observed
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap()
+            {
+                TaskQueueEvent::Started {
+                    reference: started, ..
+                } if started == reference => break,
+                _ => {}
+            }
+        }
+        let _status = queue.collect_status_snapshot(std::time::Instant::now());
+        assert!(std::time::Instant::now() < deadline);
+        release.send(()).unwrap();
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.stop();
+        release.send(()).unwrap();
+        assert!(received.recv_timeout(Duration::from_secs(5)).is_err());
+        queue.shutdown();
+    }
+}

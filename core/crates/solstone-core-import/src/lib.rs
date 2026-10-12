@@ -28,6 +28,7 @@ pub mod sync_obsidian;
 pub mod sync_plaud;
 pub mod sync_state;
 pub mod text;
+pub mod thinking;
 pub mod timestamp;
 
 pub use allocate::{

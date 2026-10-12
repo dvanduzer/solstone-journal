@@ -120,11 +120,33 @@ async fn state(root: PathBuf, clock: Clock) -> Response {
                 None => {}
             }
         }
+        let work = solstone_core_system::work_inventory::read(&root);
+        let policy = solstone_core_system::work_policy::WorkPolicy::read(&root);
+        let work_error = work.as_ref().err().cloned();
+        let (history_confirmed, confirmation_available) = policy
+            .map(|p| {
+                (
+                    p.history_confirmed,
+                    matches!(
+                        p.lane,
+                        solstone_core_system::work_policy::ThinkingLane::OwnKeys
+                            | solstone_core_system::work_policy::ThinkingLane::Confidential
+                    ),
+                )
+            })
+            .unwrap_or((false, false));
         let (items, ok) = talent_failures::today(&root);
         let count = items.len();
         Json(json!({
+            "work": {
+                "inventory": work.ok().flatten(),
+                "error": work_error,
+                "history_confirmed": history_confirmed,
+                "confirmation_available": confirmation_available,
+            },
             "backlog": {
                 "verdict": eval.verdict,
+                "scope": "recent days",
                 "not_yet": not_yet.map(solstone_core_system_health::NotYet::as_str),
                 "pending_days": eval.pending_days,
                 "oldest_pending_day": eval.oldest_pending_day,

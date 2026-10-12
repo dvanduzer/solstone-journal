@@ -151,6 +151,7 @@ pub(crate) struct ThinkContext {
     pub(crate) cortex: Arc<dyn CortexBoundary>,
     pub(crate) index: Arc<dyn IndexBoundary>,
     pub(crate) status: ThinkStatus,
+    pub(crate) protect_segment_outputs: bool,
 }
 
 impl ThinkContext {
@@ -192,6 +193,7 @@ impl ThinkContext {
             }),
             index: Arc::new(NativeIndexBoundary),
             status: ThinkStatus::default(),
+            protect_segment_outputs: false,
         })
     }
 

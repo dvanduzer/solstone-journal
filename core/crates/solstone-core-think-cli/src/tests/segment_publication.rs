@@ -41,6 +41,52 @@ fn stored_chunk_facet_ids(
 const DAY: &str = "20260813";
 const NOW: i64 = 1_786_615_200_000;
 
+#[test]
+fn protected_projections_preserve_edits_between_runtime_and_splitter_and_from_scratch_overrides() {
+    let (_journal, mut context) = fixture_journal();
+    let segment = context.day_dir.join("default/120000_60");
+    let sense = serde_json::json!({"density":"idle","content_type":"idle","activity_summary":"generated summary","facets":[]});
+    let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
+    context.protect_segment_outputs = true;
+    write_sense_and_change(
+        &context,
+        &mut log,
+        "120000_60",
+        Some("default"),
+        &segment,
+        sense.as_object().unwrap(),
+    )
+    .unwrap();
+    for filename in ["sense.json", "activity.md", "topics.md"] {
+        let path = segment.join("talents").join(filename);
+        fs::write(&path, "owner edit").unwrap();
+        assert!(
+            write_sense_and_change(
+                &context,
+                &mut log,
+                "120000_60",
+                Some("default"),
+                &segment,
+                sense.as_object().unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "owner edit");
+        context.protect_segment_outputs = false;
+        write_sense_and_change(
+            &context,
+            &mut log,
+            "120000_60",
+            Some("default"),
+            &segment,
+            sense.as_object().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(fs::read_to_string(&path).unwrap(), "owner edit");
+        context.protect_segment_outputs = true;
+    }
+}
+
 fn fixture_journal() -> (tempfile::TempDir, ThinkContext) {
     let journal = tempfile::tempdir().unwrap();
     let config_path = journal.path().join("config/journal.json");
@@ -968,7 +1014,7 @@ fn topics_no_prior_file_keyless_and_empty_does_not_create_file() {
 }
 
 #[test]
-fn topics_directory_collision_returns_ok_logs_cause() {
+fn topics_directory_collision_reports_unfinished_publication_and_logs_cause() {
     let (_journal, context) = fixture_journal();
     solstone_core_facets::create_facet(context.journal.as_path(), "work", "Work", "", "", "", None)
         .unwrap();
@@ -1006,7 +1052,7 @@ fn topics_directory_collision_returns_ok_logs_cause() {
         &segment_dir,
         sense_val.as_object().unwrap(),
     );
-    assert!(res.is_ok());
+    assert!(res.is_err());
     log.finish().unwrap();
 
     assert!(segment_dir.join("talents/sense.md").is_file());

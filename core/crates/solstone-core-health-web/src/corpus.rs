@@ -191,6 +191,13 @@ fn ac3_replays_all_captured_health_cases_through_the_shell() {
                             }
                         }
                     }
+                    if case["name"].as_str() == Some("api_state") && expected["status"] == 200 {
+                        assert!(actual["work"]["inventory"].is_null());
+                        assert!(actual["work"]["history_confirmed"].is_boolean());
+                        actual.as_object_mut().unwrap().remove("work");
+                        assert_eq!(actual["backlog"]["scope"], "recent days");
+                        actual["backlog"].as_object_mut().unwrap().remove("scope");
+                    }
                     // The info route names this machine; the corpus was captured on another.
                     if case["name"].as_str() == Some("api_info") && expected["status"] == 200 {
                         assert!(actual["hostname"].is_string());
@@ -350,6 +357,14 @@ async fn reprocess_holds_back_the_journals_today_not_this_computers() {
 
 #[tokio::test]
 async fn ac14_reprocess_response_shapes() {
+    let saved = crate::actions::response(
+        "20240101",
+        solstone_core_reprocess_cli::DayOutcome::WaitingForSupervisor,
+    );
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved: Value =
+        serde_json::from_slice(&to_bytes(saved.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(saved["status"], "saved");
     for (outcome, status, reason) in [
         (
             solstone_core_reprocess_cli::DayOutcome::Malformed,
@@ -365,11 +380,6 @@ async fn ac14_reprocess_response_shapes() {
             solstone_core_reprocess_cli::DayOutcome::NoThinkingEngine,
             StatusCode::BAD_REQUEST,
             "reprocess_no_thinking_engine",
-        ),
-        (
-            solstone_core_reprocess_cli::DayOutcome::Unreachable,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "reprocess_unreachable",
         ),
         (
             solstone_core_reprocess_cli::DayOutcome::Failed("disk failed".to_owned()),
@@ -774,7 +784,8 @@ async fn ac14_and_ac15_reprocess_handler_seam_submits_despite_backoff() {
     let calls = calls.into_inner();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].tract, "supervisor");
-    assert_eq!(calls[0].event, "request");
+    assert_eq!(calls[0].event, "drain");
+    assert!(solstone_core_system::work_intent::read(root.path()).unwrap()[day].from_scratch);
     assert_eq!(calls[0].extra["day"], day);
 
     let fingerprint =

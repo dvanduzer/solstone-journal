@@ -1731,8 +1731,8 @@ fn task_pace_missing_status_skips() {
 fn caught_up_native_backlog_fixture_states() {
     let clean = fixture();
     let row = result("journal_caught_up", &clean);
-    assert_eq!(row.status, Status::Ok);
-    assert_eq!(row.detail, "caught up");
+    assert_eq!(row.status, Status::Warn);
+    assert!(row.detail.starts_with("recent work checked"));
     assert_eq!(row.backlog_days, Some(BacklogDays::default()));
 
     let capped = fixture();
@@ -1758,8 +1758,8 @@ fn caught_up_native_backlog_fixture_states() {
         "legacy terminal logs cannot prove current daily coverage"
     );
     let row = result("journal_caught_up", &capped);
-    assert_eq!(row.status, Status::Ok);
-    assert_eq!(row.detail, "caught up");
+    assert_eq!(row.status, Status::Warn);
+    assert!(row.detail.contains("pending"), "{}", row.detail);
 
     let root = &capped.journal_path;
     configure_daily_work(root, Some("schedule"));
@@ -1781,18 +1781,18 @@ fn caught_up_native_backlog_fixture_states() {
     solstone_core_journal_io::save_daily_unit_record(root, &record).unwrap();
     let row = result("journal_caught_up", &capped);
     assert_eq!(row.status, Status::Warn);
-    assert_eq!(
-        row.detail,
-        "caught up; 1 day(s) completed with capped daily unit(s)"
+    assert!(
+        row.detail
+            .starts_with("recent work checked; 1 day(s) completed with capped daily unit(s)")
     );
 
     let pending = fixture();
     stage_backlog_pending(&pending);
     let row = result("journal_caught_up", &pending);
     assert_eq!(row.status, Status::Warn);
-    assert_eq!(
-        row.detail,
-        "1 day(s) pending, 0 day(s) stuck; oldest outstanding 20251231"
+    assert!(
+        row.detail
+            .starts_with("1 day(s) pending, 0 day(s) stuck; oldest outstanding 20251231")
     );
     // The days behind the count, in JSON and under the check in --verbose.
     let days = row.backlog_days.clone().expect("backlog days");
@@ -1813,7 +1813,7 @@ fn caught_up_native_backlog_fixture_states() {
     assert_eq!(
         row.fix.as_deref(),
         Some(
-            "solstone catches up on its own; reprocess a day from the health surface to prioritize it"
+            "open health to see waiting work and any spending confirmation; reprocess a past day to give it priority after today"
         )
     );
 
@@ -1824,8 +1824,8 @@ fn caught_up_native_backlog_fixture_states() {
             + Duration::from_millis((fresh_audio.now.timestamp_millis() - 1_000) as u64),
     );
     let row = result("journal_caught_up", &fresh_audio);
-    assert_eq!(row.status, Status::Ok);
-    assert_eq!(row.detail, "caught up");
+    assert_eq!(row.status, Status::Warn);
+    assert!(row.detail.starts_with("recent work checked"));
 
     let aged_audio = fixture();
     stage_raw_audio_pending(
@@ -1837,9 +1837,9 @@ fn caught_up_native_backlog_fixture_states() {
     );
     let row = result("journal_caught_up", &aged_audio);
     assert_eq!(row.status, Status::Warn);
-    assert_eq!(
-        row.detail,
-        "1 day(s) pending, 0 day(s) stuck; oldest outstanding 20251231"
+    assert!(
+        row.detail
+            .starts_with("1 day(s) pending, 0 day(s) stuck; oldest outstanding 20251231")
     );
 }
 
@@ -1957,8 +1957,13 @@ fn caught_up_fresh_journal_days_with_nothing_to_process() {
         &[r#"{"event":"supervisor.started","ts":1}"#],
     );
     let row = result("journal_caught_up", &fresh);
-    assert_eq!(row.status, Status::Ok, "{}", row.detail);
-    assert_eq!(row.detail, "caught up");
+    assert_eq!(row.status, Status::Warn, "{}", row.detail);
+    assert!(
+        row.detail
+            .contains("whole-journal inspection has not reported yet"),
+        "{}",
+        row.detail
+    );
 
     // A day whose completion marker cannot be read is still reported as
     // undetermined rather than quietly counted as finished.
@@ -1969,7 +1974,10 @@ fn caught_up_fresh_journal_days_with_nothing_to_process() {
     fs::create_dir_all(&marker).unwrap();
     let row = result("journal_caught_up", &unreadable);
     assert_eq!(row.status, Status::Warn);
-    assert_eq!(row.detail, "couldn't fully determine; 1 day(s) unknown");
+    assert!(
+        row.detail
+            .starts_with("couldn't fully determine; 1 day(s) unknown")
+    );
 }
 
 #[cfg(all(test, feature = "full-tests"))]
@@ -2789,7 +2797,7 @@ fn unretryable_transcribe_input_corrupt_input_on_completed_fold_day_is_healthy_t
     );
 
     let caught_up_row = result("journal_caught_up", &c);
-    assert_eq!(caught_up_row.status, Status::Ok);
+    assert_eq!(caught_up_row.status, Status::Warn);
 
     let unretryable_row = result("unretryable_transcribe_input", &c);
     assert_eq!(unretryable_row.status, Status::Warn);
@@ -3704,11 +3712,10 @@ fn journal_caught_up_appends_single_unfinished_activity_on_completed_day() {
         ],
     );
     let row = result("journal_caught_up", &c);
-    assert_eq!(row.status, Status::Ok);
-    assert_eq!(
-        row.detail,
-        "caught up; 1 activity on 1 completed day couldn't finish processing"
-    );
+    assert_eq!(row.status, Status::Warn);
+    assert!(row.detail.starts_with(
+        "recent work checked; 1 activity on 1 completed day couldn't finish processing"
+    ));
 }
 
 #[test]
@@ -3730,11 +3737,10 @@ fn journal_caught_up_appends_multiple_unfinished_activities_across_completed_day
         ],
     );
     let row = result("journal_caught_up", &c);
-    assert_eq!(row.status, Status::Ok);
-    assert_eq!(
-        row.detail,
-        "caught up; 2 activities on 2 completed days couldn't finish processing"
-    );
+    assert_eq!(row.status, Status::Warn);
+    assert!(row.detail.starts_with(
+        "recent work checked; 2 activities on 2 completed days couldn't finish processing"
+    ));
 }
 
 #[test]
@@ -3809,9 +3815,9 @@ fn journal_caught_up_outside_window_exhausted_and_ambiguous_scenarios() {
 
     let row = result("journal_caught_up", &c);
     assert_eq!(row.status, Status::Warn);
-    assert_eq!(
-        row.detail,
-        format!("daily unit outside the recent backlog on {day}")
+    assert!(
+        row.detail
+            .starts_with(&format!("daily unit outside the recent backlog on {day}"))
     );
     let fix = row.fix.as_deref().unwrap_or_default();
     assert!(
@@ -3967,8 +3973,19 @@ fn journal_caught_up_outside_window_exhausted_and_ambiguous_scenarios() {
     fs::remove_dir_all(root.join("chronicle").join(malformed_day)).unwrap();
     configure_daily_work(root, None);
     let row_disabled = result("journal_caught_up", &c);
-    assert_eq!(row_disabled.status, Status::Ok);
-    assert_eq!(row_disabled.detail, "caught up");
+    assert_eq!(row_disabled.status, Status::Warn);
+    // The unrelated never-made days still owe work; disabling this talent
+    // removes its failed-unit warning, not those source-derived obligations.
+    assert!(
+        !row_disabled.detail.contains("u-schedule"),
+        "{}",
+        row_disabled.detail
+    );
+    assert!(
+        !row_disabled.detail.contains("ambiguous"),
+        "{}",
+        row_disabled.detail
+    );
 }
 
 #[test]
@@ -4089,6 +4106,37 @@ fn journal_caught_up_outside_window_inactive_facet_produces_no_alarm() {
     solstone_core_journal_io::save_daily_unit_record(root, &record).unwrap();
 
     let row = result("journal_caught_up", &c);
+    assert_eq!(row.status, Status::Warn);
+    assert!(row.detail.starts_with("recent work checked"));
+}
+
+#[test]
+fn whole_journal_progress_requires_fresh_complete_inspection_and_reports_each_band() {
+    let context = fixture();
+    let mut report = solstone_core_system::work_inventory::WorkInventory {
+        as_of_ms: context.now.timestamp_millis(),
+        complete: true,
+        ..Default::default()
+    };
+    report.publish(&context.journal_path).unwrap();
+    let row = result("journal_caught_up", &context);
     assert_eq!(row.status, Status::Ok);
-    assert_eq!(row.detail, "caught up");
+    assert!(row.detail.contains("inspected 0 of 0 days"));
+    for band in 1..=6 {
+        assert!(row.detail.contains(&format!("band {band}:")));
+    }
+    report.bands[4].segments_owed = 2;
+    report.bands[4].permission_held = 2;
+    report.publish(&context.journal_path).unwrap();
+    let row = result("journal_caught_up", &context);
+    assert_eq!(row.status, Status::Warn);
+    assert!(!row.detail.starts_with("caught up"));
+    report.bands[4] = Default::default();
+    report.complete = false;
+    report.publish(&context.journal_path).unwrap();
+    assert_eq!(status("journal_caught_up", &context), Status::Warn);
+    report.complete = true;
+    report.as_of_ms -= 180_001;
+    report.publish(&context.journal_path).unwrap();
+    assert_eq!(status("journal_caught_up", &context), Status::Warn);
 }

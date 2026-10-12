@@ -27,10 +27,16 @@ pub use queue_hold_store::{
 pub mod priority;
 pub mod request;
 pub mod schedule;
+pub mod segment_output;
+pub mod segment_publication;
 #[cfg(any(unix, windows))]
 pub mod status_wire;
 pub mod stt_backend_choice;
 pub mod vulkan_observe;
+pub mod work_intent;
+pub mod work_inventory;
+#[cfg(any(unix, windows))]
+pub mod work_policy;
 
 #[cfg(any(unix, windows))]
 pub use solstone_core_journal_config::no_thinking_engine_chosen;

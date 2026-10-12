@@ -464,6 +464,7 @@ test('loaded search status reaches the headline and survives a later state-read 
   context.state = {};
   context.elements = {};
   context.loadMediaBacklog = () => {};
+  context.renderWorkProgress = () => {};
   context.seedAgentErrors = () => {};
   context.updateStatusSummary = () => { context.selection = glanceFor([], [], context.state.searchIndex); };
   context.renderHealthStateError = (error) => { context.readError = error; };
@@ -839,6 +840,57 @@ test('known service device brain and index faults retain priority over held work
   env.state.registeredClients = [];
   env.state.searchIndex = { state: 'failing', text: 'known index fault' };
   assert.strictEqual(env.verdict().vars.headline, 'known index fault');
+});
+
+test('work progress keeps unknown and stale reach honest and only confirms after a saved choice', async () => {
+  const { doc, context } = createEnvironment();
+  const section = doc.createElement('section');
+  section.id = 'workProgress';
+  for (const key of ['reach', 'bands', 'confirm', 'details', 'allow', 'action-result']) {
+    const child = doc.createElement('div');
+    child.setAttribute('data-work-' + key, '');
+    section.appendChild(child);
+    if (key === 'details') child.appendChild(doc.createElement('pre'));
+  }
+  doc.body.appendChild(section);
+  const now = 1800000000000;
+  context.Date = class extends Date { static now() { return now; } };
+  let refreshed = 0;
+  context.loadHealthState = async () => { refreshed += 1; };
+  vm.runInContext(sourceBlock(loadHealthSource(), 'function renderWorkProgress(', 'async function loadHealthState('), context);
+  context.work = { inventory: null, history_confirmed: false, confirmation_available: true };
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.strictEqual(section.querySelector('[data-work-bands]').children.length, 0);
+  assert.strictEqual(section.querySelector('[data-work-confirm]').hidden, false);
+  const button = section.querySelector('[data-work-allow]');
+  let submitted;
+  context.fetch = async (route, options) => {
+    assert.strictEqual(route, '/app/settings/api/config');
+    submitted = JSON.parse(options.body);
+    return { ok: false };
+  };
+  await button.onclick();
+  assert.strictEqual(submitted.data.history_confirmed, true);
+  assert.strictEqual(refreshed, 0);
+  assert.strictEqual(context.work.history_confirmed, false);
+  assert.strictEqual(section.querySelector('[data-work-confirm]').hidden, false);
+  context.fetch = async () => ({ ok: true });
+  await button.onclick();
+  assert.strictEqual(refreshed, 1);
+  context.work.history_confirmed = true;
+  context.work.inventory = { as_of_ms: now - 200000, complete: true, oldest_day: '19990101', newest_day: '20261011', days_inspected: 1, days_total: 2, unreadable: [], bands: Array.from({ length: 6 }, () => ({ segments_complete: 1, segments_owed: 2, daily_units_complete: 3, daily_units_owed: 4 })) };
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.strictEqual(section.querySelector('[data-work-bands]').children.length, 6);
+  assert.strictEqual(section.querySelector('[data-work-confirm]').hidden, true);
+  const stale = section.querySelector('[data-work-reach]').textContent;
+  context.work.inventory.as_of_ms = now;
+  context.work.inventory.complete = false;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.notStrictEqual(section.querySelector('[data-work-reach]').textContent, stale);
+  context.work.error = '<unreadable>';
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.strictEqual(section.querySelector('[data-work-details]').hidden, false);
+  assert.strictEqual(section.querySelector('pre').textContent, '<unreadable>');
 });
 
 async function runAsyncCases() {

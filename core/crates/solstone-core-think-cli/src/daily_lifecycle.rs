@@ -126,6 +126,11 @@ fn run_with_phase_process(
     phase_process: &dyn PhaseProcessRunner,
     sense_child_environment: &solstone_core_system::process::ChildLaunchContext,
 ) -> Result<ModeResult, String> {
+    if args.daily_only
+        && !solstone_core_system_health::day_segments_ready(&context.journal, &context.day)?
+    {
+        return Err("daily work is waiting for its segment prerequisites".into());
+    }
     let observed_generation = stream_generation(context)?;
     let observed_fingerprint = read_raw_input_fingerprint(&context.journal, &context.day)
         .map_err(|error| error.to_string())?;
@@ -175,6 +180,40 @@ fn run_with_phase_process(
             _ => None,
         },
         |phase, phase_log| match phase {
+            "sense_batch" if args.daily_only => ModeResult::default(),
+            "segment_repair" if args.daily_only => {
+                // Recheck at the phase boundary; a newly arrived segment must
+                // not be processed as part of a lower-priority daily task.
+                match solstone_core_system_health::day_segments_ready(
+                    &context.journal,
+                    &context.day,
+                ) {
+                    Ok(true) => {
+                        segment_outcome.replace(SegmentPhaseOutcome {
+                            result: ModeResult::default(),
+                            blockers: Some(BTreeSet::new()),
+                        });
+                        ModeResult::default()
+                    }
+                    Ok(false) => {
+                        let result =
+                            failed_phase("segment_repair", "segment prerequisites changed");
+                        segment_outcome.replace(SegmentPhaseOutcome {
+                            result: result.clone(),
+                            blockers: None,
+                        });
+                        result
+                    }
+                    Err(error) => {
+                        let result = failed_phase("segment_repair", error);
+                        segment_outcome.replace(SegmentPhaseOutcome {
+                            result: result.clone(),
+                            blockers: None,
+                        });
+                        result
+                    }
+                }
+            }
             "sense_batch" => {
                 let request = solstone_core_sense::batch::BatchRequest {
                     day: context.day.clone(),
@@ -2533,7 +2572,13 @@ mod tests {
                         .unwrap();
                         for path in [p1, p2] {
                             fs::create_dir_all(path.parent().unwrap()).unwrap();
-                            fs::write(path, &content).unwrap();
+                            solstone_core_system::segment_output::commit(
+                                &path,
+                                content.as_bytes(),
+                                false,
+                                || fs::write(&path, &content).map_err(|e| e.to_string()),
+                            )
+                            .unwrap();
                         }
                         report.completed.insert(
                             use_id.clone(),
@@ -2582,7 +2627,13 @@ mod tests {
                         .unwrap();
                         for path in [p1, p2] {
                             fs::create_dir_all(path.parent().unwrap()).unwrap();
-                            fs::write(path, &content).unwrap();
+                            solstone_core_system::segment_output::commit(
+                                &path,
+                                content.as_bytes(),
+                                false,
+                                || fs::write(&path, &content).map_err(|e| e.to_string()),
+                            )
+                            .unwrap();
                         }
                         report.completed.insert(
                             use_id.clone(),

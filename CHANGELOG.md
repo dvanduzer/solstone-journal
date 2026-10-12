@@ -17,6 +17,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- your journal now checks all its recorded days for unfinished thinking. imports and requests to reprocess a day wait in the same order as other work, with today's work first. health shows progress and offers one choice to allow older work with your own keys or confidential processing. importing recordings already allows their own processing. older summaries that may have been edited stay untouched until you ask to reprocess from scratch.
+
 - when today's thinking and older work are both waiting, your journal now starts today's work first. local model calls follow the same order, with newer recordings first within each priority. work already running can finish.
 
 - your journal now looks for your voice by itself each day. from your first day, your journal's home page says when it has found a voice that may be yours, or what it still needs. once you confirm it, your past conversations are updated in the background to show who said what, and the speakers page shows how far along that is. only the speaker names change: stories and weekly reflections already written stay as they were. on the speakers page you can also teach your voice from the last two weeks, teach it again later, or remove your saved voice. a voice you say isn't yours isn't offered again, and after a "no" your journal looks again in 14 days. transcripts now show your lines as "you".

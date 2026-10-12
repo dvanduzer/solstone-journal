@@ -4834,6 +4834,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(pub_record.day_markers.is_empty());
+        // The new recording still enters paced discovery, even though older
+        // coordinates in this import were deleted by the owner.
+        assert_eq!(pub_record.day_markers.len(), 1);
+        assert_eq!(pub_record.day_markers[0].day, "20260810");
+        assert!(pub_record.segments.iter().any(|row| {
+            row.segment == "090000_300"
+                && matches!(
+                    row.outcome,
+                    solstone_core_import::publish::SegmentBindingOutcome::Bound { .. }
+                )
+        }));
     }
 }

@@ -3,7 +3,6 @@
 
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::future::Future;
 use std::io::Read;
@@ -993,7 +992,7 @@ async fn daily_complete_submits_heartbeat_when_pid_file_is_absent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn drain_message_forces_day_think_over_socket() {
+async fn drain_message_discovers_durable_owner_request_over_socket() {
     let journal = TempJournal::new();
     journal.enable_thinking();
     let _stub_marker = journal.install_journal_stub();
@@ -1002,6 +1001,8 @@ async fn drain_message_forces_day_think_over_socket() {
     wait_for_socket(&mut child, &socket);
     let (mut reader, mut write) = connect(&socket).await;
 
+    let intent = solstone_core_system::work_intent::register(&journal.0, "20260102", true)
+        .expect("durable owner request");
     send_message(
         &mut write,
         json!({"tract": "supervisor", "event": "drain", "day": "20260102"}),
@@ -1010,7 +1011,16 @@ async fn drain_message_forces_day_think_over_socket() {
 
     let started = receive_started_command(
         &mut reader,
-        &["solstone", "journal", "think", "-v", "--day", "20260102"],
+        &[
+            "solstone",
+            "journal",
+            "think",
+            "--day",
+            "20260102",
+            "--from-scratch",
+            "--work-intent",
+            &intent.id,
+        ],
     )
     .await;
     assert_eq!(started["service"], "daily");
@@ -1321,13 +1331,14 @@ fn catchup_selector_with_merge_rewritten_speaker_labels() {
     .unwrap();
 
     let now = UNIX_EPOCH + Duration::from_secs(1_777_420_800); // 2026-04-28
-    let eligible = solstone_core_system::catchup::eligible_catchup_days(
-        &journal.0,
-        &[],
-        &BTreeSet::new(),
-        now,
-    )
-    .unwrap();
+    let eligible =
+        solstone_core_system::daily_coverage::reconcile_days(&journal.0, &[], now.into())
+            .unwrap()
+            .into_iter()
+            .filter(|day| {
+                solstone_core_system::catchup::eligible_or_fail_open(&journal.0, day, now)
+            })
+            .collect::<Vec<_>>();
 
     assert_eq!(eligible, vec!["20260427".to_string()]);
 }

@@ -25,7 +25,6 @@ use solstone_core_journal_io::{
 use solstone_core_processing_record::{expected_handler, read_processing_record_header, vocab};
 use thiserror::Error;
 
-pub const MAX_UPDATED_CATCHUP: usize = 4;
 pub const CATCHUP_STATE_VERSION: u64 = 1;
 pub const KIND_DAILY_CATCHUP: &str = "daily-catchup";
 pub const KIND_SEGMENT_REPAIR: &str = "segment-repair";
@@ -969,46 +968,7 @@ pub fn read_raw_input_fingerprint(journal: &Path, day: &str) -> Result<String, C
     )))
 }
 
-/// Select newest-first natural days, followed by deduplicated forced days.
-pub fn eligible_catchup_days(
-    journal: &Path,
-    force_days: &[String],
-    exclude: &BTreeSet<String>,
-    now: SystemTime,
-) -> Result<Vec<String>, CatchupError> {
-    let mut natural = crate::daily_coverage::reconcile_days(journal, force_days, now.into())
-        .map_err(CatchupError::State)?;
-    natural.extend(days_with_expired_retry_for(
-        journal,
-        exclude,
-        now,
-        Some(KIND_SEGMENT_REPAIR),
-    )?);
-    natural.sort();
-    natural.dedup();
-    let natural = natural.into_iter().filter(|day| !exclude.contains(day));
-    let eligible_natural = natural
-        .into_iter()
-        .filter(|day| eligible_or_fail_open(journal, day, false, now))
-        .collect::<Vec<_>>();
-    let mut selected = eligible_natural
-        .into_iter()
-        .rev()
-        .take(MAX_UPDATED_CATCHUP)
-        .collect::<Vec<_>>();
-    let mut seen = selected.iter().cloned().collect::<BTreeSet<_>>();
-    for day in force_days {
-        if eligible_or_fail_open(journal, day, true, now) && seen.insert(day.clone()) {
-            selected.push(day.clone());
-        }
-    }
-    Ok(selected)
-}
-
-pub fn eligible_or_fail_open(journal: &Path, day: &str, force: bool, now: SystemTime) -> bool {
-    if force {
-        return true;
-    }
+pub fn eligible_or_fail_open(journal: &Path, day: &str, now: SystemTime) -> bool {
     match (|| {
         Ok::<_, CatchupError>(
             day_eligible_to_drain(journal, day, CatchupKind::DailyCatchup, now)?
@@ -2065,7 +2025,13 @@ mod tests {
             let fingerprint_b = read_raw_input_fingerprint(&bed.root, day).unwrap();
 
             assert_eq!(
-                eligible_catchup_days(&bed.root, &[], &BTreeSet::new(), now).unwrap(),
+                days_with_expired_retry_for(
+                    &bed.root,
+                    &BTreeSet::new(),
+                    now,
+                    Some(KIND_SEGMENT_REPAIR)
+                )
+                .unwrap(),
                 vec![day.to_owned()]
             );
 
@@ -2122,11 +2088,11 @@ mod tests {
                 assert!(!entries.contains_key(&catchup_state_key(day, KIND_SEGMENT_REPAIR)));
             }
 
-            let next_scan = eligible_catchup_days(
+            let next_scan = days_with_expired_retry_for(
                 &bed.root,
-                &[],
                 &BTreeSet::new(),
                 now + Duration::from_secs(60),
+                Some(KIND_SEGMENT_REPAIR),
             )
             .unwrap();
 
@@ -2608,26 +2574,16 @@ mod tests {
             "chronicle/19691231/health/stream.updated",
             br#"{"version":1,"generation":2,"fingerprint":null}"#,
         );
-        assert_eq!(
-            eligible_catchup_days(
-                &terminal.root,
-                &[],
-                &BTreeSet::new(),
-                UNIX_EPOCH + Duration::from_secs(619),
-            )
-            .expect("unreadable fingerprint remains held before retry"),
-            Vec::<String>::new(),
-        );
-        assert_eq!(
-            eligible_catchup_days(
-                &terminal.root,
-                &[],
-                &BTreeSet::new(),
-                UNIX_EPOCH + Duration::from_secs(620),
-            )
-            .expect("unreadable fingerprint is eligible at retry"),
-            vec!["19691231".to_owned()],
-        );
+        assert!(!eligible_or_fail_open(
+            &terminal.root,
+            "19691231",
+            UNIX_EPOCH + Duration::from_secs(619)
+        ));
+        assert!(eligible_or_fail_open(
+            &terminal.root,
+            "19691231",
+            UNIX_EPOCH + Duration::from_secs(620)
+        ));
 
         let restart = Bed::new("daily-restart-unreadable-fingerprint");
         record_daily_catchup_attempt(&restart.root, "19691231", "active", 10.0, 1, &fingerprint);
@@ -3070,140 +3026,6 @@ mod tests {
         assert_eq!(
             read_raw_input_fingerprint(&bed.root, "20260101").expect("fingerprint"),
             digest(compact_ascii_entries(&entries).as_bytes())
-        );
-    }
-
-    #[test]
-    fn eligible_days_caps_natural_days_but_keeps_forced_days() {
-        let bed = Bed::new("cap");
-        let test_now = UNIX_EPOCH + Duration::from_secs(1767830400);
-        let next_retry = 1767830410_u64;
-        for day in [
-            "20260101", "20260102", "20260103", "20260104", "20260105", "20260106",
-        ] {
-            bed.updated_day(day);
-        }
-        let force = ["20260101".to_owned()];
-        let exclude = BTreeSet::new();
-        let capped_with_forced = [
-            "20260106".to_owned(),
-            "20260105".to_owned(),
-            "20260104".to_owned(),
-            "20260103".to_owned(),
-            "20260101".to_owned(),
-        ];
-        assert_eq!(
-            eligible_catchup_days(&bed.root, &force, &exclude, test_now).expect("eligible days"),
-            capped_with_forced
-        );
-
-        let fingerprint = empty_fingerprint();
-        bed.write(
-            "health/catchup-state.json",
-            state_entry(
-                "20260106",
-                CatchupKind::DailyCatchup,
-                &format!(r#"{{"next_retry_at":{next_retry},"fingerprint":"{fingerprint}"}}"#),
-            ),
-        );
-        assert_eq!(
-            eligible_catchup_days(
-                &bed.root,
-                &force,
-                &exclude,
-                test_now + Duration::from_secs(9)
-            )
-            .expect("before retry"),
-            vec![
-                "20260105".to_owned(),
-                "20260104".to_owned(),
-                "20260103".to_owned(),
-                "20260102".to_owned(),
-                "20260101".to_owned(),
-            ]
-        );
-        assert_eq!(
-            eligible_catchup_days(
-                &bed.root,
-                &force,
-                &exclude,
-                test_now + Duration::from_secs(10)
-            )
-            .expect("at retry"),
-            capped_with_forced
-        );
-        assert_eq!(
-            eligible_catchup_days(
-                &bed.root,
-                &force,
-                &exclude,
-                test_now + Duration::from_secs(11)
-            )
-            .expect("after retry"),
-            capped_with_forced
-        );
-    }
-
-    #[test]
-    fn expired_segment_repair_is_natural_even_without_daily_adoption() {
-        let bed = Bed::new("routing-repair-natural");
-        let day = "20200101";
-        bed.write(
-            "chronicle/20200101/health/stream.updated",
-            br#"{"version":1,"generation":1,"fingerprint":null}"#,
-        );
-        record_segment_repair_attempt(&bed.root, day, 1.0);
-        record_segment_repair_outcome(
-            &bed.root,
-            day,
-            SegmentRepairOutcome {
-                success: false,
-                timed_out: false,
-                timeout_seconds: None,
-                ended_at: 1.0,
-                cleared: Some(0),
-                remaining: Some(1),
-            },
-        );
-        assert!(
-            eligible_catchup_days(
-                &bed.root,
-                &[],
-                &BTreeSet::new(),
-                UNIX_EPOCH + Duration::from_secs(600)
-            )
-            .unwrap()
-            .is_empty()
-        );
-        assert_eq!(
-            eligible_catchup_days(
-                &bed.root,
-                &[],
-                &BTreeSet::new(),
-                UNIX_EPOCH + Duration::from_secs(601)
-            )
-            .unwrap(),
-            vec![day.to_owned()]
-        );
-    }
-
-    #[test]
-    fn forced_days_bypass_both_catchup_kind_gates() {
-        let bed = Bed::new("forced-bypass");
-        bed.write(
-            "health/catchup-state.json",
-            r#"{"version":1,"entries":{"20260101:daily-catchup":{"day":"20260101","command_kind":"daily-catchup","active":{"ref":"daily"},"next_retry_at":9999,"fingerprint":"unchanged"},"20260101:segment-repair":{"day":"20260101","command_kind":"segment-repair","active":{"ref":"repair"},"next_retry_at":9999,"fingerprint":"unchanged"}}}"#,
-        );
-
-        assert_eq!(
-            eligible_catchup_days(
-                &bed.root,
-                &["20260101".to_owned()],
-                &BTreeSet::new(),
-                UNIX_EPOCH,
-            )
-            .expect("forced day"),
-            vec!["20260101".to_owned()]
         );
     }
 

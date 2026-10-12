@@ -192,6 +192,7 @@ pub(crate) struct SupervisorState {
     pub server: Arc<CallosumSocketServer>,
     pub connection: CallosumSocketConnection,
     pub queue: TaskQueue,
+    pub discovery: super::work_discovery::WorkDiscovery,
     pub last_sync_snapshot: Option<SyncSnapshot>,
     pub stale_heartbeats: Vec<SyncPeerObservation>,
     pub shutdown_started: AtomicBool,
@@ -205,7 +206,6 @@ pub(crate) struct SupervisorState {
     pub daily: DailyState,
     /// Last completed retry-expiry scan; kept per supervisor instance so a
     /// restart cannot inherit another instance's throttle state.
-    pub last_retry_expiry_drain: Instant,
     pub last_activity_retry_drain: Instant,
     /// Last read of when each stream's activities next need a settle check.
     pub last_activity_settle_scan: Instant,
@@ -2088,6 +2088,11 @@ pub(crate) async fn boot_and_tick(
         );
     }
     let mut state = SupervisorState {
+        discovery: super::work_discovery::WorkDiscovery::new(
+            journal.clone(),
+            queue.clone(),
+            !options.no_daily,
+        ),
         journal,
         #[cfg(windows)]
         service_guard,
@@ -2109,7 +2114,6 @@ pub(crate) async fn boot_and_tick(
             last_day: Some(wall.date_naive()),
         },
         // Startup reconciliation/drain below seeds the retry watermark.
-        last_retry_expiry_drain: Instant::now(),
         last_activity_retry_drain: Instant::now() - Duration::from_secs(60),
         last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
         last_scratch_sweep: None,
@@ -2190,16 +2194,9 @@ pub(crate) async fn boot_and_tick(
         return Err(abort_pre_ready_state(&mut state, &lifecycle, startup).await);
     }
     state.queue.set_ready();
-    if let Err(error) = tick::initialize_catchup(
-        &state.journal,
-        &state.queue,
-        state.no_daily,
-        tick::owner_now(&state.journal).date_naive(),
-        SystemTime::now(),
-    ) {
-        log::warn!("supervisor: startup catchup reconciliation failed: {error}");
+    if !state.no_daily {
+        state.discovery.request();
     }
-    state.last_retry_expiry_drain = Instant::now();
     let stop_reason = tick::run(
         &mut state,
         &mut lifecycle,

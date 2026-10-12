@@ -47,6 +47,7 @@ pub(crate) struct SupervisorShutdownDriver {
 }
 impl ShutdownDriver for SupervisorShutdownDriver {
     fn reap_managed(&mut self, cap: Duration) -> ShutdownDisposition {
+        self.state.discovery.stop();
         if self.parent_loss_bounded {
             let deadline = Instant::now() + cap;
             return if self.state.reap_managed_until(deadline) {
@@ -65,6 +66,7 @@ impl ShutdownDriver for SupervisorShutdownDriver {
         ShutdownDisposition::Orderly
     }
     fn drain_tasks(&mut self, cap: Duration) -> ShutdownDisposition {
+        self.state.discovery.stop();
         // ⚠ One shared budget in every regime. The standard regime used to
         // call the unbounded `queue.shutdown()`, whose two independent
         // ten-second windows put the drain alone at two thirds of the unit's
@@ -458,6 +460,11 @@ mod tests {
             app_processes.push(app);
         }
         let state = SupervisorState {
+            discovery: super::super::work_discovery::WorkDiscovery::new(
+                journal.path().to_path_buf(),
+                queue.clone(),
+                false,
+            ),
             journal: journal.path().to_path_buf(),
             no_daily: true,
             server,
@@ -474,7 +481,6 @@ mod tests {
             parakeet,
             flush: FlushState::default(),
             daily: DailyState { last_day: None },
-            last_retry_expiry_drain: Instant::now(),
             last_activity_retry_drain: Instant::now(),
             last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
             last_scratch_sweep: None,

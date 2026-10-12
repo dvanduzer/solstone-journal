@@ -37,8 +37,10 @@ pub async fn get(journal_root: PathBuf) -> Response {
 
 /// A partial update keeps the other condition and its unspecified fields.
 fn merge_processing(target: &mut Map<String, Value>, patch: &Map<String, Value>) {
-    if let Some(mode) = patch.get("mode") {
-        target.insert("mode".into(), mode.clone());
+    for key in ["mode", "history_confirmed"] {
+        if let Some(value) = patch.get(key) {
+            target.insert(key.into(), value.clone());
+        }
     }
     if let Some(gate_patch) = patch.get("gate").and_then(Value::as_object) {
         let gate = target.entry("gate").or_insert_with(|| json!({}));
@@ -491,6 +493,8 @@ mod tests {
             (json!({"gate":{"time_window":{"end":"04:00"}}}), 200),
             (json!({"gate":{"time_window":{"start":"25:00"}}}), 400),
             (json!({"mode":"unknown"}), 400),
+            (json!({"history_confirmed":true}), 200),
+            (json!({"history_confirmed":"true"}), 400),
             (json!({"gate":{"display_powersave":{"enabled":"yes"}}}), 400),
         ] {
             let before = std::fs::read(&path).unwrap();
@@ -522,6 +526,7 @@ mod tests {
         let public: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
+        assert_eq!(public["processing"]["history_confirmed"], true);
         assert_eq!(
             public["processing"]["gate"]["time_window"]["start"],
             "23:00"

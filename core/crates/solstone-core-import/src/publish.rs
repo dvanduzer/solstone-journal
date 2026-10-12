@@ -23,31 +23,8 @@ use crate::events::{
     emit_supervisor_drain,
 };
 
-pub(crate) const PUBLICATION_SCHEMA: &str = "solstone.import.publication.v1";
-
-/// How many days back from the owner's today a body import makes the journal
-/// think. A body history often reaches back a decade, and every day it touches
-/// would otherwise queue a whole day of thinking. Older body days are still
-/// published and indexed, so search and agents read them; the journal thinks
-/// about them when the owner asks for that day, or when a day it already keeps
-/// current is re-derived because what it holds changed.
-pub const BODY_IMPORT_THINK_WINDOW_DAYS: i64 = 7;
-
-/// Whether publishing this segment starts the journal's own thinking.
-fn starts_thinking(segment: &CreatedSegment, oldest_body_day: &str) -> bool {
-    !solstone_core_format::body::is_body_stream(&segment.stream)
-        || segment.day.as_str() >= oldest_body_day
-}
-
-fn oldest_body_day(today: &str) -> String {
-    chrono::NaiveDate::parse_from_str(today, "%Y%m%d")
-        .map(|today| {
-            (today - chrono::Duration::days(BODY_IMPORT_THINK_WINDOW_DAYS))
-                .format("%Y%m%d")
-                .to_string()
-        })
-        .unwrap_or_else(|_| today.to_owned())
-}
+pub const LEGACY_PUBLICATION_SCHEMA: &str = "solstone.import.publication.v1";
+pub const PUBLICATION_SCHEMA: &str = "solstone.import.publication.v2";
 
 #[derive(Clone, Debug)]
 pub struct CreatedSegment {
@@ -70,6 +47,7 @@ pub struct PublicationInput<'a> {
 
 #[derive(Debug)]
 pub enum PublishError {
+    Thinking(String),
     RecordWrite(AtomicWriteError),
     RecordRead {
         path: PathBuf,
@@ -84,6 +62,7 @@ pub enum PublishError {
 impl fmt::Display for PublishError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Thinking(error) => formatter.write_str(error),
             Self::RecordWrite(error) => error.fmt(formatter),
             Self::RecordRead { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::RecordDecode { path, source } => {
@@ -96,6 +75,7 @@ impl fmt::Display for PublishError {
 impl Error for PublishError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Thinking(_) => None,
             Self::RecordWrite(error) => Some(error),
             Self::RecordRead { source, .. } => Some(source),
             Self::RecordDecode { source, .. } => Some(source),
@@ -213,13 +193,6 @@ pub trait PublicationOperations {
         entries_written: u64,
     );
     fn emit_drain(&self, journal: &Path, revision: Option<&str>, day: &str);
-    /// The owner's local day, which bounds how far back a body import thinks.
-    fn today(&self, journal: &Path) -> String {
-        chrono::Utc::now()
-            .with_timezone(&solstone_core_journal_config::owner_zone(journal))
-            .format("%Y%m%d")
-            .to_string()
-    }
 }
 
 pub struct NativePublicationOperations;
@@ -300,7 +273,6 @@ pub fn publish_with_operations(
     input: PublicationInput<'_>,
     operations: &dyn PublicationOperations,
 ) -> Result<PublicationRecord, PublishError> {
-    let oldest_body_day = oldest_body_day(&operations.today(input.journal));
     let mut segments = Vec::with_capacity(input.segments.len());
     let mut failed_streams = BTreeSet::new();
     for segment in input.segments {
@@ -310,22 +282,11 @@ pub fn publish_with_operations(
             }
         } else {
             match operations.advance_stream(input.journal, segment) {
-                Ok(advance) => {
-                    if starts_thinking(segment, &oldest_body_day) {
-                        operations.emit_observed(
-                            input.journal,
-                            input.revision,
-                            &segment.day,
-                            &segment.segment,
-                            &segment.stream,
-                        );
-                    }
-                    SegmentBindingOutcome::Bound {
-                        prev_day: advance.prev_day,
-                        prev_segment: advance.prev_segment,
-                        seq: advance.seq,
-                    }
-                }
+                Ok(advance) => SegmentBindingOutcome::Bound {
+                    prev_day: advance.prev_day,
+                    prev_segment: advance.prev_segment,
+                    seq: advance.seq,
+                },
                 Err(UnboundStreamAdvanceError::Advance(SegmentError::Tombstoned { .. })) => {
                     SegmentBindingOutcome::OwnerDeleted
                 }
@@ -379,10 +340,7 @@ pub fn publish_with_operations(
         .segments
         .iter()
         .zip(&segments)
-        .filter(|(s_in, s_out)| {
-            starts_thinking(s_in, &oldest_body_day)
-                && !matches!(s_out.outcome, SegmentBindingOutcome::OwnerDeleted)
-        })
+        .filter(|(_, s_out)| matches!(s_out.outcome, SegmentBindingOutcome::Bound { .. }))
         .map(|(s_in, _)| s_in.day.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -390,10 +348,7 @@ pub fn publish_with_operations(
     let mut day_markers = Vec::with_capacity(days.len());
     for day in &days {
         let outcome = match operations.touch_stream_health_marker(input.journal, day) {
-            Ok(()) => {
-                operations.emit_drain(input.journal, input.revision, day);
-                DayMarkerStatus::Touched
-            }
+            Ok(()) => DayMarkerStatus::Touched,
             Err(error) => DayMarkerStatus::Failed { error },
         };
         day_markers.push(DayMarkerOutcome {
@@ -406,22 +361,11 @@ pub fn publish_with_operations(
         .iter()
         .filter(|path| {
             !input.segments.iter().zip(&segments).any(|(s_in, s_out)| {
-                (!starts_thinking(s_in, &oldest_body_day)
-                    || matches!(s_out.outcome, SegmentBindingOutcome::OwnerDeleted))
+                (!matches!(s_out.outcome, SegmentBindingOutcome::Bound { .. }))
                     && is_path_under_segment(path, &s_in.day, &s_in.stream, &s_in.segment)
             })
         })
         .count();
-    if thinking_file_count > 0 && !days.is_empty() {
-        operations.emit_enrichment_ready(
-            input.journal,
-            input.revision,
-            input.import_id,
-            input.importer,
-            &days,
-            u64::try_from(thinking_file_count).expect("file count fits u64"),
-        );
-    }
 
     let failed = segments.iter().any(|segment| {
         matches!(
@@ -433,7 +377,7 @@ pub fn publish_with_operations(
         || day_markers
             .iter()
             .any(|marker| matches!(marker.outcome, DayMarkerStatus::Failed { .. }));
-    let record = PublicationRecord {
+    let mut record = PublicationRecord {
         schema: PUBLICATION_SCHEMA.to_owned(),
         status: if failed {
             PublicationStatus::Failure
@@ -446,7 +390,32 @@ pub fn publish_with_operations(
     };
     let should_write = input.may_write_record.is_none_or(|predicate| predicate());
     if should_write {
-        write_publication_record(input.import_dir, &record)?;
+        record = write_publication_record(input.import_dir, &record)?;
+        // The durable coordinate scope is visible before any admission wakeup.
+        for segment in &record.segments {
+            if matches!(segment.outcome, SegmentBindingOutcome::Bound { .. }) {
+                operations.emit_observed(
+                    input.journal,
+                    input.revision,
+                    &segment.day,
+                    &segment.segment,
+                    &segment.stream,
+                );
+            }
+        }
+        if let Some(day) = days.last() {
+            operations.emit_drain(input.journal, input.revision, day);
+        }
+        if thinking_file_count > 0 && !days.is_empty() {
+            operations.emit_enrichment_ready(
+                input.journal,
+                input.revision,
+                input.import_id,
+                input.importer,
+                &days,
+                u64::try_from(thinking_file_count).expect("file count fits u64"),
+            );
+        }
     }
     Ok(record)
 }
@@ -454,16 +423,32 @@ pub fn publish_with_operations(
 pub fn write_publication_record(
     import_dir: Option<&Path>,
     record: &PublicationRecord,
-) -> Result<(), PublishError> {
+) -> Result<PublicationRecord, PublishError> {
     let Some(import_dir) = import_dir else {
-        return Ok(());
+        return Ok(record.clone());
     };
+    let _lock = solstone_core_journal_io::hold_lock(
+        import_dir.join("thinking.lock"),
+        solstone_core_journal_io::LockOptions::default(),
+    )
+    .map_err(|error| PublishError::Thinking(error.to_string()))?;
+    let mut record = record.clone();
+    if read_publication_record(import_dir)?
+        .is_some_and(|old| old.schema == LEGACY_PUBLICATION_SCHEMA)
+    {
+        // A pre-ladder import can finish a retry without acquiring fresh
+        // spending consent. Its files remain visible to ordinary discovery.
+        record.schema = LEGACY_PUBLICATION_SCHEMA.into();
+    } else {
+        crate::thinking::prepare(import_dir).map_err(PublishError::Thinking)?;
+    }
     write_json(
         import_dir.join("imported.json"),
-        record,
+        &record,
         JsonWriteOptions::default(),
     )
-    .map_err(PublishError::RecordWrite)
+    .map_err(PublishError::RecordWrite)?;
+    Ok(record)
 }
 
 pub fn read_publication_record(
@@ -491,6 +476,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeOperations {
+        durable_scope: Option<PathBuf>,
         advances: RefCell<Vec<Result<StreamAdvance, UnboundStreamAdvanceError>>>,
         rescans: RefCell<Vec<Result<RescanFileStatus, String>>>,
         rescans_seen: RefCell<Vec<PathBuf>>,
@@ -529,6 +515,15 @@ mod tests {
         }
 
         fn emit_observed(&self, _: &Path, _: Option<&str>, day: &str, segment: &str, stream: &str) {
+            if let Some(directory) = &self.durable_scope {
+                let record = read_publication_record(directory)
+                    .unwrap()
+                    .expect("published before notification");
+                assert!(record.segments.iter().any(|row| row.day == day
+                    && row.segment == segment
+                    && row.stream == stream
+                    && matches!(row.outcome, SegmentBindingOutcome::Bound { .. })));
+            }
             self.observed.borrow_mut().push((
                 day.to_owned(),
                 segment.to_owned(),
@@ -552,10 +547,6 @@ mod tests {
 
         fn emit_drain(&self, _: &Path, _: Option<&str>, day: &str) {
             self.drains.borrow_mut().push(day.to_owned());
-        }
-
-        fn today(&self, _: &Path) -> String {
-            "20260805".to_owned()
         }
     }
 
@@ -694,7 +685,7 @@ mod tests {
             "20260803".to_owned(),
         ];
         assert_eq!(*fake.markers.borrow(), expected);
-        assert_eq!(*fake.drains.borrow(), expected);
+        assert_eq!(*fake.drains.borrow(), vec!["20260803".to_owned()]);
         assert_eq!(*fake.enrichment.borrow(), vec![(expected, 1)]);
         assert_eq!(fake.observed.borrow().len(), 4);
     }
@@ -719,6 +710,7 @@ mod tests {
         let segments = vec![segment("20260801", "120000_60")];
         let files = vec![PathBuf::from("declined.raw"), PathBuf::from("failed.jsonl")];
         let fake = FakeOperations {
+            durable_scope: Some(import_dir.clone()),
             advances: RefCell::new(vec![advance(1)]),
             rescans: RefCell::new(vec![
                 Ok(RescanFileStatus::Declined),
@@ -737,6 +729,26 @@ mod tests {
             saved.indexing.errored[0].path,
             PathBuf::from("failed.jsonl")
         );
+    }
+
+    #[test]
+    fn failed_scope_publication_emits_no_admission_notifications() {
+        let temporary = tempfile::tempdir().unwrap();
+        let import_dir = temporary.path().join("imports/broken");
+        fs::create_dir_all(&import_dir).unwrap();
+        fs::create_dir(import_dir.join("imported.json")).unwrap();
+        let segments = vec![segment("20260801", "120000_60")];
+        let fake = FakeOperations::with_advances(vec![advance(1)]);
+        assert!(
+            publish_with_operations(
+                input(temporary.path(), Some(&import_dir), &segments, &[]),
+                &fake
+            )
+            .is_err()
+        );
+        assert!(fake.observed.borrow().is_empty());
+        assert!(fake.drains.borrow().is_empty());
+        assert!(fake.enrichment.borrow().is_empty());
     }
 
     #[test]
@@ -883,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_body_day_is_published_and_indexed_without_starting_thinking() {
+    fn an_older_body_day_enters_the_same_paced_discovery_as_other_imports() {
         let temporary = tempfile::TempDir::new().unwrap();
         let mut old = segment("20260728", "120000_60");
         old.stream = "import.strava".to_string();
@@ -906,12 +918,12 @@ mod tests {
             SegmentBindingOutcome::Bound { .. }
         ));
         assert_eq!(*fake.rescans_seen.borrow(), vec![file]);
-        assert!(fake.observed.borrow().is_empty());
-        assert!(record.day_markers.is_empty());
-        assert!(fake.drains.borrow().is_empty());
-        assert!(fake.enrichment.borrow().is_empty());
+        assert_eq!(fake.observed.borrow().len(), 1);
+        assert_eq!(record.day_markers.len(), 1);
+        assert_eq!(*fake.drains.borrow(), vec!["20260728".to_owned()]);
+        assert_eq!(fake.enrichment.borrow().len(), 1);
 
-        // The bound is for body imports only: other imports think on every day.
+        // Source age does not remove a published import from discovery.
         let fake = FakeOperations::with_advances(vec![advance(1)]);
         publish_with_operations(
             input(
@@ -927,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn real_publish_of_an_old_body_day_declines_an_unread_file_and_starts_no_thinking() {
+    fn real_publish_of_an_old_body_day_retains_declined_index_status_and_durable_scope() {
         let temporary = tempfile::TempDir::new().unwrap();
         let file_path = temporary
             .path()
@@ -942,7 +954,7 @@ mod tests {
         assert_eq!(record.status, PublicationStatus::Success);
         assert_eq!(record.indexing.declined, vec![file_path]);
         assert!(record.indexing.published.is_empty());
-        assert!(record.day_markers.is_empty());
+        assert_eq!(record.day_markers.len(), 1);
     }
 
     #[test]

@@ -5,6 +5,9 @@
 pub(crate) struct ThinkArgs {
     pub day: Option<String>,
     pub segment: Option<String>,
+    pub repair_segment: bool,
+    pub daily_only: bool,
+    pub work_intent: Option<String>,
     pub refresh: bool,
     pub from_scratch: bool,
     pub segments: bool,
@@ -34,6 +37,9 @@ impl Default for ThinkArgs {
         Self {
             day: None,
             segment: None,
+            repair_segment: false,
+            daily_only: false,
+            work_intent: None,
             refresh: false,
             from_scratch: false,
             segments: false,
@@ -85,7 +91,7 @@ pub(crate) const MULTI_WORKER_UNLIMITED_JOBS: &str = "--jobs 0 is incompatible w
 
 pub(crate) enum ParseOutcome {
     Help,
-    Args(ThinkArgs),
+    Args(Box<ThinkArgs>),
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<ParseOutcome, String> {
@@ -101,6 +107,9 @@ pub(crate) fn parse(args: &[String]) -> Result<ParseOutcome, String> {
         match argument.as_str() {
             "--day" => parsed.day = Some(value("--day")?),
             "--segment" => parsed.segment = Some(value("--segment")?),
+            "--repair-segment" => parsed.repair_segment = true,
+            "--daily-only" => parsed.daily_only = true,
+            "--work-intent" => parsed.work_intent = Some(value("--work-intent")?),
             "--refresh" => parsed.refresh = true,
             "--from-scratch" => parsed.from_scratch = true,
             "--segments" => parsed.segments = true,
@@ -138,7 +147,7 @@ pub(crate) fn parse(args: &[String]) -> Result<ParseOutcome, String> {
         }
         index += 1;
     }
-    Ok(ParseOutcome::Args(parsed))
+    Ok(ParseOutcome::Args(Box::new(parsed)))
 }
 
 pub(crate) const SENSE_BATCH_INCOMPATIBLE: &str = "--sense-batch is incompatible with ";

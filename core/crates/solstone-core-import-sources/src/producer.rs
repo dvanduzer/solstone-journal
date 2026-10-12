@@ -1158,7 +1158,7 @@ mod tests {
         let imported: Value = serde_json::from_str(&imported_text).unwrap();
         assert_eq!(
             imported.get("schema").and_then(Value::as_str),
-            Some("solstone.import.publication.v1")
+            Some(solstone_core_import::publish::PUBLICATION_SCHEMA)
         );
 
         let proj = solstone_core_import::project_import_result(root, id);

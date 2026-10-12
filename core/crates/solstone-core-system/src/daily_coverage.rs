@@ -35,11 +35,8 @@ impl CoverageState {
 
     /// The owner is missing an output they should have.
     ///
-    /// `HistoricalUnverified` is deliberately excluded: history that predates
-    /// evidence-bound completion is readable and unverified by design, is
-    /// outside the adoption boundary, and will never be regenerated on its
-    /// own — reporting it as owed work is a standing false alarm for something
-    /// nobody will ever act on.
+    /// Unsupported evidence contracts stay unverified; an absent accepted
+    /// record is outstanding regardless of reconciliation bookkeeping.
     pub fn is_owed(self) -> bool {
         matches!(self, Self::Outstanding | Self::Unreadable)
     }
@@ -399,13 +396,7 @@ fn read_unit_coverage_cached(
     let mut reason = None;
     let mut earlier_version = None;
     let state = match &record {
-        None => {
-            if day_is_adopted(journal, day)? {
-                CoverageState::Outstanding
-            } else {
-                CoverageState::HistoricalUnverified
-            }
-        }
+        None => CoverageState::Outstanding,
         Some(record) => {
             if record.evidence_revision == e && record.contract_digest == contract {
                 reason = record.reason_code.clone();
@@ -585,35 +576,9 @@ pub fn conflict_attempt_day(
 #[derive(Default, Serialize, Deserialize)]
 struct Adoption {
     version: u32,
-    first_closed_day: String,
     adopted: std::collections::BTreeSet<String>,
     pending: std::collections::BTreeSet<String>,
     cursor: Option<String>,
-}
-
-fn day_is_adopted(journal: &Path, day: &str) -> Result<bool, String> {
-    let path = journal.join("health/daily-adoption.json");
-    // ⛔ Adoption is bookkeeping -- the accepted unit records are the sole result
-    // authority (see `Adoption`). A file we cannot parse must read as "this day
-    // was never adopted", not as an error: erroring here makes EVERY day's
-    // coverage unreadable, which stops daily processing entirely and makes the
-    // backlog, the doctor and reprocess all fail, for a file the next
-    // reconciliation pass rebuilds on its own.
-    let state: Adoption = match solstone_core_journal_io::durability::observe_json_durable(
-        ArtifactId::DailyAdoption,
-        &path,
-    ) {
-        solstone_core_journal_io::durability::DurableObservation::Present(state) => state,
-        solstone_core_journal_io::durability::DurableObservation::Absent
-        | solstone_core_journal_io::durability::DurableObservation::Malformed { .. }
-        | solstone_core_journal_io::durability::DurableObservation::Unreadable { .. } => {
-            return Ok(false);
-        }
-    };
-    if state.version != 1 {
-        return Ok(false);
-    }
-    Ok(state.adopted.contains(day))
 }
 
 /// Keep explicitly processed old days in the bounded reconciliation set, including failed preparation.
@@ -632,15 +597,12 @@ pub fn register_daily_day(journal: &Path, day: &str, now: DateTime<Utc>) -> Resu
 }
 
 fn load_adoption(path: &Path, today: &str) -> Result<Adoption, String> {
-    let date = chrono::NaiveDate::parse_from_str(today, "%Y%m%d").map_err(|e| e.to_string())?;
+    chrono::NaiveDate::parse_from_str(today, "%Y%m%d").map_err(|e| e.to_string())?;
     // A pointer we cannot parse is rebuilt from the same defaults an absent one
     // gets.  ⚠ The cost of rebuilding is at most one redundant reconciliation
     // pass; the cost of refusing is that no day is ever processed again.
     let fresh = || Adoption {
         version: 1,
-        first_closed_day: (date - chrono::Duration::days(7))
-            .format("%Y%m%d")
-            .to_string(),
         ..Adoption::default()
     };
     let state: Adoption = match read_json_durable(ArtifactId::DailyAdoption, path) {
@@ -689,9 +651,7 @@ pub fn reconcile_days_with_roots(
                 continue;
             }
             let known_dirty = raw_marker_dirty(journal, day)?;
-            if (day >= &state.first_closed_day || explicit.contains(day) || known_dirty)
-                && (state.adopted.insert(day.clone()) || known_dirty)
-            {
+            if state.adopted.insert(day.clone()) || known_dirty {
                 state.pending.insert(day.clone());
             }
         }
@@ -1068,10 +1028,9 @@ mod tests {
         let day = "20260801";
         let now: DateTime<Utc> = "2026-09-14T12:00:00Z".parse().unwrap();
         source(root, day, "# Flow\nAn old meeting.");
-        assert!(
-            reconcile_days_with_roots(root, &[], now, &talent, &apps)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            reconcile_days_with_roots(root, &[], now, &talent, &apps).unwrap(),
+            vec![day]
         );
         register_daily_day(root, day, now).unwrap();
         assert_eq!(
@@ -1099,7 +1058,7 @@ mod tests {
 
     /// Late material -- a re-paired device's backlog, say -- reaches a day only
     /// through that day's stream marker.  On every platform, a moved marker must
-    /// adopt a day older than the first-run boundary and reopen a finished day,
+    /// retain an old day and reopen a finished day,
     /// and publishing the daily marker must settle both again.
     #[test]
     fn late_raw_input_adopts_an_old_day_and_reopens_a_finished_one() {
@@ -1115,8 +1074,9 @@ mod tests {
         let now: DateTime<Utc> = "2026-09-14T12:00:00Z".parse().unwrap();
         assert_eq!(
             reconcile_days_with_roots(root, &[], now, &talent, &apps).unwrap(),
-            vec![finished]
+            vec![old, finished]
         );
+        accept(root, old, &talent, &apps);
         accept(root, finished, &talent, &apps);
         assert!(
             reconcile_days_with_roots(root, &[], now, &talent, &apps)
@@ -1147,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn adoption_persists_closed_calendar_boundary_and_reconciles_derived_only_changes() {
+    fn adoption_has_no_calendar_floor_and_reconciles_derived_only_changes() {
         let (dir, talent, apps) = fixture();
         let root = dir.path();
         fs::create_dir_all(root.join("config")).unwrap();
@@ -1161,7 +1121,7 @@ mod tests {
         }
         let now: DateTime<Utc> = "2026-09-14T12:00:00Z".parse().unwrap();
         let pending = reconcile_days_with_roots(root, &[], now, &talent, &apps).unwrap();
-        assert_eq!(pending, vec!["20260907", "20260910"]);
+        assert_eq!(pending, vec!["20260801", "20260907", "20260910"]);
         assert_eq!(
             read_daily_coverage_with_roots(root, "20260910", &talent, &apps)
                 .unwrap()
@@ -1172,8 +1132,9 @@ mod tests {
             read_daily_coverage_with_roots(root, "20260801", &talent, &apps)
                 .unwrap()
                 .state,
-            CoverageState::HistoricalUnverified
+            CoverageState::Outstanding
         );
+        accept(root, "20260801", &talent, &apps);
         accept(root, "20260907", &talent, &apps);
         accept(root, "20260910", &talent, &apps);
         assert!(
@@ -1189,10 +1150,10 @@ mod tests {
         let state: Value =
             serde_json::from_slice(&fs::read(root.join("health/daily-adoption.json")).unwrap())
                 .unwrap();
-        assert_eq!(state["first_closed_day"], "20260907");
+        assert!(state.get("first_closed_day").is_none());
         let pending =
             reconcile_days_with_roots(root, &["20260801".to_owned()], now, &talent, &apps).unwrap();
-        assert!(pending.contains(&"20260801".to_owned()));
+        assert!(!pending.contains(&"20260801".to_owned()));
         assert!(!pending.contains(&"20260914".to_owned()));
     }
 

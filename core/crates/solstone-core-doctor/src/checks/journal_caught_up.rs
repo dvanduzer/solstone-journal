@@ -46,6 +46,66 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
     let mut days = None;
     let mut result = evaluate(context, check, &mut days)?;
     result.backlog_days = days;
+    let inventory = solstone_core_system::work_inventory::read(&context.journal_path);
+    let (summary, complete) = match inventory {
+        Ok(Some(report)) => {
+            let age = context.now.timestamp_millis() - report.as_of_ms;
+            let fresh = (0..180_000).contains(&age);
+            let owed = report
+                .bands
+                .iter()
+                .any(|band| band.segments_owed + band.daily_units_owed + band.owner_requests > 0);
+            let bands = report.bands.iter().enumerate().map(|(i, band)| format!(
+                "band {}: {} recordings ready / {} left, {} daily outputs ready / {} left, {} owner requests, {} waiting for permission, {} waiting for prerequisites",
+                i + 1, band.segments_complete, band.segments_owed, band.daily_units_complete,
+                band.daily_units_owed, band.owner_requests, band.permission_held, band.prerequisite_held,
+            )).collect::<Vec<_>>().join("; ");
+            (
+                format!(
+                    "inspected {} of {} days, {} through {}, as of {}; {}; {}{}",
+                    report.days_inspected,
+                    report.days_total,
+                    report.oldest_day.as_deref().unwrap_or("none"),
+                    report.newest_day.as_deref().unwrap_or("none"),
+                    report.as_of_ms,
+                    bands,
+                    if report.complete {
+                        "whole-journal inspection"
+                    } else {
+                        "incomplete inspection"
+                    },
+                    if fresh { "" } else { "; last known progress" },
+                ),
+                fresh
+                    && report.complete
+                    && report.unreadable.is_empty()
+                    && report.holds.is_empty()
+                    && !owed,
+            )
+        }
+        Ok(None) => (
+            "whole-journal inspection has not reported yet".into(),
+            false,
+        ),
+        Err(error) => (
+            format!("whole-journal inspection unavailable: {error}"),
+            false,
+        ),
+    };
+    if !complete {
+        if result.status == Status::Ok {
+            result.status = Status::Warn;
+        }
+        if result.detail.starts_with("caught up") {
+            result.detail = result
+                .detail
+                .replacen("caught up", "recent work checked", 1);
+        }
+        if result.fix.is_none() {
+            result.fix = Some("open health to see waiting work and its next step".into());
+        }
+    }
+    result.detail.push_str(&format!("; {summary}"));
     Ok(result)
 }
 
@@ -656,7 +716,7 @@ fn evaluate(context: &CheckContext, check: Check, days: &mut Option<BacklogDays>
             )
         }
         _ if !read_errors.is_empty() => CANT_TELL.to_owned(),
-        _ => "solstone catches up on its own; reprocess a day from the health surface to prioritize it".to_owned(),
+        _ => "open health to see waiting work and any spending confirmation; reprocess a past day to give it priority after today".to_owned(),
     };
     Ok(make_result(check, Status::Warn, detail, Some(fix)))
 }

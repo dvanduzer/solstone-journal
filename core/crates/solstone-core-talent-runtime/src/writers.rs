@@ -137,6 +137,22 @@ pub fn write_output_if_configured(
         return write_output_with_sources(contained, output, &trusted_sources(prepared))
             .map_err(|error| error.to_string());
     }
+    if prepared.config.get("schedule").and_then(Value::as_str) == Some("segment") {
+        let protect = prepared
+            .config
+            .get("_protect_segment_outputs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return solstone_core_system::segment_output::commit(
+            &path,
+            output.as_bytes(),
+            protect,
+            || {
+                write_output_with_sources(path.clone(), output, &trusted_sources(prepared))
+                    .map_err(|error| error.to_string())
+            },
+        );
+    }
     write_output_with_sources(path, output, &trusted_sources(prepared))
         .map_err(|error| error.to_string())
 }
@@ -543,6 +559,43 @@ mod tests {
     use solstone_core_journal_io::{MalformedPolicy, read_jsonl};
 
     use super::*;
+
+    #[test]
+    fn segment_runtime_checks_owner_edits_at_publication_and_records_only_its_generated_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root
+            .path()
+            .join("chronicle/20261011/default/120000_60/talents/sense.json");
+        let mut prepared = PreparedTalent {
+            name: "sense".into(),
+            config: json!({
+                "schedule":"segment", "output_path":output, "_protect_segment_outputs":true
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let context = ExecutionContext {
+            journal: root.path().into(),
+        };
+        write_output_if_configured(&prepared, &context, "first generated result").unwrap();
+        write_output_if_configured(&prepared, &context, "second generated result").unwrap();
+        fs::write(&output, "owner edit while model was running").unwrap();
+        assert!(write_output_if_configured(&prepared, &context, "late generated result").is_err());
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "owner edit while model was running"
+        );
+        assert!(solstone_core_system::segment_output::read_generated(&output).is_err());
+        prepared
+            .config
+            .insert("_protect_segment_outputs".into(), json!(false));
+        write_output_if_configured(&prepared, &context, "explicit from-scratch result").unwrap();
+        assert_eq!(
+            solstone_core_system::segment_output::read_generated(&output).unwrap(),
+            b"explicit from-scratch result"
+        );
+    }
 
     #[cfg(all(test, feature = "full-tests"))]
     fn test_scratch_root() -> std::path::PathBuf {

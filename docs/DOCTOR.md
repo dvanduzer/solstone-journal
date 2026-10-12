@@ -266,9 +266,9 @@ Causes: Supervisor not started, socket path permissions.
 ### Processing backlog
 
 ```bash
-# Which days are pending, stuck or unknown (`backlog_days` in the JSON)
+# Work by priority, inspection reach, and pending/stuck/unknown recent days
 solstone journal doctor --json
-# Each day in a range as states and counts: markers, coverage, units, owed by cause
+# Optional daily-output detail for a range; read-only, excludes segment publication
 solstone journal reprocess FIRST --through LAST --owed --json
 # Check sense log for queue status
 solstone journal health logs --service sense --grep queue -c 10
@@ -276,7 +276,7 @@ solstone journal health logs --service sense --grep queue -c 10
 
 After midnight the daily run of the day that just ended waits at least ten minutes, and while a segment, flush or activity task of that day or any activity settle check is still running, or an activity of that day is still being written, so it reads that day's final inputs once. An hour after the day ends it runs whatever is still pending.
 
-Causes: Slow transcription, describe API rate limits.
+Today's work goes first, followed by owner requests and yesterday, recent days, imports, older recordings, and older day updates. Health shows the inspected date range and whether inspection is complete. With your own keys, older recordings and day updates wait for one Health confirmation. Confidential processing also waits for that confirmation for historical work; an import permits its own scope. Local thinking runs every priority automatically.
 
 ### SPL relay / scheduled backup never run on a convey-only setup
 

@@ -19,6 +19,7 @@ mod flush;
 mod gate;
 mod helpers;
 mod phase_process;
+mod repair;
 mod run_log;
 mod segment;
 mod settle;
@@ -208,13 +209,9 @@ pub fn run_cli(
     )
 }
 
-/// Whether `raw_args` would reach the whole-day lifecycle (the sole caller of
-/// `sense_batch`, and thus the only mode that can launch transcription),
-/// rather than a narrower `--updated`, `--cadence`, `--activity`, `--flush`,
-/// `--segments`, `--segment`, `--weekly`, or `--dry-run` mode. Callers use
-/// this to decide whether to acquire a speakers-analyze generation before
-/// invoking [`run_cli`]; this crate has no dependency on the speakers-analyze
-/// lease itself, so the decision is made by the caller.
+/// Whether this invocation can launch raw transcription and therefore needs
+/// the speakers-analyze generation lease. Historical segment repair and full
+/// daily work can; daily-only work cannot. The caller owns that lease.
 pub fn requires_daily_lifecycle(raw_args: &[String]) -> bool {
     let Ok(args::ParseOutcome::Args(parsed)) = args::parse(raw_args) else {
         return false;
@@ -229,6 +226,12 @@ pub fn requires_daily_lifecycle(raw_args: &[String]) -> bool {
     }
     if validate(&parsed, None, false, LocalEndpointResolution::Bundled, None).is_err() {
         return false;
+    }
+    if parsed.daily_only {
+        return false;
+    }
+    if parsed.repair_segment {
+        return true;
     }
     !parsed.updated
         && !parsed.cadence
@@ -519,6 +522,16 @@ where
         }
         if let Some(segment) = parsed.segment.as_deref() {
             let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
+            if parsed.repair_segment {
+                let result = repair::run(
+                    &context,
+                    &mut log,
+                    &parsed,
+                    timeout,
+                    sense_child_environment,
+                );
+                return logged_mode_outcome(log, run, result);
+            }
             let skip_talents = parsed
                 .skip_talents
                 .split(',')
@@ -557,6 +570,12 @@ where
             return logged_mode_outcome(log, run, result);
         }
         let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
+        if let Some(id) = &parsed.work_intent
+            && let Err(error) =
+                solstone_core_system::work_intent::claim_from_scratch(journal, &selected_day, id)
+        {
+            return logged_mode_outcome(log, run, Err(error));
+        }
         let result = if parsed.weekly {
             weekly::run(
                 &context,
@@ -575,7 +594,23 @@ where
                 sense_child_environment,
             )
         };
-        logged_mode_outcome(log, run, result)
+        let outcome = logged_mode_outcome(log, run, result);
+        if let Some(id) = &parsed.work_intent {
+            let success = outcome.as_ref().is_ok_and(|run| run.exit_code == 0);
+            if let Err(error) = solstone_core_system::work_intent::finish_from_scratch(
+                journal,
+                &selected_day,
+                id,
+                success,
+            ) {
+                return Ok(CliRun {
+                    stdout: String::new(),
+                    stderr: format!("could not record reprocess outcome: {error}\n"),
+                    exit_code: 1,
+                });
+            }
+        }
+        outcome
     })();
     match result {
         Ok(run) => run,
@@ -715,6 +750,69 @@ fn validate(
             message: message.to_owned(),
         })
     };
+    if args.work_intent.is_some()
+        && (!args.from_scratch
+            || args.day.is_none()
+            || args.segment.is_some()
+            || args.segments
+            || args.activity.is_some()
+            || args.facet.is_some()
+            || args.flush
+            || args.settle
+            || args.updated
+            || args.weekly
+            || args.cadence
+            || args.dry_run
+            || args.sense_batch
+            || args.repair_segment
+            || args.daily_only)
+    {
+        return usage("--work-intent requires a from-scratch daily request");
+    }
+    if args.repair_segment
+        && (args.day.is_none()
+            || args.segment.is_none()
+            || args.refresh
+            || args.from_scratch
+            || args.segments
+            || args.activity.is_some()
+            || args.facet.is_some()
+            || args.flush
+            || args.settle
+            || args.live
+            || args.updated
+            || args.weekly
+            || args.cadence
+            || args.dry_run
+            || args.sense_batch
+            || args.daily_only)
+    {
+        return usage(
+            "--repair-segment requires --day and --segment and cannot be combined with another thinking mode",
+        );
+    }
+    if args.daily_only
+        && (args.day.is_none()
+            || args.segment.is_some()
+            || args.refresh
+            || args.from_scratch
+            || args.segments
+            || args.activity.is_some()
+            || args.facet.is_some()
+            || args.flush
+            || args.settle
+            || args.live
+            || args.updated
+            || args.weekly
+            || args.cadence
+            || args.dry_run
+            || args.sense_batch
+            || args.repair_segment)
+    {
+        return usage(
+            "--daily-only requires --day and cannot be combined with another thinking mode",
+        );
+    }
     if args.reactivate && args.activity.is_none() {
         return usage(REACTIVATE_REQUIRES_ACTIVITY);
     }
@@ -879,6 +977,24 @@ mod tests {
             }
             if let Some(error) = self.dispatch_failure.lock().unwrap().clone() {
                 return Err(error);
+            }
+            // The mock model returns the fixture's staged output. Exercise the
+            // same writer receipt as the real talent worker before its finish.
+            if request.config.get("schedule").and_then(Value::as_str) == Some("segment")
+                && let Some(path) = request.config.get("output_path").and_then(Value::as_str)
+                && let Ok(bytes) = fs::read(path)
+            {
+                solstone_core_system::segment_output::commit(
+                    Path::new(path),
+                    &bytes,
+                    request
+                        .config
+                        .get("_protect_segment_outputs")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    || fs::write(path, &bytes).map_err(|e| e.to_string()),
+                )
+                .map_err(|_| context::DispatchFailure::Unavailable)?;
             }
             Ok(format!("use-{}", requests.len()))
         }
@@ -3178,7 +3294,11 @@ mod tests {
     fn write_sense_output(context: &context::ThinkContext, segment: &str, value: Value) {
         let path = sense_output_path(context, segment);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        solstone_core_system::segment_output::commit(&path, &bytes, false, || {
+            fs::write(&path, &bytes).map_err(|e| e.to_string())
+        })
+        .unwrap();
     }
 
     fn segment_context(
@@ -6383,6 +6503,164 @@ mod tests {
     // A late delivery queues every segment for live thinking while the day's
     // repair thinks the same segments; whichever comes second must not think
     // the segment again on unchanged input.
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn historical_repair_retries_saved_search_publication_without_another_model_call() {
+        struct RecoveringIndex(std::sync::atomic::AtomicBool);
+        impl context::IndexBoundary for RecoveringIndex {
+            fn rescan_file(
+                &self,
+                root: &Path,
+                path: &Path,
+            ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+                if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("fixture publication failure".into());
+                }
+                solstone_core_indexer_store::scan::rescan_file(root, path)
+                    .map_err(|e| e.to_string())
+            }
+        }
+        let journal = tempdir().unwrap();
+        let roots = tempdir().unwrap();
+        let (mut context, recorder) = thought_after_input_context(journal.path(), roots.path());
+        write_analyzed_screen(journal.path(), "20260813", "090000_300");
+        write_sense_output(
+            &context,
+            "090000_300",
+            serde_json::json!({"density":"active","content_type":"work","activity_summary":"A garden meeting with plans for spring."}),
+        );
+        let directory = journal.path().join("chronicle/20260813/default/090000_300");
+        fs::create_dir_all(directory.join("talents")).unwrap();
+        let saved = directory.join("talents/activity.md");
+        solstone_core_system::segment_output::commit(
+            &saved,
+            b"A garden meeting with plans for spring.",
+            false,
+            || {
+                fs::write(&saved, "A garden meeting with plans for spring.")
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        let index = Arc::new(RecoveringIndex(std::sync::atomic::AtomicBool::new(true)));
+        context.index = index.clone();
+        let parsed = args::ThinkArgs {
+            day: Some("20260813".into()),
+            segment: Some("090000_300".into()),
+            stream: Some("default".into()),
+            repair_segment: true,
+            ..Default::default()
+        };
+        assert!(
+            repair::run(
+                &context,
+                &mut test_log(&context, "segment"),
+                &parsed,
+                None,
+                &Default::default()
+            )
+            .is_err()
+        );
+        let calls = recorder.requests.lock().unwrap().len();
+        assert!(calls > 0);
+        index.0.store(false, std::sync::atomic::Ordering::Release);
+        let retry = repair::run(
+            &context,
+            &mut test_log(&context, "segment"),
+            &parsed,
+            None,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(retry.failed, 0);
+        assert_eq!(recorder.requests.lock().unwrap().len(), calls);
+        let db = solstone_core_indexer_store::db::open_index_reader(journal.path()).unwrap();
+        let found: i64 = db
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE chunks MATCH 'garden'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(found > 0);
+        assert_eq!(
+            fs::read_to_string(saved).unwrap(),
+            "A garden meeting with plans for spring."
+        );
+    }
+
+    #[test]
+    fn interrupted_or_unpersistable_destructive_claim_never_enters_daily_phases() {
+        for broken_store in [false, true] {
+            let journal = tempdir().unwrap();
+            let day = "20260813";
+            let intent =
+                solstone_core_system::work_intent::register(journal.path(), day, true).unwrap();
+            let owner_output = journal.path().join("chronicle/20260813/summary.md");
+            fs::create_dir_all(owner_output.parent().unwrap()).unwrap();
+            fs::write(&owner_output, "the owner's words").unwrap();
+            if broken_store {
+                fs::remove_file(journal.path().join("health/work-intent.json")).unwrap();
+                fs::create_dir(journal.path().join("health/work-intent.json")).unwrap();
+            } else {
+                solstone_core_system::work_intent::claim_from_scratch(
+                    journal.path(),
+                    day,
+                    &intent.id,
+                )
+                .unwrap();
+            }
+            let run = run_at(
+                journal.path(),
+                &["--day", day, "--from-scratch", "--work-intent", &intent.id],
+            );
+            assert_ne!(run.exit_code, 0);
+            assert_eq!(
+                fs::read_to_string(owner_output).unwrap(),
+                "the owner's words"
+            );
+            assert!(
+                !sidecar_events(journal.path(), day, "daily")
+                    .iter()
+                    .any(|event| event["event"] == "phase.start")
+            );
+        }
+    }
+
+    #[test]
+    fn historical_modes_validate_and_only_raw_repair_needs_transcription_lease() {
+        let argv = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(requires_daily_lifecycle(&argv(&[
+            "--day",
+            "20260101",
+            "--segment",
+            "120000_60",
+            "--repair-segment"
+        ])));
+        assert!(!requires_daily_lifecycle(&argv(&[
+            "--day",
+            "20260101",
+            "--daily-only"
+        ])));
+        for words in [
+            vec!["--repair-segment"],
+            vec!["--day", "20260101", "--daily-only", "--from-scratch"],
+            vec!["--day", "20260101", "--work-intent", "id"],
+        ] {
+            let args::ParseOutcome::Args(parsed) = args::parse(&argv(&words)).unwrap() else {
+                panic!("args")
+            };
+            assert!(
+                validate(&parsed, None, false, LocalEndpointResolution::Bundled, None).is_err()
+            );
+        }
+    }
+
     #[test]
     fn live_thinking_skips_a_segment_already_thought_on_its_current_input() {
         let journal = tempdir().unwrap();
