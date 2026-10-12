@@ -21,6 +21,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - when you redo a past day with `solstone journal reprocess`, your journal now remakes that day's daily results soon after it finishes redoing its recordings. before, they could wait for your journal's next check of its recorded days, close to an hour on a large journal.
 - a screen category in the ignored group in settings was still read in detail when it was the first thing on screen in a recording, or when it was on screen beside another app. it's now never read in detail, and your journal still keeps a short description of it.
 - the help under "frames read in detail" in settings said the number counted frames across your whole screen segment. it counts for each screen separately, and the help now says so.
+- on mac and windows, the health page no longer lists "original media cleanup" as scheduled, and your journal no longer starts it every day. offload isn't available there in this version, so each run stopped without doing anything.
 
 ## [2.0.43] - 2026-10-12
 

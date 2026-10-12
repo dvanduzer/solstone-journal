@@ -827,7 +827,7 @@ fn schedules_are_reconciled_before_the_scheduler_loads() {
     // An installed journal carries a retired maintenance entry and an
     // operator-authored entry; the built-in entries and a registry routine are
     // absent. Boot must prune the retired name, register every built-in and
-    // every registry routine, and leave the operator's entry byte-for-byte as
+    // every registry routine this host can run, and leave the operator's entry byte-for-byte as
     // written, without any manual sync.
     let journal = TempJournal::new();
     let operator_entry = serde_json::json!({
@@ -888,6 +888,14 @@ fn schedules_are_reconciled_before_the_scheduler_loads() {
     assert!(!routines.is_empty());
     for routine in routines {
         let entry = &raw[format!("maintenance:{}", routine.id)];
+        if solstone_core_maintenance::schedule_sync::host_unscheduled().contains(&routine.id) {
+            assert!(
+                entry.is_null(),
+                "{} cannot run on this host and must not be scheduled",
+                routine.id
+            );
+            continue;
+        }
         assert_eq!(
             entry["cmd"],
             serde_json::json!(["solstone", "journal", "maintenance", "run", routine.id]),

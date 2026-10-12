@@ -28,6 +28,8 @@ pub enum ScheduleStatus {
     Synced,
     Divergent,
     Disabled,
+    /// This host never schedules the routine; see [`host_unscheduled`].
+    NotHere,
 }
 
 impl ScheduleStatus {
@@ -37,6 +39,7 @@ impl ScheduleStatus {
             Self::Synced => "synced",
             Self::Divergent => "divergent",
             Self::Disabled => "disabled",
+            Self::NotHere => "n/a",
         }
     }
 }
@@ -58,6 +61,18 @@ pub struct SyncSummary {
     pub disabled: Vec<String>,
 }
 
+/// Routines this host never schedules because their body can only refuse
+/// here: offload is unavailable wherever its installed producer is. Sync does
+/// not add their entries and removes one already present, so the scheduler
+/// never records a daily failure for work that cannot run.
+pub fn host_unscheduled() -> &'static [&'static str] {
+    if solstone_core_offload::cli_run::PRODUCER_SUPPORTED {
+        &[]
+    } else {
+        &["backup:offload"]
+    }
+}
+
 /// The journal-local schedules configuration path.
 pub fn schedules_path(journal: &Path) -> std::path::PathBuf {
     journal.join("config/schedules.json")
@@ -69,7 +84,7 @@ pub fn statuses<'a>(
     routines: &'a [RoutineDescriptor],
 ) -> Result<Vec<RoutineStatus<'a>>, String> {
     let raw = read_raw_schedules(path)?;
-    Ok(classify(routines, &raw))
+    Ok(classify(routines, &raw, host_unscheduled()))
 }
 
 /// Render the reference maintenance routine list.
@@ -108,7 +123,7 @@ pub fn sync(path: &Path, routines: &[RoutineDescriptor]) -> Result<SyncSummary, 
     initialize_schedule_config(path).map_err(|error| error.to_string())?;
     mutate_schedule_entries(path, |raw| {
         let mut next = raw.clone();
-        let summary = plan_sync(&mut next, routines);
+        let summary = plan_sync(&mut next, routines, host_unscheduled());
         let changed = next != *raw;
         if changed {
             *raw = next;
@@ -121,7 +136,11 @@ pub fn sync(path: &Path, routines: &[RoutineDescriptor]) -> Result<SyncSummary, 
     .map_err(|error| error.to_string())
 }
 
-fn plan_sync(raw: &mut Map<String, Value>, routines: &[RoutineDescriptor]) -> SyncSummary {
+fn plan_sync(
+    raw: &mut Map<String, Value>,
+    routines: &[RoutineDescriptor],
+    unscheduled: &[&str],
+) -> SyncSummary {
     let mut summary = SyncSummary::default();
     for entry in RETIRED_ENTRIES {
         if raw.remove(*entry).is_some() {
@@ -129,7 +148,7 @@ fn plan_sync(raw: &mut Map<String, Value>, routines: &[RoutineDescriptor]) -> Sy
         }
     }
 
-    let classified = classify(routines, raw)
+    let classified = classify(routines, raw, unscheduled)
         .into_iter()
         .filter(|item| !is_retired_schedule_entry(item.descriptor.id));
     for item in classified {
@@ -144,6 +163,12 @@ fn plan_sync(raw: &mut Map<String, Value>, routines: &[RoutineDescriptor]) -> Sy
             ScheduleStatus::Synced => summary.synced.push(item.descriptor.id.to_owned()),
             ScheduleStatus::Divergent => summary.divergent.push(item.descriptor.id.to_owned()),
             ScheduleStatus::Disabled => summary.disabled.push(item.descriptor.id.to_owned()),
+            ScheduleStatus::NotHere => {
+                let name = schedule_name(item.descriptor.id);
+                if raw.remove(&name).is_some() {
+                    summary.removed.push(name);
+                }
+            }
         }
     }
     summary
@@ -230,6 +255,7 @@ fn read_raw_schedules(path: &Path) -> Result<Map<String, Value>, String> {
 fn classify<'a>(
     routines: &'a [RoutineDescriptor],
     raw: &Map<String, Value>,
+    unscheduled: &[&str],
 ) -> Vec<RoutineStatus<'a>> {
     let mut sorted = routines.iter().collect::<Vec<_>>();
     sorted.sort_by_key(|descriptor| descriptor.id);
@@ -237,7 +263,11 @@ fn classify<'a>(
         .into_iter()
         .map(|descriptor| RoutineStatus {
             descriptor,
-            status: classify_one(descriptor, raw.get(&schedule_name(descriptor.id))),
+            status: if unscheduled.contains(&descriptor.id) {
+                ScheduleStatus::NotHere
+            } else {
+                classify_one(descriptor, raw.get(&schedule_name(descriptor.id)))
+            },
         })
         .collect()
 }
@@ -289,7 +319,10 @@ fn alias_command(cmd: Option<&Value>) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScheduleStatus, classify_one, expected_entry, sync};
+    use super::{
+        ScheduleStatus, classify, classify_one, expected_entry, host_unscheduled, plan_sync,
+        schedule_name, sync,
+    };
     use crate::registry::{Cadence, RoutineDescriptor, routines};
     use serde_json::{Value, json};
     use std::fs;
@@ -486,5 +519,92 @@ mod tests {
             raw["maintenance:app:uncapped"]["cmd"],
             json!(["solstone", "journal", "maintenance", "run", "app:uncapped"])
         );
+    }
+
+    const OFFLOAD: &str = "backup:offload";
+
+    fn offload_descriptor() -> &'static RoutineDescriptor {
+        routines()
+            .iter()
+            .find(|descriptor| descriptor.id == OFFLOAD)
+            .expect("offload routine")
+    }
+
+    #[test]
+    fn a_routine_this_host_cannot_run_is_never_scheduled_and_its_entry_is_removed() {
+        let offload = schedule_name(OFFLOAD);
+        let mut raw = serde_json::Map::new();
+        raw.insert(offload.clone(), expected_entry(offload_descriptor()));
+        let summary = plan_sync(&mut raw, routines(), &[OFFLOAD]);
+        assert_eq!(summary.removed, vec![offload.clone()]);
+        assert!(raw.get(&offload).is_none());
+        assert!(!summary.added.iter().any(|id| id == OFFLOAD));
+        assert_eq!(summary.added.len(), routines().len() - 1);
+
+        let again = plan_sync(&mut raw, routines(), &[OFFLOAD]);
+        assert!(again.removed.is_empty() && again.added.is_empty());
+        assert!(raw.get(&offload).is_none());
+
+        let mut disabled = serde_json::Map::new();
+        disabled.insert(offload.clone(), json!({"enabled": false}));
+        let summary = plan_sync(&mut disabled, routines(), &[OFFLOAD]);
+        assert_eq!(summary.removed, vec![offload.clone()]);
+        assert!(summary.disabled.is_empty());
+
+        let statuses = classify(routines(), &raw, &[OFFLOAD]);
+        for item in statuses {
+            assert_eq!(
+                item.status == ScheduleStatus::NotHere,
+                item.descriptor.id == OFFLOAD,
+                "{}",
+                item.descriptor.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_routine_this_host_runs_keeps_its_existing_sync_behavior() {
+        let offload = schedule_name(OFFLOAD);
+        let mut raw = serde_json::Map::new();
+        let summary = plan_sync(&mut raw, routines(), &[]);
+        assert!(summary.removed.is_empty());
+        assert!(summary.added.iter().any(|id| id == OFFLOAD));
+        assert_eq!(raw[&offload], expected_entry(offload_descriptor()));
+
+        let again = plan_sync(&mut raw, routines(), &[]);
+        assert!(again.removed.is_empty() && again.added.is_empty());
+        assert!(again.synced.iter().any(|id| id == OFFLOAD));
+    }
+
+    #[test]
+    fn offload_is_scheduled_exactly_where_its_producer_runs() {
+        assert_eq!(
+            host_unscheduled().contains(&OFFLOAD),
+            !solstone_core_offload::cli_run::PRODUCER_SUPPORTED
+        );
+        assert_eq!(
+            solstone_core_offload::cli_run::PRODUCER_SUPPORTED,
+            cfg!(target_os = "linux")
+        );
+        let root = tempfile::tempdir().expect("temporary journal");
+        let config = root.path().join("config/schedules.json");
+        let offload = schedule_name(OFFLOAD);
+        write_config(
+            &config,
+            &json!({offload.clone(): expected_entry(offload_descriptor())}),
+        );
+        sync(&config, routines()).expect("sync");
+        let raw: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
+        assert_eq!(
+            raw.get(&offload).is_some(),
+            solstone_core_offload::cli_run::PRODUCER_SUPPORTED
+        );
+        for descriptor in routines().iter().filter(|routine| routine.id != OFFLOAD) {
+            assert!(
+                raw.get(schedule_name(descriptor.id)).is_some(),
+                "{}",
+                descriptor.id
+            );
+        }
     }
 }

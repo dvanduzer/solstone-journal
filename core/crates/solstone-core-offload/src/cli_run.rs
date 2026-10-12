@@ -255,6 +255,10 @@ impl OwnedOffloadCliRun {
     }
 }
 
+/// Whether this host runs the installed offload producer. Elsewhere every
+/// non-preview run is refused before it opens the journal.
+pub const PRODUCER_SUPPORTED: bool = cfg!(target_os = "linux");
+
 /// Run the installed offload producer while retaining its complete outcome.
 pub fn run_cli_offload(
     journal: &Path,
@@ -263,7 +267,7 @@ pub fn run_cli_offload(
 ) -> OwnedOffloadCliRun {
     let refusal = if dry_run {
         Some(CliPrelaunchRefusal::DryRun)
-    } else if !cfg!(target_os = "linux") {
+    } else if !PRODUCER_SUPPORTED {
         Some(CliPrelaunchRefusal::UnsupportedPlatform)
     } else {
         None

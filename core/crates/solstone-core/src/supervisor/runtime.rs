@@ -859,8 +859,8 @@ fn ready_sleep_marker_path(argv: &[String]) -> Option<&str> {
 /// Bring `config/schedules.json` up to date with what the journal ships before
 /// the scheduler loads it: the built-in entries are registered when absent, and
 /// the maintenance entries are reconciled with the routine registry, retired
-/// names pruned and missing routines added. Entries an operator added or edited
-/// survive untouched. A failure leaves the file as it was and never blocks the
+/// names and routines this host cannot run pruned and missing routines added.
+/// Other entries an operator added or edited survive untouched. A failure leaves the file as it was and never blocks the
 /// boot; the scheduler then runs whatever the file already holds.
 /// Returns the schedule names added by this reconciliation, so the boot
 /// catch-up can leave them to start at their next mark.
