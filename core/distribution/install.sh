@@ -1535,13 +1535,15 @@ compare_dotted_ge() {
 
 find_host_library() {
 	_lib_target=$1
-	if command -v ldconfig >/dev/null 2>&1; then
-		_found=$(ldconfig -p 2>/dev/null | awk -v name="$_lib_target" '$1 == name && /=>/ { print $NF; exit }')
+	# ldconfig lives in /sbin or /usr/sbin, which a normal user's PATH may lack (Debian).
+	for _ldconfig in "$(command -v ldconfig 2>/dev/null || true)" /sbin/ldconfig /usr/sbin/ldconfig; do
+		[ -n "$_ldconfig" ] && [ -x "$_ldconfig" ] || continue
+		_found=$("$_ldconfig" -p 2>/dev/null | awk -v name="$_lib_target" '$1 == name && /=>/ { print $NF; exit }')
 		if [ -n "$_found" ] && [ -f "$_found" ]; then
 			printf '%s\n' "$_found"
 			return 0
 		fi
-	fi
+	done
 	for _dir in /lib /lib64 /usr/lib /usr/lib64; do
 		if [ -f "$_dir/$_lib_target" ]; then
 			printf '%s\n' "$_dir/$_lib_target"
@@ -1550,7 +1552,8 @@ find_host_library() {
 	done
 	for _dir in /lib /lib64 /usr/lib /usr/lib64; do
 		if [ -d "$_dir" ]; then
-			_found=$(find "$_dir" -name "$_lib_target" -type f 2>/dev/null | head -n 1)
+			# Multiarch libraries are usually symlinks; accept one only if a regular file is behind it.
+			_found=$(find "$_dir" -name "$_lib_target" \( -type f -o -type l \) -exec test -f {} \; -print 2>/dev/null | head -n 1)
 			if [ -n "$_found" ] && [ -f "$_found" ]; then
 				printf '%s\n' "$_found"
 				return 0
