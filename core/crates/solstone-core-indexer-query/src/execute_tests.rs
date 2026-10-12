@@ -2858,3 +2858,84 @@ fn the_last_relaxed_rung_lets_a_word_match_as_a_prefix() {
     );
     fs::remove_dir_all(root).expect("cleanup prefix ladder index");
 }
+
+#[test]
+fn retained_owner_search_observes_commits_and_releases_wal_snapshots() {
+    let (root, writer) = seeded_root("retained-owner-search");
+    insert(
+        &writer,
+        "copper first",
+        "20260107/talents/first.md",
+        "20260107",
+        "",
+        "first",
+        "",
+        0,
+    );
+    let request = SearchRequest {
+        query: "copper".into(),
+        ..Default::default()
+    };
+    let mut reader = open_owner_index(&root, OwnerBoundary).expect("owner reader");
+    let first = reader
+        .search(&request, reference_date())
+        .expect("first search");
+    assert_eq!(first.results.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(
+            owner_search(&root, OwnerBoundary, &request, reference_date()).unwrap()
+        )
+        .unwrap()
+    );
+    writer.execute_batch("BEGIN; UPDATE chunks SET content='copper changed' WHERE path='20260107/talents/first.md'; COMMIT;").expect("writer commit");
+    let changed = reader
+        .search(&request, reference_date())
+        .expect("fresh committed search");
+    assert_eq!(changed.results[0].text, "copper changed");
+    // An unfinished statement/read transaction would pin these committed WAL frames.
+    let checkpoint: (i64, i64, i64) = writer
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("checkpoint with retained reader");
+    assert_eq!(checkpoint, (0, 0, 0));
+    assert_eq!(
+        fs::metadata(db_path(&root).with_extension("sqlite-wal"))
+            .unwrap()
+            .len(),
+        0
+    );
+    insert(
+        &writer,
+        "copper second",
+        "20260107/talents/second.md",
+        "20260107",
+        "",
+        "second",
+        "",
+        0,
+    );
+    assert_eq!(
+        reader
+            .search(&request, reference_date())
+            .unwrap()
+            .results
+            .len(),
+        2
+    );
+    let punctuation = SearchRequest {
+        query: "!!!".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(reader.search(&punctuation, reference_date()).unwrap()).unwrap(),
+        serde_json::to_value(
+            owner_search(&root, OwnerBoundary, &punctuation, reference_date()).unwrap()
+        )
+        .unwrap()
+    );
+    drop(reader);
+    drop(writer);
+    fs::remove_dir_all(root).expect("remove fixture");
+}

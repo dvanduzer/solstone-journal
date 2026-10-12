@@ -218,6 +218,7 @@ The full layout and vocabulary, written for the agents that work inside it: [cor
 | `schemas/` | JSON schemas for the release manifest and transparency records |
 | `packaging/keys/` | the minisign public key that signs every release |
 | `scripts/` | repository maintenance and hygiene checks, mostly Python. Tooling that guards the codebase, not product code |
+| [`tools/ios-runtime/`](tools/ios-runtime/README.md) | dedicated iOS development host, bundled Journal helper and physical qualification |
 | `tools/journal_device_sim/` | a dependency-free simulator of a paired device, for ingest and recovery testing |
 | `journal/` | in a source checkout, your live journal. Git-ignored except its agent breadcrumbs |
 

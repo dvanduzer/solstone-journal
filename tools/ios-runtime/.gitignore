@@ -1,0 +1,4 @@
+*.xcodeproj/
+Resources/
+native/target/
+__pycache__/
