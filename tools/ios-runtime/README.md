@@ -1,8 +1,8 @@
 # Journal on a dedicated iOS device
 
-This development app runs Journal storage, indexing and search in a standard bundled ExtensionFoundation helper. Keep the device plugged in and the host app in the foreground. It requires iOS 26 and a development signing identity. It does not integrate with the capture app or run a network service.
+This development app exercises Journal storage, indexing and search with a standard bundled ExtensionFoundation helper. Keep the device plugged in and the host app in the foreground. It requires iOS 26 and a development signing identity. It can serve the production authenticated Journal API over a private Wi-Fi interface. It does not integrate with the capture app.
 
-The helper owns persistent files in its private `Documents/journal-<suite>` directory. The host sends typed operations over XPC and receives results. A supplied host path conveys no file authority. The bridge retains an admitted `JournalRoot` and checks its canonical binding before each operation; bound publication uses the production Journal IO primitives. Indexing and queries use the production crates. Exported synthetic results go to the host's Documents directory for independent checking.
+The helper owns persistent files in its private `Documents/journal-<suite>` directory. The host sends typed operations over XPC and receives results. A supplied host path conveys no file authority. The bridge retains an admitted `JournalRoot` and checks its canonical binding before each operation; bound publication uses the production Journal IO primitives. Indexing and queries use the production crates. For LAN serving, the foreground host retains the shared [mobile serving runtime](../mobile-serving/README.md). The host and helper independently select the same dedicated app-group journal; the helper performs indexing and export. The maintained router payload is bundled as a signed resource. Exported synthetic results go to the host's Documents directory for independent checking.
 
 ## Build and install
 
@@ -15,7 +15,7 @@ make install DEVICE=<device-identifier>
 
 `make build` uses the selected iPhoneOS SDK and a generic iOS destination. It generates the Xcode project, builds the native library, generates ExtensionFoundation metadata from the compiler's constant values, then signs and verifies the helper and host. These steps are part of the build. Generated projects and build products are ignored. `BUILD_ROOT` defaults to `/var/tmp/journal-ios-runtime-build`.
 
-The development signing defaults in `project.yml` and `finalize.py` must match the local team, identity and unlocked signing keychain. They use development provisioning only. This app has its own bundle identifier, `app.solstone.journal.runtime.dev`. Installation preserves other apps and their data.
+The development signing defaults in `project.yml` and `finalize.py` must match the local team, identity and unlocked signing keychain. They use development provisioning only. This app has its own bundle identifier, `app.solstone.journal.runtime.dev`. Installation preserves other apps and their data. Automatic provisioning must authorize `group.app.solstone.journal.runtime.dev` for this host and helper; both refuse serving storage if the signed group container is unavailable.
 
 `make run DEVICE=<device-identifier>` opens the manual controls. `make check` checks native formatting and all-target Clippy on the host. This standalone development crate is separate from the core workspace and release packages.
 
@@ -38,3 +38,25 @@ The controls repeat unpaced production searches with and without a retained read
 The host-loss command kills the observed host PID after indexing while the worker is active. The next command opens the same helper-owned journal from a cold host and verifies its files and index. The verifier fails on missing completion, a reported operation error, wrong content or FTS rows, or observed background heartbeats. Re-run the verifier against preserved console output with `--verify-only` and the same arguments. Keep failed runs alongside successful receipts.
 
 All data generated here is synthetic. The fault interface and test-hook dependency belong only to this development app. Do not embed this bridge in a release app.
+
+## Authenticated LAN qualification
+
+The listener and production owner router run on a serial native queue in the foreground host. The standard non-UI helper has a measured 35 MiB dirty-memory limit, below the existing journal mark's 64 MiB Argon2 allocation. Host placement preserves that derivation. The host retains the helper process and private XPC connection for indexing and export. Both derive `Documents/journal-<suite>` from the dedicated signed app-group container; host-supplied paths confer no authority. The earlier storage qualification continues to use the helper's private container. Local owner setup and consent stay inside the app; it opens no unauthenticated loopback port. The host selects its private `en0` IPv4 address and binds only that address. A changed Wi-Fi address requires a restart. Keep the host foreground and the phone plugged in for this development capability.
+
+Build the separate laptop client and run the physical qualification from the Mac connected to the phone:
+
+```sh
+cargo build --locked --manifest-path tools/mobile-serving/client/Cargo.toml
+cd tools/ios-runtime
+python3 qualify_serving.py --device <id> --host <phone-wifi-ip> --suite serving1 --client ../mobile-serving/client/target/debug/ios-serving-client --output /tmp/serving1
+```
+
+Use a fresh suite and output directory. The default workload runs 120 write/index/query cycles with five seconds between cycles. `--cycles` and `--interval` bound shorter diagnostic runs. The client connects directly to the phone over the existing SPL TLS transport. USB transfers only app-owned control commands and receipts; journal input and search always travel over the LAN.
+
+The harness completes the existing mark-preview, lock and finalize flow, creates a Work facet through Settings, and opens an owner-approved pairing window. It submits synthetic text through the activity-create API, runs the production index scanner through private owner control, then searches through the authenticated API. It checks missing and invalid credentials during a live pairing window, rejects an invalid pairing request, restarts both worker and host, and checks persistent identity and content. Revocation must close an already-authorized carrier and reject a new connection.
+
+Activity creation uses a stable `since_segment`. A repeated create returns a conflict. After an uncertain reply, the harness reads the corresponding record and compares its content before deciding whether to create again. It drops one incomplete request before publication and discards one response after the server begins replying. This qualifies that bounded reconciliation path; it does not promise exactly-once delivery for arbitrary operations.
+
+The host accepts qualification commands from its own `Documents/owner-command.json`, dispatches owner requests in process, sends index/export operations over private XPC, and writes `owner-reply.json`. Each command has an ID, the launched suite name and the `serving` storage selection. The host records consumption before execution and retains the command file through the USB transfer check. A host death can leave an uncertain owner-control reply; it never automatically replays that command. These files are development operator controls inside the app container, with no network route. `serve-stop` closes the listener before the harness snapshots source records and exports SQLite. The verifier independently checks exact source fields, record IDs, FTS population and database integrity, including a deliberately wrong-payload control. Receipts retain source hashes, process IDs, foreground heartbeats, thermal states and resource counters. Credentials remain in a separate mode-0600 file and must stay out of shared receipts.
+
+Incoming TCP listening does not require Local Network privilege on iOS, as described in [Apple TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy). This adapter performs no Bonjour discovery. Outbound connections and discovery have separate permission rules. Physical qualification covers the observed foreground listener lifetime; background serving and unattended endurance remain unqualified.

@@ -23,6 +23,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 static ROOT: Mutex<Option<JournalRoot>> = Mutex::new(None);
 static QUERY: Mutex<Option<OwnerIndex>> = Mutex::new(None);
+static SERVING: Mutex<Option<journal_mobile_serving::MobileServing>> = Mutex::new(None);
 fn fixture(i: u64, revision: u64) -> String {
     format!(
         "# Synthetic memory {i}\n\nauroraruntime document {i}: copper kite revision {revision}.\n"
@@ -105,8 +106,36 @@ fn inventory(root: &Path) -> Result<Value, String> {
         json!({"files":files,"entries":entries,"sizes":sizes,"checkpoint":std::fs::read_to_string(root.join("checkpoint.bin")).ok(),"committed":std::fs::read_to_string(root.join("committed.bin")).ok(),"exclusive":std::fs::read_to_string(root.join("exclusive.bin")).ok()}),
     )
 }
+fn wifi_address() -> Result<std::net::Ipv4Addr, String> {
+    let mut interfaces: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut cursor = interfaces;
+    let mut address = None;
+    while !cursor.is_null() {
+        let interface = unsafe { &*cursor };
+        if !interface.ifa_addr.is_null()
+            && unsafe { (*interface.ifa_addr).sa_family as i32 } == libc::AF_INET
+            && unsafe { CStr::from_ptr(interface.ifa_name) }.to_bytes() == b"en0"
+        {
+            let socket = unsafe { &*(interface.ifa_addr as *const libc::sockaddr_in) };
+            let ip = std::net::Ipv4Addr::from(socket.sin_addr.s_addr.to_ne_bytes());
+            if ip.is_private() {
+                address = Some(ip);
+            }
+        }
+        cursor = interface.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(interfaces) };
+    let ip = address.ok_or("no private en0 IPv4 address")?;
+    Ok(ip)
+}
 fn run(v: Value) -> Result<Value, String> {
     let op = v["op"].as_str().ok_or("missing operation")?;
+    if op == "serve-crash" {
+        std::process::abort();
+    }
     if op == "activity" {
         return Ok(json!({"active": ACTIVE.load(Ordering::SeqCst)}));
     }
@@ -136,13 +165,104 @@ fn run(v: Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
     let p = root.canonical_path();
     match op {
+        "serve-start" => {
+            let mut serving = SERVING.lock().map_err(|e| e.to_string())?;
+            if serving.is_some() {
+                return Err("serving already started".into());
+            }
+            let port = v["count"]
+                .as_u64()
+                .filter(|p| (1024..=65535).contains(p))
+                .ok_or("port must be between 1024 and 65535")? as u16;
+            let address = std::net::SocketAddrV4::new(wifi_address()?, port);
+            let payload = PathBuf::from(v["payload"].as_str().ok_or("missing bundled payload")?);
+            let runtime = journal_mobile_serving::MobileServing::start_with_payload(
+                p.to_owned(),
+                address,
+                payload,
+            )?;
+            let status = runtime.status();
+            *serving = Some(runtime);
+            Ok(json!({"address":address.to_string(),"status":status}))
+        }
+        "serve-stop" => {
+            if let Some(serving) = SERVING.lock().map_err(|e| e.to_string())?.take() {
+                serving.shutdown();
+            }
+            Ok(json!({"stopped":true}))
+        }
+        "serve-index" => {
+            let report = solstone_core_indexer_store::scan::scan_journal(p, false)
+                .map_err(|e| e.to_string())?;
+            if report.failed != 0 {
+                return Err(format!("index scan failed: {:?}", report.failures));
+            }
+            Ok(
+                json!({"indexed":report.indexed,"removed":report.removed,"skipped":report.skipped,
+                "failed":report.failed,"warnings":report.warnings}),
+            )
+        }
+        "serve-status" | "serve-owner" => {
+            let serving = SERVING.lock().map_err(|e| e.to_string())?;
+            let serving = serving.as_ref().ok_or("serving is stopped")?;
+            match op {
+                "serve-status" => Ok(serving.status()),
+                _ => {
+                    let payload: Value =
+                        serde_json::from_str(v["payload"].as_str().ok_or("missing owner request")?)
+                            .map_err(|e| e.to_string())?;
+                    let response = serving.request_owner(
+                        payload["method"].as_str().ok_or("missing method")?,
+                        payload["uri"].as_str().ok_or("missing URI")?,
+                        payload["body"].as_str().unwrap_or(""),
+                    )?;
+                    Ok(json!({"status":response.status,"body":response.body}))
+                }
+            }
+        }
+        "serve-inventory" => {
+            if SERVING.lock().map_err(|e| e.to_string())?.is_some() {
+                return Err("stop serving before snapshotting files".into());
+            }
+            let mut files = serde_json::Map::new();
+            for name in [
+                "facets/work/activities/20261012.jsonl",
+                "link/state.json",
+                "link/authorized_clients.json",
+            ] {
+                files.insert(
+                    name.into(),
+                    json!(std::fs::read_to_string(p.join(name)).ok()),
+                );
+            }
+            fn storage(path: &Path) -> Result<(u64, u64), String> {
+                let mut sum = (0, 0);
+                for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    let metadata = entry.metadata().map_err(|e| e.to_string())?;
+                    let count = if metadata.is_dir() {
+                        storage(&entry.path())?
+                    } else {
+                        (1, metadata.len())
+                    };
+                    sum.0 += count.0;
+                    sum.1 += count.1;
+                }
+                Ok(sum)
+            }
+            let (count, bytes) = storage(p)?;
+            Ok(json!({"files":files,"storage_files":count,"storage_bytes":bytes}))
+        }
         "prepare-export" => {
+            if SERVING.lock().map_err(|e| e.to_string())?.is_some() {
+                return Err("stop serving before exporting a snapshot".into());
+            }
             let requested = v["root"].as_str().ok_or("missing export authority")?;
             if std::fs::canonicalize(requested).map_err(|e| e.to_string())? != p {
                 return Err("export journal does not match admitted root".into());
             }
             // Release the actor reader before Swift snapshots the database and WAL.
-            // The serial work queue excludes concurrent IO.
+            // Serving is stopped; the serial work queue excludes concurrent IO.
             QUERY.lock().map_err(|e| e.to_string())?.take();
             Ok(json!({"validated":true}))
         }
@@ -290,7 +410,14 @@ pub unsafe extern "C" fn journal_runtime(input: *const c_char) -> *mut c_char {
     let body = match result {
         Ok(Ok(v)) => json!({"ok":true,"value":v}),
         Ok(Err(e)) => json!({"ok":false,"error":e}),
-        Err(_) => json!({"ok":false,"error":"native panic; reopen helper"}),
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            json!({"ok":false,"error":format!("native panic; reopen helper: {detail}")})
+        }
     };
     CString::new(json!({"pid":std::process::id(),"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"result":body}).to_string()).unwrap().into_raw()
 }
