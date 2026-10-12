@@ -325,6 +325,20 @@ fn modify_detected_entities<F>(
 where
     F: FnOnce(&mut Vec<Value>) -> Result<(), FacetEntityWriteError>,
 {
+    let path = write_detected_entities(journal_root, facet_dir, day, modify)?;
+    super::publication::publish_saved(journal_root, &path);
+    Ok(())
+}
+
+fn write_detected_entities<F>(
+    journal_root: &Path,
+    facet_dir: &str,
+    day: &str,
+    modify: F,
+) -> Result<std::path::PathBuf, FacetEntityWriteError>
+where
+    F: FnOnce(&mut Vec<Value>) -> Result<(), FacetEntityWriteError>,
+{
     let _trust = hold_facet_trust_lock(journal_root)?;
     let mut rows = read_detected_entities(journal_root, facet_dir, day)?;
     modify(&mut rows)?;
@@ -367,7 +381,8 @@ where
     let path = detected_path(journal_root, facet_dir, day)?;
     write_text(&path, &contents, AtomicWriteOptions { mode: Some(0o600) }).map_err(|error| {
         FacetEntityWriteError::FacetWrite(super::error::FacetWriteError::ContentWrite(error))
-    })
+    })?;
+    Ok(path)
 }
 
 fn detected_path(

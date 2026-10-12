@@ -285,6 +285,32 @@ fn locked_modify_day_records<T>(
         Vec<ActivityRecord>,
     ) -> Result<(Vec<ActivityRecord>, T), ActivityRecordStoreError>,
 ) -> Result<T, ActivityRecordStoreError> {
+    let (result, written) = write_day_records(
+        root,
+        facet,
+        day,
+        create_if_missing,
+        expected_facet_id,
+        modify,
+    )?;
+    if let Some(path) = written {
+        super::publication::publish_saved(root, &path);
+    }
+    Ok(result)
+}
+
+/// The locked half of [`locked_modify_day_records`]: the day file's path when
+/// it was written.
+fn write_day_records<T>(
+    root: &Path,
+    facet: &str,
+    day: &str,
+    create_if_missing: bool,
+    expected_facet_id: &str,
+    modify: impl FnOnce(
+        Vec<ActivityRecord>,
+    ) -> Result<(Vec<ActivityRecord>, T), ActivityRecordStoreError>,
+) -> Result<(T, Option<PathBuf>), ActivityRecordStoreError> {
     let _entity =
         solstone_core_entity::hold_entity_trust_lock(root).map_err(|error| match error {
             solstone_core_entity::EntityTrustLockError::Path(error) => {
@@ -304,13 +330,13 @@ fn locked_modify_day_records<T>(
     let current = read_rows(&path)?;
     let (updated, result) = modify(current.clone())?;
     if !existed && updated.is_empty() {
-        return Ok(result);
+        return Ok((result, None));
     }
     if existed && updated == current {
-        return Ok(result);
+        return Ok((result, None));
     }
     write_rows(&path, &updated)?;
-    Ok(result)
+    Ok((result, Some(path)))
 }
 
 /// One anticipated-calendar file, including corrections and supersession hides.
@@ -417,6 +443,21 @@ pub fn publish_anticipation_batch(
     allow_before: bool,
     receipt: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    // A receipt that fails leaves the batch written, and its retry then writes
+    // nothing, so search takes the file whenever it holds the batch.
+    let (path, receipted) = write_anticipation_batch(root, batch, allow_before, receipt)?;
+    super::publication::publish_saved(root, &path);
+    receipted
+}
+
+/// The locked half of [`publish_anticipation_batch`]: the day file, which now
+/// holds the batch, and the receipt's result.
+fn write_anticipation_batch(
+    root: &Path,
+    batch: &PreparedAnticipationBatch,
+    allow_before: bool,
+    receipt: impl FnOnce() -> Result<(), String>,
+) -> Result<(PathBuf, Result<(), String>), String> {
     let _facet = crate::hold_facet_trust_lock(root).map_err(|e| e.to_string())?;
     super::declaration::require_facet_write_identity(root, &batch.facet, &batch.facet_id)?;
     let path = day_path(root, &batch.facet, &batch.day).map_err(|e| e.to_string())?;
@@ -440,7 +481,8 @@ pub fn publish_anticipation_batch(
             .map_err(|e| e.to_string())?;
         }
     }
-    receipt()
+    let receipted = receipt();
+    Ok((path, receipted))
 }
 
 /// Whether the rows a batch changes are still as its prompt saw them.
