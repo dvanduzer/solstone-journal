@@ -8,7 +8,9 @@ use axum::{
     http::{Request, header::CONTENT_TYPE},
 };
 use serde_json::{Value, json};
-use solstone_core_convey_shell::{EmbeddedConveyHandle, bind_embedded_device_door};
+use solstone_core_convey_shell::{
+    EmbeddedConveyHandle, bind_embedded_device_door, bind_embedded_device_door_with_payload,
+};
 use solstone_core_journal_io::JournalRoot;
 use std::{net::SocketAddrV4, path::PathBuf};
 
@@ -27,6 +29,22 @@ pub struct MobileServing {
 
 impl MobileServing {
     pub fn start(root: PathBuf, address: SocketAddrV4) -> Result<Self, String> {
+        Self::start_using(root, address, None)
+    }
+
+    pub fn start_with_payload(
+        root: PathBuf,
+        address: SocketAddrV4,
+        payload_root: PathBuf,
+    ) -> Result<Self, String> {
+        Self::start_using(root, address, Some(payload_root))
+    }
+
+    fn start_using(
+        root: PathBuf,
+        address: SocketAddrV4,
+        payload_root: Option<PathBuf>,
+    ) -> Result<Self, String> {
         if address.ip().is_unspecified() || address.ip().is_multicast() || address.port() == 0 {
             return Err("an explicit interface address and nonzero port are required".into());
         }
@@ -44,10 +62,22 @@ impl MobileServing {
             .build()
             .map_err(|e| e.to_string())?;
         let handle = runtime
-            .block_on(bind_embedded_device_door(
-                root.canonical_path().to_path_buf(),
-                address,
-            ))
+            .block_on(async {
+                match payload_root {
+                    Some(payload) => {
+                        bind_embedded_device_door_with_payload(
+                            root.canonical_path().to_path_buf(),
+                            address,
+                            payload,
+                        )
+                        .await
+                    }
+                    None => {
+                        bind_embedded_device_door(root.canonical_path().to_path_buf(), address)
+                            .await
+                    }
+                }
+            })
             .map_err(|e| e.to_string())?;
         Ok(Self {
             handle,
@@ -118,5 +148,53 @@ impl MobileServing {
 impl Drop for MobileServing {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn synchronous_app_start_setup_and_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let payload = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/payload");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = match probe.local_addr().unwrap() {
+            std::net::SocketAddr::V4(v) => v,
+            _ => unreachable!(),
+        };
+        drop(probe);
+        assert!(
+            MobileServing::start_with_payload(
+                root.path().to_path_buf(),
+                address,
+                root.path().to_path_buf()
+            )
+            .is_err()
+        );
+        let server =
+            MobileServing::start_with_payload(root.path().to_path_buf(), address, payload).unwrap();
+        assert_eq!(server.status()["door_address"], Value::Null);
+        assert_eq!(
+            server
+                .request_owner("GET", "/init/mark", "")
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(
+            server
+                .request_owner("POST", "/init/mark/lock", "{}")
+                .unwrap()
+                .status,
+            200
+        );
+        let finalized = server
+            .request_owner("POST", "/init/finalize", "{}")
+            .unwrap();
+        assert_eq!(finalized.status, 200, "{}", finalized.body);
+        assert_eq!(server.status()["door_address"], address.to_string());
+        server.shutdown();
+        assert_eq!(server.status()["door_address"], Value::Null);
     }
 }

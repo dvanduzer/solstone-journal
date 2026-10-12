@@ -54,6 +54,29 @@ impl TalentRoots {
             .ok_or_else(|| solstone_core_journal::describe_installation_root_miss(directory))
     }
 
+    pub(crate) fn from_payload_root(root: &Path) -> Result<Self, String> {
+        let root = fs::canonicalize(root).map_err(|e| format!("packaged payload: {e}"))?;
+        for anchor in [
+            "solstone/talent/journal/contract/bundle.json",
+            "solstone/think/contract/layout.json",
+            "solstone/think/templates/segment_preamble.md",
+        ] {
+            if !root.join(anchor).is_file() {
+                return Err(format!("packaged payload missing {anchor}"));
+            }
+        }
+        for directory in [
+            "solstone/talent",
+            "solstone/apps",
+            "solstone/think/templates",
+        ] {
+            if !root.join(directory).is_dir() {
+                return Err(format!("packaged payload missing {directory}"));
+            }
+        }
+        Ok(Self::from_root(root))
+    }
+
     fn from_root(root: PathBuf) -> Self {
         Self {
             talent_root: root.join("solstone/talent"),

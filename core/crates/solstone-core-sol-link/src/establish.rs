@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use solstone_core_journal_io::{
-    AtomicWriteOptions, JsonWriteOptions, LockError, LockOptions, StagedDirOptions,
-    StagedWriteError, hold_lock, publish_staged_dir, write_bytes_exclusive, write_json,
+    JsonWriteOptions, LockError, LockOptions, StagedDirOptions, StagedWriteError, hold_lock,
+    publish_staged_dir, write_json,
 };
 
 use crate::ca::{CaError, LocalCa, generate_ca, jid_from_spki, load_ca};
@@ -342,19 +342,48 @@ fn write_ca_material(staging: &Path, ca: &LocalCa) -> Result<(), io::Error> {
 }
 
 fn write_certificate(staging: &Path, ca: &LocalCa) -> Result<(), io::Error> {
-    write_bytes_exclusive(
-        staging.join("cert.pem"),
-        ca.certificate_pem().as_bytes(),
-        AtomicWriteOptions { mode: Some(0o644) },
+    write_identity_file(staging, "cert.pem", ca.certificate_pem().as_bytes(), 0o644)
+}
+
+fn write_private_key(staging: &Path, ca: &LocalCa) -> Result<(), io::Error> {
+    write_identity_file(
+        staging,
+        "private.pem",
+        ca.private_key_pem().as_bytes(),
+        0o600,
+    )
+}
+
+#[cfg(target_os = "android")]
+fn write_identity_file(
+    staging: &Path,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), io::Error> {
+    // App policy denies path-based hard-link publication. Use the maintained
+    // descriptor-bound create-only writer for these already-created stage dirs.
+    let root = solstone_core_journal_io::JournalRoot::open(staging).map_err(io::Error::other)?;
+    solstone_core_journal_io::write_bytes_exclusive_bound(
+        &root,
+        std::ffi::OsStr::new(name),
+        bytes,
+        mode,
     )
     .map_err(io::Error::other)
 }
 
-fn write_private_key(staging: &Path, ca: &LocalCa) -> Result<(), io::Error> {
-    write_bytes_exclusive(
-        staging.join("private.pem"),
-        ca.private_key_pem().as_bytes(),
-        AtomicWriteOptions { mode: Some(0o600) },
+#[cfg(not(target_os = "android"))]
+fn write_identity_file(
+    staging: &Path,
+    name: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), io::Error> {
+    solstone_core_journal_io::write_bytes_exclusive(
+        staging.join(name),
+        bytes,
+        solstone_core_journal_io::AtomicWriteOptions { mode: Some(mode) },
     )
     .map_err(io::Error::other)
 }

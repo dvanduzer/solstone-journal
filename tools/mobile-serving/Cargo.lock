@@ -1386,6 +1386,7 @@ dependencies = [
  "solstone-core-indexer-store",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
+ "tempfile",
  "tokio",
 ]
 

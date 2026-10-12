@@ -15,3 +15,6 @@ solstone-core-indexer-store = { path = "../../core/crates/solstone-core-indexer-
 solstone-core-journal-io = { path = "../../core/crates/solstone-core-journal-io" }
 solstone-core-journal-config-write = { path = "../../core/crates/solstone-core-journal-config-write" }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
