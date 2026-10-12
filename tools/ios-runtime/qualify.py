@@ -40,6 +40,7 @@ def verify(rows):
     assert max_gap < 3, f'foreground heartbeat gap {max_gap}'
     assert events['authority']['value']['reply']['host_file_readable'] is False
     inventory = value(events['final.inventory'])
+    assert len(inventory['files']) == count
     actual = {f['name']: f['text'] for f in inventory['files']}
     assert set(actual) == {f'fixture{i:04}.md' for i in range(count)}
     # Compute expected bytes independently from the synthetic workload schedule.
@@ -51,6 +52,7 @@ def verify(rows):
         assert actual[f'fixture{i:04}.md'] == expected, i
     expected = {f'20261012/talents/{name}': text.rstrip() for name, text in actual.items()}
     results = value(events['final.query'])['results']
+    assert len(results) == count
     assert_mapping({r['metadata']['path']: r['text'] for r in results}, expected)
     exported = events['export']['value']['reply']
     data = base64.b64decode(exported['indexer/journal.sqlite'], validate=True)
@@ -61,7 +63,9 @@ def verify(rows):
             p.with_name(p.name + '-wal').write_bytes(base64.b64decode(exported['indexer/journal.sqlite-wal'], validate=True))
         with sqlite3.connect(p.as_uri() + '?mode=ro', uri=True) as db:
             assert db.execute('pragma integrity_check').fetchall() == [('ok',)]
-            matches = dict(db.execute('select path,content from chunks where chunks match ?', ('auroraruntime',)))
+            matched_rows = db.execute('select path,content from chunks where chunks match ?', ('auroraruntime',)).fetchall()
+            assert len(matched_rows) == count
+            matches = dict(matched_rows)
             assert matches == expected
             assert db.execute('select count(*) from files').fetchone()[0] == count
     worker_pids = [r['value']['reply']['journal']['pid'] for r in rows if r['event'] == 'open']
