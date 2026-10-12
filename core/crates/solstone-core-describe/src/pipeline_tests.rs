@@ -637,6 +637,85 @@ fn synthetic_decode_promotes_empty_and_corrupt_results() {
 }
 
 #[test]
+fn failed_retry_keeps_a_partial_reading_and_still_exhausts() {
+    let test = TestRun::new("keep-partial");
+    run_decoded(
+        test.options(false, Vec::new()),
+        &ScriptedFactory::new(default_response),
+        decoded(&[1, 2]),
+    )
+    .expect("initial reading");
+    rewrite_header(&test.artifact(), |header| {
+        header["_solstone_processing"]["state"] = json!("failed");
+        header["_solstone_processing"]["reason_code"] = json!("analysis_failed");
+        header["_solstone_processing"]["attempts"] = json!(1);
+    });
+    let body = artifact_body(&test.artifact());
+
+    run_decoded(
+        test.options(false, Vec::new()),
+        &ScriptedFactory::new(default_response),
+        DescribeResult {
+            decode_failed: true,
+            ..DescribeResult::default()
+        },
+    )
+    .expect("a retry that cannot decode still completes");
+    assert_eq!(artifact_body(&test.artifact()), body);
+    let header = &test.rows()[0];
+    assert_eq!(header["_solstone_processing"]["state"], "failed");
+    assert_eq!(
+        header["_solstone_processing"]["reason_code"],
+        "analysis_failed"
+    );
+    assert_eq!(header["_solstone_processing"]["attempts"], 2);
+
+    let invalid = ScriptedFactory::new(|request| generated(request, "not json"));
+    assert!(matches!(
+        run_decoded(
+            test.options(false, Vec::new()),
+            &invalid,
+            decoded(&[1, 2, 3])
+        ),
+        Err(RunError::Internal(_))
+    ));
+    assert_eq!(artifact_body(&test.artifact()), body);
+    assert_eq!(test.rows()[0]["_solstone_processing"]["attempts"], 3);
+
+    let exhausted = ScriptedFactory::new(default_response);
+    run_decoded(
+        test.options(false, Vec::new()),
+        &exhausted,
+        decoded(&[1, 2]),
+    )
+    .expect("an exhausted reading is skipped");
+    assert!(exhausted.requests().is_empty());
+    assert_eq!(artifact_body(&test.artifact()), body);
+
+    let unread = TestRun::new("replace-unread");
+    fs::write(
+        unread.artifact(),
+        "{\"_solstone_processing\":{\"state\":\"failed\",\"reason_code\":\"analysis_failed\",\"handler\":\"describe\",\"attempts\":1}}\n{\"frame_id\":1,\"timestamp\":0.0,\"requests\":[],\"error\":\"prior failure\",\"enhanced\":false}\n",
+    )
+    .expect("write unread fixture");
+    run_decoded(
+        unread.options(false, Vec::new()),
+        &ScriptedFactory::new(default_response),
+        DescribeResult {
+            decode_failed: true,
+            ..DescribeResult::default()
+        },
+    )
+    .expect("corrupt retry promotes");
+    let rows = unread.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["_solstone_processing"]["reason_code"],
+        "corrupt_input"
+    );
+}
+
+#[test]
 fn synthetic_decode_preserves_category_contracts_and_extraction_outcomes() {
     for (primary, context, tokens, json_output) in [
         ("browsing", "observe.describe.browsing", 3072, false),

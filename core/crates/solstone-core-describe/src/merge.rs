@@ -71,6 +71,11 @@ pub(crate) fn read_existing_describe_artifact(path: &Path) -> Option<ExistingDes
     })
 }
 
+/// Whether a row carries a frame analysis: the content a retry must not shrink.
+pub(crate) fn is_analyzed(row: &Value) -> bool {
+    row.get("analysis").is_some_and(Value::is_object)
+}
+
 /// Validate a prior artifact against freshly decoded frames and classify reusable work.
 pub(crate) fn build_incremental_merge_plan(
     artifact: Option<&ExistingDescribeArtifact>,
