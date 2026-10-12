@@ -151,7 +151,6 @@ pub(crate) struct ThinkContext {
     pub(crate) cortex: Arc<dyn CortexBoundary>,
     pub(crate) index: Arc<dyn IndexBoundary>,
     pub(crate) status: ThinkStatus,
-    pub(crate) protect_segment_outputs: bool,
     pub(crate) retry: Option<(
         solstone_core_system::work_retry::Unit,
         solstone_core_system::work_retry::Attempt,
@@ -197,7 +196,6 @@ impl ThinkContext {
             }),
             index: Arc::new(NativeIndexBoundary),
             status: ThinkStatus::default(),
-            protect_segment_outputs: false,
             retry: None,
         })
     }

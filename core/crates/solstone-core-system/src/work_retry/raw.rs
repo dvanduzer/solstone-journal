@@ -8,7 +8,6 @@ use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::{Attempt, DECLARED_FIXES, Unit};
 
@@ -18,7 +17,6 @@ pub const CAUSE_ENV: &str = "SOLSTONE_RETRY_CAUSE";
 pub const ATTEMPT_ENV: &str = "SOLSTONE_RETRY_ATTEMPT";
 
 pub struct Evidence {
-    pub protected: bool,
     pub unit: Unit,
     pub reason: String,
     pub input: String,
@@ -115,28 +113,6 @@ pub fn inspect_output(journal: &Path, output: &Path) -> Result<Option<Evidence>,
         .and_then(Value::as_str)
         .ok_or("native failure has no handler")?;
     let unit = unit_for_output(journal, output, handler)?;
-    // Failed native outputs may retain partial rows. Only their actual writer
-    // can establish a baseline; never adopt owner text during discovery.
-    let mut body = std::io::BufReader::new(std::fs::File::open(output).map_err(|e| e.to_string())?);
-    let mut first = Vec::new();
-    body.read_until(b'\n', &mut first)
-        .map_err(|e| e.to_string())?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 65536];
-    let mut length = 0;
-    loop {
-        let count = body.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        length += count;
-        hash.update(&buffer[..count]);
-    }
-    let digest = format!("{:x}", hash.finalize());
-    let protected = match record.get("body_sha256").and_then(Value::as_str) {
-        Some(expected) => expected != digest,
-        None => length != 0,
-    };
     let raw = header
         .get("raw")
         .and_then(Value::as_str)
@@ -159,17 +135,12 @@ pub fn inspect_output(journal: &Path, output: &Path) -> Result<Option<Evidence>,
         }
         Some(_) => return Err("native failure input fingerprint is malformed".into()),
     };
-    let reason = if protected {
-        "owner_output_protected"
-    } else {
-        record
-            .get("reason_code")
-            .and_then(Value::as_str)
-            .unwrap_or("analysis_failed")
-    }
-    .to_owned();
+    let reason = record
+        .get("reason_code")
+        .and_then(Value::as_str)
+        .unwrap_or("analysis_failed")
+        .to_owned();
     Ok(Some(Evidence {
-        protected,
         unit,
         reason,
         input,
@@ -208,9 +179,6 @@ fn selected(
         return Ok(None);
     }
     let evidence = inspect_output(journal, output)?.ok_or("native output is no longer held")?;
-    if evidence.protected {
-        return Err("owner_output_protected".into());
-    }
     if evidence.unit != unit {
         return Err("native failure handler changed".into());
     }
@@ -265,7 +233,6 @@ pub fn stamp_failed_input(record: &mut Value, input: &Path) -> Result<(), String
     stamp_attempt(record)?;
     if record.get("state").and_then(Value::as_str) == Some("failed") {
         let hash = super::file_fingerprint(input)?;
-        record["body_sha256"] = Value::String(format!("{:x}", Sha256::digest([])));
         record
             .as_object_mut()
             .ok_or("processing record is not an object")?

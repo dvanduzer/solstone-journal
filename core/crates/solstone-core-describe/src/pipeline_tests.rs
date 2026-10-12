@@ -1278,12 +1278,12 @@ fn writer_commit_admits_unchanged_success_and_empty_but_refuses_stale_or_deleted
 }
 
 #[test]
-fn owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows() {
+fn owner_retry_reaches_describe_writer_and_keeps_retained_partial_rows() {
     use solstone_core_processing_record::vocab;
     use solstone_core_system::work_retry::{self, raw};
     if std::env::var_os("DESCRIBE_RETRY_TEST_CHILD").is_none() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "pipeline::pipeline_tests::owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows", "--nocapture"])
+            .args(["--exact", "pipeline::pipeline_tests::owner_retry_reaches_describe_writer_and_keeps_retained_partial_rows", "--nocapture"])
             .env("DESCRIBE_RETRY_TEST_CHILD", "1").output().unwrap();
         assert!(
             status.status.success(),
@@ -1334,14 +1334,6 @@ fn owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows() {
             ),
         ],
         || {
-            let original = fs::read(run.artifact()).unwrap();
-            let mut edited = original.clone();
-            edited.extend_from_slice(b"{\"text\":\"owner text\"}\n");
-            fs::write(run.artifact(), &edited).unwrap();
-            assert!(run_decoded(run.options(false, vec![]), &factory, decoded(&[1])).is_err());
-            assert_eq!(fs::read(run.artifact()).unwrap(), edited);
-            assert!(factory.requests().is_empty());
-            fs::write(run.artifact(), original).unwrap();
             run_decoded(run.options(false, vec![]), &factory, decoded(&[1])).unwrap();
             assert!(!factory.requests().is_empty());
         },
@@ -1354,14 +1346,12 @@ fn owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows() {
     assert_eq!(factory.requests().len(), calls);
     // Main's retained-partial-reading path must publish this attempt's receipt
     // too, without replacing its rows with an empty decode failure.
-    use sha2::{Digest, Sha256};
     let body = artifact_body(&run.artifact());
     rewrite_header(&run.artifact(), |h| {
         let record = &mut h["_solstone_processing"];
         record["state"] = json!("failed");
         record["reason_code"] = json!("analysis_failed");
         record["attempts"] = json!(3);
-        record["body_sha256"] = json!(format!("{:x}", Sha256::digest(body.as_bytes())));
     });
     let evidence = raw::inspect_output(&run.journal, &run.artifact())
         .unwrap()
@@ -1396,12 +1386,6 @@ fn owner_retry_reaches_describe_writer_and_preserves_edited_partial_rows() {
         },
     );
     assert_eq!(artifact_body(&run.artifact()), body);
-    assert!(
-        !raw::inspect_output(&run.journal, &run.artifact())
-            .unwrap()
-            .unwrap()
-            .protected
-    );
     raw::finish_output(&run.journal, &evidence.unit, &attempt).unwrap();
     let record = work_retry::read(&run.journal, &id).unwrap().unwrap();
     assert!(record.held);

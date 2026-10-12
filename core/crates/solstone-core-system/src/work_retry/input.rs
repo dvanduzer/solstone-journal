@@ -10,7 +10,7 @@ pub fn current(journal: &Path, unit: &Unit) -> Result<String, String> {
     match unit {
         Unit::Segment { .. } => {
             let path = unit.segment_directory(journal)?.join("talents/sense.json");
-            let bytes = crate::segment_output::read_generated(&path)?;
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             Ok(format!("{:x}", Sha256::digest(bytes)))
         }
         Unit::Activity {

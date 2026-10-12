@@ -32,7 +32,6 @@ base64 = "0.22.1"
 chrono.workspace = true
 
 solstone-core-system.workspace = true
-sha2.workspace = true
 
 [features]
 test-fixture-pin = ["solstone-core-distribution/test-fixture-pin"]
@@ -58,6 +57,7 @@ required-features = ["test-stubs"]
 
 [dev-dependencies]
 temp-env = "0.3.6"
+sha2.workspace = true
 solstone-core-distribution.workspace = true
 solstone-core-generate-wire.workspace = true
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["format", "software-scaling", "build"] }

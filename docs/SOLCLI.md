@@ -494,7 +494,7 @@ not the codebase. See [APPS.md](APPS.md).
 
 `solstone journal install-provider local` and `solstone journal install-provider parakeet` are native.
 
-`reprocess DAY` saves a request to prioritize a past day after today's work. Requests survive a supervisor restart. `--from-scratch` permits one attempt that can replace owner-edited outputs; with `--through`, it requests an inclusive past-day range. An interrupted from-scratch attempt waits for review. `--owed` only reports daily-output coverage; it does not submit work or describe segment publication. Health and doctor report progress across the whole journal and any spending confirmation.
+`reprocess DAY` saves a request to prioritize a past day after today's work. Requests survive a supervisor restart. `--from-scratch` permits one full re-run of the day, including results it would otherwise keep; with `--through`, it requests an inclusive past-day range. An interrupted from-scratch attempt waits for review. `--owed` only reports daily-output coverage; it does not submit work or describe segment publication. Health and doctor report progress across the whole journal and any spending confirmation.
 
 `reprocess DAY --unit TALENT [--facet FACET]` saves one retry request for a failed daily processing step. It preserves accepted outputs and unresolved writes. Health's set-aside work list offers the same request for individual failed steps. Retries require changed input, your request, or a shipped fix for that failure; an upgrade alone does not retry them.
 

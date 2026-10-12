@@ -1505,7 +1505,7 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
-    fn held_floor_permission_reaches_the_real_model_once_and_preserves_owner_output() {
+    fn held_floor_permission_reaches_the_real_model_once() {
         use solstone_core_system::work_retry::{self, Unit};
         let (root, paths, context) = fixture(
             "documents",
@@ -1522,10 +1522,7 @@ mod tests {
         fs::create_dir_all(directory.join("talents")).unwrap();
         let sense = directory.join("talents/sense.json");
         let bytes = br#"{"density":"active","content_type":"work"}"#;
-        solstone_core_system::segment_output::commit(&sense, bytes, false, || {
-            fs::write(&sense, bytes).map_err(|e| e.to_string())
-        })
-        .unwrap();
+        fs::write(&sense, bytes).unwrap();
         let input = work_retry::input::current(&context.journal, &unit).unwrap();
         work_retry::observe_held(&context.journal, &unit, "analysis_failed", &input).unwrap();
         let stub = test_support::one_shot_stub(root.path(), "Recovered text");
@@ -1536,7 +1533,7 @@ mod tests {
         test_support::install_stub(&stub, &script);
         let client = OneShotClient::at_path(stub);
         let output = directory.join("talents/documents.md");
-        let base = json!({"name":"documents", "day":"20260101", "segment":"120000_300", "stream":"desktop", "output_path":output, "_protect_segment_outputs":true, "_work_unit":unit});
+        let base = json!({"name":"documents", "day":"20260101", "segment":"120000_300", "stream":"desktop", "output_path":output, "_work_unit":unit});
         let run = |request: Value| {
             execute_request(
                 request.as_object().unwrap().clone(),
@@ -1570,19 +1567,6 @@ mod tests {
                 .unwrap()
                 .held
         );
-        // New failure, followed by an owner edit: an owner retry is not overwrite permission.
-        work_retry::observe_held(&context.journal, &unit, "analysis_failed", &input).unwrap();
-        fs::write(&output, "Owner correction").unwrap();
-        work_retry::request(&context.journal, &unit).unwrap();
-        let grant = work_retry::read(&context.journal, &unit.id().unwrap())
-            .unwrap()
-            .unwrap()
-            .permission(&input, work_retry::DECLARED_FIXES)
-            .unwrap();
-        let mut request = base;
-        request["_work_retry"] = serde_json::to_value(grant).unwrap();
-        let _ = run(request);
-        assert_eq!(fs::read_to_string(output).unwrap(), "Owner correction");
     }
 
     #[cfg(all(test, feature = "full-tests"))]

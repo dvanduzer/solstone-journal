@@ -2572,13 +2572,7 @@ mod tests {
                         .unwrap();
                         for path in [p1, p2] {
                             fs::create_dir_all(path.parent().unwrap()).unwrap();
-                            solstone_core_system::segment_output::commit(
-                                &path,
-                                content.as_bytes(),
-                                false,
-                                || fs::write(&path, &content).map_err(|e| e.to_string()),
-                            )
-                            .unwrap();
+                            fs::write(&path, &content).unwrap();
                         }
                         report.completed.insert(
                             use_id.clone(),
@@ -2627,13 +2621,7 @@ mod tests {
                         .unwrap();
                         for path in [p1, p2] {
                             fs::create_dir_all(path.parent().unwrap()).unwrap();
-                            solstone_core_system::segment_output::commit(
-                                &path,
-                                content.as_bytes(),
-                                false,
-                                || fs::write(&path, &content).map_err(|e| e.to_string()),
-                            )
-                            .unwrap();
+                            fs::write(&path, &content).unwrap();
                         }
                         report.completed.insert(
                             use_id.clone(),

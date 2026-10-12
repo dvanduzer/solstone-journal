@@ -324,9 +324,7 @@ fn raw_retries(
             work_retry::request_with_id(journal, &evidence.unit, &intent.id)?;
         }
         let record = work_retry::read(journal, &id)?.ok_or("missing native hold")?;
-        let grant = (!evidence.protected)
-            .then(|| record.permission(&evidence.input, work_retry::DECLARED_FIXES))
-            .flatten();
+        let grant = record.permission(&evidence.input, work_retry::DECLARED_FIXES);
         let imported = retry_imported(&record.unit, imports);
         let explicit = match grant.as_ref().map(|a| a.cause.as_str()) {
             Some(cause) if cause.starts_with("owner:") => Some(WorkBand::Waiting),
@@ -667,20 +665,7 @@ fn inspect_day(
         }
         prerequisites_ready = false;
         report.band(p.band).segments_owed += 1;
-        if solstone_core_system_health::segment_repair_protected(
-            journal,
-            day,
-            segment,
-            &progress.value,
-        )? {
-            held(
-                report,
-                day,
-                Some((&segment.key, &segment.stream)),
-                p.band,
-                solstone_core_system::segment_output::PROTECTED,
-            );
-        } else if policy.permits(p.band, imported) {
+        if policy.permits(p.band, imported) {
             report.band(p.band).eligible += 1;
             work.candidates.push(task(
                 day,
@@ -807,9 +792,6 @@ fn still_owed(
                 let Some(evidence) = work_retry::raw::inspect_output(journal, &output)? else {
                     return Ok(false);
                 };
-                if evidence.protected {
-                    return Ok(false);
-                }
                 (evidence.input, evidence.reason)
             }
             Unit::Daily { .. } => {
@@ -1703,27 +1685,49 @@ mod tests {
             .unwrap();
         assert_eq!(report.bands[3].segments_owed, 1);
         assert_eq!(report.bands[4].permission_held, 1);
-        // Unknown existing output is protected even after spending permission.
-        let protected = root
+    }
+
+    #[test]
+    fn segment_outputs_from_an_earlier_version_are_repaired_not_held() {
+        let root = fixture("local");
+        let day = "19990101";
+        segment(root.path(), day, "120000_60");
+        let talents = root
             .path()
-            .join("chronicle/19990101/notes/120000_60/talents/activity.md");
-        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
-        std::fs::write(&protected, "owner text without generated evidence").unwrap();
+            .join("chronicle")
+            .join(day)
+            .join("notes/120000_60/talents");
+        std::fs::create_dir_all(&talents).unwrap();
+        // Outputs with no digest file, and a digest file that disagrees with them.
+        std::fs::write(talents.join("activity.md"), "an earlier summary").unwrap();
+        std::fs::write(
+            talents.join("sense.json"),
+            r#"{"density":"active","content_type":"work"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            talents.join(".generated-outputs.json"),
+            format!(
+                r#"{{"version":1,"files":{{"sense.json":"{}"}}}}"#,
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        let queue = queue(root.path());
         reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
-        assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+        assert!(queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
         let report = solstone_core_system::work_inventory::read(root.path())
             .unwrap()
             .unwrap();
+        assert_eq!(report.bands[4].segments_owed, 1);
+        assert_eq!(report.bands[4].eligible, 1);
         assert!(
-            report
+            !report
                 .holds
                 .iter()
-                .any(|h| h.segment.as_deref() == Some("120000_60")
-                    && h.reason == "owner_output_protected")
-        );
-        assert_eq!(
-            std::fs::read_to_string(protected).unwrap(),
-            "owner text without generated evidence"
+                .any(|hold| hold.segment.as_deref() == Some("120000_60")),
+            "{:?}",
+            report.holds
         );
     }
     #[cfg(all(unix, feature = "full-tests"))]

@@ -27,7 +27,6 @@ pub use queue_hold_store::{
 pub mod priority;
 pub mod request;
 pub mod schedule;
-pub mod segment_output;
 pub mod segment_publication;
 #[cfg(any(unix, windows))]
 pub mod status_wire;

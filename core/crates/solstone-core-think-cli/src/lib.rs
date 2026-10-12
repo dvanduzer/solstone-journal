@@ -1025,24 +1025,6 @@ mod tests {
             if let Some(error) = self.dispatch_failure.lock().unwrap().clone() {
                 return Err(error);
             }
-            // The mock model returns the fixture's staged output. Exercise the
-            // same writer receipt as the real talent worker before its finish.
-            if request.config.get("schedule").and_then(Value::as_str) == Some("segment")
-                && let Some(path) = request.config.get("output_path").and_then(Value::as_str)
-                && let Ok(bytes) = fs::read(path)
-            {
-                solstone_core_system::segment_output::commit(
-                    Path::new(path),
-                    &bytes,
-                    request
-                        .config
-                        .get("_protect_segment_outputs")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    || fs::write(path, &bytes).map_err(|e| e.to_string()),
-                )
-                .map_err(|_| context::DispatchFailure::Unavailable)?;
-            }
             Ok(format!("use-{}", requests.len()))
         }
         fn dispatch_prepared(
@@ -3342,10 +3324,7 @@ mod tests {
         let path = sense_output_path(context, segment);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let bytes = serde_json::to_vec(&value).unwrap();
-        solstone_core_system::segment_output::commit(&path, &bytes, false, || {
-            fs::write(&path, &bytes).map_err(|e| e.to_string())
-        })
-        .unwrap();
+        fs::write(&path, &bytes).unwrap();
     }
 
     fn segment_context(
@@ -6605,16 +6584,7 @@ mod tests {
         let directory = journal.path().join("chronicle/20260813/default/090000_300");
         fs::create_dir_all(directory.join("talents")).unwrap();
         let saved = directory.join("talents/activity.md");
-        solstone_core_system::segment_output::commit(
-            &saved,
-            b"A garden meeting with plans for spring.",
-            false,
-            || {
-                fs::write(&saved, "A garden meeting with plans for spring.")
-                    .map_err(|e| e.to_string())
-            },
-        )
-        .unwrap();
+        fs::write(&saved, "A garden meeting with plans for spring.").unwrap();
         let index = Arc::new(RecoveringIndex(std::sync::atomic::AtomicBool::new(true)));
         context.index = index.clone();
         let parsed = args::ThinkArgs {

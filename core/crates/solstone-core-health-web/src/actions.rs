@@ -183,9 +183,6 @@ fn retry_work_blocking(
                     return Ok(None);
                 };
                 work_retry::raw::observe(&root, &evidence)?;
-                if evidence.protected {
-                    return Err("this output has changes that retry will preserve. replacing it requires an explicit from-scratch request".into());
-                }
                 if matches!(
                     evidence.reason.as_str(),
                     "corrupt_input" | "no_audio_stream"

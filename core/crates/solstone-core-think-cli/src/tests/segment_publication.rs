@@ -42,12 +42,22 @@ const DAY: &str = "20260813";
 const NOW: i64 = 1_786_615_200_000;
 
 #[test]
-fn protected_projections_preserve_edits_between_runtime_and_splitter_and_from_scratch_overrides() {
-    let (_journal, mut context) = fixture_journal();
+fn segment_publication_replaces_whatever_its_output_files_already_hold() {
+    let (_journal, context) = fixture_journal();
     let segment = context.day_dir.join("default/120000_60");
+    let talents = segment.join("talents");
+    fs::create_dir_all(&talents).unwrap();
+    // A digest file an earlier version left beside its outputs is not consulted.
+    fs::write(
+        talents.join(".generated-outputs.json"),
+        r#"{"version":1,"files":{"sense.json":"0000000000000000000000000000000000000000000000000000000000000000"}}"#,
+    )
+    .unwrap();
+    for filename in ["sense.json", "activity.md", "topics.md"] {
+        fs::write(talents.join(filename), "written by an earlier version").unwrap();
+    }
     let sense = serde_json::json!({"density":"idle","content_type":"idle","activity_summary":"generated summary","facets":[]});
     let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
-    context.protect_segment_outputs = true;
     write_sense_and_change(
         &context,
         &mut log,
@@ -58,33 +68,15 @@ fn protected_projections_preserve_edits_between_runtime_and_splitter_and_from_sc
     )
     .unwrap();
     for filename in ["sense.json", "activity.md", "topics.md"] {
-        let path = segment.join("talents").join(filename);
-        fs::write(&path, "owner edit").unwrap();
-        assert!(
-            write_sense_and_change(
-                &context,
-                &mut log,
-                "120000_60",
-                Some("default"),
-                &segment,
-                sense.as_object().unwrap()
-            )
-            .is_err()
+        assert_ne!(
+            fs::read_to_string(talents.join(filename)).unwrap(),
+            "written by an earlier version"
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "owner edit");
-        context.protect_segment_outputs = false;
-        write_sense_and_change(
-            &context,
-            &mut log,
-            "120000_60",
-            Some("default"),
-            &segment,
-            sense.as_object().unwrap(),
-        )
-        .unwrap();
-        assert_ne!(fs::read_to_string(&path).unwrap(), "owner edit");
-        context.protect_segment_outputs = true;
     }
+    assert_eq!(
+        fs::read_to_string(talents.join("activity.md")).unwrap(),
+        "generated summary"
+    );
 }
 
 fn fixture_journal() -> (tempfile::TempDir, ThinkContext) {

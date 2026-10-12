@@ -165,13 +165,6 @@ pub(crate) fn run_with(
         log_skip(log, context, "*", segment, "already_thought", stream);
         return Ok(ModeResult::default());
     }
-    if context.protect_segment_outputs
-        && solstone_core_system::segment_output::has_protected_outputs(
-            &segment_dir.join("talents"),
-        )?
-    {
-        return Err(solstone_core_system::segment_output::PROTECTED.into());
-    }
     let load = sense
         .metadata
         .get("load")
@@ -220,17 +213,14 @@ pub(crate) fn run_with(
         false
     };
     if routing_pending && !refresh {
-        let raw = solstone_core_system::segment_output::read_generated(
-            &segment_dir.join("talents/sense.json"),
-        )?;
+        let raw = std::fs::read(segment_dir.join("talents/sense.json"))
+            .map_err(|error| error.to_string())?;
         let retained: Value = serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
         let sense = retained
             .as_object()
             .filter(|_| valid_activity_sense(&retained))
             .ok_or("retained routing source is invalid")?;
-        let mut protected = context.clone();
-        protected.protect_segment_outputs = true;
-        write_sense_and_change(&protected, log, segment, stream, &segment_dir, sense)?;
+        write_sense_and_change(context, log, segment, stream, &segment_dir, sense)?;
         return Ok(ModeResult::default());
     }
     if solstone_core_talent_runtime::check_segment_has_no_input(
@@ -399,16 +389,10 @@ pub(crate) fn run_with(
         None,
         stream,
     );
-    let sense_bytes = match solstone_core_system::segment_output::read_generated(&sense_path) {
+    let sense_bytes = match std::fs::read(&sense_path) {
         Ok(bytes) => bytes,
-        Err(error) => {
-            let result = failed(
-                if error.starts_with(solstone_core_system::segment_output::PROTECTED) {
-                    "sense (owner_output_protected)"
-                } else {
-                    "sense (output_parse)"
-                },
-            );
+        Err(_) => {
+            let result = failed("sense (output_parse)");
             complete(log, context, segment, stream, result.clone());
             return Ok(result);
         }
@@ -994,10 +978,6 @@ fn dispatch_agent(
     };
     let generate = config.metadata.get("type").and_then(Value::as_str) == Some("generate");
     let mut request = Map::from_iter([
-        (
-            "_protect_segment_outputs".to_owned(),
-            Value::Bool(context.protect_segment_outputs),
-        ),
         ("day".to_owned(), Value::String(context.day.clone())),
         ("segment".to_owned(), Value::String(segment.to_owned())),
         ("schedule".to_owned(), Value::String("segment".to_owned())),
@@ -2735,7 +2715,6 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
     let result: Result<Value, String> = (|| {
         let activity_path = talents.join("activity.md");
         replace_text(
-            context,
             &activity_path,
             sense
                 .get("activity_summary")
@@ -2745,7 +2724,7 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         published.insert(activity_path.clone());
 
         let sense_json_path = talents.join("sense.json");
-        replace_json(context, &sense_json_path, &Value::Object(sense.clone()))?;
+        replace_json(&sense_json_path, &Value::Object(sense.clone()))?;
         published.insert(sense_json_path.clone());
 
         let inventory = observe_declared_facet_inventory(&context.journal)
@@ -2766,17 +2745,16 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         let assignment_changed = previous_facets.as_ref() != Some(&filtered_facets.0);
-        replace_json(context, &facets_json_path, &filtered_facets.0)?;
+        replace_json(&facets_json_path, &filtered_facets.0)?;
         published.insert(facets_json_path.clone());
         assignment_published = assignment_changed;
 
         let sense_json_path = talents.join("sense.json");
-        replace_json(context, &sense_json_path, &Value::Object(sense.clone()))?;
+        replace_json(&sense_json_path, &Value::Object(sense.clone()))?;
         published.insert(sense_json_path.clone());
 
         let density_json_path = talents.join("density.json");
         replace_json(
-            context,
             &density_json_path,
             &serde_json::json!({"classification":sense["density"],"timestamp":Utc::now().to_rfc3339()}),
         )?;
@@ -2822,7 +2800,6 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
             if !lines.is_empty() {
                 let sense_md_path = talents.join("sense.md");
                 replace_text(
-                    context,
                     &sense_md_path,
                     &format!("# Sense Entities\n\n{}", lines.join("\n")),
                 )?;
@@ -2832,7 +2809,6 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         if sense.get("meeting_detected").is_some_and(python_truthy) {
             let speakers_json_path = talents.join("speakers.json");
             replace_json(
-                context,
                 &speakers_json_path,
                 &sense
                     .get("speakers")
@@ -2858,7 +2834,7 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
             &Utc::now().to_rfc3339(),
         );
         let change_json_path = segment.join("talents/change.json");
-        replace_json(context, &change_json_path, &change)?;
+        replace_json(&change_json_path, &change)?;
         published.insert(change_json_path.clone());
         publish_segment_topics(
             context,
@@ -3034,7 +3010,7 @@ fn publish_segment_topics<W: std::io::Write>(
 
     if markdown.is_some() || file_exists {
         let bytes = markdown.unwrap_or("");
-        match replace_text(context, &topics_path, bytes) {
+        match replace_text(&topics_path, bytes) {
             Ok(()) => {
                 published.insert(topics_path);
             }
@@ -3137,33 +3113,14 @@ pub(crate) fn named_stream<'a>(segment_dir: &'a std::path::Path, day: &str) -> O
     (parent != day).then_some(parent)
 }
 
-fn replace_text(context: &ThinkContext, path: &std::path::Path, text: &str) -> Result<(), String> {
-    solstone_core_system::segment_output::commit(
-        path,
-        text.as_bytes(),
-        context.protect_segment_outputs,
-        || {
-            atomic_replace(path, text.as_bytes(), AtomicWriteOptions::default())
-                .map_err(|error| error.to_string())
-        },
-    )
+fn replace_text(path: &std::path::Path, text: &str) -> Result<(), String> {
+    atomic_replace(path, text.as_bytes(), AtomicWriteOptions::default())
+        .map_err(|error| error.to_string())
 }
 
-fn replace_json(
-    context: &ThinkContext,
-    path: &std::path::Path,
-    value: &Value,
-) -> Result<(), String> {
+fn replace_json(path: &std::path::Path, value: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    solstone_core_system::segment_output::commit(
-        path,
-        &bytes,
-        context.protect_segment_outputs,
-        || {
-            atomic_replace(path, &bytes, AtomicWriteOptions::default())
-                .map_err(|error| error.to_string())
-        },
-    )
+    atomic_replace(path, &bytes, AtomicWriteOptions::default()).map_err(|error| error.to_string())
 }
 
 fn segment_event(
@@ -3512,10 +3469,7 @@ fn from_scratch_floor_retry_consumes_one_durable_owner_cause() {
     let directory = unit.segment_directory(root.path()).unwrap();
     std::fs::create_dir_all(directory.join("talents")).unwrap();
     let sense = directory.join("talents/sense.json");
-    solstone_core_system::segment_output::commit(&sense, b"{}", false, || {
-        std::fs::write(&sense, b"{}").map_err(|e| e.to_string())
-    })
-    .unwrap();
+    std::fs::write(&sense, b"{}").unwrap();
     let context = ThinkContext::new(
         root.path(),
         day.into(),

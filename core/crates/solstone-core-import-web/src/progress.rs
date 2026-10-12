@@ -137,17 +137,7 @@ fn read_counts(root: &Path, import_id: &str) -> Result<Option<Value>, String> {
                 }
                 Ok(false) => {}
             }
-            let protected =
-                match health::segment_repair_protected(root, &day, segment, &progress.value) {
-                    Ok(protected) => protected,
-                    Err(_) => {
-                        unreadable += 1;
-                        continue;
-                    }
-                };
-            if protected {
-                held += 1;
-            } else if !hold_errors.is_empty() {
+            if !hold_errors.is_empty() {
                 unreadable += 1;
             } else {
                 waiting += 1;

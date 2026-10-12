@@ -38,10 +38,7 @@ fn fixture() -> (
         fs::create_dir_all(&path).unwrap();
         let output = path.join("sense.json");
         let bytes = serde_json::to_vec(&sense).unwrap();
-        solstone_core_system::segment_output::commit(&output, &bytes, false, || {
-            fs::write(&output, &bytes).map_err(|e| e.to_string())
-        })
-        .unwrap();
+        fs::write(&output, &bytes).unwrap();
     }
     (journal, roots, context, recorder)
 }
@@ -1146,10 +1143,7 @@ fn unreadable_projection_retries_retained_source_and_keeps_valid_siblings() {
         ]}),
     )
     .unwrap();
-    solstone_core_system::segment_output::commit(&source, &bytes, false, || {
-        fs::write(&source, &bytes).map_err(|e| e.to_string())
-    })
-    .unwrap();
+    fs::write(&source, &bytes).unwrap();
     assert!(
         replay(&context, &["090000_300", "090500_300"], false)
             .unwrap_err()

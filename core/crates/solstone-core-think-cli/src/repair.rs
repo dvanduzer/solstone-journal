@@ -16,9 +16,6 @@ pub(crate) fn run(
     timeout: Option<Duration>,
     child_environment: &solstone_core_system::process::ChildLaunchContext,
 ) -> Result<ModeResult, String> {
-    let mut protected_context = context.clone();
-    protected_context.protect_segment_outputs = true;
-    let context = &protected_context;
     let segment = args.segment.as_deref().ok_or("missing repair segment")?;
     let request = solstone_core_sense::batch::BatchRequest {
         day: context.day.clone(),

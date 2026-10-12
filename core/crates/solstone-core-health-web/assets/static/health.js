@@ -819,7 +819,6 @@
     const reasons = {
       corrupt_input: 'the recording could not be read. replace its source before trying again.',
       no_audio_stream: 'the recording has no audio stream.',
-      owner_output_protected: 'this output may have been edited. retry keeps it; replacing it requires an explicit from-scratch request.',
       segment_prerequisites: 'waiting for the recordings on this day.',
       spending_confirmation: 'waiting for permission to process older work.',
       thinking_unavailable: 'choose a model in thinking before this work can run.',

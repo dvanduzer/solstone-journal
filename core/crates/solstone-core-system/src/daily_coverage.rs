@@ -166,7 +166,7 @@ pub enum AcceptedReuse {
 ///
 /// `Some(None)` is an exact match on evidence and contract; `Some(Some(_))` is
 /// an accepted result kept on purpose.  Either stands whatever became of its
-/// files: a deleted or edited output is the owner's.  ⛔ Every reader that decides reuse goes through this --
+/// files.  ⛔ Every reader that decides reuse goes through this --
 /// the coverage reader and the run's own skip must never disagree, or a day
 /// reads current while its run regenerates it.
 pub fn accepted_reuse(
@@ -407,9 +407,9 @@ fn read_unit_coverage_cached(
             {
                 CoverageState::Outstanding
             } else if let Some(reuse) = accepted_reuse(record, &evidence, now) {
-                // An accepted result stands whatever became of its files: a
-                // deleted or edited output is the owner's, not work to redo.
-                // The run's own skip reads the same, so the two never disagree.
+                // An accepted result stands whatever became of its files, so
+                // it is never work to redo. The run's own skip reads the same,
+                // so the two never disagree.
                 earlier_version = reuse;
                 if record
                     .accepted

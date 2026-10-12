@@ -977,10 +977,6 @@ fn promote(promotion: Promotion<'_>) -> Result<(), RunError> {
             record["attempts"] = json!(promotion.previous_attempts + 1);
             solstone_core_system::work_retry::raw::stamp_failed_input(&mut record, promotion.video)
                 .map_err(RunError::Internal)?;
-            record["body_sha256"] = json!(
-                solstone_core_system::work_retry::file_fingerprint(promotion.rows)
-                    .map_err(RunError::Internal)?
-            );
         }
         header.insert("_solstone_processing".to_owned(), record);
         let mut final_file =
@@ -1054,14 +1050,6 @@ fn keep_existing_reading(
     record["attempts"] = json!(promotion.previous_attempts + 1);
     solstone_core_system::work_retry::raw::stamp_failed_input(&mut record, promotion.video)
         .map_err(RunError::Internal)?;
-    // The retained rows are this publication's body, not the unsuccessful
-    // replacement's scratch rows. Bind permission and protection to both.
-    use sha2::{Digest, Sha256};
-    let mut body_hash = Sha256::new();
-    for row in existing.rows.iter().flatten() {
-        body_hash.update(row.raw_line.as_bytes());
-    }
-    record["body_sha256"] = json!(format!("{:x}", body_hash.finalize()));
     header["_solstone_processing"] = record;
     let mut final_file =
         File::create(final_path).map_err(|error| RunError::Internal(error.to_string()))?;

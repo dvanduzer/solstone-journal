@@ -21,23 +21,6 @@ fn directory(journal: &Path, day: &str, segment: &DaySegment) -> std::path::Path
     }
 }
 
-pub fn segment_repair_protected(
-    journal: &Path,
-    day: &str,
-    segment: &DaySegment,
-    progress: &BTreeMap<SegmentIdentity, SegmentProgress>,
-) -> Result<bool, String> {
-    let directory = directory(journal, day, segment);
-    let newest = crate::newest_segment_input_ms(&directory).map_err(|e| e.to_string())?;
-    if crate::segment_thinking_is_current(
-        crate::lookup_segment_progress(progress, &segment.stream, &segment.key),
-        newest,
-    ) {
-        return Ok(false); // Saved-text publication does not overwrite outputs.
-    }
-    solstone_core_system::segment_output::has_protected_outputs(&directory.join("talents"))
-}
-
 pub fn segment_work_ready(
     journal: &Path,
     day: &str,

@@ -101,7 +101,6 @@ pub(crate) fn run(
                 .ok_or("segment retry permission changed")?;
             let mut retry_context = context.clone();
             retry_context.retry = Some((record.unit.clone(), attempt));
-            retry_context.protect_segment_outputs = true;
             crate::segment::retry_talent(&retry_context, log, segment, stream, talent)
         }
     }
