@@ -48,8 +48,8 @@ set `LOCAL_THINKING_EXPECT=installed` and pass the GPU through with
 podman works (`CONTAINER_ENGINE=podman`); with `GPU_DEVICES` set the runner adds
 `--userns=keep-id:uid=1000,gid=1000`, so the in-container test user is the
 invoking host user and holds that user's access to the device nodes. Without
-`GPU_DEVICES` the same host refuses, and that refusal is the control. To run
-the GPU cell:
+`GPU_DEVICES`, and with `LOCAL_THINKING_EXPECT` left at `refusal`, the same
+host refuses; that refusal is the control. To run the GPU cell:
 
 ```bash
 CONTAINER_ENGINE=podman make build
