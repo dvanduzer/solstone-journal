@@ -3,11 +3,12 @@
 
 IMAGE ?= solstone-systemd-test:latest
 FEDORA_IMAGE ?= solstone-systemd-test:fedora
+CONTAINER_ENGINE ?= docker
 
 .PHONY: build build-fedora smoke install full local-thinking-install legacy-upgrade legacy-upgrade-v1022 release-crossover-v1022-deb release-crossover-v1022-rpm shell clean rebuild
 
 build:
-	docker build -t $(IMAGE) .
+	$(CONTAINER_ENGINE) build -t $(IMAGE) .
 
 build-fedora:
 	docker build -f Dockerfile.fedora -t $(FEDORA_IMAGE) .
@@ -50,9 +51,9 @@ shell: build
 	IMAGE=$(IMAGE) KEEP=1 ./run-test.sh shell
 
 clean:
-	-docker rm -f solstone-systemd-test-run 2>/dev/null
+	-$(CONTAINER_ENGINE) rm -f solstone-systemd-test-run 2>/dev/null
 	-docker rm -f solstone-systemd-v1022 2>/dev/null
-	-docker rmi $(IMAGE) 2>/dev/null
+	-$(CONTAINER_ENGINE) rmi $(IMAGE) 2>/dev/null
 	-docker rmi $(FEDORA_IMAGE) 2>/dev/null
 
 rebuild: clean build

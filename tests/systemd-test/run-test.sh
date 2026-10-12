@@ -35,6 +35,11 @@
 #   LOCAL_THINKING_RECEIPT_DIR — new host directory that receives the preserved
 #                       local-thinking harness receipt. Required for
 #                       local-thinking-install.
+#   LOCAL_THINKING_EXPECT — "refusal" (default: GPU-less hardware refuses before
+#                       download) or "installed" (full download to terminal
+#                       installed; needs GPU_DEVICES).
+#   GPU_DEVICES — space-separated host device paths to pass through (/dev/dri).
+#   CONTAINER_ENGINE — "docker" (default) or "podman".
 #
 # Exit codes:
 #   0  test passed
@@ -55,6 +60,9 @@ PRIVILEGED="${PRIVILEGED:-1}"
 KEEP="${KEEP:-0}"
 SOLSTONE_DIST_DIR="${SOLSTONE_DIST_DIR:-}"
 LOCAL_THINKING_RECEIPT_DIR="${LOCAL_THINKING_RECEIPT_DIR:-}"
+LOCAL_THINKING_EXPECT="${LOCAL_THINKING_EXPECT:-refusal}"
+GPU_DEVICES="${GPU_DEVICES:-}"
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 
 mode="${1:-smoke}"
 shift || true
@@ -67,7 +75,15 @@ case "$mode" in
     *) die "unknown mode: $mode (expected: smoke | install | local-thinking-install | legacy-upgrade | legacy-upgrade-v1022 | shell)" ;;
 esac
 
-command -v docker >/dev/null || die "docker not found in PATH"
+case "$LOCAL_THINKING_EXPECT" in
+    refusal|installed) ;;
+    *) die "LOCAL_THINKING_EXPECT must be refusal or installed, got: $LOCAL_THINKING_EXPECT" ;;
+esac
+
+# Every container command below goes through the selected engine; podman
+# accepts the same CLI.
+command -v "$CONTAINER_ENGINE" >/dev/null || die "$CONTAINER_ENGINE not found in PATH"
+docker() { command "$CONTAINER_ENGINE" "$@"; }
 
 # Image is built by `make build` — fail fast if it isn't there yet.
 docker image inspect "$IMAGE" >/dev/null 2>&1 || \
@@ -111,6 +127,18 @@ if [ "$mode" = "local-thinking-install" ]; then
     mkdir "$LOCAL_THINKING_RECEIPT_DIR"
     repo_root="$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)"
     RUN_FLAGS+=(-v "$repo_root:/harness:ro")
+fi
+
+for device in $GPU_DEVICES; do
+    [ -e "$device" ] || die "GPU_DEVICES entry does not exist: $device"
+    RUN_FLAGS+=(--device "$device")
+done
+# Rootless podman runs the test user (uid 1000 in the image) as a subordinate
+# host id with no access to the GPU nodes. keep-id runs it as the invoking
+# host user instead, whose access to those nodes is what is being passed in.
+if [ -n "$GPU_DEVICES" ] && [ "$CONTAINER_ENGINE" = podman ] \
+        && [ "$(podman info --format '{{.Host.Security.Rootless}}')" = true ]; then
+    RUN_FLAGS+=("--userns=keep-id:uid=1000,gid=1000")
 fi
 
 install_solstone_cmd='
@@ -309,16 +337,24 @@ UNIT
         '
 
         # The generic container has no usable GPU, and the product refuses a
-        # local install there before downloading. Prove that refusal through
-        # the resident service; installation needs a suitable host.
-        log "local-thinking-install: drive portal bootstrap through the hardware refusal"
+        # local install there before downloading, so by default prove that
+        # refusal through the resident service. On a host whose GPU is passed
+        # through (GPU_DEVICES), LOCAL_THINKING_EXPECT=installed requires the
+        # full download to reach terminal installed instead.
+        if [ "$LOCAL_THINKING_EXPECT" = "refusal" ]; then
+            harness_flags=--expect-hardware-refusal
+            log "local-thinking-install: drive portal bootstrap through the hardware refusal"
+        else
+            harness_flags=
+            log "local-thinking-install: drive portal bootstrap through terminal installed"
+        fi
         if docker exec -u "$TEST_USER" "$CONTAINER" bash -lc '
                 set -euo pipefail
                 cd /harness
                 python3 -m tools.local_thinking_install \
                     --candidate-dir /usr/bin \
                     --existing-service-journal "$HOME/journal" \
-                    --expect-hardware-refusal \
+                    '"$harness_flags"' \
                     --run-dir /var/tmp/lti-systemd
             '
         then

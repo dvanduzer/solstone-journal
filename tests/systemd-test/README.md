@@ -40,9 +40,26 @@ downloading, so this cell runs with `--expect-hardware-refusal`: it requires the
 portal's installer refusal and a persisted `failed` status with a hardware
 cause (`gpu_unavailable` or `gpu_memory_insufficient`), no download progress
 and no target. It copies the harness receipt to the new host directory named
-by `LOCAL_THINKING_RECEIPT_DIR`. Without that flag, service-context mode waits
-for terminal `installed` and verifies byte progress; run it, and the direct
-harness for runtime readiness and real generation, on a suitable Linux host.
+by `LOCAL_THINKING_RECEIPT_DIR`. On a Linux host whose GPU has a Mesa Vulkan
+driver (the image carries no NVIDIA driver) and enough VRAM for a local install,
+set `LOCAL_THINKING_EXPECT=installed` and pass the GPU through with
+`GPU_DEVICES=/dev/dri`: the cell then drops the flag, waits for terminal
+`installed` and verifies byte progress through the full download. Rootless
+podman works (`CONTAINER_ENGINE=podman`); with `GPU_DEVICES` set the runner adds
+`--userns=keep-id:uid=1000,gid=1000`, so the in-container test user is the
+invoking host user and holds that user's access to the device nodes. Without
+`GPU_DEVICES` the same host refuses, and that refusal is the control. To run
+the GPU cell:
+
+```bash
+CONTAINER_ENGINE=podman make build
+CONTAINER_ENGINE=podman LOCAL_THINKING_EXPECT=installed GPU_DEVICES=/dev/dri \
+  SOLSTONE_DIST_DIR=/var/tmp/<outdir>/linux-x86_64 \
+  LOCAL_THINKING_RECEIPT_DIR=/var/tmp/local-thinking-receipt \
+  make local-thinking-install
+```
+
+Run the direct harness on such a host for runtime readiness and real generation.
 
 Linked-device ingest is not a systemd-test mode. It requires a paired client certificate, so use `tools/journal_device_sim` with a disposable journal for protocol-v3 ingest and reconciliation proof.
 
@@ -107,6 +124,9 @@ up. This is useful when an install step fails and you want to inspect it.
 | `KEEP`       | `0`                           | `1` leaves the container up on success for inspection.                  |
 | `SOLSTONE_DIST_DIR` | unset                  | Host directory of produced `linux-x86_64` artifacts, mounted at `/artifacts`. Required for package-backed tests. Must contain the candidate `.deb` or `.rpm` selected by the target. |
 | `LOCAL_THINKING_RECEIPT_DIR` | unset          | New host directory that receives the preserved receipt from `local-thinking-install`. Required for that mode. |
+| `LOCAL_THINKING_EXPECT` | `refusal`          | `local-thinking-install` outcome: `refusal` (hardware refusal before download) or `installed` (full download to terminal `installed`; needs a passed-through GPU). |
+| `GPU_DEVICES` | unset                        | Space-separated host device paths passed with `--device` (e.g. `/dev/dri`). Under rootless podman also maps the test user to the invoking host user. |
+| `CONTAINER_ENGINE` | `docker`                | Container CLI for `run-test.sh`, `make build` and `make clean`; `podman` is accepted. |
 
 ## why `--privileged`
 
@@ -141,7 +161,7 @@ write-permission errors.
 
 | File          | What it is                                                                |
 |---------------|---------------------------------------------------------------------------|
-| `Dockerfile`  | Debian 12 (bookworm) base, full systemd, dbus-user-session, pre-lingered non-root user, uv pre-installed. |
+| `Dockerfile`  | Debian 12 (bookworm) base, full systemd, dbus-user-session, Vulkan loader and Mesa drivers, pre-lingered non-root user, uv pre-installed. |
 | `Dockerfile.fedora` | Fedora base for the native `.rpm` crossover. |
 | `run-test.sh` | `smoke` / `install` / `local-thinking-install` / `legacy-upgrade` / `shell` modes. Drives the boot-wait, runs the package install, asserts readiness. |
 | `run-release-crossover-v1022.sh` | Runs the public-v1 package crossover in a disposable Debian or Fedora container. |

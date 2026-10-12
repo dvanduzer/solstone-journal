@@ -13,7 +13,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 # per-user systemd instances to run without a GUI login. python3 is the
 # install target. curl + ca-certificates fetch uv. sudo is for any setup
 # step that escalates (solstone journal setup does not, but having it avoids surprises).
+# The Vulkan loader and Mesa drivers let the journal see a GPU passed through
+# from the host; without one it sees only a software device.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        libvulkan1 \
+        mesa-vulkan-drivers \
         systemd \
         systemd-sysv \
         dbus \
