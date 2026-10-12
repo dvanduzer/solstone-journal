@@ -106,3 +106,30 @@ fn short_options() -> LockOptions {
         ..LockOptions::default()
     }
 }
+
+#[test]
+fn after_release_work_waits_for_the_outermost_trust_guard_and_runs_once_per_key() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let temp = TempDir::new();
+    let journal = temp.path.as_path();
+    let ran = Rc::new(RefCell::new(Vec::new()));
+    let record = |label: &'static str| {
+        let ran = Rc::clone(&ran);
+        move || ran.borrow_mut().push(label)
+    };
+
+    crate::after_entity_trust_released(journal, Path::new("unheld"), record("unheld"));
+    assert_eq!(*ran.borrow(), ["unheld"]);
+
+    let outer = crate::hold_facet_trust_lock(journal).unwrap();
+    let inner = hold_entity_trust_lock(journal).unwrap();
+    crate::after_entity_trust_released(journal, Path::new("a"), record("a"));
+    crate::after_entity_trust_released(journal, Path::new("a"), record("a again"));
+    crate::after_entity_trust_released(journal, Path::new("b"), record("b"));
+    drop(inner);
+    assert_eq!(*ran.borrow(), ["unheld"]);
+    drop(outer);
+    assert_eq!(*ran.borrow(), ["unheld", "a", "b"]);
+}

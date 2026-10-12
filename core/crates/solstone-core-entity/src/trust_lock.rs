@@ -212,18 +212,64 @@ pub(crate) fn hold_entity_trust_lock_with_options(
     }
 }
 
-/// Whether this thread holds the entity trust lock, directly or through the
-/// facet trust lock. A caller that must not wait on another journal lock while
-/// trust is held (the index writer lease is taken before trust) checks this.
-pub fn entity_trust_held_by_current_thread(journal_root: &Path) -> bool {
-    let Ok(lock_path) = contained_path(journal_root, TRUST_LOCK_RELATIVE_PATH) else {
-        return false;
+/// Run `action` once this thread holds no entity trust for this journal: now
+/// when it holds none, otherwise when its outermost guard drops (facet trust
+/// holds entity trust, so that is also after any facet trust). Work that must
+/// not wait on another journal lock while trust is held, such as taking the
+/// index writer lease, goes through here. Actions queued under one guard run
+/// once per `key`, in order. An action queued while the thread is unwinding a
+/// panic is dropped.
+pub fn after_entity_trust_released(
+    journal_root: &Path,
+    key: &Path,
+    action: impl FnOnce() + 'static,
+) {
+    let held = contained_path(journal_root, TRUST_LOCK_RELATIVE_PATH)
+        .ok()
+        .filter(|lock_path| {
+            let owner = thread::current().id();
+            matches!(
+                lock_state(coordinator()).get(lock_path),
+                Some(TrustLockState::Held { owner: held_owner, .. }) if *held_owner == owner
+            )
+        });
+    let Some(lock_path) = held else {
+        action();
+        return;
     };
-    let owner = thread::current().id();
-    matches!(
-        lock_state(coordinator()).get(&lock_path),
-        Some(TrustLockState::Held { owner: held_owner, .. }) if *held_owner == owner
-    )
+    AFTER_RELEASE.with(|queued| {
+        let mut queued = queued.borrow_mut();
+        if !queued
+            .iter()
+            .any(|(path, queued_key, _)| *path == lock_path && queued_key == key)
+        {
+            queued.push((lock_path, key.to_path_buf(), Box::new(action)));
+        }
+    });
+}
+
+type AfterRelease = (PathBuf, PathBuf, Box<dyn FnOnce()>);
+
+thread_local! {
+    static AFTER_RELEASE: std::cell::RefCell<Vec<AfterRelease>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn run_after_release(lock_path: &Path) {
+    let due = AFTER_RELEASE.with(|queued| {
+        let mut queued = queued.borrow_mut();
+        let (due, kept) = std::mem::take(&mut *queued)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(path, _, _)| path == lock_path);
+        *queued = kept;
+        due
+    });
+    if thread::panicking() {
+        return;
+    }
+    for (_, _, action) in due {
+        action();
+    }
 }
 
 /// Acquire the raw entity trust-lock file directly, bypassing the in-process
@@ -350,6 +396,8 @@ impl Drop for EntityTrustLock {
         if release {
             state.remove(&self.lock_path);
             coordinator.available.notify_all();
+            drop(state);
+            run_after_release(&self.lock_path);
         }
     }
 }

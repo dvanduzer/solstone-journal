@@ -32,7 +32,7 @@
 //! - backup `NativeJournalMaintenance::full_scan`
 //! - segment move prune+rescan
 //! - retention `RetentionIndex::paths_removed` via `notify_index` (transcripts delete, strava delete while `imports/.strava` is held, `release_misplaced_strava_pieces`)
-//! - facets store saved activity and detection day files (`publish_saved`), after the store's own trust guards drop, and skipped while the thread still holds entity trust
+//! - facets store saved activity and detection day files (`publish_saved`), after this thread's outermost entity trust guard drops (`after_entity_trust_released`)
 //!
 //! Read-only, no lease:
 //! - `open_index_reader`
