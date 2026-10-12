@@ -373,7 +373,8 @@
     if (agent === 'tiles') return `with the solstone plugin installed, Tiles already has the address. in the Tiles chat, type ${command('/mcp-auth solstone__journal')}`;
     // The path that reaches chats and dots. A server added in the desktop app's own settings is Codex configuration.
     if (agent === 'chatgpt') return 'on chatgpt.com, open <strong>Plugins</strong>, choose <strong>Add</strong> › <strong>Add custom MCP server</strong>, paste the address, choose <strong>OAuth</strong>, then <strong>Create as a plugin</strong>. it then works in your chats, and in a dot if you use one. an MCP server added in ChatGPT\'s desktop app settings works only in Codex.';
-    if (agent === 'claude') return 'in Claude, add the address as a custom connector, then connect it.';
+    // The directory listing matches solstone.me addresses only, so another door is always a custom connector.
+    if (agent === 'claude') return connectWay === 'relay' ? "in Claude, if solstone is in Claude's connector directory, choose it there and connect. if it isn't there yet, add the address as a custom connector, then connect it." : 'in Claude, add the address as a custom connector, then connect it.';
     if (agent === 'claude-code' && address) return `run ${command(`claude mcp add --transport http journal "${address}"`)} then, in Claude Code, type <code>/mcp</code>, choose <code>journal</code> and authenticate.`;
     if (agent === 'codex' && address) return `run ${command(`codex mcp add journal --url "${address}"`)} then ${command('codex mcp login journal')}`;
     if (agent === 'gemini-cli' && address) return `run ${command(`gemini mcp add --transport http journal "${address}"`)} then, in Gemini CLI, type <code>/mcp auth journal</code>.`;

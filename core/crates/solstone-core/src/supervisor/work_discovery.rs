@@ -17,13 +17,14 @@ use solstone_core_journal_config::work_priority::{WorkBand, WorkPriority};
 use solstone_core_system::{
     daily_coverage::{self, CoverageState},
     partition::canonical_journal_command,
-    queue::{DiscoveredTask, TaskQueue},
+    queue::{DISCOVERED_ADMISSION, DiscoveredTask, TaskQueue},
     request::{BusTaskRequest, DailyCatchupProvenance, TaskArgv},
     work_intent::{self, IntentState, OwnerIntent},
     work_inventory::{WorkHold, WorkInventory},
     work_policy::WorkPolicy,
     work_retry::{self, Unit},
 };
+use solstone_core_system_health::SegmentReadiness;
 
 /// The least time between automatic passes.
 const MIN_REST: Duration = Duration::from_secs(60);
@@ -32,14 +33,19 @@ const MIN_REST: Duration = Duration::from_secs(60);
 const REST_PER_PASS: u32 = 9;
 /// How often a pass publishes its progress before it finishes.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+/// How much of its ranking a pass keeps. The queue admits a few tasks at a
+/// time; the rest wait here, in order, and are admitted as those tasks leave
+/// the queue, so a backlog drains at the pace work finishes rather than a few
+/// tasks per pass.
+const RANKED: usize = 1024;
 
 fn rest_after(pass: Duration) -> Duration {
     MIN_REST.max(pass * REST_PER_PASS)
 }
 
-/// While an owner's requested work is in the queue, a resting worker checks
-/// this often whether it has finished.
-const OWNER_POLL: Duration = Duration::from_secs(1);
+/// While it watches the queue, a resting worker checks it this often: for
+/// the end of an owner's requested work, and for discovered work that has left.
+const QUEUE_POLL: Duration = Duration::from_secs(1);
 
 /// Days the owner asked to redo whose discovered work is still in the queue.
 fn owner_days_in_queue(journal: &Path, queue: &TaskQueue) -> BTreeSet<String> {
@@ -64,11 +70,18 @@ fn owner_work_in_queue(queue: &TaskQueue, day: &str) -> bool {
 /// request starts one rather than waiting out the automatic rest. It still
 /// waits as long as the last pass ran, so discovery stays at most half a core
 /// while owner work keeps finishing. Returns false when the worker must exit.
+///
+/// While it rests, `top_up` admits the pass's next ranked work as earlier work
+/// leaves the queue, until it returns false. Each top-up then rests nine times
+/// as long as it ran and moves the next pass back by ten times as long, so
+/// discovery as a whole still holds at most a tenth of one core.
 fn rest(
     receiver: &mpsc::Receiver<()>,
-    next_pass: Option<Instant>,
+    mut next_pass: Option<Instant>,
     owner: Option<(Instant, &dyn Fn() -> bool)>,
+    mut top_up: Option<&mut dyn FnMut() -> bool>,
 ) -> bool {
+    let mut top_up_at = Instant::now();
     loop {
         let now = Instant::now();
         if next_pass.is_some_and(|due| now >= due)
@@ -76,7 +89,27 @@ fn rest(
         {
             return true;
         }
-        let poll = owner.map(|(from, _)| from.saturating_duration_since(now).max(OWNER_POLL));
+        if now >= top_up_at
+            && let Some(admit_next) = top_up.as_mut()
+        {
+            let more = admit_next();
+            let spent = now.elapsed();
+            top_up_at = Instant::now() + spent * REST_PER_PASS;
+            next_pass = next_pass.map(|due| due + spent * (REST_PER_PASS + 1));
+            if !more {
+                top_up = None;
+            }
+        }
+        let now = Instant::now();
+        let poll = owner
+            .map(|(from, _)| from.saturating_duration_since(now).max(QUEUE_POLL))
+            .into_iter()
+            .chain(
+                top_up
+                    .is_some()
+                    .then(|| top_up_at.saturating_duration_since(now).max(QUEUE_POLL)),
+            )
+            .min();
         let timeout = match (
             next_pass.map(|due| due.saturating_duration_since(now)),
             poll,
@@ -114,7 +147,7 @@ impl WorkDiscovery {
         journal: PathBuf,
         queue: TaskQueue,
         automatic: bool,
-        mut reconcile_pass: impl FnMut(&Path, &TaskQueue, &AtomicBool) -> Result<(), String>
+        mut reconcile_pass: impl FnMut(&Path, &TaskQueue, &AtomicBool) -> Result<Backlog, String>
         + Send
         + 'static,
     ) -> Self {
@@ -144,8 +177,12 @@ impl WorkDiscovery {
                         }
                         reconcile_pass(&journal, &queue, &worker_stop)
                     }));
+                    let mut backlog = Backlog::default();
                     let error = match result {
-                        Ok(Ok(())) => None,
+                        Ok(Ok(found)) => {
+                            backlog = found;
+                            None
+                        }
                         Ok(Err(error)) => Some(error),
                         Err(_) => Some("work discovery panicked".into()),
                     };
@@ -168,11 +205,13 @@ impl WorkDiscovery {
                             .iter()
                             .any(|day| !owner_work_in_queue(&queue, day))
                     };
+                    let mut top_up = || backlog.top_up(&journal, &queue, &worker_stop);
                     if !rest(
                         &receiver,
                         automatic.then(|| ended + rest_after(pass)),
                         (!owner_days.is_empty())
                             .then_some((ended + pass, &owner_done as &dyn Fn() -> bool)),
+                        automatic.then_some(&mut top_up as &mut dyn FnMut() -> bool),
                     ) {
                         return;
                     }
@@ -197,6 +236,52 @@ impl WorkDiscovery {
 impl Drop for WorkDiscovery {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// What the last pass handed the queue, and the rest of its ranking in order.
+#[derive(Default)]
+struct Backlog {
+    admitted: Vec<DiscoveredTask>,
+    ranked: VecDeque<DiscoveredTask>,
+}
+
+impl Backlog {
+    /// Once admitted work has left the queue, admit the next ranked work that
+    /// is still owed in its place, without another pass. Returns whether any
+    /// ranked work remains.
+    fn top_up(&mut self, journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> bool {
+        if self.ranked.is_empty() {
+            return false;
+        }
+        let present = self
+            .admitted
+            .iter()
+            .filter(|task| queue.contains_reference(&task.request.reference))
+            .cloned()
+            .collect::<Vec<_>>();
+        if present.len() == self.admitted.len() {
+            return true;
+        }
+        let mut report = WorkInventory::default();
+        match admit(
+            journal,
+            queue,
+            stopped,
+            present,
+            &mut self.ranked,
+            &mut report,
+        ) {
+            Ok(admitted) => self.admitted = admitted,
+            Err(error) => {
+                log::warn!("work discovery: {error}");
+                self.ranked.clear();
+            }
+        }
+        for error in report.unreadable {
+            log::warn!("work discovery: {error}");
+        }
+        !self.ranked.is_empty()
     }
 }
 
@@ -698,7 +783,11 @@ fn inspect_day(
     if capped.malformed_line_count != 0 {
         return Err("floor failure evidence is unreadable".into());
     }
+    // Ready also needs every segment's saved outputs published; thought does
+    // not, as daily work publishes those itself.
     let mut prerequisites_ready = true;
+    let mut segments_thought = true;
+    let mut owed_segments = Vec::new();
     for segment in &segments {
         if super::tick::is_mcp_audit_segment(Some(&segment.stream)) {
             continue;
@@ -725,14 +814,57 @@ fn inspect_day(
             .map(|_| WorkBand::Waiting)
             .or_else(|| imported.then_some(WorkBand::Import));
         let p = priority(day, Some(&segment.key), today, explicit);
-        if solstone_core_system_health::segment_work_ready(journal, day, segment, &progress.value)?
-        {
+        let readiness =
+            solstone_core_system_health::segment_readiness(journal, day, segment, &progress.value)?;
+        if readiness == SegmentReadiness::Ready {
             report.band(p.band).segments_complete += 1;
             work.completed_segments.insert(coordinate);
             continue;
         }
         prerequisites_ready = false;
+        if readiness == SegmentReadiness::Owed {
+            segments_thought = false;
+        }
+        owed_segments.push((segment, p, imported, readiness));
+    }
+    let closing =
+        super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref() == Some(day);
+    let imported = imports.iter().any(|import| import.days.contains(day));
+    let explicit = intent
+        .map(|_| WorkBand::Waiting)
+        .or_else(|| imported.then_some(WorkBand::Import));
+    let p = priority(day, None, today, explicit);
+    let coverage = daily_coverage::read_daily_coverage(journal, day)?;
+    work.candidates.extend(daily_retries(
+        journal,
+        day,
+        &coverage,
+        intent,
+        imports,
+        policy,
+        prerequisites_ready && !closing,
+        report,
+    )?);
+    let closes_day = day < today.format("%Y%m%d").to_string().as_str()
+        && queue_daily(
+            journal,
+            day,
+            &coverage,
+            segments_thought && !closing,
+            prerequisites_ready,
+            intent,
+            imported,
+            p,
+            policy,
+            &mut work,
+            report,
+        )?;
+    for (segment, p, imported, readiness) in owed_segments {
         report.band(p.band).segments_owed += 1;
+        // The day's daily work publishes the segments only owed publication.
+        if closes_day && readiness == SegmentReadiness::Unpublished {
+            continue;
+        }
         if policy.permits(p.band, imported) {
             report.band(p.band).eligible += 1;
             work.candidates.push(task(
@@ -753,27 +885,25 @@ fn inspect_day(
             );
         }
     }
-    let imported = imports.iter().any(|import| import.days.contains(day));
-    let explicit = intent
-        .map(|_| WorkBand::Waiting)
-        .or_else(|| imported.then_some(WorkBand::Import));
-    let p = priority(day, None, today, explicit);
-    let coverage = daily_coverage::read_daily_coverage(journal, day)?;
-    work.candidates.extend(daily_retries(
-        journal,
-        day,
-        &coverage,
-        intent,
-        imports,
-        policy,
-        prerequisites_ready
-            && super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref()
-                != Some(day),
-        report,
-    )?);
-    if day >= today.format("%Y%m%d").to_string().as_str() {
-        return Ok(work);
-    }
+    Ok(work)
+}
+
+/// Account for a closed day's daily units and queue its daily work when its
+/// segments are thought. Returns whether that work was queued.
+#[allow(clippy::too_many_arguments)]
+fn queue_daily(
+    journal: &Path,
+    day: &str,
+    coverage: &daily_coverage::DailyCoverage,
+    segments_thought: bool,
+    prerequisites_ready: bool,
+    intent: Option<&OwnerIntent>,
+    imported: bool,
+    p: WorkPriority,
+    policy: WorkPolicy,
+    work: &mut DayWork,
+    report: &mut WorkInventory,
+) -> Result<bool, String> {
     let owed = coverage
         .units
         .iter()
@@ -801,11 +931,9 @@ fn inspect_day(
         return Err("daily coverage is unreadable".into());
     }
     if owed == 0 {
-        return Ok(work);
+        return Ok(false);
     }
-    if !prerequisites_ready
-        || super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref() == Some(day)
-    {
+    if !segments_thought {
         report.band(p.band).prerequisite_held += owed;
         held(report, day, None, p.band, "segment_prerequisites");
     } else if !policy.permits(p.band, imported) {
@@ -818,8 +946,9 @@ fn inspect_day(
     } else {
         report.band(p.band).eligible += owed;
         work.candidates.push(task(day, None, p, None, imported));
+        return Ok(true);
     }
-    Ok(work)
+    Ok(false)
 }
 
 fn retain_best(candidates: &mut Vec<DiscoveredTask>, new: Vec<DiscoveredTask>) {
@@ -832,7 +961,7 @@ fn retain_best(candidates: &mut Vec<DiscoveredTask>, new: Vec<DiscoveredTask>) {
             .sort_key()
     });
     candidates.dedup_by(|a, b| a.request.cmd == b.request.cmd);
-    candidates.truncate(4);
+    candidates.truncate(RANKED);
 }
 
 fn still_owed(
@@ -954,21 +1083,24 @@ fn still_owed(
     Ok(daily_coverage::read_daily_coverage(journal, day)?
         .state
         .is_owed()
-        && solstone_core_system_health::day_segments_ready(journal, day)?)
+        && solstone_core_system_health::day_unpublished_segments(journal, day)?.is_some())
 }
 
+/// Hand the queue `current` and then the best of `ranked` still owed, up to
+/// its admission bound, replacing the discovered work it has not started.
+/// Returns what was handed over; `ranked` keeps what was not examined.
 fn admit(
     journal: &Path,
     queue: &TaskQueue,
     stopped: &AtomicBool,
-    candidates: Vec<DiscoveredTask>,
+    mut current: Vec<DiscoveredTask>,
+    ranked: &mut VecDeque<DiscoveredTask>,
     report: &mut WorkInventory,
-) -> Result<(), String> {
+) -> Result<Vec<DiscoveredTask>, String> {
     if stopped.load(Ordering::Acquire) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let imports = solstone_core_import::thinking::read(journal)?;
-    let mut current = Vec::new();
     for error in &imports.unreadable {
         if !report.unreadable.contains(error) {
             report.unreadable.push(error.clone());
@@ -977,9 +1109,11 @@ fn admit(
     if !imports.unreadable.is_empty() {
         report.complete = false;
     }
-    for mut candidate in candidates {
+    while current.len() < DISCOVERED_ADMISSION
+        && let Some(mut candidate) = ranked.pop_front()
+    {
         if stopped.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         match still_owed(journal, &candidate, &imports.imports) {
             Ok(true) => {
@@ -1037,10 +1171,11 @@ fn admit(
             }
         }
     }
-    if !stopped.load(Ordering::Acquire) {
-        queue.replace_discovered(current);
+    if stopped.load(Ordering::Acquire) {
+        return Ok(Vec::new());
     }
-    Ok(())
+    queue.replace_discovered(current.clone());
+    Ok(current)
 }
 
 /// Fold the per-day snapshots into the published totals. Built only when it
@@ -1073,7 +1208,7 @@ fn aggregate(
 
 #[cfg(test)]
 fn reconcile(journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> Result<(), String> {
-    reconcile_pass(journal, queue, stopped, false)
+    reconcile_pass(journal, queue, stopped, false).map(|_| ())
 }
 
 /// An automatic pass says when the next one is due, so its snapshot stays
@@ -1083,7 +1218,7 @@ fn reconcile_pass(
     queue: &TaskQueue,
     stopped: &AtomicBool,
     automatic: bool,
-) -> Result<(), String> {
+) -> Result<Backlog, String> {
     let pass_started = Instant::now();
     let policy = WorkPolicy::read(journal)?;
     let mut days = solstone_core_journal_io::day_dirs(journal)
@@ -1143,7 +1278,7 @@ fn reconcile_pass(
     let mut ordered = days.keys().rev().cloned().collect::<VecDeque<_>>();
     loop {
         if stopped.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(Backlog::default());
         }
         let intents = work_intent::read(journal)?;
         let owner_day = intents
@@ -1279,7 +1414,7 @@ fn reconcile_pass(
         inspected.insert(day.clone());
         day_reports.insert(day, day_report);
         if stopped.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(Backlog::default());
         }
         // Progress, not a rewrite of the whole inventory after every day.
         if last_publish.elapsed() >= PROGRESS_INTERVAL {
@@ -1301,20 +1436,16 @@ fn reconcile_pass(
             })
         {
             // Reconstruct an independent copy; TaskQueue owns submissions.
-            let early = candidates
+            let mut early = candidates
                 .iter()
                 .filter(|task| {
                     task.request
                         .priority
                         .is_some_and(|p| p.band <= WorkBand::Waiting)
                 })
-                .map(|task| DiscoveredTask {
-                    guard: task.guard.clone(),
-                    request: task.request.clone(),
-                    confirmed_import: task.confirmed_import,
-                })
+                .cloned()
                 .collect();
-            admit(journal, queue, stopped, early, &mut report)?;
+            admit(journal, queue, stopped, Vec::new(), &mut early, &mut report)?;
         }
     }
     aggregate(
@@ -1340,14 +1471,23 @@ fn reconcile_pass(
         }
     }
     report.complete = report.unreadable.is_empty() && report.days_inspected == report.days_total;
-    admit(journal, queue, stopped, candidates, &mut report)?;
+    let mut ranked = VecDeque::from(candidates);
+    let admitted = admit(
+        journal,
+        queue,
+        stopped,
+        Vec::new(),
+        &mut ranked,
+        &mut report,
+    )?;
     if stopped.load(Ordering::Acquire) {
-        return Ok(());
+        return Ok(Backlog::default());
     }
     report.as_of_ms = chrono::Utc::now().timestamp_millis();
     report.next_pass_ms =
         automatic.then(|| report.as_of_ms + rest_after(pass_started.elapsed()).as_millis() as i64);
-    report.publish(journal)
+    report.publish(journal)?;
+    Ok(Backlog { admitted, ranked })
 }
 
 #[cfg(test)]
@@ -1755,6 +1895,111 @@ mod tests {
         assert_eq!(report.bands[4].permission_held, 1);
     }
 
+    /// Record transcribed segments as thought, after their input, the way an
+    /// earlier version did: no publication receipt beside their outputs.
+    fn thought_without_receipt(root: &Path, day: &str, keys: &[&str]) {
+        use solstone_core_journal_io::{
+            JournalRoot,
+            operational_log::{OplogFormat, create_oplog_at},
+        };
+        use std::io::Write;
+        let mut log = create_oplog_at(
+            JournalRoot::open(root).unwrap(),
+            "think",
+            "segment",
+            OplogFormat::Jsonl,
+            chrono::NaiveDate::parse_from_str(day, "%Y%m%d")
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+                .fixed_offset(),
+        )
+        .unwrap();
+        let sensed = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        for key in keys {
+            segment(root, day, key);
+            std::fs::write(
+                root.join("chronicle")
+                    .join(day)
+                    .join("notes")
+                    .join(key)
+                    .join("audio.jsonl"),
+                "{\"start\":\"00:00:01\",\"text\":\"A meeting about a garden.\"}\n",
+            )
+            .unwrap();
+            let row = serde_json::json!({"event":"sense.complete","ts":sensed,"mode":"segment","stream":"notes","segment":key,"density":"idle"});
+            writeln!(log, "{row}").unwrap();
+        }
+    }
+
+    /// Segments thought before their publication was recorded must not hold
+    /// their day's close behind one repair each: the daily work that closes
+    /// the day is queued in the first pass, and publishes them itself.
+    #[test]
+    fn a_thought_day_without_publication_receipts_is_closed_in_the_first_pass() {
+        let root = fixture("local");
+        let day = "19990101";
+        let keys = [
+            "090000_60",
+            "100000_60",
+            "110000_60",
+            "120000_60",
+            "130000_60",
+            "140000_60",
+        ];
+        thought_without_receipt(root.path(), day, &keys);
+        // Every segment is sensed and thought on its current input.
+        let (_, _, segments) = solstone_core_system_health::scan_day(
+            &solstone_core_system_health::FilesystemSegmentSource,
+            root.path(),
+            day,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let progress = solstone_core_system_health::read_segment_progress(
+            &solstone_core_system_health::FilesystemHealthLogSource::new(root.path()),
+            day,
+        )
+        .unwrap()
+        .value;
+        assert_eq!(segments.len(), keys.len());
+        for segment in &segments {
+            let directory = root
+                .path()
+                .join("chronicle")
+                .join(day)
+                .join("notes")
+                .join(&segment.key);
+            assert!(solstone_core_system_health::segment_fully_sensed(
+                &segment.data_state
+            ));
+            assert!(solstone_core_system_health::segment_thinking_is_current(
+                solstone_core_system_health::lookup_segment_progress(
+                    &progress,
+                    "notes",
+                    &segment.key
+                ),
+                solstone_core_system_health::newest_segment_input_ms(&directory).unwrap(),
+            ));
+        }
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference("supervisor-work-19990101-daily"));
+        let repairs = |reference: &str| reference.starts_with("supervisor-work-19990101-notes-");
+        assert!(!queue.any_reference(repairs));
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.bands[4].segments_owed, keys.len() as u64);
+        assert!(
+            !report
+                .holds
+                .iter()
+                .any(|hold| hold.reason == "segment_prerequisites")
+        );
+    }
+
     #[test]
     fn segment_outputs_from_an_earlier_version_are_repaired_not_held() {
         let root = fixture("local");
@@ -1880,7 +2125,7 @@ mod tests {
                     );
                 }
                 passes.send(count).unwrap();
-                Ok(())
+                Ok(Backlog::default())
             },
         );
         worker.request();
@@ -1892,6 +2137,77 @@ mod tests {
         assert!(passed.recv_timeout(Duration::from_secs(3)).is_err());
         worker.stop();
         queue.shutdown();
+    }
+
+    /// The queue admits a few discovered tasks at a time. As they finish, the
+    /// pass's next ranked work is admitted in their place, newest first, well
+    /// before the automatic rest would start another pass.
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn ranked_work_past_the_admission_bound_is_admitted_as_the_queue_drains() {
+        use solstone_core_system::lifecycle::{
+            CoordinatorBootstrap, DeclaredParent, ParentLossCoordinator,
+        };
+        use solstone_core_system::queue::SystemProcessStateProbe;
+        let root = fixture("local");
+        let keys = (10..20)
+            .map(|hour| format!("{hour}0000_60"))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            segment(root.path(), "19990101", key);
+        }
+        let parent = DeclaredParent::capture_current().unwrap();
+        let (_coordinator, _) = ParentLossCoordinator::bootstrap(CoordinatorBootstrap {
+            journal: root.path().into(),
+            supervisor: parent.instance(),
+            enabled: Vec::new(),
+            supervisor_heartbeat_filename: format!(
+                "solstone-v2-drain-test-{}.check",
+                std::process::id()
+            ),
+            capability: format!("drain-test-{}", root.path().display()).into_bytes(),
+        })
+        .unwrap();
+        // Each task finishes at once and leaves its segment owed.
+        let queue = TaskQueue::new(TaskQueueOptions {
+            journal_root: root.path().into(),
+            cap_resolver: Arc::new(solstone_core_system::cap::DefaultCapResolver::default()),
+            process_state_probe: Arc::new(SystemProcessStateProbe),
+            queue_sink: None,
+            process_sink: None,
+            ready: true,
+            before_deadline_commit: None,
+            child_environment: BTreeMap::new(),
+            task_binary: Some("/bin/true".into()),
+        });
+        let worker = WorkDiscovery::new(root.path().into(), queue.clone(), true);
+        worker.request();
+        // The automatic rest is at least a minute.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let finished = loop {
+            let finished = queue
+                .history()
+                .into_iter()
+                .filter(|record| {
+                    record
+                        .reference
+                        .starts_with("supervisor-work-19990101-notes-")
+                })
+                .map(|record| record.reference)
+                .collect::<Vec<_>>();
+            if finished.len() >= keys.len() || Instant::now() >= deadline {
+                break finished;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        worker.stop();
+        queue.shutdown();
+        let expected = keys
+            .iter()
+            .rev()
+            .map(|key| format!("supervisor-work-19990101-notes-{key}"))
+            .collect::<Vec<_>>();
+        assert_eq!(finished, expected);
     }
 
     #[cfg(all(unix, feature = "full-tests"))]
@@ -1944,7 +2260,7 @@ mod tests {
             move |_, _, _| {
                 entered.send(()).unwrap();
                 blocked.recv().unwrap();
-                Ok(())
+                Ok(Backlog::default())
             },
         );
         worker.request();

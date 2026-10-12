@@ -651,10 +651,7 @@ fn log_plan_json(
                 None,
                 Some("the entry's retention date could not be determined".to_owned()),
             ),
-            Kept::ContentMalformed { day, detail } => (
-                Some(day_key(*day)),
-                Some(format!("malformed talent day-index row: {detail}")),
-            ),
+            Kept::ContentUnreadable { day, detail } => (Some(day_key(*day)), Some(detail.clone())),
             Kept::TooYoung(_) | Kept::Exempt | Kept::NotAMatch | Kept::ContentNotFullyOld => {
                 (None, None)
             }

@@ -659,6 +659,9 @@ fn run_convey_bound(
                 _ = wait_for_hosted_termination_signal() => ParentLossReason::ExitedOrReused,
             }
         });
+        // Stop archive children (restic) before the process goes, rather than
+        // leave them running after it; a few seconds bounds the wait.
+        let _ = solstone_core_backup_web::stop_archive_work(Duration::from_secs(5));
         // `ConveyServeHandle::shutdown` synchronously aborts every listener
         // task and has no fallible result; Convey has no separate runner once
         // those tasks have been aborted.

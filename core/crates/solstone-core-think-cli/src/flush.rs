@@ -39,6 +39,8 @@ pub(crate) fn run(
         crate::dispatch::record_followup_failure(&mut closed, "activity close", &error);
     }
     let mut result = run_hooks(context, log, segment, stream)?;
+    // Flush outputs are saved beside the segment's own; publish them too.
+    crate::segment::publish_if_thought(context, segment, stream, &mut result);
     merge(&mut result, closed);
     Ok(result)
 }

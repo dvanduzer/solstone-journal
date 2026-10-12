@@ -536,6 +536,51 @@ pub fn stale_receipt_free_conflict(record: &solstone_core_journal_io::DailyUnitR
     }
 }
 
+/// Entity review conflicts found before the conflicting action writes. Each
+/// is raised while preparing the plan, or by a publish check that runs before
+/// the action records that it started, so the journal holds every earlier
+/// action whole and nothing of this one. A new kind joins only once the same
+/// holds for it.
+const PRE_WRITE_REVIEW_CONFLICTS: &[&str] = &[
+    "alias_claimed",
+    "alias_target_detached",
+    "promotion_owner_state",
+    "identity_moved",
+    "identity_changed",
+    "identity_disappeared",
+    "identity_blocked",
+    "promoted_entity_blocked",
+    "identity_map_group_lost",
+    "name_matches_multiple",
+    "no_usable_entity_id",
+    "identity_unreadable",
+    "relationship_occupied",
+    "relationship_changed",
+    "merge_proposal_preparation",
+    "merge_proposals_changed",
+    "output_artifact_changed",
+    "owning_facet_changed",
+    "artifact_before_changed",
+    "identity_merged",
+    "identity_deleted",
+    "principal_grant_refused",
+];
+
+/// An entity review stopped on a conflict that a fresh preparation can clear:
+/// every change it started also committed, and the conflict was found before
+/// its action wrote. The owner's retry request replaces the attempt; committed
+/// changes stay in the journal, and the new preparation reads them as the
+/// journal's current state.
+pub fn review_conflict_reprepares(record: &solstone_core_journal_io::DailyUnitRecord) -> bool {
+    record.identity.name == "entities:entities_review"
+        && record.status == DailyUnitStatus::Conflicting
+        && !record.has_uncommitted_started_receipt()
+        && record
+            .owner_conflict_kind
+            .as_deref()
+            .is_some_and(|kind| PRE_WRITE_REVIEW_CONFLICTS.contains(&kind))
+}
+
 pub fn conflict_recovery(
     record: &solstone_core_journal_io::DailyUnitRecord,
     today: &str,

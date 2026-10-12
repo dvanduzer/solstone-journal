@@ -235,6 +235,25 @@ fn prune_logs_removes_every_existing_class_compacts_retention_log_and_keeps_nega
 }
 
 #[test]
+fn an_old_talent_day_index_with_a_torn_row_is_removed_without_an_error() {
+    let journal = Journal::new("torn-day-index");
+    let torn = journal.file(
+        "talents/20260101.jsonl",
+        b"{\"ts\":1767225600000}\n{\"ts\":17672{\"ts\":1767225600000}25600000}\n\n",
+    );
+
+    let output = run(&journal, true);
+    assert!(output.status.success(), "{output:?}");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON receipt");
+    assert_eq!(
+        receipt["detail"]["plan"]["errors"],
+        serde_json::json!([]),
+        "{receipt}"
+    );
+    assert!(!torn.exists(), "the old index was removed");
+}
+
+#[test]
 fn a_refusal_is_reported_without_aborting_other_log_removals() {
     use std::os::unix::fs::PermissionsExt;
 

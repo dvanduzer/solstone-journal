@@ -205,12 +205,54 @@ fn packaged_cli_restore_entry() {
     let mut selection = vec![DAY.to_owned()];
     match input.mode.as_str() {
         "cli_day" => {}
-        "cli_all" | "cli_killed" => selection = vec!["--all".into()],
+        "cli_all" | "cli_killed" | "cli_sigint" => selection = vec!["--all".into()],
         "cli_conflict" => fs::write(bound.join(&input.bound.name), b"different raw").unwrap(),
         "cli_busy" => held = Some(ActivityLease::try_acquire(Arc::clone(&root)).unwrap()),
         other => panic!("unknown CLI restore mode {other}"),
     }
     let marks = fs::read(input.journal.join("health/retention-marks.json")).unwrap();
+    if input.mode == "cli_sigint" {
+        // Ctrl-C mid-download: the command stops its restic child and still reports.
+        let first = Command::new(&input.cli)
+            .args(["backup", "offload", "restore", "--all", "--json"])
+            .env_clear()
+            .env("HOME", input.journal.parent().unwrap())
+            .env("SOLSTONE_JOURNAL", &input.journal)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut partial = None;
+        while std::time::Instant::now() < deadline && partial.is_none() {
+            partial = residue(&input.journal)
+                .iter()
+                .filter(|entry| entry.ends_with("restore-download"))
+                .filter_map(|entry| fs::metadata(input.journal.join(entry)).ok())
+                .map(|metadata| metadata.len())
+                .find(|bytes| *bytes > 0 && *bytes < input.bound.bytes);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let partial = partial.expect("the first restore never partly wrote its download");
+        let signalled = Command::new("kill")
+            .args(["-INT", &first.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(signalled.success());
+        let interrupted = first.wait_with_output().unwrap();
+        let remaining = restic_dumps();
+        assert!(
+            remaining.is_empty(),
+            "restic outlived the interrupted command: {remaining:?}"
+        );
+        assert_eq!(interrupted.status.code(), Some(1));
+        let report: Value = serde_json::from_slice(&interrupted.stdout).unwrap();
+        assert_ne!(report["status"], "ok");
+        println!(
+            "CLI_RESTORE_SIGINT {}",
+            json!({"partial_bytes": partial, "report_status": report["status"], "settlement": report["settlement"], "residue": residue(&input.journal)})
+        );
+    }
     if input.mode == "cli_killed" {
         // A crash mid-download: the command dies while its restic child, in its own
         // process group, keeps writing. The next run must recover and finish.
@@ -289,7 +331,7 @@ fn packaged_cli_restore_entry() {
     assert!(!stderr.contains('_'), "{stderr}");
     let restored = |fixture: &Fixture| json!({"bytes":fixture.bytes, "sha256":fixture.sha256});
     match input.mode.as_str() {
-        "cli_day" | "cli_all" | "cli_killed" => {
+        "cli_day" | "cli_all" | "cli_killed" | "cli_sigint" => {
             assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
             assert_eq!(report["status"], "ok");
             assert_eq!(report["settlement"], "settled");

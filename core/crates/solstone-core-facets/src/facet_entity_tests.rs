@@ -400,6 +400,7 @@ fn promotion_resolves_a_punctuated_identity_through_the_id_namespace() {
         "The repository gate",
         &["the gate".to_owned()],
         false,
+        &Default::default(),
     )
     .unwrap();
     assert_eq!(promotion.attachment.entity_id, "make_ci");
@@ -446,6 +447,7 @@ fn promotion_reuses_a_punctuated_link_already_attached_to_the_facet() {
         "The repository gate",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap();
     assert_eq!(promotion.attachment.entity_id, "make_ci");
@@ -642,6 +644,7 @@ fn promotion_prefers_a_name_match_over_an_id_match() {
         "The repository gate",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap();
     assert_eq!(promotion.attachment.entity_id, "other_id");
@@ -664,6 +667,7 @@ fn promotion_still_refuses_a_blocked_identity_reached_through_the_id_namespace()
         "The repository gate",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap_err();
     assert!(error.to_string().starts_with("conflict:"), "{error}");
@@ -691,6 +695,7 @@ fn promotion_still_mints_an_identity_no_namespace_holds() {
         "Engineer",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap();
     assert_eq!(promotion.attachment.entity_id, "grace_hopper");
@@ -745,6 +750,7 @@ fn promotion_disambiguates_a_duplicate_name_family_by_the_id_it_derives() {
         "A recurring review",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap();
     assert_eq!(promotion.attachment.entity_id, "weekly_reflection");
@@ -771,6 +777,7 @@ fn promotion_still_refuses_a_duplicate_name_family_no_member_can_claim() {
         "A recurring review",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap_err();
     assert_eq!(
@@ -806,6 +813,7 @@ fn promotion_still_refuses_a_shared_name_held_by_an_identity_map_collision_loser
         "A recurring review",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap_err();
     assert_eq!(
@@ -972,6 +980,7 @@ fn a_merge_landing_between_prepare_and_publish_ends_the_promotion_as_a_conflict(
         "An earlier project name",
         &[],
         false,
+        &Default::default(),
     )
     .unwrap();
     let change = promotion.identity.expect("a new identity is prepared");

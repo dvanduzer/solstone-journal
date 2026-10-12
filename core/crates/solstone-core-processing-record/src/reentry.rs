@@ -3,14 +3,13 @@
 
 //! Bounded JSONL evidence reads and analysis-output re-entry decisions.
 
-use std::fmt;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
-use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
+use crate::rows::{LeadingRow, read_leading_rows};
 use crate::{analysis_row_key, is_failure_exhausted, vocab};
 
 /// Branch-2 allowlist for recordless re-entry (describe | depict).
@@ -44,134 +43,17 @@ pub fn read_processing_record_header(path: &Path) -> Option<Value> {
 /// Return whether either of the first two nonblank JSONL rows carries `row_key`
 /// as a top-level key.
 ///
-/// Rows are streamed rather than read through a fixed window, so a row of any
-/// length is judged whole, in constant memory: keys are compared and values are
-/// skipped without being kept. At most two rows are read. A row that is not one
+/// Each row is read whole, in constant memory, so its length does not matter;
+/// at most two rows are read ([`read_leading_rows`]). A row that is not one UTF-8
 /// JSON object on its own line is no evidence, but still counts as one of the two.
 pub fn jsonl_has_row_with_key(path: &Path, row_key: &str) -> bool {
     let Ok(file) = File::open(path) else {
         return false;
     };
-    let mut reader = BufReader::new(file);
-    for _ in 0..2 {
-        match skip_blank_lines(&mut reader) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => return false,
-        }
-        let mut line = LineReader {
-            inner: &mut reader,
-            ended: false,
-        };
-        let found = row_has_key(&mut line, row_key);
-        if io::copy(&mut line, &mut io::sink()).is_err() {
-            return false;
-        }
-        if found {
-            return true;
-        }
-    }
-    false
-}
-
-/// Consume JSON whitespace, including blank lines; false at end of file.
-fn skip_blank_lines(reader: &mut impl BufRead) -> io::Result<bool> {
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            return Ok(false);
-        }
-        let blank = buffer
-            .iter()
-            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-            .count();
-        let more = blank < buffer.len();
-        reader.consume(blank);
-        if more {
-            return Ok(true);
-        }
-    }
-}
-
-/// One line of the underlying reader, ending before its newline (which it consumes).
-struct LineReader<'a, R> {
-    inner: &'a mut R,
-    ended: bool,
-}
-
-impl<R: BufRead> Read for LineReader<'_, R> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.ended || out.is_empty() {
-            return Ok(0);
-        }
-        let buffer = self.inner.fill_buf()?;
-        let (take, newline) = match buffer.iter().position(|byte| *byte == b'\n') {
-            Some(at) => (at.min(out.len()), at <= out.len()),
-            None => (buffer.len().min(out.len()), false),
-        };
-        let at_end = buffer.is_empty();
-        out[..take].copy_from_slice(&buffer[..take]);
-        self.inner.consume(take + usize::from(newline));
-        self.ended = newline || at_end;
-        Ok(take)
-    }
-}
-
-/// Whether this line is exactly one JSON object with `row_key` at its top level.
-fn row_has_key(line: &mut impl Read, row_key: &str) -> bool {
-    let mut deserializer = serde_json::Deserializer::from_reader(line);
-    let found = RowKey(row_key).deserialize(&mut deserializer);
-    matches!(found, Ok(true)) && deserializer.end().is_ok()
-}
-
-/// Visits a row's top-level keys, skipping every value.
-struct RowKey<'k>(&'k str);
-
-impl<'de> DeserializeSeed<'de> for RowKey<'_> {
-    type Value = bool;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
-        deserializer.deserialize_map(self)
-    }
-}
-
-impl<'de> Visitor<'de> for RowKey<'_> {
-    type Value = bool;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSONL row object")
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
-        let mut found = false;
-        while let Some(matched) = map.next_key_seed(KeyIs(self.0))? {
-            found |= matched;
-            map.next_value::<IgnoredAny>()?;
-        }
-        Ok(found)
-    }
-}
-
-/// Compares one key without keeping it.
-struct KeyIs<'k>(&'k str);
-
-impl<'de> DeserializeSeed<'de> for KeyIs<'_> {
-    type Value = bool;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
-        deserializer.deserialize_str(self)
-    }
-}
-
-impl<'de> Visitor<'de> for KeyIs<'_> {
-    type Value = bool;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an object key")
-    }
-
-    fn visit_str<E: de::Error>(self, key: &str) -> Result<bool, E> {
-        Ok(key == self.0)
-    }
+    read_leading_rows(BufReader::new(file), Some(row_key)).is_ok_and(|rows| {
+        rows.iter()
+            .any(|row| matches!(row, LeadingRow::Object { has_key: true, .. }))
+    })
 }
 
 /// Return whether an existing analysis output should be retried by `handler`.

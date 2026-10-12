@@ -4,7 +4,10 @@
 //! Read-only schema and folds for per-day thinking health logs.
 
 mod work_readiness;
-pub use work_readiness::{day_segments_ready, segment_work_ready};
+pub use work_readiness::{
+    SegmentReadiness, day_segments_ready, day_unpublished_segments, segment_readiness,
+    segment_work_ready,
+};
 
 #[cfg(test)]
 mod acceptance_tests;

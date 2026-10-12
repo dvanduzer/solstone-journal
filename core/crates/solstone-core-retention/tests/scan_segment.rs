@@ -429,6 +429,87 @@ mod bound {
         assert!(!observed.files()[0].sidecar.has_analysis_row);
     }
 
+    /// A long transcript whose read bound falls inside a multi-byte character.
+    #[test]
+    fn a_character_cut_by_the_read_bound_neither_refuses_nor_hides_rows() {
+        let bed = Bed::new();
+        bed.write("audio.flac", b"1234567");
+        let bound = READ_BOUND as usize;
+        let mut sidecar = format!(
+            "{{\"_solstone_processing\": {{\"schema\": \"{}\", \"state\": \"analyzed\"}}}}\n{{\"start\": 0, \"text\": \"hi\"}}\n",
+            vocab::SCHEMA
+        );
+        let filler = format!("{{\"start\": 1, \"text\": \"{}\"}}\n", "b".repeat(1000));
+        while sidecar.len() + filler.len() < bound - 2000 {
+            sidecar.push_str(&filler);
+        }
+        sidecar.push_str("{\"start\": 2, \"text\": \"");
+        sidecar.push_str(&"c".repeat(bound - 2 - sidecar.len()));
+        sidecar.push_str("\u{1F600}\"}\n");
+        assert!(!sidecar.is_char_boundary(bound));
+        bed.write("audio.jsonl", &sidecar);
+
+        let bound_scan = bed.scan(2).unwrap();
+        let path_scan =
+            scan_segment_checked(&bed.path(), &ClosedHandlerSet, &JournalMedia).unwrap();
+        let soft = read_sidecar(
+            &bed.path().join("audio.jsonl"),
+            Some(vocab::AUDIO_TRANSCRIPT_ROW_KEY),
+        );
+        for facts in [
+            &bound_scan.files()[0].sidecar,
+            &path_scan.files()[0].sidecar,
+            &soft,
+        ] {
+            assert!(facts.record.is_some());
+            assert!(facts.has_analysis_row);
+        }
+    }
+
+    /// A header longer than the bound, cut mid-character, holds the raw without
+    /// refusing the segment.
+    #[test]
+    fn a_header_cut_mid_character_by_the_bound_holds_without_refusing() {
+        let bed = Bed::new();
+        bed.write("audio.flac", b"1234567");
+        let sidecar = format!(
+            "{{\"pad\": \"{}\", \"_solstone_processing\": {{}}}}\n{{\"start\": 0}}\n",
+            "\u{e9}".repeat(READ_BOUND as usize)
+        );
+        assert!(!sidecar.is_char_boundary(READ_BOUND as usize));
+        bed.write("audio.jsonl", &sidecar);
+        let bound_scan = bed.scan(2).unwrap();
+        let path_scan =
+            scan_segment_checked(&bed.path(), &ClosedHandlerSet, &JournalMedia).unwrap();
+        for facts in [
+            &bound_scan.files()[0].sidecar,
+            &path_scan.files()[0].sidecar,
+        ] {
+            assert!(facts.record.is_none());
+            assert!(!facts.has_analysis_row);
+        }
+    }
+
+    /// Only the rows the decision reads are held to UTF-8.
+    #[test]
+    fn invalid_utf8_refuses_only_within_the_rows_read() {
+        let bed = Bed::new();
+        bed.write("audio.flac", b"1234567");
+        bed.write("audio.jsonl", b"{}\n{\"start\": \"\xff\"}\n");
+        assert!(bed.scan(2).is_err());
+        assert!(scan_segment_checked(&bed.path(), &ClosedHandlerSet, &JournalMedia).is_err());
+
+        bed.write("audio.jsonl", b"{}\n{\"start\": 0}\n\xff\n");
+        assert!(bed.scan(2).unwrap().files()[0].sidecar.has_analysis_row);
+        assert!(
+            scan_segment_checked(&bed.path(), &ClosedHandlerSet, &JournalMedia)
+                .unwrap()
+                .files()[0]
+                .sidecar
+                .has_analysis_row
+        );
+    }
+
     #[test]
     fn bound_nonplain_raw_or_sidecar_and_invalid_utf8_refuse() {
         let bed = Bed::new();

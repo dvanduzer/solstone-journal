@@ -6,6 +6,7 @@
 pub mod media;
 pub mod predicate;
 pub mod reentry;
+pub mod rows;
 pub mod vocab;
 
 #[cfg(test)]
@@ -18,3 +19,4 @@ pub use predicate::{
 pub use reentry::{
     jsonl_has_row_with_key, read_processing_record_header, should_reenter_analysis_output,
 };
+pub use rows::{LeadingRow, read_leading_rows};
