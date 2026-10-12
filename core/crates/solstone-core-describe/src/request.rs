@@ -56,7 +56,10 @@ pub fn request(
             },
         ],
         system_instruction: Some(instruction.to_owned()),
-        temperature: 0.7,
+        // Categorization is a closed choice that picks the extractor. Sampled at
+        // 0.7 the same screen changed categories between tries; greedy matched or
+        // beat it on a labelled sample.
+        temperature: 0.0,
         max_output_tokens: 256,
         timeout_s: None,
         json_output: true,

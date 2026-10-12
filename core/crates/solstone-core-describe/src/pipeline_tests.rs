@@ -374,7 +374,7 @@ fn synthetic_decode_covers_pipeline_contracts_without_native_media() {
     assert_eq!(phase_one.len(), 3);
     assert!(phase_one.iter().all(|request| {
         request.json_output
-            && request.temperature == 0.7
+            && request.temperature == 0.0
             && request.max_output_tokens == 256
             && request
                 .system_instruction
