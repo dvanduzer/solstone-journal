@@ -231,7 +231,7 @@ fn valid_asset(directory: &Path, name: &str) -> Option<PathBuf> {
         .map(|_| asset)
 }
 
-fn verify_digest(name: &str, path: PathBuf) -> Result<PathBuf, ModelAssetError> {
+pub(crate) fn verify_digest(name: &str, path: PathBuf) -> Result<PathBuf, ModelAssetError> {
     let expected = expected_sha256(name);
     let actual = sha256_file(&path).unwrap_or_else(|error| format!("<unreadable: {error}>"));
     if actual == expected {
