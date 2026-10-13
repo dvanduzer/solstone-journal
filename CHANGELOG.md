@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- when your journal can't set up its solstone.me address, the agents app now says the problem is on this computer and needs a fix, instead of saying this computer isn't reaching solstone.me and will keep trying. `solstone journal health logs` names the step that failed.
+- `solstone journal mcp token create` now says that an agent using a new token can't read your journal until you grant it access, and prints the command to do that.
 - on windows, media offload runs again. you can approve its proposals from the home page and bring the media back from the backup page or with `solstone journal backup offload restore`, including media an earlier version offloaded.
 - your journal renews its private link service token automatically before it expires or when the relay stops publishing the key that signed the token, keeping remote connections alive without having to turn private link off and on.
 

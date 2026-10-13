@@ -270,7 +270,8 @@
     if (enableOp?.phase === 'error' || enableOp?.phase === 'revoked') return 'failed';
     if (!state.enabled) return state.owner_state?.address ? 'turnedoff' : 'off';
     if (state.status === 'on') return 'on';
-    if (state.status === 'offline' || state.status === 'failed') return 'offline';
+    if (state.status === 'offline') return 'offline';
+    if (state.status === 'failed') return 'stopped';
     if (state.status === 'renewal_overdue') return 'renewal';
     if (state.status === 'needs_subscription') return 'lapsed';
     if (state.status === 'not_accepted') return 'refused';
@@ -278,7 +279,7 @@
     return 'turning';
   }
   function meTag() {
-    return {unavailable:['','not available'], off:['','off'], turnedoff:['','off'], approve:['warn','setting up'], notyet:['warn','not on yet'], failed:['warn','not on yet'], on:['on','on'], offline:['warn','offline'], renewal:['warn','needs attention'], lapsed:['warn','not on'], refused:['warn','needs attention'], held:['warn', state.status === 'address_not_ready' ? 'not ready yet' : 'needs attention'], turning:['warn','turning on']}[meState()];
+    return {unavailable:['','not available'], off:['','off'], turnedoff:['','off'], approve:['warn','setting up'], notyet:['warn','not on yet'], failed:['warn','not on yet'], on:['on','on'], offline:['warn','offline'], stopped:['warn','needs attention'], renewal:['warn','needs attention'], lapsed:['warn','not on'], refused:['warn','needs attention'], held:['warn', state.status === 'address_not_ready' ? 'not ready yet' : 'needs attention'], turning:['warn','turning on']}[meState()];
   }
   function meBody() {
     const me = meState();
@@ -302,6 +303,7 @@
       return `<div class="lane-body">${row('turning on', true)}<ol class="legs">${legs.map(([title, leg], i) => `<li class="${leg === 'done' ? 'done' : ''}"><span class="step">${leg === 'done' ? '✓' : i + 1}</span><span>${title}</span><span class="meta">${esc(leg.replaceAll('_', ' '))}</span></li>`).join('')}</ol>${owner.certificate_leg === 'not_this_week' ? `<div class="notice"><p>certificates are rationed each week, and this week's have run out. your journal tries again on its own.${next}</p></div>` : ''}<p class="note">your journal does this itself. you can leave this page.</p></div>`;
     }
     if (me === 'offline') return `<div class="lane-body">${row('on, not reaching it right now', true)}${address}<div class="notice"><p>this computer isn't reaching solstone.me right now, so agents can't reach your journal through it. your journal keeps trying on its own.</p></div>${about}</div>`;
+    if (me === 'stopped') return `<div class="lane-body">${row("on, but it isn't working", true)}<div class="notice"><p>${esc(state.owner_state?.detail || "solstone.me isn't working on this journal.")}</p></div>${about}</div>`;
     if (me === 'renewal') return `<div class="lane-body">${row('on, certificate renewal overdue', true)}${address}<div class="notice"><p>the address's certificate is past its renewal window and its renewal hasn't gone through yet. your journal keeps trying on its own. if the certificate expires first, agents will see a warning from their side.</p></div>${about}</div>`;
     if (me === 'lapsed') return `<div class="lane-body">${row("on here, but solstone.me isn't on", true)}<div class="notice"><p>finish turning it on in the services portal, and your journal picks it up on its own. it checks about every five minutes.${next}</p></div><div class="hand"><a class="btn primary" data-solstone-outside href="${esc(state.subscribe_url || PORTAL)}" target="_blank" rel="noopener">open the services portal</a></div></div>`;
     if (me === 'held') return `<div class="lane-body">${row('on, not reachable right now', true)}<div class="notice"><p>${esc(state.owner_state?.detail || "solstone.me isn't reachable right now. your journal keeps trying on its own.")}${next}</p></div>${about}</div>`;
@@ -316,6 +318,7 @@
     const ownOn = own === 'on', meOn = me === 'on' || me === 'renewal';
     if (ownOn && meOn) return ['g', 'agents on this computer, and anywhere through solstone.me, can reach your journal.'];
     if (ownOn && me === 'offline') return ['a', "agents on this computer can reach your journal. solstone.me isn't reaching it right now."];
+    if (ownOn && me === 'stopped') return ['a', "agents on this computer can reach your journal. solstone.me isn't working on it."];
     if (ownOn) return ['g', 'agents on this computer can reach your journal.'];
     if (meOn) return ['g', 'agents can reach your journal through solstone.me.'];
     if (own === 'down' || own === 'unreadable') return ['a', "agents on this computer can't reach your journal right now."];
