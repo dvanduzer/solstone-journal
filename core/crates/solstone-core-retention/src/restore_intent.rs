@@ -284,6 +284,35 @@ pub struct PublicationFacts {
     pub error: Option<String>,
 }
 
+impl PublicationFacts {
+    pub fn matches_ignoring_cleanup(&self, other: &Self) -> bool {
+        self.effect == other.effect
+            && self.confirmation == other.confirmation
+            && self.file_durability == other.file_durability
+            && self.parent_durability == other.parent_durability
+            && self.identity == other.identity
+            && self.error == other.error
+    }
+
+    pub fn is_valid_successor(&self, next: &Self) -> bool {
+        if self.effect != next.effect
+            || self.confirmation != next.confirmation
+            || self.cleanup != next.cleanup
+            || self.identity != next.identity
+            || self.error != next.error
+        {
+            return false;
+        }
+        let file_valid = self.file_durability == next.file_durability
+            || (self.file_durability == Durability::Unproven
+                && next.file_durability == Durability::Synced);
+        let parent_valid = self.parent_durability == next.parent_durability
+            || (self.parent_durability == Durability::Unproven
+                && next.parent_durability == Durability::Synced);
+        file_valid && parent_valid
+    }
+}
+
 impl From<&PublicationReceipt> for PublicationFacts {
     fn from(receipt: &PublicationReceipt) -> Self {
         Self {
@@ -665,7 +694,12 @@ impl RestoreIntent {
             || self.destination != next.destination
             || self.stage != next.stage
             || self.retirement != next.retirement
-            || self.outcome.as_ref().is_some_and(|facts| next.outcome.as_ref() != Some(facts))
+            || self.outcome.as_ref().is_some_and(|facts| {
+                match &next.outcome {
+                    Some(next_facts) => !facts.is_valid_successor(next_facts),
+                    None => true,
+                }
+            })
             || self.confirmed.as_ref().is_some_and(|facts| next.confirmed.as_ref() != Some(facts))
             || self.event_recorded == Obligation::Complete && self.event != next.event
             || self.event_recorded == Obligation::Complete
@@ -753,6 +787,27 @@ impl RestoreIntent {
                 facts,
                 effects,
             })
+    }
+
+    /// Advance parent directory durability monotonically from Unproven to Synced
+    /// before event publication completes.
+    pub fn advance_parent_durability(&mut self) -> Result<(), RepairHold> {
+        if self.event_recorded == Obligation::Complete {
+            return Err(RepairHold::ImmutableEvent);
+        }
+        let Some(outcome) = &self.outcome else {
+            return Err(RepairHold::InvalidIntent);
+        };
+        if outcome.parent_durability == Durability::Synced {
+            return Ok(());
+        }
+        let mut updated_outcome = outcome.clone();
+        updated_outcome.parent_durability = Durability::Synced;
+        let mut updated = self.clone();
+        updated.outcome = Some(updated_outcome);
+        self.validate_successor(&updated)?;
+        *self = updated;
+        Ok(())
     }
 
     fn record_outcome_checked(
@@ -1448,7 +1503,15 @@ pub(super) mod tests {
         rebound.outcome.as_mut().unwrap().error = None;
         rebound.outcome.as_mut().unwrap().parent_durability = Durability::Synced;
         rebound.validate().unwrap();
-        assert!(published.validate_successor(&rebound).is_err());
+        assert_eq!(published.validate_successor(&rebound), Ok(()));
+        let mut regressed = rebound.clone();
+        regressed.outcome.as_mut().unwrap().parent_durability = Durability::Unproven;
+        regressed.validate().unwrap();
+        assert!(rebound.validate_successor(&regressed).is_err());
+        let mut modified = rebound.clone();
+        modified.outcome.as_mut().unwrap().error = Some("changed".into());
+        modified.validate().unwrap();
+        assert!(published.validate_successor(&modified).is_err());
         let mut rebound = published.clone();
         rebound.event.files[0].disposition = RestoreDisposition::AlreadyPresent;
         rebound.confirmed.as_mut().unwrap().identity = identity(99);

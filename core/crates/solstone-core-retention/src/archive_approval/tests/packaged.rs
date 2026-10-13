@@ -1095,8 +1095,8 @@ fn parent_check_attempts(
         assert_eq!(native.original_name, OriginalName::Absent);
         assert_eq!(native.claim_confirmation, Confirmation::Confirmed);
         assert_eq!(native.cleanup, Cleanup::Complete);
+        assert_eq!(native.file_durability, Durability::Unproven);
         for durability in [
-            native.file_durability,
             native.source_durability,
             native.claim_durability,
             native.stage_parent_durability,
@@ -2200,8 +2200,8 @@ mod owned_finish_qualification {
         assert!(receipt.claimed_identity.is_some());
         assert!(!receipt.restoration_attempted);
         assert!(receipt.failures.is_empty());
+        assert_eq!(receipt.file_durability, Durability::Unproven);
         for fact in [
-            receipt.file_durability,
             receipt.source_durability,
             receipt.claim_durability,
             receipt.stage_parent_durability,

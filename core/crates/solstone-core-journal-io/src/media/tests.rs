@@ -1423,7 +1423,7 @@ mod removal {
         assert!(!path.exists());
         #[cfg(unix)]
         {
-            assert_eq!(receipt.file_durability, Durability::Synced);
+            assert_eq!(receipt.file_durability, Durability::Unproven);
             assert_eq!(receipt.source_durability, Durability::Synced);
             assert_eq!(receipt.claim_durability, Durability::Synced);
             assert_eq!(receipt.stage_parent_durability, Durability::Synced);

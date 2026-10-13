@@ -908,15 +908,42 @@ impl TransactionOutcome<'_, '_> {
             return self.finish_no_effect(commit, time);
         }
         let intent = &self.record()?.intent;
-        let unproven = intent.outcome.as_ref().is_some_and(|facts| {
+        let unproven_content = intent.outcome.as_ref().is_some_and(|facts| {
             (matches!(
                 facts.effect,
                 PublicationEffect::Published | PublicationEffect::AlreadyPresent
             ) && facts.confirmation != Confirmation::Confirmed)
                 || (facts.effect == PublicationEffect::Published
-                    && (facts.file_durability != Durability::Synced
-                        || facts.parent_durability != Durability::Synced))
+                    && facts.file_durability != Durability::Synced)
         });
+        if unproven_content {
+            return Err(Hold::Repair(RepairHold::UncertainContent));
+        }
+        let missing_parent_sync = intent.outcome.as_ref().is_some_and(|facts| {
+            matches!(
+                facts.effect,
+                PublicationEffect::Published | PublicationEffect::AlreadyPresent
+            ) && facts.confirmation == Confirmation::Confirmed
+                && (facts.effect != PublicationEffect::Published
+                    || facts.file_durability == Durability::Synced)
+                && facts.parent_durability != Durability::Synced
+        });
+        if missing_parent_sync {
+            if !replay {
+                return Err(Hold::Retirement);
+            }
+            self.live_matches()?;
+            if self.owner.destination.live().sync().is_ok() {
+                self.record_mut()?
+                    .intent
+                    .advance_parent_durability()
+                    .map_err(Hold::Repair)?;
+                self.persist()?;
+            } else {
+                return Err(Hold::Retirement);
+            }
+        }
+        let intent = &self.record()?.intent;
         let changed_day = intent.outcome.as_ref().is_some_and(|facts| {
             matches!(
                 facts.effect,
@@ -930,9 +957,6 @@ impl TransactionOutcome<'_, '_> {
             self.bump_marker(options)?;
             self.record_mut()?.intent.marker = Obligation::Complete;
             self.persist()?;
-        }
-        if unproven {
-            return Err(Hold::Repair(RepairHold::UncertainContent));
         }
         let decision = self.inspect()?;
         let successful = decision.event.files.iter().all(|file| {
@@ -1069,13 +1093,19 @@ impl TransactionOutcome<'_, '_> {
 
     fn finish_no_effect(&mut self, commit: &SegmentCommit<'_>, time: u64) -> Result<(), Hold> {
         let receipt = self.publication.as_ref().ok_or(Hold::Retirement)?;
+        let expected_facts =
+            solstone_core_retention::restore_intent::PublicationFacts::from(receipt);
         if !matches!(
             receipt.effect,
             PublicationEffect::Conflict | PublicationEffect::NotPublished
         ) || receipt.identity.is_some()
             || self.effects != AttemptEffects::default()
-            || self.record()?.intent.outcome.as_ref()
-                != Some(&solstone_core_retention::restore_intent::PublicationFacts::from(receipt))
+            || !self
+                .record()?
+                .intent
+                .outcome
+                .as_ref()
+                .is_some_and(|facts| facts.matches_ignoring_cleanup(&expected_facts))
         {
             return Err(Hold::Retirement);
         }

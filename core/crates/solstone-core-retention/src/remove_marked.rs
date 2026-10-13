@@ -2027,17 +2027,26 @@ fn execute_reviewed_mode(
                     .attempts
                     .get(*index)
                     .ok_or(ReviewedRemovalRefusal::Changed)?;
+                let receipt = attempt.native.receipt();
+                if staged.is_none() && receipt.cleanup != Cleanup::Complete {
+                    staged = reviewed_stage_path(&attempt.native);
+                }
+                if receipt.cleanup != Cleanup::Complete {
+                    complete = false;
+                    if !remaining.contains(name) {
+                        remaining.push(name.clone());
+                    }
+                    failed = true;
+                }
                 if !attempt.settled {
                     complete = false;
-                    remaining.push(name.clone());
-                    let receipt = attempt.native.receipt();
+                    if !remaining.contains(name) {
+                        remaining.push(name.clone());
+                    }
                     if receipt.effect != RemovalEffect::NotClaimed
                         || receipt.cleanup != Cleanup::Complete
                     {
                         failed = true;
-                        if staged.is_none() && receipt.cleanup != Cleanup::Complete {
-                            staged = reviewed_stage_path(&attempt.native);
-                        }
                     }
                     if receipt.effect == RemovalEffect::Deleted {
                         row.post_commit_failure = Some(crate::receipt::PostCommitFailure {
@@ -2162,7 +2171,7 @@ fn reviewed_bookkeeping(
     now: DateTime<Utc>,
     attempt: &mut ReviewedFileRemoval,
 ) {
-    use solstone_core_journal_io::media::{Cleanup, Durability};
+    use solstone_core_journal_io::media::Durability;
     use std::ffi::OsStr;
     let bindings = || -> std::io::Result<()> {
         root.revalidate_canonical_binding()
@@ -2224,11 +2233,8 @@ fn reviewed_bookkeeping(
     );
     attempt.binding = bindings().err();
     let native = attempt.native.receipt();
-    let native_settled = native.file_durability == Durability::Synced
-        && native.source_durability == Durability::Synced
-        && native.claim_durability == Durability::Synced
-        && native.stage_parent_durability == Durability::Synced
-        && native.cleanup == Cleanup::Complete;
+    let native_settled = native.source_durability == Durability::Synced
+        && native.claim_durability == Durability::Synced;
     let append_settled = attempt.append.as_ref().is_some_and(|a| {
         a.confirmation() == solstone_core_journal_io::append::BoundAppendConfirmation::Confirmed
             && a.file_durability()
