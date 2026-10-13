@@ -3306,7 +3306,12 @@ mod tests {
             .journal
             .join("chronicle/20260101")
             .join(std::ffi::OsStr::from_bytes(&[0xff]));
-        fs::create_dir_all(&odd).unwrap();
+        // APFS refuses a name that is not UTF-8 (EILSEQ), so this sub-case runs
+        // only where the filesystem stores the raw bytes, as Linux does.
+        match fs::create_dir_all(&odd) {
+            Err(error) if error.raw_os_error() == Some(nix::libc::EILSEQ) => return,
+            created => created.unwrap(),
+        }
         fs::write(odd.join("location.jsonl"), b"bytes").unwrap();
         let outcome = execute(
             request,
