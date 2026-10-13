@@ -1013,11 +1013,8 @@ fn remove_one(
     }
 
     // Step 2: stage, then make the move durable.
-    if let Err(reason) = guard.before_phase(target) {
+    if let Err(reason) = stage_segment(guard, target, &live, &staged) {
         return (refused(target, live, reason), false);
-    }
-    if let Err(error) = rename_within(journal, &live, &staged) {
-        return (refused(target, live, owner_reason(&error)), false);
     }
     #[cfg(all(test, unix, feature = "full-tests"))]
     cooperation_tests::checkpoint(cooperation_tests::Phase::AfterPivot, target);
@@ -1032,6 +1029,82 @@ fn remove_one(
         finish_staged(guard, target, &staged, deleted_at, reason, cid),
         true,
     )
+}
+
+// Windows cannot rename a directory while a reader holds a leaf anywhere below
+// it, even with delete sharing. Wait for those short reads at the claim boundary;
+// do not replace the claim with an in-place delete or change recovery's name.
+fn stage_segment(
+    guard: &WholeSegmentActivity<'_>,
+    target: &Target,
+    live: &str,
+    staged: &str,
+) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        guard.before_phase(target)?;
+        rename_within(guard.journal(), live, staged).map_err(|error| owner_reason(&error))
+    }
+    #[cfg(windows)]
+    stage_segment_windows(guard, target, live, staged)
+}
+
+#[cfg(windows)]
+fn stage_segment_windows(
+    guard: &WholeSegmentActivity<'_>,
+    target: &Target,
+    live: &str,
+    staged: &str,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        guard.before_phase(target)?;
+        // Recheck on each attempt: a retry must never overwrite another claim.
+        if !matches!(path_lexists(&guard.journal().join(staged)), Ok(false)) {
+            return Err("a previous removal of this segment did not finish; \
+                        it needs looking at before this can be retried"
+                .to_owned());
+        }
+        match rename_within(guard.journal(), live, staged) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if matches!(
+                    &error,
+                    solstone_core_journal_io::PathError::Io { source, .. }
+                        if matches!(source.raw_os_error(), Some(5 | 32))
+                ) && std::time::Instant::now() < deadline
+                {
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    stage_test_hook::retrying();
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                return Err(owner_reason(&error));
+            }
+        }
+    }
+}
+
+/// One-shot interleaving at a refused Windows removal claim.
+#[cfg(all(windows, any(test, feature = "test-hooks")))]
+pub mod stage_test_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run the callback after this thread's first transient staging refusal.
+    pub fn on_retry(callback: impl FnOnce() + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+    }
+
+    pub(super) fn retrying() {
+        let callback = HOOK.with(|hook| hook.borrow_mut().take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
 }
 
 /// Bump the day's stream marker, and record a failure in the row's single
@@ -2181,6 +2254,58 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec![TOMBSTONE_NAME.to_owned()]);
+    }
+
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    fn segment_delete_waits_for_ordinary_and_nested_readers() {
+        for name in ["audio.flac", "talents/sense.json"] {
+            let bed = Bed::new();
+            let segment = populated(&bed, "070000_17");
+            let reader = fs::File::open(segment.join(name)).unwrap();
+            stage_test_hook::on_retry(move || drop(reader));
+            let outcome = remove(&bed, &[target("20260805", "field.audio", "070000_17")]);
+            assert!(!outcome.has_failures(), "{outcome:?}");
+            assert!(!segment.join(name).exists());
+            assert!(segment.join(TOMBSTONE_NAME).is_file());
+        }
+    }
+
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    fn segment_delete_refuses_a_claim_that_appears_during_retry() {
+        let bed = Bed::new();
+        let segment = populated(&bed, "070000_17");
+        let reader = fs::File::open(segment.join("audio.flac")).unwrap();
+        let staged = segment.with_file_name(".removing_070000_17");
+        let hook_staged = staged.clone();
+        stage_test_hook::on_retry(move || {
+            fs::create_dir(&hook_staged).unwrap();
+            fs::write(hook_staged.join("keep"), b"another claim").unwrap();
+            drop(reader);
+        });
+        let outcome = remove(&bed, &[target("20260805", "field.audio", "070000_17")]);
+        assert!(outcome.has_failures(), "{outcome:?}");
+        assert!(segment.join("audio.flac").is_file());
+        assert!(!segment.join(TOMBSTONE_NAME).exists());
+        assert_eq!(fs::read(staged.join("keep")).unwrap(), b"another claim");
+    }
+
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    fn segment_delete_refuses_a_reader_that_outlives_the_retry_budget() {
+        let bed = Bed::new();
+        let segment = populated(&bed, "070000_17");
+        let reader = fs::File::open(segment.join("audio.flac")).unwrap();
+        let started = std::time::Instant::now();
+        let outcome = remove(&bed, &[target("20260805", "field.audio", "070000_17")]);
+        assert!(outcome.has_failures(), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(segment.join("audio.flac").is_file());
+        assert!(!segment.join(TOMBSTONE_NAME).exists());
+        assert!(!segment.with_file_name(".removing_070000_17").exists());
+        drop(reader);
+        assert!(!remove(&bed, &[target("20260805", "field.audio", "070000_17")]).has_failures());
     }
 
     #[cfg(feature = "full-tests")]

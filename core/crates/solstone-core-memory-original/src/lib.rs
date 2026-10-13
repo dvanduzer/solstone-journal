@@ -533,7 +533,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(feature = "full-tests", not(windows)))]
     #[test]
     fn real_deletion_completes_while_bounded_reader_holds_leaf_open() {
         let root = temporary_journal("delete-open-leaf");
@@ -552,6 +552,38 @@ mod tests {
         ));
         assert!(ran.get());
         assert!(segment.join("tombstone.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(feature = "full-tests", windows))]
+    #[test]
+    fn real_deletion_completes_while_bounded_reader_holds_leaf_open() {
+        let root = temporary_journal("delete-open-leaf");
+        let (source, coordinate, segment) = ready_fixture(&root);
+        let hook_root = root.clone();
+        let hook_coordinate = coordinate.clone();
+        let worker = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_worker = worker.clone();
+        solstone_core_journal_io::read_test_hook::after_open(segment.join("note.txt"), move || {
+            let (retried, retry) = std::sync::mpsc::channel();
+            *hook_worker.borrow_mut() = Some(std::thread::spawn(move || {
+                solstone_core_retention::door::stage_test_hook::on_retry(move || {
+                    retried.send(()).unwrap();
+                });
+                delete_original(&hook_root, &hook_coordinate);
+            }));
+            // Prove deletion encountered the held leaf, then let the real read
+            // close it. A one-shot staging rename fails this handshake.
+            retry.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let _read = read_original(&root, &source, &coordinate);
+        worker.borrow_mut().take().unwrap().join().unwrap();
+        assert_eq!(
+            read_original(&root, &source, &coordinate),
+            OriginalRead::Deleted
+        );
+        assert!(segment.join("tombstone.json").is_file());
+        assert!(!segment.join("note.txt").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
