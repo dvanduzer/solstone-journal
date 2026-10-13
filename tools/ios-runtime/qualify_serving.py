@@ -27,12 +27,12 @@ class Phone:
         self.processes = []
         self.log = (args.output / 'phone.jsonl').open('w')
 
-    def launch(self):
+    def launch(self, extra_args=()):
         self.events = queue.Queue()
         process = subprocess.Popen([
             'xcrun', 'devicectl', 'device', 'process', 'launch', '--device', self.args.device,
             '--console', '--terminate-existing', BUNDLE, '--serve', '--suite', self.args.suite,
-            '--port', str(self.args.port), '--duration', '1700'],
+            '--port', str(self.args.port), '--duration', '1700', *extra_args],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.processes.append(process)
         events = self.events
@@ -60,12 +60,12 @@ class Phone:
             if predicate(row):
                 return row
 
-    def control(self, op, payload='', count=128):
+    def control(self, op, payload='', count=128, mode='reopen'):
         identifier = uuid.uuid4().hex
         command = self.args.output / 'command.json'
         command.write_text(json.dumps({'id': identifier, 'request': {
             'op': op, 'journal': self.args.suite, 'root': '', 'count': count,
-            'seconds': 0, 'revision': 0, 'mode': 'reopen', 'storage': 'serving', 'payload': payload}}))
+            'seconds': 0, 'revision': 0, 'mode': mode, 'storage': 'serving', 'payload': payload}}))
         subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', self.args.device,
                         '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
                         '--source', str(command), '--destination', 'Documents/owner-command.json'],

@@ -12,7 +12,7 @@ settings:
     DEVELOPMENT_TEAM: 7QCG8V4M6H
     SWIFT_OBJC_BRIDGING_HEADER: Shared/Bridge.h
     OTHER_LDFLAGS: $(RUST_LIB) -lc++ -lz -liconv -framework Foundation -framework
-      Security -framework SystemConfiguration
+      Security -framework SystemConfiguration -framework Metal -framework MetalKit -framework Accelerate
     ENABLE_DEBUG_DYLIB: false
     OTHER_CODE_SIGN_FLAGS: --keychain /Users/jer/Library/Keychains/sol-signing.keychain-db
     CURRENT_PROJECT_VERSION: 1
@@ -26,6 +26,9 @@ targets:
     - Host
     - Shared
     - path: Resources/JournalPayload
+      type: folder
+      buildPhase: resources
+    - path: Resources/AudioModels
       type: folder
       buildPhase: resources
     settings:

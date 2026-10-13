@@ -60,3 +60,22 @@ Activity creation uses a stable `since_segment`. A repeated create returns a con
 The host accepts qualification commands from its own `Documents/owner-command.json`, dispatches owner requests in process, sends index/export operations over private XPC, and writes `owner-reply.json`. Each command has an ID, the launched suite name and the `serving` storage selection. The host records consumption before execution and retains the command file through the USB transfer check. A host death can leave an uncertain owner-control reply; it never automatically replays that command. These files are development operator controls inside the app container, with no network route. `serve-stop` closes the listener before the harness snapshots source records and exports SQLite. The verifier independently checks exact source fields, record IDs, FTS population and database integrity, including a deliberately wrong-payload control. Receipts retain source hashes, process IDs, foreground heartbeats, thermal states and resource counters. Credentials remain in a separate mode-0600 file and must stay out of shared receipts.
 
 Incoming TCP listening does not require Local Network privilege on iOS, as described in [Apple TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy). This adapter performs no Bonjour discovery. Outbound connections and discovery have separate permission rules. Physical qualification covers the observed foreground listener lifetime; background serving and unattended endurance remain unqualified.
+
+## Local audio processing
+
+The optional audio build runs local inference on a dedicated thread in the foreground host. It uses the maintained Parakeet C API and the production decoder, VAD, speaker analysis, transcript publication and index scanner. The [mobile audio adapter](../mobile-audio/README.md) verifies the pinned model before loading it. The app bundles the models; the helper continues to own storage checks and database export.
+
+Stage verified native libraries and models, then build on the Mac:
+
+```sh
+python3 tools/mobile-audio/prepare.py --retained <ios-native-build-directory> --output /var/tmp/audio-inputs
+export PARAKEET_LIB_DIR=/var/tmp/audio-inputs/parakeet
+export ORT_LIB_PATH=/var/tmp/audio-inputs/onnx
+export ORT_PREFER_DYNAMIC_LINK=false
+make -C tools/ios-runtime install AUDIO_MODELS_DIR=/var/tmp/audio-inputs/models DEVICE=<device-identifier>
+python3 tools/ios-runtime/qualify_audio.py --device <id> --host <phone-wifi-ip> --suite audio1 --client tools/mobile-serving/client/target/debug/ios-serving-client --output /var/tmp/audio1
+```
+
+The [audio qualification](qualify_audio.py) generates synthetic speech on the Mac and uploads it through the production protocol-v3 device-ingest route over paired SPL. The phone discovers inputs with accepted custody receipts, decodes and transcribes them locally, writes normal transcript and speaker outputs, and indexes them for authenticated search. The verifier compares raw-file hashes, transcript content, custody records, exported embedding sidecars and SQLite search rows. It records native stage timing, foreground resource counters, thermal state and request latency during processing. Use a fresh suite and output directory; `--smoke` runs only the first speech case.
+
+The embedded processing pass accepts at most 16 MiB of encoded input and 30 seconds of decoded mono audio at 16 kHz. Over-limit or failed input keeps its original file. These processing limits do not change the ingest format contract. Restarting the process retries failed inputs. Model failure leaves the authenticated listener available. Cancellation takes effect at native stage boundaries; an active inference call may finish before cancellation is observed. The default build and serving startup leave audio processing disabled.
