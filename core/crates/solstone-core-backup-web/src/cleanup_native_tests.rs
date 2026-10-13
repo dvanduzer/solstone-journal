@@ -36,6 +36,7 @@ const INNER_MARKERS: &[&str] = &[
     "BACKUP_CLEANUP_GLOBAL_RESULT_PRESERVED_PASS",
     "BACKUP_CLEANUP_WHOLE_RECORDING_GUARD_PASS",
     "BACKUP_CLEANUP_SELECTIVE_RESTORE_HELD_PASS",
+    "BACKUP_CLEANUP_ARCHIVE_QUERY_RELEASE_PASS",
 ];
 
 fn run_owned_fixture() {
@@ -182,6 +183,148 @@ struct FaultRunner {
     publish: Mutex<mpsc::Receiver<()>>,
     calls: AtomicUsize,
     partial_output: Option<PathBuf>,
+}
+
+struct ArchiveQueryFault(HelperCleanupObservationFault);
+
+struct ArchiveQueryCleanup(BoundedHelperCleanup);
+
+impl solstone_core_backup::archive_readback::WindowsArchiveCleanup for ArchiveQueryCleanup {
+    fn quiescent(&self) -> bool {
+        matches!(self.0.observe(), HelperCleanupStatus::Quiescent)
+    }
+}
+
+impl solstone_core_backup::archive_readback::WindowsArchiveExecutor for ArchiveQueryFault {
+    fn run_cancellable(
+        &self,
+        request: solstone_core_backup::archive_readback::WindowsArchiveRequest<'_>,
+        _capture_limit: usize,
+    ) -> solstone_core_backup::archive_readback::WindowsExecutionOutput {
+        assert_eq!(request.argv, [OsString::from("version")]);
+        let mut resources = BoundedHelperResources::new();
+        resources.retain(Arc::new(request.retained));
+        let failure =
+            run_bounded_helper_with_observation_fault_for_test(child_request(resources), &self.0)
+                .expect_err("query helper must initially retain its actual cleanup owner");
+        let cleanup = failure
+            .cleanup()
+            .expect("launched native query owner")
+            .clone();
+        assert!(cleanup.identity().is_some());
+        request
+            .cancellation
+            .expect("original page cancellation")
+            .cancel();
+        solstone_core_backup::archive_readback::WindowsExecutionOutput {
+            returncode: 1,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            cleanup: Some(Arc::new(ArchiveQueryCleanup(cleanup))),
+        }
+    }
+
+    fn run_dump(
+        &self,
+        _request: solstone_core_backup::archive_readback::WindowsArchiveRequest<'_>,
+        _stage: std::fs::File,
+        _byte_bound: u64,
+    ) -> solstone_core_backup::archive_readback::WindowsExecutionOutput {
+        panic!("refused admission must never submit a dump writer")
+    }
+}
+
+fn archive_query_cleanup_releases_original_page_owner() {
+    use crate::archive_worker::{self, ArchivePayload};
+    use solstone_core_backup::archive_activity::OwnedArchivePreparationInput;
+    use solstone_core_backup_runtime::OwnedArchiveAdmissionFailure;
+    use solstone_core_journal_io::JournalRoot;
+
+    let directory = crate::test_support::root("healthy");
+    let root = Arc::new(JournalRoot::open(directory.path()).unwrap());
+    let deps = BackupWebDeps::production(
+        directory.path().to_path_buf(),
+        crate::measurement::new(directory.path()),
+    );
+    let begin = archive_worker::begin_owned(
+        &deps.operations,
+        "offload_restore",
+        root.clone(),
+        deps.clock.clone(),
+    )
+    .unwrap();
+    let (ticket, root, budget, clock) = begin.into_parts();
+    assert!(archive_worker::start_owned_worker(
+        &deps.operations,
+        &ticket
+    ));
+    let (input, custody) = OwnedArchivePreparationInput::capture(root, budget, clock)
+        .unwrap_or_else(|_| panic!("original query preparation inputs"));
+    let prepared = input
+        .prepare()
+        .unwrap_or_else(|_| panic!("original query preparation"));
+    let carrier = Arc::downgrade(prepared.carrier());
+    let destination = prepared.configuration().destination().unwrap();
+    let password = prepared.configuration().keys().unwrap().unwrap().daily_key;
+    let fault = FaultGuard(HelperCleanupObservationFault::new());
+    let refusal = match prepared
+        .capture_current_read(destination, password, PathBuf::from("unused-restic.exe"))
+        .admit(Some(Arc::new(ArchiveQueryFault(fault.0.clone()))))
+    {
+        Ok(_) => panic!("pending query must refuse admission"),
+        Err(refusal) => refusal,
+    };
+    assert_eq!(
+        refusal.reason(),
+        solstone_core_backup::archive_readback::ReadbackError::Admission(
+            solstone_core_backup::archive_admission::AdmissionError::Cancelled,
+        ),
+    );
+    archive_worker::return_owned(
+        &deps.operations,
+        ticket,
+        Some(custody),
+        ArchivePayload::AdmissionFailure(
+            OwnedArchiveAdmissionFailure::from_readback_refusal_for_test(refusal),
+        ),
+        operation::Terminal::error("cancelled"),
+    );
+    assert!(operation::is_busy(&deps.operations));
+    assert_eq!(deps.operations.lock().unwrap().archive_returns().count(), 1);
+    assert!(
+        archive_worker::begin_owned(
+            &deps.operations,
+            "offload_restore",
+            Arc::new(JournalRoot::open(directory.path()).unwrap()),
+            deps.clock.clone(),
+        )
+        .is_err()
+    );
+
+    fault.0.release();
+    assert!(matches!(
+        retry_bounded_helper_admission_until(Instant::now() + WAIT),
+        HelperAdmissionStatus::Ready
+    ));
+    let current = operation::observed_current(&deps.operations)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.phase, "error");
+    assert_eq!(current.reason_code.as_deref(), Some("cancelled"));
+    assert_eq!(deps.operations.lock().unwrap().archive_returns().count(), 0);
+    assert!(
+        carrier.upgrade().is_none(),
+        "the original carrier must be released"
+    );
+    let next = archive_worker::begin_owned(
+        &deps.operations,
+        "offload_restore",
+        Arc::new(JournalRoot::open(directory.path()).unwrap()),
+        deps.clock.clone(),
+    )
+    .unwrap();
+    next.cancel_before_preparation(&deps.operations);
+    println!("BACKUP_CLEANUP_ARCHIVE_QUERY_RELEASE_PASS");
 }
 
 impl ToolRunner for FaultRunner {
@@ -660,4 +803,5 @@ async fn backup_native_cleanup_ownership() {
     println!("BACKUP_CLEANUP_GLOBAL_RESULT_PRESERVED_PASS");
     drop(fault);
     restore_engines_preserve_configuration_while_writer_cleanup_is_pending();
+    archive_query_cleanup_releases_original_page_owner();
 }

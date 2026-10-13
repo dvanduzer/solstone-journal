@@ -413,9 +413,12 @@ pub(super) fn before_handoff(slot: &SharedOperationSlot) {
         let root = &state.archive.reservation.as_ref().unwrap().root;
         let path = root.canonical_path().join("backup-activity.lock");
         fs::rename(&path, root.canonical_path().join("retired-test-lock")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         fs::write(&path, b"").unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
     if CONTROL.get() == Some(Cut::Stale) {
         let mut state = slot.lock().unwrap();

@@ -640,7 +640,7 @@ fn execute<'clock, R: RestoreRead<'clock>>(
     }
 }
 
-#[cfg(all(test, feature = "full-tests", unix))]
+#[cfg(all(test, feature = "full-tests", any(unix, windows)))]
 pub(crate) mod tests;
 
 mod finish;

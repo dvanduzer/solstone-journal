@@ -1895,6 +1895,21 @@ enum ClosedArchiveAdmissionOwner {
     Admitted(Box<OwnedAdmittedArchiveHold>),
 }
 impl OwnedArchiveAdmissionFailure {
+    #[cfg(all(windows, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn from_readback_refusal_for_test(readback: OwnedReadbackAdmissionError) -> Self {
+        Self {
+            inner: Box::new(OwnedArchiveAdmissionFailureInner {
+                error: ArchiveError::Readback(readback.reason()),
+                effects: ArchiveAdmissionEffects {
+                    read_repository_requested: true,
+                    ..ArchiveAdmissionEffects::default()
+                },
+                owned: ClosedArchiveAdmissionOwner::Readback(Box::new(readback)),
+            }),
+        }
+    }
+
     pub fn error(&self) -> ArchiveError {
         self.inner.error
     }

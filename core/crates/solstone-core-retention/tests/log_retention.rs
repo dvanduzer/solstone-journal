@@ -595,6 +595,7 @@ fn the_cache_class_removes_directories_by_mtime() {
 
 /// A file-class symlink is an entry to unlink, while an escaping parent is not a root.
 #[test]
+#[cfg(unix)]
 fn file_classes_unlink_leaf_symlinks_but_refuse_escaping_parents() {
     use std::os::unix::fs::symlink;
 
@@ -698,6 +699,7 @@ fn class_roots_do_not_follow_fixed_or_expanded_health_symlinks() {
 
 /// A contained directory removal refuses a cache symlink rather than following it.
 #[test]
+#[cfg(unix)]
 fn the_cache_class_does_not_follow_a_symlink() {
     use std::os::unix::fs::symlink;
 
