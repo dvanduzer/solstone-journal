@@ -106,6 +106,7 @@ class Element {
   }
 
   get id() { return this.getAttribute('id') || ''; }
+  get isConnected() { return this === this.ownerDocument.body || Boolean(this.parentElement?.isConnected); }
   set id(value) { this.setAttribute('id', value); }
   get href() { return this.getAttribute('href') || ''; }
   set href(value) { this.setAttribute('href', value); }
@@ -416,6 +417,7 @@ function glanceFor(crashed, staleHeartbeats, searchIndex = null, attention = {})
       health: { stale_heartbeats: staleHeartbeats },
       searchIndex,
       connected: true, heldWorkCurrent: true, heldWorkSnapshot: null,
+      backupView: { tone: 'neutral' },
     };
     ${extractGlanceFunction(loadHealthSource())}
     result = selectGlanceSentence(state, 0);
@@ -520,6 +522,7 @@ function createDeviceEnvironment() {
     clients: new Map(), localHost: 'local', agents: new Map(), imports: new Map(),
     services: new Map([['observe', {}]]), crashed: new Map(), health: {}, connected: true,
     heldWorkCurrent: true, heldWorkSnapshot: null,
+    backupView: { tone: 'neutral' },
   };
   const context = vm.createContext({
     document: doc, elements, state, Date: ControlledDate, clock, console: { warn() {} },
@@ -944,6 +947,147 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   assert.strictEqual(section.querySelector('[data-work-details]').hidden, false);
   assert.strictEqual(section.querySelector('pre').textContent, '<unreadable>');
 });
+
+function createBackupEnvironment() {
+  const env = createDeviceEnvironment();
+  const { doc, context, state } = env;
+  state.registeredClients = [];
+  const section = doc.createElement('section');
+  section.id = 'backup';
+  const summary = doc.createElement('p');
+  summary.setAttribute('data-backup-summary', '');
+  const facts = doc.createElement('div');
+  facts.setAttribute('data-backup-facts', '');
+  section.append(summary, facts);
+  doc.body.appendChild(section);
+  Object.assign(context, { AbortController, setTimeout, clearTimeout, logHealthError() {} });
+  vm.runInContext(fs.readFileSync(path.resolve(crateDir, '..', 'solstone-core-backup-web', 'assets', 'backup-status.js'), 'utf8'), context);
+  vm.runInContext(sourceBlock(loadHealthSource(), 'const backupSection =', 'function clearHealthStateError('), context);
+  const read = async payload => {
+    context.getJson = async path => {
+      assert.strictEqual(path, '/app/backup/status');
+      if (payload instanceof Error) throw payload;
+      return payload;
+    };
+    await vm.runInContext('loadBackupStatus()', context);
+  };
+  return { ...env, section, summary, facts, read };
+}
+
+const successfulBackup = { status: 'ok', time: 1770000000, snapshot_id: 'copy-a' };
+const backupSnapshot = attempt => ({ success: true, enabled: true, operation: null,
+  last_backup: attempt, last_verification: { status: 'ok', time: 1770000100, checked_subset: '1/52' } });
+
+test('backup producer facts survive failed refresh and recover without a misleading Health verdict', async () => {
+  const env = createBackupEnvironment();
+  const failed = { status: 'error', time: 1770000200, error_reason: 'timeout', last_success: successfulBackup };
+  await env.read(backupSnapshot(failed));
+  assert.strictEqual(env.state.backupView.tone, 'attention');
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_BACKUP');
+  const rows = env.facts.querySelectorAll('dd');
+  assert.ok(rows[2].textContent.includes(new Date(failed.time * 1000).toLocaleString()));
+  assert.ok(rows[3].textContent.includes(new Date(successfulBackup.time * 1000).toLocaleString()));
+  assert.ok(rows[4].textContent.includes('1/52'));
+  assert.strictEqual(env.facts.querySelector('details').hasAttribute('open'), false);
+  env.facts.querySelector('details').open = true;
+  env.facts.querySelector('summary').focus();
+  await env.read(backupSnapshot(failed));
+  assert.strictEqual(env.facts.querySelector('details').open, true);
+  assert.strictEqual(env.doc.activeElement, env.facts.querySelector('summary'));
+  await env.read(new Error('failed read'));
+  assert.strictEqual(env.state.backupView.tone, 'unavailable');
+  assert.strictEqual(env.facts.children.length, 0);
+  assert.strictEqual(env.doc.activeElement, env.summary);
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_BACKUP');
+  await env.read(backupSnapshot(successfulBackup));
+  assert.strictEqual(env.state.backupView.tone, 'neutral');
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_OK');
+  await env.read(backupSnapshot(failed));
+  env.facts.querySelector('summary').focus();
+  await env.read(backupSnapshot(successfulBackup));
+  assert.strictEqual(env.facts.querySelector('details'), null);
+  assert.strictEqual(env.doc.activeElement, env.summary,
+    'removing resolved technical details keeps keyboard focus at the backup status');
+});
+
+test('backup off, unknown, incomplete, active and changed-destination history stay distinct', async () => {
+  const env = createBackupEnvironment();
+  await env.read({ ...backupSnapshot(null), enabled: false });
+  assert.strictEqual(env.state.backupView.tone, 'neutral');
+  await env.read(backupSnapshot(null));
+  assert.strictEqual(env.state.backupView.tone, 'unavailable');
+  const incomplete = { ...successfulBackup, error_reason: 'incomplete', detail: '<img src=x onerror=evil()>' };
+  await env.read(backupSnapshot(incomplete));
+  assert.strictEqual(env.state.backupView.tone, 'attention');
+  assert.strictEqual(env.facts.querySelectorAll('img').length, 0);
+  assert.ok(env.facts.querySelector('details').textContent.includes(incomplete.detail));
+  const failure = { status: 'error', time: 1770000200, last_success: incomplete };
+  const active = { ...backupSnapshot(failure), operation: { kind: 'restore', phase: 'restoring' }, destination: { repository: 'changed' } };
+  await env.read(active);
+  assert.strictEqual(env.state.backupView.tone, 'attention');
+  assert.strictEqual(env.state.backupView.snapshot.operation.phase, 'restoring');
+  assert.strictEqual(env.state.backupView.snapshot.last_backup.last_success.error_reason, 'incomplete');
+  await env.read(backupSnapshot({ ...successfulBackup, last_success: null }));
+  assert.ok(!env.facts.querySelectorAll('dd')[3].textContent.includes(new Date(successfulBackup.time * 1000).toLocaleString()));
+  await env.read({ ...backupSnapshot(successfulBackup), enabled: 'false' });
+  assert.strictEqual(env.state.backupView.tone, 'unavailable');
+  await env.read({ ...backupSnapshot(successfulBackup), operation: { kind: 'restore', phase: 'future-phase' } });
+  assert.strictEqual(env.state.backupView.tone, 'unavailable');
+  await env.read({ ...backupSnapshot(successfulBackup), operation: { kind: 'restore', phase: 'error', reason_code: 'integrity_failed' } });
+  assert.strictEqual(env.state.backupView.tone, 'attention');
+  await env.read({ ...backupSnapshot(successfulBackup), operation: { kind: 'restore', phase: 'error', reason_code: 'cancelled' } });
+  assert.strictEqual(env.state.backupView.tone, 'neutral');
+  await env.read(backupSnapshot({ ...successfulBackup, last_success: { ...successfulBackup, time: 'yesterday' } }));
+  assert.ok(!env.facts.querySelectorAll('dd')[3].textContent.includes(new Date(successfulBackup.time * 1000).toLocaleString()));
+  await env.read(backupSnapshot({ status: 'toString', time: 1770000000 }));
+  assert.strictEqual(env.state.backupView.tone, 'unavailable');
+});
+
+test('backup read cannot repaint a replacement workspace and the deep link reaches detail', async () => {
+  const env = createBackupEnvironment();
+  let finish;
+  env.context.getJson = () => new Promise(resolve => { finish = resolve; });
+  const pending = vm.runInContext('loadBackupStatus()', env.context);
+  env.doc.body.removeChild(env.section);
+  const before = env.state.backupView;
+  finish(backupSnapshot(successfulBackup));
+  await pending;
+  assert.strictEqual(env.state.backupView, before);
+  const replacement = env.doc.createElement('section');
+  replacement.id = 'backup';
+  env.doc.body.appendChild(replacement);
+  let reads = 0;
+  env.context.getJson = async () => { reads++; return backupSnapshot(successfulBackup); };
+  await vm.runInContext('loadBackupStatus()', env.context);
+  assert.strictEqual(reads, 0, 'a detached consumer cannot start reads against a replacement');
+  env.doc.body.removeChild(replacement);
+  env.doc.body.appendChild(env.section);
+  env.context.window.location.hash = '#backup';
+  vm.runInContext('focusBackupDetails()', env.context);
+  assert.strictEqual(env.section.scrolledIntoView, true);
+});
+
+test('a proved backup problem precedes unassessed devices, and service failure still wins', async () => {
+  const env = createBackupEnvironment();
+  await env.read(backupSnapshot({ status: 'error', time: 1770000200 }));
+  env.state.registeredClients = null;
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_BACKUP');
+  env.state.crashed.set('observe', {});
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_SERVICE_ATTENTION');
+});
+
+if (process.env.BACKUP_STATUS_FIXTURES) {
+  test('actual persisted backup status feeds the shared Health renderer', async () => {
+    for (const fixture of JSON.parse(process.env.BACKUP_STATUS_FIXTURES)) {
+      const env = createBackupEnvironment();
+      await env.read(fixture.payload);
+      assert.strictEqual(env.state.backupView.tone, fixture.tone);
+      if (fixture.success_time) {
+        assert.ok(env.facts.querySelectorAll('dd')[3].textContent.includes(new Date(fixture.success_time * 1000).toLocaleString()));
+      }
+    }
+  });
+}
 
 async function runAsyncCases() {
   for (const runCase of asyncCases) await runCase();
