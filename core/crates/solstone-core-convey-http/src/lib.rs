@@ -163,6 +163,7 @@ pub mod identity;
 pub mod ip_literal_guard;
 pub mod listener;
 pub mod loopback_guard;
+pub mod media;
 pub mod owner_read;
 pub mod refusal;
 pub mod serve;

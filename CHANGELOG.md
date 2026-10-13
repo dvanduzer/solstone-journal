@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- playing a voice sample on the speakers page now reads only the part of the audio your browser asks for, using less memory for long recordings.
+
 - health now shows recorded backup attempts, successful copies and spot-checks. the backup page also shows a status summary and links to those details.
 
 - in entities, "block" is now "hide", "unblock" is "unhide", and "blocked" is "hidden". the actions work as before.
