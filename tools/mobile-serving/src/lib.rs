@@ -120,7 +120,7 @@ impl MobileServing {
     }
 
     /// Enable the dedicated foreground app's local processing pass. Successful
-    /// input never needs a private command to trigger transcription or indexing.
+    /// input never needs a private command to trigger transcription.
     #[cfg(feature = "audio")]
     pub fn enable_audio(
         &mut self,

@@ -118,8 +118,6 @@ fn run(
     let started = Instant::now();
     let asr = journal_mobile_audio::Parakeet::new(model, scratch)?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.;
-    // Recover an output committed just before death but not yet indexed.
-    index(root)?;
     *state.status.lock().unwrap() = json!({"state":"ready","model_load_ms":load_ms});
     let mut failures = HashSet::new();
     let mut retry_generation = state.generation.load(Ordering::Acquire);
@@ -178,8 +176,7 @@ fn run(
                         *state.status.lock().unwrap() = prior;
                     }
                     Ok(result) => {
-                        index(root)?;
-                        let last = json!({"input":input,"outcome":format!("{:?}",result.outcome),"transcript":result.transcript_path,"processing_ms":start.elapsed().as_secs_f64()*1000.,"indexed":true,"failed_inputs":failures.len()});
+                        let last = json!({"input":input,"outcome":format!("{:?}",result.outcome),"transcript":result.transcript_path,"processing_ms":start.elapsed().as_secs_f64()*1000.,"failed_inputs":failures.len()});
                         *state.status.lock().unwrap() =
                             json!({"state":"ready","model_load_ms":load_ms,"last":last});
                     }
@@ -197,15 +194,6 @@ fn run(
             .wake
             .wait_timeout(status, Duration::from_secs(2))
             .unwrap();
-    }
-    Ok(())
-}
-
-fn index(root: &Path) -> Result<(), String> {
-    let result =
-        solstone_core_indexer_store::scan::scan_journal(root, false).map_err(|e| e.to_string())?;
-    if result.failed != 0 {
-        return Err(format!("audio index scan failed: {:?}", result.failures));
     }
     Ok(())
 }
