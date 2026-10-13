@@ -164,7 +164,8 @@ pub use inventory_budget::{InventoryBudget, InventoryBudgetLimit};
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use journal_root::{AcquisitionPrimitive, run_with_acquisition_fault};
 pub use journal_root::{
-    JournalEntryKind, JournalRoot, JournalRootError, ObjectIdentity, WindowsRefusalCategory,
+    DirectoryIdentityWitness, JournalEntryKind, JournalRoot, JournalRootError, ObjectIdentity,
+    WindowsRefusalCategory,
 };
 #[cfg(all(windows, feature = "test-hooks"))]
 pub use journal_root::{

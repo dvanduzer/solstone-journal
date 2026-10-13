@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use solstone_core_journal_io::{
-    BoundParentLock, ExistingParentLockError, JournalRoot, LockOptions, ObjectIdentity,
-    acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
+    BoundParentLock, DirectoryIdentityWitness, ExistingParentLockError, JournalRoot, LockOptions,
+    ObjectIdentity, acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
 };
 use solstone_core_processing_record::media::is_media_extension;
 
@@ -71,7 +71,7 @@ fn live(segment: &Path) -> Result<()> {
 // Transplanting the same segment into a replacement journal is also a change.
 struct DirectoryBinding {
     root: JournalRoot,
-    ancestors: Vec<JournalRoot>,
+    ancestors: Vec<DirectoryIdentityWitness>,
 }
 impl DirectoryBinding {
     fn capture(path: &Path) -> Result<Self> {
@@ -80,7 +80,7 @@ impl DirectoryBinding {
             .canonical_path()
             .ancestors()
             .skip(1)
-            .map(admit)
+            .map(|path| DirectoryIdentityWitness::open(path).map_err(|e| refusal(e.to_string())))
             .collect::<Result<_>>()?;
         let binding = Self { root, ancestors };
         binding.revalidate()?;
@@ -88,7 +88,9 @@ impl DirectoryBinding {
     }
     fn revalidate(&self) -> Result<()> {
         for ancestor in &self.ancestors {
-            revalidate(ancestor)?;
+            ancestor
+                .revalidate_canonical_binding()
+                .map_err(|e| refusal(e.to_string()))?;
         }
         revalidate(&self.root)
     }

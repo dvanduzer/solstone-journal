@@ -1456,7 +1456,7 @@ fn map_detailed_outcome(
 /// Contents are written and synced to an unlinked temporary inode first, then
 /// published with `link(2)`. Consequently the destination name is never visible
 /// with partial content.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 pub fn write_bytes_exclusive(
     path: impl AsRef<Path>,
     contents: &[u8],
@@ -1488,12 +1488,34 @@ pub fn write_bytes_exclusive(
     operation
 }
 
+/// Android app UIDs cannot publish hard links. Use the same descriptor-bound,
+/// create-only rename as the detailed API, retaining final-name and sync checks.
+#[cfg(target_os = "android")]
+pub fn write_bytes_exclusive(
+    path: impl AsRef<Path>,
+    contents: &[u8],
+    options: AtomicWriteOptions,
+) -> Result<(), AtomicWriteError> {
+    let path = path.as_ref();
+    fs::create_dir_all(parent_dir(path)).map_err(|source| io_error(path, source))?;
+    let result = write_bytes_exclusive_detailed(path, contents, options)
+        .map_err(|error| io_error(path, error.source))?;
+    if result.is_fully_confirmed() {
+        Ok(())
+    } else {
+        Err(io_error(
+            path,
+            io::Error::other(format!("exclusive publication unconfirmed: {result:?}")),
+        ))
+    }
+}
+
 /// Create and durably fill a new file from a bounded-memory reader.
 ///
 /// The destination is create-only, receives the requested final mode before
 /// publication is reported, and is synced before this function returns. A
 /// failed copy removes the incomplete destination.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 pub fn write_reader_exclusive(
     path: &Path,
     reader: &mut impl Read,
@@ -1519,6 +1541,26 @@ pub fn write_reader_exclusive(
         let _ = fs::remove_file(&temporary_path);
     }
     operation
+}
+
+/// Android counterpart of the legacy create-only streaming writer.
+#[cfg(target_os = "android")]
+pub fn write_reader_exclusive(
+    path: &Path,
+    reader: &mut impl Read,
+    options: AtomicWriteOptions,
+) -> Result<u64, AtomicWriteError> {
+    fs::create_dir_all(parent_dir(path)).map_err(|source| io_error(path, source))?;
+    let result = write_reader_exclusive_detailed(path, reader, options)
+        .map_err(|error| io_error(path, error.source))?;
+    if result.is_fully_confirmed() {
+        Ok(result.bytes_written)
+    } else {
+        Err(io_error(
+            path,
+            io::Error::other(format!("exclusive publication unconfirmed: {result:?}")),
+        ))
+    }
 }
 
 /// Publish `contents` only when `path` does not yet exist.
