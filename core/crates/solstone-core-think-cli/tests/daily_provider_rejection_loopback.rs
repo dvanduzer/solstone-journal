@@ -94,7 +94,6 @@ fn cross_boundary_loopback_400_to_capped_daily_unit_with_detail() {
         timeout_s: Some(5.0),
         json_output: false,
         json_schema: None,
-        enforce_responsiveness: false,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: None,

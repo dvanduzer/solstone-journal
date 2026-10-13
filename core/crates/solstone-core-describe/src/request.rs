@@ -64,7 +64,6 @@ pub fn request(
         timeout_s: None,
         json_output: true,
         json_schema: Some(serde_json::from_str(SCHEMA).expect("describe schema is valid JSON")),
-        enforce_responsiveness: true,
         attempt_index,
         exclusive_admission: false,
         transport_retries: None,

@@ -8,10 +8,11 @@ use std::time::Duration;
 use serde_json::Value;
 use solstone_core_local::HttpResponse;
 
-use crate::NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS;
 use crate::endpoint::EndpointTransportError;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+/// The most characters of a provider error body kept as refusal detail.
+pub(crate) const PROVIDER_DETAIL_CAP_CHARS: usize = 512;
 
 /// The caller's timeout, else the lane default plus time for any thinking room.
 pub(crate) fn request_timeout(timeout_s: Option<f64>, thinking_room: u64) -> Duration {
@@ -78,12 +79,7 @@ pub(crate) fn capture_provider_detail(body: &str, secret: &str) -> Option<String
     } else {
         body.replace(secret, "[redacted]")
     };
-    Some(
-        scrubbed
-            .chars()
-            .take(NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS)
-            .collect(),
-    )
+    Some(scrubbed.chars().take(PROVIDER_DETAIL_CAP_CHARS).collect())
 }
 
 #[cfg(test)]
@@ -165,13 +161,12 @@ mod tests {
             capture_provider_detail("key,key", "key"),
             Some("[redacted],[redacted]".into())
         );
-        let prefix = "é".repeat(NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS - 3);
+        let prefix = "é".repeat(PROVIDER_DETAIL_CAP_CHARS - 3);
         let detail = capture_provider_detail(&format!("{prefix}secret🙂"), "secret").unwrap();
         assert_eq!(detail, format!("{prefix}[re"));
-        assert_eq!(detail.chars().count(), NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS);
+        assert_eq!(detail.chars().count(), PROVIDER_DETAIL_CAP_CHARS);
         let detail =
-            capture_provider_detail(&"🙂".repeat(NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS + 1), "")
-                .unwrap();
-        assert_eq!(detail.chars().count(), NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS);
+            capture_provider_detail(&"🙂".repeat(PROVIDER_DETAIL_CAP_CHARS + 1), "").unwrap();
+        assert_eq!(detail.chars().count(), PROVIDER_DETAIL_CAP_CHARS);
     }
 }

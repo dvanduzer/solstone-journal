@@ -457,7 +457,7 @@ fn failure(reason_code: &str) -> OpenAiResult {
 mod tests {
     use std::fs;
 
-    use crate::NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS;
+    use crate::transport::PROVIDER_DETAIL_CAP_CHARS;
 
     use solstone_core_generate::{ContentPart, ReasonCodeValue};
 
@@ -503,7 +503,6 @@ mod tests {
             timeout_s: None,
             json_output: false,
             json_schema: None,
-            enforce_responsiveness: false,
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: None,
@@ -981,7 +980,6 @@ mod tests {
             finish_reason: &zero.finish_reason,
             usage: &zero.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: None,
             thinking_seen: false,
         });
@@ -997,7 +995,6 @@ mod tests {
             finish_reason: &nonzero.finish_reason,
             usage: &nonzero.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: None,
             thinking_seen: false,
         });
@@ -1143,7 +1140,7 @@ mod tests {
 
     #[test]
     fn captured_http_error_body_truncates_to_512_utf8_characters() {
-        let body = format!("I cannot {}", "界".repeat(600));
+        let body = format!("server error {}", "界".repeat(600));
         let mut transport = StubTransport {
             responses: vec![Ok(HttpResponse {
                 status: 500,
@@ -1159,8 +1156,8 @@ mod tests {
             panic!("server error must fail");
         };
         let detail = failure.detail.expect("captured body");
-        assert_eq!(detail.chars().count(), NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS);
-        assert!(detail.starts_with("I cannot "));
+        assert_eq!(detail.chars().count(), PROVIDER_DETAIL_CAP_CHARS);
+        assert!(detail.starts_with("server error "));
         assert!(!detail.contains("fixture"));
     }
 
@@ -1185,7 +1182,6 @@ mod tests {
             finish_reason: &generated.finish_reason,
             usage: &generated.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: generated.raw_response_snippet.as_deref(),
             thinking_seen: false,
         });

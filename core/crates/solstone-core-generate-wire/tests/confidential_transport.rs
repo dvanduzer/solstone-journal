@@ -30,7 +30,6 @@ fn request(timeout_s: Option<f64>) -> GenerateRequest {
         timeout_s,
         json_output: false,
         json_schema: None,
-        enforce_responsiveness: false,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: None,

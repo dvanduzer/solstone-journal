@@ -971,7 +971,6 @@ fn tile_context(
         json_output: true,
         json_schema: serde_json::from_str(TOPICS_SCHEMA)
             .expect("vendored transcript schema is valid JSON"),
-        enforce_responsiveness: true,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: None,

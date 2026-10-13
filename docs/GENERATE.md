@@ -31,7 +31,7 @@ Three record types, three schema identifiers:
 
 | | identifier |
 |---|---|
-| request | `solstone-generate-request-v2` |
+| request | `solstone-generate-request-v3` |
 | response | `solstone-generate-response-v2` |
 | protocol error | `solstone-generate-error-v2` |
 
@@ -43,7 +43,7 @@ reads that file. ⛔ **No implementation holds its own copy of any vocabulary.**
 
 ```json
 {
-  "schema": "solstone-generate-request-v2",
+  "schema": "solstone-generate-request-v3",
   "id": "f3a1",
   "context": "observe.depict",
   "contents": [
@@ -56,7 +56,6 @@ reads that file. ⛔ **No implementation holds its own copy of any vocabulary.**
   "timeout_s": null,
   "json_output": false,
   "json_schema": null,
-  "enforce_responsiveness": true,
   "attempt_index": 0,
   "exclusive_admission": false,
   "transport_retries": null
@@ -218,7 +217,8 @@ presentation.
 It does not retry, whatever `retryable` says.
 
 A blocking refusal can also be marked retryable. Read `blocking` first so that a retryable flag
-does not cause retries of work that must stop. The non-retryable reason codes are nonblocking.
+does not cause retries of work that must stop. The one non-retryable reason code,
+`thinking_consumed_budget`, is nonblocking.
 
 🔴 **What "stop" means here, precisely.** The caller ends *this* attempt and holds the owner's
 material. ⛔ It does not discard it, and ⛔ it does not mean the work is abandoned — a later
@@ -426,6 +426,7 @@ survive a migration that was supposed to end them.
   had no `id`, no `outcome` tag, no reason code and no session framing, and it exited `69` for a
   no-engine refusal. Redefining a published identifier in place would have meant two shapes answering
   to one name across the tree's own history for no gain, since nothing had adopted it.
+- **`-v3` removed the `enforce_responsiveness` request field** along with the output responsiveness check it gated; `-v2` requests are refused as an unknown schema.
 - The **fixture's `fixture_version`** changes on any additive change: a new refusal reason, a new
   runtime reason code, a new optional field.
 - Because every closed vocabulary lives in the fixture rather than in either language's source,
@@ -445,12 +446,11 @@ These are guarantees of the boundary, each backed by a test.
    absence of a fallback branch. ⚠ A guarantee that holds because a branch is missing is a guarantee
    that a tidy-up can remove with nothing going red.
 3. **Request guards run before egress.** Engine selection, confidential attestation and schema
-   preparation are checked before sending. Strict result validation and responsiveness
-   classification run on the response. Both framings enforce these checks.
+   preparation are checked before sending. Strict result validation runs on the response. Both
+   framings enforce these checks.
 4. **The caller owns domain-output writes.** The boundary reads configuration and writes operational
-   records, including token usage, provider health and cache records. For a nonresponsive reply, the
-   local token log can also contain a bounded portion of the model's output as diagnostic evidence.
-   The caller writes the declared domain outputs; it does not write the boundary's operational paths.
+   records, including token usage, provider health and cache records. The caller writes the declared
+   domain outputs; it does not write the boundary's operational paths.
 5. **Usage reaches the token log for every completion.** ⛔ The forbidden shortcut is suppressing
    usage logging to simplify invariant 4; that silently empties the usage ledger for every future
    caller, and the logger swallows its own exceptions, so nothing would ever error.

@@ -158,12 +158,6 @@ pub fn refusal_for(
             Some("thinking_consumed_budget".to_owned()),
             Some(THINKING_CONSUMED_BUDGET_DETAIL),
         ),
-        LaneOutcome::ValidationFailure(ValidationFailure::NonResponsiveOutput) => (
-            "refused-non-responsive-output",
-            RefusalReason::NonResponsiveOutput,
-            Some("non_responsive".to_owned()),
-            None,
-        ),
         LaneOutcome::UnimplementedLane => (
             "refused-provider-response-invalid",
             RefusalReason::ProviderResponseInvalid,
@@ -618,13 +612,6 @@ mod tests {
                 ValidationFailure::ThinkingConsumedBudget { json_output: true },
                 RefusalReason::IncompleteJson,
                 Some("thinking_consumed_budget"),
-                false,
-                false,
-            ),
-            (
-                ValidationFailure::NonResponsiveOutput,
-                RefusalReason::NonResponsiveOutput,
-                Some("non_responsive"),
                 false,
                 false,
             ),

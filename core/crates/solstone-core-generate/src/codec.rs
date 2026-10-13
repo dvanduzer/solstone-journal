@@ -122,7 +122,6 @@ pub fn encode_one_shot_request(request: &GenerateRequest) -> Result<String, Stri
         "timeout_s": request.timeout_s,
         "json_output": request.json_output,
         "json_schema": request.json_schema,
-        "enforce_responsiveness": request.enforce_responsiveness,
         "attempt_index": request.attempt_index,
         "exclusive_admission": request.exclusive_admission,
         "transport_retries": request.transport_retries,
@@ -183,9 +182,6 @@ pub fn decode_one_shot_request(input: &str) -> Result<GenerateRequest, String> {
             value if value.is_object() => Some(value.clone()),
             _ => return Err("json_schema must be an object or null".to_owned()),
         },
-        enforce_responsiveness: value_or_default(&object, "enforce_responsiveness")
-            .as_bool()
-            .ok_or_else(|| "enforce_responsiveness must be a boolean".to_owned())?,
         attempt_index: value_or_default(&object, "attempt_index")
             .as_u64()
             .ok_or_else(|| "attempt_index must be an integer".to_owned())?,
@@ -440,7 +436,6 @@ mod tests {
             timeout_s: None,
             json_output: false,
             json_schema: None,
-            enforce_responsiveness: true,
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: None,
@@ -485,7 +480,6 @@ mod tests {
         assert_eq!(request.timeout_s, None);
         assert!(!request.json_output);
         assert_eq!(request.json_schema, None);
-        assert!(request.enforce_responsiveness);
         assert_eq!(request.attempt_index, 0);
         assert!(!request.exclusive_admission);
         assert_eq!(request.transport_retries, None);
@@ -532,7 +526,6 @@ mod tests {
             RefusalReason::ProviderResponseInvalid,
             RefusalReason::ConfidentialChannelClosed,
             RefusalReason::SchemaValidationFailed,
-            RefusalReason::NonResponsiveOutput,
             RefusalReason::Unknown,
         ]
         .into_iter()
@@ -645,7 +638,12 @@ mod tests {
 
     #[test]
     fn unknown_reason_code_is_safe() {
-        let vector = &contract()["conformance_vectors"][12]["response"];
+        let vector = &contract()["conformance_vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|vector| vector["id"] == "unknown-reason-code")
+            .unwrap()["response"];
         let response = decode_one_shot_response(&vector.to_string()).unwrap();
         let GenerateResponse::Refused(value) = response else {
             panic!("expected refusal")

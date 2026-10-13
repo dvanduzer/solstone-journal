@@ -13,13 +13,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -60,13 +59,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -103,13 +101,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -146,13 +143,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -189,13 +185,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -232,13 +227,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -275,13 +269,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -318,13 +311,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -361,13 +353,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -389,49 +380,6 @@
         "exception": "SchemaValidationError",
         "path": "typed_exception",
         "reason_code": null
-      }
-    },
-    {
-      "exit_code": 0,
-      "framing": "one_shot",
-      "id": "refused-non-responsive-output",
-      "request": {
-        "attempt_index": 0,
-        "contents": [
-          {
-            "text": "Reply with OK.",
-            "type": "text"
-          }
-        ],
-        "context": "fixture.generate",
-        "enforce_responsiveness": true,
-        "exclusive_admission": false,
-        "id": "fixture-request",
-        "json_output": false,
-        "json_schema": null,
-        "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
-        "system_instruction": null,
-        "temperature": 0.3,
-        "timeout_s": null,
-        "transport_retries": null
-      },
-      "response": {
-        "blocking": false,
-        "detail": "fixture non-responsive-output",
-        "id": "fixture-request",
-        "outcome": "refused",
-        "provider": "local",
-        "reason": "non-responsive-output",
-        "reason_code": "non_responsive",
-        "reset_at_ms": null,
-        "retryable": false,
-        "schema": "solstone-generate-response-v2"
-      },
-      "source": {
-        "exception": "NonResponsiveOutputError",
-        "path": "typed_exception",
-        "reason_code": "non_responsive"
       }
     },
     {
@@ -502,13 +450,12 @@
           }
         ],
         "context": "fixture.generate",
-        "enforce_responsiveness": true,
         "exclusive_admission": false,
         "id": "fixture-request",
         "json_output": false,
         "json_schema": null,
         "max_output_tokens": 16384,
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "system_instruction": null,
         "temperature": 0.3,
         "timeout_s": null,
@@ -539,7 +486,7 @@
     "response": 0
   },
   "fixture": "solstone-generate-contract",
-  "fixture_version": 6,
+  "fixture_version": 7,
   "framing": {
     "one_shot": {
       "id": "optional",
@@ -808,12 +755,6 @@
     },
     {
       "blocking": false,
-      "code": "non_responsive",
-      "overrides_live_taxonomy": false,
-      "retryable": false
-    },
-    {
-      "blocking": false,
       "code": "pipeline_unavailable",
       "overrides_live_taxonomy": false,
       "retryable": true
@@ -919,7 +860,6 @@
     "provider-response-invalid",
     "confidential-channel-closed",
     "schema-validation-failed",
-    "non-responsive-output",
     "unknown"
   ],
   "request": {
@@ -946,7 +886,6 @@
     },
     "defaults": {
       "attempt_index": 0,
-      "enforce_responsiveness": true,
       "exclusive_admission": false,
       "json_output": false,
       "json_schema": null,
@@ -967,7 +906,6 @@
       "timeout_s",
       "json_output",
       "json_schema",
-      "enforce_responsiveness",
       "attempt_index",
       "exclusive_admission",
       "transport_retries"
@@ -1028,7 +966,7 @@
   },
   "schema_identifiers": {
     "error": "solstone-generate-error-v2",
-    "request": "solstone-generate-request-v2",
+    "request": "solstone-generate-request-v3",
     "response": "solstone-generate-response-v2",
     "session_terminal": "solstone-generate-session-terminal-v2"
   },

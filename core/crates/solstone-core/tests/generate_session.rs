@@ -331,7 +331,7 @@ fn chat_response_body(content: &str) -> String {
     if content == "json-truncated" {
         return json!({
             "model": "stub-json-truncated",
-            "choices": [{"message": {"content": "I cannot complete that request."}, "finish_reason": "length"}],
+            "choices": [{"message": {"content": "{\"answer\": "}, "finish_reason": "length"}],
             "usage": stub_usage(content),
         })
         .to_string();
@@ -416,7 +416,6 @@ fn request_with_text(id: &str, text: String) -> GenerateRequest {
         timeout_s: Some(30.0),
         json_output: false,
         json_schema: None,
-        enforce_responsiveness: true,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: None,
@@ -880,7 +879,7 @@ fn session_uses_the_same_validation_and_logging_order_as_one_shot() {
         Some("incomplete_json_length")
     );
     let token: Value = serde_json::from_str(&journal.token_log_lines()[0]).expect("token JSON");
-    assert_eq!(token["non_responsive_matched_signal"], "i cannot");
+    assert_eq!(token["usage"], generated_usage("json-truncated"));
     assert!(wait_for_exit(&mut session.child).success());
     stub.finish();
 }

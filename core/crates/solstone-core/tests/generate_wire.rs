@@ -1028,51 +1028,6 @@ fn completed_provider_results_log_before_strict_validation() {
 }
 
 #[test]
-fn non_responsive_empty_usage_logs_diagnostics_and_json_truncation_wins() {
-    let journal = root("non-responsive-empty-usage");
-    write_config(&journal, bundled_config(false));
-    let body = completion_body("I cannot complete that request.", "stop", None);
-    let (port, server) = serve(&body);
-    std::fs::write(journal.join("health/local.port"), port.to_string()).expect("write port");
-    let response = stdout_json(&one_shot(&journal, &fixture_vector("generated")["request"]));
-    assert_eq!(response["reason"], "non-responsive-output");
-    let entry = token_entries(&journal).pop().expect("one usage entry");
-    assert_eq!(entry["usage"], json!({}));
-    assert_eq!(entry["non_responsive_matched_signal"], "i cannot");
-    assert_eq!(
-        entry["non_responsive_output"],
-        "I cannot complete that request."
-    );
-    assert_eq!(server.join().expect("join server"), 6);
-
-    let precedence_journal = root("strict-before-responsiveness");
-    write_config(&precedence_journal, bundled_config(false));
-    let body = completion_body(
-        "I cannot complete that request.",
-        "length",
-        Some(json!({"prompt_tokens": 2})),
-    );
-    let (port, server) = serve(&body);
-    std::fs::write(
-        precedence_journal.join("health/local.port"),
-        port.to_string(),
-    )
-    .expect("write port");
-    let mut request = fixture_vector("generated")["request"].clone();
-    request["json_output"] = json!(true);
-    request["json_schema"] = json!({"type": "object", "required": ["answer"]});
-    let response = stdout_json(&one_shot(&precedence_journal, &request));
-    assert_eq!(response["reason"], "incomplete-json");
-    let entry = token_entries(&precedence_journal)
-        .pop()
-        .expect("one usage entry");
-    assert_eq!(entry["non_responsive_matched_signal"], "i cannot");
-    assert_eq!(server.join().expect("join server"), 6);
-    let _ = std::fs::remove_dir_all(journal);
-    let _ = std::fs::remove_dir_all(precedence_journal);
-}
-
-#[test]
 fn attestation_stale_refusal_matches_fixture_vector_fields() {
     // The one-shot binary owns a fresh process-local state store; producing a
     // stale session would require waiting for the real cadence deadline.

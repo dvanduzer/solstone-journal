@@ -80,7 +80,6 @@ pub fn request(
         json_schema: category
             .schema
             .map(|schema| serde_json::from_str(schema).expect("category schema is valid JSON")),
-        enforce_responsiveness: true,
         attempt_index: attempt,
         exclusive_admission: false,
         transport_retries: None,

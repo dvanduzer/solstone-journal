@@ -12,6 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `solstone journal mcp token create` now says that an agent using a new token can't read your journal until you grant it access, and prints the command to do that.
 - on windows, media offload runs again. you can approve its proposals from the home page and bring the media back from the backup page or with `solstone journal backup offload restore`, including media an earlier version offloaded.
 - your journal now renews its access to the relay on its own, so devices keep reaching it from afar without you turning your private network off and on.
+- when something said in a recording or shown on your screen begins with words like "I can't", your journal no longer throws away what it wrote about that part of your day or that screen frame. it used to mistake those words for the model refusing the work. when a model turns the work down in plain words, and its provider doesn't mark that as a refusal, its reply now shows up as written, instead of nothing.
 
 ## [2.0.44] - 2026-10-13
 

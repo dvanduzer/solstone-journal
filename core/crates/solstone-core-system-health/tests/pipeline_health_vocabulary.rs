@@ -35,7 +35,6 @@ fn vocabulary_constants_match_inlined_expectations() {
             "max_turns_exhausted",
             "model_not_found",
             "no_output",
-            "non_responsive",
             "provider_request_rejected",
             "schema_invalid",
             "token_budget_exceeded",

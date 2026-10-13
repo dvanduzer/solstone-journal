@@ -1272,7 +1272,6 @@ fn generate_request(prepared: &PreparedTalent) -> Result<GenerateRequest, String
         timeout_s: None,
         json_output: prepared.config.contains_key("json_schema"),
         json_schema: prepared.config.get("json_schema").cloned(),
-        enforce_responsiveness: true,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: None,
@@ -1857,7 +1856,6 @@ mod tests {
             ]),
         };
         let request = generate_request(&prepared).unwrap();
-        assert!(request.enforce_responsiveness);
         let GenerateResponse::Generated(response) = client.execute(&request).unwrap() else {
             panic!("stub generates")
         };
