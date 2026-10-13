@@ -1181,10 +1181,9 @@ mod windows {
             media.revalidate().map_err(io_refusal)?;
             let mut current_bytes = Vec::new();
             file.read_to_end(&mut current_bytes).map_err(io_refusal)?;
-            if current_bytes != bytes
-                || read_complete_catalog(root).map_err(LedgerWriteRefusal::HistoryUnavailable)?
-                    != baseline
-            {
+            // The ledger lock protects the catalog; confirm this leaf through
+            // the same writable handle, whose sharing mode excludes replacement.
+            if current_bytes != bytes {
                 return Err(LedgerWriteRefusal::Changed);
             }
             offload.revalidate_bound().map_err(io_refusal)

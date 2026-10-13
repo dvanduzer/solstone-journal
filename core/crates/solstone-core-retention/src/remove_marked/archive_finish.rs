@@ -131,11 +131,11 @@ impl OwnedReviewedArchiveRemoval {
     /// its own remains and every child its read launched was reaped. Only the
     /// empty carrier is left, for the outside finish owner to retire.
     pub fn release_refused(self) -> Result<(RefusedDirectRead, ReviewedArchiveReport), Box<Self>> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(Box::new(self))
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let execution = &self.execution;
             if !execution.attempts.is_empty()
@@ -226,13 +226,15 @@ pub struct ReviewedRemovalFileReport {
     binding: Option<std::io::Error>,
 }
 impl ReviewedRemovalFileReport {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn from_actual(attempt: ReviewedFileRemoval) -> Self {
         Self {
             relative: attempt.relative,
             class: attempt.class,
             native: attempt.native.into_receipt(),
+            #[cfg(unix)]
             append: attempt.append,
+            #[cfg(unix)]
             marker: attempt.marker,
             binding: attempt.binding,
         }
@@ -396,7 +398,7 @@ impl<'clock> ReviewedArchiveRemoval<'clock> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn complete_selection(
     checked: &crate::review_context::CheckedReviewContext,
     execution: &ReviewedExecution,
@@ -404,7 +406,7 @@ fn complete_selection(
     execution.carrier.is_none() && complete_selected_files(checked, execution)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) fn complete_selected_files(
     checked: &crate::review_context::CheckedReviewContext,
     execution: &ReviewedExecution,
@@ -470,7 +472,7 @@ pub(super) fn complete_selected_files(
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn complete_selection(
     _: &crate::review_context::CheckedReviewContext,
     _: &ReviewedExecution,
@@ -479,11 +481,11 @@ fn complete_selection(
 }
 
 impl<'clock> ReviewedArchiveRemoval<'clock> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn finish_complete(self) -> Result<ReviewedArchiveFinish<'clock>, Box<Self>> {
         self.hold(ReviewedArchiveFinishRefusal::IncompleteSelection)
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn finish_complete(self) -> Result<ReviewedArchiveFinish<'clock>, Box<Self>> {
         let Self {
             checked,
@@ -530,7 +532,7 @@ impl<'clock> ReviewedArchiveRemoval<'clock> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) fn finish_native(
     execution: &mut ReviewedExecution,
     carrier: &solstone_core_journal_io::media::RootActivityCarrier,
@@ -566,7 +568,7 @@ pub(super) fn finish_native(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn release_report(
     checked: crate::review_context::CheckedReviewContext,
     execution: ReviewedExecution,
@@ -612,9 +614,9 @@ pub fn remove_reviewed_with_owned_archive(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> OwnedReviewedArchiveRun {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let selected = preflight_archive_review(&checked, read.as_read());
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let selected: Result<Vec<Mark>, ReviewedRemovalRefusal> =
         Err(ReviewedRemovalRefusal::Unsupported);
     let mut execution = ReviewedExecution::new();
@@ -630,7 +632,7 @@ pub fn remove_reviewed_with_owned_archive(
         }
     };
     let approval = crate::archive_approval::create_owned_archive_approval_batch(read, &selected);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let result = match &approval {
         Ok(batch) => execute_reviewed_mode(
             &checked,
@@ -642,7 +644,7 @@ pub fn remove_reviewed_with_owned_archive(
         ),
         Err(_) => Err(ReviewedRemovalRefusal::ArchiveApproval),
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let result = {
         let _parameters = (today, now);
         Err(ReviewedRemovalRefusal::Unsupported)
@@ -783,11 +785,11 @@ impl OwnedReviewedArchiveRun {
         }
         self.finish_complete()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn finish_complete(self) -> OwnedReviewedArchiveFinish {
         self.hold(ReviewedArchiveFinishRefusal::IncompleteSelection)
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn finish_complete(self) -> OwnedReviewedArchiveFinish {
         let Self {
             checked,

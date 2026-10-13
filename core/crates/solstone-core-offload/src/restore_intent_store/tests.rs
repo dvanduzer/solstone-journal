@@ -579,7 +579,7 @@ mod unix_tests {
 
 #[cfg(windows)]
 #[test]
-fn windows_store_refuses_before_any_parent_or_store_lock_creation() {
+fn windows_store_persists_intents_and_excludes_a_second_writer() {
     use super::*;
     use solstone_core_journal_io::JournalRoot;
     use solstone_core_journal_io::activity::ActivityLease;
@@ -587,12 +587,42 @@ fn windows_store_refuses_before_any_parent_or_store_lock_creation() {
     let temp = tempfile::tempdir().unwrap();
     let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
     let activity = ActivityLease::try_acquire(root).unwrap();
-    let failure = match RestoreIntentStore::create(Arc::clone(&activity)) {
+    let store = RestoreIntentStore::create(Arc::clone(&activity))
+        .unwrap_or_else(|failure| panic!("{:?}", failure.problem));
+    assert!(store.preparation.confirmed);
+    assert_eq!(store.preparation.durability, [Durability::Unproven; 4]);
+    let mut intent = crate::test_restore_intent::fixture(true);
+    intent.destination.root = activity.journal_root().identity().observation_id();
+    let written = store.create_intent(intent.clone());
+    assert!(
+        written.receipt.fully_confirmed(),
+        "{:?}",
+        written.receipt.failures
+    );
+    assert_eq!(
+        written
+            .owner
+            .read(&intent.event.operation_id)
+            .unwrap()
+            .unwrap()
+            .intent,
+        intent
+    );
+    let busy = match RestoreIntentStore::create(Arc::clone(&activity)) {
         Err(failure) => failure,
-        Ok(_) => panic!("unsupported store admitted"),
+        Ok(_) => panic!("second store writer admitted"),
     };
-    assert_eq!(failure.problem, StoreProblem::Unsupported);
-    assert!(failure.owner.preparation.attempted.is_empty());
-    assert!(!temp.path().join("health").exists());
-    assert!(Arc::ptr_eq(&activity, &failure.owner.activity));
+    assert_eq!(busy.problem, StoreProblem::Busy);
+    drop(busy);
+    drop(written);
+    let reopened = RestoreIntentStore::open_existing(activity)
+        .unwrap_or_else(|failure| panic!("{:?}", failure.problem));
+    assert_eq!(
+        reopened
+            .read(&intent.event.operation_id)
+            .unwrap()
+            .unwrap()
+            .intent,
+        intent
+    );
 }

@@ -60,7 +60,6 @@ fn probes(review: &OwnedLegacyRestoreReviewOutcome) -> serde_json::Value {
                     "name":probe.name,"capacity":probe.capacity.and_then(|v|v.as_ref().ok()),
                     "digest":probe.digest.map(|v|serde_json::json!({"bytes":v.size,"sha256":v.sha256})),
                     "cleanup":probe.cleanup.map(|v|format!("{v:?}")),
-                    "parent_sync":probe.parent_sync.map(Result::is_ok),
                 })
             })
             .collect(),
@@ -211,8 +210,7 @@ fn packaged_legacy_restore_review_entry() {
             review
                 .probes()
                 .last()
-                .is_some_and(|probe| probe.cleanup == Some(Cleanup::Complete)
-                    && probe.parent_sync.is_some_and(Result::is_ok))
+                .is_some_and(|probe| probe.cleanup == Some(Cleanup::Complete))
         );
         assert_eq!(scratch_residue(segment.parent().unwrap()), 0);
         let held = review.into_owned_hold();
@@ -260,8 +258,9 @@ fn packaged_legacy_restore_review_entry() {
         );
         assert!(!review.retained_probe());
         assert!(
-            review.probes().all(|p| p.cleanup == Some(Cleanup::Complete)
-                && p.parent_sync.is_some_and(Result::is_ok))
+            review
+                .probes()
+                .all(|p| p.cleanup == Some(Cleanup::Complete))
         );
         match input.mode.as_str() {
             "stale_config" => {

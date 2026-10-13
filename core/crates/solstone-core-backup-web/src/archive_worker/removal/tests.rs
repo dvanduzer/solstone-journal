@@ -504,7 +504,13 @@ fn seed(input: &Input, root: &Arc<JournalRoot>) -> (Mark, PathBuf) {
             name: "audio.flac".into(),
             bytes: input.bytes,
             sha256: input.sha256.clone(),
-            archive_path: input.archive_path.clone(),
+            // Pending-admission fixtures read a native local source above;
+            // their synthetic archive locator uses the backup's path syntax.
+            archive_path: if cfg!(windows) {
+                "/synthetic/audio.flac".into()
+            } else {
+                input.archive_path.clone()
+            },
             processing,
         }],
     };

@@ -71,14 +71,12 @@ struct ProbeRecord {
     capacity: Option<io::Result<u64>>,
     digest: Option<MediaDigest>,
     cleanup: Option<Cleanup>,
-    parent_sync: Option<io::Result<()>>,
 }
 pub struct LegacyProbeFacts<'a> {
     pub name: &'a str,
     pub capacity: Option<&'a io::Result<u64>>,
     pub digest: Option<&'a MediaDigest>,
     pub cleanup: Option<Cleanup>,
-    pub parent_sync: Option<&'a io::Result<()>>,
 }
 fn probe_facts(record: &ProbeRecord) -> LegacyProbeFacts<'_> {
     LegacyProbeFacts {
@@ -86,7 +84,6 @@ fn probe_facts(record: &ProbeRecord) -> LegacyProbeFacts<'_> {
         capacity: record.capacity.as_ref(),
         digest: record.digest.as_ref(),
         cleanup: record.cleanup,
-        parent_sync: record.parent_sync.as_ref(),
     }
 }
 enum ProbeOwner {
@@ -123,11 +120,7 @@ impl ProbeOwner {
 /// still be using it: never launched, or a qualified dump that simply did not
 /// match the record. The probe is an unpublished copy of backup bytes, never
 /// owner media. An uncertain writer or a refused cleanup keeps it owned.
-fn release_probe(
-    owner: &mut Option<ProbeOwner>,
-    probes: &mut [ProbeRecord],
-    destination: Option<&PreparedRestore>,
-) {
+fn release_probe(owner: &mut Option<ProbeOwner>, probes: &mut [ProbeRecord]) {
     let Some(mut probe) = owner.take() else {
         return;
     };
@@ -153,14 +146,8 @@ fn release_probe(
         *owner = Some(probe);
         return;
     }
-    let sync = destination.map(|destination| destination.stage_parent().sync());
-    let confirmed = sync.as_ref().is_some_and(Result::is_ok);
     if let Some(record) = record {
         record.cleanup = Some(cleanup);
-        record.parent_sync = sync;
-    }
-    if !confirmed {
-        *owner = Some(probe);
     }
 }
 

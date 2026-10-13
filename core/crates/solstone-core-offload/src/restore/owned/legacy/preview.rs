@@ -47,11 +47,7 @@ pub(super) fn prepare<'clock, R: RestoreRead<'clock>>(
     };
     if let Err(error) = outcome.prepare() {
         outcome.refusal = Some(error);
-        release_probe(
-            &mut outcome.probe_owner,
-            &mut outcome.probes,
-            outcome.destination.as_ref(),
-        );
+        release_probe(&mut outcome.probe_owner, &mut outcome.probes);
     }
     outcome
 }
@@ -242,7 +238,6 @@ impl<R> LegacyRestoreReview<R> {
             capacity: None,
             digest: None,
             cleanup: None,
-            parent_sync: None,
         });
         let stage = match MediaStage::create(
             destination.stage_parent(),
@@ -334,20 +329,11 @@ impl<R> LegacyRestoreReview<R> {
             .destination
             .as_ref()
             .ok_or_else(|| refuse("legacy_destination_unavailable"))?;
-        let sync = destination.stage_parent().sync();
-        let confirmed = sync.is_ok();
-        self.probes
-            .last_mut()
-            .ok_or_else(|| refuse("legacy_probe_unavailable"))?
-            .parent_sync = Some(sync);
-        if !confirmed {
-            return Err(refuse("legacy_probe_sync_uncertain"));
-        }
         destination
             .revalidate()
             .map_err(|_| refuse("legacy_destination_changed"))?;
         self.qualification()?;
-        // Only confirmed cleanup/sync and the same live token allow releasing this probe.
+        // Confirmed cleanup and the same live token allow releasing this disposable probe.
         self.probe_owner = None;
         Ok(())
     }

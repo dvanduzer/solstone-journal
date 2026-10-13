@@ -590,9 +590,9 @@ pub fn remove_reviewed(
     now: DateTime<Utc>,
 ) -> ReviewedRemoval {
     let mut execution = ReviewedExecution::new();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let result = execute_reviewed(&checked, today, now, &mut execution);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let result: Result<(), ReviewedRemovalRefusal> = {
         let _parameters = (today, now);
         Err(ReviewedRemovalRefusal::Unsupported)
@@ -1546,7 +1546,7 @@ pub(crate) enum ReviewedCheckpoint {
     BeforeFinalCas,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn execute_reviewed(
     checked: &crate::review_context::CheckedReviewContext,
     today: NaiveDate,
@@ -1556,7 +1556,7 @@ fn execute_reviewed(
     execute_reviewed_with(checked, today, now, execution, |_, _| {})
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn execute_reviewed_with(
     checked: &crate::review_context::CheckedReviewContext,
     today: NaiveDate,

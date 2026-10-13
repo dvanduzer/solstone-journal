@@ -105,17 +105,17 @@ impl ReviewedRemoval {
     /// Finish actual local effects under the original activity. This operation
     /// launches no child/HTTP work; native namespace cooperation remains required.
     pub fn finish(self) -> ReviewedRemovalFinish {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.finish_local()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             self.hold_local(ReviewedRemovalFinishRefusal::IncompleteSelection)
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn finish_local(mut self) -> ReviewedRemovalFinish {
         use solstone_core_journal_io::media::{
             ActivityCarrierRetirementEffect, Confirmation, Durability,
@@ -136,7 +136,12 @@ impl ReviewedRemoval {
         // also qualify namespace cooperation; a census or lease does not do so.
         let retired = carrier.retire_after_settlement();
         let confirmed = retired.receipt.effect() == ActivityCarrierRetirementEffect::Removed
-            && retired.receipt.root_durability() == Durability::Synced
+            && retired.receipt.root_durability()
+                == if cfg!(windows) {
+                    Durability::Unproven
+                } else {
+                    Durability::Synced
+                }
             && retired.receipt.confirmation() == Confirmation::Confirmed
             && retired.receipt.failures().is_empty();
         if !confirmed {
@@ -149,7 +154,7 @@ impl ReviewedRemoval {
         self.settle(Some(retired.receipt))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn settle(self, retirement: Option<ActivityCarrierRetirementReceipt>) -> ReviewedRemovalFinish {
         let selected = self.checked.marks().to_vec();
         let attempts = self
@@ -174,7 +179,7 @@ impl ReviewedRemoval {
 /// the register recorded those deletions. A file that was already gone, kept
 /// by the current policy or refused before staging is known and untouched,
 /// so it does not hold the run.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn known_selected_files(execution: &ReviewedExecution) -> bool {
     use crate::mark_mutation::BoundMutationOutcome;
     use solstone_core_journal_io::media::{Cleanup, Confirmation, OriginalName, RemovalEffect};

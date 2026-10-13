@@ -269,6 +269,14 @@ fn launch_windows_helper(
         timeout,
     };
 
+    let mut environment = env.clone();
+    // The native runner needs the Windows root; restic also uses the owner's
+    // temporary directory. Keep credential and command settings explicit.
+    for name in ["SystemRoot", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+            environment.entry(name.into()).or_insert(value);
+        }
+    }
     let bounded_request = solstone_core_system::process::BoundedHelperRequest {
         package_root,
         executable: canonical_program,
@@ -283,7 +291,7 @@ fn launch_windows_helper(
             })
             .collect(),
         current_directory: bin_dir,
-        environment: env.clone(),
+        environment,
         stdin: stdin.unwrap_or_default(),
         budget,
         resource_limits: None,

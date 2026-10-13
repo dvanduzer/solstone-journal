@@ -331,7 +331,6 @@ mod tests {
             capacity: None,
             digest: None,
             cleanup: None,
-            parent_sync: None,
         };
         let matching = MediaDigest {
             size: 12,
@@ -365,10 +364,9 @@ mod tests {
         for probe in owners {
             let mut owner = Some(probe);
             let mut probes = vec![record()];
-            release_probe(&mut owner, &mut probes, Some(&destination));
+            release_probe(&mut owner, &mut probes);
             assert!(owner.is_none());
             assert_eq!(probes[0].cleanup, Some(Cleanup::Complete));
-            assert!(probes[0].parent_sync.as_ref().is_some_and(Result::is_ok));
         }
         assert_eq!(scratch(), 0);
 
@@ -379,10 +377,9 @@ mod tests {
         drop(target.helper_transport().unwrap());
         let mut owner = Some(ProbeOwner::ReadyTarget(target));
         let mut probes = vec![record()];
-        release_probe(&mut owner, &mut probes, Some(&destination));
+        release_probe(&mut owner, &mut probes);
         assert!(owner.is_some());
         assert_eq!(probes[0].cleanup, Some(Cleanup::Refused));
-        assert!(probes[0].parent_sync.is_none());
         assert_eq!(scratch(), 1);
         assert_eq!(
             fs::read(temp.path().join("source/raw.webm")).unwrap(),

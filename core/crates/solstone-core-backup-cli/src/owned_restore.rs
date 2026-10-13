@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn well_formed_restore_selects_the_owned_path_on_linux_only() {
+    fn well_formed_restore_selects_the_owned_path_on_supported_platforms() {
         for (given, expected) in [
             (vec!["offload", "restore", "--all"], Some((None, false))),
             (
@@ -120,7 +120,13 @@ mod tests {
                 Some((Some("20261009".to_owned()), false)),
             ),
         ] {
-            let expected = expected.filter(|_| cfg!(any(target_os = "linux", target_os = "macos")));
+            let expected = expected.filter(|_| {
+                cfg!(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "windows"
+                ))
+            });
             assert_eq!(owned_restore_options(&args(&given)), expected, "{given:?}");
         }
         for given in [
@@ -135,7 +141,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn nothing_offloaded_succeeds_and_a_missing_journal_refuses() {
         let journal = tempfile::tempdir().unwrap();

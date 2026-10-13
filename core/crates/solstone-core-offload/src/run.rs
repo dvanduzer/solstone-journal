@@ -2322,20 +2322,24 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn current_batch_is_unavailable_without_writable_readback_transport() {
+    fn current_batch_with_no_marks_is_available_on_windows() {
+        struct RepositoryOnly;
+        impl ToolRunner for RepositoryOnly {
+            fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                assert!(
+                    request
+                        .argv
+                        .windows(2)
+                        .any(|args| args == ["cat", "config"])
+                );
+                Ok(output(json!({"id":"a".repeat(64)}).to_string()))
+            }
+        }
         let journal = tempfile::tempdir().unwrap();
         configure_offload(journal.path(), 100, Some(1));
         let root = std::sync::Arc::new(JournalRoot::open(journal.path()).unwrap());
-        let runner = Script {
-            outputs: RefCell::new(
-                (0..2)
-                    .map(|_| output(json!({"id":"a".repeat(64)}).to_string()))
-                    .collect(),
-            ),
-            calls: RefCell::new(vec![]),
-        };
         let clock = TestClock { now: 100 };
-        let services = services(&runner, &Http, &clock, &Maintenance);
+        let services = services(&RepositoryOnly, &Http, &clock, &Maintenance);
         let mut operation = solstone_core_backup_runtime::admit_archive(root, &services).unwrap();
         let decision = inspect_current_offload(
             &mut operation,
@@ -2344,13 +2348,9 @@ mod tests {
         );
         assert_eq!(
             decision.availability(),
-            CurrentOffloadAvailability::Unavailable
+            CurrentOffloadAvailability::Available
         );
         assert_eq!(decision.eligible().count(), 0);
-        assert_eq!(
-            decision.refusals()[0].reason(),
-            &CurrentOffloadRefusalReason::ExecutionUnavailable
-        );
-        assert_eq!(runner.calls.borrow().len(), 2);
+        assert!(decision.refusals().is_empty());
     }
 }

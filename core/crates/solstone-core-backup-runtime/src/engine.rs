@@ -2854,7 +2854,12 @@ impl OwnedDirectReadFinish {
                 lifetime_failure: None,
                 ..
             } if retirement.receipt.effect() == ActivityCarrierRetirementEffect::Removed
-                && retirement.receipt.root_durability() == Durability::Synced
+                && retirement.receipt.root_durability()
+                    == if cfg!(windows) {
+                        Durability::Unproven
+                    } else {
+                        Durability::Synced
+                    }
                 && retirement.receipt.confirmation() == Confirmation::Confirmed
                 && retirement.receipt.failures().is_empty() =>
             {
@@ -2871,7 +2876,8 @@ impl OwnedDirectReadFinish {
         };
         matches!(&*self.inner, OwnedDirectReadFinishInner::Released { retirement, .. }
             if retirement.receipt.effect() == ActivityCarrierRetirementEffect::Removed
-                && retirement.receipt.root_durability() == Durability::Synced
+                && retirement.receipt.root_durability()
+                    == if cfg!(windows) { Durability::Unproven } else { Durability::Synced }
                 && retirement.receipt.confirmation() == Confirmation::Confirmed
                 && retirement.receipt.failures().is_empty())
     }

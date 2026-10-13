@@ -67,13 +67,29 @@ impl Fixture {
 
 #[cfg(windows)]
 #[test]
-fn windows_refuses_before_creating_any_namespace() {
+fn windows_append_flushes_the_file_and_confirmed_replay_does_not_duplicate_it() {
     let fixture = Fixture::new();
     let proof = fixture.proof("one", SegmentLayout::Direct);
+    let written = append_archive_witness(&fixture.root, &proof, 1).unwrap();
+    assert!(matches!(
+        written.effect(),
+        LedgerWriteEffect::Appended { .. }
+    ));
+    assert!(written.settles());
     assert_eq!(
-        append_archive_witness(&fixture.root, &proof, 1).unwrap_err(),
-        LedgerWriteRefusal::Unsupported
+        written.durability(),
+        [
+            LedgerSync::Confirmed,
+            LedgerSync::Uncertain,
+            LedgerSync::Uncertain,
+            LedgerSync::Uncertain,
+        ]
     );
+    let bytes = std::fs::read(fixture.path("20260101")).unwrap();
+    let replay = confirm_archive_witness(&fixture.root, &proof, 2).unwrap();
+    assert_eq!(replay.effect(), LedgerWriteEffect::AlreadyRecorded);
+    assert!(replay.settles());
+    assert_eq!(std::fs::read(fixture.path("20260101")).unwrap(), bytes);
     assert_eq!(
         append_restore_operation(
             &fixture.root,
@@ -83,12 +99,11 @@ fn windows_refuses_before_creating_any_namespace() {
                 operation_id: "op".into(),
                 files: vec![]
             },
-            1
+            1,
         )
         .unwrap_err(),
-        LedgerWriteRefusal::Unsupported
+        LedgerWriteRefusal::InvalidInput
     );
-    assert!(!fixture.temp.path().join("health").exists());
 }
 
 #[cfg(unix)]
