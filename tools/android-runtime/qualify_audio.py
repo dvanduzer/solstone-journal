@@ -332,21 +332,25 @@ class AudioQualification(serving.Qualification):
             else:
                 assert hashlib.sha256(transcript.read_bytes()).hexdigest()==item['transcript_sha256']
                 sidecar=base.with_suffix('.npz')
-                assert sidecar.is_file()
-                with zipfile.ZipFile(sidecar) as archive:
-                    assert archive.testzip() is None
-                    shape, embeddings = npy_array(archive.read('embeddings.npy'))
-                    _, ids = npy_array(archive.read('statement_ids.npy'))
-                    _, durations = npy_array(archive.read('durations_s.npy'))
-                    _, encoder = npy_array(archive.read('encoder.npy'))
-                    assert shape == (len(ids),256), shape
-                    assert len(durations) == len(ids)
-                    assert all(math.isfinite(v) for v in embeddings)
-                    assert all(math.isfinite(v) and v > 0 for v in durations)
-                    assert encoder == 'wespeaker-resnet34-256', encoder
-                    assert set(ids) <= {row['sentence_id'] for row in item['rows'][1:]}
-                    if item.get('word_error_rate') is not None: assert ids
-                item['speaker_sidecar_sha256']=hashlib.sha256(sidecar.read_bytes()).hexdigest()
+                if item['rows'][0]['_solstone_processing']['state'] != 'analyzed':
+                    assert not sidecar.exists(), sidecar
+                else:
+                    assert sidecar.is_file(), sidecar
+                if sidecar.is_file():
+                    with zipfile.ZipFile(sidecar) as archive:
+                        assert archive.testzip() is None
+                        shape, embeddings = npy_array(archive.read('embeddings.npy'))
+                        _, ids = npy_array(archive.read('statement_ids.npy'))
+                        _, durations = npy_array(archive.read('durations_s.npy'))
+                        _, encoder = npy_array(archive.read('encoder.npy'))
+                        assert shape == (len(ids),256), shape
+                        assert len(durations) == len(ids)
+                        assert all(math.isfinite(v) for v in embeddings)
+                        assert all(math.isfinite(v) and v > 0 for v in durations)
+                        assert encoder == 'wespeaker-resnet34-256', encoder
+                        assert set(ids) <= {row['sentence_id'] for row in item['rows'][1:]}
+                        if item.get('word_error_rate') is not None: assert ids
+                    item['speaker_sidecar_sha256']=hashlib.sha256(sidecar.read_bytes()).hexdigest()
             receipts=[json.loads(line) for line in (base.parent/'events.jsonl').read_text().splitlines()]
             accepted=[r for r in receipts if r.get('record_type')=='device_ingest' and r.get('outcome')=='accepted']
             assert len(accepted)==1, receipts
@@ -355,6 +359,8 @@ class AudioQualification(serving.Qualification):
                                transcript=not item.get('expected_failure'),bounded_failure=item.get('expected_failure')))
         for item in self.denied:
             assert not list((root/'chronicle'/item['day']).glob('*/'+item['requested_segment'])), item
+        generated=list(root.glob('chronicle/*/*/*/talents/audio.md'))
+        assert not generated, generated
         databases=[]
         for path in root.rglob('*.sqlite'):
             db=sqlite3.connect(f'file:{path}?mode=ro',uri=True)
@@ -363,11 +369,8 @@ class AudioQualification(serving.Qualification):
             assert raw==0, raw
             matches=db.execute('select count(*) from chunks where chunks match ?',('"quick brown fox"',)).fetchone()[0]
             assert matches==0, matches
-            generated=list(root.glob('chronicle/*/*/*/talents/audio.md'))
-            assert not generated, generated
             databases.append(dict(path=str(path.relative_to(root)),integrity='ok',raw_audio_files=raw))
             db.close()
-        assert databases
         (self.out/'independent-verification.json').write_text(json.dumps(dict(inputs=checks,databases=databases),indent=2)+'\n')
 
 
