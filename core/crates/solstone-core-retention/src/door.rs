@@ -45,7 +45,7 @@ use solstone_core_journal_io::paths::{
 use solstone_core_journal_io::removal::remove_dir_all;
 use solstone_core_journal_io::{
     AtomicWriteOptions, HealthMarkerKind, JournalRoot, LockOptions, bump_stream_marker,
-    health_marker_path, hold_lock, write_bytes_exclusive,
+    health_marker_path, hold_daily_location_admission, hold_lock, write_bytes_exclusive,
 };
 
 use crate::eligibility::{Evidence, ProvenRaw};
@@ -432,7 +432,42 @@ pub fn remove_segments_with_activity(
     reason: RemovalReason,
     cid: &str,
 ) -> Outcome {
+    // A borrowed activity may refer to a root that has since been replaced.
+    // Refuse it before creating even a coordination sidecar in that replacement.
     let guard = WholeSegmentActivity { activity, carrier };
+    if let Err(reason) = guard.revalidate() {
+        let mut outcome = Outcome {
+            targets: Vec::new(),
+            halted: None,
+        };
+        for target in targets {
+            if !outcome.targets.iter().any(|row| &row.target == target) {
+                outcome
+                    .targets
+                    .push(refused(target, segment_rel(target), reason.clone()));
+            }
+        }
+        return outcome;
+    }
+    let _admission = match hold_daily_location_admission(activity.journal_root().canonical_path()) {
+        Ok(lock) => lock,
+        Err(_) => {
+            let mut outcome = Outcome {
+                targets: Vec::new(),
+                halted: None,
+            };
+            for target in targets {
+                if !outcome.targets.iter().any(|row| &row.target == target) {
+                    outcome.targets.push(refused(
+                        target,
+                        segment_rel(target),
+                        "couldn't remove these segments; try again".to_owned(),
+                    ));
+                }
+            }
+            return outcome;
+        }
+    };
     let mut outcome = Outcome {
         targets: Vec::new(),
         halted: None,
@@ -1504,6 +1539,12 @@ pub(crate) mod cooperation_tests;
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    #[cfg(feature = "full-tests")]
+    use std::sync::mpsc;
+    #[cfg(feature = "full-tests")]
+    use std::thread;
+    #[cfg(feature = "full-tests")]
+    use std::time::Duration;
 
     use super::*;
     use crate::content::{ContentName, MediaClassifier};
@@ -2138,6 +2179,46 @@ mod tests {
         let names: Vec<String> = fs::read_dir(&segment)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![TOMBSTONE_NAME.to_owned()]);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn remove_segments_waits_for_the_admission_guard() {
+        let bed = Bed::new();
+        let segment = populated(&bed, "070000_17");
+        let root = bed.root.clone();
+        let guard = solstone_core_journal_io::hold_daily_location_admission(&root).unwrap();
+        let (started_sender, started) = mpsc::channel();
+        let (done_sender, done) = mpsc::channel();
+        let removal = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let result = remove_segments(
+                &root,
+                &[target("20260805", "field.audio", "070000_17")],
+                "2026-08-05T21:00:00Z",
+                RemovalReason::OwnerSegmentDelete,
+                "sha256:abc",
+            );
+            done_sender.send(()).unwrap();
+            result
+        });
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("removal started");
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(segment.join("audio.flac").is_file());
+        drop(guard);
+        let outcome = removal.join().unwrap();
+        assert!(outcome.halted.is_none());
+        assert!(outcome.targets[0].not_removed.is_empty());
+        let names: Vec<String> = fs::read_dir(&segment)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec![TOMBSTONE_NAME.to_owned()]);
     }

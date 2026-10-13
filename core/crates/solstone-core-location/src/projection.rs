@@ -695,6 +695,44 @@ mod tests {
                 "{coordinate} leaked into {text}"
             );
         }
+        assert!(text.lines().any(|line| line.starts_with("- ")));
+        let store = crate::places::PlaceStore {
+            version: 1,
+            places: vec![crate::places::Place {
+                id: "named".to_owned(),
+                latitude: 39.7527,
+                longitude: -105.0001,
+                name: Some("$source_packet".to_owned()),
+                alias: None,
+                hidden: false,
+            }],
+        };
+        assert_eq!(
+            rebuild_day(
+                root.path(),
+                DAY,
+                tier(),
+                None,
+                &store,
+                &directory(),
+                chrono_tz::America::Denver,
+            )
+            .unwrap(),
+            Rebuilt::Written
+        );
+        let named = fs::read_to_string(document_path(root.path(), DAY)).unwrap();
+        assert!(named.contains("$source_packet"), "{named}");
+        assert!(
+            named
+                .lines()
+                .any(|line| { line.starts_with("- ") && line.contains("$source_packet") })
+        );
+        for coordinate in ["39.75", "105.2", "105.0"] {
+            assert!(
+                !named.contains(coordinate),
+                "{coordinate} leaked into {named}"
+            );
+        }
         let record = read_build_record(root.path(), DAY).unwrap();
         assert_eq!((record.readings, record.visits, record.devices), (2, 1, 1));
         assert!(matches!(

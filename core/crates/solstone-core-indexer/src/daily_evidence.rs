@@ -160,15 +160,75 @@ fn strict_text(path: &Path) -> Result<String, String> {
 
 /// Day documents the journal derives for search, at `chronicle/<day>/<name>`.
 ///
-/// ⛔ Not daily evidence: no daily hook's packet reads them, and they are rewritten
-/// from inputs that are not the day's own material. `location.md` is rebuilt from the
-/// phone location already in the day's segments whenever the bundled area names, the
-/// location-accuracy download, the owner's place names or its own wording change, and
-/// its first write backfills every past day that holds location. Counted as evidence,
-/// each of those re-owed every such day's outputs, however old (2.0.42's Suze burn-in).
-/// If a daily hook ever reads one, remove it here and bump
-/// [`SEMANTIC_EVIDENCE_VERSION`], which re-owes only the recent window.
+/// These files stay excluded from daily evidence. Admitting a new source into
+/// the evidence value changes `revision_under` on every day that source touches,
+/// so `EarlierContract` does not keep those days. The seven-day window applies
+/// only when evidence still matches under the accepted contract.
 const DERIVED_DAY_DOCUMENTS: &[&str] = &["location.md"];
+
+/// A supplemental source's immutable contract policy. Mutable source state
+/// belongs only to unfinished-packet freshness, never semantic evidence.
+#[derive(Debug)]
+pub struct DailyInput {
+    pub id: &'static str,
+    pub version: &'static str,
+    pub recipients: &'static [&'static str],
+    pub lookback_closed_days: i64,
+}
+
+pub const DAILY_INPUTS: &[DailyInput] = &[DailyInput {
+    id: "location",
+    version: "location-words-1",
+    lookback_closed_days: 7,
+    recipients: &[
+        "schedule",
+        "facet_newsletter",
+        "entities:entity_suggest",
+        "entities:entity_observer",
+        "morning_briefing",
+    ],
+}];
+
+impl DailyInput {
+    pub fn applies(
+        &self,
+        hook: &str,
+        day: &str,
+        config: &Map<String, Value>,
+    ) -> Result<bool, String> {
+        if !self.recipients.contains(&hook) {
+            return Ok(false);
+        }
+        let cutoff = solstone_core_journal_config::daily_input_since(config, self.id, self.version)
+            .map_err(|error| error.to_string())?;
+        Ok(self.version_since(hook, day, cutoff).is_some())
+    }
+    fn version_since(
+        &self,
+        hook: &str,
+        day: &str,
+        cutoff: Option<NaiveDate>,
+    ) -> Option<&'static str> {
+        let cutoff = cutoff?;
+        let day = NaiveDate::parse_from_str(day, "%Y%m%d").ok()?;
+        (self.recipients.contains(&hook) && day >= cutoff).then_some(self.version)
+    }
+}
+
+/// Registered providers admitted to a recipient's contract on this day.
+pub fn daily_input_contract(
+    hook: &str,
+    day: &str,
+    config: &Map<String, Value>,
+) -> Result<Map<String, Value>, String> {
+    let mut admitted = Map::new();
+    for input in DAILY_INPUTS {
+        if input.applies(hook, day, config)? {
+            admitted.insert(input.id.to_owned(), Value::String(input.version.to_owned()));
+        }
+    }
+    Ok(admitted)
+}
 
 fn output_path(rel: &str) -> bool {
     let parts = rel.split('/').collect::<Vec<_>>();
@@ -442,6 +502,7 @@ pub fn compute_contract_digest(
     metadata: &Map<String, Value>,
     body: &str,
     overrides: Option<&Map<String, Value>>,
+    daily_inputs: Option<&Map<String, Value>>,
 ) -> Result<String, String> {
     let mut effective = metadata.clone();
     let key = name
@@ -496,9 +557,14 @@ pub fn compute_contract_digest(
         .unwrap_or_default();
     let active = configured.get("providers").and_then(|v| v.get("active"));
     let brain = json!({"provider":active.and_then(|v|v.get("provider")),"model":active.and_then(|v|v.get("model"))});
-    Ok(digest(
-        &json!({"version":SEMANTIC_EVIDENCE_VERSION,"name":name,"metadata":effective,"body":body.trim(),"templates":templates,"facets":facets,"brain":brain}),
-    ))
+    let mut contract = json!({"version":SEMANTIC_EVIDENCE_VERSION,"name":name,"metadata":effective,"body":body.trim(),"templates":templates,"facets":facets,"brain":brain});
+    if let Some(inputs) = daily_inputs.filter(|inputs| !inputs.is_empty()) {
+        contract
+            .as_object_mut()
+            .expect("contract digest is an object")
+            .insert("daily_inputs".to_owned(), Value::Object(inputs.clone()));
+    }
+    Ok(digest(&contract))
 }
 
 fn facet_declarations(journal: &Path) -> Result<BTreeMap<String, Value>, String> {
@@ -708,8 +774,14 @@ pub fn compute_daily_evidence_cached(
     overrides: Option<&Map<String, Value>>,
     cache: &mut DayProjectionCache,
 ) -> Result<DailyEvidence, String> {
-    let contract = compute_contract_digest(journal, name, metadata, body, overrides)?;
     let hook = daily_hook(name, metadata)?;
+    let configured = solstone_core_journal_config::read_journal_config(journal)
+        .map_err(|error| error.to_string())?
+        .config
+        .unwrap_or_default();
+    let inputs = daily_input_contract(&hook, day, &configured)?;
+    let contract =
+        compute_contract_digest(journal, name, metadata, body, overrides, Some(&inputs))?;
     let date = NaiveDate::parse_from_str(day, "%Y%m%d").map_err(|e| e.to_string())?;
     let evidence = if hook == "daily_schedule" {
         let anchor = journal_today(journal);
@@ -860,22 +932,29 @@ mod tests {
         fs::write(p, text).unwrap();
     }
     fn revision(root: &Path, name: &str, facet: Option<&str>) -> String {
+        evidence_of(root, "20260910", name, facet).revision
+    }
+
+    fn metadata_for(name: &str) -> Map<String, Value> {
         let hook = match name {
             "schedule" => json!({"post":name}),
             "morning_briefing" => json!({"pre":name}),
             _ => json!({"pre":name,"post":name}),
         };
-        compute_daily_evidence_revision(
-            root,
-            "20260910",
-            name,
-            &Map::from_iter([("hook".to_owned(), hook)]),
-            "prompt",
-            facet,
-            None,
-        )
-        .unwrap()
-        .0
+        let mut metadata = Map::from_iter([("hook".to_owned(), hook)]);
+        if name == "daily_schedule" {
+            metadata.insert("meta".to_owned(), json!({"lookback_days":7}));
+        }
+        metadata
+    }
+
+    fn evidence_of(root: &Path, day: &str, name: &str, facet: Option<&str>) -> DailyEvidence {
+        compute_daily_evidence(root, day, name, &metadata_for(name), "prompt", facet, None)
+            .unwrap_or_else(|error| panic!("{name} {day}: {error}"))
+    }
+
+    fn write_config(root: &Path, value: &Value) {
+        write(root, "config/journal.json", &value.to_string());
     }
 
     /// The briefing's revision used to hash the observed activity of the eight
@@ -990,6 +1069,26 @@ mod tests {
                 .iter()
                 .all(|chunk| chunk.path != "20260910/location.md")
         );
+        write_config(
+            &root,
+            &json!({"identity":{"timezone":"UTC"},"daily_inputs":{"location":{"location-words-1":"20260901"}}}),
+        );
+        let activated = names.map(|name| evidence_of(&root, "20260910", name, Some("work")));
+        for text in [
+            "# location on Thursday, September 10, 2026\n\n- readings near Golden, 14:00 to 14:09: 3 readings from your iphone.\n",
+            "# location on Thursday, September 10, 2026\n\n- a visit your iphone reported at a place you named.\n",
+        ] {
+            write(&root, "chronicle/20260910/location.md", text);
+            let next = names.map(|name| evidence_of(&root, "20260910", name, Some("work")));
+            for (index, name) in names.iter().enumerate() {
+                assert_eq!(next[index].evidence, activated[index].evidence, "{name}");
+                assert_eq!(next[index].contract, activated[index].contract, "{name}");
+                assert!(
+                    !next[index].evidence.to_string().contains("location.md"),
+                    "{name}"
+                );
+            }
+        }
         // Control: the day's own material still moves every revision.
         write(
             &root,
@@ -1240,13 +1339,14 @@ mod tests {
             ("hook".to_owned(), json!({"post":"schedule"})),
             ("max_output_tokens".to_owned(), json!(1024)),
         ]);
-        let first = compute_contract_digest(&root, "schedule", &metadata, "prompt", None).unwrap();
+        let first =
+            compute_contract_digest(&root, "schedule", &metadata, "prompt", None, None).unwrap();
         // Retuning a talent's ceiling, or an old owner override of it, re-owes nothing.
         let mut retuned = metadata.clone();
         retuned.insert("max_output_tokens".to_owned(), json!(4096));
         assert_eq!(
             first,
-            compute_contract_digest(&root, "schedule", &retuned, "prompt", None).unwrap()
+            compute_contract_digest(&root, "schedule", &retuned, "prompt", None, None).unwrap()
         );
         let overrides = Map::from_iter([(
             "talent.system.schedule".to_owned(),
@@ -1254,18 +1354,168 @@ mod tests {
         )]);
         assert_eq!(
             first,
-            compute_contract_digest(&root, "schedule", &metadata, "prompt", Some(&overrides))
-                .unwrap()
+            compute_contract_digest(
+                &root,
+                "schedule",
+                &metadata,
+                "prompt",
+                Some(&overrides),
+                None
+            )
+            .unwrap()
         );
         write(&root, "talent/schedule.schema.json", "{\"type\":\"array\"}");
         assert_ne!(
             first,
-            compute_contract_digest(&root, "schedule", &metadata, "prompt", None).unwrap()
+            compute_contract_digest(&root, "schedule", &metadata, "prompt", None, None).unwrap()
         );
         write(&root, "talent/schedule.schema.json", "malformed");
-        assert!(compute_contract_digest(&root, "schedule", &metadata, "prompt", None).is_err());
+        assert!(
+            compute_contract_digest(&root, "schedule", &metadata, "prompt", None, None).is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn absent_cutoff_keeps_todays_contract_bytes() {
+        let root = root("absent-cutoff-contract");
+        let evidence = evidence_of(&root, "20260910", "schedule", None);
+        let direct = compute_contract_digest(
+            &root,
+            "schedule",
+            &metadata_for("schedule"),
+            "prompt",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(evidence.contract, direct);
+        assert!(evidence.evidence.get("daily_location_input").is_none());
+        assert!(!root.join("config/journal.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn eligible_recipient_appends_daily_location_input_and_excluded_hooks_do_not_read_a_malformed_cutoff()
+     {
+        let root = root("location-input-cutoff");
+        write(&root, "facets/work/facet.json", r#"{"title":"Work"}"#);
+        let recipients = [
+            "schedule",
+            "facet_newsletter",
+            "entities:entity_suggest",
+            "entities:entity_observer",
+            "morning_briefing",
+        ];
+        let excluded = ["daily_schedule", "entities:entities_review"];
+        write_config(
+            &root,
+            &json!({"identity":{"timezone":"UTC"},"daily_inputs":{"location":{"location-words-1":"not-a-day"}}}),
+        );
+        for name in excluded {
+            let facet = (name != "daily_schedule").then_some("work");
+            let without =
+                compute_contract_digest(&root, name, &metadata_for(name), "prompt", None, None)
+                    .unwrap();
+            let evidence = evidence_of(&root, "20260910", name, facet);
+            assert_eq!(evidence.contract, without, "{name}");
+            assert!(evidence.evidence.get("daily_location_input").is_none());
+        }
+        for name in recipients {
+            let facet = (!matches!(name, "schedule" | "morning_briefing")).then_some("work");
+            assert!(
+                compute_daily_evidence(
+                    &root,
+                    "20260910",
+                    name,
+                    &metadata_for(name),
+                    "prompt",
+                    facet,
+                    None,
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+        write_config(
+            &root,
+            &json!({"identity":{"timezone":"UTC"},"daily_inputs":{"location":{"location-words-1":"20260910"}}}),
+        );
+        for name in recipients {
+            let facet = (!matches!(name, "schedule" | "morning_briefing")).then_some("work");
+            let on_cutoff = evidence_of(&root, "20260910", name, facet);
+            let with_bit = compute_contract_digest(
+                &root,
+                name,
+                &metadata_for(name),
+                "prompt",
+                None,
+                Some(
+                    &serde_json::from_value(json!({"location": DAILY_INPUTS[0].version})).unwrap(),
+                ),
+            )
+            .unwrap();
+            let without =
+                compute_contract_digest(&root, name, &metadata_for(name), "prompt", None, None)
+                    .unwrap();
+            assert_eq!(on_cutoff.contract, with_bit, "{name}");
+            assert_ne!(on_cutoff.contract, without, "{name}");
+            assert!(on_cutoff.evidence.get("daily_location_input").is_none());
+            let before = evidence_of(&root, "20260909", name, facet);
+            assert_eq!(before.contract, without, "{name} before cutoff");
+        }
+        for name in excluded {
+            let facet = (name != "daily_schedule").then_some("work");
+            let evidence = evidence_of(&root, "20260910", name, facet);
+            let without =
+                compute_contract_digest(&root, name, &metadata_for(name), "prompt", None, None)
+                    .unwrap();
+            assert_eq!(evidence.contract, without, "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn daily_location_input_version_is_none_until_the_cutoff() {
+        let cutoff = chrono::NaiveDate::parse_from_str("20260910", "%Y%m%d").unwrap();
+        for hook in [
+            "schedule",
+            "facet_newsletter",
+            "entities:entity_suggest",
+            "entities:entity_observer",
+            "morning_briefing",
+        ] {
+            assert_eq!(DAILY_INPUTS[0].version_since(hook, "20260910", None), None);
+            assert_eq!(
+                DAILY_INPUTS[0].version_since(hook, "20260909", Some(cutoff)),
+                None
+            );
+            assert_eq!(
+                DAILY_INPUTS[0].version_since(hook, "20260910", Some(cutoff)),
+                Some(DAILY_INPUTS[0].version)
+            );
+            assert_eq!(
+                DAILY_INPUTS[0].version_since(hook, "not-a-day", Some(cutoff)),
+                None
+            );
+        }
+        for hook in ["daily_schedule", "entities:entities_review"] {
+            assert_eq!(
+                DAILY_INPUTS[0].version_since(hook, "20260910", Some(cutoff)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn compute_daily_evidence_on_a_journal_with_no_config_file_creates_none() {
+        let root = root("evidence-no-config");
+        let evidence = evidence_of(&root, "20260910", "schedule", None);
+        assert!(!evidence.contract.is_empty());
+        assert!(!root.join("config/journal.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn daily_maintenance_shares_calendar_window_and_observes_named_segment_topology() {
         let root = root("daily-maintenance-window");

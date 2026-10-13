@@ -1140,7 +1140,9 @@ fn reconcile_pass(
     );
     let (held_activities, held_errors) = solstone_core_think_cli::discover_held_activities(journal);
     let (held_records, retry_errors) = work_retry::list(journal);
-    let today = daily_coverage::local_day(journal, chrono::Utc::now());
+    let now = chrono::Utc::now();
+    let today = daily_coverage::local_day(journal, now);
+    solstone_core_system::daily_coverage::activate_daily_inputs(journal, now)?;
     let maintenance =
         solstone_core_journal_io::DailyUnitIdentity::new(&today, "daily_schedule", None);
     if solstone_core_journal_io::load_daily_unit_record(journal, &maintenance)
@@ -2225,5 +2227,98 @@ mod tests {
         release.send(()).unwrap();
         assert!(received.recv_timeout(Duration::from_secs(5)).is_err());
         queue.shutdown();
+    }
+
+    #[test]
+    fn reconcile_pass_persists_the_cutoff_before_inspect_day() {
+        let root = fixture("local");
+        let journal = root.path();
+        let zone = solstone_core_journal_config::owner_zone(journal);
+        let now = chrono::Utc::now();
+        let today =
+            chrono::NaiveDate::parse_from_str(&daily_coverage::local_day(journal, now), "%Y%m%d")
+                .unwrap();
+        let mut days = Vec::new();
+        for age in 1..=12 {
+            let day = (today - chrono::Duration::days(age))
+                .format("%Y%m%d")
+                .to_string();
+            std::fs::create_dir_all(journal.join("chronicle").join(&day)).unwrap();
+            let coverage = daily_coverage::read_daily_coverage(journal, &day).unwrap();
+            for unit in &coverage.units {
+                if unit.evidence_revision.is_empty() || unit.contract_digest.is_empty() {
+                    continue;
+                }
+                let mut record = solstone_core_journal_io::DailyUnitRecord::new(
+                    unit.identity.clone(),
+                    &unit.evidence_revision,
+                    &unit.contract_digest,
+                );
+                record.status = solstone_core_journal_io::DailyUnitStatus::CommittedNoOutput;
+                record.accepted = Some(solstone_core_journal_io::AcceptedDailyResult {
+                    evidence_revision: unit.evidence_revision.clone(),
+                    contract_digest: unit.contract_digest.clone(),
+                    status: solstone_core_journal_io::DailyUnitStatus::CommittedNoOutput,
+                    packet_digest: Some("a".repeat(64)),
+                    generated_result: Some(serde_json::json!({"response":"[]","output":"[]"})),
+                    receipts: Vec::new(),
+                    committed_at_ms: 1,
+                });
+                solstone_core_journal_io::save_daily_unit_record(journal, &record).unwrap();
+            }
+            days.push(day);
+        }
+        let before = chrono::Utc::now();
+        let backlog =
+            reconcile_pass(journal, &queue(journal), &AtomicBool::new(false), false).unwrap();
+        let after = chrono::Utc::now();
+        let early = daily_coverage::daily_input_since_day(before, &zone, 7);
+        let late = daily_coverage::daily_input_since_day(after, &zone, 7);
+        let config = solstone_core_journal_config::read_journal_config(journal)
+            .unwrap()
+            .config
+            .unwrap();
+        let stored = solstone_core_journal_config::daily_input_since(
+            &config,
+            "location",
+            "location-words-1",
+        )
+        .unwrap()
+        .unwrap()
+        .format("%Y%m%d")
+        .to_string();
+        assert!(stored == early || stored == late, "{stored} {early} {late}");
+        let mut owed = BTreeSet::new();
+        for task in backlog.admitted.iter().chain(backlog.ranked.iter()) {
+            let wire = task.request.cmd.as_wire();
+            if wire.iter().any(|arg| arg == "--daily-only")
+                && let Some(day) = task.request.day.clone()
+            {
+                owed.insert(day);
+            }
+        }
+        if let Some(report) = solstone_core_system::work_inventory::read(journal).unwrap() {
+            for hold in report.holds {
+                if hold.segment.is_none() && hold.retry_unit.is_none() {
+                    owed.insert(hold.day);
+                }
+            }
+        }
+        let earlier = early.clone().min(late.clone());
+        let later = early.max(late);
+        for day in &owed {
+            assert!(
+                day.as_str() >= earlier.as_str(),
+                "{day} is before {earlier}: {owed:?}"
+            );
+        }
+        for day in &days {
+            if day.as_str() >= later.as_str() {
+                assert!(owed.contains(day), "{day} missing from {owed:?}");
+            }
+            if day.as_str() < earlier.as_str() {
+                assert!(!owed.contains(day), "{day} present in {owed:?}");
+            }
+        }
     }
 }

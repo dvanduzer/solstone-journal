@@ -17,12 +17,15 @@ pub mod accuracy;
 pub mod area;
 pub mod asset;
 pub mod day;
+pub mod fingerprint;
 pub mod install;
 pub mod pack;
 pub mod places;
 pub mod projection;
 pub mod record;
 pub mod stay;
+
+pub use fingerprint::daily_location_fingerprint;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

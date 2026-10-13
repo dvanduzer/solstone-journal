@@ -95,6 +95,10 @@ pub(crate) fn run(
     for facet in write_facets {
         solstone_core_facets::ensure_daily_facet_id(&context.journal, &facet)?;
     }
+    solstone_core_system::daily_coverage::activate_daily_inputs(
+        &context.journal,
+        chrono::Utc::now(),
+    )?;
     let mut total = ModeResult::default();
     let runtime = runtime()?;
     for (priority, group) in grouped(configs) {
@@ -279,6 +283,14 @@ fn queue_daily(
     } else {
         &context.day
     };
+    #[cfg(test)]
+    {
+        let early =
+            BEFORE_DAILY_EVIDENCE.with(|slot| slot.borrow_mut().as_mut().map(|hook| hook(context)));
+        if let Some(result) = early {
+            return result;
+        }
+    }
     let evidence =
         crate::snapshot::compute_daily_evidence(&context.journal, evidence_day, config, facet)?;
     let (evidence_rev, contract_dig) = (evidence.revision.clone(), evidence.contract.clone());
@@ -430,9 +442,37 @@ fn queue_daily(
                 && record.contract_digest == contract_dig
         })
         .and_then(|record| record.frozen_packet.clone());
-    let frozen_packet = match retained {
-        Some(packet) => packet,
-        None => crate::snapshot::prepare_daily_packet(context, config, facet, &extra)?,
+    let hook = solstone_core_indexer::daily_evidence::daily_hook(&config.key, &config.metadata)?;
+    let recovering = existing_record
+        .as_ref()
+        .is_some_and(solstone_core_talent_runtime::daily_location::has_owner_actions)
+        && retained.is_some();
+    let freshness = if recovering {
+        solstone_core_talent_runtime::daily_location::DailyLocationFreshness::NotApplicable
+    } else {
+        solstone_core_talent_runtime::daily_location::daily_location_freshness(
+            &context.journal,
+            &hook,
+            evidence_day,
+            retained.as_ref(),
+        )?
+    };
+    let frozen_packet = match freshness {
+        solstone_core_talent_runtime::daily_location::DailyLocationFreshness::NotApplicable => {
+            match retained {
+                Some(packet) => packet,
+                None => crate::snapshot::prepare_daily_packet(context, config, facet, &extra)?,
+            }
+        }
+        solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Reuse => {
+            retained.ok_or_else(|| "daily location reuse has no stored packet".to_owned())?
+        }
+        solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Stale => {
+            crate::snapshot::prepare_daily_packet(context, config, facet, &extra)?
+        }
+        solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Unreadable => {
+            return Err("daily location could not be read".into());
+        }
     };
     let mut reservation_error = None;
     let mut conflict_exhausted = false;
@@ -548,14 +588,16 @@ pub(crate) fn reserve_daily_attempt(
     now_ms: i64,
 ) -> Result<(), solstone_core_journal_io::DailyUnitError> {
     let _execution = solstone_core_journal_io::claim_daily_execution(journal, identity)?;
-    solstone_core_journal_io::with_locked_daily_unit_record(journal, identity, |slot| {
-        let mut record = slot.take().unwrap_or_else(|| {
+    solstone_core_journal_io::with_daily_unit_authority(journal, identity, |authority| {
+        let existed = authority.record().is_some();
+        let mut record = authority.record_mut().take().unwrap_or_else(|| {
             solstone_core_journal_io::DailyUnitRecord::new(
                 identity.clone(),
                 evidence_rev,
                 contract_dig,
             )
         });
+        let baseline = record.clone();
         if record.has_uncommitted_started_receipt() {
             return Err(solstone_core_journal_io::DailyUnitError::Malformed(
                 "unit has ambiguous uncommitted owner action".to_owned(),
@@ -640,9 +682,69 @@ pub(crate) fn reserve_daily_attempt(
             );
             record.accepted = accepted;
         }
-        // An interrupted same-revision attempt retains the exact packet and publication plan.
-        if record.frozen_packet.is_none() {
-            record.frozen_packet = Some(frozen_packet.clone());
+        // An interrupted same-revision attempt retains the exact packet unless its
+        // location fingerprint is stale. A stale caller is stored only when it
+        // matches a fresh read; otherwise the four attempt fields stay cleared.
+        let freshness = if solstone_core_talent_runtime::daily_location::has_owner_actions(&record)
+        {
+            Ok(solstone_core_talent_runtime::daily_location::DailyLocationFreshness::NotApplicable)
+        } else {
+            solstone_core_talent_runtime::daily_location::daily_location_freshness(
+                journal,
+                &identity.name,
+                &identity.day,
+                record.frozen_packet.as_ref(),
+            )
+        };
+        match freshness {
+            Err(error) => return Err(solstone_core_journal_io::DailyUnitError::Malformed(error)),
+            Ok(
+                solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Unreadable,
+            ) => {
+                return Err(solstone_core_journal_io::DailyUnitError::Malformed(
+                    "daily location could not be read".to_owned(),
+                ));
+            }
+            Ok(
+                solstone_core_talent_runtime::daily_location::DailyLocationFreshness::NotApplicable,
+            ) => {
+                if record.frozen_packet.is_none() {
+                    record.frozen_packet = Some(frozen_packet.clone());
+                }
+            }
+            Ok(solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Reuse) => {}
+            Ok(solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Stale) => {
+                let caller_matches = matches!(
+                    solstone_core_talent_runtime::daily_location::daily_location_freshness(
+                        journal,
+                        &identity.name,
+                        &identity.day,
+                        Some(frozen_packet),
+                    ),
+                    Ok(solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Reuse)
+                );
+                if caller_matches {
+                    record.packet_digest = None;
+                    record.generated_result = None;
+                    record.action_plan = None;
+                    record.frozen_packet = Some(frozen_packet.clone());
+                } else if existed {
+                    let mut cleared = baseline;
+                    cleared.frozen_packet = None;
+                    cleared.packet_digest = None;
+                    cleared.generated_result = None;
+                    cleared.action_plan = None;
+                    *authority.record_mut() = Some(cleared);
+                    authority.checkpoint()?;
+                    return Err(solstone_core_journal_io::DailyUnitError::Malformed(
+                        "daily location fingerprint is stale".to_owned(),
+                    ));
+                } else {
+                    return Err(solstone_core_journal_io::DailyUnitError::Malformed(
+                        "daily location fingerprint is stale".to_owned(),
+                    ));
+                }
+            }
         }
         record.packet_digest = record
             .frozen_packet
@@ -658,9 +760,24 @@ pub(crate) fn reserve_daily_attempt(
             record.attempt_day = Some(today.to_owned());
         }
         record.updated_at_ms = now_ms;
-        *slot = Some(record);
+        *authority.record_mut() = Some(record);
+        authority.checkpoint()?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+type DailyEvidenceHook = Box<dyn FnMut(&crate::context::ThinkContext) -> Result<(), String>>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_DAILY_EVIDENCE: std::cell::RefCell<Option<DailyEvidenceHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` at the start of each daily queue, before evidence is read.
+#[cfg(test)]
+pub(crate) fn set_before_daily_evidence(hook: Option<DailyEvidenceHook>) {
+    BEFORE_DAILY_EVIDENCE.with(|slot| *slot.borrow_mut() = hook);
 }
 
 fn log_skip(
@@ -4310,5 +4427,326 @@ cat "${0%/*}/response-$kind.json"
                 .unwrap()
                 .held
         );
+    }
+
+    struct ClearDailyEvidenceHook;
+    impl Drop for ClearDailyEvidenceHook {
+        fn drop(&mut self) {
+            set_before_daily_evidence(None);
+        }
+    }
+
+    fn location_config(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"identity":{"timezone":"America/Denver"},"daily_inputs":{"location":{"location-words-1":"20260101"}}}"#,
+        )
+        .unwrap();
+    }
+
+    fn stored_cutoff(root: &std::path::Path) -> String {
+        let config = solstone_core_journal_config::read_journal_config(root)
+            .unwrap()
+            .config
+            .unwrap();
+        solstone_core_journal_config::daily_input_since(&config, "location", "location-words-1")
+            .unwrap()
+            .unwrap()
+            .format("%Y%m%d")
+            .to_string()
+    }
+
+    fn briefing_packet(root: &std::path::Path) -> Value {
+        let prepared = solstone_core_talent_runtime::PreparedTalent {
+            name: "morning_briefing".to_owned(),
+            config: json!({
+                "day":"20260101",
+                "type":"generate",
+                "max_output_tokens":1024,
+                "prompt":"ordinary briefing",
+                "skip_reason":"no_input",
+                "hook":{"pre":"morning_briefing"}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        solstone_core_talent_runtime::daily_prepare::freeze(
+            prepared,
+            &solstone_core_talent_runtime::ExecutionContext {
+                journal: root.to_path_buf(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn accepted_briefing(
+        root: &std::path::Path,
+        packet: Value,
+        failure_count: u32,
+    ) -> DailyUnitRecord {
+        let identity = DailyUnitIdentity::new("20260101", "morning_briefing", None);
+        let mut record = DailyUnitRecord::new(identity, "E", "C");
+        record.status = DailyUnitStatus::Unfinished;
+        record.failure_count = failure_count;
+        record.attempts = 2;
+        record.frozen_packet = Some(packet.clone());
+        record.packet_digest = Some(solstone_core_talent_runtime::daily_prepare::packet_digest(
+            &packet,
+        ));
+        record.generated_result = Some(json!({"response":"kept","output":"kept"}));
+        record.accepted = Some(solstone_core_journal_io::AcceptedDailyResult {
+            evidence_revision: "E".to_owned(),
+            contract_digest: "C".to_owned(),
+            status: DailyUnitStatus::CommittedNoOutput,
+            packet_digest: Some("a".repeat(64)),
+            generated_result: Some(json!({"response":"[]","output":"[]"})),
+            receipts: Vec::new(),
+            committed_at_ms: 1,
+        });
+        save_daily_unit_record(root, &record).unwrap();
+        record
+    }
+
+    fn reserve_briefing(
+        root: &std::path::Path,
+        packet: &Value,
+    ) -> Result<(), solstone_core_journal_io::DailyUnitError> {
+        reserve_daily_attempt(
+            root,
+            &DailyUnitIdentity::new("20260101", "morning_briefing", None),
+            "E",
+            "C",
+            packet,
+            "20260102",
+            "worker-token",
+            false,
+            false,
+            9,
+        )
+    }
+
+    #[test]
+    fn daily_run_stores_the_cutoff_before_evidence() {
+        let _clear = ClearDailyEvidenceHook;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"identity":{"timezone":"America/Denver"}}"#,
+        )
+        .unwrap();
+        let day = "20261012";
+        std::fs::create_dir_all(root.join("chronicle").join(day)).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let calls_hook = std::rc::Rc::clone(&calls);
+        set_before_daily_evidence(Some(Box::new(move |context| {
+            calls_hook.set(calls_hook.get() + 1);
+            let config = solstone_core_journal_config::read_journal_config(&context.journal)
+                .unwrap()
+                .config
+                .unwrap();
+            assert!(
+                solstone_core_journal_config::daily_input_since(
+                    &config,
+                    "location",
+                    "location-words-1"
+                )
+                .unwrap()
+                .is_some()
+            );
+            Err("stop".into())
+        })));
+        let before = chrono::Utc::now();
+        let context = ThinkContext::new(
+            root,
+            day.to_owned(),
+            root.join("chronicle").join(day),
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let mut log = RunLogWriter::open(root, day, "daily");
+        run(&context, &mut log, None, false, 1).unwrap();
+        let after = chrono::Utc::now();
+        assert!(calls.get() >= 1);
+        let zone = solstone_core_journal_config::owner_zone(root);
+        let early = solstone_core_system::daily_coverage::daily_input_since_day(before, &zone, 7);
+        let late = solstone_core_system::daily_coverage::daily_input_since_day(after, &zone, 7);
+        let stored = stored_cutoff(root);
+        assert!(stored == early || stored == late, "{stored} {early} {late}");
+        let mut log = RunLogWriter::open(root, day, "daily");
+        run(&context, &mut log, None, false, 1).unwrap();
+        assert_eq!(stored_cutoff(root), stored);
+    }
+
+    #[test]
+    fn uncommitted_started_receipt_is_not_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        location_config(root.path());
+        let packet = briefing_packet(root.path());
+        let identity = DailyUnitIdentity::new("20260101", "morning_briefing", None);
+        let mut record = accepted_briefing(root.path(), packet, 4);
+        record.identity = identity.clone();
+        record.receipts.push(json!({
+            "kind": "owner_action",
+            "action_id": "0:action_1",
+            "token": "old_token",
+            "state": "started"
+        }));
+        let stale = {
+            let mut caller = record.frozen_packet.clone().unwrap();
+            caller["prepared"]["config"]["_daily_location_fingerprint"] = json!("ab".repeat(32));
+            caller
+        };
+        record.frozen_packet = Some(stale);
+        save_daily_unit_record(root.path(), &record).unwrap();
+        let before = load_daily_unit_record(root.path(), &identity)
+            .unwrap()
+            .unwrap();
+        let caller = briefing_packet(root.path());
+        assert!(reserve_briefing(root.path(), &caller).is_err());
+        let stored = load_daily_unit_record(root.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, before);
+        assert!(stored.has_uncommitted_started_receipt());
+        assert_eq!(stored.failure_count, 4);
+        assert!(stored.frozen_packet.is_some());
+    }
+
+    #[test]
+    fn missing_fingerprint_on_an_eligible_recipient_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        location_config(root.path());
+        let mut packet = briefing_packet(root.path());
+        packet["prepared"]["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("_daily_location_fingerprint");
+        assert_eq!(
+            solstone_core_talent_runtime::daily_location::daily_location_freshness(
+                root.path(),
+                "morning_briefing",
+                "20260101",
+                Some(&packet),
+            ),
+            Ok(solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Stale)
+        );
+        let identity = DailyUnitIdentity::new("20260101", "morning_briefing", None);
+        let seeded = accepted_briefing(root.path(), packet, 4);
+        let caller = json!({"version":1,"prepared":{"config":{"_daily_location_fingerprint":"00".repeat(32)}}});
+        assert!(reserve_briefing(root.path(), &caller).is_err());
+        let stored = load_daily_unit_record(root.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert!(stored.frozen_packet.is_none());
+        assert!(stored.packet_digest.is_none());
+        assert!(stored.generated_result.is_none());
+        assert!(stored.action_plan.is_none());
+        assert_eq!(stored.failure_count, 4);
+        assert_eq!(stored.accepted, seeded.accepted);
+        assert_ne!(stored.status, DailyUnitStatus::Capped);
+        assert_eq!(stored.status, DailyUnitStatus::Unfinished);
+    }
+
+    #[test]
+    fn receipt_free_matching_fingerprint_resumes_stored_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        location_config(root.path());
+        let packet = briefing_packet(root.path());
+        assert_eq!(
+            solstone_core_talent_runtime::daily_location::daily_location_freshness(
+                root.path(),
+                "morning_briefing",
+                "20260101",
+                Some(&packet),
+            ),
+            Ok(solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Reuse)
+        );
+        let seeded = accepted_briefing(root.path(), packet.clone(), 4);
+        let identity = DailyUnitIdentity::new("20260101", "morning_briefing", None);
+        let caller = json!({"version":1,"prepared":{"name":"morning_briefing","config":{"prompt":"other","_daily_location_fingerprint":"cd".repeat(32)}}});
+        reserve_briefing(root.path(), &caller).unwrap();
+        let stored = load_daily_unit_record(root.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.frozen_packet, Some(packet));
+        assert_eq!(stored.generated_result, seeded.generated_result);
+        assert_eq!(stored.accepted, seeded.accepted);
+        assert_eq!(stored.failure_count, 4);
+        assert_eq!(stored.status, DailyUnitStatus::Unfinished);
+        assert_eq!(stored.attempts, 3);
+        assert_ne!(stored.status, DailyUnitStatus::Capped);
+    }
+
+    #[test]
+    fn fingerprint_change_before_dispatch_during_generation_and_before_saved_response_refuses_without_spending_failure_count()
+     {
+        let root = tempfile::tempdir().unwrap();
+        location_config(root.path());
+        let packet = briefing_packet(root.path());
+        let location = root
+            .path()
+            .join("chronicle/20260101/phone/120000_1/location.jsonl");
+        std::fs::create_dir_all(location.parent().unwrap()).unwrap();
+        std::fs::write(&location, b"changed\n").unwrap();
+        let seeded = accepted_briefing(root.path(), packet.clone(), 4);
+        let identity = DailyUnitIdentity::new("20260101", "morning_briefing", None);
+        assert_eq!(
+            solstone_core_talent_runtime::daily_location::daily_location_freshness(
+                root.path(),
+                "morning_briefing",
+                "20260101",
+                seeded.frozen_packet.as_ref(),
+            ),
+            Ok(solstone_core_talent_runtime::daily_location::DailyLocationFreshness::Stale)
+        );
+        assert!(reserve_briefing(root.path(), &packet).is_err());
+        let cleared = load_daily_unit_record(root.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert!(cleared.frozen_packet.is_none());
+        assert!(cleared.packet_digest.is_none());
+        assert!(cleared.generated_result.is_none());
+        assert!(cleared.action_plan.is_none());
+        assert_eq!(cleared.failure_count, 4);
+        assert_eq!(cleared.accepted, seeded.accepted);
+        assert_eq!(cleared.status, DailyUnitStatus::Unfinished);
+        std::fs::remove_file(&location).unwrap();
+        reserve_briefing(root.path(), &packet).unwrap();
+        let prepared = load_daily_unit_record(root.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.frozen_packet, Some(packet));
+        assert_eq!(prepared.failure_count, 4);
+        assert_eq!(prepared.status, DailyUnitStatus::Unfinished);
+        assert_ne!(prepared.status, DailyUnitStatus::Capped);
+        assert!(prepared.packet_digest.is_some());
+    }
+    #[test]
+    fn partially_committed_reservation_keeps_the_exact_attempt_when_location_is_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        location_config(root.path());
+        let packet = briefing_packet(root.path());
+        let mut before = accepted_briefing(root.path(), packet.clone(), 4);
+        before
+            .receipts
+            .push(json!({"kind":"owner_action","action_id":"first","state":"committed"}));
+        before.action_plan = Some(json!({"actions":["retained-plan"]}));
+        save_daily_unit_record(root.path(), &before).unwrap();
+        let accuracy = root.path().join("cache/location/accuracy");
+        std::fs::create_dir_all(&accuracy).unwrap();
+        std::fs::write(accuracy.join("installed.json"), b"{").unwrap();
+        reserve_briefing(root.path(), &packet).unwrap();
+        let after = load_daily_unit_record(root.path(), &before.identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.frozen_packet, before.frozen_packet);
+        assert_eq!(after.generated_result, before.generated_result);
+        assert_eq!(after.action_plan, before.action_plan);
+        assert_eq!(after.receipts, before.receipts);
+        assert_eq!(after.failure_count, before.failure_count);
     }
 }

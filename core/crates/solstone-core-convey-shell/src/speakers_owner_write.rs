@@ -47,7 +47,10 @@ const OWNER_IDENTITY_INVALID_MESSAGE: &str =
     "that speaker command couldn't run because your configured owner identity needs attention.";
 const OWNER_IDENTITY_INVALID_DETAIL: &str = "configured owner identity is not admitted";
 
-pub async fn detect(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
+pub(crate) async fn detect(
+    Extension(root): Extension<Arc<JournalRoot>>,
+    request: Request,
+) -> Response {
     let body = optional_json(request).await;
     let force = body.get("force") == Some(&Value::Bool(true));
     match detect_owner_candidate(&root.0, force) {
@@ -63,7 +66,7 @@ pub async fn detect(Extension(root): Extension<Arc<JournalRoot>>, request: Reque
     }
 }
 
-pub async fn build_from_tags(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
+pub(crate) async fn build_from_tags(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
     match bootstrap_owner_from_manual_tags(&root.0) {
         Ok(value) if value["reason_code"] == OWNER_IDENTITY_INVALID => owner_identity_invalid(),
         Ok(value) if value.get("error").is_some() => err(
@@ -88,7 +91,10 @@ pub async fn build_from_tags(Extension(root): Extension<Arc<JournalRoot>>) -> Re
     }
 }
 
-pub async fn rebuild(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
+pub(crate) async fn rebuild(
+    Extension(root): Extension<Arc<JournalRoot>>,
+    request: Request,
+) -> Response {
     let body = optional_json(request).await;
     let override_regression = body.get("override") == Some(&Value::Bool(true));
     match rebuild_owner(&root.0, override_regression) {
@@ -111,7 +117,10 @@ pub async fn rebuild(Extension(root): Extension<Arc<JournalRoot>>, request: Requ
     }
 }
 
-pub async fn confirm(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
+pub(crate) async fn confirm(
+    Extension(root): Extension<Arc<JournalRoot>>,
+    request: Request,
+) -> Response {
     let body = match required_json(request).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -283,7 +292,10 @@ pub async fn confirm(Extension(root): Extension<Arc<JournalRoot>>, request: Requ
         .into_response()
 }
 
-pub async fn reject(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
+pub(crate) async fn reject(
+    Extension(root): Extension<Arc<JournalRoot>>,
+    request: Request,
+) -> Response {
     let body = match required_json(request).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -299,7 +311,7 @@ pub async fn reject(Extension(root): Extension<Arc<JournalRoot>>, request: Reque
     }
 }
 
-pub async fn undo(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
+pub(crate) async fn undo(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
     match undo_owner_voice(&root.0) {
         Ok(value) => {
             if let Err(error) = action(&root.0, "owner_voiceprint_undo", json!({})) {
@@ -337,7 +349,10 @@ pub(crate) fn owner_voice_error(error: OwnerVoiceError) -> Response {
     }
 }
 
-pub async fn set_aside(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
+pub(crate) async fn set_aside(
+    Extension(root): Extension<Arc<JournalRoot>>,
+    request: Request,
+) -> Response {
     let body = match required_json(request).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -391,7 +406,10 @@ pub async fn set_aside(Extension(root): Extension<Arc<JournalRoot>>, request: Re
     Json(json!({"status":"no_cluster"})).into_response()
 }
 
-pub async fn classify(Extension(root): Extension<Arc<JournalRoot>>, request: Request) -> Response {
+pub(crate) async fn classify(
+    Extension(root): Extension<Arc<JournalRoot>>,
+    request: Request,
+) -> Response {
     let body = match required_json(request).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -465,7 +483,7 @@ pub async fn classify(Extension(root): Extension<Arc<JournalRoot>>, request: Req
     Json(json!({"sentences":sentences})).into_response()
 }
 
-pub async fn ready(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
+pub(crate) async fn ready(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
     match owner_detection_ready(&root.0) {
         Ok(value) => Json(value).into_response(),
         Err(()) => owner_identity_invalid(),

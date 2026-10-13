@@ -12,6 +12,9 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+full-tests = []
+
 [dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true

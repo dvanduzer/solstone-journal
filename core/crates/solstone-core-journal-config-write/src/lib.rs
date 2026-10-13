@@ -33,8 +33,9 @@ pub use commit::{
     CommitConfigError, ConfigConflict, ConfigExpectation, ConfigFingerprint, commit_journal_config,
 };
 pub use config::{
-    CasConfigMutationError, ConfigMutationError, JournalConfigMutation, JournalConfigTransaction,
-    mutate_journal_config, mutate_journal_config_cas,
+    CasConfigMutationError, ConfigMutationError, InsertDailyInputSinceError, JournalConfigMutation,
+    JournalConfigTransaction, insert_daily_input_since, mutate_journal_config,
+    mutate_journal_config_cas,
 };
 pub use direct_port::persist_direct_door_port;
 pub use pairing_migration::{PairingAddressMigrationReport, migrate_pairing_home_address};

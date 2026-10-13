@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use solstone_core_journal_config::{
-    ConfigLoadError, get_journal_config_path, load_mutation_base, materialized_defaults,
-    read_journal_config,
+    ConfigLoadError, DailyInputSinceError, get_journal_config_path, load_mutation_base,
+    materialized_defaults, parse_daily_input_day, read_journal_config,
 };
 use solstone_core_journal_io::{
     AtomicWriteError, JsonWriteOptions, LockError, LockOptions, LockTimeout, hold_lock, write_json,
@@ -108,6 +108,70 @@ impl Error for CasConfigMutationError {
             Self::Write(error) => Some(error),
         }
     }
+}
+
+/// Why an input/version's cutoff could not be initialized.
+#[derive(Debug)]
+pub enum InsertDailyInputSinceError {
+    Caller(DailyInputSinceError),
+    Stored(DailyInputSinceError),
+    Mutation(ConfigMutationError),
+}
+impl fmt::Display for InsertDailyInputSinceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Caller(error) | Self::Stored(error) => error.fmt(formatter),
+            Self::Mutation(error) => error.fmt(formatter),
+        }
+    }
+}
+impl Error for InsertDailyInputSinceError {}
+
+/// Initialize one registered input/version once, preserving all sibling cutoffs.
+/// Invalid stored state is refused without rewriting it.
+pub fn insert_daily_input_since(
+    journal: &Path,
+    id: &str,
+    version: &str,
+    day: &str,
+) -> Result<String, InsertDailyInputSinceError> {
+    if id.is_empty() || version.is_empty() {
+        return Err(InsertDailyInputSinceError::Caller(DailyInputSinceError));
+    }
+    let date = parse_daily_input_day(day).map_err(InsertDailyInputSinceError::Caller)?;
+    let canonical = date.format("%Y%m%d").to_string();
+    let transaction = mutate_journal_config(journal, LockOptions::default(), |config| {
+        let stored = solstone_core_journal_config::daily_input_since(config, id, version);
+        match stored {
+            Err(error) => JournalConfigMutation {
+                changed: false,
+                value: Err(InsertDailyInputSinceError::Stored(error)),
+            },
+            Ok(Some(date)) => JournalConfigMutation {
+                changed: false,
+                value: Ok(date.format("%Y%m%d").to_string()),
+            },
+            Ok(None) => {
+                let inputs = config
+                    .entry("daily_inputs")
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                    .expect("validated input map");
+                let versions = inputs
+                    .entry(id)
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                    .expect("validated version map");
+                versions.insert(version.to_owned(), Value::String(canonical.clone()));
+                JournalConfigMutation {
+                    changed: true,
+                    value: Ok(canonical.clone()),
+                }
+            }
+        }
+    })
+    .map_err(InsertDailyInputSinceError::Mutation)?;
+    transaction.value
 }
 
 /// Strictly load, mutate, and conditionally atomically write journal config.
@@ -505,5 +569,97 @@ mod tests {
         assert!(matches!(error, CasConfigMutationError::Timeout(_)));
         assert!(invocations > 1);
         assert_eq!(fs::read(path).unwrap(), latest);
+    }
+
+    #[test]
+    fn insert_rejects_a_bad_caller_date_and_a_bad_stored_date_without_writing() {
+        let temporary = TempDir::new();
+        let path = get_journal_config_path(temporary.path());
+        assert!(
+            insert_daily_input_since(
+                temporary.path(),
+                "location",
+                "location-words-1",
+                "2026-10-05"
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = b"{\"daily_inputs\":{\"location\":{\"location-words-1\":\"20260231\"}},\"keep\":true}\n";
+        fs::write(&path, original).unwrap();
+        assert!(
+            insert_daily_input_since(temporary.path(), "location", "location-words-1", "20261005")
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn two_inserts_persist_one_stored_date() {
+        let temporary = TempDir::new();
+        let first =
+            insert_daily_input_since(temporary.path(), "location", "location-words-1", "20261001")
+                .unwrap();
+        let second =
+            insert_daily_input_since(temporary.path(), "location", "location-words-1", "20261008")
+                .unwrap();
+        assert_eq!(first, "20261001");
+        assert_eq!(second, first);
+        let value: Value =
+            serde_json::from_slice(&fs::read(get_journal_config_path(temporary.path())).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["daily_inputs"]["location"]["location-words-1"],
+            json!("20261001")
+        );
+
+        let left = temporary.path().to_path_buf();
+        let right = left.clone();
+        let first_thread = std::thread::spawn(move || {
+            insert_daily_input_since(&left, "location", "location-words-1", "20260101").unwrap()
+        });
+        let second_thread = std::thread::spawn(move || {
+            insert_daily_input_since(&right, "location", "location-words-1", "20260202").unwrap()
+        });
+        let left_result = first_thread.join().unwrap();
+        let right_result = second_thread.join().unwrap();
+        assert_eq!(left_result, right_result);
+        assert_eq!(left_result, "20261001");
+    }
+    #[test]
+    fn activation_preserves_sibling_inputs_versions_and_first_concurrent_cutoff() {
+        let temporary = TempDir::new();
+        let journal = temporary.path();
+        insert_daily_input_since(journal, "location", "v1", "20261005").unwrap();
+        insert_daily_input_since(journal, "other", "v1", "20261006").unwrap();
+        insert_daily_input_since(journal, "location", "v2", "20261007").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let threads: Vec<_> = ["20261008", "20261009"]
+            .into_iter()
+            .map(|day| {
+                let journal = journal.to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    insert_daily_input_since(&journal, "new", "v1", day).unwrap()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results[0], results[1]);
+        let config = read_journal_config(journal).unwrap().config.unwrap();
+        assert_eq!(config["daily_inputs"]["location"]["v1"], "20261005");
+        assert_eq!(config["daily_inputs"]["location"]["v2"], "20261007");
+        assert_eq!(config["daily_inputs"]["other"]["v1"], "20261006");
+        assert_eq!(
+            insert_daily_input_since(journal, "new", "v1", "20261101").unwrap(),
+            results[0]
+        );
     }
 }

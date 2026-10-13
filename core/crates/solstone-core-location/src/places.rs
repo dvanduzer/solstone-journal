@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use solstone_core_journal_io::{AtomicWriteOptions, LockOptions, atomic_replace, hold_lock};
+use solstone_core_journal_io::{
+    AtomicWriteOptions, LockOptions, atomic_replace, hold_daily_location_admission, hold_lock,
+};
 
 use crate::pack::distance_m;
 
@@ -157,6 +159,29 @@ impl PlaceStore {
             .unwrap_or_default()
     }
 
+    /// Read the store for a fingerprint.
+    ///
+    /// A missing file is an empty store. IO, invalid JSON, and a wrong version
+    /// are errors. This read takes no place-store lock.
+    pub fn read_strict(journal: &Path) -> std::io::Result<Self> {
+        let bytes = match fs::read(store_path(journal)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error),
+        };
+        let store: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if store.version != STORE_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "place store version",
+            ));
+        }
+        Ok(store)
+    }
+
     pub fn write(&self, journal: &Path) -> std::io::Result<()> {
         let path = store_path(journal);
         if let Some(parent) = path.parent() {
@@ -172,6 +197,8 @@ impl PlaceStore {
     /// pass and an owner's edit never overwrite each other. Writes only when
     /// the store changed. Returns what `change` returned.
     pub fn update<T>(journal: &Path, change: impl FnOnce(&mut Self) -> T) -> std::io::Result<T> {
+        let _admission = hold_daily_location_admission(journal)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let path = store_path(journal);
         let _lock = hold_lock(&path, LockOptions::default())
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -414,6 +441,53 @@ pub fn clean_name(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "full-tests")]
+    use std::sync::mpsc;
+    #[cfg(feature = "full-tests")]
+    use std::thread;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn place_update_waits_for_the_admission_guard() {
+        let journal = tempfile::tempdir().unwrap();
+        let store = PlaceStore {
+            version: 1,
+            places: vec![Place {
+                id: "place-1".to_owned(),
+                latitude: 1.0,
+                longitude: 2.0,
+                name: Some("old".to_owned()),
+                alias: None,
+                hidden: false,
+            }],
+        };
+        store.write(journal.path()).unwrap();
+        let before = fs::read(store_path(journal.path())).unwrap();
+        let guard = hold_daily_location_admission(journal.path()).unwrap();
+        let path = journal.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            PlaceStore::update(&path, |store| {
+                store.places[0].name = Some("new".to_owned());
+            })
+            .unwrap();
+            sender.send(()).unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(fs::read(store_path(journal.path())).unwrap(), before);
+        drop(guard);
+        receiver.recv().unwrap();
+        worker.join().unwrap();
+        let after = fs::read_to_string(store_path(journal.path())).unwrap();
+        assert!(after.contains("new"));
+        assert!(!after.contains("old"));
+    }
 
     const LAT: f64 = 39.7527;
     const LON: f64 = -105.0003;
