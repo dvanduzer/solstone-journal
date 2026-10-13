@@ -7,12 +7,12 @@ use std::sync::Arc;
 use axum::{
     Extension, Json,
     body::Bytes,
-    extract::{Path as RoutePath, State, rejection::PathRejection},
+    extract::{Path as RoutePath, Query, State, rejection::PathRejection},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::SecondsFormat;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_retention::mark_mutation::{
@@ -73,37 +73,95 @@ struct RecoverOutcome {
 const MAX_REVIEW_CONTEXT_BYTES: usize = 512 * 1024;
 const LIST_REVIEW_TOO_LARGE: &str = "list.review_too_large";
 
-pub async fn list(State(journal_root): State<PathBuf>) -> Response {
-    match tokio::task::spawn_blocking(move || rendered_review(&journal_root)).await {
-        Ok(Ok((removals, context))) => {
-            let state = if removals.is_empty() {
-                LIST_EMPTY
-            } else {
-                LIST_READY
-            };
-            list_response(state, removals, Some(context))
-        }
+const REVIEW_PAGE_SIZE: usize = 20;
+
+#[derive(Default, Deserialize)]
+pub struct ReviewPageQuery {
+    #[serde(default)]
+    offset: usize,
+}
+
+#[derive(Serialize)]
+struct ReviewPage {
+    state: &'static str,
+    removals: Vec<Value>,
+    review_context: Option<String>,
+    offset: usize,
+    next_offset: Option<usize>,
+    total_rows: usize,
+}
+
+pub async fn list(
+    State(journal_root): State<PathBuf>,
+    Query(query): Query<ReviewPageQuery>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || rendered_review(&journal_root, query.offset)).await {
+        Ok(Ok(page)) => uncached(Json(page).into_response()),
         Ok(Err(state)) => list_response(state, Vec::new(), None),
         Err(_) => list_response(OUTCOME_UNKNOWN, Vec::new(), None),
     }
 }
 
-fn rendered_review(journal_root: &Path) -> Result<(Vec<Value>, String), &'static str> {
+fn rendered_review(journal_root: &Path, offset: usize) -> Result<ReviewPage, &'static str> {
     let root = JournalRoot::open(journal_root).map_err(|_| LIST_REGISTER_UNAVAILABLE)?;
     let register = load_at_root(&root).map_err(|_| LIST_REGISTER_UNAVAILABLE)?;
-    let ids = register
+    let mut marks = register
         .marks
         .values()
         .filter(|mark| project_mark((*mark).clone()).is_some())
+        .collect::<Vec<_>>();
+    marks.sort_by(|left, right| {
+        (&right.target.day, &right.target.dir, right.id.as_str()).cmp(&(
+            &left.target.day,
+            &left.target.dir,
+            left.id.as_str(),
+        ))
+    });
+    let total_rows = marks.len();
+    // A completed action may have removed the last page since it was rendered.
+    let offset = if offset < total_rows { offset } else { 0 };
+    let mut ids = marks
+        .iter()
+        .skip(offset)
+        .take(REVIEW_PAGE_SIZE)
         .map(|mark| mark.id.clone())
         .collect::<Vec<_>>();
-    let context = read_review_context(&root, &ids).map_err(|_| LIST_REGISTER_UNAVAILABLE)?;
-    let removals = project_context(&context);
-    let context = serde_json::to_string(&context).map_err(|_| OUTCOME_UNKNOWN)?;
-    if context.len() > MAX_REVIEW_CONTEXT_BYTES {
-        return Err(LIST_REVIEW_TOO_LARGE);
+    let observed = read_review_context(&root, &ids).map_err(|_| LIST_REGISTER_UNAVAILABLE)?;
+    let mut context = observed.clone();
+    loop {
+        let serialized = serde_json::to_string(&context).map_err(|_| OUTCOME_UNKNOWN)?;
+        let next = offset + ids.len();
+        let next_offset = (next < total_rows).then_some(next);
+        if serialized.len() <= MAX_REVIEW_CONTEXT_BYTES {
+            let removals = project_context(&context);
+            return Ok(ReviewPage {
+                state: if removals.is_empty() {
+                    LIST_EMPTY
+                } else {
+                    LIST_READY
+                },
+                removals,
+                review_context: Some(serialized),
+                offset,
+                next_offset,
+                total_rows,
+            });
+        }
+        if ids.len() == 1 {
+            // Keep the identity visible and allow navigation past this item, but
+            // never send truncated approval evidence or actionable controls.
+            return Ok(ReviewPage {
+                state: LIST_REVIEW_TOO_LARGE,
+                removals: project_context(&context),
+                review_context: None,
+                offset,
+                next_offset,
+                total_rows,
+            });
+        }
+        ids.pop();
+        context = observed.select(&ids).map_err(|_| OUTCOME_UNKNOWN)?;
     }
-    Ok((removals, context))
 }
 
 pub async fn approve(
@@ -665,7 +723,10 @@ fn append_action(journal_root: &Path, action: &str, params: Value) {
 }
 
 fn list_response(state: &'static str, removals: Vec<Value>, context: Option<String>) -> Response {
-    Json(json!({"state": state, "removals": removals, "review_context": context})).into_response()
+    uncached(
+        Json(json!({"state": state, "removals": removals, "review_context": context}))
+            .into_response(),
+    )
 }
 
 fn request_response(status: StatusCode, state: &'static str) -> Response {
@@ -712,6 +773,146 @@ mod tests {
         recover_from_call, recover_outcome, recover_unavailable, recover_unknown, refusal_item,
         removal_outcome, remove_preflight_refusal,
     };
+
+    fn review_fixture(
+        count: usize,
+        reason_bytes: usize,
+    ) -> (tempfile::TempDir, Vec<super::retention::Mark>) {
+        use solstone_core_retention::{
+            Target,
+            marks::{Mark, MarkId, MarkState, Proposal, Register},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("health")).unwrap();
+        let marks = (0..count)
+            .map(|index| {
+                let target = Target {
+                    day: "20260101".into(),
+                    stream: "_default".into(),
+                    dir: format!("{:06}_60", index),
+                };
+                let names = vec!["audio.flac".into()];
+                Mark {
+                    id: MarkId::derive(RemovalClass::PolicyRawRelease, &target, &names),
+                    class: RemovalClass::PolicyRawRelease,
+                    target,
+                    marked_at: "2026-01-01T00:00:00Z".into(),
+                    proposal: Proposal {
+                        bytes: 1,
+                        reason: "r".repeat(reason_bytes),
+                        names,
+                    },
+                    state: MarkState::Marked,
+                    offload: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let register = Register {
+            version: 2,
+            marks: marks
+                .iter()
+                .map(|mark| (mark.id.clone(), mark.clone()))
+                .collect(),
+        };
+        fs::write(
+            dir.path().join("health/retention-marks.json"),
+            serde_json::to_vec(&register).unwrap(),
+        )
+        .unwrap();
+        (dir, marks)
+    }
+
+    #[test]
+    fn review_pages_bound_complete_contexts_without_skipping_marks() {
+        let (dir, marks) = review_fixture(25, 40_000);
+        let mut offset = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let page = super::rendered_review(dir.path(), offset).unwrap();
+            assert_eq!(page.total_rows, marks.len());
+            assert_eq!(page.offset, offset);
+            let serialized = page.review_context.unwrap();
+            assert!(serialized.len() <= super::MAX_REVIEW_CONTEXT_BYTES);
+            let context: super::ReviewContext = serde_json::from_str(&serialized).unwrap();
+            for mark in context.marks() {
+                assert_eq!(
+                    Some(mark),
+                    marks.iter().find(|original| original.id == mark.id)
+                );
+                assert!(seen.insert(mark.id.clone()));
+            }
+            match page.next_offset {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), marks.len());
+    }
+
+    #[test]
+    fn an_oversized_mark_has_no_consent_context_and_can_be_passed() {
+        let (dir, mut marks) = review_fixture(2, super::MAX_REVIEW_CONTEXT_BYTES);
+        marks[0].proposal.reason = "small review".into();
+        let register = solstone_core_retention::marks::Register {
+            version: 2,
+            marks: marks
+                .into_iter()
+                .map(|mark| (mark.id.clone(), mark))
+                .collect(),
+        };
+        fs::write(
+            dir.path().join("health/retention-marks.json"),
+            serde_json::to_vec(&register).unwrap(),
+        )
+        .unwrap();
+        let first = super::rendered_review(dir.path(), 0).unwrap();
+        assert_eq!(first.state, super::LIST_REVIEW_TOO_LARGE);
+        assert!(first.review_context.is_none());
+        assert_eq!(first.removals.len(), 1);
+        assert_eq!(first.next_offset, Some(1));
+        let next = super::rendered_review(dir.path(), first.next_offset.unwrap()).unwrap();
+        assert_ne!(first.removals[0]["id"], next.removals[0]["id"]);
+        assert_eq!(next.state, super::LIST_READY);
+        assert!(next.review_context.is_some());
+        assert!(next.next_offset.is_none());
+    }
+
+    #[test]
+    fn paged_review_retains_stale_proposal_refusal() {
+        use solstone_core_retention::marks::Register;
+        let (dir, mut marks) = review_fixture(21, 10);
+        let page = super::rendered_review(dir.path(), 20).unwrap();
+        let context: super::ReviewContext =
+            serde_json::from_str(&page.review_context.unwrap()).unwrap();
+        let id = &context.marks()[0].id;
+        marks
+            .iter_mut()
+            .find(|mark| &mark.id == id)
+            .unwrap()
+            .proposal
+            .reason
+            .push_str(" changed");
+        let register = Register {
+            version: 2,
+            marks: marks
+                .into_iter()
+                .map(|mark| (mark.id.clone(), mark))
+                .collect(),
+        };
+        fs::write(
+            dir.path().join("health/retention-marks.json"),
+            serde_json::to_vec(&register).unwrap(),
+        )
+        .unwrap();
+        let root = std::sync::Arc::new(super::JournalRoot::open(dir.path()).unwrap());
+        assert!(matches!(
+            super::check_review_context(root, &context),
+            Err(super::ReviewRefusal::Stale { .. })
+        ));
+    }
 
     fn receipt(removed: &[&str], entries: &[&str], halted: bool) -> Value {
         let not_removed = entries

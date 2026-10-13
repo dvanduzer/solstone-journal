@@ -7,6 +7,11 @@
     "card.subhead": "original audio and video marked for deletion, plus anything a deletion left unfinished. nothing marked here is deleted until you say so.",
     "card.empty": "nothing is waiting on you.",
     "card.unavailable": "the list couldn't be loaded.",
+    "card.loading": "loading originals…",
+    "card.too_large": "this item's deletion details are too large to review here.",
+    "card.support": "contact support for help",
+    "page.range": "items {first}–{last} of {total}",
+    "page.selection": "selection applies to this page and clears when you change pages.",
     "operation.submitting": "sending your deletion request.",
     "operation.running": "deletion is in progress.",
     "operation.stop_pending": "requesting a stop.",
@@ -18,8 +23,8 @@
     "operation.unknown": "it's unclear what was deleted and what wasn't.",
     "operation.unavailable": "the current result couldn't be checked.",
     "operation.record_unavailable": "the deletion record isn't available.",
-    "card.total_one": "in all: 1 original · {size}",
-    "card.total_many": "in all: {n} originals · {size}",
+    "card.total_one": "on this page: 1 original · {size}",
+    "card.total_many": "on this page: {n} originals · {size}",
     "row.identity": "{date} · {stream}",
     "row.origin_policy_one": "1 original marked by your retention settings. this part of the list rebuilds every day.",
     "row.origin_policy_many": "{n} originals marked by your retention settings. this part of the list rebuilds every day.",
@@ -31,7 +36,7 @@
     "row.kept_many": "nothing else goes with them.",
     "row.delete": "delete originals",
     "row.keep": "keep for now",
-    "bulk.select_all": "select all",
+    "bulk.select_all": "select this page",
     "bulk.clear": "clear selection",
     "bulk.selected_one": "1 selected",
     "bulk.selected_many": "{n} selected",
@@ -103,9 +108,11 @@
   let confirmation = null;
   let outcomeHtml = '';
   let selected = new Set();
-  let pageIndex = 0;
+  let pageOffset = 0;
+  let nextOffset = null;
+  let totalRows = 0;
+  let previousOffsets = [];
   let expanded = false;
-  const PAGE_SIZE = 20;
 
   function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -251,7 +258,7 @@
   }
 
   function cardRows() {
-    return rows.slice(pageIndex * PAGE_SIZE, (pageIndex + 1) * PAGE_SIZE).map(function (row) {
+    return rows.map(function (row) {
       return row.state === 'failed' ? failedRow(row) : markedRow(row);
     }).join('');
   }
@@ -269,8 +276,7 @@
   // original takes nothing else with it. Each origin sentence carries its own
   // count, because on a mixed list a bare "this" or "these" leaves the reader
   // no way to tell which rows the sentence covers. Counted over every marked
-  // row in the list rather than the current page, so it agrees with the totals
-  // line and with the selection, which also span every page.
+  // row on this page, agreeing with its totals and selection scope.
   function listNoteHtml() {
     const marked = markedRows();
     if (marked.length === 0) return '';
@@ -353,10 +359,17 @@
       + '</section>';
   }
 
+  function pagesHtml() {
+    return '<nav class="removals-card-pages" aria-label="originals pages"><button type="button" data-removal-action="previous"'
+      + (previousOffsets.length === 0 ? ' disabled' : '') + '>previous</button><span>'
+      + copy('page.range', { first: pageOffset + 1, last: pageOffset + rows.length, total: totalRows })
+      + '</span><button type="button" data-removal-action="next"'
+      + (nextOffset === null ? ' disabled' : '') + '>next</button></nav>';
+  }
+
   function render() {
     if (!card || retired || mountedRoot !== document.querySelector('[data-home-root]')) return;
     renderGeneration += 1;
-    pageIndex = Math.min(pageIndex, Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1));
     const heading = '<h2 class="pulse-section-header">' + copy("card.heading") + '</h2><p>' + copy("card.subhead") + '</p>';
     if (listState === 'list.empty') {
       card.innerHTML = '<section class="removals-card">' + heading
@@ -367,9 +380,18 @@
         + '<p class="removals-card-total">'
         + copyForCount('card.total', totals.count, { n: totals.count, size: formatBytes(totals.bytes) })
         + '</p><details class="removals-review"' + (expanded ? ' open' : '') + '><summary>review originals' + (rows.some(row => row.state === 'failed') ? ' · unfinished deletions need review' : '') + '</summary>'
-        + listNoteHtml() + toolbarHtml() + '<p class="removals-card-scope">selection applies across every page.</p>' + cardRows()
-        + '<nav class="removals-card-pages" aria-label="originals pages"><button type="button" data-removal-action="previous"' + (pageIndex === 0 ? ' disabled' : '') + '>previous</button><span>page ' + (pageIndex + 1) + ' of ' + Math.max(1, Math.ceil(rows.length / PAGE_SIZE)) + '</span><button type="button" data-removal-action="next"' + ((pageIndex + 1) * PAGE_SIZE >= rows.length ? ' disabled' : '') + '>next</button></nav>'
+        + listNoteHtml() + toolbarHtml() + '<p class="removals-card-scope">' + copy('page.selection') + '</p>' + cardRows()
+        + pagesHtml()
         + finishHtml() + '</details>' + confirmationHtml() + outcomeHtml + operationHtml() + '</section>';
+    } else if (listState === 'list.review_too_large') {
+      card.innerHTML = '<section class="removals-card">' + heading
+        + rows.map(row => identity(identityText(row), row)).join('')
+        + '<p data-removals-list-unavailable>' + copy('card.too_large') + '</p>'
+        + '<p><a href="/app/support/">' + copy('card.support') + '</a></p>'
+        + pagesHtml() + outcomeHtml + operationHtml() + '</section>';
+    } else if (listState === 'list.loading') {
+      card.innerHTML = '<section class="removals-card">' + heading
+        + '<p role="status">' + copy('card.loading') + '</p>' + operationHtml() + '</section>';
     } else {
       card.innerHTML = '<section class="removals-card">' + heading
         + '<p data-removals-list-unavailable>' + copy("card.unavailable") + '</p>' + outcomeHtml + operationHtml() + '</section>';
@@ -510,13 +532,18 @@
     const root = mountedRoot;
     let response;
     try {
-      response = await request(LIST_URL);
+      response = await request(LIST_URL + '?offset=' + pageOffset);
     } catch (_) {
       response = { state: 'list.register_unavailable' };
     }
     if (retired || epoch !== mountEpoch || root !== document.querySelector('[data-home-root]')
         || generation !== refreshGeneration) return false;
-    const trustworthy = (response?.state === 'list.ready' || response?.state === 'list.empty')
+    const validPage = Number.isSafeInteger(response?.offset) && response.offset >= 0
+      && Number.isSafeInteger(response.total_rows) && response.total_rows >= 0
+      && (response.next_offset === null || (Number.isSafeInteger(response.next_offset) && response.next_offset > response.offset));
+    const oversized = validPage && response?.state === 'list.review_too_large'
+      && Array.isArray(response.removals) && response.removals.length === 1 && response.review_context === null;
+    const trustworthy = validPage && (response?.state === 'list.ready' || response?.state === 'list.empty')
       && Array.isArray(response.removals)
       && typeof response.review_context === 'string' && response.review_context.length > 0;
     const nextContext = trustworthy ? response.review_context : null;
@@ -525,8 +552,14 @@
       confirmation = null;
     }
     reviewContext = nextContext;
-    listState = trustworthy ? response.state : 'list.register_unavailable';
-    rows = trustworthy ? response.removals : [];
+    listState = trustworthy || oversized ? response.state : 'list.register_unavailable';
+    rows = trustworthy || oversized ? response.removals : [];
+    if (trustworthy || oversized) {
+      if (pageOffset !== response.offset) previousOffsets = [];
+      pageOffset = response.offset;
+      nextOffset = response.next_offset;
+      totalRows = response.total_rows;
+    }
     const markedIds = new Set(markedRows().map(function (row) { return row.id; }));
     selected = new Set(Array.from(selected).filter(function (id) { return markedIds.has(id); }));
     render();
@@ -755,8 +788,27 @@
           return candidate.id === control.dataset.markId;
         });
         if (action === 'previous' || action === 'next') {
-          pageIndex += action === 'next' ? 1 : -1; expanded = true; render();
-          card.querySelector('.removals-card-pages button:not(:disabled)')?.focus();
+          if (action === 'next') {
+            if (nextOffset === null) return;
+            previousOffsets.push(pageOffset);
+            pageOffset = nextOffset;
+          } else {
+            if (!previousOffsets.length) return;
+            pageOffset = previousOffsets.pop();
+          }
+          selected = new Set();
+          confirmation = null;
+          reviewContext = null;
+          listState = 'list.loading';
+          expanded = true;
+          render();
+          const pageCard = card;
+          const pageEpoch = mountEpoch;
+          refresh().then(() => {
+            if (card === pageCard && mountEpoch === pageEpoch) {
+              card?.querySelector('.removals-card-pages button:not(:disabled)')?.focus();
+            }
+          });
           return;
         }
         if (action === 'approve' && row) openDeleteConfirmation([row]);
@@ -829,6 +881,10 @@
     if (root === mountedRoot && card) { refresh(); return; }
     detach();
     reviewContext = null;
+    pageOffset = 0;
+    nextOffset = null;
+    totalRows = 0;
+    previousOffsets = [];
     selected = new Set();
     confirmation = null;
     outcomeHtml = '';
