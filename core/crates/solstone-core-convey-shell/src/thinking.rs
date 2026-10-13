@@ -182,6 +182,13 @@ pub struct ConfidentialRuntimeOverride {
 }
 
 #[derive(Clone)]
+pub struct EndpointImageCheckOverride {
+    pub check: Arc<
+        dyn Fn() -> Result<solstone_core_thinking::endpoint_image::ImageCheck, ()> + Send + Sync,
+    >,
+}
+
+#[derive(Clone)]
 struct ConfidentialRuntime {
     portal_base_url: String,
     poll: Arc<dyn ConfidentialPoll>,
@@ -456,6 +463,10 @@ pub(crate) fn router_with_roots(
                 .post(update_endpoint)
                 .delete(clear_endpoint)
                 .options(endpoint_options),
+        )
+        .route(
+            "/app/thinking/api/local/endpoint/check",
+            post(check_local_endpoint_image),
         )
         .route(
             "/app/thinking/api/generators",
@@ -1556,6 +1567,43 @@ async fn clear_endpoint(Extension(journal): Extension<Arc<JournalRoot>>) -> Resp
     endpoint_result(solstone_core_thinking::local::clear_endpoint(&journal.0))
 }
 
+async fn check_local_endpoint_image(
+    Extension(journal): Extension<Arc<JournalRoot>>,
+    image_check_override: Option<Extension<EndpointImageCheckOverride>>,
+) -> Response {
+    let config = match solstone_core_thinking::read_config(&journal.0) {
+        Ok(value) => value,
+        Err(_error) => return thinking_failure(),
+    };
+    let resolution = solstone_core_local::endpoint::resolve_local_endpoint(&config);
+    let own_endpoint = matches!(
+        resolution,
+        solstone_core_local::endpoint::LocalEndpointResolution::Byo(endpoint)
+            if !endpoint.is_confidential
+    );
+    if !own_endpoint {
+        return json_response(json!({"image_check":{"status":"not_applicable"}}));
+    }
+    let journal_root = journal.0.clone();
+    let check = tokio::task::spawn_blocking(move || {
+        if let Some(Extension(custom)) = image_check_override {
+            (custom.check)()
+        } else {
+            solstone_core_thinking::endpoint_image::check_endpoint_images(&journal_root)
+        }
+    })
+    .await;
+    match check {
+        Ok(Ok(check)) => json_response(check.to_json()),
+        Ok(Err(())) | Err(_) => json_response(json!({
+            "image_check": {
+                "status": "unchecked",
+                "reason": "unavailable",
+            }
+        })),
+    }
+}
+
 fn endpoint_result(
     result: Result<Value, solstone_core_thinking::local::EndpointMutationError>,
 ) -> Response {
@@ -2399,6 +2447,16 @@ mod tests {
             "chatgpt",
             "openai_card",
             "tuning",
+            "endpoint_image_checking",
+            "endpoint_image_not_read",
+            "endpoint_image_unchecked",
+            "endpoint_reason_unreachable",
+            "endpoint_reason_timeout",
+            "endpoint_reason_busy",
+            "endpoint_reason_key",
+            "endpoint_reason_rejected",
+            "endpoint_reason_unusable",
+            "endpoint_reason_other",
         ] {
             setup.insert(key.into(), live["byo_setup"][key].clone());
         }
@@ -3384,6 +3442,420 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body.get("access").is_none());
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn endpoint_image_check_route_contracts() {
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+        const MODE_SUCCESS: u8 = 0;
+        const MODE_ERROR: u8 = 1;
+        const MODE_PANIC: u8 = 2;
+
+        let root = temporary_journal("endpoint-image-check");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mode = Arc::new(AtomicU8::new(MODE_SUCCESS));
+
+        let counter_for_override = counter.clone();
+        let mode_for_override = mode.clone();
+        let image_override = super::EndpointImageCheckOverride {
+            check: Arc::new(move || {
+                counter_for_override.fetch_add(1, Ordering::SeqCst);
+                match mode_for_override.load(Ordering::SeqCst) {
+                    MODE_SUCCESS => Ok(solstone_core_thinking::endpoint_image::ImageCheck::Read),
+                    MODE_ERROR => Err(()),
+                    _ => {
+                        panic!("secret-credential-value leaked from http://endpoint.example:9/v1");
+                    }
+                }
+            }),
+        };
+
+        let app = super::router(Arc::new(crate::JournalRoot(root.clone())))
+            .layer(axum::extract::Extension(image_override.clone()));
+
+        let own_endpoint_config = json!({
+            "setup": { "completed_at": 1767225600 },
+            "providers": {
+                "local": {
+                    "endpoint_url": "http://endpoint.example:9/v1",
+                    "served_model_id": "vision-or-not",
+                    "credential": "secret-credential-value"
+                }
+            }
+        });
+
+        // 1. Complete own endpoint -> 200, status "read", count 1, secrets absent
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&own_endpoint_config).unwrap(),
+        )
+        .unwrap();
+
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "read");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let body_str = serde_json::to_string(&body).unwrap();
+        assert!(!body_str.contains("secret-credential-value"));
+        assert!(!body_str.contains("http://endpoint.example:9/v1"));
+        assert!(body.get("error").is_none());
+        assert!(body.get("detail").is_none());
+
+        // 2. No local endpoint (default temp journal) -> 200 not_applicable, count 1 (unchanged)
+        fs::write(
+            root.join("config/journal.json"),
+            br#"{"setup":{"completed_at":1767225600}}"#,
+        )
+        .unwrap();
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "not_applicable");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // 3. Whitespace-only URL, and separately blank model, even with confidential = {} -> not_applicable, checker 0
+        let whitespace_url_config = json!({
+            "setup": { "completed_at": 1767225600 },
+            "providers": {
+                "local": {
+                    "endpoint_url": "   \t\n  ",
+                    "served_model_id": "vision-or-not"
+                }
+            },
+            "services": { "confidential": {} }
+        });
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&whitespace_url_config).unwrap(),
+        )
+        .unwrap();
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "not_applicable");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let blank_model_config = json!({
+            "setup": { "completed_at": 1767225600 },
+            "providers": {
+                "local": {
+                    "endpoint_url": "http://endpoint.example:9/v1",
+                    "served_model_id": "  "
+                }
+            },
+            "services": { "confidential": {} }
+        });
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&blank_model_config).unwrap(),
+        )
+        .unwrap();
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "not_applicable");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // 4. services.confidential = {} plus complete URL and model -> not_applicable, count 1
+        let confidential_empty_obj_config = json!({
+            "setup": { "completed_at": 1767225600 },
+            "providers": {
+                "local": {
+                    "endpoint_url": "http://endpoint.example:9/v1",
+                    "served_model_id": "vision-or-not"
+                }
+            },
+            "services": { "confidential": {} }
+        });
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&confidential_empty_obj_config).unwrap(),
+        )
+        .unwrap();
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "not_applicable");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // 5. services.confidential = true, and one of string / array / null -> own, checker invoked
+        for conf_val in [
+            json!(true),
+            json!("not an object"),
+            json!([1, 2]),
+            Value::Null,
+        ] {
+            let non_obj_conf_config = json!({
+                "setup": { "completed_at": 1767225600 },
+                "providers": {
+                    "local": {
+                        "endpoint_url": "http://endpoint.example:9/v1",
+                        "served_model_id": "vision-or-not"
+                    }
+                },
+                "services": { "confidential": conf_val }
+            });
+            fs::write(
+                root.join("config/journal.json"),
+                serde_json::to_vec(&non_obj_conf_config).unwrap(),
+            )
+            .unwrap();
+            let before = counter.load(Ordering::SeqCst);
+            let req = Request::post("/app/thinking/api/local/endpoint/check")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["image_check"]["status"], "read");
+            assert_eq!(counter.load(Ordering::SeqCst), before + 1);
+        }
+
+        // 6. Trailing /v1 is own, and also without /v1 is own
+        let no_v1_config = json!({
+            "setup": { "completed_at": 1767225600 },
+            "providers": {
+                "local": {
+                    "endpoint_url": "http://endpoint.example:9",
+                    "served_model_id": "vision-or-not"
+                }
+            }
+        });
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&no_v1_config).unwrap(),
+        )
+        .unwrap();
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "read");
+        assert_eq!(counter.load(Ordering::SeqCst), before + 1);
+
+        // 7. providers.active.provider = openai plus complete saved endpoint -> own, checker invoked
+        let active_openai_config = json!({
+            "setup": { "completed_at": 1767225600 },
+            "providers": {
+                "active": { "provider": "openai" },
+                "local": {
+                    "endpoint_url": "http://endpoint.example:9/v1",
+                    "served_model_id": "vision-or-not"
+                }
+            }
+        });
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&active_openai_config).unwrap(),
+        )
+        .unwrap();
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "read");
+        assert_eq!(counter.load(Ordering::SeqCst), before + 1);
+
+        // 8. Checker returns Err(()) -> 200 unchecked / unavailable
+        mode.store(MODE_ERROR, Ordering::SeqCst);
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "unchecked");
+        assert_eq!(body["image_check"]["reason"], "unavailable");
+        assert_eq!(counter.load(Ordering::SeqCst), before + 1);
+
+        // 9. Checker panics with secrets -> 200 unchecked / unavailable, no secrets, no error/detail
+        mode.store(MODE_PANIC, Ordering::SeqCst);
+        let before = counter.load(Ordering::SeqCst);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        std::panic::set_hook(prev_hook);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "unchecked");
+        assert_eq!(body["image_check"]["reason"], "unavailable");
+        assert!(body.get("error").is_none());
+        assert!(body.get("detail").is_none());
+        let body_str = serde_json::to_string(&body).unwrap();
+        assert!(!body_str.contains("secret-credential-value"));
+        assert!(!body_str.contains("http://endpoint.example:9/v1"));
+        assert_eq!(counter.load(Ordering::SeqCst), before + 1);
+        mode.store(MODE_SUCCESS, Ordering::SeqCst);
+
+        // 10. POST a JSON body whose endpoint_url is http://body-must-not-win.example while saved config is own
+        // Checker runs once on saved config. Neither URL in response body.
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&own_endpoint_config).unwrap(),
+        )
+        .unwrap();
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"endpoint_url":"http://body-must-not-win.example","served_model_id":"sentinel"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "read");
+        assert_eq!(counter.load(Ordering::SeqCst), before + 1);
+        let body_str = serde_json::to_string(&body).unwrap();
+        assert!(!body_str.contains("http://body-must-not-win.example"));
+        assert!(!body_str.contains("http://endpoint.example:9/v1"));
+
+        // 11. POST that same body when no endpoint is saved -> not_applicable, checker count unchanged
+        fs::write(
+            root.join("config/journal.json"),
+            br#"{"setup":{"completed_at":1767225600}}"#,
+        )
+        .unwrap();
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"endpoint_url":"http://body-must-not-win.example","served_model_id":"sentinel"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "not_applicable");
+        assert_eq!(counter.load(Ordering::SeqCst), before);
+
+        // 12. Unreadable config: replace config/journal.json with directory
+        fs::remove_file(root.join("config/journal.json")).unwrap();
+        fs::create_dir(root.join("config/journal.json")).unwrap();
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["reason_code"], "settings_operation_failed");
+        assert_eq!(counter.load(Ordering::SeqCst), before);
+        fs::remove_dir(root.join("config/journal.json")).unwrap();
+
+        // 13. Form-typed POST (text/plain and application/x-www-form-urlencoded), own endpoint saved
+        // Status 415, checker count unchanged.
+        let composed_app =
+            crate::router(root.clone()).layer(axum::extract::Extension(image_override.clone()));
+        fs::write(
+            root.join("config/journal.json"),
+            serde_json::to_vec(&own_endpoint_config).unwrap(),
+        )
+        .unwrap();
+        for content_type in ["text/plain", "application/x-www-form-urlencoded"] {
+            let before = counter.load(Ordering::SeqCst);
+            let req = Request::post("/app/thinking/api/local/endpoint/check")
+                .header("content-type", content_type)
+                .header("origin", "http://localhost:5015")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = composed_app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{content_type}"
+            );
+            assert_eq!(counter.load(Ordering::SeqCst), before, "{content_type}");
+        }
+
+        // 14. Cross-site: loopback_guard::apply_layer, Host: localhost, Sec-Fetch-Site: cross-site, own endpoint
+        // 403 and reason_code "cross_origin_blocked", checker 0.
+        let loopback_app = crate::loopback_guard::apply_layer(composed_app.clone());
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .header("host", "localhost")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        let resp = loopback_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["reason_code"], "cross_origin_blocked");
+        assert_eq!(counter.load(Ordering::SeqCst), before);
+
+        // 15. Positive twin: Host: localhost, Sec-Fetch-Site: same-origin
+        // Once with no content-type and once with application/json.
+        // Checker invoked exactly once per request. 200 with image_check.
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .header("host", "localhost")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .unwrap();
+        let resp = loopback_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "read");
+        assert_eq!(counter.load(Ordering::SeqCst), before + 1);
+
+        let before = counter.load(Ordering::SeqCst);
+        let req = Request::post("/app/thinking/api/local/endpoint/check")
+            .header("host", "localhost")
+            .header("sec-fetch-site", "same-origin")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = loopback_app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["image_check"]["status"], "read");
+        assert_eq!(counter.load(Ordering::SeqCst), before + 1);
 
         let _ = fs::remove_dir_all(root);
     }

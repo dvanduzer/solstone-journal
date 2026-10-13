@@ -116,7 +116,8 @@ and the affirmative proof cache. A configured endpoint uses:
 The configured logical provider remains `local`, so the same readiness and
 safety boundary applies without maintaining vendor-specific adapters. Native
 Generate owns endpoint requests and holds governed local admission during the
-request.
+request. After saving in thinking settings, the journal checks whether the
+endpoint reads images.
 
 Bundled and configured local endpoints can use different JSON grammar engines.
 Shipped talent schemas therefore stay inside the measured regex subset shared

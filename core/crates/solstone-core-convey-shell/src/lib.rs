@@ -128,7 +128,7 @@ mod link_health_cache;
 #[cfg(feature = "host")]
 mod local_network;
 #[cfg(feature = "host")]
-mod loopback_guard;
+pub(crate) mod loopback_guard;
 #[cfg(feature = "host")]
 mod network;
 #[cfg(feature = "host")]
@@ -196,7 +196,7 @@ pub use network_writes::{
 #[cfg(feature = "host")]
 pub use thinking::{
     AccessClientHandle, AccessSnapshot, ConfidentialAccess, ConfidentialPoll,
-    ConfidentialRuntimeOverride, PollOutcome,
+    ConfidentialRuntimeOverride, EndpointImageCheckOverride, PollOutcome,
 };
 
 use assets::lookup;

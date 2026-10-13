@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- when you save your own endpoint in thinking settings, your journal now sends it one test image and tells you right away if the model didn't read it, so you can switch models. before, a model that can't read images only showed up later, as screens and photos that failed to process or were described wrongly.
+
 ### Fixed
 
 - when your journal can't set up its solstone.me address, the agents app now says the problem is on this computer and needs a fix, instead of saying this computer isn't reaching solstone.me and will keep trying. `solstone journal health logs` names the step that failed.

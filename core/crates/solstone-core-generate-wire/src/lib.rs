@@ -41,7 +41,7 @@ pub use confidential::{ConfidentialResult, confidential_generate};
 pub use endpoint::{
     ENDPOINT_SERVED_WINDOW_CACHE_TTL, EndpointFailure, EndpointGenerated, EndpointResult,
     EndpointRuntime, EndpointTransport, EndpointTransportError, OverflowDecision,
-    UreqEndpointTransport, endpoint_generate, endpoint_overflow_decision,
+    UreqEndpointTransport, endpoint_generate, endpoint_generate_with, endpoint_overflow_decision,
 };
 pub use google::{
     GoogleFailure, GoogleGenerated, GoogleResult, GoogleTransport, UreqGoogleTransport,

@@ -292,6 +292,9 @@ async function main() {
     set accessUnknownRereadScheduled(v) { accessUnknownRereadScheduled = v; },
     scheduleAccessUnknownReread,
     loadInitialState,
+    saveLocalEndpoint,
+    clearLocalEndpoint,
+    switchLane,
   };
 })();`,
   );
@@ -3363,6 +3366,397 @@ async function main() {
   // Restore state
   thinking.state.providers = savedProvidersBeforeGpt;
   thinking.state.keys = savedKeysBeforeGpt;
+
+  // Endpoint Image Check DOM test cases
+  thinking.applyCopy({
+    byo_setup: {
+      endpoint_image_checking: 'endpoint_image_checking:{model}',
+      endpoint_image_not_read: 'endpoint_image_not_read:{model}',
+      endpoint_image_unchecked: 'endpoint_image_unchecked:{model}:{reason}',
+      endpoint_reason_unreachable: 'endpoint_reason_unreachable',
+      endpoint_reason_timeout: 'endpoint_reason_timeout',
+      endpoint_reason_busy: 'endpoint_reason_busy',
+      endpoint_reason_key: 'endpoint_reason_key',
+      endpoint_reason_rejected: 'endpoint_reason_rejected',
+      endpoint_reason_unusable: 'endpoint_reason_unusable',
+      endpoint_reason_other: 'endpoint_reason_other',
+    },
+  });
+
+  const urlInput = make('localEndpointUrl');
+  const modelInput = make('localEndpointModel');
+  const credInput = make('localEndpointCredential');
+  const saveBtn = make('localEndpointSave');
+  const clearBtn = make('localEndpointClear');
+  const clearFromLocalBtn = make('localEndpointClearFromLocal');
+  const statusNode = make('localEndpointStatus');
+
+  const resetForm = () => {
+    window.location.hash = '#byo-setup';
+    urlInput.value = 'http://endpoint.example/v1';
+    modelInput.value = 'model-sentinel';
+    credInput.value = '';
+    saveBtn.disabled = false;
+    clearBtn.disabled = false;
+    clearFromLocalBtn.disabled = false;
+    statusNode.textContent = '';
+    delete statusNode.dataset.tone;
+  };
+
+  const assertButtonsRestoredAndNoChecking = () => {
+    assert.strictEqual(saveBtn.disabled, false, 'save button restored');
+    assert.strictEqual(clearBtn.disabled, false, 'clear button restored');
+    assert.strictEqual(clearFromLocalBtn.disabled, false, 'clearFromLocal button restored');
+    assert(!statusNode.textContent.includes('endpoint_image_checking'), 'checking text cleared');
+  };
+
+  let checkCalls = 0;
+  let saveCalls = 0;
+  let nextCheckHandler = null;
+  let saveHandler = null;
+  let putProvidersCount = 0;
+  let getAvailabilityCount = 0;
+  let checkRecordedBeforeCheck = null;
+
+  const originalApiJson = window.apiJson;
+  window.apiJson = async function (url, options = {}) {
+    const method = options.method || 'GET';
+    if (url === 'api/local/endpoint' && method === 'POST') {
+      saveCalls += 1;
+      if (saveHandler) {
+        return saveHandler(url, options);
+      }
+      return {
+        local_endpoint: {
+          endpoint_url: 'http://endpoint.example/v1',
+          served_model_id: 'model-sentinel',
+        },
+      };
+    }
+    if (url === 'api/local/endpoint' && method === 'DELETE') {
+      return { local_endpoint: {} };
+    }
+    if (url.startsWith('api/local/endpoint/check') && method === 'POST') {
+      checkCalls += 1;
+      assert.strictEqual(saveBtn.disabled, true, 'save button is disabled during check');
+      assert.strictEqual(clearBtn.disabled, true, 'clear button is disabled during check');
+      assert.strictEqual(
+        clearFromLocalBtn.disabled,
+        true,
+        'clearFromLocal button is disabled during check'
+      );
+      assert.strictEqual(
+        statusNode.textContent,
+        'endpoint_image_checking:model-sentinel',
+        'status shows checking message during check'
+      );
+      checkRecordedBeforeCheck = {
+        putProviders: putProvidersCount,
+        getAvailability: getAvailabilityCount,
+      };
+      if (nextCheckHandler) {
+        const handler = nextCheckHandler;
+        nextCheckHandler = null;
+        return typeof handler === 'function' ? handler(url, options) : handler;
+      }
+      return { image_check: { status: 'read' } };
+    }
+    if (url.startsWith('api/providers')) {
+      if (method === 'PUT') putProvidersCount += 1;
+      return {
+        local_override: {
+          endpoint_url: 'http://endpoint.example/v1',
+          served_model_id: 'model-sentinel',
+        },
+        active_lane: { lane: 'byo' },
+        active: { provider: 'local' },
+      };
+    }
+    if (url.startsWith('api/local/availability')) {
+      getAvailabilityCount += 1;
+      return { available: true };
+    }
+    if (url.startsWith('api/keys')) {
+      return { api_keys: {}, key_validation: {} };
+    }
+    if (method === 'GET') {
+      return {};
+    }
+    return originalApiJson.call(this, url, options);
+  };
+
+  // Case 1: successful save, check returns read
+  resetForm();
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'read' } });
+  const checkCallsBefore1 = checkCalls;
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(checkCalls, checkCallsBefore1 + 1, 'check called once');
+  assert.strictEqual(window.location.hash, '#main', 'leaves form on read');
+  assert(!statusNode.textContent.includes('endpoint_image_checking'));
+  assert(!statusNode.textContent.includes('endpoint_image_not_read'));
+  assert(!statusNode.textContent.includes('endpoint_image_unchecked'));
+
+  // Case 2: not_applicable
+  resetForm();
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'not_applicable' } });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#main', 'leaves form on not_applicable');
+  assert(!statusNode.textContent.includes('endpoint_image_checking'));
+  assert(!statusNode.textContent.includes('endpoint_image_not_read'));
+  assert(!statusNode.textContent.includes('endpoint_image_unchecked'));
+
+  // Case 3: not_read
+  resetForm();
+  putProvidersCount = 0;
+  getAvailabilityCount = 0;
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'not_read' } });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup', 'stays on form on not_read');
+  assert(statusNode.textContent.includes('endpoint_image_not_read:model-sentinel'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+  assert(checkRecordedBeforeCheck.putProviders > 0, 'PUT providers ran before check');
+  assert(
+    checkRecordedBeforeCheck.getAvailability > 0,
+    'GET availability ran before check'
+  );
+
+  // Case 4: unchecked with reason timeout
+  resetForm();
+  nextCheckHandler = Promise.resolve({
+    image_check: { status: 'unchecked', reason: 'timeout' },
+  });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup', 'stays on timeout');
+  assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_timeout'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+
+  // Case 5: unchecked with reason unavailable and with reason other
+  for (const reason of ['unavailable', 'other']) {
+    resetForm();
+    nextCheckHandler = Promise.resolve({
+      image_check: { status: 'unchecked', reason },
+    });
+    await thinking.saveLocalEndpoint();
+    assertButtonsRestoredAndNoChecking();
+    assert.strictEqual(window.location.hash, '#byo-setup');
+    assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+    assert.strictEqual(statusNode.dataset.tone, 'error');
+  }
+
+  // Case 6: unchecked with reason nope and with no reason
+  for (const checkPayload of [
+    { status: 'unchecked', reason: 'nope' },
+    { status: 'unchecked' },
+  ]) {
+    resetForm();
+    nextCheckHandler = Promise.resolve({ image_check: checkPayload });
+    await thinking.saveLocalEndpoint();
+    assertButtonsRestoredAndNoChecking();
+    assert.strictEqual(window.location.hash, '#byo-setup');
+    assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+    assert.strictEqual(statusNode.dataset.tone, 'error');
+  }
+
+  // Case 7: 200 {}
+  resetForm();
+  nextCheckHandler = Promise.resolve({});
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup');
+  assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+
+  // Case 8: unknown status Read
+  resetForm();
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'Read' } });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup');
+  assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+
+  // Case 9: apiJson returns non-JSON failure (throw with no status, or status 200 and a non-object)
+  resetForm();
+  nextCheckHandler = () => Promise.reject(new Error('throw with no status'));
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup');
+  assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+
+  resetForm();
+  nextCheckHandler = Promise.resolve('plain-string-non-object');
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup');
+  assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+
+  // Case 10: thrown check (status 500, status 418 with reason_code provider_key_invalid, status 403, rejected fetch)
+  const thrownCheckErrors = [
+    (() => {
+      const e = new Error('500');
+      e.status = 500;
+      return e;
+    })(),
+    (() => {
+      const e = new Error('418');
+      e.status = 418;
+      e.reasonCode = 'provider_key_invalid';
+      return e;
+    })(),
+    (() => {
+      const e = new Error('403');
+      e.status = 403;
+      return e;
+    })(),
+    new TypeError('fetch failed'),
+  ];
+  for (const err of thrownCheckErrors) {
+    resetForm();
+    nextCheckHandler = () => Promise.reject(err);
+    await thinking.saveLocalEndpoint();
+    assertButtonsRestoredAndNoChecking();
+    assert.strictEqual(window.location.hash, '#byo-setup');
+    assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+    assert(!statusNode.textContent.includes('not_applicable'));
+    assert.strictEqual(statusNode.dataset.tone, 'error');
+  }
+
+  // Case 11: unlogged
+  resetForm();
+  thinking.state.providers = {
+    local_override: {
+      endpoint_url: 'http://endpoint.example/v1',
+      served_model_id: 'model-sentinel',
+    },
+  };
+  saveHandler = () => {
+    const err = new Error('UNLOGGED_SENTINEL');
+    err.status = 500;
+    err.reasonCode = 'settings_saved_unlogged';
+    err.payload = {
+      error: 'UNLOGGED_SENTINEL',
+      reason_code: 'settings_saved_unlogged',
+    };
+    return Promise.reject(err);
+  };
+
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'read' } });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup');
+  assert(statusNode.textContent.includes('UNLOGGED_SENTINEL'));
+  assert(!statusNode.textContent.includes('endpoint_image_checking'));
+  assert(!statusNode.textContent.includes('endpoint_image_not_read'));
+  assert(!statusNode.textContent.includes('endpoint_image_unchecked'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+
+  resetForm();
+  thinking.state.providers = {
+    local_override: {
+      endpoint_url: 'http://endpoint.example/v1',
+      served_model_id: 'model-sentinel',
+    },
+  };
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'not_read' } });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup');
+  assert(statusNode.textContent.includes('UNLOGGED_SENTINEL'));
+  assert(statusNode.textContent.includes('endpoint_image_not_read:model-sentinel'));
+  assert(!statusNode.textContent.includes('endpoint_image_checking'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+  saveHandler = null;
+
+  // Case 12: failed save (throw reason invalid_config_value)
+  resetForm();
+  saveHandler = () => {
+    const err = new Error('bad config');
+    err.reasonCode = 'invalid_config_value';
+    return Promise.reject(err);
+  };
+  const checkCallsBefore12 = checkCalls;
+  await assert.rejects(async () => {
+    await thinking.saveLocalEndpoint();
+  });
+  assert.strictEqual(checkCalls, checkCallsBefore12, 'check count does not increase on failed save');
+  saveHandler = null;
+
+  // Case 13: clearLocalEndpoint()
+  const checkCallsBefore13 = checkCalls;
+  await thinking.clearLocalEndpoint();
+  assert.strictEqual(checkCalls, checkCallsBefore13, 'check count does not increase on clearLocalEndpoint');
+
+  // Case 14: second save
+  resetForm();
+  const checkCallsBefore14 = checkCalls;
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'read' } });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(checkCalls, checkCallsBefore14 + 1, 'check count increases by one on second save');
+
+  // Case 15: leave the form
+  resetForm();
+  let deferredResolve;
+  const pendingPromise = new Promise((resolve) => {
+    deferredResolve = resolve;
+  });
+  nextCheckHandler = pendingPromise;
+
+  let showViewCount = 0;
+  const origQSA = document.querySelectorAll;
+  document.querySelectorAll = function (selector) {
+    if (selector === '#providers [data-view]') showViewCount += 1;
+    return origQSA.call(this, selector);
+  };
+
+  const savePromise = thinking.saveLocalEndpoint();
+  await advance(0);
+  await settle();
+
+  assert.strictEqual(saveBtn.disabled, true, 'save disabled while pending');
+  assert.strictEqual(clearBtn.disabled, true, 'clear disabled while pending');
+  assert.strictEqual(
+    clearFromLocalBtn.disabled,
+    true,
+    'clearFromLocal disabled while pending'
+  );
+  assert.strictEqual(
+    statusNode.textContent,
+    'endpoint_image_checking:model-sentinel',
+    'status is checking key while pending'
+  );
+
+  thinking.showView('main');
+  assert.strictEqual(window.location.hash, '#main');
+  const showViewCountAtLeave = showViewCount;
+
+  deferredResolve({ image_check: { status: 'not_read' } });
+  await savePromise;
+  await settle();
+
+  assert.strictEqual(saveBtn.disabled, false, 'save re-enabled after leave');
+  assert.strictEqual(clearBtn.disabled, false, 'clear re-enabled after leave');
+  assert.strictEqual(
+    clearFromLocalBtn.disabled,
+    false,
+    'clearFromLocal re-enabled after leave'
+  );
+  assert(!statusNode.textContent.includes('endpoint_image_not_read'));
+  assert(!statusNode.textContent.includes('endpoint_image_checking'));
+  assert.strictEqual(
+    showViewCount,
+    showViewCountAtLeave,
+    'showView was not called again by the result'
+  );
+  document.querySelectorAll = origQSA;
+
+  window.apiJson = originalApiJson;
 
   console.log(`DOM CASES: ${passedCases}/${executedCases} passed`);
 }

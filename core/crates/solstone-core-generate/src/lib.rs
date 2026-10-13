@@ -11,8 +11,9 @@ mod session_adapter;
 mod types;
 
 pub use client::{
-    CapturedStream, ChildStatus, ClientError, OneShotClient, ProtocolFailure, STDERR_LIMIT,
-    STDOUT_LIMIT, UnexpectedChildFailure, sibling_executable,
+    CapturedStream, ChildStatus, ClientError, InvalidResponseFailure, OneShotClient,
+    ProcessFailure, ProtocolFailure, STDERR_LIMIT, STDOUT_LIMIT, UnexpectedChildFailure,
+    sibling_executable,
 };
 pub use codec::{
     SessionCorrelation, SessionError, decode_one_shot_request, decode_one_shot_response,

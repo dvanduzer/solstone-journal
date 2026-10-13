@@ -1830,12 +1830,101 @@ mod tests {
             }
         }
 
+        fn new_generated(name: &str, text: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("solstone-thinking-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("stub directory creates");
+            let executable = root.join("stub.sh");
+            let raw_request = root.join("request.json");
+            let environment = root.join("environment.txt");
+            let mut generated_response = generated();
+            let GenerateResponse::Generated(ref mut inner) = generated_response else {
+                unreachable!()
+            };
+            inner.text = text.to_owned();
+            let response =
+                encode_one_shot_response(&generated_response).expect("stub response encodes");
+            let script = format!(
+                "#!/bin/sh\ncat > {}\nenv > {}\ncat <<'SOLSTONE_RESPONSE'\n{}\nSOLSTONE_RESPONSE\n",
+                shell_quote(&raw_request),
+                shell_quote(&environment),
+                response,
+            );
+            fs::write(&executable, script).expect("stub script writes");
+            let mut permissions = fs::metadata(&executable)
+                .expect("stub metadata reads")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&executable, permissions).expect("stub script becomes executable");
+            Self {
+                root,
+                executable,
+                raw_request,
+                environment,
+            }
+        }
+
         fn records(&self) -> (Vec<u8>, String) {
             (
                 fs::read(&self.raw_request).expect("raw request records"),
                 fs::read_to_string(&self.environment).expect("environment records"),
             )
         }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_image_check_spawned_child_contract() {
+        use crate::endpoint_image::{Hue, ImageCheck, check_with_hue};
+        use solstone_core_generate::{ContentPart, OneShotClient};
+        use solstone_core_generate_wire::parse_one_shot_request;
+
+        let stub = ValidationStub::new_generated("endpoint-image-spawn", "orange");
+        let parent_env_before = std::env::var("SOLSTONE_JOURNAL").ok();
+        let journal_path = stub.root.join("test-journal");
+        fs::create_dir_all(&journal_path).expect("journal dir creates");
+
+        let mut client = OneShotClient::at_path(&stub.executable);
+        let check = check_with_hue(&mut client, &journal_path, Hue::Orange);
+        assert_eq!(check, ImageCheck::Read);
+
+        let parent_env_after = std::env::var("SOLSTONE_JOURNAL").ok();
+        assert_eq!(
+            parent_env_before, parent_env_after,
+            "parent SOLSTONE_JOURNAL must remain unchanged"
+        );
+
+        let (raw_req, env_text) = stub.records();
+        let env_lines: Vec<&str> = env_text.lines().collect();
+        assert!(
+            env_lines.contains(&"SOLSTONE_GENERATE_PROVIDER_OVERRIDE=local"),
+            "child must receive SOLSTONE_GENERATE_PROVIDER_OVERRIDE=local, got env:\n{env_text}"
+        );
+        let expected_journal_line = format!("SOLSTONE_JOURNAL={}", journal_path.display());
+        assert!(
+            env_lines.iter().any(|line| *line == expected_journal_line),
+            "child must receive exact SOLSTONE_JOURNAL line {expected_journal_line}, got env:\n{env_text}"
+        );
+
+        let request =
+            parse_one_shot_request(std::str::from_utf8(&raw_req).expect("valid utf-8 request"))
+                .expect("request parses");
+        assert_eq!(request.context, "settings.local.endpoint_image");
+        assert_eq!(request.temperature, 0.0);
+        assert_eq!(request.timeout_s, Some(20.0));
+        assert_eq!(request.max_output_tokens, 512);
+        assert!(!request.json_output);
+        assert!(request.system_instruction.is_none());
+        assert_eq!(request.contents.len(), 2);
+        assert!(matches!(request.contents[0], ContentPart::Image { .. }));
+        assert_eq!(
+            request.contents[1],
+            ContentPart::Text {
+                text: "What color is this image? Answer with one word.".to_owned(),
+            }
+        );
     }
 
     #[cfg(all(test, feature = "full-tests"))]

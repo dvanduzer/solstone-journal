@@ -4284,16 +4284,80 @@
     }
     state.providers.local_override = result.local_endpoint || {};
     if ($('localEndpointCredential')) $('localEndpointCredential').value = '';
-    setMessage('localEndpointStatus', unlogged || 'endpoint saved', unlogged ? 'error' : 'ok');
     setSelectedByoProvider('local');
     state.byoMode = 'endpoint';
+    const model = (result.local_endpoint || {}).served_model_id || '';
     await switchLane('byo');
     await Promise.all([refreshProviders(), refreshLocalAvailability()]);
-    if (unlogged) {
-      setMessage('localEndpointStatus', unlogged, 'error');
-      return;
+
+    const saveBtn = $('localEndpointSave');
+    const clearBtn = $('localEndpointClear');
+    const clearFromLocalBtn = $('localEndpointClearFromLocal');
+    if (saveBtn) saveBtn.disabled = true;
+    if (clearBtn) clearBtn.disabled = true;
+    if (clearFromLocalBtn) clearFromLocalBtn.disabled = true;
+    const checkingMessage = formatCopy(copy.byo_setup?.endpoint_image_checking, {model});
+    setMessage('localEndpointStatus', checkingMessage);
+
+    try {
+      let checkResult;
+      try {
+        checkResult = await api('api/local/endpoint/check', {method: 'POST'});
+      } catch {
+        checkResult = {image_check: {status: 'unchecked', reason: 'unavailable'}};
+      }
+
+      if (viewFromHash() !== 'byo-setup') {
+        if ($('localEndpointStatus')?.textContent === checkingMessage) {
+          setMessage('localEndpointStatus', '');
+        }
+        return;
+      }
+
+      const check =
+        checkResult && typeof checkResult === 'object' ? checkResult.image_check : null;
+      const status = check?.status;
+
+      if (status === 'read' || status === 'not_applicable') {
+        if (unlogged) {
+          setMessage('localEndpointStatus', unlogged, 'error');
+        } else {
+          setMessage('localEndpointStatus', 'endpoint saved', 'ok');
+          showView('main');
+        }
+        return;
+      }
+
+      let checkLine = '';
+      if (status === 'not_read') {
+        checkLine = formatCopy(copy.byo_setup?.endpoint_image_not_read, {model});
+      } else {
+        let reasonKey = 'endpoint_reason_other';
+        const reason = check?.reason;
+        if (reason === 'unreachable') reasonKey = 'endpoint_reason_unreachable';
+        else if (reason === 'timeout') reasonKey = 'endpoint_reason_timeout';
+        else if (reason === 'busy') reasonKey = 'endpoint_reason_busy';
+        else if (reason === 'key') reasonKey = 'endpoint_reason_key';
+        else if (reason === 'rejected') reasonKey = 'endpoint_reason_rejected';
+        else if (reason === 'unusable') reasonKey = 'endpoint_reason_unusable';
+        else reasonKey = 'endpoint_reason_other';
+        const reasonPhrase = copy.byo_setup?.[reasonKey] || '';
+        checkLine = formatCopy(copy.byo_setup?.endpoint_image_unchecked, {
+          model,
+          reason: reasonPhrase,
+        });
+      }
+
+      const statusText = unlogged ? `${unlogged}\n${checkLine}` : checkLine;
+      setMessage('localEndpointStatus', statusText, 'error');
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
+      if (clearBtn) clearBtn.disabled = false;
+      if (clearFromLocalBtn) clearFromLocalBtn.disabled = false;
+      if ($('localEndpointStatus')?.textContent === checkingMessage) {
+        setMessage('localEndpointStatus', '');
+      }
     }
-    showView('main');
   }
 
   async function clearLocalEndpoint() {

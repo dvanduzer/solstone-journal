@@ -166,7 +166,7 @@ pub fn endpoint_generate(
     )
 }
 
-pub(crate) fn endpoint_generate_with<T: EndpointTransport>(
+pub fn endpoint_generate_with<T: EndpointTransport>(
     request: &GenerateRequest,
     journal_path: &Path,
     endpoint: &ByoEndpoint,

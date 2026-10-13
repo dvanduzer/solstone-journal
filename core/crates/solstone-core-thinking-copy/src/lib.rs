@@ -742,6 +742,50 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
                     "processing checks the endpoint works before relying on it. if it can't reach it, you'll see. it never quietly falls back to anyone else.",
                 ),
             ),
+            (
+                "endpoint_image_checking",
+                CopyValue::String("checking whether {model} reads images…"),
+            ),
+            (
+                "endpoint_image_not_read",
+                CopyValue::String(
+                    "endpoint saved, but {model} didn't name the color of a test image, so screen and photo descriptions may fail or come out wrong. if it's meant to read images, try another model, then save again.",
+                ),
+            ),
+            (
+                "endpoint_image_unchecked",
+                CopyValue::String(
+                    "endpoint saved. couldn't check whether {model} reads images: {reason}.",
+                ),
+            ),
+            (
+                "endpoint_reason_unreachable",
+                CopyValue::String("couldn't reach the endpoint"),
+            ),
+            (
+                "endpoint_reason_timeout",
+                CopyValue::String("it didn't answer in time"),
+            ),
+            (
+                "endpoint_reason_busy",
+                CopyValue::String("your journal was busy with other work"),
+            ),
+            (
+                "endpoint_reason_key",
+                CopyValue::String("it didn't accept the key"),
+            ),
+            (
+                "endpoint_reason_rejected",
+                CopyValue::String("it rejected the request"),
+            ),
+            (
+                "endpoint_reason_unusable",
+                CopyValue::String("it sent back nothing usable"),
+            ),
+            (
+                "endpoint_reason_other",
+                CopyValue::String("something went wrong"),
+            ),
             ("paste_cta", CopyValue::String("check this key →")),
             (
                 "checking_key",

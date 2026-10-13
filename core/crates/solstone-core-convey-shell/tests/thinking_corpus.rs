@@ -440,6 +440,16 @@ fn project_byo_setup_copy(setup: &mut Map<String, Value>) {
         "chatgpt",
         "openai_card",
         "tuning",
+        "endpoint_image_checking",
+        "endpoint_image_not_read",
+        "endpoint_image_unchecked",
+        "endpoint_reason_unreachable",
+        "endpoint_reason_timeout",
+        "endpoint_reason_busy",
+        "endpoint_reason_key",
+        "endpoint_reason_rejected",
+        "endpoint_reason_unusable",
+        "endpoint_reason_other",
     ] {
         setup.insert(key.into(), live["byo_setup"][key].clone());
     }
