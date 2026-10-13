@@ -12,11 +12,8 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
-use std::process::{Child, Command, ExitStatus, Stdio};
-#[cfg(not(windows))]
-use std::thread;
-#[cfg(not(windows))]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -54,8 +51,6 @@ const MODEL_NAME: &str = "rfdetr-nano-f16";
 const THRESHOLD: f64 = 0.25;
 #[cfg(not(windows))]
 const RFDETR_TIMEOUT: Duration = Duration::from_secs(120);
-#[cfg(not(windows))]
-const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(not(windows))]
 const RFDETR_UNAVAILABLE_DETAIL: &str = "Object detection is unavailable. Run `solstone journal install-models` to check or repair the RF-DETR assets.";
 
@@ -248,30 +243,9 @@ impl Detector for SystemDetector {
         let journal = current_journal_path().ok_or_else(rfdetr_unavailable)?;
         let (binary, model) = rfdetr_paths_at(&journal, env::consts::OS, env::consts::ARCH)
             .map_err(|_| rfdetr_unavailable())?;
-        let temporary = DetectorTempDir::new().map_err(|_| rfdetr_unavailable())?;
-        let input = temporary.path.join("input.png");
-        let output = temporary.path.join("output.json");
-        fs::write(&input, full_png).map_err(|_| rfdetr_unavailable())?;
-        let mut process = Command::new(binary)
-            .args(["detect", "--model"])
-            .arg(model)
-            .args(["--input"])
-            .arg(&input)
-            .args(["--output"])
-            .arg(&output)
-            .args(["--threshold", "0.25", "--threads", "4"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| rfdetr_unavailable())?;
-        if !wait_for_child(&mut process, RFDETR_TIMEOUT)
-            .map_err(|_| rfdetr_unavailable())?
-            .success()
-        {
-            return Err(rfdetr_unavailable());
-        }
-        let parsed = serde_json::from_slice(&fs::read(output).map_err(|_| rfdetr_unavailable())?)
-            .map_err(|_| rfdetr_unavailable())?;
+        let parsed =
+            solstone_core_system::rfdetr::detect(full_png, &binary, &model, RFDETR_TIMEOUT)
+                .map_err(|_| rfdetr_unavailable())?;
         Ok(Some(parsed))
     }
 }
@@ -284,25 +258,6 @@ fn rfdetr_unavailable() -> String {
     #[cfg(not(windows))]
     {
         RFDETR_UNAVAILABLE_DETAIL.to_owned()
-    }
-}
-
-#[cfg(not(windows))]
-fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            child.wait().map_err(|error| error.to_string())?;
-            return Err(format!(
-                "rfdetr-cli detect timed out after {}s",
-                timeout.as_secs()
-            ));
-        }
-        thread::sleep(CHILD_POLL_INTERVAL);
     }
 }
 
@@ -360,10 +315,12 @@ fn rfdetr_paths_from_install_check(
     }
 }
 
+#[cfg(windows)]
 struct DetectorTempDir {
     path: PathBuf,
 }
 
+#[cfg(windows)]
 impl DetectorTempDir {
     fn new() -> Result<Self, String> {
         let nonce = SystemTime::now()
@@ -376,6 +333,7 @@ impl DetectorTempDir {
     }
 }
 
+#[cfg(windows)]
 impl Drop for DetectorTempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);

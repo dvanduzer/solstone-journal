@@ -26,6 +26,8 @@ pub use queue_hold_store::{
 };
 pub mod priority;
 pub mod request;
+#[cfg(unix)]
+pub mod rfdetr;
 pub mod schedule;
 pub mod segment_publication;
 #[cfg(any(unix, windows))]

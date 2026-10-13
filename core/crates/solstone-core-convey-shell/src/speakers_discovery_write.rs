@@ -19,6 +19,9 @@ use solstone_core_convey_http::envelope::error_envelope;
 use solstone_core_journal_io::{LockOptions, hold_lock};
 
 use crate::speakers_attribution::action;
+use crate::speakers_dismissals::{
+    DiscoveryMember, canonical_members, dismissal_suppressed, fold_dismissal_members, member_set,
+};
 use crate::{HostedLaunchContext, JournalRoot};
 #[cfg(test)]
 use solstone_core_speaker_resolve::discovery_scan::{
@@ -37,8 +40,6 @@ const OWNER_VOICE_UNAVAILABLE_MESSAGE: &str =
 const INVALID_EMBEDDINGS: &str = "speaker_discovery_invalid_embeddings";
 const INVALID_EMBEDDINGS_MESSAGE: &str =
     "some voice samples were skipped because they weren't usable.";
-
-type DiscoveryMember = (String, String, String, String, String, i64);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IdentifyPreflightError {
@@ -584,114 +585,7 @@ fn folded_dismissal_members(root: &Path) -> Result<Vec<BTreeSet<DiscoveryMember>
         events.push(member_set(members)?);
     }
 
-    let mut folded = Vec::new();
-    let mut seen = vec![false; events.len()];
-    for start in 0..events.len() {
-        if seen[start] {
-            continue;
-        }
-        let mut stack = vec![start];
-        let mut component = BTreeSet::new();
-        seen[start] = true;
-        while let Some(current) = stack.pop() {
-            component.extend(events[current].iter().cloned());
-            for next in 0..events.len() {
-                if !seen[next] && overlap_ratio_at_least_half(&events[current], &events[next]) {
-                    seen[next] = true;
-                    stack.push(next);
-                }
-            }
-        }
-        folded.push(component);
-    }
-    Ok(folded)
-}
-
-fn dismissal_suppressed(
-    candidate: &BTreeSet<DiscoveryMember>,
-    dismissals: &[BTreeSet<DiscoveryMember>],
-) -> bool {
-    !candidate.is_empty()
-        && dismissals
-            .iter()
-            .any(|dismissal| candidate.intersection(dismissal).count() * 2 >= candidate.len())
-}
-
-fn overlap_ratio_at_least_half(
-    left: &BTreeSet<DiscoveryMember>,
-    right: &BTreeSet<DiscoveryMember>,
-) -> bool {
-    let denominator = left.len().min(right.len());
-    denominator != 0 && left.intersection(right).count() * 2 >= denominator
-}
-
-fn member_set(members: &[Value]) -> Result<BTreeSet<DiscoveryMember>, String> {
-    canonical_members(members).map(|members| {
-        members
-            .into_iter()
-            .map(|member| {
-                (
-                    member["day"].as_str().expect("canonical day").to_owned(),
-                    member["stream_layout"]
-                        .as_str()
-                        .expect("canonical stream layout")
-                        .to_owned(),
-                    member["stream"]
-                        .as_str()
-                        .expect("canonical stream")
-                        .to_owned(),
-                    member["segment_key"]
-                        .as_str()
-                        .expect("canonical segment key")
-                        .to_owned(),
-                    member["source"]
-                        .as_str()
-                        .expect("canonical source")
-                        .to_owned(),
-                    member["sentence_id"]
-                        .as_i64()
-                        .expect("canonical sentence id"),
-                )
-            })
-            .collect()
-    })
-}
-
-fn canonical_members(members: &[Value]) -> Result<Vec<Value>, String> {
-    let mut tuples = BTreeSet::new();
-    for member in members {
-        let object = member
-            .as_object()
-            .ok_or_else(|| "invalid cluster member provenance".to_owned())?;
-        let field = |name: &str| {
-            object
-                .get(name)
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| "invalid cluster member provenance".to_owned())
-        };
-        let sentence_id = object
-            .get("sentence_id")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| "invalid cluster member provenance".to_owned())?;
-        let stream_layout = object
-            .get("stream_layout")
-            .map(|_| field("stream_layout"))
-            .transpose()?
-            .unwrap_or_else(|| "named".to_owned());
-        if !matches!(stream_layout.as_str(), "direct" | "named") {
-            return Err("invalid cluster member provenance".to_owned());
-        }
-        tuples.insert((
-            field("day")?,
-            stream_layout,
-            field("stream")?,
-            field("segment_key")?,
-            field("source")?,
-            sentence_id,
-        ));
-    }
-    Ok(tuples.into_iter().map(|(day, stream_layout, stream, segment_key, source, sentence_id)| json!({"day":day,"stream_layout":stream_layout,"stream":stream,"segment_key":segment_key,"source":source,"sentence_id":sentence_id})).collect())
+    Ok(fold_dismissal_members(&events))
 }
 
 fn preflight_error(failure: IdentifyPreflightError) -> Response {
