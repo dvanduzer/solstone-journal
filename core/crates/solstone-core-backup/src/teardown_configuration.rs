@@ -32,37 +32,37 @@ pub struct TeardownConfiguration {
     keys: Option<BackupKeys>,
     destination: Option<Destination>,
     binding: Option<HostedBinding>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     root: Arc<JournalRoot>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     directory: Arc<solstone_core_journal_io::media::MediaDirectory>,
-    #[cfg(unix)]
-    binding_observation: Option<unix::BindingObservation>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    binding_observation: Option<local::BindingObservation>,
+    #[cfg(any(unix, windows))]
     expected_clear_sha256: Option<String>,
 }
 
-#[cfg(unix)]
-pub use unix::binding::{BindingFinalization, BindingFinalizationRefusal, BindingRemovalReceipt};
+#[cfg(any(unix, windows))]
+pub use local::binding::{BindingFinalization, BindingFinalizationRefusal, BindingRemovalReceipt};
 
 impl TeardownConfiguration {
     /// Retain both original-parent locks after this exact clear has been confirmed.
     /// The returned value supplies local observations, not remote settlement authority.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn begin_binding_finalization(
         &self,
         publication: &BoundConfigPublication,
     ) -> Result<BindingFinalization, BindingFinalizationRefusal> {
-        unix::binding::begin(self, publication)
+        local::binding::begin(self, publication)
     }
 
     /// Capture existing state only; never creates parents or materializes defaults.
     pub fn capture(root: &Arc<JournalRoot>) -> Result<Self, TeardownConfigurationRefusal> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            unix::capture(root)
+            local::capture(root)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = root;
             Err(TeardownConfigurationRefusal::Unsupported)
@@ -71,11 +71,11 @@ impl TeardownConfiguration {
 
     /// Recheck the original root, parents, full-config bytes and binding observation.
     pub fn revalidate(&self) -> Result<(), TeardownConfigurationRefusal> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            unix::revalidate(self)
+            local::revalidate(self)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(TeardownConfigurationRefusal::Unsupported)
         }
@@ -83,7 +83,7 @@ impl TeardownConfiguration {
 
     /// Invoke the bound clear through this admission's original config parent.
     pub fn clear_configuration(&self) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             solstone_core_journal_config_write::conditional_update_journal_config_in_directory(
                 &self.root,
@@ -93,7 +93,7 @@ impl TeardownConfiguration {
                 crate::state::mutation_lock_options(),
             )
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(BoundConfigRefusal::Unsupported)
         }
@@ -104,11 +104,11 @@ impl TeardownConfiguration {
         &self,
         publication: &BoundConfigPublication,
     ) -> Result<(), TeardownConfigurationRefusal> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            unix::revalidate_published_clear(self, publication)
+            local::revalidate_published_clear(self, publication)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = publication;
             Err(TeardownConfigurationRefusal::Unsupported)
@@ -136,8 +136,8 @@ impl TeardownConfiguration {
     }
 }
 
-#[cfg(unix)]
-mod unix {
+#[cfg(any(unix, windows))]
+mod local {
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -289,12 +289,8 @@ mod unix {
         if current.sha256.as_deref() != Some(publication.candidate_sha256.as_str())
             || entry.name != OsStr::new("journal.json")
             || entry.kind != JournalEntryKind::RegularFile
-            || entry.identity
-                != (MediaIdentity::Unix {
-                    device: publication.published_file.device,
-                    inode: publication.published_file.inode,
-                })
-            || entry.size != publication.published_file.size
+            || Some(entry.identity) != publication.published_identity
+            || Some(entry.size) != publication.published_file.as_ref().map(|file| file.size)
         {
             return Err(Refusal::ConfigurationChanged);
         }
@@ -318,12 +314,13 @@ mod unix {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
     mod tests;
 }
 
 #[cfg(all(test, feature = "full-tests"))]
 mod unsupported_tests {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn capture_refuses_before_reading_or_creating_state() {
         use super::*;

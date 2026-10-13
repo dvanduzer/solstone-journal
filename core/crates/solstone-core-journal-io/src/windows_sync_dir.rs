@@ -21,10 +21,15 @@ use windows_sys::Win32::Foundation::{
     RtlNtStatusToDosError, STATUS_SUCCESS,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_TRAVERSE, FILE_TYPE_DISK, FileAttributeTagInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFileType, SYNCHRONIZE,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE, FILE_TYPE_DISK, FileAttributeTagInfo,
+    FileDispositionInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFileType,
+    SYNCHRONIZE, SetFileInformationByHandle,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+    FileDispositionInfoEx,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -33,7 +38,9 @@ use crate::journal_root::JournalEntryKind;
 use crate::name_admission::{NameAdmissionReason, check_portable_component};
 use crate::observation::{FileObservation, FlatDirectoryEntry, NativeMtime, same_entry_metadata};
 use crate::windows_identity::{WindowsFileIdentity, file_identity};
-use crate::windows_ntcreate::{nt_create_relative, nt_create_relative_exact};
+use crate::windows_ntcreate::{
+    nt_create_relative, nt_create_relative_exact, nt_create_relative_share_read,
+};
 
 const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
 const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
@@ -72,17 +79,21 @@ impl WindowsFlatDirectory {
     }
 
     /// Revalidate the retained directory before a descriptor-relative operation.
-    #[allow(
-        dead_code,
-        reason = "retained for generic capability-bound file operations"
-    )]
-    pub(crate) fn revalidate_bound(&self) -> Result<(), FlatDirectoryError> {
+    pub fn revalidate_bound(&self) -> Result<(), FlatDirectoryError> {
         self.revalidate()
     }
 
     /// Full identity captured when this directory was bound.
     pub const fn identity(&self) -> WindowsFileIdentity {
         self.identity
+    }
+
+    /// The bound directory's identity, comparable with a media directory's.
+    pub fn object_identity(&self) -> crate::journal_root::ObjectIdentity {
+        crate::journal_root::ObjectIdentity::from_volume_and_file_id(
+            self.identity.volume_serial(),
+            self.identity.file_id(),
+        )
     }
 
     /// Retained directory handle used as the authority for relative operations.
@@ -380,6 +391,106 @@ pub(crate) fn native_child_directory_identity(
         return Ok(None);
     }
     Ok(Some(entry_identity(handle.as_raw_handle(), &path)?))
+}
+
+/// Delete one direct regular file only while it is the exact observed object
+/// holding the observed bytes. The handle shares reading only, so nothing can
+/// write or rename it between verification and the delete, and the delete goes
+/// through that verified handle with POSIX semantics where the filesystem
+/// allows, so the name is gone when this returns even if another reader still
+/// has it open. Windows has no directory flush, so success is
+/// `RemovedUnflushed`; the caller confirms the name is gone. Any refusal leaves
+/// the entry untouched.
+pub fn remove_windows_observed_file_bounded(
+    directory: &WindowsFlatDirectory,
+    name: &OsStr,
+    observed: &FileObservation,
+    limit: usize,
+) -> Result<crate::errors::ClaimRemovalOutcome, crate::errors::ClaimRemovalError> {
+    use crate::errors::{ClaimRemovalError, ClaimRemovalOutcome};
+    let preflight = |source| ClaimRemovalError::Preflight { source };
+    let name = validate_portable_name(name).map_err(preflight)?;
+    if observed.entry.name != name {
+        return Err(ClaimRemovalError::ObservationNameMismatch {
+            original: name,
+            observed: observed.entry.name.clone(),
+        });
+    }
+    directory.revalidate().map_err(preflight)?;
+    let path = directory.diagnostic_entry(&name);
+    let changed = || preflight(FlatDirectoryError::IdentityChanged { path: path.clone() });
+    let handle = nt_create_relative_share_read(
+        directory.directory.as_raw_handle(),
+        &name,
+        DELETE | FILE_READ_ATTRIBUTES | FILE_READ_DATA | SYNCHRONIZE,
+        FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+    .map_err(|source| {
+        preflight(FlatDirectoryError::Io {
+            operation: "open observed file for deletion",
+            path: path.clone(),
+            source,
+        })
+    })?;
+    let before =
+        entry_from_handle(name.clone(), handle.as_raw_handle(), &path).map_err(preflight)?;
+    if before.kind != JournalEntryKind::RegularFile
+        || !same_entry_metadata(&before, &observed.entry)
+        || (before.size as u128) > (limit as u128)
+    {
+        return Err(changed());
+    }
+    let mut file = File::from(handle);
+    let mut bytes = vec![0; observed.bytes.len()];
+    read_exact(&mut file, &mut bytes).map_err(|_| changed())?;
+    let mut trailing = [0u8; 1];
+    if bytes != observed.bytes || !matches!(file.read(&mut trailing), Ok(0)) {
+        return Err(changed());
+    }
+    let after = entry_from_handle(name, file.as_raw_handle(), &path).map_err(preflight)?;
+    if !same_entry_metadata(&after, &observed.entry) {
+        return Err(changed());
+    }
+    directory.revalidate().map_err(preflight)?;
+    let posix = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: the retained handle was opened with DELETE access and each input
+    // is one initialized, correctly sized disposition structure.
+    #[allow(unsafe_code)]
+    let mut set = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&posix as *const FILE_DISPOSITION_INFO_EX).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if set == 0 {
+        // Filesystems without POSIX semantics take the legacy delete-on-close.
+        let legacy = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: as above, with the legacy disposition structure.
+        #[allow(unsafe_code)]
+        let retried = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&legacy as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        set = retried;
+    }
+    if set == 0 {
+        return Err(ClaimRemovalError::Io {
+            operation: "delete observed file",
+            path,
+            source: io::Error::last_os_error(),
+        });
+    }
+    drop(file); // The delete lands when this last handle closes.
+    Ok(ClaimRemovalOutcome::RemovedUnflushed)
 }
 
 /// Read one direct regular file while proving stable metadata and enforcing a byte limit.
@@ -983,5 +1094,58 @@ mod bounded_listing_tests {
                 parse_directory_buffer_bounded(&buffer, path, &mut Vec::new(), true, 10).is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod observed_removal_tests {
+    use super::*;
+    use crate::errors::ClaimRemovalOutcome;
+
+    #[test]
+    fn only_the_exact_observed_file_is_deleted_through_its_verified_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::JournalRoot::open(temp.path()).unwrap();
+        std::fs::create_dir(temp.path().join("hosted")).unwrap();
+        let file = temp.path().join("hosted/binding.json");
+        std::fs::write(&file, b"original").unwrap();
+        let directory = open_windows_flat_directory_bound(&root, OsStr::new("hosted"), temp.path())
+            .unwrap()
+            .unwrap();
+        let name = OsStr::new("binding.json");
+        let observed = read_windows_observed_file_bounded(&directory, name, 1024)
+            .unwrap()
+            .unwrap();
+        // Same size and modification time, different bytes: only the byte
+        // comparison can refuse it, and the file stays as it is.
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, b"changed!").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(remove_windows_observed_file_bounded(&directory, name, &observed, 1024).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"changed!");
+        // A different name than the observation is refused before any open.
+        assert!(
+            remove_windows_observed_file_bounded(&directory, OsStr::new("other"), &observed, 1024)
+                .is_err()
+        );
+        let observed = read_windows_observed_file_bounded(&directory, name, 1024)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            remove_windows_observed_file_bounded(&directory, name, &observed, 1024),
+            Ok(ClaimRemovalOutcome::RemovedUnflushed)
+        ));
+        assert!(!file.exists());
+        // Nothing left to remove.
+        assert!(remove_windows_observed_file_bounded(&directory, name, &observed, 1024).is_err());
     }
 }

@@ -79,7 +79,7 @@ Journal entities represent the canonical identity record:
 - `type` (string) – Entity type (e.g., "Person", "Company", "Project", "Tool"). Types are flexible and owner-defined; must be alphanumeric with spaces, minimum 3 characters.
 - `aka` (array of strings) – Alternative names, nicknames, or acronyms. Used in audio transcription and fuzzy matching.
 - `is_principal` (boolean) – When `true`, identifies this entity as the journal owner. Auto-flagged when name/aka matches identity config.
-- `blocked` (boolean) – When `true`, entity is hidden from all facets and excluded from agent context.
+- `blocked` (boolean) – When `true`, the owner has hidden the entity. It is detached from all facets and excluded from normal entity context. Explicit reads can still return it with this status.
 - `created_at` (integer) – Unix timestamp in milliseconds when entity was created.
 
 ### Facet Relationships
@@ -122,7 +122,7 @@ Daily detection files (`facets/<facet>/entities/YYYYMMDD.jsonl`) contain entitie
 4. **Persistence**: Creates journal entity + facet relationship; remains active until detached
 5. **Detachment**: Sets `detached: true` on facet relationship, preserving all data
 6. **Re-attachment**: Clears detached flag, restoring the entity with preserved history
-7. **Blocking**: Sets `blocked: true` on journal entity and detaches from all facets
+7. **Hiding**: Sets `blocked: true` on journal entity and detaches from all facets
 
 ### Cross-Facet Behavior
 

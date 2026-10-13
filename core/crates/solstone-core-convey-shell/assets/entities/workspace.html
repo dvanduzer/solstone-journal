@@ -2092,12 +2092,12 @@ body.presentation-mode .entity-desc { color: var(--ink-soft); }
 
     <div class="entity-action-section entity-detach-section">
       <div style="display: flex; gap: 0.5em; flex-wrap: wrap;">
-        <button class="btn btn-secondary" id="journal-detail-block-btn" disabled>block</button>
+        <button class="btn btn-secondary" id="journal-detail-block-btn" disabled>hide</button>
         <button class="btn btn-danger" id="journal-detail-delete-btn" disabled>delete</button>
       </div>
       <div id="block-action-error" class="error-message" style="display: none;"></div>
       <p style="margin-top: 0.75em; font-size: 0.85em; color: var(--ink-faint);">
-        <strong>block</strong> hides the entity from all views but preserves data.
+        <strong>hide</strong> removes the entity from all facets and keeps its data.
         <strong>delete</strong> permanently removes the entity and all associated data.
       </p>
     </div>
@@ -4003,8 +4003,8 @@ function renderJournalDetailView(entity) {
       blockedBadge = document.createElement('span');
       blockedBadge.id = 'journal-detail-blocked-badge';
       blockedBadge.className = 'entity-detail-blocked-badge';
-      blockedBadge.textContent = 'blocked';
-      blockedBadge.title = 'this entity is blocked';
+      blockedBadge.textContent = 'hidden';
+      blockedBadge.title = 'this entity is hidden';
       typeEl.parentNode.insertBefore(blockedBadge, typeEl.nextSibling);
     }
   } else if (blockedBadge) {
@@ -4018,8 +4018,8 @@ function renderJournalDetailView(entity) {
   if (isPrincipal) {
     // Principal cannot be blocked or deleted
     blockBtn.disabled = true;
-    blockBtn.textContent = 'block';
-    blockBtn.title = 'cannot block yourself';
+    blockBtn.textContent = 'hide';
+    blockBtn.title = 'cannot hide yourself';
     blockBtn.onclick = null;
     deleteBtn.disabled = true;
     deleteBtn.title = 'cannot delete yourself';
@@ -4027,8 +4027,8 @@ function renderJournalDetailView(entity) {
   } else if (isBlocked) {
     // Show unblock option
     blockBtn.disabled = false;
-    blockBtn.textContent = 'unblock';
-    blockBtn.title = 'unblock this entity';
+    blockBtn.textContent = 'unhide';
+    blockBtn.title = 'unhide this entity';
     blockBtn.onclick = unblockJournalEntity;
     deleteBtn.disabled = false;
     deleteBtn.title = '';
@@ -4036,7 +4036,7 @@ function renderJournalDetailView(entity) {
   } else {
     // Normal state
     blockBtn.disabled = false;
-    blockBtn.textContent = 'block';
+    blockBtn.textContent = 'hide';
     blockBtn.title = '';
     blockBtn.onclick = blockJournalEntity;
     deleteBtn.disabled = false;
@@ -4087,7 +4087,7 @@ function renderJournalDetailView(entity) {
 
       if (isBlocked) {
         // Blocked dominates: non-navigable (covers blocked, and blocked+detached).
-        row.title = 'Entity is blocked and detached from this facet';
+        row.title = 'entity is hidden and detached from this facet';
       } else {
         // Navigable — now includes detached-but-not-blocked rows (re-attach lives in the facet detail).
         row.title = `Click to view in ${facet.title}`;
@@ -4658,7 +4658,7 @@ function blockJournalEntity() {
 
   const btn = document.getElementById('journal-detail-block-btn');
   btn.disabled = true;
-  btn.textContent = 'blocking…';
+  btn.textContent = 'hiding…';
 
   fetch(`api/journal/entity/${encodeURIComponent(entityId)}/block`, {
     method: 'POST'
@@ -4674,10 +4674,10 @@ function blockJournalEntity() {
     refreshEntitiesAfterMutation();
   })
   .catch(error => {
-    console.error('Error blocking entity:', error);
-    showInlineError('block-action-error', "couldn't block entity");
+    console.error('Error hiding entity:', error);
+    showInlineError('block-action-error', "couldn't hide entity");
     btn.disabled = false;
-    btn.textContent = 'block';
+    btn.textContent = 'hide';
   });
 }
 
@@ -4687,7 +4687,7 @@ function unblockJournalEntity() {
 
   const btn = document.getElementById('journal-detail-block-btn');
   btn.disabled = true;
-  btn.textContent = 'unblocking…';
+  btn.textContent = 'unhiding…';
 
   fetch(`api/journal/entity/${encodeURIComponent(entityId)}/unblock`, {
     method: 'POST'
@@ -4703,10 +4703,10 @@ function unblockJournalEntity() {
     refreshEntitiesAfterMutation();  // Refresh list in background
   })
   .catch(error => {
-    console.error('Error unblocking entity:', error);
-    showInlineError('block-action-error', "couldn't unblock entity");
+    console.error('Error unhiding entity:', error);
+    showInlineError('block-action-error', "couldn't unhide entity");
     btn.disabled = false;
-    btn.textContent = 'unblock';
+    btn.textContent = 'unhide';
   });
 }
 
@@ -5973,7 +5973,7 @@ function createJournalEntityCard(entity) {
 
     const blockedBadge = document.createElement('div');
     blockedBadge.className = 'entity-card-blocked-badge';
-    blockedBadge.textContent = 'blocked';
+    blockedBadge.textContent = 'hidden';
     card.appendChild(blockedBadge);
   }
 

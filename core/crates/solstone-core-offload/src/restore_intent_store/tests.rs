@@ -552,8 +552,10 @@ mod unix_tests {
 #[cfg(windows)]
 #[test]
 fn windows_store_refuses_before_any_parent_or_store_lock_creation() {
-    use super::super::*;
+    use super::*;
     use solstone_core_journal_io::JournalRoot;
+    use solstone_core_journal_io::activity::ActivityLease;
+    use std::sync::Arc;
     let temp = tempfile::tempdir().unwrap();
     let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
     let activity = ActivityLease::try_acquire(root).unwrap();

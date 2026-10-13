@@ -1133,16 +1133,16 @@ fn plan_merge(
         .ok_or_else(|| EntityMergeError::Refused(format!("Target entity not found: {target_id}")))?
         .value()
         .clone();
-    // The router classifies refusals by their text ("blocked", "both are
+    // The router classifies refusals by their text ("hidden", "both are
     // marked as you", "isn't a person"); its route tests pin each one.
     if source.get("blocked").and_then(Value::as_bool) == Some(true) {
         return Err(EntityMergeError::Refused(
-            "can't merge something that's blocked. unblock it first.".to_owned(),
+            "can't merge something that's hidden. unhide it first.".to_owned(),
         ));
     }
     if target.get("blocked").and_then(Value::as_bool) == Some(true) {
         return Err(EntityMergeError::Refused(
-            "can't merge into something that's blocked. unblock it first.".to_owned(),
+            "can't merge into something that's hidden. unhide it first.".to_owned(),
         ));
     }
     if super::lifecycle::identity_is_principal(&source)

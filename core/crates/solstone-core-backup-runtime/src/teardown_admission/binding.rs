@@ -227,4 +227,5 @@ impl BoundTeardownAdmission {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
 mod tests;

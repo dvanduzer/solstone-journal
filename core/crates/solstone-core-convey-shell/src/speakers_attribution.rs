@@ -1092,14 +1092,16 @@ pub(crate) fn entity_allowed(root: &std::path::Path, speaker: &str) -> Result<()
     match entity {
         Some(entity) if entity.is_blocked() => Err(err(
             "entity_blocked",
-            "that speaker couldn't be used because it's blocked.",
-            &format!("Entity '{speaker}' is blocked"),
+            "that speaker couldn't be used because it's hidden.",
+            &format!("Entity '{speaker}' is hidden"),
             StatusCode::BAD_REQUEST,
         )),
         Some(entity) if !solstone_core_entity::is_admissible_person(&entity) => Err(err(
             "speaker_not_person",
             "that speaker couldn't be used because it isn't a person.",
-            &format!("Entity '{speaker}' is not a Person. Select an existing, unblocked Person."),
+            &format!(
+                "Entity '{speaker}' is not a Person. Select an existing Person who isn't hidden."
+            ),
             StatusCode::BAD_REQUEST,
         )),
         Some(_) => Ok(()),

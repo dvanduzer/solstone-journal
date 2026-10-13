@@ -27,7 +27,8 @@ pub use activity_carrier::{
     ActivityCarrierRetirement, ActivityCarrierRetirementEffect, ActivityCarrierRetirementReceipt,
     RootActivityCarrier, RootCarrierObservation, RootTeardownCarrier,
     TeardownCarrierPreparationFailure, exclusive_local_activity, retire_orphan_root_carriers,
-    retire_recorded_stage, retire_unrecorded_stage, retire_unrecorded_stage_where,
+    retire_orphan_root_carriers_for_teardown, retire_recorded_stage, retire_unrecorded_stage,
+    retire_unrecorded_stage_where,
 };
 mod observation;
 pub use observation::{MediaEntry, MediaRead};
@@ -152,6 +153,20 @@ pub enum MediaIdentity {
 }
 
 impl MediaIdentity {
+    /// Whether a flat-directory observation names this object. Windows flat
+    /// entries carry the volume serial and a folded 128-bit file id.
+    pub fn matches_flat_entry(self, entry: &crate::FlatDirectoryEntry) -> bool {
+        match self {
+            Self::Unix { device, inode } => entry.device == device && entry.inode == inode,
+            Self::Windows { volume, file_id } => {
+                let (first, second) = file_id.split_at(8);
+                let fold = u64::from_le_bytes(first.try_into().expect("8 bytes"))
+                    ^ u64::from_le_bytes(second.try_into().expect("8 bytes"));
+                entry.device == volume && entry.inode == fold
+            }
+        }
+    }
+
     fn same_volume(self, other: Self) -> bool {
         match (self, other) {
             (Self::Unix { device: a, .. }, Self::Unix { device: b, .. }) => a == b,

@@ -234,7 +234,7 @@ fn render_full(profile: &Value) -> Vec<String> {
         .filter(|label| !label.is_empty());
     let mut lines = vec![
         format!(
-            "{} \u{00b7} {} \u{00b7} facets={} \u{00b7} self={} \u{00b7} blocked={}",
+            "{} \u{00b7} {} \u{00b7} facets={} \u{00b7} self={} \u{00b7} hidden={}",
             field(profile, "name"),
             field(profile, "type"),
             facets_label,
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "Ada · person · facets=work · self=False · blocked=False".to_string(),
+                "Ada · person · facets=work · self=False · hidden=False".to_string(),
                 String::new(),
                 "Cadence:".to_string(),
                 "  last_seen: 20261010".to_string(),

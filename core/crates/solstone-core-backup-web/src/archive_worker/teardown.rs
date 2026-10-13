@@ -580,7 +580,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
                 .unwrap();
         assert_eq!(body["operation"]["report"]["state"], "held");
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             assert_eq!(body["operation"]["phase"], "error");
             assert_eq!(body["operation"]["reason_code"], "backup_only_held");
@@ -597,7 +597,7 @@ mod tests {
                 .unwrap(),
             );
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             assert_eq!(body["operation"]["phase"], "refused");
             assert_eq!(body["operation"]["report"]["phase"], "prelaunch");
@@ -875,14 +875,14 @@ mod tests {
         ] {
             assert!(report[field].is_null(), "{field}");
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             assert_eq!(report["remote"]["phase"], "not_started");
             assert_eq!(report["remote"]["broker_attempted"], false);
             assert!(report["preparation_failure"]["receipt"].is_null());
             assert!(report["preparation_failure"]["error"].is_null());
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         for field in ["remote", "preparation_failure"] {
             assert!(report[field].is_null(), "{field}");
         }

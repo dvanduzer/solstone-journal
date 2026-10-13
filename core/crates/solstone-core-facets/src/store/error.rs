@@ -391,7 +391,7 @@ impl fmt::Display for FacetEntityWriteError {
             Self::EntityWrite(error) => error.fmt(formatter),
             Self::EntityExists { name } => write!(formatter, "entity already exists: {name:?}"),
             Self::EntityBlocked { entity_id } => {
-                write!(formatter, "entity is blocked: {entity_id}")
+                write!(formatter, "entity is hidden: {entity_id}")
             }
             Self::EntityNotFound { entity_id } => {
                 write!(formatter, "entity not found: {entity_id}")

@@ -71,7 +71,7 @@ impl fmt::Display for EntityLifecycleError {
                 write!(formatter, "entity already exists: {entity_id}")
             }
             Self::EntityNotBlocked { entity_id } => {
-                write!(formatter, "entity is not blocked: {entity_id}")
+                write!(formatter, "entity is not hidden: {entity_id}")
             }
             Self::HistoryVersionNotFound {
                 entity_id,

@@ -1514,7 +1514,7 @@ fn resolved_from_body_or_exit(
 fn render_resolve_error(facet: &str, entity: &str, body: &Value) -> CommandOutput {
     if truthy(body.get("blocked")) {
         let blocked_name = string_field(body, "blocked_name").unwrap_or_else(|| entity.to_string());
-        return stderr(format!("Error: Entity '{blocked_name}' is blocked."));
+        return stderr(format!("Error: Entity '{blocked_name}' is hidden."));
     }
     let candidates = array_field(body, "candidates");
     if !candidates.is_empty() {
@@ -1625,7 +1625,7 @@ fn entity_error(error: ClientError, entity: Option<&str>, type_: Option<&str>) -
         }
         _ if error.reason_code() == Some("entity_blocked") => {
             let name = error.detail().or(entity).unwrap_or("entity");
-            stderr(format!("Error: Entity '{name}' is blocked."))
+            stderr(format!("Error: Entity '{name}' is hidden."))
         }
         _ if error.reason_code() == Some("entity_not_found") => {
             let name = error.detail().or(entity).unwrap_or("entity");

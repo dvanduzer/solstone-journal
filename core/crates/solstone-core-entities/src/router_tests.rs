@@ -5077,7 +5077,7 @@ async fn classifier_refusal_sites_cover_remaining_message_branches() {
     );
 
     let blocked =
-        solstone_core_entity::EntityMergeError::Refused("target entity is blocked".to_owned());
+        solstone_core_entity::EntityMergeError::Refused("target entity is hidden".to_owned());
     assert_oracle_refusal(
         "_entity_operation_error:284",
         response_value(crate::router::classify_merge_error(&blocked)).await,
@@ -5120,7 +5120,7 @@ async fn classifier_refusal_sites_cover_remaining_message_branches() {
 #[tokio::test]
 async fn classifier_precedence_prefers_not_found_over_blocked_and_busy() {
     let combined = solstone_core_entity::EntityMergeError::Refused(
-        "target was not found because it is blocked and the worker is busy".to_owned(),
+        "target was not found because it is hidden and the worker is busy".to_owned(),
     );
     assert_oracle_refusal(
         "_entity_operation_error:282",
@@ -5167,13 +5167,13 @@ async fn merge_owner_refusals_keep_their_reason_through_classifier() {
             json!({"id":"source","name":"Source","type":"Person","blocked":true}),
             json!({"id":"target","name":"Target","type":"Person"}),
             "entity_blocked",
-            "can't merge something that's blocked. unblock it first.",
+            "can't merge something that's hidden. unhide it first.",
         ),
         (
             json!({"id":"source","name":"Source","type":"Person"}),
             json!({"id":"target","name":"Target","type":"Person","blocked":true}),
             "entity_blocked",
-            "can't merge into something that's blocked. unblock it first.",
+            "can't merge into something that's hidden. unhide it first.",
         ),
         (
             json!({"id":"source","name":"Source","type":"Person","is_principal":true}),
