@@ -43,7 +43,7 @@ License notice: BSD 3-Clause License (BSD-3-Clause).
 ## bundled place names (area tier)
 
 `lib/solstone_journal_models/assets/geo/area-tier.bin` (SHA-256
-`88f1332d94d8a72fa028c75197f84cfd048ad3cf6cad7044c3fb226f38015370`) names a
+`58bbe852b513785d0cd5d465ace7d7d3c1721d0dcd98ff775349e0a10fadc5d2`) names a
 location reading after a nearby town, and gives the map app its country and
 state borders. The journal reads it on the owner's own computer; nothing is
 looked up anywhere. It is built by `scripts/build_location_area_tier.py` from
