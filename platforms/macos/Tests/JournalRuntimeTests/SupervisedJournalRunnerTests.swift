@@ -340,7 +340,13 @@ struct SupervisedJournalRunnerTests {
     }
 
     @Test func provenanceResolverDoesNotUseProcessGlobalFallbacks() throws {
-        let sourceURL = URL(fileURLWithPath: "Sources/JournalRuntime/JournalRuntimeEntryReceiptProvenance.swift")
+        // The package root (platforms/macos), from this file's own path, so the scan never
+        // depends on the runner's working directory.
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = packageRoot.appendingPathComponent("Sources/JournalRuntime/JournalRuntimeEntryReceiptProvenance.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
         let forbiddenFallbacks = [
             "currentDirectoryPath",

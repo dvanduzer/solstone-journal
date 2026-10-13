@@ -9,7 +9,7 @@ import UpdateKit
 @Suite("JournalUpdatesWireUp")
 struct JournalUpdatesWireUpTests {
     @Test func journalInfoPlistCarriesValidSparkleFeed() throws {
-        let plistURL = repoRoot().appendingPathComponent("Sources/journal/Info.plist")
+        let plistURL = packageRoot().appendingPathComponent("Sources/journal/Info.plist")
         let data = try Data(contentsOf: plistURL)
         let plist = try #require(
             try PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
@@ -21,7 +21,7 @@ struct JournalUpdatesWireUpTests {
         #expect(UpdateController.validateSparkleConfig(feedURL: feedURL, publicKey: publicKey))
     }
 
-    private func repoRoot() -> URL {
+    private func packageRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()

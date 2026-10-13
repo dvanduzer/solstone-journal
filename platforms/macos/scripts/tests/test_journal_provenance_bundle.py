@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-# scripts/run-ci.sh runs this Python suite only after swift test exits. That ordering is
+# run-ci.sh (the support checkout's) runs this Python suite only after swift test exits. That ordering is
 # load-bearing: this test's child make process must own SwiftPM's .build lock itself.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 MAKEFILE = REPO_ROOT / "Makefile"
@@ -20,7 +20,7 @@ JOURNAL_APP = REPO_ROOT / "journal.app"
 APPLE_OUTPUTS = [
     APPLE_RELEASE / "journal",
     APPLE_RELEASE / "solstone-watchdog",
-    APPLE_RELEASE / "solstone_journal.bundle",
+    APPLE_RELEASE / "SolstoneJournalMac_journal.bundle",
     APPLE_RELEASE / "solstone_JournalMarkKit.bundle",
 ]
 
@@ -104,11 +104,11 @@ class JournalProvenanceBundleTest(unittest.TestCase):
         watchdog = APPLE_RELEASE / "solstone-watchdog"
         product_provenance = (
             APPLE_RELEASE
-            / "solstone_journal.bundle/Contents/Resources/Resources/runtime-entry-candidate-provenance.json"
+            / "SolstoneJournalMac_journal.bundle/Contents/Resources/Resources/runtime-entry-candidate-provenance.json"
         )
         assembled_provenance = (
             JOURNAL_APP
-            / "Contents/Resources/solstone_journal.bundle/Contents/Resources/Resources/runtime-entry-candidate-provenance.json"
+            / "Contents/Resources/SolstoneJournalMac_journal.bundle/Contents/Resources/Resources/runtime-entry-candidate-provenance.json"
         )
 
         self.assertTrue(journal.is_file())
@@ -126,7 +126,7 @@ class JournalProvenanceBundleTest(unittest.TestCase):
 
         blocks = parse_makefile()
         journal_bundle_copy = (
-            "\t@cp -r .build/apple/Products/Release/solstone_journal.bundle "
+            "\t@cp -r .build/apple/Products/Release/SolstoneJournalMac_journal.bundle "
             "journal.app/Contents/Resources/"
         )
         mark_bundle_copy = (

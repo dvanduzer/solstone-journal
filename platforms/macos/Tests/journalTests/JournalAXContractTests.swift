@@ -7,7 +7,7 @@ import Testing
 
 @Suite("AXContract-journal", .serialized)
 struct JournalAXContractTests {
-    private let contractPath = "journal-ax-contract.json"
+    private let contractPath = journalPackageRoot().appendingPathComponent("journal-ax-contract.json").path
 
     @Test func contractMatchesCommittedFileOrRegenerates() throws {
         let generated = AXContract.generate()

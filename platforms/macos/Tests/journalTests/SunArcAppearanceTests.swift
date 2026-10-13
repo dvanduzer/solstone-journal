@@ -3,6 +3,7 @@
 
 import AppKit
 import Foundation
+import MacTestSupport
 import SolstoneCore
 import SwiftUI
 import Testing
@@ -11,7 +12,8 @@ import Testing
 /// 2026-09-23 amendment (spec § 2, § 6, § 10, § 12): the sun arc follows the owner's system
 /// appearance and nothing sets the appearance by clock. Two halves: the background view draws
 /// the ground of whichever appearance its window is in, at noon and in the middle of the night;
-/// and no source in the journal app sets an appearance at all.
+/// and no source in the journal app sets an appearance at all. The shared modules it draws with
+/// are scanned by the same rule in the capture package.
 @Suite("SunArc — the appearance follows the system")
 @MainActor
 struct SunArcAppearanceFollowsSystemTests {
@@ -89,30 +91,13 @@ struct SunArcAppearanceFollowsSystemTests {
         // The 09-19 build applied `.preferredColorScheme(...)` from the clock to the whole
         // window. The amendment: the pattern reads the appearance and never sets it; the owner's
         // system setting is the setting, with no in-app override.
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        var files: [URL] = []
-        for dir in ["Sources/journal", "Sources/SolstoneCore", "Sources/JournalMarkKit"] {
-            let found = try #require(FileManager.default.enumerator(at: root.appendingPathComponent(dir), includingPropertiesForKeys: nil))
-                .compactMap { $0 as? URL }
-                .filter { $0.pathExtension == "swift" }
-            #expect(!found.isEmpty, "no Swift sources under \(dir)")
-            files += found
-        }
-        let forbidden = [
-            "preferredColorScheme", ".colorScheme(", "environment(\\.colorScheme", "NSApp.appearance",
-            "NSApplication.shared.appearance", ".appearance =", "NSAppearance.current"
-        ]
+        let root = journalPackageRoot()
+        let files = try #require(AppearanceSourceAssertions.swiftFiles(under: root.appendingPathComponent("Sources/journal")))
+        #expect(!files.isEmpty, "no Swift sources under Sources/journal")
         for file in files {
-            // a doc comment may name what the pattern must not do; code may not do it
-            let codeLines = try String(contentsOf: file, encoding: .utf8)
-                .split(separator: "\n")
-                .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
-            for token in forbidden {
-                #expect(!codeLines.contains { $0.contains(token) }, "\(file.lastPathComponent) sets the appearance via \(token)")
-            }
+            let source = try String(contentsOf: file, encoding: .utf8)
+            let violations = AppearanceSourceAssertions.violations(in: source, file: file.lastPathComponent)
+            #expect(violations.isEmpty, "\(violations.joined(separator: "\n"))")
         }
         // …and no plist pins the app to the light appearance either
         for plist in ["Sources/journal/Info.plist"] {

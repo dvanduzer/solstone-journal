@@ -1,4 +1,4 @@
-import SolstoneCore
+import JournalRuntime
 import Testing
 
 @Suite("SolVersionParser")

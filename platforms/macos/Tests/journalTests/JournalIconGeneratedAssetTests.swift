@@ -9,7 +9,7 @@ import Testing
 @Suite("JournalIconGeneratedAsset")
 struct JournalIconGeneratedAssetTests {
     @Test func committedSVGContainsSharedWordPathsAndPlate() throws {
-        let svgURL = repoRootURL().appendingPathComponent("assets/icon-journal.svg")
+        let svgURL = journalPackageRoot().appendingPathComponent("assets/icon-journal.svg")
         let svg = try String(contentsOf: svgURL, encoding: .utf8)
 
         #expect(svg.contains(JournalIconTileGeometry.platePathElement))
