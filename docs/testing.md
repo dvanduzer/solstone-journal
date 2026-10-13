@@ -136,3 +136,13 @@ Notes:
 - `make dev` writes runtime artifacts (stats cache, health logs, task logs) into
   the fixtures journal. They are covered by `tests/fixtures/journal/.gitignore`
   and should never be committed.
+
+## The mac app (Swift)
+
+The journal app for mac (`platforms/macos/`) is a separate Swift package, tested on a Mac only. None of it runs in `make ci` or `make ci-full`. Its three tiers do not substitute for each other:
+
+- **Unit gate:** `make macos-app-ci` (or `make ci` in `platforms/macos/`): brand assets, `swift test`, and the package's own Python packaging tests, under the host-wide Mac CI lock.
+- **Native integration (opt-in):** `make macos-app-integration-native`: the app's runtime code against a real native runtime in an isolated home. Its first line names the runtime that ran.
+- **Release acceptance:** the signed app installed, updated and used end to end, per release; no source test stands in for it.
+
+The app's setup-event parser is held to the native setup vocabulary through `platforms/macos/Tests/JournalRuntimeTests/Fixtures/native-setup-contract.json`, which a unit test in `solstone-core-setup` keeps equal to `src/events.rs`. After changing that vocabulary, regenerate it with `SOLSTONE_UPDATE_SETUP_CONTRACT=1 cargo test -p solstone-core-setup` and commit the fixture.
