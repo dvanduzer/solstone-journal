@@ -12,9 +12,9 @@ if (!manifestDir) throw new Error('manifest directory required');
 let source = fs.readFileSync(path.join(manifestDir, 'assets/home.js'), 'utf8');
 source = source.replace(
   '  window.toggleBriefingCard = toggleBriefingCard;\n',
-  `  window.__vitals = { renderVitalsHtml, homeHealthGlance, receiveSupervisorStatus, invalidateHeldWork, refreshVitals, refreshNarrative,
+  `  window.__vitals = { renderVitalsHtml, homeHealthGlance, receiveSupervisorStatus, invalidateHeldWork, refreshVitals, refreshNarrative, refreshChangedPulse,
     captureNarrative: () => { renderNarrative = data => { window.__narrative = data.narrative_content; }; },
-    seedPulse: data => { lastPulse=data; pulseObservedAt=Date.now(); pulseReadFailed=false; } };
+    seedPulse: data => { lastPulse=data; pulseObservedAt=Date.now(); pulseReadFailed=false; pulseRequest=null; vitalsRequest=null; narrativeRequest=null; } };
   window.toggleBriefingCard = toggleBriefingCard;\n`,
 );
 
@@ -175,40 +175,44 @@ async function issueReadCases() {
   const progressing={...ordinary,health_glance:{verdict:'progressing',severity:'amber',headline:'processing',issues:[]}};
   assert.strictEqual(homeHealthGlance(progressing).glance.verdict, 'progressing');
   seedPulse(diagnosed);
+  seedPulse(diagnosed);
   window.apiJson=()=>Promise.reject(new Error('synthetic read failed'));
   await refreshVitals();
   g=homeHealthGlance(diagnosed).glance;
   assert.strictEqual(g.verdict, 'unavailable');
   assert.ok(g.issues[0].text.startsWith('last known:'));
   assert.strictEqual(g.issues[0].href, '/app/health/#registeredClientsCard');
-  // A late older success cannot clear the failure from a newer read.
-  let older;
-  window.apiJson=()=>new Promise(resolve=>{older=resolve;});
-  const olderRead=refreshVitals();
-  window.apiJson=()=>Promise.reject(new Error('newer read failed'));
-  await refreshVitals();
-  older(ordinary);await olderRead;
-  assert.strictEqual(homeHealthGlance(diagnosed).glance.verdict, 'unavailable');
-  // A pending newer request must not starve a valid earlier completion.
-  let first, second;
-  window.apiJson=()=>new Promise(resolve=>{first=resolve;});
+  // Event bursts share one read and one paint per section; a later event
+  // after settlement can observe new state.
+  let resolveRead;
+  let requests = 0;
+  window.apiJson=()=>{ requests += 1; return new Promise(resolve=>{resolveRead=resolve;}); };
   const firstRead=refreshVitals();
-  window.apiJson=()=>new Promise(resolve=>{second=resolve;});
-  const secondRead=refreshVitals();
-  first(ordinary);await firstRead;
-  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'ok');
-  second(diagnosed);await secondRead;
-  window.apiJson=()=>Promise.resolve(ordinary);
-  await refreshVitals();
-  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'ok');
+  const sharedRead=refreshVitals();
   window.__vitals.captureNarrative();
-  let narrativeResult;
-  window.apiJson=()=>new Promise(resolve=>{narrativeResult=resolve;});
   const narrativeRead=window.__vitals.refreshNarrative();
-  window.apiJson=()=>Promise.resolve(ordinary);
+  assert.strictEqual(firstRead, sharedRead);
+  assert.strictEqual(requests, 1);
+  resolveRead({...ordinary,narrative_content:'new narrative'});
+  await Promise.all([firstRead, sharedRead, narrativeRead]);
+  assert.strictEqual(homeHealthGlance(ordinary).glance.verdict, 'ok');
+  assert.strictEqual(window.__narrative, 'new narrative');
+  window.apiJson=()=>{ requests += 1; return Promise.resolve(diagnosed); };
   await refreshVitals();
-  narrativeResult({...ordinary,narrative_content:'new narrative'});await narrativeRead;
-  assert.strictEqual(window.__narrative, 'new narrative', 'a newer vitals read cannot discard the narrative refresh');
+  assert.strictEqual(requests, 2, 'a later event reads fresh state');
+  let oldResult, newResult;
+  window.apiJson=()=>new Promise(resolve=>{ oldResult=resolve; });
+  const oldRead=refreshVitals();
+  const afterFinish=window.__vitals.refreshChangedPulse();
+  assert.strictEqual(window.__vitals.refreshChangedPulse(), afterFinish, 'invalidations queue one trailing read');
+  window.apiJson=()=>new Promise(resolve=>{ newResult=resolve; });
+  oldResult(ordinary);
+  await oldRead;
+  for (let i=0; i<8; i++) await Promise.resolve();
+  assert.strictEqual(typeof newResult, 'function', 'finished work is read after the older observation');
+  newResult({...ordinary,narrative_content:'finished narrative'});
+  await afterFinish;
+  assert.strictEqual(window.__narrative, 'finished narrative');
   console.log('vitals render and issue-read contracts passed');
 }
 issueReadCases().catch(error=>{console.error(error);process.exitCode=1;});

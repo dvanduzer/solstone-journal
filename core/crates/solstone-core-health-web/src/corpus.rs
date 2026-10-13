@@ -243,6 +243,13 @@ fn ac3_replays_all_captured_health_cases_through_the_shell() {
                         }
                     }
                     if case["name"].as_str() == Some("api_state") && expected["status"] == 200 {
+                        // The dashboard omits per-segment search outcomes; the
+                        // shared evaluator still owns that detailed projection.
+                        assert!(actual["search_index"].get("outcomes").is_none());
+                        wanted["search_index"]
+                            .as_object_mut()
+                            .expect("search index")
+                            .remove("outcomes");
                         assert!(actual["work"]["inventory"].is_null());
                         assert!(actual["work"]["history_confirmed"].is_boolean());
                         actual.as_object_mut().unwrap().remove("work");

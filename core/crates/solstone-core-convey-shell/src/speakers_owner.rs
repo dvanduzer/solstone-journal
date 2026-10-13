@@ -12,7 +12,9 @@ use solstone_core_convey_http::envelope::error_envelope;
 
 use crate::JournalRoot;
 use crate::speakers_calendar::audio_embedding_sources;
-use crate::speakers_npz::{load_voiceprints, npz_row_count, owner_centroid_summary};
+use crate::speakers_npz::{
+    OwnerCentroidSummary, load_voiceprints, npz_row_count, owner_centroid_summary,
+};
 use crate::speakers_quality::{ManualOwnerTagStats, manual_owner_tag_stats, principal_folder};
 use solstone_core_speaker_resolve::owner_detection::{
     CANDIDATE_EXPANSION_MAX_EMBEDDINGS, intra_cosine_p25, segment_overlap_fraction,
@@ -81,7 +83,7 @@ fn owner_setup_status(root: &Path) -> Result<Value, OwnerStatusError> {
             return Err(OwnerStatusError::IdentityInvalid);
         }
     };
-    let _lock = solstone_core_speaker_resolve::owner_candidate::hold_owner_candidate_lock(root)
+    let lock = solstone_core_speaker_resolve::owner_candidate::hold_owner_candidate_lock(root)
         .map_err(|e| OwnerStatusError::Failed(e.to_string()))?;
     let voiceprint = voiceprint_state(root);
     let status = match voiceprint.get("status") {
@@ -89,15 +91,35 @@ fn owner_setup_status(root: &Path) -> Result<Value, OwnerStatusError> {
         Some(_) => "invalid",
         None => "none",
     };
+    // Snapshot the status with the candidate or saved voice it describes.
+    // Recording inventory and manual-tag validation can take much longer.
+    let candidate_opt = if status == "candidate" {
+        solstone_core_speaker_resolve::owner_candidate::load_owner_candidate(root)
+            .map_err(|e| OwnerStatusError::Failed(e.to_string()))?
+    } else {
+        None
+    };
+    let centroid = if status == "confirmed" {
+        solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(root, &principal_id)
+            .ok()
+            .and_then(|path| owner_centroid_summary(&path))
+    } else {
+        None
+    };
+    drop(lock);
     let manual_stats = manual_owner_tag_stats(root, &principal_id);
+    if status == "confirmed" {
+        return Ok(confirmed_status(
+            root,
+            &principal_id,
+            &manual_stats,
+            centroid,
+        ));
+    }
     let diagnostics = diagnostics(root, &manual_stats).map_err(OwnerStatusError::Catalog)?;
 
     Ok(match status {
-        "confirmed" => confirmed_status(root, &principal_id, &manual_stats),
         "candidate" => {
-            let candidate_opt =
-                solstone_core_speaker_resolve::owner_candidate::load_owner_candidate(root)
-                    .map_err(|e| OwnerStatusError::Failed(e.to_string()))?;
             let detected_at = voiceprint.get("detected_at").and_then(Value::as_str);
 
             match (candidate_opt, detected_at) {
@@ -212,12 +234,13 @@ fn owner_setup_status(root: &Path) -> Result<Value, OwnerStatusError> {
     })
 }
 
-fn confirmed_status(root: &Path, principal_id: &str, manual_stats: &ManualOwnerTagStats) -> Value {
+fn confirmed_status(
+    root: &Path,
+    principal_id: &str,
+    manual_stats: &ManualOwnerTagStats,
+    centroid: Option<OwnerCentroidSummary>,
+) -> Value {
     let folder = principal_folder(root, principal_id);
-    let centroid =
-        solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(root, principal_id)
-            .ok()
-            .and_then(|path| owner_centroid_summary(&path));
     let (streams, intra_cosine_p25) = if centroid.is_some() {
         solstone_core_entity::entity_voiceprints_path(root, &folder)
             .ok()

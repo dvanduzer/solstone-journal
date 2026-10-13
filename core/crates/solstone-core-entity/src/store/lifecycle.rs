@@ -185,16 +185,9 @@ pub(crate) fn drop_stray_principal_flag(before: Option<&Value>, identity: &mut V
 /// order. Each identity carries its effective id in `id`.
 fn principal_identities(journal_root: &Path) -> Result<Vec<(String, Value)>, EntityStoreError> {
     let mut found = Vec::new();
-    for (entity_id, entity_dir) in read_identity_map(journal_root)?.resolved {
-        let Some(identity) = read_entity_identity(journal_root, &entity_dir)? else {
-            continue;
-        };
-        if identity_is_principal(identity.value()) {
-            let mut value = identity.value().clone();
-            if let Some(object) = value.as_object_mut() {
-                object.insert("id".to_owned(), Value::String(entity_id));
-            }
-            found.push((entity_dir, value));
+    for (entity_dir, entity) in super::journal_entities::live_journal_entities(journal_root)? {
+        if identity_is_principal(&entity.value) {
+            found.push((entity_dir, entity.value));
         }
     }
     found.sort_by(|left, right| left.0.cmp(&right.0));

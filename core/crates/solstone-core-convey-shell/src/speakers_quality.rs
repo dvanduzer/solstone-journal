@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -429,8 +429,9 @@ pub(crate) fn manual_owner_tag_stats(root: &Path, principal_id: &str) -> ManualO
     let mut manual_tags_count = 0;
     let mut lookup_error_count = invalid_layout_count;
     let mut streams = std::collections::BTreeSet::new();
+    let mut reads = ManualOwnerTagReads::default();
     for (_, _, row) in latest.into_values() {
-        match manual_owner_tag_stream(root, principal_id, &row) {
+        match manual_owner_tag_stream(root, principal_id, &row, &mut reads) {
             ManualOwnerTagResolution::Tagged(stream) => {
                 manual_tags_count += 1;
                 if !stream.is_empty() {
@@ -460,10 +461,19 @@ enum ManualOwnerTagResolution {
     LookupError,
 }
 
+// A request validates many statements from the same recordings. Read each
+// label file and source overlap once, without retaining data across requests.
+#[derive(Default)]
+struct ManualOwnerTagReads {
+    labels: BTreeMap<PathBuf, Option<Vec<Value>>>,
+    overlap: BTreeMap<PathBuf, f64>,
+}
+
 fn manual_owner_tag_stream(
     root: &Path,
     principal_id: &str,
     row: &Value,
+    reads: &mut ManualOwnerTagReads,
 ) -> ManualOwnerTagResolution {
     let Some(day) = row.get("day").and_then(Value::as_str) else {
         return ManualOwnerTagResolution::NotTagged;
@@ -496,13 +506,18 @@ fn manual_owner_tag_stream(
             return ManualOwnerTagResolution::LookupError;
         }
     };
-    let Some(labels) = read_json_object(&segment.join("talents/speaker_labels.json"))
-        .and_then(|labels| labels.get("labels").and_then(Value::as_array).cloned())
-    else {
+    let labels = reads
+        .labels
+        .entry(segment.join("talents/speaker_labels.json"))
+        .or_insert_with_key(|path| {
+            read_json_object(path)
+                .and_then(|labels| labels.get("labels").and_then(Value::as_array).cloned())
+        });
+    let Some(labels) = labels else {
         return ManualOwnerTagResolution::NotTagged;
     };
     let label = labels
-        .into_iter()
+        .iter()
         .find(|label| value_as_i64(label.get("sentence_id")) == Some(sentence_id));
     let Some(label) = label else {
         return ManualOwnerTagResolution::NotTagged;
@@ -516,10 +531,13 @@ fn manual_owner_tag_stream(
     ) {
         return ManualOwnerTagResolution::NotTagged;
     }
-    if solstone_core_speaker_resolve::owner_detection::segment_overlap_fraction(
-        &segment.join(format!("{source}.jsonl")),
-    ) <= 0.10
-    {
+    let overlap = reads
+        .overlap
+        .entry(segment.join(format!("{source}.jsonl")))
+        .or_insert_with_key(|path| {
+            solstone_core_speaker_resolve::owner_detection::segment_overlap_fraction(path)
+        });
+    if *overlap <= 0.10 {
         ManualOwnerTagResolution::Tagged(stream.to_owned())
     } else {
         ManualOwnerTagResolution::NotTagged
@@ -587,20 +605,35 @@ mod tests {
             "{\"overlap_fraction\":0}\n",
         )
         .expect("jsonl");
+        let row = serde_json::json!({
+            "day": "20260731", "segment_key": "080000_300", "source": "mic_audio",
+            "sentence_id": 1, "stream_layout": "direct"
+        });
         let stream = super::manual_owner_tag_stream(
             root.path(),
             "ada_lovelace",
-            &serde_json::json!({
-                "day": "20260731",
-                "segment_key": "080000_300",
-                "source": "mic_audio",
-                "sentence_id": 1,
-                "stream_layout": "direct"
-            }),
+            &row,
+            &mut super::ManualOwnerTagReads::default(),
         );
         assert!(matches!(
             stream,
             super::ManualOwnerTagResolution::Tagged(ref value) if value == "_default"
+        ));
+        // A later request must see an owner's correction, not an earlier read.
+        std::fs::write(
+            segment.join("talents/speaker_labels.json"),
+            r#"{"labels":[{"sentence_id":1,"speaker":"someone_else","method":"user_corrected"}]}"#,
+        )
+        .unwrap();
+        let corrected = super::manual_owner_tag_stream(
+            root.path(),
+            "ada_lovelace",
+            &row,
+            &mut super::ManualOwnerTagReads::default(),
+        );
+        assert!(matches!(
+            corrected,
+            super::ManualOwnerTagResolution::NotTagged
         ));
     }
 

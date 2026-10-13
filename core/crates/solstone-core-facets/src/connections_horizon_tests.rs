@@ -586,3 +586,24 @@ fn cache_file_is_not_listed_as_a_facet() {
     );
     assert!(root.join(CACHE_REL).is_file());
 }
+
+#[test]
+fn read_horizon_does_not_create_or_refresh_the_derived_cache() {
+    let temporary = journal_with_facet();
+    let root = temporary.path();
+    write_chronicle(root, "20260115");
+    write_detected(root, "work", "20260615", QUALIFYING);
+    assert_eq!(
+        crate::read_connections_horizon(root).unwrap().day,
+        "20260615"
+    );
+    assert!(!root.join(CACHE_REL).exists());
+    refresh_connections_horizon(root).unwrap();
+    let before = fs::read(root.join(CACHE_REL)).unwrap();
+    write_detected(root, "work", "20260215", QUALIFYING);
+    assert_eq!(
+        crate::read_connections_horizon(root).unwrap().day,
+        "20260215"
+    );
+    assert_eq!(fs::read(root.join(CACHE_REL)).unwrap(), before);
+}

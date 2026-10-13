@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
-use solstone_core_journal_io::{
-    AtomicWriteOptions, JsonWriteOptions, LockOptions, hold_lock, write_json, write_text,
-};
+use solstone_core_brain::{RuntimeRetryRecord, RuntimeRetryTransaction, hold_runtime_operation};
+use solstone_core_journal_io::{AtomicWriteOptions, JsonWriteOptions, write_json, write_text};
 
 use crate::process::{
     LaunchAuthority, ProcessObservation, ProcessObservationTuple, classify_process_observation,
@@ -731,16 +730,6 @@ struct HealthRecord {
 }
 
 #[derive(Debug, Clone)]
-struct RetryRecord {
-    revision: u64,
-    token_id: Option<String>,
-    desired_fingerprint: Option<String>,
-    requested_at: Option<String>,
-    reason_code: Option<ReasonCode>,
-    owner: Option<Map<String, Value>>,
-}
-
-#[derive(Debug, Clone)]
 struct RetryObservation {
     revision: u64,
     desired_fingerprint: Option<String>,
@@ -807,23 +796,28 @@ impl FileRuntimeStore {
         reason_code: ReasonCode,
         owner: Map<String, Value>,
     ) -> Result<RetryToken, RuntimeStoreError> {
-        let _lock = self.lock_operation()?;
-        let current = read_retry(&self.retry_path(), self.provider)?;
+        let transaction = self.retry_transaction()?;
+        let current = transaction
+            .repair_record()
+            .map_err(|_| RuntimeStoreError::Unavailable)?;
         let revision = current.revision + 1;
         let token_id = format!(
             "{}-retry-{}",
             self.provider.as_str(),
             NEXT_RETRY_TOKEN.fetch_add(1, Ordering::Relaxed)
         );
-        let record = RetryRecord {
+        let record = RuntimeRetryRecord {
+            provider: self.provider.as_str().to_owned(),
             revision,
             token_id: Some(token_id.clone()),
-            desired_fingerprint: desired_fingerprint.clone(),
+            desired_fingerprint_sha256: desired_fingerprint.clone(),
             requested_at: Some(self.clock.now_utc_rfc3339()),
-            reason_code: Some(reason_code.clone()),
+            reason_code: Some(reason_code.as_str().to_owned()),
             owner: Some(owner),
         };
-        self.write_retry(&record)?;
+        transaction
+            .publish(&record)
+            .map_err(|_| RuntimeStoreError::Unavailable)?;
         Ok(RetryToken {
             revision,
             token_id,
@@ -832,25 +826,24 @@ impl FileRuntimeStore {
         })
     }
 
+    #[cfg(test)]
     fn runtime_directory(&self) -> PathBuf {
-        self.journal_path
-            .join("health")
-            .join("providers")
-            .join("runtime")
+        self.journal_path.join("health/providers/runtime")
     }
 
     fn health_path(&self) -> PathBuf {
         health_record_path(&self.journal_path, self.provider)
     }
 
+    #[cfg(test)]
     fn retry_path(&self) -> PathBuf {
-        self.runtime_directory()
-            .join(format!("{}.retry-token.json", self.provider.as_str()))
+        solstone_core_brain::runtime_retry_token_path(&self.journal_path, self.provider.as_str())
+            .expect("supported runtime provider")
     }
 
-    fn operation_path(&self) -> PathBuf {
-        self.runtime_directory()
-            .join(format!("{}.operation", self.provider.as_str()))
+    fn retry_transaction(&self) -> Result<RuntimeRetryTransaction, RuntimeStoreError> {
+        RuntimeRetryTransaction::begin(&self.journal_path, self.provider.as_str())
+            .map_err(|_| RuntimeStoreError::Unavailable)
     }
 
     fn port_path(&self) -> PathBuf {
@@ -871,14 +864,8 @@ impl FileRuntimeStore {
     }
 
     fn lock_operation(&self) -> Result<solstone_core_journal_io::FileLock, RuntimeStoreError> {
-        hold_lock(
-            self.operation_path(),
-            LockOptions {
-                mode: Some(FILE_MODE),
-                ..LockOptions::default()
-            },
-        )
-        .map_err(|_| RuntimeStoreError::Unavailable)
+        hold_runtime_operation(&self.journal_path, self.provider.as_str())
+            .map_err(|_| RuntimeStoreError::Unavailable)
     }
 
     fn capture_owner_fence(&mut self, state: &ProviderRuntimeState) -> Option<ProviderFence> {
@@ -1005,29 +992,6 @@ impl FileRuntimeStore {
         )
         .map_err(|_| RuntimeStoreError::Unavailable)
     }
-
-    fn write_retry(&self, record: &RetryRecord) -> Result<(), RuntimeStoreError> {
-        let value = json!({
-            "schema_version": SCHEMA_VERSION,
-            "provider": self.provider.as_str(),
-            "revision": record.revision,
-            "token_id": record.token_id,
-            "desired_fingerprint_sha256": record.desired_fingerprint,
-            "requested_at": record.requested_at,
-            "reason_code": record.reason_code.as_ref().map(ReasonCode::as_str),
-            "owner": record.owner,
-        });
-        write_json(
-            self.retry_path(),
-            &value,
-            JsonWriteOptions {
-                mode: Some(FILE_MODE),
-                indent: Some(2),
-                sort_keys: true,
-            },
-        )
-        .map_err(|_| RuntimeStoreError::Unavailable)
-    }
 }
 
 impl RuntimeStore for FileRuntimeStore {
@@ -1036,21 +1000,24 @@ impl RuntimeStore for FileRuntimeStore {
         provider: ProviderName,
     ) -> Result<Option<RetryToken>, RuntimeStoreError> {
         self.ensure_provider(provider)?;
-        let _lock = self.lock_operation()?;
-        let record = read_retry(&self.retry_path(), self.provider)?;
+        let transaction = self.retry_transaction()?;
+        let record = transaction
+            .repair_record()
+            .map_err(|_| RuntimeStoreError::Unavailable)?;
         if let Some(token_id) = record.token_id {
-            let reason_code = record.reason_code.ok_or(RuntimeStoreError::Corrupt)?;
+            let reason_code =
+                ReasonCode::from_wire(record.reason_code.ok_or(RuntimeStoreError::Corrupt)?);
             self.observed_retry_tokens.insert(
                 token_id.clone(),
                 RetryObservation {
                     revision: record.revision,
-                    desired_fingerprint: record.desired_fingerprint.clone(),
+                    desired_fingerprint: record.desired_fingerprint_sha256.clone(),
                 },
             );
             return Ok(Some(RetryToken {
                 revision: record.revision,
                 token_id,
-                desired_fingerprint: record.desired_fingerprint,
+                desired_fingerprint: record.desired_fingerprint_sha256,
                 reason_code,
             }));
         }
@@ -1068,23 +1035,28 @@ impl RuntimeStore for FileRuntimeStore {
             .get(token_id)
             .cloned()
             .ok_or(RuntimeStoreError::Conflict)?;
-        let _lock = self.lock_operation()?;
-        let current = read_retry(&self.retry_path(), self.provider)?;
+        let transaction = self.retry_transaction()?;
+        let current = transaction
+            .repair_record()
+            .map_err(|_| RuntimeStoreError::Unavailable)?;
         if current.revision != expected.revision
             || current.token_id.as_deref() != Some(token_id)
-            || current.desired_fingerprint != expected.desired_fingerprint
+            || current.desired_fingerprint_sha256 != expected.desired_fingerprint
         {
             return Err(RuntimeStoreError::Conflict);
         }
-        let cleared = RetryRecord {
+        let cleared = RuntimeRetryRecord {
+            provider: self.provider.as_str().to_owned(),
             revision: current.revision + 1,
             token_id: None,
-            desired_fingerprint: None,
+            desired_fingerprint_sha256: None,
             requested_at: None,
             reason_code: None,
             owner: None,
         };
-        self.write_retry(&cleared)?;
+        transaction
+            .publish(&cleared)
+            .map_err(|_| RuntimeStoreError::Unavailable)?;
         self.observed_retry_tokens.remove(token_id);
         Ok(())
     }
@@ -1250,67 +1222,6 @@ fn read_health(path: &Path, provider: ProviderName) -> Result<HealthRecord, Runt
             .map_err(|_| RuntimeStoreError::Corrupt)?,
         process: optional_object(object.get("process"))?,
         detail: object.get("detail").cloned().unwrap_or_else(|| json!({})),
-    })
-}
-
-fn read_retry(path: &Path, provider: ProviderName) -> Result<RetryRecord, RuntimeStoreError> {
-    use solstone_core_journal_io::durability::{
-        ArtifactId, DurableRead, read_json_durable_validated,
-    };
-    let value =
-        match read_json_durable_validated::<Value>(ArtifactId::ProviderRetryToken, path, |val| {
-            let Some(object) = val.as_object() else {
-                return Err("retry record must be an object".to_owned());
-            };
-            validate_schema_and_provider(object, provider).map_err(|e| format!("{e:?}"))?;
-            let token_id = optional_string(object.get("token_id")).map_err(|e| format!("{e:?}"))?;
-            let desired_fingerprint = optional_string(object.get("desired_fingerprint_sha256"))
-                .map_err(|e| format!("{e:?}"))?;
-            let requested_at =
-                optional_string(object.get("requested_at")).map_err(|e| format!("{e:?}"))?;
-            let reason_code =
-                optional_reason(object.get("reason_code")).map_err(|e| format!("{e:?}"))?;
-            let owner = optional_object(object.get("owner")).map_err(|e| format!("{e:?}"))?;
-            if (token_id.is_none()
-                && (desired_fingerprint.is_some()
-                    || requested_at.is_some()
-                    || reason_code.is_some()
-                    || owner.is_some()))
-                || (token_id.is_some() && (requested_at.is_none() || reason_code.is_none()))
-            {
-                return Err("invalid retry token shape".to_owned());
-            }
-            nonnegative(object.get("revision")).map_err(|e| format!("{e:?}"))?;
-            Ok(())
-        }) {
-            Ok(DurableRead::Present(value)) => Some(value),
-            Ok(DurableRead::Absent | DurableRead::SetAside(_)) => None,
-            Ok(DurableRead::Unreadable { .. }) => return Err(RuntimeStoreError::Unavailable),
-            Err(_) => return Err(RuntimeStoreError::Unavailable),
-        };
-    let Some(value) = value else {
-        return Ok(RetryRecord {
-            revision: 0,
-            token_id: None,
-            desired_fingerprint: None,
-            requested_at: None,
-            reason_code: None,
-            owner: None,
-        });
-    };
-    let object = value.as_object().ok_or(RuntimeStoreError::Corrupt)?;
-    let token_id = optional_string(object.get("token_id"))?;
-    let desired_fingerprint = optional_string(object.get("desired_fingerprint_sha256"))?;
-    let requested_at = optional_string(object.get("requested_at"))?;
-    let reason_code = optional_reason(object.get("reason_code"))?;
-    let owner = optional_object(object.get("owner"))?;
-    Ok(RetryRecord {
-        revision: nonnegative(object.get("revision"))?,
-        token_id,
-        desired_fingerprint,
-        requested_at,
-        reason_code,
-        owner,
     })
 }
 
@@ -2011,6 +1922,86 @@ mod tests {
         assert_eq!(
             store.consume_retry_token(ProviderName::Local, &token.token_id),
             Err(RuntimeStoreError::Conflict)
+        );
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn retry_replacement_conflicts_and_restart_requires_a_new_observation() {
+        let journal = TempJournal::new();
+        let shared = Arc::new(LocalRuntimeShared::default());
+        let mut first = store(&journal, shared.clone());
+        let requested = first
+            .request_retry_token(
+                Some("fingerprint".to_owned()),
+                ReasonCode::known("retry-token-requested"),
+                Map::new(),
+            )
+            .unwrap();
+        first.read_retry_token(ProviderName::Local).unwrap();
+        let mut restarted = store(&journal, shared);
+        assert_eq!(
+            restarted.consume_retry_token(ProviderName::Local, &requested.token_id),
+            Err(RuntimeStoreError::Conflict)
+        );
+        assert_eq!(
+            restarted.read_retry_token(ProviderName::Local).unwrap(),
+            Some(requested.clone())
+        );
+        let replacement = restarted
+            .request_retry_token(
+                Some("fingerprint".to_owned()),
+                ReasonCode::known("retry-token-requested"),
+                Map::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            first.consume_retry_token(ProviderName::Local, &requested.token_id),
+            Err(RuntimeStoreError::Conflict)
+        );
+        assert_eq!(
+            first.read_retry_token(ProviderName::Local).unwrap(),
+            Some(replacement.clone())
+        );
+        first
+            .consume_retry_token(ProviderName::Local, &replacement.token_id)
+            .unwrap();
+        assert_eq!(restarted.read_retry_token(ProviderName::Local), Ok(None));
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn retry_request_and_consume_share_one_publication_lock() {
+        use std::sync::Barrier;
+
+        let journal = TempJournal::new();
+        let shared = Arc::new(LocalRuntimeShared::default());
+        let mut consumer = store(&journal, shared.clone());
+        consumer
+            .request_retry_token(None, ReasonCode::known("retry-token-requested"), Map::new())
+            .unwrap();
+        let observed = consumer
+            .read_retry_token(ProviderName::Local)
+            .unwrap()
+            .unwrap();
+        let mut requester = store(&journal, shared);
+        let barrier = Arc::new(Barrier::new(2));
+        let request_barrier = barrier.clone();
+        let request = std::thread::spawn(move || {
+            request_barrier.wait();
+            requester
+                .request_retry_token(None, ReasonCode::known("retry-token-requested"), Map::new())
+                .unwrap()
+        });
+        barrier.wait();
+        let consumed = consumer.consume_retry_token(ProviderName::Local, &observed.token_id);
+        let requested = request.join().unwrap();
+        assert!(consumed == Ok(()) || consumed == Err(RuntimeStoreError::Conflict));
+        assert_eq!(requested.revision, if consumed.is_ok() { 3 } else { 2 });
+        assert_ne!(requested.token_id, observed.token_id);
+        assert_eq!(
+            consumer.read_retry_token(ProviderName::Local).unwrap(),
+            Some(requested)
         );
     }
 

@@ -4,13 +4,13 @@
 //! Best-effort RF-DETR invocation for screen-gated describe rows.
 
 use std::env;
+#[cfg(windows)]
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus};
 #[cfg(not(windows))]
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 #[cfg(not(windows))]
@@ -23,13 +23,10 @@ use solstone_core_local::install::rfdetr_install::{
 #[cfg(not(windows))]
 use solstone_core_local::install::rfdetr_install::{check_rfdetr_model, rfdetr_artifact_key};
 
-#[cfg(not(windows))]
-const THRESHOLD: &str = "0.25";
 const ENGINE_NAME: &str = "rf-detr.cpp";
 const MODEL_NAME: &str = "rfdetr-nano-f16";
 #[cfg(not(windows))]
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(not(windows))]
 const BINARY_ENV: &str = "SOLSTONE_DESCRIBE_DETECT_BINARY";
 #[cfg(not(windows))]
@@ -113,26 +110,7 @@ pub fn detect(full_png: &[u8], journal: &Path) -> Result<Value, String> {
         Some(binary) => (PathBuf::from(binary), PathBuf::from("stub-model")),
         None => native_paths(journal)?,
     };
-    let temp = TempDir::new()?;
-    let input = temp.path.join("input.png");
-    let output = temp.path.join("output.json");
-    fs::write(&input, full_png).map_err(|error| error.to_string())?;
-    let mut child = Command::new(binary)
-        .args(["detect", "--model"])
-        .arg(model)
-        .args(["--input"])
-        .arg(&input)
-        .args(["--output"])
-        .arg(&output)
-        .args(["--threshold", THRESHOLD, "--threads", "4"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    if !wait_for_child(&mut child, timeout())?.success() {
-        return Err("rfdetr-cli detect failed".to_owned());
-    }
-    serde_json::from_slice(&fs::read(output).map_err(|error| error.to_string())?)
+    solstone_core_system::rfdetr::detect(full_png, &binary, &model, timeout())
         .map_err(|error| error.to_string())
 }
 
@@ -143,27 +121,6 @@ fn timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_TIMEOUT)
-}
-
-/// Wait for a detector child, terminating and reaping it when the failure
-/// ceiling expires. Public for its integration-level cancellation contract.
-#[doc(hidden)]
-pub fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            child.wait().map_err(|error| error.to_string())?;
-            return Err(format!(
-                "rfdetr-cli detect timed out after {}ms",
-                timeout.as_millis()
-            ));
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
 }
 
 #[cfg(not(windows))]
@@ -197,9 +154,11 @@ fn paths_from_install_check(
     }
 }
 
+#[cfg(windows)]
 struct TempDir {
     path: PathBuf,
 }
+#[cfg(windows)]
 impl TempDir {
     fn new() -> Result<Self, String> {
         let nonce = SystemTime::now()
@@ -214,6 +173,7 @@ impl TempDir {
         Ok(Self { path })
     }
 }
+#[cfg(windows)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);

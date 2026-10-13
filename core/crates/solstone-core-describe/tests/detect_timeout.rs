@@ -7,7 +7,7 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use solstone_core_describe::detect::wait_for_child;
+use solstone_core_system::rfdetr::wait_for_child;
 
 #[test]
 fn detector_timeout_cancels_a_child_that_reported_ready() {
@@ -28,6 +28,6 @@ fn detector_timeout_cancels_a_child_that_reported_ready() {
 
     let error = wait_for_child(&mut child, Duration::from_millis(100))
         .expect_err("ready child must be cancelled at the failure ceiling");
-    assert_eq!(error, "rfdetr-cli detect timed out after 100ms");
+    assert_eq!(error.to_string(), "rfdetr-cli detect timed out after 100ms");
     assert!(child.try_wait().expect("reaped child").is_some());
 }

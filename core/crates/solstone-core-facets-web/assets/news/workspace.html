@@ -96,6 +96,14 @@
   color: var(--ink);
 }
 
+/* The shell supplies the page title. Keep a source title readable without
+   giving the same issue a second display heading. Source/export is unchanged. */
+.news-body > h1:first-child {
+  font-size: 1.125rem;
+  line-height: 1.4;
+  margin-top: 0;
+}
+
 .news-body p,
 .news-body li,
 .news-index p,

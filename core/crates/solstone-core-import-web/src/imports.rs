@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{BufRead, BufReader},
     path::Path,
@@ -356,10 +356,11 @@ pub(crate) async fn list(
     let Ok(entries) = fs::read_dir(&imports_dir) else {
         return json_response(
             StatusCode::OK,
-            json!({"imports": [], "total": 0, "page": 1, "per_page": 25, "pages": 0, "total_entries_written": 0, "total_entities_seeded": 0}),
+            json!({"imports": [], "source_options": [], "total": 0, "page": 1, "per_page": 25, "pages": 0, "total_entries_written": 0, "total_entities_seeded": 0}),
         );
     };
     let mut rows = Vec::new();
+    let mut source_options = BTreeSet::new();
     for entry in entries.flatten() {
         let timestamp = entry.file_name().to_string_lossy().into_owned();
         if timestamp.len() != 15 || timestamp.matches('_').count() != 1 || !entry.path().is_dir() {
@@ -379,6 +380,9 @@ pub(crate) async fn list(
             .map(|item| item.display_name)
         {
             info.values.insert("source_display".into(), json!(display));
+        }
+        if let Some(name) = source_type.as_ref().filter(|name| !name.is_empty()) {
+            source_options.insert(name.clone());
         }
         if filter.is_none_or(|wanted| source_type.as_deref() == Some(wanted)) {
             rows.push(info);
@@ -428,13 +432,13 @@ pub(crate) async fn list(
         .sum();
     let page_rows: Vec<Value> = rows
         .into_iter()
-        .skip((page - 1) * per_page)
+        .skip((page - 1).saturating_mul(per_page))
         .take(per_page)
         .map(|row| Value::Object(row.values))
         .collect();
     json_response(
         StatusCode::OK,
-        json!({"imports": page_rows, "total": total, "page": page, "per_page": per_page, "pages": if total == 0 { 0 } else { total.div_ceil(per_page) }, "total_entries_written": total_entries_written, "total_entities_seeded": total_entities_seeded}),
+        json!({"imports": page_rows, "source_options": source_options, "total": total, "page": page, "per_page": per_page, "pages": if total == 0 { 0 } else { total.div_ceil(per_page) }, "total_entries_written": total_entries_written, "total_entities_seeded": total_entities_seeded}),
     )
 }
 
@@ -641,6 +645,42 @@ mod tests {
             serde_json::to_vec(&metadata).unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_choices_cover_history_while_pages_and_totals_match_filter() {
+        let dir = tempdir().unwrap();
+        for (id, source_type) in [
+            ("20260101_120000", "image"),
+            ("20260102_120000", "text"),
+            ("20260103_120000", "text"),
+        ] {
+            write_native_attempt(dir.path(), id, source_type);
+        }
+        let state = AppState {
+            root: dir.path().to_path_buf(),
+        };
+        for (filter, page, expected_total, expected_source) in [
+            ("", "1", 3, "text"),
+            ("image", "1", 1, "image"),
+            ("text", "2", 2, "text"),
+        ] {
+            let query = HashMap::from([
+                ("source".into(), filter.into()),
+                ("page".into(), page.into()),
+                ("per_page".into(), "1".into()),
+            ]);
+            let response = list(State(state.clone()), Query(query)).await;
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["source_options"], json!(["image", "text"]));
+            assert_eq!(body["total"], expected_total);
+            assert_eq!(body["pages"], expected_total);
+            assert_eq!(body["imports"].as_array().unwrap().len(), 1);
+            assert_eq!(body["imports"][0]["source_type"], expected_source);
+        }
     }
 
     #[test]

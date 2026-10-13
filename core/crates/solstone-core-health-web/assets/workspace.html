@@ -1571,7 +1571,9 @@ h2.card-title {
   <section class="dashboard-card" id="processingHolds" aria-labelledby="processingHoldsTitle" hidden>
     <h2 class="card-title" id="processingHoldsTitle">set-aside work</h2>
     <p data-held-work-notice></p>
+    <details data-held-work-list><summary>review items on hold</summary>
     <div data-held-work-rows></div>
+    <nav data-held-work-pages aria-label="set-aside work pages" hidden><button type="button" data-held-previous>previous</button> <span></span> <button type="button" data-held-next>next</button></nav></details>
     <p data-held-work-support><a href="https://support.solstone.app/">get help →</a></p>
   </section>
 
@@ -1654,7 +1656,7 @@ h2.card-title {
   <div class="dashboard-card clients-card hidden" id="clientsCard">
     <div class="card-header">
       <div class="card-title">
-        what's going into your journal
+        sources adding to your journal
       </div>
     </div>
     <div class="clients-grid" id="clientsGrid"></div>

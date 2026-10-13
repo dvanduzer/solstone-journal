@@ -365,7 +365,10 @@ function createHarness() {
     SurfaceState: { loading() { return ''; }, error() { return ''; } },
     CONVEY_COPY: { RELOAD_HINT: 'please reload' },
     logError() {},
-    location: { href: '/app/settings/', pathname: '/app/settings/', hash: '' },
+    location: { href: '/app/settings/', pathname: '/app/settings/', hash: '',
+      assign(url) { this.assigned = url; },
+      replace(url) { this.replaced = url; },
+    },
     history: {
       pushState(_state, _title, next) {
         historyEntries.splice(historyIndex + 1);
@@ -559,6 +562,23 @@ async function testCase(name, fn) {
     assert.ok(empty);
     assert.ok(empty.textContent.includes('without needing two journals'));
     assert.strictEqual(harness.document.querySelectorAll('#facetsList .facets-list-empty button').length, 1);
+  });
+
+  await testCase('mobile support opens the support app and retired fragments replace their history entry', async () => {
+    const harness = createHarness();
+    const select = harness.document.getElementById('navSelect');
+    select.value = 'support';
+    select.dispatchEvent(event('change', {target: select}));
+    await settle();
+    assert.strictEqual(harness.window.location.assigned, '/app/support/');
+    assert.strictEqual(harness.window.location.hash, '', 'selection does not create a dead settings fragment');
+    assert.strictEqual(harness.window.location.replaced, undefined, 'selection preserves the settings page in history');
+    harness.window.location.hash = '#support';
+    await run(harness, 'initFromHash()');
+    assert.strictEqual(harness.window.location.replaced, '/app/support/', 'opening an old fragment replaces it, so Back can leave');
+    harness.window.location.replaced = undefined;
+    for (const listener of harness.windowListeners.hashchange || []) listener(event('hashchange'));
+    assert.strictEqual(harness.window.location.replaced, '/app/support/', 'history navigation handles the old fragment too');
   });
 
   await testCase('settings tabs preserve browser history', async () => {

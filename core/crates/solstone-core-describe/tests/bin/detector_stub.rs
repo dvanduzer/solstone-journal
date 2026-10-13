@@ -35,12 +35,17 @@ fn main() {
             .open(path)
             .expect("log");
         use std::io::Write;
-        writeln!(file, "{}", json!({"input_bytes":fs::metadata(&input).expect("input metadata").len(),"threshold":threshold,"threads":threads})).expect("log row");
+        writeln!(file, "{}", json!({"input":input,"output":output,"input_bytes":fs::metadata(&input).expect("input metadata").len(),"threshold":threshold,"threads":threads})).expect("log row");
     }
     match env::var("SOLSTONE_DESCRIBE_DETECT_STUB_MODE").as_deref().unwrap_or("detected") {
         "detected" => fs::write(output, json!({"image":{"width":1,"height":1},"detections":[{"class_name":"laptop","score":0.9},{"class_name":"person","score":0.1}]}).to_string()).expect("output"),
         "invalid_json" => fs::write(output, "not json").expect("output"),
+        "missing_output" => {},
         "exit_failure" => std::process::exit(1),
+        "exit_failure_with_output" => {
+            fs::write(output, json!({"image":{"width":1,"height":1},"detections":[]}).to_string()).expect("output");
+            std::process::exit(1);
+        },
         mode => panic!("unknown mode {mode}"),
     }
 }

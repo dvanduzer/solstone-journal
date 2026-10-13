@@ -2402,6 +2402,8 @@
       loading.textContent = "couldn't load backup settings. reload this page to try again.";
       return;
     }
+    root.querySelector('[data-backup-loading]').hidden = true;
+    showPanel(initialPanel());
     try {
       await refreshOffloadStatus();
     } catch (err) {
@@ -2410,8 +2412,6 @@
       }
       renderOffloadUnavailable();
     }
-    root.querySelector('[data-backup-loading]').hidden = true;
-    showPanel(initialPanel());
   }
 
   if (document.readyState === 'loading') {

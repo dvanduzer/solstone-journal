@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use getrandom::fill as fill_random;
 use serde_json::{Map, Value};
-use solstone_core_journal_io::{JsonWriteOptions, LockOptions, hold_lock, write_json};
+use solstone_core_journal_io::{FileLock, JsonWriteOptions, LockOptions, hold_lock, write_json};
 
 use crate::fixture::local_contract;
 
@@ -82,6 +82,97 @@ impl fmt::Display for RuntimeRetryError {
 }
 
 impl Error for RuntimeRetryError {}
+
+/// The provider operation lock also serializes runtime health publications.
+pub fn hold_runtime_operation(
+    journal: &Path,
+    provider: &str,
+) -> Result<FileLock, RuntimeRetryError> {
+    let provider = validated_provider(provider)?;
+    hold_lock(
+        operation_path(journal, provider),
+        LockOptions {
+            mode: Some(RUNTIME_RECORD_MODE),
+            ..LockOptions::default()
+        },
+    )
+    .map_err(|error| RuntimeRetryError::Unavailable(error.to_string()))
+}
+
+pub fn runtime_retry_token_path(
+    journal: &Path,
+    provider: &str,
+) -> Result<PathBuf, RuntimeRetryError> {
+    Ok(retry_path(journal, validated_provider(provider)?))
+}
+
+/// Holds one provider operation lock from observation through publication.
+/// Callers retain their own owner-request or internal retry admission policy.
+pub struct RuntimeRetryTransaction {
+    provider: String,
+    path: PathBuf,
+    _lock: FileLock,
+}
+
+impl RuntimeRetryTransaction {
+    pub fn begin(journal: &Path, provider: &str) -> Result<Self, RuntimeRetryError> {
+        Ok(Self {
+            provider: validated_provider(provider)?.to_owned(),
+            path: runtime_retry_token_path(journal, provider)?,
+            _lock: hold_runtime_operation(journal, provider)?,
+        })
+    }
+
+    /// Read without repairing or setting aside a corrupt record.
+    pub fn read_record(&self) -> Result<RuntimeRetryRecord, RuntimeRetryError> {
+        read_retry_record(&self.path, &self.provider)
+    }
+
+    /// Explicit runtime repair; inspection and owner requests never use this.
+    pub fn repair_record(&self) -> Result<RuntimeRetryRecord, RuntimeRetryError> {
+        use solstone_core_journal_io::durability::{
+            ArtifactId, DurableRead, read_json_durable_validated,
+        };
+        let result = read_json_durable_validated::<Value>(
+            ArtifactId::ProviderRetryToken,
+            &self.path,
+            |value| {
+                // Runtime reads require a persisted revision; read-only legacy
+                // inspection retains its missing-revision default of zero.
+                required_u64(&value["revision"])?;
+                retry_record_from_value(value.clone(), &self.provider).map(|_| ())
+            },
+        )
+        .map_err(|error| RuntimeRetryError::Unavailable(error.to_string()))?;
+        match result {
+            DurableRead::Present(value) => {
+                retry_record_from_value(value, &self.provider).map_err(RuntimeRetryError::Malformed)
+            }
+            DurableRead::Absent | DurableRead::SetAside(_) => {
+                Ok(synthetic_retry_record(&self.provider))
+            }
+            DurableRead::Unreadable { .. } => Err(RuntimeRetryError::Unavailable(
+                "runtime retry-token record is unreadable".to_owned(),
+            )),
+        }
+    }
+
+    pub fn publish(&self, record: &RuntimeRetryRecord) -> Result<(), RuntimeRetryError> {
+        if record.provider != self.provider {
+            return Err(RuntimeRetryError::InvalidProvider(record.provider.clone()));
+        }
+        write_json(
+            &self.path,
+            &retry_record_value(record),
+            JsonWriteOptions {
+                mode: Some(RUNTIME_RECORD_MODE),
+                indent: Some(2),
+                sort_keys: true,
+            },
+        )
+        .map_err(|error| RuntimeRetryError::Unavailable(error.to_string()))
+    }
+}
 
 pub fn inspect_runtime_health(journal_path: &Path) -> RuntimeRecordInspection {
     inspect_runtime_health_for_provider(journal_path, "local")
@@ -157,18 +248,9 @@ pub fn request_runtime_retry(
 ) -> Result<RuntimeRetryRecord, RuntimeRetryError> {
     let provider = validated_provider(provider)?;
     let health_path = health_path(journal, provider);
-    let retry_path = retry_path(journal, provider);
-    let operation_path = operation_path(journal, provider);
-    let _lock = hold_lock(
-        &operation_path,
-        LockOptions {
-            mode: Some(RUNTIME_RECORD_MODE),
-            ..LockOptions::default()
-        },
-    )
-    .map_err(|error| RuntimeRetryError::Unavailable(error.to_string()))?;
+    let transaction = RuntimeRetryTransaction::begin(journal, provider)?;
     let health = read_health_record(&health_path, provider)?;
-    let retry = read_retry_record(&retry_path, provider)?;
+    let retry = transaction.read_record()?;
 
     if health["revision"].as_u64() != Some(expected_health_revision) {
         return Err(RuntimeRetryError::HealthRevisionConflict);
@@ -197,16 +279,7 @@ pub fn request_runtime_retry(
         reason_code: Some("retry-token-requested".to_owned()),
         owner: Some(owner),
     };
-    write_json(
-        retry_path,
-        &retry_record_value(&record),
-        JsonWriteOptions {
-            mode: Some(RUNTIME_RECORD_MODE),
-            indent: Some(2),
-            sort_keys: true,
-        },
-    )
-    .map_err(|error| RuntimeRetryError::Unavailable(error.to_string()))?;
+    transaction.publish(&record)?;
     Ok(record)
 }
 
@@ -339,6 +412,14 @@ fn retry_record_from_value(value: Value, provider: &str) -> Result<RuntimeRetryR
     if schema_version != RUNTIME_HEALTH_SCHEMA_VERSION {
         return Err(format!(
             "unsupported runtime retry-token schema_version for {provider}"
+        ));
+    }
+    if object
+        .get("provider")
+        .is_some_and(|value| value.as_str() != Some(provider))
+    {
+        return Err(format!(
+            "runtime retry-token provider does not match {provider}"
         ));
     }
     let token_id = optional_string(object, "token_id")?;
@@ -710,6 +791,90 @@ mod tests {
             fingerprint,
             Map::from_iter([("source".to_owned(), Value::String("test".to_owned()))]),
         )
+    }
+
+    #[test]
+    fn retry_codec_validates_provider_and_token_shape() {
+        use super::{retry_record_from_value, synthetic_retry_record};
+
+        let cleared = retry_record_value(&synthetic_retry_record("local"));
+        assert_eq!(
+            retry_record_from_value(cleared.clone(), "local").unwrap(),
+            synthetic_retry_record("local")
+        );
+        let mut pending = cleared.clone();
+        pending["revision"] = json!(7);
+        pending["token_id"] = json!("retry-1");
+        pending["requested_at"] = json!("2026-01-01T00:00:00Z");
+        pending["reason_code"] = json!("retry-token-requested");
+        let decoded = retry_record_from_value(pending.clone(), "local").unwrap();
+        assert_eq!(retry_record_value(&decoded), pending);
+        // Missing provider and schema retain the existing wire defaults.
+        let mut minimal = pending.clone();
+        minimal.as_object_mut().unwrap().remove("provider");
+        minimal.as_object_mut().unwrap().remove("schema_version");
+        assert_eq!(retry_record_from_value(minimal, "local").unwrap(), decoded);
+
+        for (field, value) in [
+            ("provider", json!("parakeet")),
+            ("provider", Value::Null),
+            ("provider", json!(42)),
+            ("schema_version", json!(2)),
+            ("schema_version", json!("1")),
+            ("revision", json!(-1)),
+            ("token_id", json!(42)),
+            ("requested_at", Value::Null),
+            ("reason_code", Value::Null),
+            ("reason_code", json!("unknown")),
+            ("owner", json!([])),
+        ] {
+            let mut invalid = pending.clone();
+            invalid[field] = value;
+            assert!(
+                retry_record_from_value(invalid, "local").is_err(),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("desired_fingerprint_sha256", json!("fingerprint")),
+            ("requested_at", json!("2026-01-01T00:00:00Z")),
+            ("reason_code", json!("retry-token-requested")),
+            ("owner", json!({})),
+        ] {
+            let mut invalid = cleared.clone();
+            invalid[field] = value;
+            assert!(
+                retry_record_from_value(invalid, "local").is_err(),
+                "{field}"
+            );
+        }
+        assert!(retry_record_from_value(json!([]), "local").is_err());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn corrupt_retry_inspection_and_owner_request_never_repair() {
+        let journal = TestJournal::new();
+        journal.write_health(7, "failed", "fingerprint");
+        journal.write_retry(2, Some("retry-1"), Some("fingerprint"));
+        let path = retry_path(&journal.0, "local");
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["provider"] = json!("parakeet");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            inspect_runtime_retry_token(&journal.0, "local").status,
+            "corrupt"
+        );
+        assert!(matches!(
+            request(&journal, 7, 2, "fingerprint"),
+            Err(RuntimeRetryError::Malformed(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let transaction = super::RuntimeRetryTransaction::begin(&journal.0, "local").unwrap();
+        assert!(!transaction.repair_record().unwrap().pending());
+        assert!(!path.exists());
     }
 
     #[test]
