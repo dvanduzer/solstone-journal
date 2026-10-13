@@ -372,7 +372,7 @@ pub fn project_public_config(mut config: Map<String, Value>) -> Result<Map<Strin
 /// A known backend this host cannot run. A mac has no parakeet.cpp server, so
 /// saving that backend there would leave the journal with no transcription.
 fn backend_refusal_on(backend: &str, os: &str) -> Option<&'static str> {
-    (backend == "parakeet-cpp" && !crate::transcribe::parakeet_cpp_runs_on(os))
+    (backend == "parakeet-cpp" && matches!(os, "macos" | "darwin"))
         .then_some("Invalid backend: parakeet-cpp can't run on a mac. Use parakeet.")
 }
 

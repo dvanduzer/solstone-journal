@@ -22,6 +22,7 @@ mod schema_validation;
 pub mod session;
 mod thinking;
 mod token_log;
+mod transport;
 mod validation;
 
 pub use anthropic::{

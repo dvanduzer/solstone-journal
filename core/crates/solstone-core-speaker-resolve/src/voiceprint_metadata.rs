@@ -10,8 +10,50 @@ use chrono_tz::Tz;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use solstone_core_entity::{VoiceprintKey, voiceprint_key_from_metadata};
 use solstone_core_journal_config::{ConfigLoadError, read_journal_config};
 use solstone_core_journal_io::paths::SegmentLayout;
+
+/// Required scalar fields for speaker-resolution archive rows. The entity
+/// store also accepts other scalar shapes, which these consumers must skip.
+pub(crate) fn metadata_key(value: &Value) -> Option<VoiceprintKey> {
+    value.get("day")?.as_str()?;
+    value.get("segment_key")?.as_str()?;
+    value.get("source")?.as_str()?;
+    value.get("sentence_id")?.as_i64()?;
+    voiceprint_key_from_metadata(value).ok()
+}
+
+/// Bootstrap and accumulation require a valid string when layout is present,
+/// including rejecting null. Missing layout still uses canonical inference.
+pub(crate) fn strict_metadata_key(value: &Value) -> Option<VoiceprintKey> {
+    if let Some(layout) = value.get("stream_layout") {
+        match layout.as_str()? {
+            "direct" | "named" => {}
+            _ => return None,
+        }
+    }
+    metadata_key(value)
+}
+
+pub(crate) fn provenance_key(
+    day: &str,
+    layout: SegmentLayout,
+    stream: &str,
+    segment_key: &str,
+    source: &str,
+    sentence_id: i64,
+) -> VoiceprintKey {
+    voiceprint_key_from_metadata(&serde_json::json!({
+        "day": day,
+        "stream_layout": layout.as_str(),
+        "stream": stream,
+        "segment_key": segment_key,
+        "source": source,
+        "sentence_id": sentence_id,
+    }))
+    .expect("typed voiceprint provenance has supported key fields")
+}
 
 /// The required field order for all newly written voiceprint metadata.
 pub const VOICEPRINT_METADATA_KEYS: [&str; 9] = [
@@ -228,6 +270,78 @@ fn wall_time_ms(timezone: &Tz, local: &NaiveDateTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_keys_normalize_streams_without_widening_row_admission() {
+        let direct = provenance_key(
+            "20260808",
+            SegmentLayout::Direct,
+            "_default",
+            "120000_300",
+            "audio",
+            7,
+        );
+        let base = serde_json::json!({"day":"20260808","segment_key":"120000_300","source":"audio","sentence_id":7});
+        for stream in [
+            None,
+            Some(Value::Null),
+            Some(Value::Bool(false)),
+            Some(Value::from("")),
+            Some(Value::from("_default")),
+        ] {
+            let mut value = base.clone();
+            if let Some(stream) = stream {
+                value["stream"] = stream;
+            }
+            assert_eq!(strict_metadata_key(&value), Some(direct.clone()));
+        }
+        let mut value = base.clone();
+        value["stream"] = Value::from("_default");
+        value["stream_layout"] = Value::from("named");
+        let named = provenance_key(
+            "20260808",
+            SegmentLayout::Named,
+            "_default",
+            "120000_300",
+            "audio",
+            7,
+        );
+        assert_eq!(strict_metadata_key(&value), Some(named.clone()));
+        assert_ne!(named, direct);
+        value["stream"] = Value::from("mic");
+        value.as_object_mut().unwrap().remove("stream_layout");
+        assert_eq!(
+            strict_metadata_key(&value),
+            Some(provenance_key(
+                "20260808",
+                SegmentLayout::Named,
+                "mic",
+                "120000_300",
+                "audio",
+                7
+            ))
+        );
+        for layout in [
+            Value::Null,
+            Value::from(1),
+            Value::from(""),
+            Value::from("other"),
+        ] {
+            value["stream_layout"] = layout;
+            assert_eq!(strict_metadata_key(&value), None);
+        }
+        for field in ["day", "segment_key", "source", "sentence_id"] {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().remove(field);
+            assert_eq!(strict_metadata_key(&value), None);
+            value[field] = if field == "sentence_id" {
+                Value::from("7")
+            } else {
+                Value::from(7)
+            };
+            assert_eq!(strict_metadata_key(&value), None);
+        }
+    }
 
     #[test]
     fn segment_start_is_owner_local_wall_time() {

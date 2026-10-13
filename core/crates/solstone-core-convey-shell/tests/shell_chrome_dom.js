@@ -509,6 +509,7 @@ function createHarness(options = {}) {
       };
     },
     sessionStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+    localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
     URL,
     addEventListener(type, listener) { (windowListeners[type] ||= []).push(listener); },
     removeEventListener(type, listener) {
@@ -554,6 +555,7 @@ function createHarness(options = {}) {
     Element,
     navigator,
     location,
+    localStorage: window.localStorage,
     MutationObserver: MutationObserverShim,
     console,
     URL,
@@ -566,6 +568,14 @@ function createHarness(options = {}) {
     fetch,
   });
   const read = (file) => fs.readFileSync(path.join(crateDir, 'assets/static', file), 'utf8');
+  const surfaceStub = window.SurfaceState;
+  const servicesStub = window.AppServices;
+  vm.runInContext(read('convey_icons.js'), context, { filename: 'convey_icons.js' });
+  vm.runInContext(read('app.js'), context, { filename: 'app.js' });
+  if (options.boot) {
+    window.SurfaceState = surfaceStub;
+    Object.assign(window.AppServices, servicesStub);
+  }
   vm.runInContext(read('journal-web-host.js'), context, { filename: 'journal-web-host.js' });
   if (options.capable) {
     navigator.userAgent = `${navigator.userAgent} ${window.solstoneJournalWebHost.userAgentProduct}`;

@@ -185,3 +185,99 @@ async fn serve_audio_matches_every_captured_case_except_the_declared_refusal() {
         }
     }
 }
+
+#[tokio::test]
+async fn both_media_routes_preserve_zero_range_headers_and_refusals() {
+    let journal = EmptyEstablishedJournal::new();
+    let day = journal.0.join("chronicle/20260101");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(day.join("clip.FLAC"), b"abcde").unwrap();
+    fs::write(day.join("empty.flac"), b"").unwrap();
+    let app = router(journal.0.clone());
+    for route in [
+        "/app/speakers/api/serve_audio",
+        "/app/transcripts/api/serve_file",
+    ] {
+        for (range, expected_status, expected_body, expected_range) in [
+            ("bytes=1-2", 206, &b"bc"[..], Some("bytes 1-2/5")),
+            ("bytes=3-", 206, &b"de"[..], Some("bytes 3-4/5")),
+            ("bytes=-2", 206, &b"de"[..], Some("bytes 3-4/5")),
+            ("bytes=1-99", 206, &b"bcde"[..], Some("bytes 1-4/5")),
+            ("bytes=bad", 200, &b"abcde"[..], None),
+            ("bytes=0-1,3-4", 200, &b"abcde"[..], None),
+            ("bytes=18446744073709551616-", 200, &b"abcde"[..], None),
+        ] {
+            let headers = serde_json::json!({"range": range});
+            let (status, headers, body) = request(
+                app.clone(),
+                &format!("{route}/20260101/clip.FLAC"),
+                headers.as_object().unwrap(),
+            )
+            .await;
+            assert_eq!(status, expected_status, "{route}: {range}");
+            assert_eq!(body, expected_body);
+            assert_eq!(headers["content-type"], "audio/flac");
+            assert_eq!(headers["content-length"], body.len().to_string());
+            assert_eq!(headers["content-disposition"], "inline; filename=clip.FLAC");
+            assert_eq!(headers["cache-control"], "public, max-age=300");
+            assert_eq!(
+                headers.get("content-range").map(|v| v.to_str().unwrap()),
+                expected_range
+            );
+            assert_eq!(
+                headers.get("accept-ranges").map(|v| v.to_str().unwrap()),
+                expected_range.map(|_| "bytes")
+            );
+        }
+        for range in ["bytes=-0", "bytes=5-", "bytes=3-1"] {
+            let headers = serde_json::json!({"range": range});
+            let (status, headers, body) = request(
+                app.clone(),
+                &format!("{route}/20260101/clip.FLAC"),
+                headers.as_object().unwrap(),
+            )
+            .await;
+            assert_eq!(status, 416);
+            assert_eq!(headers["content-type"], "application/json");
+            assert!(!headers.contains_key("content-range"));
+            assert!(!headers.contains_key("accept-ranges"));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                serde_json::json!({"error": "that request didn't finish.", "reason_code": "http_error", "detail": ""})
+            );
+            assert_eq!(body.last(), Some(&b'\n'));
+            let (status, headers, body) = request(
+                app.clone(),
+                &format!("{route}/20260101/empty.flac"),
+                serde_json::json!({"range": range}).as_object().unwrap(),
+            )
+            .await;
+            assert_eq!(status, 200);
+            assert!(body.is_empty());
+            assert_eq!(headers["content-length"], "0");
+            assert!(!headers.contains_key("content-range"));
+        }
+        let (status, _, body) = request(
+            app.clone(),
+            &format!("{route}/20260101/%2e%2e/clip.FLAC"),
+            &serde_json::Map::new(),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["reason_code"],
+            "invalid_path"
+        );
+        let (status, _, body) = request(
+            app.clone(),
+            &format!("{route}/20260101/missing.flac"),
+            &serde_json::Map::new(),
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["reason_code"],
+            "file_not_found"
+        );
+    }
+}

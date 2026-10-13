@@ -8,11 +8,14 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use solstone_core_generate::{ContentPart, GenerateRequest};
 use solstone_core_generate_wire::{
-    EndpointFailure, EndpointResult, EndpointRuntime, endpoint_generate,
+    AnthropicTransport, EndpointFailure, EndpointResult, EndpointRuntime, GoogleTransport,
+    OpenAiTransport, UreqAnthropicTransport, UreqGoogleTransport, UreqOpenAiTransport,
+    endpoint_generate,
 };
 use solstone_core_local::ByoEndpoint;
 
@@ -85,15 +88,15 @@ fn write_http_json(stream: &mut std::net::TcpStream, body: &str) {
         .expect("write response body");
 }
 
-fn read_request(stream: &mut std::net::TcpStream) {
+fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
         let Ok(read) = stream.read(&mut buffer) else {
-            return;
+            return request;
         };
         if read == 0 {
-            return;
+            return request;
         }
         request.extend_from_slice(&buffer[..read]);
         let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
@@ -107,8 +110,75 @@ fn read_request(stream: &mut std::net::TcpStream) {
             .and_then(|(_, value)| value.trim().parse::<usize>().ok())
             .unwrap_or_default();
         if request.len() >= header_end + 4 + content_length {
-            return;
+            return request;
         }
+    }
+}
+
+#[test]
+fn buffered_cloud_transports_preserve_json_status_and_request_scoped_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("cloud listener");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let body = json!({"text": "synthetic é🙂"});
+    let response_body = "synthetic refusal é🙂";
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept cloud client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            requests.push(read_request(&mut stream));
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            ).expect("write cloud refusal");
+        }
+        requests
+    });
+    for provider in 0..3 {
+        let timeout = Duration::from_secs(5);
+        let response = match provider {
+            0 => UreqOpenAiTransport.post_json(&base_url, "/wire", &body, "openai-key", timeout),
+            1 => UreqGoogleTransport.post_json(&base_url, "/wire", &body, "google-key", timeout),
+            _ => UreqAnthropicTransport.post_json(
+                &base_url,
+                "/wire",
+                &body,
+                "anthropic-key",
+                "test-version",
+                timeout,
+            ),
+        }
+        .expect("buffered cloud exchange");
+        assert_eq!(response.status, 429);
+        assert_eq!(response.body, response_body);
+    }
+    let requests = server.join().expect("join cloud server");
+    for (provider, request) in requests.iter().enumerate() {
+        let request = std::str::from_utf8(request).unwrap();
+        let (headers, sent_body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(headers.lines().next(), Some("POST /wire HTTP/1.1"));
+        assert_eq!(sent_body, serde_json::to_string(&body).unwrap());
+        let headers: std::collections::BTreeMap<_, _> = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim()))
+            .collect();
+        assert_eq!(headers.get("content-type"), Some(&"application/json"));
+        match provider {
+            0 => assert_eq!(headers.get("authorization"), Some(&"Bearer openai-key")),
+            1 => assert_eq!(headers.get("x-goog-api-key"), Some(&"google-key")),
+            _ => {
+                assert_eq!(headers.get("x-api-key"), Some(&"anthropic-key"));
+                assert_eq!(headers.get("anthropic-version"), Some(&"test-version"));
+            }
+        }
+        assert_eq!(headers.contains_key("authorization"), provider == 0);
+        assert_eq!(headers.contains_key("x-goog-api-key"), provider == 1);
+        assert_eq!(headers.contains_key("x-api-key"), provider == 2);
+        assert_eq!(headers.contains_key("anthropic-version"), provider == 2);
     }
 }
 

@@ -12,8 +12,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solstone_core_entity::{
-    EncoderIdentity, VoiceprintItem, is_admissible_person, load_all_journal_entities,
-    load_entity_voiceprints_file, normalize_embedding, save_voiceprints_batch,
+    EncoderIdentity, VoiceprintItem, VoiceprintKey, is_admissible_person,
+    load_all_journal_entities, load_entity_voiceprints_file, normalize_embedding,
+    save_voiceprints_batch,
 };
 use solstone_core_journal_io::SegmentLayout;
 use solstone_core_speaker_id::calibration::{
@@ -22,7 +23,9 @@ use solstone_core_speaker_id::calibration::{
 
 use crate::owner_admission::{OwnerAdmission, admitted_owner_id};
 use crate::owner_centroid::{OwnerCentroidError, load_owner_centroid};
-use crate::voiceprint_metadata::{VoiceprintMetadata, owner_timezone};
+use crate::voiceprint_metadata::{
+    VoiceprintMetadata, owner_timezone, provenance_key, strict_metadata_key,
+};
 
 const METHODS: [&str; 4] = [
     "structural_single_speaker",
@@ -205,7 +208,7 @@ pub fn accumulate_voiceprints(
         .collect::<HashMap<_, _>>();
     let mut existing = HashMap::<String, ExistingVoiceprints>::new();
     let mut pending = BTreeMap::<String, Vec<VoiceprintItem>>::new();
-    let mut pending_keys = HashSet::<(String, String, String, String, String, String, i64)>::new();
+    let mut pending_keys = HashSet::<(String, VoiceprintKey)>::new();
 
     for label in &request.labels {
         if label.confidence.as_deref() != Some("high") {
@@ -265,12 +268,12 @@ pub fn accumulate_voiceprints(
         let state = existing
             .entry(speaker.to_owned())
             .or_insert_with(|| ExistingVoiceprints::load(&request.journal_root, speaker));
-        let key = (
-            request.day.clone(),
-            request.stream_layout.as_str().to_owned(),
-            request.stream.clone(),
-            request.segment_key.clone(),
-            request.source.clone(),
+        let key = provenance_key(
+            &request.day,
+            request.stream_layout,
+            &request.stream,
+            &request.segment_key,
+            &request.source,
             label.sentence_id,
         );
         if state.keys.contains(&key) {
@@ -281,15 +284,7 @@ pub fn accumulate_voiceprints(
             );
             continue;
         }
-        if pending_keys.contains(&(
-            speaker.to_owned(),
-            request.day.clone(),
-            request.stream_layout.as_str().to_owned(),
-            request.stream.clone(),
-            request.segment_key.clone(),
-            request.source.clone(),
-            label.sentence_id,
-        )) {
+        if pending_keys.contains(&(speaker.to_owned(), key.clone())) {
             skip_entity(
                 report,
                 &mut skipped,
@@ -306,15 +301,7 @@ pub fn accumulate_voiceprints(
             skip_entity(report, &mut skipped, AccumulationSkipReason::Outlier);
             continue;
         }
-        pending_keys.insert((
-            speaker.to_owned(),
-            request.day.clone(),
-            request.stream_layout.as_str().to_owned(),
-            request.stream.clone(),
-            request.segment_key.clone(),
-            request.source.clone(),
-            label.sentence_id,
-        ));
+        pending_keys.insert((speaker.to_owned(), key));
         pending
             .entry(speaker.to_owned())
             .or_default()
@@ -376,7 +363,7 @@ pub fn accumulate_voiceprints(
 
 struct ExistingVoiceprints {
     count: usize,
-    keys: HashSet<(String, String, String, String, String, i64)>,
+    keys: HashSet<VoiceprintKey>,
     centroid: Option<Vec<f32>>,
 }
 
@@ -392,36 +379,8 @@ impl ExistingVoiceprints {
         let keys = archive
             .metadata
             .iter()
-            .filter_map(|metadata| {
-                let value = serde_json::from_str::<Value>(metadata).ok()?;
-                let day = value.get("day")?.as_str()?.to_owned();
-                let stream_raw = value.get("stream").and_then(Value::as_str).unwrap_or("");
-                let (layout, stream) = if let Some(layout_val) = value.get("stream_layout") {
-                    let layout_str = layout_val.as_str()?;
-                    match layout_str {
-                        "direct" => ("direct".to_owned(), stream_raw.to_owned()),
-                        "named" => ("named".to_owned(), stream_raw.to_owned()),
-                        _ => return None,
-                    }
-                } else if stream_raw.is_empty() || stream_raw == "_default" {
-                    ("direct".to_owned(), "_default".to_owned())
-                } else {
-                    ("named".to_owned(), stream_raw.to_owned())
-                };
-                let stream = if stream.is_empty() {
-                    "_default".to_owned()
-                } else {
-                    stream
-                };
-                Some((
-                    day,
-                    layout,
-                    stream,
-                    value.get("segment_key")?.as_str()?.to_owned(),
-                    value.get("source")?.as_str()?.to_owned(),
-                    value.get("sentence_id")?.as_i64()?,
-                ))
-            })
+            .filter_map(|metadata| serde_json::from_str::<Value>(metadata).ok())
+            .filter_map(|value| strict_metadata_key(&value))
             .collect();
         let normalized = archive
             .embeddings
