@@ -47,7 +47,7 @@ fn actual_publication_and_no_effect_move_receipts_after_confirmed_cleanup() {
         assert!(cleanup.parent_sync.unwrap().is_ok());
         #[cfg(windows)]
         assert_eq!(
-            cleanup.parent_sync.unwrap().unwrap_err().kind(),
+            cleanup.parent_sync.unwrap().as_ref().unwrap_err().kind(),
             std::io::ErrorKind::Unsupported
         );
         assert!(!facts.retained_media);
