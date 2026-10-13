@@ -276,7 +276,7 @@ call :run_exact_library "solstone-core-indexer-store" "db::derived_recovery_test
 call :run_exact_library "solstone-core-indexer-store" "db::derived_recovery_tests::missing_memberships_invalidates_only_classification_and_preserves_search" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-indexer-store" "classification_batch::tests::classification_batch_missing_facet_memberships_restarts_without_losing_search" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-indexer-store" "chunk_sources::tests::apply_path_lookup_rollback_on_failure" "full-tests" || exit /b 1
-call :run_exact_library "solstone-core-indexer-query" "execute_tests::repaired_memberships_deny_partial_rows_then_restore_only_authorized_results" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-indexer-query" "execute_tests::repaired_memberships_deny_partial_rows_then_restore_only_authorized_results" "" || exit /b 1
 call :run_exact_library "solstone-core-talent-runtime" "facet_newsletter::packet::tests::packet_is_independent_of_index_presence_and_contents" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-indexer-store" "writer_admission::tests::full_process_tests::two_writers_exclude_each_other_before_source_and_cursor_reads" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-indexer-store" "writer_admission::tests::full_process_tests::process_death_releases_the_lease_and_reacquire_keeps_the_sidecar" "full-tests" || exit /b 1

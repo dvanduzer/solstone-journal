@@ -1390,7 +1390,7 @@ mod tests {
     }
     #[cfg(any(unix, windows))]
     fn services<'a>(
-        runner: &'a Script,
+        runner: &'a dyn ToolRunner,
         http: &'a Http,
         clock: &'a TestClock,
         maintenance: &'a Maintenance,
