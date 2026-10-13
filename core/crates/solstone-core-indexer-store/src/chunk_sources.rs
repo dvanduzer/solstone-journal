@@ -629,7 +629,11 @@ mod tests {
         );
         conn.execute("DROP TRIGGER corrupt_seed", []).unwrap();
         drop(conn);
-        assert!(apply_path_lookup(&root).unwrap().ready);
+        let admission = IndexAdmission::acquire(&root, "retry-probe").unwrap();
+        let reopened = crate::db::open_index_admitted(&root, &admission).unwrap();
+        assert!(chunk_path_lookup_ready(&reopened).unwrap());
+        drop(reopened);
+        drop(admission);
         let conn = Connection::open(db_path(&root)).unwrap();
         assert_eq!(
             conn.query_row(VALIDATE_CHUNK_SOURCES_CORRESPONDENCE, [], |r| r

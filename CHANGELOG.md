@@ -18,6 +18,11 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- when a saved agent note temporarily can't be read, your journal now keeps its search entry for a later retry. an agent still can't read the note until the original can be checked.
+- a missing part of the search index could stop all search updates. your journal now rebuilds that part automatically, keeping the text already indexed. agents limited to a facet may see fewer results while it catches up.
+- facet newsletters now read their evidence directly from your journal, so a missing or incomplete search index no longer changes what they receive. they keep the existing attached people and things and the day's detections, but no longer add a second selection from search.
+- when a recording can't be transcribed because its original audio is damaged, doctor no longer suggests a retry command that wouldn't run. the warning remains.
+
 - fixed a problem that made saved agent notes unreadable after restoring or copying your journal.
 
 - a failed backup attempt no longer replaces the record of your last successful backup. the backup page shows both, including when a stored copy was incomplete.

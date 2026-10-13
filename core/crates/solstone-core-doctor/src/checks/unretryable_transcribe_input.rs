@@ -214,12 +214,7 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
                 formatted_ids
             );
             let detail = truncate(&detail_raw, 400);
-            Ok(make_result(
-                check,
-                Status::Warn,
-                detail,
-                Some("solstone journal transcribe --redo"),
-            ))
+            Ok(make_result(check, Status::Warn, detail, None::<String>))
         }
         UnretryableScan::CannotDetermine(reason) => Ok(make_result(
             check,

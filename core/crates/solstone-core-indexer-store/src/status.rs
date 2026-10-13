@@ -631,10 +631,10 @@ mod tests {
         let journal = Journal::new("stopped");
         journal.write("chronicle/20260717/talents/flow.md", "# Flow\n\none");
         scan_journal(&journal.0, true).expect("scan");
-        // Every write refuses once classification memberships are gone.
+        // A storage failure during repair stops the scan and leaves a receipt.
         Connection::open(db_path(&journal.0))
             .expect("open")
-            .execute_batch("DROP TABLE chunk_classification_facets;")
+            .execute_batch("DROP TABLE chunk_classification_facets; CREATE TRIGGER refuse_repair BEFORE DELETE ON chunk_classification BEGIN SELECT RAISE(ABORT,'injected membership repair failure'); END;")
             .expect("drop memberships");
         assert!(scan_journal(&journal.0, false).is_err());
         let status = inspect_index(&journal.0).expect("status");
@@ -642,7 +642,7 @@ mod tests {
         assert!(!scan.full);
         assert!(
             scan.error
-                .is_some_and(|error| error.contains("memberships"))
+                .is_some_and(|error| error.contains("membership repair failure"))
         );
     }
 

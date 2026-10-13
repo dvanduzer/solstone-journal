@@ -412,11 +412,7 @@ pub fn inspect_classifications(journal: &Path) -> Result<ClassificationStatus, S
             missing,
             unclassified,
             coverage_mismatch,
-            repair: Some(if memberships_missing {
-                "solstone-core indexer --reset --rescan-full".to_owned()
-            } else {
-                "solstone-core indexer classifications --apply".to_owned()
-            }),
+            repair: Some("solstone-core indexer classifications --apply".to_owned()),
             committed: false,
             stalled_error: None,
         });
@@ -463,7 +459,7 @@ pub(crate) fn classify_one_batch(
 ) -> Result<ClassificationStatus, StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_chunk_path_lookup(&tx)?;
-    crate::db::require_classification_facets(&tx)?;
+    crate::db::repair_missing_classification_facets(&tx)?;
 
     let has_classification = sqlite_table_exists(&tx, "chunk_classification")?;
     let has_facets = sqlite_table_exists(&tx, "chunk_classification_facets")?;
@@ -880,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn classification_batch_missing_facet_memberships_preserves_progress_and_refuses_recreation() {
+    fn classification_batch_missing_facet_memberships_restarts_without_losing_search() {
         for complete in [false, true] {
             let root = temp_root("missing-facet-memberships");
             fs::create_dir_all(root.join("facets/Public/news")).unwrap();
@@ -930,40 +926,34 @@ mod tests {
             assert!(observed.coverage_mismatch);
             assert_eq!(
                 observed.repair.as_deref(),
-                Some("solstone-core indexer --reset --rescan-full")
+                Some("solstone-core indexer classifications --apply")
             );
             assert!(
                 observed
                     .format_human()
-                    .contains("run 'solstone-core indexer --reset --rescan-full'")
+                    .contains("run 'solstone-core indexer classifications --apply'")
             );
             assert_eq!(fs::read(db_path(&root)).unwrap(), before);
-            let error = apply_classification_batch(&root).unwrap_err();
-            assert!(error.to_string().contains("facet memberships are missing"));
-            let error = crate::db::open_index(&root).unwrap_err();
-            assert!(error.to_string().contains("facet memberships are missing"));
-            let conn =
-                Connection::open_with_flags(db_path(&root), OpenFlags::SQLITE_OPEN_READ_ONLY)
-                    .unwrap();
-            assert!(!sqlite_table_exists(&conn, "chunk_classification_facets").unwrap());
-            let retained: (String, bool) = conn
-                .query_row(
-                    "SELECT cursor, completed FROM chunk_classification_backfill WHERE id=1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
+            // The ordinary scan repairs a derived side table without resetting
+            // searchable chunks or trusting the old completed cursor.
+            let before_rows: i64 = Connection::open(db_path(&root))
+                .unwrap()
+                .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(retained.0, saved.cursor);
-            assert_eq!(retained.1, saved.completed);
-            let rows: i64 = conn
-                .query_row("SELECT COUNT(*) FROM chunk_classification", [], |r| {
-                    r.get(0)
-                })
+            if complete {
+                let first = apply_classification_batch(&root).unwrap();
+                assert_eq!(first.processed, STEP);
+                assert!(!first.completed);
+                assert_eq!(first.remaining, 8);
+                drain_classifications(&root).unwrap();
+            } else {
+                crate::scan::scan_journal(&root, false).unwrap();
+            }
+            let after_rows: i64 = Connection::open(db_path(&root))
+                .unwrap()
+                .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(rows, memberships);
-            drop(conn);
-            crate::db::reset_index(&root).unwrap();
-            crate::scan::scan_journal(&root, true).unwrap();
+            assert!(after_rows >= before_rows);
             let restored = inspect_classifications(&root).unwrap();
             assert_eq!(restored.initialization, ClassificationInitialization::Ready);
             assert!(!restored.coverage_mismatch);

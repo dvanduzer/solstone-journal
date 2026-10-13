@@ -2714,7 +2714,7 @@ fn unretryable_transcribe_input_reports_healthy_zero_on_clean_journal() {
 }
 
 #[test]
-fn unretryable_transcribe_input_reports_warn_with_ids_and_fix_on_corrupt_input() {
+fn unretryable_transcribe_input_reports_warn_without_retry_on_corrupt_input() {
     let c = fixture();
     let segment_dir = c.journal_path.join("chronicle/20260101/120000_60");
     fs::create_dir_all(&segment_dir).unwrap();
@@ -2743,10 +2743,7 @@ fn unretryable_transcribe_input_reports_warn_with_ids_and_fix_on_corrupt_input()
         row.detail,
         "1 recordings the journal will not retry on its own (handler: transcribe, reason_code: corrupt_input): 20260101/_default/120000_60"
     );
-    assert_eq!(
-        row.fix,
-        Some("solstone journal transcribe --redo".to_owned())
-    );
+    assert!(row.fix.is_none());
 }
 
 #[test]

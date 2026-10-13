@@ -41,11 +41,14 @@ pub enum StoreError {
     OutsideJournal(PathBuf),
     NonUtf8Path(PathBuf),
     MissingFile(PathBuf),
+    MemoryOriginalUnavailable {
+        path: PathBuf,
+        detail: String,
+    },
     EdgeRebuildFailed(scan::EdgeRebuildReport),
     PathLookupRequired {
         cause: Option<String>,
     },
-    ClassificationFacetsMissing,
     WriterBusy {
         operation: &'static str,
         cause: String,
@@ -82,13 +85,14 @@ impl fmt::Display for StoreError {
             StoreError::MissingFile(path) => {
                 write!(formatter, "file not found: {}", path.display())
             }
+            StoreError::MemoryOriginalUnavailable { path, detail } => write!(
+                formatter,
+                "memory original could not be checked at {}; cached index retained; retry when the source is readable: {detail}",
+                path.display()
+            ),
             StoreError::EdgeRebuildFailed(report) => {
                 write!(formatter, "edge rebuild failed: {report:?}")
             }
-            StoreError::ClassificationFacetsMissing => write!(
-                formatter,
-                "search classification facet memberships are missing; run 'solstone-core indexer --reset --rescan-full'"
-            ),
             StoreError::PathLookupRequired { cause: None } => {
                 write!(formatter, "indexer path-lookup --apply")
             }

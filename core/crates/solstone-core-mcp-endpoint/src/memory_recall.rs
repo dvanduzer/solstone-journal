@@ -1460,6 +1460,49 @@ mod tests {
             .unwrap();
         scan_journal(&journal, false).unwrap();
         assert_eq!(recall_now().notes.len(), 1);
+        #[cfg(feature = "test-hooks")]
+        for bulk in [false, true] {
+            let snapshot = || {
+                let conn =
+                    Connection::open(solstone_core_indexer_store::db::db_path(&journal)).unwrap();
+                conn.query_row("SELECT memory_originals.*, files.mtime FROM memory_originals JOIN files USING(path)", [], |r| (0..r.as_ref().column_count()).map(|i| r.get(i)).collect::<Result<Vec<rusqlite::types::Value>, _>>()).unwrap()
+            };
+            let swap_on_read = |suffix: &str| {
+                let from = segment.clone();
+                let moved = outer.path().join(format!("moved-{bulk}-{suffix}"));
+                solstone_core_journal_io::read_test_hook::after_open(
+                    segment.join("ready.json"),
+                    move || {
+                        fs::rename(&from, &moved).unwrap();
+                        fs::create_dir(&from).unwrap();
+                        for name in ["note.txt", "origin.json", "ready.json", "stream.json"] {
+                            fs::copy(moved.join(name), from.join(name)).unwrap();
+                        }
+                    },
+                );
+            };
+            let before = snapshot();
+            swap_on_read("scan");
+            if bulk {
+                assert!(scan_journal(&journal, false).unwrap().failed > 0);
+            } else {
+                assert!(rescan_file(&journal, &note).is_err());
+            }
+            assert_eq!(
+                snapshot(),
+                before,
+                "inconclusive live binding must preserve exact cache"
+            );
+            swap_on_read("recall");
+            let raced = recall_now();
+            assert!(!raced.complete);
+            assert!(
+                raced.notes.is_empty(),
+                "retained bytes must not bypass live validation"
+            );
+            rescan_file(&journal, &note).unwrap();
+            assert_eq!(recall_now().notes[0].bytes, b"needle exact original");
+        }
         let ready = fs::read(segment.join("ready.json")).unwrap();
         fs::remove_file(segment.join("ready.json")).unwrap();
         scan_journal(&journal, false).unwrap();

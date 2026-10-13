@@ -2939,3 +2939,107 @@ fn retained_owner_search_observes_commits_and_releases_wal_snapshots() {
     drop(writer);
     fs::remove_dir_all(root).expect("remove fixture");
 }
+
+#[test]
+fn repaired_memberships_deny_partial_rows_then_restore_only_authorized_results() {
+    use solstone_core_indexer_store::{
+        chunk_sources::apply_path_lookup,
+        classification_batch::{apply_classification_batch, drain_classifications},
+    };
+    let (root, conn) = seeded_root("membership-repair-boundary");
+    let a = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let b = "b1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    for (name, id) in [("A", a), ("B", b)] {
+        fs::create_dir_all(root.join(format!("facets/{name}"))).unwrap();
+        fs::write(
+            root.join(format!("facets/{name}/facet.json")),
+            format!(r#"{{"id":"{id}"}}"#),
+        )
+        .unwrap();
+    }
+    for i in 0..140 {
+        let path = format!("facets/A/news/{i:03}.md");
+        insert(
+            &conn,
+            if i == 139 {
+                "repairmarker lateauthorized"
+            } else {
+                "repairmarker"
+            },
+            &path,
+            "20260107",
+            "a",
+            "news",
+            "",
+            0,
+        );
+        seed_classification(&conn, &path, "facets", "facet_owned", &[a]);
+    }
+    insert(
+        &conn,
+        "repairmarker foreign",
+        "facets/B/news/one.md",
+        "20260107",
+        "b",
+        "news",
+        "",
+        0,
+    );
+    seed_classification(&conn, "facets/B/news/one.md", "facets", "facet_owned", &[b]);
+    finish_classification(&conn);
+    drop(conn);
+    apply_path_lookup(&root).unwrap();
+    let conn = Connection::open(db_path(&root)).unwrap();
+    conn.execute_batch("DROP TABLE chunk_classification_facets")
+        .unwrap();
+    drop(conn);
+    drop(open_index(&root).unwrap());
+    let chosen = connection_boundary(
+        &["Facets"],
+        ConnectionScope::ChosenFacets {
+            ids: [a.to_string()].into_iter().collect(),
+        },
+    );
+    assert!(
+        !owner_search(
+            &root,
+            OwnerBoundary,
+            &request("repairmarker"),
+            reference_date()
+        )
+        .unwrap()
+        .results
+        .is_empty()
+    );
+    assert!(
+        connection_search(&root, &chosen, "repairmarker")
+            .results
+            .is_empty()
+    );
+    let partial = apply_classification_batch(&root).unwrap();
+    assert!(!partial.completed);
+    assert!(partial.remaining > 0);
+    let partial_results = connection_search(&root, &chosen, "repairmarker").results;
+    assert!(partial_results.iter().all(|r| !r.text.contains("foreign")));
+    assert!(
+        connection_search(&root, &chosen, "foreign")
+            .results
+            .is_empty()
+    );
+    assert!(
+        connection_search(&root, &chosen, "lateauthorized")
+            .results
+            .is_empty()
+    );
+    drain_classifications(&root).unwrap();
+    assert_eq!(
+        connection_search(&root, &chosen, "lateauthorized")
+            .results
+            .len(),
+        1
+    );
+    let final_results = connection_search(&root, &chosen, "repairmarker").results;
+    assert!(!final_results.is_empty());
+    assert!(final_results.iter().all(|r| !r.text.contains("foreign")));
+    fs::remove_dir_all(root).unwrap();
+}

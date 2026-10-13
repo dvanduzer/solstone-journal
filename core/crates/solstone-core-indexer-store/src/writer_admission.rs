@@ -370,6 +370,49 @@ pub(crate) mod tests {
             )
         }
 
+        #[test]
+        fn unavailable_memory_retains_cache_until_source_can_be_checked() {
+            for bulk in [false, true] {
+                let root = temp_root("memory-read-unavailable");
+                let (note, _) = seed_memory_original(&root);
+                crate::scan::scan_journal(&root, false).unwrap();
+                let count = || {
+                    let conn = rusqlite::Connection::open(crate::db::db_path(&root)).unwrap();
+                    conn.query_row("SELECT count(*) FROM memory_originals", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap()
+                };
+                let snapshot = || {
+                    let conn = rusqlite::Connection::open(crate::db::db_path(&root)).unwrap();
+                    conn.query_row("SELECT memory_originals.*, files.mtime FROM memory_originals JOIN files USING(path)", [], |r| (0..r.as_ref().column_count()).map(|i| r.get(i)).collect::<Result<Vec<rusqlite::types::Value>, _>>()).unwrap()
+                };
+                assert_eq!(count(), 1);
+                let before = snapshot();
+                let marker = note.parent().unwrap().join("ready.json");
+                let bytes = fs::read(&marker).unwrap();
+                fs::remove_file(&marker).unwrap();
+                fs::create_dir(&marker).unwrap();
+                if bulk {
+                    let report = crate::scan::scan_journal(&root, false).unwrap();
+                    assert!(report.failed > 0);
+                } else {
+                    assert!(crate::scan::rescan_file(&root, &note).is_err());
+                }
+                assert_eq!(count(), 1, "an unreadable source is not proof of deletion");
+                assert_eq!(snapshot(), before);
+                fs::remove_dir(&marker).unwrap();
+                fs::write(&marker, &bytes).unwrap();
+                crate::scan::scan_journal(&root, false).unwrap();
+                assert_eq!(count(), 1);
+                // A positively observed non-ready original still invalidates.
+                fs::remove_file(&marker).unwrap();
+                crate::scan::scan_journal(&root, false).unwrap();
+                assert_eq!(count(), 0);
+                fs::remove_dir_all(&root).unwrap();
+            }
+        }
+
         fn seed_memory_original(root: &Path) -> (PathBuf, String) {
             use solstone_core_format::agent_memory::{
                 Coordinate, OperationRecord, SourceKey, digest, ready_document,

@@ -9,13 +9,11 @@ use std::path::Path;
 
 use chrono::NaiveDate;
 use serde_json::{Map, Value, json};
-use solstone_core_indexer_query::{Order, OwnerBoundary, SearchRequest, search};
 
 const MAX_ACTIVITY_RECORDS: usize = 12;
 const MAX_NARRATIVES_PER_ACTIVITY: usize = 4;
 const MAX_ATTACHED_ENTITY_RECORDS: usize = 12;
 const MAX_DETECTED_ENTITY_RECORDS: usize = 12;
-const MAX_ENTITY_RESULTS: usize = 12;
 const MAX_TITLE_CHARS: usize = 220;
 const MAX_DESCRIPTION_CHARS: usize = 700;
 const MAX_DETAILS_CHARS: usize = 1200;
@@ -59,15 +57,6 @@ struct ItemSpec {
     path: Option<String>,
     result_id: Option<String>,
 }
-struct IndexItemSpec<'a> {
-    id: &'a str,
-    text: &'a str,
-    path: &'a str,
-    agent: &'a str,
-    tier: u8,
-    limit: usize,
-}
-
 macro_rules! gather_item {
     ($source_class:expr, $source_label:expr, $agent:expr, $origin:expr, $tier:expr, $text:expr, $clipped:expr, $order:expr, $path:expr, $result_id:expr $(,)?) => {
         gather_item(ItemSpec {
@@ -107,7 +96,6 @@ pub(super) fn gather(journal: &Path, facet: &str, day: &str) -> Result<Packet, S
     items.extend(load_facet_metadata(journal, facet, &mut gaps));
     items.extend(load_facet_entity_context(journal, facet, day, &mut gaps));
     items.extend(load_prior_newsletter(journal, facet, day, &mut gaps));
-    items.extend(search_facet_entities(journal, facet, day, &mut gaps));
     let (included, dropped) = gather_budgeted_items(items.clone());
     gaps.extend(dropped);
     let mut counts = gather_source_counts(&included);
@@ -370,7 +358,7 @@ fn load_facet_entity_context(
 ) -> Vec<Item> {
     let mut result = Vec::new();
     let attached = match solstone_core_facets::list_scoped_facet_entities(journal, facet, false, false) {
-        Ok(items) => items.into_iter().map(|item| json!({"id":item.entity_id,"name":item.identity.get("name").cloned().unwrap_or(Value::Null),"type":item.identity.get("type").cloned().unwrap_or(Value::Null),"description":item.relationship.get("description").cloned().unwrap_or(Value::Null)})).collect(),
+        Ok(items) => items.into_iter().map(|item| json!({"id":item.entity_id,"name":item.identity.get("name").cloned().unwrap_or(Value::Null),"type":item.identity.get("type").cloned().unwrap_or(Value::Null),"description":item.relationship.get("description").cloned().unwrap_or(Value::Null),"aka":item.identity.get("aka").cloned().unwrap_or(Value::Null),"tags":item.relationship.get("tags").cloned().unwrap_or(Value::Null)})).collect(),
         Err(error) => { gaps.push(format!("failed: facet_entities:attached failed for {facet}: {error}")); Vec::new() }
     };
     result.extend(entity_items(
@@ -444,86 +432,6 @@ fn entity_items(
         })
         .collect()
 }
-fn search_facet_entities(
-    journal: &Path,
-    facet: &str,
-    day: &str,
-    gaps: &mut Vec<String>,
-) -> Vec<Item> {
-    let mut request = SearchRequest::new("", Order::Relevance);
-    request.limit = MAX_ENTITY_RESULTS;
-    request.day = Some(day.to_owned());
-    request.facet = Some(facet.to_owned());
-    request.agent = Some("entity".to_owned());
-    match search(
-        journal,
-        OwnerBoundary,
-        &request,
-        NaiveDate::parse_from_str(day, "%Y%m%d").expect("validated day"),
-    ) {
-        Ok(response) if !response.results.is_empty() => response
-            .results
-            .iter()
-            .enumerate()
-            .map(|(i, hit)| {
-                gather_index_item(
-                    IndexItemSpec {
-                        id: &hit.id,
-                        text: &hit.text,
-                        path: &hit.metadata.path,
-                        agent: "entity",
-                        tier: 3,
-                        limit: MAX_ENTITY_TEXT_CHARS,
-                    },
-                    gaps,
-                    vec!["2".to_owned(), "2".to_owned(), format!("{i:04}")],
-                    Some("facet_entities:indexed".to_owned()),
-                )
-            })
-            .collect(),
-        Ok(_) => {
-            gaps.push(format!(
-                "missing: facet_entities:indexed absent for {facet} {day}"
-            ));
-            Vec::new()
-        }
-        Err(error) => {
-            gaps.push(format!(
-                "failed: facet_entities:indexed failed for {facet} {day}: {error}"
-            ));
-            Vec::new()
-        }
-    }
-}
-fn gather_index_item(
-    spec: IndexItemSpec<'_>,
-    gaps: &mut Vec<String>,
-    order: Vec<String>,
-    label: Option<String>,
-) -> Item {
-    let origin = format!("{} ({}; agent={})", spec.id, spec.path, spec.agent);
-    let (text, clipped) = render_clipped_text(
-        spec.text.trim(),
-        spec.limit,
-        gaps,
-        "index_result",
-        &origin,
-        "text",
-        Some(spec.agent),
-    );
-    gather_item!(
-        "index_result",
-        label,
-        Some(spec.agent.to_owned()),
-        origin,
-        spec.tier,
-        text,
-        clipped,
-        order,
-        Some(spec.path.to_owned()),
-        Some(spec.id.to_owned()),
-    )
-}
 fn gather_item(spec: ItemSpec) -> Item {
     Item {
         source_class: spec.source_class,
@@ -571,7 +479,6 @@ fn gather_source_counts(items: &[Item]) -> BTreeMap<String, usize> {
         "facet_metadata",
         "facet_entities:attached",
         "facet_entities:detected",
-        "facet_entities:indexed",
     ] {
         counts.insert(key.to_owned(), 0);
     }
@@ -727,8 +634,6 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 fn render_source_label(item: &Item) -> String {
     item.source_label.clone().unwrap_or_else(|| {
         match (item.source_class.as_str(), item.agent.as_deref()) {
-            ("index_result", Some(agent)) => format!("index_result:{agent}"),
-            ("facet_entities", Some("entity")) => "facet_entities:indexed".to_owned(),
             ("facet_entities", Some(agent)) => format!("facet_entities:{agent}"),
             _ => item.source_class.clone(),
         }
@@ -760,6 +665,7 @@ fn render_entity_text(
         "name",
         "description",
         "aka",
+        "tags",
         "relationship",
         "attached_at",
         "updated_at",
@@ -869,6 +775,101 @@ fn render_coverage_preamble(counts: &BTreeMap<String, usize>, gaps: &[String]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packet_is_independent_of_index_presence_and_contents() {
+        let root = tempfile::tempdir().unwrap();
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        for (path, value) in [
+            (
+                "entities/alice/entity.json",
+                json!({"id":"alice","name":"Alice","type":"Person","aka":["AliasUnique"]}),
+            ),
+            (
+                "facets/work/entities/alice/entity.json",
+                json!({"entity_id":"alice","description":"Direct relationship","tags":["colleague"]}),
+            ),
+            (
+                "facets/work/entities/blocked/entity.json",
+                json!({"entity_id":"blocked","description":"Forbidden relationship"}),
+            ),
+            (
+                "entities/blocked/entity.json",
+                json!({"id":"blocked","name":"Blocked","blocked":true}),
+            ),
+        ] {
+            let path = root.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let narrative = root
+            .path()
+            .join("facets/work/activities/20260103/a/story.md");
+        fs::create_dir_all(narrative.parent().unwrap()).unwrap();
+        fs::write(narrative, "A real activity happened today.").unwrap();
+        let absent = gather(root.path(), "work", "20260103").unwrap();
+        assert!(absent.substantive_items > 0);
+        for expected in [
+            "Alice",
+            "AliasUnique",
+            "Direct relationship",
+            "colleague",
+            "A real activity",
+        ] {
+            assert!(
+                absent.source_packet.contains(expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!absent.source_packet.contains("Forbidden relationship"));
+        std::fs::create_dir_all(root.path().join("indexer")).unwrap();
+        std::fs::write(root.path().join("indexer/journal.sqlite"), "not a database").unwrap();
+        let unreadable = gather(root.path(), "work", "20260103").unwrap();
+        assert_eq!(
+            absent, unreadable,
+            "index state cannot change a permanent writer's input"
+        );
+        fs::remove_file(root.path().join("indexer/journal.sqlite")).unwrap();
+        let conn = solstone_core_indexer_store::db::open_index(root.path()).unwrap();
+        conn.execute_batch("INSERT INTO index_build_state VALUES(1,1,'complete',0,0);")
+            .unwrap();
+        assert_eq!(absent, gather(root.path(), "work", "20260103").unwrap());
+        conn.execute("INSERT INTO chunks(content,path,day,facet,agent,stream,idx,time_bucket) VALUES('STALE_INDEX_ONLY','entity_search:missing','20260103','work','entity','',0,'')", []).unwrap();
+        let mut probe = solstone_core_indexer_query::SearchRequest::new(
+            "",
+            solstone_core_indexer_query::Order::Relevance,
+        );
+        probe.day = Some("20260103".into());
+        probe.facet = Some("work".into());
+        probe.agent = Some("entity".into());
+        let indexed = solstone_core_indexer_query::search(
+            root.path(),
+            solstone_core_indexer_query::OwnerBoundary,
+            &probe,
+            NaiveDate::from_ymd_opt(2026, 1, 3).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            indexed.results.len(),
+            1,
+            "stale fixture must be query-eligible"
+        );
+        assert_eq!(indexed.results[0].text, "STALE_INDEX_ONLY");
+        assert_eq!(absent, gather(root.path(), "work", "20260103").unwrap());
+        drop(conn);
+        let narrative = root
+            .path()
+            .join("facets/work/activities/20260103/a/story.md");
+        fs::remove_file(&narrative).unwrap();
+        fs::create_dir(&narrative).unwrap();
+        let failed_source = gather(root.path(), "work", "20260103").unwrap();
+        assert!(
+            failed_source
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("failed: activity_narrative"))
+        );
+    }
+
     #[test]
     fn clips_and_drops_over_budget() {
         // Derived from solstone/talent/facet_newsletter.py:595-606,741-759.

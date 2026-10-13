@@ -533,6 +533,15 @@ fn scan_journal_pass(
         let memory_original = if family == Family::AgentMemory {
             match read_memory_original(journal, rel) {
                 Ok(original) => Some(original),
+                Err(result @ OriginalRead::Unavailable { .. }) => {
+                    report.skipped += 1;
+                    report.fail(Some(rel), Some(*mtime));
+                    report.warnings.push(format!(
+                        "memory original could not be checked for {rel}; cached index retained: {}",
+                        original_read_label(&result)
+                    ));
+                    continue;
+                }
                 Err(result) => {
                     let has_memory_row = memory_original_exists(&conn, rel)?;
                     debug_assert_eq!(
@@ -550,10 +559,7 @@ fn scan_journal_pass(
                         tx.execute("DELETE FROM files WHERE path=?", [rel])?;
                     tx.commit()?;
                     report.skipped += 1;
-                    if matches!(
-                        result,
-                        OriginalRead::Corrupt | OriginalRead::Unavailable { .. }
-                    ) {
+                    if matches!(result, OriginalRead::Corrupt) {
                         report.fail(Some(rel), Some(*mtime));
                         report.warnings.push(format!(
                             "memory original is incomplete for {rel}: {}",
@@ -830,6 +836,9 @@ pub(crate) fn rescan_file_admitted(
     require_chunk_path_lookup(&conn)?;
     let memory_original = match memory_original_res {
         Some(Ok(original)) => Some(original),
+        Some(Err(OriginalRead::Unavailable { detail })) => {
+            return Err(StoreError::MemoryOriginalUnavailable { path, detail });
+        }
         Some(Err(_)) => {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             delete_file_chunks(&tx, &rel, None)?;

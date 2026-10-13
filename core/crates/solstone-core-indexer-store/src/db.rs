@@ -436,7 +436,7 @@ pub(crate) fn prune_authored_chat_paths_admitted(
 
 fn ensure_schema(conn: &mut Connection) -> Result<(), StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_classification_facets(&tx)?;
+    repair_missing_classification_facets(&tx)?;
     let chunks_existed = sqlite_table_exists(&tx, "chunks")?;
     let rebuilt = migrate_legacy_chunks(&tx)?;
     create_schema(&tx)?;
@@ -455,7 +455,7 @@ fn ensure_schema(conn: &mut Connection) -> Result<(), StoreError> {
 }
 
 // Existing classifications cannot recover their lost memberships by creating
-// an empty table. A normal schema open must preserve this incomplete state.
+// an empty table. Rebuild the projection rather than trusting those classifications.
 pub(crate) fn classification_facets_missing(conn: &Connection) -> Result<bool, StoreError> {
     if !sqlite_table_exists(conn, "chunk_classification")?
         || sqlite_table_exists(conn, "chunk_classification_facets")?
@@ -469,9 +469,16 @@ pub(crate) fn classification_facets_missing(conn: &Connection) -> Result<bool, S
     )?)
 }
 
-pub(crate) fn require_classification_facets(conn: &Connection) -> Result<(), StoreError> {
+/// Discard only a broken derived classification projection. Call under the
+/// caller's transaction, so readers see either the old state or an explicitly
+/// incomplete projection that the ordinary bounded backfill can repopulate.
+pub(crate) fn repair_missing_classification_facets(conn: &Connection) -> Result<(), StoreError> {
     if classification_facets_missing(conn)? {
-        return Err(StoreError::ClassificationFacetsMissing);
+        conn.execute("DELETE FROM chunk_classification", [])?;
+        if sqlite_table_exists(conn, "chunk_classification_backfill")? {
+            conn.execute("DELETE FROM chunk_classification_backfill", [])?;
+        }
+        log::warn!(target: "solstone::indexer", "rebuilding classification after missing facet memberships");
     }
     Ok(())
 }
@@ -1952,5 +1959,76 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
         assert_eq!(schema_before, schema_after);
         drop(reader);
         fs::remove_dir_all(&existing).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod derived_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn failed_membership_repair_rolls_back_classification_and_cursor() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&mut conn).unwrap();
+        conn.execute_batch("INSERT INTO chunk_classification VALUES ('p','facets','facet_owned',1,0);
+            INSERT INTO chunk_classification_backfill VALUES(1,'z',1,0,NULL,2);
+            DROP TABLE chunk_classification_facets;
+            CREATE TRIGGER refuse_cursor_reset BEFORE DELETE ON chunk_classification_backfill BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(ensure_schema(&mut conn).is_err());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM chunk_classification", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT cursor FROM chunk_classification_backfill",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "z"
+        );
+        assert!(!sqlite_table_exists(&conn, "chunk_classification_facets").unwrap());
+        conn.execute_batch("DROP TRIGGER refuse_cursor_reset")
+            .unwrap();
+        ensure_schema(&mut conn).unwrap();
+        assert!(read_chunk_classification_backfill(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_memberships_invalidates_only_classification_and_preserves_search() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&mut conn).unwrap();
+        conn.execute_batch("INSERT INTO chunks(rowid,content,path) VALUES (41,'preserved','facets/work/news/20260101.md');
+            INSERT INTO files VALUES ('facets/work/news/20260101.md', 12);
+            INSERT INTO chunk_classification VALUES ('facets/work/news/20260101.md','facets','facet_owned',1,0);
+            INSERT INTO chunk_classification_backfill VALUES(1,'z',1,0,NULL,2);
+            DROP TABLE chunk_classification_facets;").unwrap();
+        ensure_schema(&mut conn).expect("derived memberships recover on ordinary open");
+        assert_eq!(
+            conn.query_row(
+                "SELECT rowid FROM chunks WHERE chunks MATCH 'preserved'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            41
+        );
+        assert_eq!(
+            conn.query_row("SELECT mtime FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM chunk_classification", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(read_chunk_classification_backfill(&conn).unwrap().is_none());
+        assert!(sqlite_table_exists(&conn, "chunk_classification_facets").unwrap());
+        ensure_schema(&mut conn).unwrap();
     }
 }
