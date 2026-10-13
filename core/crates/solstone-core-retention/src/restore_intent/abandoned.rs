@@ -348,8 +348,9 @@ mod local {
             && receipt.original_name == OriginalName::Absent
             && receipt.claim_confirmation == Confirmation::Confirmed
             && receipt.cleanup == Cleanup::Complete
-            && receipt.source_durability == Durability::Synced
-            && receipt.claim_durability == Durability::Synced
+            && (cfg!(windows)
+                || (receipt.source_durability == Durability::Synced
+                    && receipt.claim_durability == Durability::Synced))
             && !receipt
                 .failures
                 .iter()
@@ -412,3 +413,13 @@ mod local {
     reason = "native fixture assertions"
 )]
 mod tests;
+
+#[cfg(all(test, feature = "full-tests", windows))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::disallowed_methods,
+    reason = "native fixture assertions"
+)]
+mod windows_tests;

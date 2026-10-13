@@ -452,6 +452,15 @@ pub(super) fn check_leaf(
     name: &OsStr,
     expected: MediaIdentity,
 ) -> io::Result<()> {
+    check_entry(directory, name, expected, false)
+}
+
+fn check_entry(
+    directory: &Directory,
+    name: &OsStr,
+    expected: MediaIdentity,
+    is_directory: bool,
+) -> io::Result<()> {
     let file = nt_create_relative(
         directory.handle(),
         name,
@@ -459,7 +468,7 @@ pub(super) fn check_leaf(
         FILE_OPEN,
         OPTIONS,
     )?;
-    require_kind(file.as_raw_handle(), false)?;
+    require_kind(file.as_raw_handle(), is_directory)?;
     if witness(file_identity(file.as_raw_handle())?) != expected {
         return Err(changed());
     }
@@ -688,7 +697,7 @@ pub(super) fn remove_directory(
     name: &OsStr,
     directory: &Directory,
 ) -> io::Result<()> {
-    check_leaf(parent, name, directory.identity())?;
+    check_entry(parent, name, directory.identity(), true)?;
     step(MediaPrimitive::NativeDirectoryRemoveCut)?;
     mark_delete(directory.file())
 }

@@ -15,6 +15,51 @@ fn fixture() -> (tempfile::TempDir, Arc<ActivityLease>) {
     (temp, activity)
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn abandoned_stage_retirement_removes_only_empty_or_its_download() {
+    let (temp, activity) = fixture();
+    let parent = MediaDirectory::open(activity.journal_root().clone(), Path::new("")).unwrap();
+    for (suffix, leaf) in [
+        ("empty", None),
+        ("download", Some("download")),
+        ("other", Some("other")),
+    ] {
+        let name = format!(".tmp-offload-{suffix}");
+        let path = temp.path().join(&name);
+        fs::create_dir(&path).unwrap();
+        if let Some(leaf) = leaf {
+            fs::write(path.join(leaf), b"retained bytes").unwrap();
+        }
+        let identity = parent
+            .open_child(OsStr::new(&name))
+            .unwrap()
+            .unwrap()
+            .identity();
+        let result = retire_unrecorded_stage(
+            &activity,
+            &parent,
+            OsStr::new(&name),
+            identity,
+            OsStr::new("download"),
+        );
+        if leaf == Some("other") {
+            assert!(result.is_err());
+            assert_eq!(fs::read(path.join("other")).unwrap(), b"retained bytes");
+        } else {
+            assert!(result.unwrap());
+            assert!(!path.exists());
+        }
+    }
+    assert_eq!(
+        crate::activity_obligations::observe_obligations(activity.journal_root())
+            .unwrap()
+            .entries()
+            .len(),
+        1
+    );
+}
+
 fn teardown_fixture() -> (tempfile::TempDir, Arc<TeardownLease>) {
     let temp = match std::env::var_os("SOLSTONE_MEDIA_TEST_ROOT") {
         Some(root) => tempfile::tempdir_in(root).unwrap(),
