@@ -15,6 +15,7 @@ import tarfile
 import time
 import wave
 import zipfile
+from urllib.parse import quote
 from provenance import source_manifest
 import qualify_serving as serving
 
@@ -44,6 +45,7 @@ class AudioQualification(serving.Qualification):
         self.sequence = int(time.time())%2400
         self.model_held = False
         self.denied = []
+        self.search_probe = None
         with wave.open(str(self.fixture('speech.wav'))) as f:
             self.speech_duration = f.getnframes() / f.getframerate()
         self.expected_words = 'the quick brown fox jumps over the lazy dog'.split()
@@ -109,9 +111,15 @@ class AudioQualification(serving.Qualification):
         start = time.monotonic()
         path = self.input_path(item) + '.jsonl'
         latencies = []
+        search_latencies = []
         while time.monotonic()-start < timeout:
             before = time.monotonic()
             self.network(method='GET', uri='/api/system/status')
+            if self.search_probe:
+                query_started = time.monotonic()
+                found = self.network(method='GET', uri=self.search_probe['uri'])
+                search_latencies.append(time.monotonic()-query_started)
+                assert found == self.search_probe['baseline'], (found, self.search_probe)
             latencies.append(time.monotonic()-before)
             raw = self.cat(path)
             if raw:
@@ -149,7 +157,8 @@ class AudioQualification(serving.Qualification):
                 item['retrieved'] = found
                 worker=self.control('status')
                 item.update(worker=worker, completion_seconds=time.monotonic()-start, rows=rows,
-                            heartbeat_seconds=latencies, transcript_sha256=hashlib.sha256(raw).hexdigest())
+                            heartbeat_seconds=latencies, search_seconds=search_latencies,
+                            transcript_sha256=hashlib.sha256(raw).hexdigest())
                 self.event('terminal', item=item)
                 return rows
             time.sleep(1)  # Test instrumentation observes response latency during inference.
@@ -194,6 +203,12 @@ class AudioQualification(serving.Qualification):
         self.owner('POST', '/init/finalize', {})
         pair = self.owner('POST', '/app/network/pair-start', {'device_label': self.marker, 'role': ''})
         self.network('pair', link=pair['pair_link'], label=self.marker)
+        if self.args.search_probe:
+            uri='/app/search/api/search?q='+quote(self.args.search_probe, safe='')
+            baseline=self.network(method='GET',uri=uri)
+            assert baseline['total'] > 0, baseline
+            self.search_probe=dict(uri=uri,baseline=baseline)
+            self.event('existing_search_probe',**self.search_probe)
         self.event('fixture_contract', expected_words=self.expected_words,
                    formats=['WAV PCM16 mono 16kHz', 'AAC in M4A stereo 44.1kHz'],
                    synthetic_source='core/fixtures/parakeet_sample.wav; documented purpose-recorded phrase',
@@ -382,6 +397,7 @@ def main():
     p.add_argument('--client',required=True);p.add_argument('--apk-sha256',required=True)
     p.add_argument('--fixtures',required=True);p.add_argument('--output',required=True)
     p.add_argument('--repeats',type=int,default=10)
+    p.add_argument('--search-probe',help='Existing indexed text to verify during native inference')
     args=p.parse_args()
     if args.package!='app.solstone.development.journal.audio':p.error('separate audio development application required')
     q=AudioQualification(args)
