@@ -38,8 +38,9 @@ pub use record::{
     validate_refresh_probe_outcome,
 };
 pub use runtime_health::{
-    RuntimeRecordInspection, RuntimeRetryError, RuntimeRetryRecord, inspect_runtime_health,
-    inspect_runtime_retry_token, request_runtime_retry,
+    RuntimeRecordInspection, RuntimeRetryError, RuntimeRetryRecord, RuntimeRetryTransaction,
+    hold_runtime_operation, inspect_runtime_health, inspect_runtime_retry_token,
+    request_runtime_retry, runtime_retry_token_path,
 };
 pub use transcription_verification::{
     TranscriptionVerification, TranscriptionVerificationError, clear_transcription_verification,
