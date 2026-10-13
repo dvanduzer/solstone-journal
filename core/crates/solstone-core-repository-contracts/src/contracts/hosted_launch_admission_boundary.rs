@@ -449,6 +449,11 @@ const SCANNED_MODULE_SOURCES: &[(&str, &str, &str)] = &[
     ),
     (
         "convey",
+        "speakers_dismissals",
+        include_str!("../../../solstone-core-convey-shell/src/speakers_dismissals.rs"),
+    ),
+    (
+        "convey",
         "speakers_known",
         include_str!("../../../solstone-core-convey-shell/src/speakers_known.rs"),
     ),

@@ -38,8 +38,10 @@ mod tests {
             "day":"20261001", "band":"now", "reason":"spending_confirmation"
         }))
         .unwrap();
-        let mut inventory = WorkInventory::default();
-        inventory.holds = vec![hold.clone(); 1000];
+        let mut inventory = WorkInventory {
+            holds: vec![hold.clone(); 1000],
+            ..WorkInventory::default()
+        };
         for id in ["one", "two"] {
             let mut retry = hold.clone();
             retry.retry_unit = Some(id.into());
