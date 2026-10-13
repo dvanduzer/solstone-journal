@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- on windows, media offload runs again. you can approve its proposals from the home page and bring the media back from the backup page or with `solstone journal backup offload restore`, including media an earlier version offloaded.
+
 ## [2.0.44] - 2026-10-13
 
 ### Changed

@@ -593,6 +593,18 @@ fn windows_store_persists_intents_and_excludes_a_second_writer() {
     assert_eq!(store.preparation.durability, [Durability::Unproven; 4]);
     let mut intent = crate::test_restore_intent::fixture(true);
     intent.destination.root = activity.journal_root().identity().observation_id();
+    let identity = solstone_core_journal_io::media::MediaDirectory::open(
+        Arc::clone(activity.journal_root()),
+        std::path::Path::new(""),
+    )
+    .unwrap()
+    .identity();
+    // This storage-only fixture needs a consistent native identity envelope.
+    intent.destination.parent = identity;
+    intent.destination.segment = identity;
+    intent.stage.parent = identity;
+    intent.stage.directory = identity;
+    intent.stage.leaf = identity;
     let written = store.create_intent(intent.clone());
     assert!(
         written.receipt.fully_confirmed(),

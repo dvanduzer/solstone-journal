@@ -452,7 +452,7 @@ fn stop_and_drain(owner: &mut super::job_process::WindowsJobProcess, io: &mut He
     }
     io.drain_until(drain_deadline);
     io.observe();
-    owner.is_quiescent().unwrap_or(false)
+    owner.is_quiescent().unwrap_or(false) && io.settled()
 }
 
 /// Run one package-rooted helper under an atomic, bounded Windows Job scope.
@@ -718,7 +718,7 @@ pub fn run_bounded_helper(
             stderr_result.as_ref(),
             stdin_complete,
         ) {
-            if !owner.is_quiescent().unwrap_or(false) && !stop_and_drain(&mut owner, &mut io) {
+            if !stop_and_drain(&mut owner, &mut io) {
                 return Err(reservation.failure(
                     BoundedHelperError::JobNotQuiescent { identity },
                     owner,

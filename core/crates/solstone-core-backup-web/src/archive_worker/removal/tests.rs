@@ -728,7 +728,7 @@ fn approval_unknown_snapshot_keeps_actual_preparation_custody() {
         let (input, custody) = OwnedArchivePreparationInput::capture(root, budget, clock)
             .unwrap_or_else(|_| panic!("actual preparation capture"));
         let (result, consumed) = run_with_media_hook(
-            MediaPrimitive::CarrierRootSync,
+            MediaPrimitive::CarrierConfirmation,
             || panic!("actual preparation publication unwind"),
             || catch_unwind(AssertUnwindSafe(|| input.prepare())),
         );
@@ -1218,7 +1218,11 @@ fn policy_only_approval_settles_locally_and_frees_the_slot() {
     let observed = status(&deps.operations, started.generation()).unwrap();
     assert!(observed.worker_settled);
     assert_eq!(observed.state, ApprovalState::Completed);
-    assert_eq!(observed.actor_phase.as_deref(), Some("done"));
+    assert_eq!(
+        observed.actor_phase.as_deref(),
+        Some("done"),
+        "{observed:?}"
+    );
     let report = observed.report.as_ref().unwrap();
     assert_eq!(report["settlement"]["state"], "settled");
     assert_eq!(report["attempts"][0]["native"]["effect"], "deleted");
@@ -1258,7 +1262,11 @@ fn policy_only_known_unremoved_files_settle_and_free_the_slot() {
     let observed = status(&deps.operations, started.generation()).unwrap();
     assert!(observed.worker_settled);
     assert_eq!(observed.state, ApprovalState::Completed);
-    assert_eq!(observed.actor_phase.as_deref(), Some("degraded"));
+    assert_eq!(
+        observed.actor_phase.as_deref(),
+        Some("degraded"),
+        "{observed:?}"
+    );
     let report = observed.report.as_ref().unwrap();
     assert_eq!(report["settlement"]["state"], "settled");
     let row = &report["outcome"]["targets"][0];
@@ -1303,7 +1311,7 @@ fn policy_only_uncertain_remnant_stays_in_the_slot_and_status_reports_it() {
     let started = started.unwrap();
     let observed = status(&deps.operations, started.generation()).unwrap();
     assert!(observed.worker_settled);
-    assert_eq!(observed.state, ApprovalState::Held);
+    assert_eq!(observed.state, ApprovalState::Held, "{observed:?}");
     assert_eq!(observed.actor_phase.as_deref(), Some("degraded"));
     assert_eq!(observed.reason_code.as_deref(), Some("failed"));
     assert_eq!(

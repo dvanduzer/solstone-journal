@@ -374,7 +374,10 @@ mod tests {
         let mut target = stage()
             .create_target()
             .unwrap_or_else(|failure| panic!("{}", failure.error));
+        #[cfg(unix)]
         drop(target.helper_transport().unwrap());
+        #[cfg(windows)]
+        drop(target.issue_stage_file().unwrap());
         let mut owner = Some(ProbeOwner::ReadyTarget(target));
         let mut probes = vec![record()];
         release_probe(&mut owner, &mut probes);

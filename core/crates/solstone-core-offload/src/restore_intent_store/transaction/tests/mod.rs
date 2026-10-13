@@ -488,20 +488,39 @@ fn no_effect_source_substitution_refuses_cleanup_and_preserves_both_files() {
     let result = with_hook(
         Point::AfterPublication,
         move || {
-            fs::rename(&changed, retained).unwrap();
-            fs::write(changed, b"foreign").unwrap();
+            #[cfg(unix)]
+            {
+                fs::rename(&changed, retained).unwrap();
+                fs::write(changed, b"foreign").unwrap();
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                fs::rename(&changed, retained).unwrap_err().raw_os_error(),
+                Some(32)
+            );
         },
         || staged.commit(2, options()),
     );
-    assert!(matches!(result.hold, Some(Hold::Retirement)));
-    assert_eq!(
-        result.no_effect_cleanup.as_ref().unwrap().cleanup,
-        Cleanup::Refused
-    );
-    assert_eq!(fs::read(saved).unwrap(), b"abc");
-    assert_eq!(fs::read(payload).unwrap(), b"foreign");
-    assert_eq!(fs::read(f.raw()).unwrap(), b"old");
-    assert!(result.retirement.is_none());
+    #[cfg(windows)]
+    {
+        assert!(result.hold.is_none(), "{:?}", result.hold);
+        assert_eq!(result.no_effect_cleanup.unwrap().cleanup, Cleanup::Complete);
+        assert!(!saved.exists());
+        assert!(!payload.exists());
+        assert_eq!(fs::read(f.raw()).unwrap(), b"old");
+    }
+    #[cfg(unix)]
+    {
+        assert!(matches!(result.hold, Some(Hold::Retirement)));
+        assert_eq!(
+            result.no_effect_cleanup.as_ref().unwrap().cleanup,
+            Cleanup::Refused
+        );
+        assert_eq!(fs::read(saved).unwrap(), b"abc");
+        assert_eq!(fs::read(payload).unwrap(), b"foreign");
+        assert_eq!(fs::read(f.raw()).unwrap(), b"old");
+        assert!(result.retirement.is_none());
+    }
 }
 
 #[test]
@@ -771,6 +790,8 @@ fn missing_recorded_publication_never_advances_replay_marker_or_cas() {
     let record = result.record.as_mut().unwrap();
     let id = record.intent.event.operation_id.clone();
     assert_eq!(record.intent.event_recorded, Obligation::Complete);
+    // Model loss of the former publication owner before restart/replay.
+    drop(result.owner.media.take());
     fs::remove_file(f.raw()).unwrap();
     let before = fs::read(f.marker()).unwrap();
     let owner = result.owner;
@@ -980,7 +1001,19 @@ fn late_owner_delete_or_missing_segment_refuses_without_recreation_or_intent() {
         let staged = f.staged(&allowed);
         let segment = f.raw().parent().unwrap().to_path_buf();
         if missing {
+            #[cfg(unix)]
             fs::rename(&segment, segment.with_extension("moved")).unwrap();
+            #[cfg(windows)]
+            {
+                assert_eq!(
+                    fs::rename(&segment, segment.with_extension("moved"))
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(32)
+                );
+                assert!(segment.is_dir());
+                continue;
+            }
         } else {
             fs::write(segment.join("tombstone.json"), b"owner deleted").unwrap();
         }
@@ -1377,9 +1410,11 @@ fn actual_stage_capacity_query_failure_preserves_empty_stage_before_target_issua
     assert!(fired);
     assert!(result.is_err());
     assert_eq!(stage.observation().unwrap(), observed);
+    drop(stage);
     let directory = parent
         .open_child(OsStr::new(&observed.directory_name))
         .unwrap()
         .unwrap();
+    assert_eq!(directory.identity(), observed.directory_identity);
     assert!(directory.entries(8).unwrap().unwrap().is_empty());
 }

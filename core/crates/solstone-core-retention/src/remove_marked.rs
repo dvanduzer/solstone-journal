@@ -2341,6 +2341,40 @@ fn reviewed_bookkeeping(
 }
 
 #[cfg(windows)]
+fn append_windows_removal_event(
+    parent: &solstone_core_journal_io::WindowsFlatDirectory,
+    diagnostic: &Path,
+    event: &solstone_core_callosum::CallosumEnvelope,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut contents = serde_json::to_vec(event).map_err(std::io::Error::other)?;
+    contents.push(b'\n');
+    parent.revalidate_bound().map_err(std::io::Error::other)?;
+    let mut file = solstone_core_journal_io::create_or_open_windows_append_file_bound(
+        parent,
+        std::ffi::OsStr::new("events.jsonl"),
+        diagnostic,
+    )
+    .map_err(std::io::Error::other)?;
+    if file.seek(SeekFrom::End(0))? != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail)?;
+        if tail != [b'\n'] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "removal event log has an unfinished record",
+            ));
+        }
+    }
+    parent.revalidate_bound().map_err(std::io::Error::other)?;
+    file.write_all(&contents)?;
+    file.sync_all()?;
+    parent.revalidate_bound().map_err(std::io::Error::other)
+}
+
+#[cfg(windows)]
 fn reviewed_bookkeeping(
     root: &std::sync::Arc<solstone_core_journal_io::JournalRoot>,
     group: &ReviewedGroup,
@@ -2410,11 +2444,11 @@ fn reviewed_bookkeeping(
         extra,
     };
 
-    let events_path = root
-        .canonical_path()
-        .join(group.relative())
-        .join("events.jsonl");
-    let append_result = solstone_core_journal_io::append_jsonl_no_follow(&events_path, &event);
+    let append_result = append_windows_removal_event(
+        &group.events,
+        &root.canonical_path().join(group.relative()),
+        &event,
+    );
 
     let bump_marker = || -> Result<bool, std::io::Error> {
         let lock_name = OsStr::new("stream.updated.lock");
@@ -2521,6 +2555,62 @@ mod tests {
     use crate::marks::{Proposal, RemovalClass, decline, preflight, reconcile};
     use crate::policy::policy_from_retention;
     use serde_json::json;
+
+    #[test]
+    #[cfg(windows)]
+    fn removal_events_preserve_linked_and_unfinished_files() {
+        use solstone_core_journal_io::{JournalRoot, open_windows_flat_directory_bound};
+        use std::{ffi::OsStr, sync::Arc};
+
+        let event = solstone_core_callosum::CallosumEnvelope {
+            tract: "retention".to_owned(),
+            event: "original_deleted".to_owned(),
+            ts: Some(1),
+            extra: serde_json::Map::new(),
+        };
+        for (initial, linked, allowed) in [
+            (b"".as_slice(), false, true),
+            (b"{}\n".as_slice(), false, true),
+            (b"{unfinished".as_slice(), false, false),
+            (b"owner's other file\n".as_slice(), true, false),
+        ] {
+            let journal = tempfile::tempdir().unwrap();
+            let directory = journal.path().join("segment");
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("events.jsonl");
+            let other = journal.path().join("other");
+            fs::write(&path, initial).unwrap();
+            if linked {
+                fs::hard_link(&path, &other).unwrap();
+            }
+            let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+            let parent = open_windows_flat_directory_bound(
+                root.as_ref(),
+                OsStr::new("segment"),
+                root.canonical_path(),
+            )
+            .unwrap()
+            .unwrap();
+            let result = append_windows_removal_event(&parent, &directory, &event);
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "linked={linked} initial={initial:?}"
+            );
+            let bytes = fs::read(&path).unwrap();
+            if allowed {
+                assert!(bytes.starts_with(initial));
+                let appended: solstone_core_callosum::CallosumEnvelope =
+                    serde_json::from_slice(&bytes[initial.len()..]).unwrap();
+                assert_eq!(appended.event, event.event);
+            } else {
+                assert_eq!(bytes, initial);
+            }
+            if linked {
+                assert_eq!(fs::read(other).unwrap(), initial);
+            }
+        }
+    }
 
     #[test]
     fn a_mark_declined_after_preflight_is_not_unlinked() {

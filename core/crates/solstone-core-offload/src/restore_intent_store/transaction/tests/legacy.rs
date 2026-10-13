@@ -58,7 +58,19 @@ fn fixture() -> (Fixture, LegacyRestoreBinding) {
     let appended =
         crate::ledger::writer::append_legacy_restore_binding(&f.root, &binding, 2).unwrap();
     assert_eq!(appended.confirmation(), LedgerConfirmation::Confirmed);
-    assert_eq!(appended.durability(), [LedgerSync::Confirmed; 4]);
+    assert_eq!(
+        appended.durability(),
+        if cfg!(windows) {
+            [
+                LedgerSync::Confirmed,
+                LedgerSync::Uncertain,
+                LedgerSync::Uncertain,
+                LedgerSync::Uncertain,
+            ]
+        } else {
+            [LedgerSync::Confirmed; 4]
+        }
+    );
     (f, binding)
 }
 
