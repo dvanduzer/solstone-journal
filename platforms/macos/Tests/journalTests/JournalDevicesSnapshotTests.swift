@@ -21,7 +21,9 @@ private func runDevicesSnapshotGit(_ args: String...) throws -> String {
 }
 
 private func makeDevicesSnapshotOutputDir() throws -> URL {
-    let repoRoot = try runDevicesSnapshotGit("rev-parse", "--show-toplevel")
+    // Renders land under this package (platforms/macos/snapshots, ignored), not the
+    // repository root: the package root and the Git root are different directories.
+    let repoRoot = journalPackageRoot().path
     let gitHash = try runDevicesSnapshotGit("rev-parse", "--short", "HEAD")
 
     let dirtyCheck = Process()
