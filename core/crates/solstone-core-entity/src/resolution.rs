@@ -106,7 +106,7 @@ impl fmt::Display for EntityResolutionError {
                 entity_id,
             } => write!(
                 formatter,
-                "resolved ambiguity {ambiguity_id} names blocked entity {entity_id:?}"
+                "resolved ambiguity {ambiguity_id} names hidden entity {entity_id:?}"
             ),
         }
     }

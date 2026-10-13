@@ -743,7 +743,7 @@ fn resolution_error_response(error: FacetResolutionError) -> Response {
             solstone_core_entity::EntityResolutionError::ResolvedChoiceEntityBlocked { .. },
         ) => refusal(
             ReasonCode::ResolvedChoiceEntityBlocked,
-            "recorded entity choice is blocked",
+            "recorded entity choice is hidden",
         ),
         FacetResolutionError::Resolution(solstone_core_entity::EntityResolutionError::Read(
             solstone_core_entity::EntityStoreError::AmbiguityInvalidRow { path, .. },
@@ -1381,7 +1381,7 @@ fn classified_operation_error(detail: String) -> Response {
         refusal(ReasonCode::OperationNoLongerAvailable, detail)
     } else if lowered.contains("not found") {
         refusal(ReasonCode::EntityNotFound, detail)
-    } else if lowered.contains("blocked") {
+    } else if lowered.contains("hidden") {
         refusal(ReasonCode::EntityBlocked, detail)
     } else if lowered.contains("must be different")
         || lowered.contains("two principal")
@@ -3068,7 +3068,7 @@ async fn block_journal_entity_route(
             axum::http::StatusCode::BAD_REQUEST,
         ),
         Ok(Err(error)) => refusal(ReasonCode::EntityOperationFailed, error.to_string()),
-        Err(_) => refusal(ReasonCode::EntityOperationFailed, "entity block failed"),
+        Err(_) => refusal(ReasonCode::EntityOperationFailed, "couldn't hide entity"),
     }
 }
 
@@ -3095,7 +3095,7 @@ async fn unblock_journal_entity_route(
             )
         }
         Ok(Err(error)) => refusal(ReasonCode::EntityOperationFailed, error.to_string()),
-        Err(_) => refusal(ReasonCode::EntityOperationFailed, "entity unblock failed"),
+        Err(_) => refusal(ReasonCode::EntityOperationFailed, "couldn't unhide entity"),
     }
 }
 
@@ -3879,7 +3879,7 @@ pub(crate) fn attach_entity_write_error_response(
             refusal(ReasonCode::EntityAlreadyExists, "entity already exists")
         }
         solstone_core_facets::FacetEntityWriteError::EntityBlocked { .. } => {
-            refusal(ReasonCode::EntityBlocked, "entity blocked")
+            refusal(ReasonCode::EntityBlocked, "entity hidden")
         }
         solstone_core_facets::FacetEntityWriteError::EntityNotFound { .. } => {
             refusal(ReasonCode::EntityNotFound, "entity not found")
@@ -3900,7 +3900,7 @@ pub(crate) fn create_entity_write_error_response(
     }
     match error {
         solstone_core_facets::FacetEntityWriteError::EntityBlocked { .. } => {
-            refusal(ReasonCode::EntityBlocked, "entity blocked")
+            refusal(ReasonCode::EntityBlocked, "entity hidden")
         }
         solstone_core_facets::FacetEntityWriteError::EntityExists { .. } => refusal(
             ReasonCode::EntityAlreadyExists,

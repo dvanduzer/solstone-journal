@@ -590,7 +590,7 @@ pub fn prepare_review_promotion(
         if existing.blocked {
             return Err(ReviewOwnerError::conflict(
                 ReviewOwnerConflictKind::PromotedEntityBlocked,
-                format!("conflict: promoted entity {name:?} is blocked"),
+                format!("conflict: promoted entity {name:?} is hidden"),
             ));
         }
         // The entity's own link, preferring the folder named by its id.
@@ -693,7 +693,7 @@ pub fn prepare_review_promotion(
     if identity.get("blocked") == Some(&Value::Bool(true)) {
         return Err(ReviewOwnerError::conflict(
             ReviewOwnerConflictKind::PromotedEntityBlocked,
-            "conflict: promoted entity is blocked",
+            "conflict: promoted entity is hidden",
         ));
     }
     if before_link
@@ -847,7 +847,7 @@ pub fn publish_review_attachment(
     if identity.value().get("blocked") == Some(&Value::Bool(true)) {
         return Err(ReviewOwnerError::conflict(
             ReviewOwnerConflictKind::IdentityBlocked,
-            "conflict: promotion identity blocked",
+            "conflict: promotion identity hidden",
         ));
     }
     let current = read_facet_entity_link(root, &change.facet, &change.relationship_dir)

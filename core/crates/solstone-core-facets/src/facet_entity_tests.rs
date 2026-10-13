@@ -671,7 +671,7 @@ fn promotion_still_refuses_a_blocked_identity_reached_through_the_id_namespace()
     )
     .unwrap_err();
     assert!(error.to_string().starts_with("conflict:"), "{error}");
-    assert!(error.to_string().contains("blocked"), "{error}");
+    assert!(error.to_string().contains("hidden"), "{error}");
     assert_eq!(
         error.kind(),
         Some(solstone_core_entity::ReviewOwnerConflictKind::PromotedEntityBlocked)

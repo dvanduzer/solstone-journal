@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- in entities, "block" is now "hide", "unblock" is "unhide", and "blocked" is "hidden". the actions work as before.
+
 - confidential processing now finishes older recordings and day updates automatically. with your own key, you still choose whether to allow this work and any provider charges.
 
 - when your journal's thinking runs on a local model, on confidential processing or at your own endpoint, it now settles which kind of app is in a screen frame consistently, rather than sometimes landing on a different kind for the same frame. that choice decides what it reads in detail.

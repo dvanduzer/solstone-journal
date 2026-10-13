@@ -1725,7 +1725,7 @@ fn merge_refuses_blocked_source() {
         commit_entity_merge(&journal, "source", "target", EntityMergeOptions::default())
             .unwrap_err()
             .to_string(),
-        "can't merge something that's blocked. unblock it first."
+        "can't merge something that's hidden. unhide it first."
     );
     fs::remove_dir_all(journal).unwrap();
 }
@@ -1751,7 +1751,7 @@ fn merge_refuses_blocked_target() {
         commit_entity_merge(&journal, "source", "target", EntityMergeOptions::default())
             .unwrap_err()
             .to_string(),
-        "can't merge into something that's blocked. unblock it first."
+        "can't merge into something that's hidden. unhide it first."
     );
     fs::remove_dir_all(journal).unwrap();
 }
