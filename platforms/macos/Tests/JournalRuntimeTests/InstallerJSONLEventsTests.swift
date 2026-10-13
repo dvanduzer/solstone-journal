@@ -139,21 +139,41 @@ struct InstallerJSONLEventsTests {
         #expect(renderer.renderedLog == "")
     }
 
-    @Test func upstreamSetupEventsDocDrift() throws {
-        let path = NSString(string: "~/projects/solstone/solstone/think/setup_events.py").expandingTildeInPath
-        guard FileManager.default.fileExists(atPath: path) else {
-            print("skipping doc-drift: upstream solstone repo not available")
-            return
+    /// The native setup's own vocabulary and emitted lines, written by the
+    /// `mac_app_setup_contract_fixture_matches_the_native_vocabulary` test in
+    /// core/crates/solstone-core-setup, which keeps the fixture equal to the native
+    /// authority. Every event type must be recognized; the free-text fields
+    /// (steps, skip reasons, error codes, statuses) pass through, so each native
+    /// value must still parse into an event and render.
+    @Test func understandsEverySetupEventTheNativeRuntimeEmits() throws {
+        let url = try #require(Bundle.module.url(
+            forResource: "native-setup-contract",
+            withExtension: "json",
+            subdirectory: "Fixtures"
+        ))
+        let contract = try JSONDecoder().decode(NativeSetupContract.self, from: Data(contentsOf: url))
+        #expect(contract.schemaVersion == 1)
+        #expect(Set(InstallerKnownValues.eventTypes) == Set(contract.eventTypes))
+        #expect(contract.lines.count == contract.eventTypes.count)
+
+        var lines = contract.lines
+        lines += contract.stepNames.map { line(["event": "step.started", "step": $0, "index": 1, "total": 1]) }
+        lines += contract.skipReasons.map {
+            line(["event": "step.completed", "step": "brain", "outcome": "skipped", "reason": $0])
         }
-
-        let content = try String(contentsOfFile: path, encoding: .utf8)
-        assertValues(named: "EVENT_TYPES", in: content, areRepresentedBy: InstallerKnownValues.eventTypes)
-        assertValues(named: "ERROR_CODES", in: content, areRepresentedBy: InstallerKnownValues.errorCodes)
-        assertValues(named: "STEP_NAMES", in: content, areRepresentedBy: InstallerKnownValues.stepNames)
-        assertValues(named: "SKIPPED_REASONS", in: content, areRepresentedBy: InstallerKnownValues.skippedReasons)
-
-        let statusValues = Array(InstallerKnownValues.statusTranslation.keys) + Array(InstallerKnownValues.statusTranslation.values)
-        assertValues(named: "STATUS_TRANSLATION", in: content, areRepresentedBy: statusValues)
+        lines += contract.errorCodes.map {
+            line(["event": "step.failed", "step": "journal", "error": ["code": $0, "message": "failed"]])
+        }
+        lines += contract.statuses.map { line(["event": "setup.completed", "status": $0]) }
+        for raw in lines {
+            guard case .event(let event) = SetupEventParser.parse(line: raw) else {
+                Issue.record("the app does not understand a native setup line: \(raw)")
+                continue
+            }
+            var renderer = EventRenderer()
+            renderer.append(event)
+            #expect(!renderer.renderedLog.isEmpty, "\(raw)")
+        }
     }
 
     private func assertEvent(_ line: String, _ expected: SetupEvent, _ rendered: String) {
@@ -165,30 +185,28 @@ struct InstallerJSONLEventsTests {
         #expect(renderer.renderedLog == rendered + "\n")
     }
 
-    private func assertValues(named name: String, in content: String, areRepresentedBy swiftValues: [String]) {
-        let upstreamValues = quotedValues(in: block(named: name, in: content))
-        for value in upstreamValues {
-            #expect(swiftValues.contains(value))
-        }
-        for value in swiftValues {
-            #expect(upstreamValues.contains(value))
-        }
+    private func line(_ object: [String: Any]) -> String {
+        let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
+}
 
-    private func block(named name: String, in content: String) -> String {
-        guard let start = content.range(of: name) else { return "" }
-        let rest = content[start.lowerBound...]
-        guard let end = rest.range(of: "\n\n") else { return String(rest) }
-        return String(rest[..<end.lowerBound])
-    }
+private struct NativeSetupContract: Decodable {
+    let schemaVersion: Int
+    let eventTypes: [String]
+    let stepNames: [String]
+    let errorCodes: [String]
+    let skipReasons: [String]
+    let statuses: [String]
+    let lines: [String]
 
-    private func quotedValues(in text: String) -> [String] {
-        let pattern = #""([^"]+)""#
-        let regex = try? NSRegularExpression(pattern: pattern)
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        return regex?.matches(in: text, range: range).compactMap { match in
-            guard let valueRange = Range(match.range(at: 1), in: text) else { return nil }
-            return String(text[valueRange])
-        } ?? []
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case eventTypes = "event_types"
+        case stepNames = "step_names"
+        case errorCodes = "error_codes"
+        case skipReasons = "skip_reasons"
+        case statuses
+        case lines
     }
 }

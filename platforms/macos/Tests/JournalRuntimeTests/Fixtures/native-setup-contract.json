@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "authority": "core/crates/solstone-core-setup/src/events.rs",
+  "event_types": [
+    "setup.started",
+    "setup.completed",
+    "step.started",
+    "step.completed",
+    "step.failed",
+    "step.warning",
+    "doctor.started",
+    "check.completed",
+    "doctor.completed"
+  ],
+  "step_names": [
+    "doctor",
+    "journal",
+    "install_models",
+    "skills_user",
+    "skills_journal",
+    "wrapper",
+    "service",
+    "brain"
+  ],
+  "error_codes": [
+    "doctor_failed",
+    "doctor_jsonl_incomplete",
+    "doctor_timeout",
+    "journal_dir_invalid",
+    "journal_existing_blocked",
+    "installation_identity_refused",
+    "installation_identity_unavailable",
+    "legacy_supervisor_lock_refused",
+    "service_up_failed",
+    "setup_unhandled_exception",
+    "step_subprocess_failed",
+    "step_subprocess_timeout",
+    "wrapper_provision_failed"
+  ],
+  "skip_reasons": [
+    "--skip-models",
+    "--skip-brain",
+    "--skip-models implies --skip-brain",
+    "--skip-skills",
+    "--skip-service",
+    "--skip-wrapper",
+    "Windows packages expose the commands directly; POSIX wrappers are not applicable",
+    "the journal app's admin terminal provides the commands on a mac; no wrappers are written",
+    "agent skills are not installed on windows yet",
+    "a provider is already configured",
+    "provider config is not in the expected shape",
+    "local provider unavailable on this host",
+    "local bootstrap did not start",
+    "choose \"install local model\" on the thinking page once you've created your journal",
+    "the journal already lives on this mac",
+    "prior_run_ok",
+    "resumed_after_restart"
+  ],
+  "statuses": [
+    "ok",
+    "warning",
+    "failed",
+    "skipped"
+  ],
+  "lines": [
+    "{\"event\":\"setup.started\",\"ts\":\"2026-01-01T00:00:00Z\",\"started_at\":\"2026-01-01T00:00:00Z\",\"version\":\"2.0.0\",\"mode\":\"non_interactive\"}",
+    "{\"event\":\"setup.completed\",\"ts\":\"2026-01-01T00:00:00Z\",\"status\":\"failed\",\"failed_step\":\"journal\",\"duration_ms\":12}",
+    "{\"event\":\"step.started\",\"ts\":\"2026-01-01T00:00:00Z\",\"step\":\"journal\",\"index\":2,\"total\":8}",
+    "{\"event\":\"step.completed\",\"ts\":\"2026-01-01T00:00:00Z\",\"step\":\"wrapper\",\"outcome\":\"skipped\",\"reason\":\"the journal app's admin terminal provides the commands on a mac; no wrappers are written\",\"duration_ms\":0}",
+    "{\"event\":\"step.failed\",\"ts\":\"2026-01-01T00:00:00Z\",\"step\":\"journal\",\"duration_ms\":0,\"error\":{\"code\":\"journal_dir_invalid\",\"message\":\"journal directory is not usable\",\"details\":\"\",\"exit_code\":1}}",
+    "{\"event\":\"step.warning\",\"ts\":\"2026-01-01T00:00:00Z\",\"step\":\"brain\",\"text\":\"local bootstrap did not start\",\"fix_hint\":\"install the local model from the thinking page\"}",
+    "{\"event\":\"doctor.started\",\"ts\":\"2026-01-01T00:00:00Z\",\"version\":\"2.0.0\"}",
+    "{\"event\":\"check.completed\",\"ts\":\"2026-01-01T00:00:00Z\",\"name\":\"disk_space\",\"severity\":\"advisory\",\"status\":\"warning\",\"detail\":\"low disk space\",\"fix\":\"\"}",
+    "{\"event\":\"doctor.completed\",\"ts\":\"2026-01-01T00:00:00Z\",\"status\":\"warning\",\"duration_ms\":42,\"summary\":{\"total\":17,\"failed\":0,\"warnings\":1,\"skipped\":2}}"
+  ]
+}

@@ -105,8 +105,10 @@ internal enum ParsedLine: Sendable, Equatable {
     case unparseableLine(String)
 }
 
-// Source of truth: solstone/think/setup_events.py.
-// upstreamSetupEventsDocDrift keeps this vocabulary in sync.
+// Source of truth: the native setup's EventType (core/crates/solstone-core-setup,
+// src/events.rs). The parser recognizes exactly these; step names, skip reasons,
+// error codes and statuses pass through as text. InstallerJSONLEventsTests decodes
+// the fixture that crate keeps equal to its own vocabulary.
 public enum InstallerKnownValues {
     public static let eventTypes: [String] = [
         "setup.started",
@@ -118,51 +120,6 @@ public enum InstallerKnownValues {
         "doctor.started",
         "check.completed",
         "doctor.completed"
-    ]
-
-    public static let errorCodes: [String] = [
-        "doctor_failed",
-        "doctor_jsonl_incomplete",
-        "doctor_timeout",
-        "journal_dir_invalid",
-        "journal_existing_blocked",
-        "service_up_failed",
-        "setup_unhandled_exception",
-        "step_subprocess_failed",
-        "step_subprocess_timeout"
-    ]
-
-    public static let stepNames: [String] = [
-        "doctor",
-        "journal",
-        "install_models",
-        "skills_user",
-        "skills_journal",
-        "wrapper",
-        "service",
-        "brain"
-    ]
-
-    public static let skippedReasons: [String] = [
-        "--skip-models",
-        "--skip-brain",
-        "--skip-models implies --skip-brain",
-        "--skip-skills",
-        "--skip-service",
-        "--skip-wrapper",
-        "a provider is already configured",
-        "provider config is not in the expected shape",
-        "local provider unavailable on this host",
-        "local bootstrap did not start",
-        "prior_run_ok",
-        "resumed_after_restart"
-    ]
-
-    public static let statusTranslation: [String: String] = [
-        "ok": "ok",
-        "warn": "warning",
-        "fail": "failed",
-        "skip": "skipped"
     ]
 }
 
