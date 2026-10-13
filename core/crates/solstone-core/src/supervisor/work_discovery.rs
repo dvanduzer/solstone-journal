@@ -947,7 +947,15 @@ fn retain_best(candidates: &mut Vec<DiscoveredTask>, new: Vec<DiscoveredTask>) {
     candidates.truncate(RANKED);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread checked whether a candidate is still owed.
+    static STILL_OWED_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String> {
+    #[cfg(test)]
+    STILL_OWED_CHECKS.with(|checks| checks.set(checks.get() + 1));
     let day = candidate.request.day.as_deref().ok_or("work has no day")?;
     let argv = candidate.request.cmd.as_wire();
     let argument = |flag: &str| {
@@ -1183,6 +1191,11 @@ fn reconcile_pass(
     let mut observed_intents = BTreeMap::new();
     let mut fulfilled_segments = BTreeSet::new();
     let mut fulfilled_days = BTreeSet::new();
+    // The early work last handed to the queue, and the references it was
+    // chosen from. Checking whether work is still owed can read a whole day,
+    // so the early work is admitted again only when it could change.
+    let mut early_considered: Option<BTreeSet<String>> = None;
+    let mut early_admitted: Vec<DiscoveredTask> = Vec::new();
     // Check owner requests before the history pass and between days. Source
     // reads run only here, never on the supervisor's event loop.
     let mut ordered = days.keys().rev().cloned().collect::<VecDeque<_>>();
@@ -1336,24 +1349,41 @@ fn reconcile_pass(
             report.publish(journal)?;
             last_publish = Instant::now();
         }
-        if owner_wakeup
-            || candidates.iter().any(|task| {
+        // Reconstruct an independent copy; TaskQueue owns submissions.
+        let mut early = candidates
+            .iter()
+            .filter(|task| {
                 task.request
                     .priority
                     .is_some_and(|p| p.band <= WorkBand::Waiting)
             })
-        {
-            // Reconstruct an independent copy; TaskQueue owns submissions.
-            let mut early = candidates
+            .cloned()
+            .collect::<VecDeque<_>>();
+        if owner_wakeup || !early.is_empty() {
+            // Admit again only when an owner asked, this day changed the early
+            // work, or early work handed over before has left the queue.
+            // Otherwise the result is the one already handed over, and checking
+            // it again after every older day re-reads the newest days each time.
+            let considered = early
                 .iter()
-                .filter(|task| {
-                    task.request
-                        .priority
-                        .is_some_and(|p| p.band <= WorkBand::Waiting)
-                })
-                .cloned()
-                .collect();
-            admit(journal, queue, stopped, Vec::new(), &mut early, &mut report)?;
+                .map(|task| task.request.reference.clone())
+                .collect::<BTreeSet<_>>();
+            if owner_wakeup
+                || early_considered.as_ref() != Some(&considered)
+                || early_admitted
+                    .iter()
+                    .any(|task| !queue.contains_reference(&task.request.reference))
+            {
+                // Track only what the queue actually took: work it skipped
+                // because the same command is already queued or running under
+                // another reference never "leaves", and must not re-trigger.
+                early_admitted =
+                    admit(journal, queue, stopped, Vec::new(), &mut early, &mut report)?
+                        .into_iter()
+                        .filter(|task| queue.contains_reference(&task.request.reference))
+                        .collect();
+                early_considered = Some(considered);
+            }
         }
     }
     aggregate(
@@ -1918,6 +1948,37 @@ mod tests {
                 .holds
                 .iter()
                 .any(|hold| hold.reason == "segment_prerequisites")
+        );
+    }
+
+    /// Yesterday's daily work is early work, and checking whether it is still
+    /// owed reads the whole day. A pass must not check it again after every
+    /// older day it inspects when nothing about the early work has changed.
+    #[test]
+    fn early_work_is_not_checked_again_after_every_older_day() {
+        let root = fixture("local");
+        let yesterday = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y%m%d")
+            .to_string();
+        thought_without_receipt(root.path(), &yesterday, &["090000_60", "100000_60"]);
+        let older = 24;
+        for n in 0..older {
+            segment(
+                root.path(),
+                &format!("1999{:02}{:02}", 1 + n / 28, 1 + n % 28),
+                "090000_60",
+            );
+        }
+        let queue = queue(root.path());
+        STILL_OWED_CHECKS.with(|checks| checks.set(0));
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        let checks = STILL_OWED_CHECKS.with(|checks| checks.get());
+        assert!(queue.contains_reference(&format!("supervisor-work-{yesterday}-daily")));
+        // One early admission after yesterday, then the final admission of the
+        // ranking: a few checks, not one more per older day.
+        assert!(
+            checks < older,
+            "{checks} still-owed checks for {older} older days"
         );
     }
 
