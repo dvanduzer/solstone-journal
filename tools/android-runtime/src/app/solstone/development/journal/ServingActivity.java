@@ -42,7 +42,9 @@ public class ServingActivity extends Activity {
         public void onServiceConnected(ComponentName name, IBinder binder) {
             worker = new Messenger(binder);
             control.execute(()->{
-                try { show(call(MainActivity.obj("op", "start", "address", wifiAddress()+":7657"))); }
+                try { show(call(MainActivity.obj("op", "start", "address", wifiAddress()+":7657", "onnx_library", getApplicationInfo().nativeLibraryDir+"/libonnxruntime.so"))); }
+                catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
+                try { show(call(MainActivity.obj("op", "audio-enable"))); }
                 catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
                 consumeCommand();
             });
