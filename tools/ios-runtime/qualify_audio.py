@@ -55,7 +55,7 @@ def multipart(directory, segment, media):
     path = directory / (segment + '.multipart')
     path.write_bytes(payload)
     return {'method': 'POST', 'uri': '/app/devices/ingest', 'body_file': str(path),
-            'content_type': 'multipart/form-data; boundary=' + boundary, 'protocol': '3'}
+            'content_type': 'multipart/form-data; boundary=' + boundary, 'protocol_version': '3'}
 
 
 def audio_status(row):

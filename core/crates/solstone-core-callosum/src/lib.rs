@@ -39,23 +39,28 @@ fn short_socket_alias(path: &std::path::Path) -> std::io::Result<std::path::Path
     Ok(target)
 }
 
-#[cfg(all(unix, test, feature = "full-tests"))]
-#[test]
-fn long_socket_alias_reaches_the_same_unix_endpoint() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
-    let physical = root.path().join("s");
-    let directory = root.path().join("long".repeat(32));
-    std::fs::create_dir(&directory).unwrap();
-    let logical = directory.join("callosum.sock");
-    std::os::unix::fs::symlink(&physical, &logical).unwrap();
-    let listener =
-        std::os::unix::net::UnixListener::bind(short_socket_alias(&logical).unwrap()).unwrap();
-    let _client =
-        std::os::unix::net::UnixStream::connect(short_socket_alias(&logical).unwrap()).unwrap();
-    let _peer = listener.accept().unwrap();
-    std::fs::remove_file(&logical).unwrap();
-    std::os::unix::fs::symlink("relative.sock", &logical).unwrap();
-    assert!(short_socket_alias(&logical).is_err());
+#[cfg(unix)]
+#[cfg(all(test, feature = "full-tests"))]
+mod endpoint_tests {
+    #[test]
+    fn long_socket_alias_reaches_the_same_unix_endpoint() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let physical = root.path().join("s");
+        let directory = root.path().join("long".repeat(32));
+        std::fs::create_dir(&directory).unwrap();
+        let logical = directory.join("callosum.sock");
+        std::os::unix::fs::symlink(&physical, &logical).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(super::short_socket_alias(&logical).unwrap())
+                .unwrap();
+        let _client =
+            std::os::unix::net::UnixStream::connect(super::short_socket_alias(&logical).unwrap())
+                .unwrap();
+        let _peer = listener.accept().unwrap();
+        std::fs::remove_file(&logical).unwrap();
+        std::os::unix::fs::symlink("relative.sock", &logical).unwrap();
+        assert!(super::short_socket_alias(&logical).is_err());
+    }
 }
 
 pub use local_inference::LOCAL_INFERENCE_TOKEN_MAX;

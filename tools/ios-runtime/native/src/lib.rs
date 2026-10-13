@@ -334,10 +334,11 @@ fn run(v: Value) -> Result<Value, String> {
                         let size = file.metadata().map_err(|e| e.to_string())?.len();
                         let mut hash = Sha256::new();
                         std::io::copy(&mut file, &mut hash).map_err(|e| e.to_string())?;
-                        let text = matches!(
-                            path.extension().and_then(|e| e.to_str()),
-                            Some("jsonl" | "json")
-                        )
+                        let text = (path.starts_with(root.join("chronicle"))
+                            && matches!(
+                                path.extension().and_then(|e| e.to_str()),
+                                Some("jsonl" | "json")
+                            ))
                         .then(|| std::fs::read_to_string(&path))
                         .transpose()
                         .map_err(|e| e.to_string())?;
