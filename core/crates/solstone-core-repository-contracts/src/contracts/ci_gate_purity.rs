@@ -39,27 +39,7 @@ fn repo_root() -> PathBuf {
     );
     root
 }
-fn dependency_keys(manifest: &str) -> BTreeSet<String> {
-    let mut in_dependencies = false;
-    let mut keys = BTreeSet::new();
-
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_dependencies = trimmed == "[dependencies]"
-                || (trimmed.starts_with("[target.") && trimmed.ends_with(".dependencies]"));
-            continue;
-        }
-        if !in_dependencies || trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((key, _value)) = trimmed.split_once('=') {
-            keys.insert(key.trim().to_owned());
-        }
-    }
-
-    keys
-}
+use super::speaker_native_routes::dependency_keys;
 
 fn explicit_binary_names(manifest: &str) -> BTreeSet<String> {
     let mut in_bin = false;
