@@ -19,7 +19,7 @@ use crate::review_context::{
 use chrono::TimeZone;
 use serde_json::json;
 use solstone_core_journal_io::media::{
-    Cleanup, MediaPrimitive, RemovalEffect, run_with_media_hook,
+    Cleanup, Durability, MediaPrimitive, RemovalEffect, run_with_media_hook,
 };
 use solstone_core_journal_io::{FlatDirectory, JournalRoot, acquire_existing_parent_lock_bound};
 use std::{ffi::OsStr, fs, sync::Arc, time::Duration};
@@ -629,8 +629,36 @@ fn native_claim_and_sync_uncertainty_preserve_owners_and_exact_failures() {
             MarkState::Failed(_)
         ));
         if primitive == MediaPrimitive::StageRemove {
-            assert_ne!(first.native().receipt().cleanup, Cleanup::Complete);
+            assert_eq!(first.native().receipt().cleanup, Cleanup::Pending);
+            assert_eq!(
+                first.native().receipt().source_durability,
+                Durability::Synced
+            );
+            assert_eq!(
+                first.native().receipt().claim_durability,
+                Durability::Synced
+            );
+            assert!(result.outcome().targets[0].post_commit_failure.is_none());
             assert!(later.exists());
+            let MarkState::Failed(failure) = &load_at_root(&f.root).unwrap().marks[&mark.id].state
+            else {
+                panic!("mark not failed");
+            };
+            let stage_path = failure.staged.as_ref().expect("stage remembered");
+            assert!(f.path(stage_path).exists());
+            fs::write(&raw, b"newer").unwrap();
+            let activity =
+                solstone_core_journal_io::activity::ActivityLease::try_acquire(Arc::clone(&f.root))
+                    .unwrap();
+            let recovered = recover_interrupted_removals(&activity);
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].outcome,
+                Ok(solstone_core_journal_io::media::InterruptedRemovalResolution::Discarded)
+            );
+            assert_eq!(fs::read(&raw).unwrap(), b"newer");
+            assert!(!f.path(stage_path).exists());
+            assert!(load_at_root(&f.root).unwrap().marks.contains_key(&mark.id));
         }
     }
 }

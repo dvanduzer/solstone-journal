@@ -133,6 +133,10 @@ impl RestoreIntentStore {
         }
     }
 
+    pub(super) fn preparation_durability(&self) -> [Durability; 4] {
+        self.preparation.durability
+    }
+
     fn read(&self, operation: &str) -> Result<Option<ObservedIntent>, StoreProblem> {
         #[cfg(unix)]
         {
@@ -184,7 +188,7 @@ mod unix {
 
     use solstone_core_journal_io::atomic::{
         BoundAtomicOutcome, DetailedAtomicError, ExclusivePublication, FinalNameConfirmation,
-        atomic_replace_bound, write_bytes_exclusive_bound_detailed,
+        MetadataDurability, atomic_replace_bound, write_bytes_exclusive_bound_detailed,
     };
     use solstone_core_journal_io::errors::ExistingParentLockError;
     use solstone_core_journal_io::flat_directory::{
@@ -232,6 +236,20 @@ mod unix {
                 Self::Create(Ok(receipt)) => receipt.is_fully_confirmed(),
                 Self::Update(Ok(BoundAtomicOutcome::Published { .. })) => true,
                 _ => false,
+            }
+        }
+
+        fn directory_durability(&self) -> Durability {
+            match self {
+                Self::Create(Ok(receipt)) => {
+                    if matches!(receipt.durability, MetadataDurability::Confirmed) {
+                        Durability::Synced
+                    } else {
+                        Durability::Unproven
+                    }
+                }
+                Self::Update(Ok(BoundAtomicOutcome::Published { .. })) => Durability::Synced,
+                _ => Durability::Unproven,
             }
         }
     }
@@ -535,9 +553,19 @@ mod unix {
             if let Err(error) = result.owner.revalidate() {
                 result.receipt.failures.push(error);
             }
-            let (facts, failures) = result.owner.sync_facts(hooks);
-            result.receipt.durability = facts.map(Some);
-            result.receipt.failures.extend(failures);
+            let intent_durability = result
+                .receipt
+                .native
+                .as_ref()
+                .map(NativePublication::directory_durability)
+                .unwrap_or(Durability::Unproven);
+            let durability = [
+                intent_durability,
+                result.owner.preparation.durability[1],
+                result.owner.preparation.durability[2],
+                result.owner.preparation.durability[3],
+            ];
+            result.receipt.durability = durability.map(Some);
             hooks.checkpoint(Point::BeforeConfirmation);
             let confirmation = (|| {
                 result.owner.revalidate()?;

@@ -822,10 +822,7 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
         || staged.commit(2, options()),
     );
     assert!(fired);
-    assert!(matches!(
-        result.hold,
-        Some(Hold::Repair(RepairHold::UncertainContent))
-    ));
+    assert!(matches!(result.hold, Some(Hold::Retirement)));
     assert_eq!(result.effects, AttemptEffects { files: 1, bytes: 3 });
     let publication = result.publication.as_ref().unwrap();
     assert_eq!(publication.confirmation, Confirmation::Confirmed);
@@ -833,18 +830,19 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
     assert_eq!(fs::read(f.raw()).unwrap(), b"abc");
     let record = result.record.as_ref().unwrap();
     let id = record.intent.event.operation_id.clone();
-    assert_eq!(record.intent.marker, Obligation::Complete);
+    assert_eq!(record.intent.marker, Obligation::Pending);
     assert_eq!(record.intent.event_recorded, Obligation::Pending);
     assert!(result.ledger.is_none());
     assert!(result.register.is_none());
     let before = fs::read(f.ledger()).unwrap();
     let owner = result.owner;
     drop(result.record);
-    let replayed = replay_local(owner, &id, 3, options());
-    assert!(matches!(
-        replayed.hold,
-        Some(Hold::Repair(RepairHold::UncertainContent))
-    ));
+    let (replayed, _) = run_with_media_hook(
+        MediaPrimitive::ParentSync,
+        || Err(std::io::Error::other("replay parent sync cut")),
+        || replay_local(owner, &id, 3, options()),
+    );
+    assert!(matches!(replayed.hold, Some(Hold::Retirement)));
     assert_eq!(replayed.effects, AttemptEffects::default());
     assert!(replayed.ledger.is_none());
     assert!(replayed.register.is_none());

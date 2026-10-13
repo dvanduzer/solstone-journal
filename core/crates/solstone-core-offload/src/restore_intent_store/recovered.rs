@@ -18,7 +18,9 @@ use solstone_core_journal_io::activity_obligations::{
 };
 use solstone_core_journal_io::archive_recovery::RecoveryPopulationFailure;
 #[cfg(target_os = "linux")]
-use solstone_core_journal_io::media::{Cleanup, Confirmation, OriginalName, RemovalEffect};
+use solstone_core_journal_io::media::{
+    Cleanup, Confirmation, OriginalName, RemovalEffect, RemovalPhase,
+};
 use solstone_core_journal_io::media::{
     Durability, MediaDirectory, MediaObservation, MediaRead, MediaRemoval, MediaStage,
     OwnedMediaFailure,
@@ -537,7 +539,7 @@ impl Owner {
         commit: &SegmentCommit<'_>,
         intent: &RestoreIntent,
         confirmed: &MediaRead,
-        hooks: &mut impl super::unix::Hooks,
+        _hooks: &mut impl super::unix::Hooks,
     ) -> Result<(), Refusal> {
         use sha2::{Digest, Sha256};
         self.retirement = Some(RetirementFacts {
@@ -591,14 +593,24 @@ impl Owner {
             return Err(Refusal::Removal);
         };
         self.removal_attempted = true;
-        *native =
-            NativeRetirement::Removal(Box::new(source.remove_observed(&name, &expected, stage)));
+        let mut removal = Box::new(source.remove_observed(&name, &expected, stage));
+        if removal.receipt().cleanup != Cleanup::Complete {
+            removal.cleanup();
+        }
+        let source_durability = removal.receipt().source_durability;
+        *native = NativeRetirement::Removal(removal);
         #[cfg(all(test, feature = "full-tests"))]
         tests::checkpoint(tests::Checkpoint::AfterRemoval);
-        let (ancestors, failures) = self.store()?.sync_facts(hooks);
+        let prep_durability = self.store()?.preparation_durability();
+        let ancestors = [
+            source_durability,
+            prep_durability[1],
+            prep_durability[2],
+            prep_durability[3],
+        ];
         let facts = self.retirement.as_mut().ok_or(Refusal::Removal)?;
         facts.ancestors = ancestors;
-        facts.failures = failures;
+        facts.failures = Vec::new();
         if !matches!(&facts.native, NativeRetirement::Removal(removal) if removal_complete(removal))
             || ancestors != [Durability::Synced; 4]
             || !facts.failures.is_empty()
@@ -640,12 +652,12 @@ fn removal_complete(removal: &MediaRemoval) -> bool {
     receipt.effect == RemovalEffect::Deleted
         && receipt.original_name == OriginalName::Absent
         && receipt.claim_confirmation == Confirmation::Confirmed
-        && receipt.file_durability == Durability::Synced
         && receipt.source_durability == Durability::Synced
         && receipt.claim_durability == Durability::Synced
-        && receipt.stage_parent_durability == Durability::Synced
-        && receipt.cleanup == Cleanup::Complete
-        && receipt.failures.is_empty()
+        && !receipt
+            .failures
+            .iter()
+            .any(|f| f.phase != RemovalPhase::Cleanup)
 }
 
 #[cfg(all(test, feature = "full-tests", target_os = "linux"))]

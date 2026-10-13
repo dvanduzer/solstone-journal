@@ -527,7 +527,7 @@ impl MediaStage {
     }
 
     #[cfg(unix)]
-    fn cleanup_exact(&mut self) -> io::Result<()> {
+    pub(super) fn cleanup_exact(&mut self) -> io::Result<()> {
         self.revalidate_activity()?;
         if self.removed {
             return Ok(());
@@ -553,7 +553,7 @@ impl MediaStage {
     }
 
     #[cfg(windows)]
-    fn cleanup_exact(&mut self) -> io::Result<()> {
+    pub(super) fn cleanup_exact(&mut self) -> io::Result<()> {
         self.revalidate_activity()?;
         if self.removed {
             return Ok(());

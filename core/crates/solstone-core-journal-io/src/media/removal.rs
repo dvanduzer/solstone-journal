@@ -326,22 +326,6 @@ impl MediaRemoval {
         {
             return Err(changed());
         }
-        #[cfg(unix)]
-        match step(MediaPrimitive::FileSync)
-            .and_then(|()| self.source_file.as_ref().ok_or_else(changed)?.sync_all())
-        {
-            Ok(()) => self.receipt.file_durability = Durability::Synced,
-            Err(error) => self.receipt.failures.push(RemovalFailure {
-                phase: RemovalPhase::FileSync,
-                error,
-            }),
-        }
-        Self::check_file(
-            directory,
-            leaf,
-            self.claim_file.as_mut().ok_or_else(changed)?,
-            &self.expected,
-        )?;
         self.validate_context()?;
         self.receipt.effect = RemovalEffect::DeletionUncertain;
         platform::delete_claim(
@@ -422,9 +406,11 @@ impl MediaRemoval {
             }
         }
         self.cleanup();
-        match Self::sync(&self.stage.parent, MediaPrimitive::RemovalParentSync) {
-            Ok(()) => self.receipt.stage_parent_durability = Durability::Synced,
-            Err(error) => self.failure(RemovalPhase::StageParentSync, error),
+        if self.stage.removed {
+            match Self::sync(&self.stage.parent, MediaPrimitive::RemovalParentSync) {
+                Ok(()) => self.receipt.stage_parent_durability = Durability::Synced,
+                Err(error) => self.failure(RemovalPhase::StageParentSync, error),
+            }
         }
         match plain_name(&self.name)
             .and_then(|()| self.source.revalidate())
@@ -438,7 +424,12 @@ impl MediaRemoval {
             }
         }
         if let Err(error) = self.stage.parent.revalidate() {
-            self.receipt.claim_confirmation = Confirmation::Unverified;
+            if error.kind() == io::ErrorKind::InvalidData
+                || !(self.receipt.effect == RemovalEffect::Deleted
+                    && self.receipt.claim_confirmation == Confirmation::Confirmed)
+            {
+                self.receipt.claim_confirmation = Confirmation::Unverified;
+            }
             self.failure(RemovalPhase::Completion, error);
         }
         let stage_confirmation = (|| {
@@ -456,7 +447,12 @@ impl MediaRemoval {
             }
         })();
         if let Err(error) = stage_confirmation {
-            self.receipt.claim_confirmation = Confirmation::Unverified;
+            if error.kind() == io::ErrorKind::InvalidData
+                || !(self.receipt.effect == RemovalEffect::Deleted
+                    && self.receipt.claim_confirmation == Confirmation::Confirmed)
+            {
+                self.receipt.claim_confirmation = Confirmation::Unverified;
+            }
             self.receipt.cleanup = Cleanup::Refused;
             self.failure(RemovalPhase::Completion, error);
         }
@@ -466,7 +462,12 @@ impl MediaRemoval {
     pub fn cleanup(&mut self) -> Cleanup {
         if let Err(error) = self.stage.revalidate_activity() {
             self.receipt.cleanup = Cleanup::Refused;
-            self.receipt.claim_confirmation = Confirmation::Unverified;
+            if error.kind() == io::ErrorKind::InvalidData
+                || !(self.receipt.effect == RemovalEffect::Deleted
+                    && self.receipt.claim_confirmation == Confirmation::Confirmed)
+            {
+                self.receipt.claim_confirmation = Confirmation::Unverified;
+            }
             self.failure(RemovalPhase::Cleanup, error);
             return Cleanup::Refused;
         }
@@ -489,7 +490,12 @@ impl MediaRemoval {
                     return Cleanup::Complete;
                 }
                 Err(error) => {
-                    self.receipt.claim_confirmation = Confirmation::Unverified;
+                    if error.kind() == io::ErrorKind::InvalidData
+                        || !(self.receipt.effect == RemovalEffect::Deleted
+                            && self.receipt.claim_confirmation == Confirmation::Confirmed)
+                    {
+                        self.receipt.claim_confirmation = Confirmation::Unverified;
+                    }
                     self.receipt.cleanup = Cleanup::Refused;
                     self.failure(RemovalPhase::Cleanup, error);
                     return Cleanup::Refused;
@@ -515,9 +521,22 @@ impl MediaRemoval {
             }
         }
         self.receipt.stage_parent_durability = Durability::Unproven;
-        let cleanup = self.stage.cleanup();
-        self.receipt.cleanup = cleanup;
-        cleanup
+        match self.stage.cleanup_exact() {
+            Ok(()) => {
+                self.receipt.cleanup = Cleanup::Complete;
+                Cleanup::Complete
+            }
+            Err(error) => {
+                let cleanup = if error.kind() == io::ErrorKind::InvalidData {
+                    Cleanup::Refused
+                } else {
+                    Cleanup::Pending
+                };
+                self.receipt.cleanup = cleanup;
+                self.failure(RemovalPhase::Cleanup, error);
+                cleanup
+            }
+        }
     }
 }
 

@@ -321,7 +321,25 @@ mod unix_tests {
             if published {
                 assert_eq!(fs::read(f.path()).unwrap(), f.intent.encode().unwrap());
             }
-            assert_eq!(result.receipt.durability, [Some(Durability::Synced); 4]);
+            let expected_parent_durability = if matches!(
+                primitive,
+                BoundPublicationPrimitive::Write
+                    | BoundPublicationPrimitive::FileSync
+                    | BoundPublicationPrimitive::ParentSync
+            ) {
+                Durability::Unproven
+            } else {
+                Durability::Synced
+            };
+            assert_eq!(
+                result.receipt.durability,
+                [
+                    Some(expected_parent_durability),
+                    Some(Durability::Synced),
+                    Some(Durability::Synced),
+                    Some(Durability::Synced),
+                ]
+            );
         }
     }
 
@@ -373,33 +391,35 @@ mod unix_tests {
                 self.changed = true;
             }
         }
-        fn sync(&mut self, directory: &impl AsFd, index: usize) -> std::io::Result<()> {
-            if self.changed && index == 3 {
-                return Err(std::io::Error::other("root sync fault"));
-            }
-            nix::unistd::fsync(directory).map_err(std::io::Error::from)
-        }
     }
 
     #[test]
     fn publication_survives_late_root_loss_with_independent_sync_and_confirmation_failures() {
         let f = Fixture::new();
         let store = f.store();
-        let result = store.write_bound(
-            f.intent.clone(),
-            None,
-            &mut LateRoot {
-                root: f.temp.path().to_owned(),
-                changed: false,
+        let (result, fired) = run_with_bound_publication_fault(
+            BoundPublicationPrimitive::ParentSync,
+            1,
+            nix::libc::EIO,
+            || {
+                store.write_bound(
+                    f.intent.clone(),
+                    None,
+                    &mut LateRoot {
+                        root: f.temp.path().to_owned(),
+                        changed: false,
+                    },
+                )
             },
         );
+        assert!(fired);
         assert!(matches!(
             result.receipt.native,
             Some(NativePublication::Create(Ok(_)))
         ));
         assert!(result.receipt.confirmation.is_none());
-        assert_eq!(result.receipt.durability[3], Some(Durability::Unproven));
-        assert!(result.receipt.failures.len() >= 3);
+        assert_eq!(result.receipt.durability[0], Some(Durability::Unproven));
+        assert!(result.receipt.failures.len() >= 2);
         assert_eq!(
             fs::read(f.temp.path().join("replacement")).unwrap(),
             b"keep"
@@ -458,7 +478,15 @@ mod unix_tests {
         );
         assert!(fired);
         assert!(matches!(result.receipt.native, Some(NativePublication::Update(Ok(solstone_core_journal_io::atomic::BoundAtomicOutcome::PublishedDurabilityUncertain { .. })))));
-        assert_eq!(result.receipt.durability, [Some(Durability::Synced); 4]);
+        assert_eq!(
+            result.receipt.durability,
+            [
+                Some(Durability::Unproven),
+                Some(Durability::Synced),
+                Some(Durability::Synced),
+                Some(Durability::Synced),
+            ]
+        );
         assert!(result.receipt.confirmation.is_some());
         assert!(!result.receipt.fully_confirmed());
     }

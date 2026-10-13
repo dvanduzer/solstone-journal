@@ -58,13 +58,13 @@ impl TransactionOutcome<'_, '_> {
     fn retire_bound(
         &mut self,
         options: LockOptions,
-        hooks: &mut impl super::super::unix::Hooks,
+        _hooks: &mut impl super::super::unix::Hooks,
     ) -> Result<(), Hold> {
         use sha2::{Digest, Sha256};
         use solstone_core_journal_io::activity_obligations::{
             IntentRead, NativeObligation, intent_filename,
         };
-        use solstone_core_journal_io::media::{Cleanup, OriginalName, RemovalEffect};
+        use solstone_core_journal_io::media::{Cleanup, OriginalName, RemovalEffect, RemovalPhase};
         use std::path::Path;
 
         self.owner.native_check()?;
@@ -81,8 +81,11 @@ impl TransactionOutcome<'_, '_> {
                 ) && receipt.identity.is_none()
                     && self.record.as_ref().is_some_and(|record| {
                         record.intent.no_effect_outcome()
-                            && record.intent.outcome.as_ref()
-                                == Some(&solstone_core_retention::restore_intent::PublicationFacts::from(receipt))
+                            && record.intent.outcome.as_ref().is_some_and(|facts| {
+                                facts.matches_ignoring_cleanup(
+                                    &solstone_core_retention::restore_intent::PublicationFacts::from(receipt),
+                                )
+                            })
                     })
             });
         let record = self.record()?;
@@ -251,27 +254,34 @@ impl TransactionOutcome<'_, '_> {
         else {
             return Err(Hold::Retirement);
         };
-        *native =
-            NativeRetirement::Removal(Box::new(source.remove_observed(&name, &expected, stage)));
-        let (ancestors, failures) = self
+        let mut removal = Box::new(source.remove_observed(&name, &expected, stage));
+        if removal.receipt().cleanup != Cleanup::Complete {
+            removal.cleanup();
+        }
+        let source_durability = removal.receipt().source_durability;
+        *native = NativeRetirement::Removal(removal);
+        let prep_durability = self
             .record()?
             .store
             .as_ref()
             .ok_or(Hold::Retirement)?
-            .sync_facts(hooks);
+            .preparation_durability();
+        let ancestors = [
+            source_durability,
+            prep_durability[1],
+            prep_durability[2],
+            prep_durability[3],
+        ];
         let facts = self.retirement.as_mut().ok_or(Hold::Retirement)?;
         facts.ancestors = ancestors;
-        facts.failures = failures;
+        facts.failures = Vec::new();
         let confirmed_removal = matches!(&facts.native, NativeRetirement::Removal(removal)
             if removal.receipt().effect == RemovalEffect::Deleted
                 && removal.receipt().original_name == OriginalName::Absent
                 && removal.receipt().claim_confirmation == Confirmation::Confirmed
-                && removal.receipt().file_durability == Durability::Synced
                 && removal.receipt().source_durability == Durability::Synced
                 && removal.receipt().claim_durability == Durability::Synced
-                && removal.receipt().stage_parent_durability == Durability::Synced
-                && removal.receipt().cleanup == Cleanup::Complete
-                && removal.receipt().failures.is_empty());
+                && !removal.receipt().failures.iter().any(|f| f.phase != RemovalPhase::Cleanup));
         if !confirmed_removal || ancestors != [Durability::Synced; 4] || !facts.failures.is_empty()
         {
             return Err(Hold::Retirement);
