@@ -46,7 +46,9 @@ pub use awareness::{
     AwarenessStoreError, append_log, load_current, load_imports, read_log, record_import,
     record_import_nudge, record_import_offer_declined,
 };
-pub use connections_horizon::{ConnectionsHorizon, refresh_connections_horizon};
+pub use connections_horizon::{
+    ConnectionsHorizon, read_connections_horizon, refresh_connections_horizon,
+};
 pub use declaration::{
     DeclaredFacetInventory, DestinationObservation, FacetDeclarationSnapshot, FacetIdentityError,
     facet_declaration_entry, facet_write_identity, observe_declared_facet_inventory,
@@ -73,8 +75,9 @@ pub use facet_entities::{
     FacetEntityAttachResult, PreparedReviewAttachment, PreparedReviewPromotion, ScopedFacetEntity,
     add_entity_aka, attach_or_reactivate_entity, attach_or_reactivate_entity_for_owner,
     detach_facet_entity, list_scoped_facet_entities, list_scoped_facet_entities_tolerant,
-    prepare_review_promotion, publish_review_aliases, publish_review_attachment,
-    review_promotion_snapshot, update_facet_entity_description, update_facet_entity_identity,
+    list_scoped_facet_entities_tolerant_with_resolved_ids, prepare_review_promotion,
+    publish_review_aliases, publish_review_attachment, review_promotion_snapshot,
+    update_facet_entity_description, update_facet_entity_identity,
 };
 pub use facet_entity_move::{FacetEntityMoveResult, move_facet_entity};
 pub use facet_id::{

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -83,15 +84,14 @@ fn known_speakers(root: &Path) -> Vec<Speaker> {
             }
             let voiceprints =
                 load_voiceprints(&solstone_core_entity::entity_voiceprints_path(root, &dir).ok()?)?;
-            let mut streams = Vec::new();
-            let mut segments = Vec::new();
-            let mut last_seen = Vec::new();
+            let mut streams = BTreeSet::new();
+            let mut segments = BTreeSet::new();
+            let mut last_seen = None;
             for metadata in &voiceprints.metadata {
                 if let Some(stream) = metadata.get("stream").and_then(Value::as_str)
                     && !stream.is_empty()
-                    && !streams.iter().any(|known| known == stream)
                 {
-                    streams.push(stream.to_owned());
+                    streams.insert(stream.to_owned());
                 }
                 let day = metadata
                     .get("day")
@@ -102,22 +102,21 @@ fn known_speakers(root: &Path) -> Vec<Speaker> {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let segment = (day.to_owned(), segment_key.to_owned());
-                if !segments.contains(&segment) {
-                    segments.push(segment);
-                }
+                segments.insert(segment);
                 if let Some(last_seen_ts) = metadata.get("last_seen_ts").and_then(Value::as_i64) {
-                    last_seen.push(last_seen_ts);
+                    last_seen = Some(
+                        last_seen.map_or(last_seen_ts, |previous: i64| previous.max(last_seen_ts)),
+                    );
                 }
             }
-            streams.sort();
             let name = entity_name(&entity, &entity_id);
             Some(Speaker {
                 entity_id,
                 name,
                 embedding_count: voiceprints.embeddings.len(),
                 segment_count: segments.len(),
-                streams,
-                last_seen_ts: last_seen.into_iter().max(),
+                streams: streams.into_iter().collect(),
+                last_seen_ts: last_seen,
                 intra_cosine_p25: intra_cosine_p25(&voiceprints.embeddings),
             })
         })

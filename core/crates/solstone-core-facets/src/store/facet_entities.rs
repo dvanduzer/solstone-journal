@@ -3,7 +3,7 @@
 
 //! Facet-scoped entity reads and write-owner operations.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use chrono::{SecondsFormat, Utc};
@@ -92,6 +92,24 @@ pub fn list_scoped_facet_entities_tolerant(
     include_blocked: bool,
 ) -> Result<Vec<ScopedFacetEntity>, FacetEntityWriteError> {
     let map = read_identity_map(journal_root)?;
+    list_scoped_facet_entities_tolerant_with_resolved_ids(
+        journal_root,
+        facet_dir,
+        include_detached,
+        include_blocked,
+        &map.resolved,
+    )
+}
+
+/// Join multiple facets against one request's identity-map winners. The caller
+/// must obtain these from the identity map, preserving its collision policy.
+pub fn list_scoped_facet_entities_tolerant_with_resolved_ids(
+    journal_root: &Path,
+    facet_dir: &str,
+    include_detached: bool,
+    include_blocked: bool,
+    resolved: &HashMap<String, String>,
+) -> Result<Vec<ScopedFacetEntity>, FacetEntityWriteError> {
     let mut entities = Vec::new();
     for relationship_dir in list_facet_entity_directories(journal_root, facet_dir)? {
         let link = match read_facet_entity_link(journal_root, facet_dir, &relationship_dir) {
@@ -103,7 +121,7 @@ pub fn list_scoped_facet_entities_tolerant(
             continue;
         }
         let entity_id = link.entity_id().to_owned();
-        let Some(entity_dir) = map.resolved.get(&entity_id) else {
+        let Some(entity_dir) = resolved.get(&entity_id) else {
             continue;
         };
         let identity = match read_entity_identity(journal_root, entity_dir) {

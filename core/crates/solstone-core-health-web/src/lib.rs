@@ -25,6 +25,7 @@ mod journal_data;
 mod logs;
 pub mod search_index;
 mod talent_failures;
+mod work_view;
 
 #[derive(Clone)]
 pub struct Clock(Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>);
@@ -144,7 +145,7 @@ async fn state(root: PathBuf, clock: Clock) -> Response {
         let count = items.len();
         Json(json!({
             "work": {
-                "inventory": work.ok().flatten(),
+                "inventory": work.ok().flatten().map(work_view::summarize),
                 "error": work_error,
                 "retry_records": retry_records.into_iter().filter_map(|record| record.unit.id().ok().map(|id| json!({"id": id, "unit": record.unit, "reason": record.reason, "attempt": record.attempt}))).collect::<Vec<_>>(),
                 "retry_errors": retry_errors,
@@ -165,7 +166,16 @@ async fn state(root: PathBuf, clock: Clock) -> Response {
                 "stuck_rows": backlog::stuck_rows(backlog.as_ref()),
                 "copy": backlog::copy(),
             },
-            "search_index": search_index,
+            "search_index": {
+                "state": search_index.state,
+                "text": search_index.text,
+                "coverage": search_index.coverage,
+                "observed_failure": search_index.observed_failure,
+                "index_activity_at_ms": search_index.index_activity_at_ms,
+                "index": search_index.index,
+                "classification": search_index.classification,
+                "diagnostics": search_index.diagnostics,
+            },
             "agent_errors": {
                 "items": items,
                 "ok": ok,

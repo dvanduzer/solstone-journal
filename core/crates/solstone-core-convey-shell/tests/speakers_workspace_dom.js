@@ -239,6 +239,36 @@ async function teachingReachesPastDays(workspace) {
   check(JSON.stringify(context.asked) === JSON.stringify(['20261011', '20261010', '20261009', '20261008']), 'teaching stops once it has enough');
 }
 
+async function overviewFailuresStayUnavailable(workspace) {
+  const calls = [];
+  const failed = new Error('read failed');
+  const context = {
+    window: { apiJson: async () => { throw failed; }, SurfaceState: {
+      error: () => 'unavailable', serverMessageFrom: () => '',
+    }, CONVEY_COPY: { RELOAD_HINT: 'reload' } },
+    qualityRequestSeq: 0,
+    qualityPanel: { innerHTML: '' },
+    COPY: { SPK_OVERVIEW_QUALITY_ERROR_HEADING: '' },
+    OWNER_STATUS_ROUTING: { candidate: 'candidate', confirmed: 'confirmed' },
+    ownerStatusError: error => calls.push(['error', error]),
+    ownerNotReady: () => calls.push(['not-ready']),
+    ownerCandidate: () => calls.push(['candidate']),
+    ownerConfirmed: () => calls.push(['confirmed']),
+    pollRelabel: () => calls.push(['poll']),
+    renderQuality: () => calls.push(['quality']),
+  };
+  vm.createContext(context);
+  for (const name of ['loadOwner', 'loadQuality']) {
+    vm.runInContext(functionSource(workspace, name), context);
+  }
+  await vm.runInContext('loadOwner()', context);
+  check(calls.length === 1 && calls[0][0] === 'error' && calls[0][1] === failed,
+    'a failed owner read never becomes an unconfirmed owner or starts polling');
+  const result = await vm.runInContext('loadQuality()', context);
+  check(result === false && context.qualityPanel.innerHTML === 'unavailable' && calls.length === 1,
+    'a failed quality read never becomes zero progress');
+}
+
 async function main() {
   const manifestDir = process.argv[2];
   if (!manifestDir) throw new Error('manifest directory required');
@@ -271,6 +301,7 @@ async function main() {
   new vm.Script(dayScript, { filename: 'speakers-day.js' });
   check(true, 'the Speakers day script parses without syntax error');
   await teachingReachesPastDays(workspace);
+  await overviewFailuresStayUnavailable(workspace);
 
   console.log(`DOM CASES: ${cases} passed`);
 }

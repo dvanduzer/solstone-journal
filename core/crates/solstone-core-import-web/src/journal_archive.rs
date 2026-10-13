@@ -388,9 +388,13 @@ mod tests {
         let detail = include_str!("../assets/import_detail.js");
 
         assert!(!workspace.contains("data-facet="));
-        assert!(workspace.contains("function filterImportsBySource()"));
-        assert!(workspace.contains("row.dataset.sourceType === currentSourceFilter"));
-        assert!(workspace.contains("no-imports-filtered"));
+        assert!(workspace.contains("importSourceOptions = data.source_options;"));
+        assert!(workspace.contains(
+            "/app/import/api/list?page=1&per_page=${IMPORT_PAGE_SIZE}&source=${encodeURIComponent(currentSourceFilter)}"
+        ));
+        assert!(workspace.contains(
+            "/app/import/api/list?page=${nextPage}&per_page=${IMPORT_PAGE_SIZE}&source=${encodeURIComponent(currentSourceFilter)}"
+        ));
         assert!(!detail.contains("importJson.facet"));
         assert!(!detail.contains("kvRow(strings.facet,"));
         assert!(detail.contains("facets_created"));

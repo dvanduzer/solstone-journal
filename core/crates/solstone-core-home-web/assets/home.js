@@ -35,6 +35,10 @@
   let root = null;
   let surface = null;
   let lastPulse = null;
+  let pulseRequest = null;
+  let vitalsRequest = null;
+  let narrativeRequest = null;
+  let trailingPulseRefresh = null;
   let pulseReadVersion = 0;
   let pulseAppliedVersion = 0;
   let pulseReadFailed = false;
@@ -67,6 +71,15 @@
       return Promise.reject(new Error('home: apiJson unavailable'));
     }
     return window.apiJson(url);
+  }
+
+  // Initial paint and live updates share the same observation. Event bursts
+  // must not queue whole-journal reads while that observation is in flight.
+  function readPulse() {
+    if (!pulseRequest) {
+      pulseRequest = apiJson(PULSE_URL).finally(function () { pulseRequest = null; });
+    }
+    return pulseRequest;
   }
 
   function logError(error, context) {
@@ -209,7 +222,7 @@
     if (!surface) return;
     surface.innerHTML = surfaceLoading('loading your day…');
     const read = ++pulseReadVersion;
-    return apiJson(PULSE_URL)
+    return readPulse()
       .then(function (data) {
         if (read < pulseAppliedVersion) return;
         pulseAppliedVersion = read;
@@ -1072,8 +1085,15 @@
   }
 
   function refreshVitals() {
+    if (!vitalsRequest) {
+      vitalsRequest = readVitals().finally(function () { vitalsRequest = null; });
+    }
+    return vitalsRequest;
+  }
+
+  function readVitals() {
     const read = ++pulseReadVersion;
-    return apiJson(PULSE_URL)
+    return readPulse()
       .then(function (data) {
         if (read < pulseAppliedVersion) return;
         pulseAppliedVersion = read;
@@ -1102,8 +1122,15 @@
   }
 
   function refreshNarrative() {
+    if (!narrativeRequest) {
+      narrativeRequest = readNarrative().finally(function () { narrativeRequest = null; });
+    }
+    return narrativeRequest;
+  }
+
+  function readNarrative() {
     const read = ++pulseReadVersion;
-    return apiJson(PULSE_URL)
+    return readPulse()
       .then(function (data) {
         validatePulse(data);
         // A newer vitals read does not paint the narrative. Keep this
@@ -1363,11 +1390,24 @@
     refreshVitals();
   }
 
+  // A finished narrative or a recovered connection invalidates any earlier
+  // observation. Follow an in-flight read once, even if several events arrive.
+  function refreshChangedPulse() {
+    if (trailingPulseRefresh) return trailingPulseRefresh;
+    const pending = [pulseRequest, vitalsRequest, narrativeRequest].filter(Boolean);
+    const refresh = function () { return Promise.all([refreshVitals(), refreshNarrative()]); };
+    if (!pending.length) return refresh();
+    trailingPulseRefresh = Promise.allSettled(pending).then(function () {
+      trailingPulseRefresh = null;
+      return refresh();
+    });
+    return trailingPulseRefresh;
+  }
+
   function wireRealtime() {
     if (realtimeWired || !window.appEvents) return;
     const recover = connectionRecovery(function () {
-      refreshVitals();
-      refreshNarrative();
+      refreshChangedPulse();
       refreshBriefing();
     });
     window.appEvents.onConnectionState?.(function (state) {
@@ -1383,7 +1423,7 @@
       if (msg.event === 'observed' || msg.event === 'status') refreshVitals();
     });
     window.appEvents.listen('cortex', function (msg) {
-      if (msg.event === 'finish' && (msg.name === 'flow' || msg.name === 'pulse')) refreshNarrative();
+      if (msg.event === 'finish' && (msg.name === 'flow' || msg.name === 'pulse')) refreshChangedPulse();
       if (msg.event === 'finish' && msg.name === 'morning_briefing') refreshBriefing();
       if (msg.event === 'error') refreshVitals();
     });
