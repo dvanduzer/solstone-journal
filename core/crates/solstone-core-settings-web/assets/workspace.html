@@ -144,6 +144,12 @@
   margin: 0 0 0.5em 0;
 }
 
+#parakeetCppInstallNote > summary {
+  cursor: pointer;
+  min-height: 44px;
+  padding: 12px 0;
+}
+
 .settings-section-desc {
   color: var(--ink-soft);
   font-size: 0.85em;
@@ -1920,6 +1926,8 @@ button:focus:not(:focus-visible) {
 }
 
 .facet-detail-page {
+  background: var(--paper);
+  border-radius: 12px;
   box-sizing: border-box;
   flex: 1;
   max-width: 720px;
@@ -1948,6 +1956,7 @@ button:focus:not(:focus-visible) {
 }
 
 .facet-detail-heading-row {
+  flex-wrap: wrap;
   align-items: center;
   display: flex;
   gap: 0.75rem;
@@ -1955,6 +1964,9 @@ button:focus:not(:focus-visible) {
 }
 
 .facet-detail-heading {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
   color: var(--ink);
   font-size: 2rem;
   line-height: 1.15;
@@ -1962,11 +1974,18 @@ button:focus:not(:focus-visible) {
 }
 
 .facet-detail-swatch {
+  flex: none;
   border: 1px solid color-mix(in srgb, var(--ink) 16%, transparent);
   border-radius: 50%;
   display: inline-block;
   height: 1.25rem;
   width: 1.25rem;
+}
+
+@media (max-width: 480px) {
+  .facet-detail-heading { flex-basis: calc(100% - 2rem); }
+  .sapp { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 4px 14px; }
+  .sapp-open { grid-column: 2; }
 }
 
 .facet-mute-action {
@@ -2247,7 +2266,7 @@ button:focus:not(:focus-visible) {
         <span class="sapp-ic">◔</span>
         <span class="sapp-b">
           <span class="sapp-title">notifications</span>
-          <span class="sapp-desc">errors from background services that weren't shown as notifications. not a setting to open, just where those errors show up.</span>
+          <span class="sapp-desc">background errors that weren't shown as notifications.</span>
         </span>
         <span class="sapp-open">see in health ›</span>
       </a>
@@ -2436,12 +2455,15 @@ button:focus:not(:focus-visible) {
           </select>
           <small>runtime preference for the parakeet.cpp server on this host</small>
         </div>
-        <p class="settings-field-note" id="parakeetCppInstallNote">
-          parakeet-cpp fetches two artifacts into this journal's provider cache before it
-          can run, both from updates.solstone.app: the parakeet.cpp server binary (MIT)
-          and the speech model (CC-BY-4.0). see THIRD_PARTY_NOTICES.md. install with
-          <code>journal install-provider parakeet</code>.
-        </p>
+        <details class="settings-field-note" id="parakeetCppInstallNote">
+          <summary>installation and licenses</summary>
+          <p>
+            parakeet-cpp fetches two artifacts into this journal's provider cache before it
+            can run, both from updates.solstone.app: the parakeet.cpp server binary (MIT)
+            and the speech model (CC-BY-4.0). see THIRD_PARTY_NOTICES.md. install with
+            <code>journal install-provider parakeet</code>.
+          </p>
+        </details>
         <p class="settings-field-note" id="parakeetCppBundledNote" style="display:none">
           parakeet.cpp and its speech model come with the journal and run on your
           computer's processor, so there's nothing to install. see THIRD_PARTY_NOTICES.md.
@@ -3115,6 +3137,11 @@ document.getElementById('settingsAboutRetry').addEventListener('click', loadAbou
 document.getElementById('settingsAboutDevicesRetry').addEventListener('click', loadAbout);
 
 function switchSection(sectionId, updateHash = true, loadSection = true, replaceHash = false) {
+  if (sectionId === 'support') {
+    if (replaceHash) window.location.replace('/app/support/');
+    else window.location.assign('/app/support/');
+    return;
+  }
   // Validate section exists
   if (!VALID_SECTIONS.includes(sectionId)) {
     sectionId = 'guide';
