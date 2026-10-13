@@ -9,19 +9,18 @@ use serde_json::{Map, Value, json};
 use solstone_core_generate::{ContentPart, GenerateRequest};
 use solstone_core_local::HttpResponse;
 
-use crate::NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS;
 use crate::endpoint::EndpointTransportError;
 use crate::schema_prep::prepare_provider_schema;
 use crate::thinking::{
     AnthropicThinking, Thinking, anthropic_candidates, anthropic_refused_thinking, apply_anthropic,
     byo_thinking, shared_ceiling,
 };
+use crate::transport::{capture_provider_detail, request_timeout};
 
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
     "prompt is too long",
     "maximum context length",
@@ -76,27 +75,16 @@ impl AnthropicTransport for UreqAnthropicTransport {
         anthropic_version: &str,
         timeout: Duration,
     ) -> Result<HttpResponse, EndpointTransportError> {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_connect(Some(timeout))
-            .timeout_recv_response(Some(timeout))
-            .timeout_recv_body(Some(timeout))
-            .timeout_global(Some(timeout))
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
-        let response = agent
-            .post(&format!("{base_url}{path}"))
-            .header("Content-Type", "application/json")
-            .header("x-api-key", api_key)
-            .header("anthropic-version", anthropic_version)
-            .send(serde_json::to_string(body).expect("JSON value serializes"))
-            .map_err(classify_ureq_error)?;
-        let status = response.status().as_u16();
-        let body = response
-            .into_body()
-            .read_to_string()
-            .map_err(classify_ureq_error)?;
-        Ok(HttpResponse { status, body })
+        crate::transport::post_json(
+            base_url,
+            path,
+            body,
+            &[
+                ("x-api-key", api_key),
+                ("anthropic-version", anthropic_version),
+            ],
+            timeout,
+        )
     }
 }
 
@@ -221,14 +209,6 @@ fn request_body(
     body
 }
 
-/// The caller's timeout, else the lane default plus time for any thinking room.
-fn request_timeout(timeout_s: Option<f64>, thinking_room: u64) -> Duration {
-    timeout_s
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(Duration::from_secs_f64)
-        .unwrap_or(DEFAULT_TIMEOUT + crate::thinking::thinking_time(thinking_room))
-}
-
 fn parse_response(body: &str, secret: &str) -> AnthropicResult {
     let raw_snippet = capture_provider_detail(body, secret);
     let Ok(body) = serde_json::from_str::<Value>(body) else {
@@ -337,41 +317,11 @@ fn is_context_window_error(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn capture_provider_detail(body: &str, secret: &str) -> Option<String> {
-    if body.is_empty() {
-        return None;
-    }
-    let scrubbed = if secret.is_empty() {
-        body.to_owned()
-    } else {
-        body.replace(secret, "[redacted]")
-    };
-    Some(
-        scrubbed
-            .chars()
-            .take(NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS)
-            .collect(),
-    )
-}
-
 fn failure(reason_code: &str) -> AnthropicResult {
     AnthropicResult::Failed(AnthropicFailure {
         reason_code: Some(reason_code.to_owned()),
         detail: None,
     })
-}
-
-fn classify_ureq_error(error: ureq::Error) -> EndpointTransportError {
-    match error {
-        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed | ureq::Error::Io(_) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(_) => EndpointTransportError::Capacity,
-        _ => EndpointTransportError::Other,
-    }
 }
 
 #[cfg(test)]

@@ -54,6 +54,33 @@
   }
 
   async function runTests() {
+    const htmlValues = [
+      null, undefined, '', 0, false,
+      'name" data-injected="yes', "name' data-injected='yes",
+      'both " and \u0027 quotes', '<img src=x> & <script>text</scr' + 'ipt>',
+      '&amp; &quot; &#39;', 'caf\u00e9 \ud83d\ude00 \u65e5\u672c\u8a9e',
+      { toString() { return 'object " & <value>'; } }
+    ];
+    htmlValues.forEach((value, index) => {
+      const expected = String(value ?? '');
+      const escaped = window.AppServices.escapeHtml(value);
+      ['"', "'"].forEach(quote => {
+        const element = parse(`<span data-value=${quote}${escaped}${quote}>${escaped}</span>`);
+        assert(`HTML value ${index} with ${quote} quotes stays one attribute`, element.attributes.length === 1);
+        assert(`HTML value ${index} with ${quote} quotes preserves attribute`, element.getAttribute('data-value') === expected);
+        assert(`HTML value ${index} with ${quote} quotes preserves text`, element.textContent === expected && element.children.length === 0);
+      });
+    });
+
+    const quotedValue = 'value" data-injected="yes & <tag>';
+    const quotedState = parse(window.SurfaceState.error({
+      heading: quotedValue,
+      detail: { correlationId: quotedValue }
+    }));
+    assert('shared state heading preserves quoted text', quotedState.querySelector('.surface-state-heading').textContent === quotedValue);
+    assert('shared state reference preserves quoted value', quotedState.querySelector('[data-copy-value]').getAttribute('data-copy-value') === quotedValue);
+    assert('shared state reference adds no attribute', !quotedState.querySelector('[data-injected]'));
+
     const basic = parse(window.SurfaceState.error({ heading: 'Oops', desc: 'Reload later.' }));
     assert('error wrapper uses alert role', basic.getAttribute('role') === 'alert');
     assert('error omits server message when absent', !basic.querySelector('.surface-state-server-message'));

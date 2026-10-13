@@ -79,12 +79,7 @@ window.SurfaceState = (() => {
   const BROWSER_ERROR_NAMES = new Set(['TypeError', 'AbortError', 'TimeoutError', 'NetworkError', 'SyntaxError']);
 
   function escapeHtml(value) {
-    return String(value ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
+    return window.AppServices.escapeHtml(value);
   }
 
   function normalizeHeadingLevel(level) {
@@ -1387,13 +1382,15 @@ window.AppServices = {
   },
 
   /**
-   * Escape a value for safe interpolation into HTML. DOM-based (routes
-   * through textContent/innerHTML). Nullish-safe: null/undefined become ''.
+   * Escape a value for HTML text or quoted attributes. Nullish values become ''.
    */
   escapeHtml(value) {
-    const div = document.createElement('div');
-    div.textContent = String(value ?? '');
-    return div.innerHTML;
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   },
 
   /**
