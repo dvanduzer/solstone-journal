@@ -347,6 +347,7 @@ window.CUR_COPY = CUR_COPY;
 (function() {
   const root = document.querySelector('[data-curation-root]');
   if (!root) return;
+  const escapeHtml = window.AppServices.escapeHtml;
 
   // G2-35: server-resolved slug -> declared-title map (the same source
   // thinking's runs facet filter reads), refreshed on every state load.
@@ -543,11 +544,11 @@ window.CUR_COPY = CUR_COPY;
     const evidenceProps = window.CurationEvidence.buildEvidenceDrawerProps(group);
     const evidenceHtml = evidenceProps ? window.Drawer.render(evidenceProps) : '';
     return `
-      <article class="curation-item" data-curation-item data-kind="facet_candidate" data-name-key="${escapeAttr(group.key)}" data-name-keys="${escapeAttr(JSON.stringify(group.keys))}">
+      <article class="curation-item" data-curation-item data-kind="facet_candidate" data-name-key="${escapeHtml(group.key)}" data-name-keys="${escapeHtml(JSON.stringify(group.keys))}">
         <p class="curation-body">${escapeHtml(copyFormat(CUR_COPY.CUR_FACET_BODY, {name: group.display}))}${facetAlsoSeenAsHtml(group.names)}</p>
         <div class="curation-actions">
-          <button class="curation-button curation-button-primary" type="button" data-action="facet-accept" data-name-key="${escapeAttr(group.key)}">${escapeHtml(CUR_COPY.CUR_FACET_CREATE_ACTION)}</button>
-          <button class="curation-button" type="button" data-action="facet-dismiss" data-name-key="${escapeAttr(group.key)}">${escapeHtml(CUR_COPY.CUR_FACET_DISMISS_ACTION)}</button>
+          <button class="curation-button curation-button-primary" type="button" data-action="facet-accept" data-name-key="${escapeHtml(group.key)}">${escapeHtml(CUR_COPY.CUR_FACET_CREATE_ACTION)}</button>
+          <button class="curation-button" type="button" data-action="facet-dismiss" data-name-key="${escapeHtml(group.key)}">${escapeHtml(CUR_COPY.CUR_FACET_DISMISS_ACTION)}</button>
         </div>
         ${evidenceHtml}
         <p class="curation-item-error" hidden></p>
@@ -602,9 +603,9 @@ window.CUR_COPY = CUR_COPY;
     const multiFacet = group.facets.length > 1;
     const dismissAttrs = multiFacet
       ? `data-action="entity-dismiss-group"`
-      : `data-action="entity-dismiss" data-facet="${escapeAttr(group.facets[0])}" data-source-slug="${escapeAttr(group.source_slug)}" data-target-slug="${escapeAttr(group.target_slug)}"`;
+      : `data-action="entity-dismiss" data-facet="${escapeHtml(group.facets[0])}" data-source-slug="${escapeHtml(group.source_slug)}" data-target-slug="${escapeHtml(group.target_slug)}"`;
     return `
-      <article class="curation-item" data-curation-item data-kind="entity_merge" data-facets='${escapeAttr(JSON.stringify(group.facets))}' data-source-slug="${escapeAttr(group.source_slug)}" data-target-slug="${escapeAttr(group.target_slug)}" data-source="${escapeAttr(group.source)}" data-target="${escapeAttr(group.target)}">
+      <article class="curation-item" data-curation-item data-kind="entity_merge" data-facets='${escapeHtml(JSON.stringify(group.facets))}' data-source-slug="${escapeHtml(group.source_slug)}" data-target-slug="${escapeHtml(group.target_slug)}" data-source="${escapeHtml(group.source)}" data-target="${escapeHtml(group.target)}">
         <label class="curation-select">
           <span class="curation-tap-target"><input type="checkbox" data-action="entity-select"></span>
           <span class="curation-body">${escapeHtml(copyFormat(CUR_COPY.CUR_ENTITY_BODY, {a: group.source, b: group.target}))}</span>
@@ -664,27 +665,27 @@ window.CUR_COPY = CUR_COPY;
       const count = fMembers.reduce((n, m) => n + m.occurrence_count, 0);
       return `
         <label class="curation-select">
-          <span class="curation-tap-target"><input type="checkbox" data-action="ambiguity-family-select" data-member-ids='${escapeAttr(JSON.stringify(memberIds))}' checked></span>
+          <span class="curation-tap-target"><input type="checkbox" data-action="ambiguity-family-select" data-member-ids='${escapeHtml(JSON.stringify(memberIds))}' checked></span>
           <span class="curation-body">${escapeHtml(copyFormat(CUR_COPY.CUR_AMBIGUITY_BODY, {query: displayQuery}))}<span class="curation-item-facets"> · ${count} ${count === 1 ? 'occurrence' : 'occurrences'} · ${escapeHtml(facets.length ? formatFacetList(facets) : 'journal')}</span></span>
         </label>
       `;
     }).join('');
 
     return `
-      <article class="curation-item" data-curation-item data-kind="ambiguity_group" data-revision="${escapeAttr(group.revision)}">
+      <article class="curation-item" data-curation-item data-kind="ambiguity_group" data-revision="${escapeHtml(group.revision)}">
         <div class="curation-group-families">
           ${familiesHtml}
         </div>
         <div class="curation-actions">
           ${candidates.map((candidate) => `
-            <button class="curation-button curation-button-primary" type="button" data-action="ambiguity-group-resolve" data-entity-id="${escapeAttr(candidate.id)}">
+            <button class="curation-button curation-button-primary" type="button" data-action="ambiguity-group-resolve" data-entity-id="${escapeHtml(candidate.id)}">
               ${escapeHtml(copyFormat(CUR_COPY.CUR_AMBIGUITY_CHOOSE_ACTION, {name: candidate.name}))}
             </button>
           `).join('')}
         </div>
         <details class="curation-origin-details"><summary>individual questions and sources</summary>
           ${members.map(m => `<div><p>${escapeHtml(m.query)} · ${escapeHtml(m.scope?.facet ? formatFacetList([m.scope.facet]) : 'journal')} · ${m.occurrence_count} occurrences</p>
-            <button class="curation-button" type="button" data-action="ambiguity-dismiss" data-ambiguity-id="${escapeAttr(m.ambiguity_id)}">${escapeHtml(CUR_COPY.CUR_AMBIGUITY_DISMISS_ACTION)}</button>
+            <button class="curation-button" type="button" data-action="ambiguity-dismiss" data-ambiguity-id="${escapeHtml(m.ambiguity_id)}">${escapeHtml(CUR_COPY.CUR_AMBIGUITY_DISMISS_ACTION)}</button>
             <ul>${(m.origins || []).map(o => `<li>${escapeHtml([o.day, o.facet, o.lane, o.field].filter(Boolean).join(' · '))}</li>`).join('')}</ul></div>`).join('')}
         </details>
         <p class="curation-item-error" hidden></p>
@@ -714,11 +715,11 @@ window.CUR_COPY = CUR_COPY;
     };
     const at = item.review?.suppression?.at || item.review?.choice?.at || '';
     return `
-      <article class="curation-item" data-review-history data-kind="${escapeAttr(item.kind)}" data-restore-id="${escapeAttr(item.restore_id || item.key)}" data-target="${escapeAttr(target)}">
+      <article class="curation-item" data-review-history data-kind="${escapeHtml(item.kind)}" data-restore-id="${escapeHtml(item.restore_id || item.key)}" data-target="${escapeHtml(target)}">
         <p class="curation-body">${escapeHtml(label)} <span class="curation-item-facets"> · ${escapeHtml(reasons[item.reason] || item.reason)}</span></p>
-        ${at ? `<p class="curation-item-facets"><time datetime="${escapeAttr(at)}">${formatCurationTime(at)}</time></p>` : ''}
+        ${at ? `<p class="curation-item-facets"><time datetime="${escapeHtml(at)}">${formatCurationTime(at)}</time></p>` : ''}
         <div class="curation-actions">
-          <button class="curation-button" type="button" data-action="review-restore" data-restore='${escapeAttr(JSON.stringify(item.restore))}'>${escapeHtml(CUR_COPY.CUR_REVIEW_RESTORE_ACTION || 'restore to review')}</button>
+          <button class="curation-button" type="button" data-action="review-restore" data-restore='${escapeHtml(JSON.stringify(item.restore))}'>${escapeHtml(CUR_COPY.CUR_REVIEW_RESTORE_ACTION || 'restore to review')}</button>
         </div>
         <details class="curation-origin-details"><summary>source evidence</summary><ul>${(item.evidence?.ranked_candidates || []).map(c => `<li>${escapeHtml(c.name)} · ${escapeHtml(String(c.score))}</li>`).join('')}${(item.evidence?.origins || []).map(o => `<li>${escapeHtml([o.day, o.facet, o.lane, o.field].filter(Boolean).join(' · '))}</li>`).join('')}</ul><p>${escapeHtml(item.evidence?.summary || '')}</p></details>
         <p class="curation-item-error" hidden></p>
@@ -759,7 +760,7 @@ window.CUR_COPY = CUR_COPY;
 
   function speakerCandidatePairItemHtml(item) {
     return `
-      <article class="curation-item" data-curation-item data-kind="speaker_candidate_pair" data-key="${escapeAttr(item.key)}" data-anchor-a="${escapeAttr(item.source_slug)}" data-anchor-b="${escapeAttr(item.target_slug)}">
+      <article class="curation-item" data-curation-item data-kind="speaker_candidate_pair" data-key="${escapeHtml(item.key)}" data-anchor-a="${escapeHtml(item.source_slug)}" data-anchor-b="${escapeHtml(item.target_slug)}">
         <p class="curation-body">${escapeHtml(CUR_COPY.CUR_SPEAKER_CANDIDATE_PAIR_BODY)}</p>
         ${speakerCandidatePairEvidenceHtml(item)}
         <div class="curation-actions">
@@ -1055,19 +1056,6 @@ window.CUR_COPY = CUR_COPY;
     });
   }
 
-  function escapeHtml(value) {
-    const holder = document.createElement('div');
-    holder.textContent = value == null ? '' : String(value);
-    return holder.innerHTML;
-  }
-
-  // Attribute values here are interpolated into both double- and single-quoted
-  // attributes, so both quote characters have to go. This is the same set
-  // curation_evidence.js escapes; keep them together.
-  function escapeAttr(value) {
-    return escapeHtml(value).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
   function removeItem(item) {
     if (!item) return;
     item.dataset.removing = 'true';
@@ -1209,9 +1197,9 @@ window.CUR_COPY = CUR_COPY;
 
   function payloadAttrs(payload) {
     if (payload.facet !== undefined) {
-      return `data-facet="${escapeAttr(payload.facet)}" data-source-slug="${escapeAttr(payload.source_slug)}" data-target-slug="${escapeAttr(payload.target_slug)}"`;
+      return `data-facet="${escapeHtml(payload.facet)}" data-source-slug="${escapeHtml(payload.source_slug)}" data-target-slug="${escapeHtml(payload.target_slug)}"`;
     }
-    return `data-key="${escapeAttr(payload.key)}" data-source-id="${escapeAttr(payload.source_id)}" data-target-id="${escapeAttr(payload.target_id)}"`;
+    return `data-key="${escapeHtml(payload.key)}" data-source-id="${escapeHtml(payload.source_id)}" data-target-id="${escapeHtml(payload.target_id)}"`;
   }
 
   function previewRows(preview) {
@@ -1256,7 +1244,7 @@ window.CUR_COPY = CUR_COPY;
     // G2-26: a merge across more than one facet-scoped suggestion for the
     // same pair confirms as one grouped action, not a re-run per facet.
     const confirmAttrs = groupFacets && groupFacets.length > 1
-      ? `data-action="entity-accept-group" data-source-slug="${escapeAttr(payload.source_slug)}" data-target-slug="${escapeAttr(payload.target_slug)}" data-facets='${escapeAttr(JSON.stringify(groupFacets))}'`
+      ? `data-action="entity-accept-group" data-source-slug="${escapeHtml(payload.source_slug)}" data-target-slug="${escapeHtml(payload.target_slug)}" data-facets='${escapeHtml(JSON.stringify(groupFacets))}'`
       : `data-action="${escapeHtml(acceptAction)}" ${payloadAttrs(payload)}`;
     previewNode.innerHTML = `
       <p class="curation-preview-lead">${escapeHtml(CUR_COPY.CUR_ENTITY_PREVIEW_LEAD)}</p>
