@@ -56,33 +56,42 @@ impl CarrierOwner {
                 }
             }
             owner.revalidate_empty()?;
-            step(MediaPrimitive::CarrierStageSync)?;
-            owner.revalidate_empty()?;
-            owner
-                .stage
-                .as_ref()
-                .and_then(|stage| stage.directory.as_ref())
-                .expect("validated directory retained")
-                .inner
-                .sync()?;
-            receipt.stage_durability = Durability::Synced;
-            owner.revalidate_empty()?;
-            step(MediaPrimitive::CarrierRootSync)?;
-            owner.revalidate_empty()?;
-            owner
-                .stage
-                .as_ref()
-                .expect("validated stage retained")
-                .parent
-                .inner
-                .sync()?;
-            receipt.root_durability = Durability::Synced;
+            if owner.flushes_directories() {
+                step(MediaPrimitive::CarrierStageSync)?;
+                owner.revalidate_empty()?;
+                owner
+                    .stage
+                    .as_ref()
+                    .and_then(|stage| stage.directory.as_ref())
+                    .expect("validated directory retained")
+                    .inner
+                    .sync()?;
+                receipt.stage_durability = Durability::Synced;
+                owner.revalidate_empty()?;
+                step(MediaPrimitive::CarrierRootSync)?;
+                owner.revalidate_empty()?;
+                owner
+                    .stage
+                    .as_ref()
+                    .expect("validated stage retained")
+                    .parent
+                    .inner
+                    .sync()?;
+                receipt.root_durability = Durability::Synced;
+            }
             step(MediaPrimitive::CarrierConfirmation)?;
             owner.revalidate_empty()?;
             receipt.confirmation = Confirmation::Confirmed;
             Ok(())
         })();
         (owner, receipt, result)
+    }
+
+    /// Windows has no directory flush. A teardown carrier there is confirmed
+    /// but its durability stays `Unproven`; every other carrier still requires
+    /// a flush, so it can't be prepared on Windows.
+    fn flushes_directories(&self) -> bool {
+        cfg!(not(windows)) || matches!(self.activity, StageLease::Activity(_))
     }
 
     fn activity(&self) -> &Arc<ActivityLease> {
@@ -142,13 +151,17 @@ impl CarrierOwner {
             return receipt;
         }
         receipt.effect = ActivityCarrierRetirementEffect::Removed;
-        let flush = step(MediaPrimitive::CarrierRetirementRootSync)
-            .and_then(|()| stage.parent.revalidate())
-            .and_then(|()| stage.parent.inner.sync());
-        match flush {
-            Ok(()) => receipt.root_durability = Durability::Synced,
-            Err(error) => receipt.failures.push(error),
+        if self.flushes_directories() {
+            let stage = self.stage.as_mut().expect("validated stage retained");
+            let flush = step(MediaPrimitive::CarrierRetirementRootSync)
+                .and_then(|()| stage.parent.revalidate())
+                .and_then(|()| stage.parent.inner.sync());
+            match flush {
+                Ok(()) => receipt.root_durability = Durability::Synced,
+                Err(error) => receipt.failures.push(error),
+            }
         }
+        let stage = self.stage.as_mut().expect("validated stage retained");
         // A flush error does not erase an independently confirmable removal.
         let confirmation = (|| {
             step(MediaPrimitive::CarrierRetirementConfirmation)?;
@@ -599,30 +612,37 @@ pub(crate) fn retire_recovered(
 /// every reservation, since an interrupted restore may name one. Removal is
 /// rmdir, so a reservation holding anything stays an unresolved obligation.
 pub fn retire_orphan_root_carriers(activity: &Arc<ActivityLease>) -> usize {
-    // Only the local-storage retirement below mutates the count.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+    retire_orphans_under(&StageLease::Activity(Arc::clone(activity)))
+}
+
+/// The same retirement under a teardown's own lease, before it observes
+/// anything, so a teardown that ended mid-run doesn't hold the next one.
+pub fn retire_orphan_root_carriers_for_teardown(lease: &Arc<TeardownLease>) -> usize {
+    retire_orphans_under(&StageLease::Teardown(Arc::clone(lease)))
+}
+
+fn retire_orphans_under(lease: &StageLease) -> usize {
     let mut retired = 0;
     // A refusal or error retires nothing further; the caller's census decides.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    retire_orphans(activity, &mut retired).unwrap_or_default();
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = activity;
+    retire_orphans(lease, &mut retired).unwrap_or_default();
     retired
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn retire_orphans(activity: &Arc<ActivityLease>, retired: &mut usize) -> io::Result<()> {
+fn retire_orphans(lease: &StageLease, retired: &mut usize) -> io::Result<()> {
     use crate::activity_obligations::{NativeObligation, observe_obligations};
     use crate::journal_root::JournalEntryKind;
 
-    activity
-        .revalidate()
-        .map_err(crate::activity::ActivityAdmissionError::into_io)?;
-    if !exclusive_local_activity(activity)? {
+    let revalidate = || {
+        lease
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)
+    };
+    revalidate()?;
+    if !exclusive_local(lease.journal_root(), &revalidate)? {
         return Ok(());
     }
-    let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
-    let census = observe_obligations(activity.journal_root()).map_err(io::Error::other)?;
+    let root = MediaDirectory::open(lease.journal_root().clone(), Path::new(""))?;
+    let census = observe_obligations(lease.journal_root()).map_err(io::Error::other)?;
     let entries = census.entries();
     if entries
         .iter()
@@ -637,37 +657,42 @@ fn retire_orphans(activity: &Arc<ActivityLease>, retired: &mut usize) -> io::Res
         if relative != Path::new(&entry.name) || entry.kind != JournalEntryKind::Directory {
             continue;
         }
-        activity
-            .revalidate()
-            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
-        let removed = root
-            .inner
-            .open_child(&entry.name)
-            .and_then(|child| match child {
-                Some(child) if child.identity() == entry.identity => {
-                    platform::remove_directory(&root.inner, &entry.name, &child).map(|()| true)
-                }
-                _ => Ok(false),
-            });
-        if matches!(removed, Ok(true)) {
+        revalidate()?;
+        if matches!(
+            platform::remove_empty_child(&root.inner, &entry.name, entry.identity),
+            Ok(true)
+        ) {
             *retired += 1;
         }
     }
+    // Windows has no directory flush; the removal itself was confirmed.
+    #[cfg(not(windows))]
     if *retired > 0 {
         root.sync()?;
     }
     Ok(())
 }
 
-/// Whether holding this lease excludes every writer of its journal: Linux, on
-/// local storage only. Elsewhere nothing an ended owner left may be retired.
+/// Whether holding this lease excludes every writer of its journal: Linux and
+/// macOS on local storage only, and Windows, whose journal roots are only ever
+/// admitted on fixed local NTFS or ReFS volumes outside Cloud Files sync roots.
+/// Elsewhere nothing an ended owner left may be retired.
 pub fn exclusive_local_activity(activity: &Arc<ActivityLease>) -> io::Result<bool> {
-    #[cfg(target_os = "linux")]
-    {
+    exclusive_local(activity.journal_root(), &|| {
         activity
             .revalidate()
-            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
-        let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
+            .map_err(crate::activity::ActivityAdmissionError::into_io)
+    })
+}
+
+fn exclusive_local(
+    journal_root: &Arc<JournalRoot>,
+    revalidate: &dyn Fn() -> io::Result<()>,
+) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        revalidate()?;
+        let root = MediaDirectory::open(journal_root.clone(), Path::new(""))?;
         Ok(local_storage(
             nix::sys::statfs::fstatfs(&root.inner)?.filesystem_type(),
         ))
@@ -676,23 +701,27 @@ pub fn exclusive_local_activity(activity: &Arc<ActivityLease>) -> io::Result<boo
     // (smbfs, nfs, afpfs, webdav, macfuse) can hold another host's writers.
     #[cfg(target_os = "macos")]
     {
-        activity
-            .revalidate()
-            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        revalidate()?;
         // A synced folder is APFS here, but another Mac may write it too.
-        let canonical = activity.journal_root().canonical_path().to_string_lossy();
+        let canonical = journal_root.canonical_path().to_string_lossy();
         if canonical.contains("/Library/CloudStorage/")
             || canonical.contains("/Library/Mobile Documents/")
         {
             return Ok(false);
         }
-        let root = MediaDirectory::open(activity.journal_root().clone(), Path::new(""))?;
+        let root = MediaDirectory::open(journal_root.clone(), Path::new(""))?;
         let stat = nix::sys::statfs::fstatfs(&root.inner)?;
         Ok(matches!(stat.filesystem_type_name(), "apfs" | "hfs"))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
     {
-        let _ = activity;
+        revalidate()?;
+        journal_root.revalidate().map_err(io::Error::other)?;
+        Ok(true)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = (journal_root, revalidate);
         Ok(false)
     }
 }
@@ -753,6 +782,7 @@ pub fn retire_unrecorded_stage_where(
 }
 
 enum Leaf<'a> {
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Exact(&'a OsStr, Option<MediaIdentity>),
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Accepted(&'a dyn Fn(&OsStr) -> bool),

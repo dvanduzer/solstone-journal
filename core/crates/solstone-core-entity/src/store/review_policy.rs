@@ -825,7 +825,7 @@ pub fn record_ambiguity_group_choice(
         if chosen_entity.is_none_or(|entity| entity.blocked) {
             return Err(EntityWriteError::AmbiguityChoiceInvalid {
                 entity_id: request.entity_id.clone(),
-                detail: "chosen entity is unavailable or blocked".to_owned(),
+                detail: "chosen entity is unavailable or hidden".to_owned(),
             });
         }
 
@@ -887,7 +887,7 @@ pub fn record_ambiguity_group_choice(
                 return Err(EntityWriteError::AmbiguityChoiceInvalid {
                     entity_id: request.entity_id.clone(),
                     detail: format!(
-                        "entity {} is blocked for member {member_id}",
+                        "entity {} is hidden for member {member_id}",
                         request.entity_id
                     ),
                 });

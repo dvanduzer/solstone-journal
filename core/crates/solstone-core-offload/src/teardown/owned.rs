@@ -7,16 +7,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use solstone_core_backup::archive_admission::{AdmissionError, ArchiveCancellation, Clock};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_backup::teardown_configuration::BindingRemovalReceipt;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use solstone_core_backup_runtime::resolve_restic_member;
 use solstone_core_backup_runtime::teardown::owned::{
     RemoteTeardownReport, TeardownOperation, TeardownRemoteRefusal,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use solstone_core_backup_runtime::teardown_admission::admit_teardown;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_backup_runtime::teardown_admission::{
     BindingTeardownAdmission, BoundTeardownAdmission, TeardownBindingFailure,
     TeardownBindingRefusal, TeardownFinishAdmission,
@@ -59,7 +59,7 @@ pub enum TeardownRunRefusal {
     Remote(TeardownRemoteRefusal),
     Clear,
     Binding,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Finish(TeardownBindingRefusal),
     CarrierShared,
     RetirementUncertain,
@@ -92,7 +92,7 @@ pub struct SettledTeardownReport {
     attempts: TeardownAttemptJournal,
     publication: Arc<BoundConfigPublication>,
     /// None for own storage, which has no hosted binding.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     binding: Option<Arc<BindingRemovalReceipt>>,
     retirement: ActivityCarrierRetirementReceipt,
 }
@@ -107,7 +107,7 @@ impl SettledTeardownReport {
     pub fn publication(&self) -> &BoundConfigPublication {
         &self.publication
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn binding(&self) -> Option<&BindingRemovalReceipt> {
         self.binding.as_deref()
     }
@@ -125,7 +125,7 @@ struct Outside {
     carrier: Option<Arc<RootTeardownCarrier>>,
     attempts: TeardownAttemptJournal,
     publication: Option<Arc<BoundConfigPublication>>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     binding: Option<Arc<BindingRemovalReceipt>>,
     retirement: Option<ActivityCarrierRetirement<RootTeardownCarrier>>,
 }
@@ -141,12 +141,12 @@ impl Outside {
             carrier: None,
             attempts: TeardownAttemptJournal::default(),
             publication: None,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             binding: None,
             retirement: None,
         }
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn remaining(&self) -> Result<(), TeardownRunRefusal> {
         self.operation
             .as_ref()
@@ -159,22 +159,25 @@ impl Outside {
 
 // Refused platforms expose the same closed custody views without constructing
 // executing phases.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 enum PhaseOwner {
     Admission(Box<TeardownAdmission>),
     CarrierFailure(Box<TeardownCarrierFailure>),
     Carrier(Box<CarrierTeardownAdmission>),
     ClearFailure(Box<TeardownClearFailure>),
     Cleared(Box<ClearedTeardownAdmission>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Guarded(Box<BindingTeardownAdmission>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Bound(Box<BoundTeardownAdmission>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     BindingFailure(Box<TeardownBindingFailure>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Finish(Box<TeardownFinishAdmission>),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CarrierMismatch {
         finish: Box<TeardownFinishAdmission>,
         operational: Arc<RootTeardownCarrier>,
@@ -237,7 +240,7 @@ impl OwnedTeardownOutcome {
             _ => self.held()?.outside.publication.as_deref(),
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn binding(&self) -> Option<&BindingRemovalReceipt> {
         match self {
             Self::Finished(report) => report.binding(),
@@ -291,21 +294,21 @@ impl OwnedTeardownOutcome {
             _ => None,
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn guarded(&self) -> Option<&BindingTeardownAdmission> {
         match self.held()?.owner.as_ref()? {
             PhaseOwner::Guarded(owner) => Some(owner),
             _ => None,
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn bound(&self) -> Option<&BoundTeardownAdmission> {
         match self.held()?.owner.as_ref()? {
             PhaseOwner::Bound(owner) => Some(owner),
             _ => None,
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn finish_admission(&self) -> Option<&TeardownFinishAdmission> {
         match self.held()?.owner.as_ref()? {
             PhaseOwner::Finish(owner) => Some(owner),
@@ -313,7 +316,7 @@ impl OwnedTeardownOutcome {
             _ => None,
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn additional_carrier(&self) -> Option<&Arc<RootTeardownCarrier>> {
         match self.held()?.owner.as_ref()? {
             PhaseOwner::CarrierMismatch { operational, .. } => Some(operational),
@@ -326,7 +329,7 @@ impl OwnedTeardownOutcome {
             _ => None,
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn binding_failure(&self) -> Option<&TeardownBindingFailure> {
         match self.held()?.owner.as_ref()? {
             PhaseOwner::BindingFailure(owner) => Some(owner),
@@ -352,9 +355,9 @@ impl OwnedTeardownOutcome {
         let remote_untouched = self.remote().is_none_or(|remote| {
             remote.phase() == RemoteTeardownPhase::NotStarted && !remote.broker_attempted()
         });
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let no_binding = held.outside.binding.is_none();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let no_binding = true;
         owner_unreserved
             && remote_untouched
@@ -388,7 +391,7 @@ fn held(
     }))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn unknown(
     outside: Outside,
     owner: Option<PhaseOwner>,
@@ -404,7 +407,7 @@ fn unknown(
 
 /// Every journal writer that could change cataloged media takes the same exclusive
 /// activity lock this teardown holds, and the coverage reader runs again at each
-/// destructive boundary. Windows is refused before root admission or WAN.
+/// destructive boundary.
 pub fn run_owned_teardown(
     journal: &Path,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -412,11 +415,11 @@ pub fn run_owned_teardown(
     version: &str,
 ) -> OwnedTeardownOutcome {
     let outside = Outside::new(clock, cancellation);
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         execute(journal, outside, version)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (journal, version);
         held(
@@ -428,7 +431,7 @@ pub fn run_owned_teardown(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardownOutcome {
     use solstone_core_journal_io::media::{
         ActivityCarrierRetirementEffect, Confirmation, Durability,
@@ -749,8 +752,10 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
         .as_ref()
         .expect("actual retirement")
         .receipt;
+    // Windows has no directory flush, so there an exactly removed and
+    // confirmed carrier is accepted with its root unflushed.
     if receipt.effect() != ActivityCarrierRetirementEffect::Removed
-        || receipt.root_durability() != Durability::Synced
+        || !(receipt.root_durability() == Durability::Synced || cfg!(windows))
         || receipt.confirmation() != Confirmation::Confirmed
         || !receipt.failures().is_empty()
     {
@@ -808,13 +813,13 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
 #[cfg(all(
     test,
     feature = "full-tests",
-    any(target_os = "linux", target_os = "macos")
+    any(target_os = "linux", target_os = "macos", windows)
 ))]
 thread_local! {
     static PANIC_AT: std::cell::Cell<Option<TeardownRunPhase>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn test_cut(phase: TeardownRunPhase) {
     #[cfg(all(test, feature = "full-tests"))]
     PANIC_AT.with(|cut| {
@@ -829,6 +834,6 @@ fn test_cut(phase: TeardownRunPhase) {
 #[cfg(all(
     test,
     feature = "full-tests",
-    any(target_os = "linux", target_os = "macos")
+    any(target_os = "linux", target_os = "macos", windows)
 ))]
 mod tests;

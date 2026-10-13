@@ -99,7 +99,7 @@ pub fn prepare_observation_batch(
         .into_iter()
         .find(|entity| entity.relationship_dir == entity_dir && !entity.detached && !entity.blocked)
         .ok_or_else(|| ObservationWriteError::Conflict {
-            message: "observation target is not attached and unblocked".into(),
+            message: "observation target is not attached or is hidden".into(),
         })?;
     let before = read_facet_entity_observations(root, facet, &entity_dir).map_err(|e| {
         ObservationWriteError::Read(ObservationStoreError::Read(

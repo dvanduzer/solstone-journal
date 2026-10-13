@@ -24,7 +24,7 @@ solstone call entities <command> [args...]
 
 - **Detected**: day-scoped, ephemeral observations captured for a specific day.
 - **Attached**: persistent entities tracked long-term in a facet.
-- **Blocked**: entities the owner has blocked; do not detect, attach, or reuse.
+- **Hidden**: entities the owner has hidden (`blocked: true`); do not detect, attach, or reuse. Explicit reads can still return them with their status.
 - **Detached**: entities the owner removed; do not re-attach automatically.
 
 Use `detect` for day-specific sightings and `attach` for long-term tracking.
@@ -69,7 +69,7 @@ Record a detected entity for a day.
 Behavior notes:
 
 - If `ENTITY` matches an attached entity, detection uses its canonical name.
-- Blocked entities are rejected.
+- Hidden entities are rejected.
 - Duplicate detections for the same day are rejected.
 
 Example:
@@ -94,7 +94,7 @@ Attach an entity permanently to a facet.
 Behavior notes:
 
 - If already attached, command reports existing entity.
-- Blocked entities are rejected.
+- Hidden entities are rejected.
 - Previously detached entities are rejected.
 
 Example:
@@ -379,7 +379,7 @@ solstone call entities resolve-ambiguity AMBIGUITY_ID ENTITY_ID --yes [--json]
 
 List persisted low-confidence entity questions and choose an existing scoped
 entity. The list includes candidates and origin lanes. A recorded choice sticks
-for later mutation runs. Never resolve to a blocked, missing, or out-of-scope
+for later mutation runs. Never resolve to a hidden, missing, or out-of-scope
 entity. `resolve-ambiguity` requires `--yes`.
 
 ## entity-history and restore-version

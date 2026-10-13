@@ -761,7 +761,7 @@ pub fn record_ambiguity_choice(
     if selected.blocked {
         return Err(EntityWriteError::AmbiguityChoiceInvalid {
             entity_id: choice.entity_id.clone(),
-            detail: "resolved entity choice is blocked".to_owned(),
+            detail: "resolved entity choice is hidden".to_owned(),
         });
     }
     let normalized_query = solstone_core_entity_matching::normalize_resolution_query(&choice.query);

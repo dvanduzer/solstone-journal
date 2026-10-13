@@ -4,13 +4,106 @@
 //! Exact local finalization. No remote, lease or carrier completion is inferred.
 
 use super::*;
+#[cfg(unix)]
+use solstone_core_journal_io::ClaimName;
 use solstone_core_journal_io::{
-    BoundParentLock, ClaimName, ClaimRemovalError, ClaimRemovalOutcome, ExistingParentLockError,
-    FlatDirectory, FlatDirectoryEntry, FlatDirectoryError, acquire_existing_parent_lock_bound,
-    claim_and_remove_observed_bounded, open_existing_parent_lock_bound, read_observed_file_bounded,
+    BoundParentLock, ClaimRemovalError, ClaimRemovalOutcome, ExistingParentLockError,
+    FlatDirectoryError, acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
 };
 use std::io;
 use std::time::Duration;
+
+/// The bound native parent each platform publishes and removes through.
+#[cfg(unix)]
+mod native {
+    use super::*;
+    pub(super) use solstone_core_journal_io::FlatDirectory as Parent;
+    use solstone_core_journal_io::{
+        FileObservation, claim_and_remove_observed_bounded, read_observed_file_bounded,
+    };
+
+    pub(super) fn open(
+        root: &Arc<JournalRoot>,
+        relative: &[&str],
+    ) -> Result<Parent, FlatDirectoryError> {
+        Parent::open(root, &relative.iter().collect::<std::path::PathBuf>())
+    }
+    pub(super) fn identity(parent: &Parent) -> solstone_core_journal_io::ObjectIdentity {
+        parent.identity()
+    }
+    pub(super) fn revalidate(parent: &Parent) -> Result<(), FlatDirectoryError> {
+        parent.revalidate()
+    }
+    pub(super) fn read(
+        parent: &Parent,
+        name: &OsStr,
+        limit: usize,
+    ) -> Result<Option<FileObservation>, FlatDirectoryError> {
+        read_observed_file_bounded(parent, name, limit)
+    }
+    pub(super) fn remove(
+        parent: &Parent,
+        name: &OsStr,
+        prior: &FileObservation,
+        claim: &ClaimName,
+        limit: usize,
+    ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
+        claim_and_remove_observed_bounded(parent, name, prior, claim, limit)
+    }
+}
+
+#[cfg(windows)]
+mod native {
+    use super::*;
+    pub(super) use solstone_core_journal_io::WindowsFlatDirectory as Parent;
+    use solstone_core_journal_io::{
+        FileObservation, open_windows_flat_directory_bound, read_windows_observed_file_bounded,
+        remove_windows_observed_file_bounded,
+    };
+
+    pub(super) fn open(
+        root: &Arc<JournalRoot>,
+        relative: &[&str],
+    ) -> Result<Parent, FlatDirectoryError> {
+        let mut diagnostic = root.canonical_path().to_path_buf();
+        let mut current: Option<Parent> = None;
+        for name in relative {
+            let next = match &current {
+                Some(parent) => {
+                    open_windows_flat_directory_bound(parent, OsStr::new(name), &diagnostic)?
+                }
+                None => open_windows_flat_directory_bound(&**root, OsStr::new(name), &diagnostic)?,
+            };
+            diagnostic.push(name);
+            current = Some(next.ok_or_else(|| FlatDirectoryError::NotDirectory {
+                path: diagnostic.clone(),
+            })?);
+        }
+        current.ok_or_else(|| FlatDirectoryError::NotDirectory { path: diagnostic })
+    }
+    pub(super) fn identity(parent: &Parent) -> solstone_core_journal_io::ObjectIdentity {
+        parent.object_identity()
+    }
+    pub(super) fn revalidate(parent: &Parent) -> Result<(), FlatDirectoryError> {
+        parent.revalidate_bound()
+    }
+    pub(super) fn read(
+        parent: &Parent,
+        name: &OsStr,
+        limit: usize,
+    ) -> Result<Option<FileObservation>, FlatDirectoryError> {
+        read_windows_observed_file_bounded(parent, name, limit)
+    }
+    /// Windows deletes through the verified handle, so no claim name is used.
+    pub(super) fn remove(
+        parent: &Parent,
+        name: &OsStr,
+        prior: &FileObservation,
+        limit: usize,
+    ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
+        remove_windows_observed_file_bounded(parent, name, prior, limit)
+    }
+}
 
 const CONFIG_LOCK: &str = "journal.json.lock";
 const BINDING_LOCK: &str = "binding.json.lock";
@@ -62,8 +155,15 @@ impl BindingRemovalReceipt {
     pub fn confirmation(&self) -> &Result<(), BindingFinalizationRefusal> {
         &self.confirmation
     }
+    /// The exact binding is gone and confirmed absent. Windows reports
+    /// `RemovedUnflushed`: it has no directory flush.
     pub fn complete(&self) -> bool {
-        matches!(self.native, Some(Ok(ClaimRemovalOutcome::Removed))) && self.confirmation.is_ok()
+        matches!(
+            self.native,
+            Some(Ok(
+                ClaimRemovalOutcome::Removed | ClaimRemovalOutcome::RemovedUnflushed
+            ))
+        ) && self.confirmation.is_ok()
     }
 }
 
@@ -73,14 +173,16 @@ impl BindingRemovalReceipt {
 pub struct BindingFinalization {
     root: Arc<JournalRoot>,
     config: Arc<MediaDirectory>,
-    config_parent: FlatDirectory,
+    config_parent: native::Parent,
     config_lock: BoundParentLock,
     binding: Arc<MediaDirectory>,
-    binding_parent: FlatDirectory,
+    binding_parent: native::Parent,
     binding_lock: BoundParentLock,
     expected: MediaRead,
     candidate_sha256: String,
-    published_file: FlatDirectoryEntry,
+    published_identity: MediaIdentity,
+    published_size: u64,
+    #[cfg(unix)]
     claim: ClaimName,
     receipt: Option<Arc<BindingRemovalReceipt>>,
 }
@@ -106,12 +208,11 @@ pub(in crate::teardown_configuration) fn begin(
         .binding_observation
         .as_ref()
         .ok_or(Failure::MissingOriginalBinding)?;
-    let config_parent =
-        FlatDirectory::open(&captured.root, Path::new("config")).map_err(Failure::Flat)?;
+    let config_parent = native::open(&captured.root, &["config"]).map_err(Failure::Flat)?;
     let binding_parent =
-        FlatDirectory::open(&captured.root, Path::new("backup/hosted")).map_err(Failure::Flat)?;
-    if config_parent.identity() != captured.directory.object_identity()
-        || binding_parent.identity() != original.directory.object_identity()
+        native::open(&captured.root, &["backup", "hosted"]).map_err(Failure::Flat)?;
+    if native::identity(&config_parent) != captured.directory.object_identity()
+        || native::identity(&binding_parent) != original.directory.object_identity()
     {
         return Err(Failure::ParentChanged);
     }
@@ -127,15 +228,18 @@ pub(in crate::teardown_configuration) fn begin(
     captured
         .revalidate_published_clear(publication)
         .map_err(Failure::Configuration)?;
-    let mut entropy = [0u8; 8];
-    getrandom::fill(&mut entropy)
-        .map_err(|_| Failure::Native(io::Error::other("binding claim entropy unavailable")))?;
-    let claim = ClaimName::parse(&format!(
-        "!solstone-claim-{:08x}-{:016x}",
-        std::process::id(),
-        u64::from_le_bytes(entropy)
-    ))
-    .map_err(|_| Failure::Native(io::Error::other("binding claim name refused")))?;
+    #[cfg(unix)]
+    let claim = {
+        let mut entropy = [0u8; 8];
+        getrandom::fill(&mut entropy)
+            .map_err(|_| Failure::Native(io::Error::other("binding claim entropy unavailable")))?;
+        ClaimName::parse(&format!(
+            "!solstone-claim-{:08x}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(entropy)
+        ))
+        .map_err(|_| Failure::Native(io::Error::other("binding claim name refused")))?
+    };
     let held = BindingFinalization {
         root: captured.root.clone(),
         config: captured.directory.clone(),
@@ -146,7 +250,15 @@ pub(in crate::teardown_configuration) fn begin(
         binding_lock,
         expected: original.read.clone(),
         candidate_sha256: publication.candidate_sha256.clone(),
-        published_file: publication.published_file.clone(),
+        published_identity: publication
+            .published_identity
+            .ok_or(Failure::PublicationUncertain)?,
+        published_size: publication
+            .published_file
+            .as_ref()
+            .ok_or(Failure::PublicationUncertain)?
+            .size,
+        #[cfg(unix)]
         claim,
         receipt: None,
     };
@@ -154,7 +266,10 @@ pub(in crate::teardown_configuration) fn begin(
     Ok(held)
 }
 
-fn lock(parent: &FlatDirectory, name: &str) -> Result<BoundParentLock, BindingFinalizationRefusal> {
+fn lock(
+    parent: &native::Parent,
+    name: &str,
+) -> Result<BoundParentLock, BindingFinalizationRefusal> {
     let name = OsStr::new(name);
     match open_existing_parent_lock_bound(parent, name, Duration::ZERO, Duration::ZERO)
         .map_err(BindingFinalizationRefusal::Lock)?
@@ -173,10 +288,10 @@ impl BindingFinalization {
             .map_err(|_| Failure::Configuration(Refusal::RootChanged))?;
         self.config.revalidate().map_err(Failure::Native)?;
         self.binding.revalidate().map_err(Failure::Native)?;
-        self.config_parent.revalidate().map_err(Failure::Flat)?;
-        self.binding_parent.revalidate().map_err(Failure::Flat)?;
-        if self.config_parent.identity() != self.config.object_identity()
-            || self.binding_parent.identity() != self.binding.object_identity()
+        native::revalidate(&self.config_parent).map_err(Failure::Flat)?;
+        native::revalidate(&self.binding_parent).map_err(Failure::Flat)?;
+        if native::identity(&self.config_parent) != self.config.object_identity()
+            || native::identity(&self.binding_parent) != self.binding.object_identity()
         {
             return Err(Failure::ParentChanged);
         }
@@ -193,12 +308,8 @@ impl BindingFinalization {
         if read.sha256.as_deref() != Some(self.candidate_sha256.as_str())
             || entry.name != OsStr::new("journal.json")
             || entry.kind != JournalEntryKind::RegularFile
-            || entry.identity
-                != (MediaIdentity::Unix {
-                    device: self.published_file.device,
-                    inode: self.published_file.inode,
-                })
-            || entry.size != self.published_file.size
+            || entry.identity != self.published_identity
+            || entry.size != self.published_size
         {
             return Err(Failure::Configuration(Refusal::ConfigurationChanged));
         }
@@ -221,7 +332,11 @@ impl BindingFinalization {
 
     fn validate_absence(&self) -> Result<(), BindingFinalizationRefusal> {
         self.validate_guards()?;
-        for name in [OsStr::new(BINDING), self.claim.as_os_str()] {
+        #[cfg(unix)]
+        let names = [OsStr::new(BINDING), self.claim.as_os_str()];
+        #[cfg(windows)]
+        let names = [OsStr::new(BINDING)];
+        for name in names {
             if self
                 .binding
                 .read_file_bounded(name, MAX_BINDING_BYTES)
@@ -239,24 +354,17 @@ impl BindingFinalization {
         if self.receipt.is_none() {
             let prior = (|| {
                 self.validate_original()?;
-                let prior = read_observed_file_bounded(
-                    &self.binding_parent,
-                    OsStr::new(BINDING),
-                    MAX_BINDING_BYTES,
-                )
-                .map_err(BindingFinalizationRefusal::Flat)?
-                .ok_or(BindingFinalizationRefusal::BindingChanged)?;
+                let prior =
+                    native::read(&self.binding_parent, OsStr::new(BINDING), MAX_BINDING_BYTES)
+                        .map_err(BindingFinalizationRefusal::Flat)?
+                        .ok_or(BindingFinalizationRefusal::BindingChanged)?;
                 self.validate_original()?;
                 let expected = &self.expected;
                 if prior.entry.name != expected.entry.name
                     || prior.entry.kind != expected.entry.kind
                     || prior.entry.size != expected.entry.size
                     || prior.bytes != expected.bytes
-                    || expected.entry.identity
-                        != (MediaIdentity::Unix {
-                            device: prior.entry.device,
-                            inode: prior.entry.inode,
-                        })
+                    || !expected.entry.identity.matches_flat_entry(&prior.entry)
                 {
                     return Err(BindingFinalizationRefusal::BindingChanged);
                 }
@@ -269,11 +377,19 @@ impl BindingFinalization {
                     confirmation: Err(refusal),
                 },
                 Ok(prior) => {
-                    let native = claim_and_remove_observed_bounded(
+                    #[cfg(unix)]
+                    let native = native::remove(
                         &self.binding_parent,
                         OsStr::new(BINDING),
                         &prior,
                         &self.claim,
+                        MAX_BINDING_BYTES,
+                    );
+                    #[cfg(windows)]
+                    let native = native::remove(
+                        &self.binding_parent,
+                        OsStr::new(BINDING),
+                        &prior,
                         MAX_BINDING_BYTES,
                     );
                     let confirmation = self.validate_absence();
@@ -314,4 +430,5 @@ impl BindingFinalization {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
 mod tests;

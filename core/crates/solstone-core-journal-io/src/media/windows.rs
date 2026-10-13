@@ -636,6 +636,37 @@ pub(super) fn mark_delete(file: &File) -> io::Result<()> {
     native_status(result)
 }
 
+/// Remove one empty child directory that still has `expected` identity. False
+/// when it is absent or another object; delete disposition refuses a directory
+/// holding anything.
+pub(super) fn remove_empty_child(
+    parent: &Directory,
+    name: &OsStr,
+    expected: MediaIdentity,
+) -> io::Result<bool> {
+    super::plain_name(name)?;
+    parent.revalidate()?;
+    let file = match nt_create_relative_deny_delete_sharing(
+        parent.handle(),
+        name,
+        DIRECTORY_ACCESS | DELETE,
+        FILE_OPEN,
+        OPTIONS | FILE_DIRECTORY_FILE,
+    ) {
+        Ok(handle) => File::from(handle),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    require_kind(file.as_raw_handle(), true)?;
+    if identity(&file)? != expected {
+        return Ok(false);
+    }
+    mark_delete(&file)?;
+    drop(file); // Close our handle before confirming absence.
+    ensure_absent(parent, name)?;
+    Ok(true)
+}
+
 pub(super) fn ensure_absent(parent: &Directory, name: &OsStr) -> io::Result<()> {
     parent.revalidate()?;
     match nt_create_relative(

@@ -12,20 +12,22 @@ use solstone_core_backup_runtime::teardown::owned::{
 use solstone_core_backup_runtime::teardown_admission::{
     TeardownAdmissionRefusal, TeardownCarrierRefusal, TeardownClearRefusal, TeardownReaderRefusal,
 };
-use solstone_core_journal_config_write::{BoundConfigConfirmationRefusal, BoundConfigRefusal};
+use solstone_core_journal_config_write::{
+    BoundConfigConfirmationRefusal, BoundConfigRefusal, DirectoryFlush,
+};
 use solstone_core_journal_io::media::ActivityCarrierRetirementEffect;
 use solstone_core_offload::teardown::{OwnedTeardownOutcome, TeardownRunPhase, TeardownRunRefusal};
 
 pub(crate) fn outcome(owner: &OwnedTeardownOutcome) -> Value {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let binding = owner.binding().map(binding_facts);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let binding: Option<Value> = None;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let binding_failure = owner
         .binding_failure()
         .map(|failure| binding_refusal(failure.refusal()));
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let binding_failure: Option<Value> = None;
     json!({
         "state":match owner { OwnedTeardownOutcome::Finished(_) => "finished", OwnedTeardownOutcome::Held(_) => "held", OwnedTeardownOutcome::Unknown(_) => "unknown" },
@@ -47,6 +49,9 @@ pub(crate) fn outcome(owner: &OwnedTeardownOutcome) -> Value {
         "attempts":{"clear":owner.attempts().clear(), "binding":owner.attempts().binding(), "retirement":owner.attempts().retirement()},
         "publication":owner.publication().map(|receipt| json!({
             "effect":"published",
+            "directory_flush":match receipt.directory_flush {
+                DirectoryFlush::Synced => "synced", DirectoryFlush::Failed => "failed", DirectoryFlush::Unavailable => "unavailable",
+            },
             "durability_uncertainty":receipt.durability_uncertainty.as_ref().map(io_kind),
             "observation_uncertainty":receipt.observation_uncertainty.as_ref().map(io_kind),
             "confirmation_refusal":receipt.confirmation_refusal.as_ref().map(|failure| match failure {
@@ -109,7 +114,7 @@ fn run_refusal(value: &TeardownRunRefusal) -> Value {
         }
         TeardownRunRefusal::Clear => json!({"kind":"clear"}),
         TeardownRunRefusal::Binding => json!({"kind":"binding"}),
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         TeardownRunRefusal::Finish(reason) => {
             json!({"kind":"finish", "reason":binding_refusal(reason)})
         }
@@ -199,7 +204,7 @@ fn io_kind(error: &std::io::Error) -> String {
     error.kind().to_string()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn binding_refusal(
     value: &solstone_core_backup_runtime::teardown_admission::TeardownBindingRefusal,
 ) -> Value {
@@ -211,7 +216,7 @@ fn binding_refusal(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn binding_finalization(
     value: &solstone_core_backup::teardown_configuration::BindingFinalizationRefusal,
 ) -> Value {
@@ -231,7 +236,7 @@ fn binding_finalization(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn binding_facts(
     receipt: &solstone_core_backup::teardown_configuration::BindingRemovalReceipt,
 ) -> Value {
@@ -246,6 +251,7 @@ fn binding_facts(
             Ok(outcome) => match outcome {
                 Outcome::Removed => json!({"effect":"removed", "durability":"synced"}),
                 Outcome::RemovedDurabilityUncertain => json!({"effect":"removed", "durability":"uncertain"}),
+                Outcome::RemovedUnflushed => json!({"effect":"removed", "durability":"unflushed"}),
                 Outcome::Unchanged {reason} => json!({"effect":"unchanged", "reason":match reason {
                     ClaimUnchangedReason::ClaimNameOccupied => "claim_name_occupied", ClaimUnchangedReason::UnsupportedNoReplace {..} => "unsupported_no_replace", ClaimUnchangedReason::RenameNotAppliedAfterReconciliation => "rename_not_applied",
                 }}),
@@ -272,7 +278,7 @@ mod tests {
         let refusal = BoundConfigRefusal::Admission(Box::new(std::io::Error::other(secret)));
         assert_eq!(config_refusal(&refusal), json!({"kind":"admission"}));
         assert!(!config_refusal(&refusal).to_string().contains(secret));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert_eq!(
             binding_finalization(
                 &solstone_core_backup::teardown_configuration::BindingFinalizationRefusal::Native(

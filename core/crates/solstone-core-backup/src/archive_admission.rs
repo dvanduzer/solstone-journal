@@ -69,13 +69,17 @@ pub fn wait_for_archive_children(timeout: std::time::Duration) -> bool {
 }
 
 /// Held from spawn until the child is reaped; see [`wait_for_archive_children`].
+/// Only the unix child runner spawns archive children.
+#[cfg(unix)]
 pub(crate) struct LiveArchiveChild(());
+#[cfg(unix)]
 impl LiveArchiveChild {
     pub(crate) fn enter() -> Self {
         LIVE_ARCHIVE_CHILDREN.fetch_add(1, Ordering::AcqRel);
         Self(())
     }
 }
+#[cfg(unix)]
 impl Drop for LiveArchiveChild {
     fn drop(&mut self) {
         LIVE_ARCHIVE_CHILDREN.fetch_sub(1, Ordering::AcqRel);
