@@ -445,7 +445,7 @@ impl Backend for UnixRoot {
 }
 
 pub(crate) fn acquire(root: &Path) -> Result<UnixRoot, JournalRootError> {
-    let (fd, canonical, identity) = acquire_root(root)?;
+    let (fd, canonical, identity) = acquire_root(root, REQUESTED_ROOT_FLAGS)?;
     Ok(UnixRoot {
         root: fd,
         canonical,
@@ -453,9 +453,21 @@ pub(crate) fn acquire(root: &Path) -> Result<UnixRoot, JournalRootError> {
     })
 }
 
-fn open_requested_root(root: &Path) -> Result<(OwnedFd, ObjectIdentity), JournalRootError> {
+pub(crate) fn acquire_identity(root: &Path) -> Result<UnixRoot, JournalRootError> {
+    let (fd, canonical, identity) = acquire_root(root, DIRECTORY_FLAGS)?;
+    Ok(UnixRoot {
+        root: fd,
+        canonical,
+        identity,
+    })
+}
+
+fn open_requested_root(
+    root: &Path,
+    flags: OFlag,
+) -> Result<(OwnedFd, ObjectIdentity), JournalRootError> {
     let opened = traced_nix(AcquisitionPrimitive::RequestedRootOpen, || {
-        open(root, REQUESTED_ROOT_FLAGS, Mode::empty())
+        open(root, flags, Mode::empty())
     })
     .map_err(|error| match error {
         Errno::ENOENT => JournalRootError::Invalid {
@@ -518,7 +530,10 @@ fn restat_canonical_root(
     Ok(())
 }
 
-fn acquire_root(root: &Path) -> Result<(OwnedFd, PathBuf, ObjectIdentity), JournalRootError> {
+fn acquire_root(
+    root: &Path,
+    flags: OFlag,
+) -> Result<(OwnedFd, PathBuf, ObjectIdentity), JournalRootError> {
     if !root.is_absolute() {
         return Err(JournalRootError::Invalid {
             root: root.to_path_buf(),
@@ -527,7 +542,7 @@ fn acquire_root(root: &Path) -> Result<(OwnedFd, PathBuf, ObjectIdentity), Journ
         });
     }
 
-    let (authoritative, expected) = open_requested_root(root)?;
+    let (authoritative, expected) = open_requested_root(root, flags)?;
     let canonical = match traced_canonicalize(root) {
         Ok(path) => path,
         Err(error)
