@@ -221,6 +221,9 @@ echo === cargo test --locked (journal-io library) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-journal-io --lib || exit /b 1
 echo === cargo test --locked (offload library with filesystem contracts) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-offload --lib --features full-tests -- --test-threads=1 || exit /b 1
+echo === abandoned offload stage and recorded restore recovery ===
+call :run_exact_library "solstone-core-journal-io" "media::activity_carrier::tests::abandoned_stage_retirement_removes_only_empty_or_its_download" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-retention" "restore_intent::abandoned::windows_tests::unpublished_recorded_restore_releases_stage_and_intent_on_windows" "full-tests" || exit /b 1
 echo === native backup page cleanup ownership ===
 call :run_exact_library "solstone-core-backup-web" "cleanup::native_tests::backup_native_cleanup_ownership" "full-tests" "ignored" || exit /b 1
 echo === checking required journal portability tests ===

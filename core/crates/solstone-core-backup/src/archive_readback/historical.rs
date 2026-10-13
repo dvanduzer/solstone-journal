@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use super::DirectInvocation;
 use super::{ExactArchiveFile, ReadOperation, ReadbackError, full_hex_identity, plain_name};
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use super::{Value, exact_archive_path};
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -53,11 +53,11 @@ impl ReadOperation<'_> {
         if !valid_selection(snapshot_selector, files) {
             return Err(ReadbackError::InvalidSelection);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(ReadbackError::Unsupported)
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.revalidate_local()?;
             self.check_repository()?;
@@ -67,29 +67,34 @@ impl ReadOperation<'_> {
                 snapshot_selector.into(),
                 "--no-cache".into(),
             ])?;
-            let observed = historical_snapshot_files(
-                &child.output().stdout,
-                self.repository_id(),
-                snapshot_selector,
-                files,
-            )?;
+            #[cfg(unix)]
+            let bytes = &child.output().stdout;
+            #[cfg(windows)]
+            let bytes = &child.stdout;
+            let observed =
+                historical_snapshot_files(bytes, self.repository_id(), snapshot_selector, files)?;
             self.check_repository()?;
             self.revalidate_local()?;
+            #[cfg(unix)]
             self.execution
                 .borrow_mut()
                 .accept(DirectInvocation::List, child);
+            #[cfg(windows)]
+            self.execution
+                .borrow_mut()
+                .accept_windows(DirectInvocation::List, child.successful());
             Ok(observed)
         }
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 struct ParentFiles {
     paths: BTreeMap<usize, String>,
     invalid: bool,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn historical_snapshot_files(
     bytes: &[u8],
     repository_id: &str,
