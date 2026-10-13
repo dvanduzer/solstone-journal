@@ -119,6 +119,35 @@ pub(crate) fn process_one(
     attestation_state: &AttestationStateStore,
     #[cfg(windows)] generation: &solstone_core_system::process::ChildLaunchContext,
 ) -> Result<ProcessOutcome, TranscribeError> {
+    process_one_with(
+        audio_path,
+        journal_path,
+        redo,
+        explicit_backend,
+        config,
+        attestation_state,
+        #[cfg(windows)]
+        generation,
+        #[cfg(all(feature = "embedded", unix))]
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_one_with(
+    audio_path: &Path,
+    journal_path: &Path,
+    redo: bool,
+    explicit_backend: Option<&str>,
+    config: &JournalConfigRead,
+    attestation_state: &AttestationStateStore,
+    #[cfg(windows)] generation: &solstone_core_system::process::ChildLaunchContext,
+    #[cfg(all(feature = "embedded", unix))] embedded: Option<&crate::embedded::EmbeddedContext<'_>>,
+) -> Result<ProcessOutcome, TranscribeError> {
+    #[cfg(all(feature = "embedded", unix))]
+    if let Some(runtime) = embedded {
+        runtime.checkpoint()?;
+    }
     if should_skip_process_one_processed(audio_path, redo) {
         return Ok(ProcessOutcome::Skipped);
     }
@@ -131,7 +160,18 @@ pub(crate) fn process_one(
     let claim = OutputClaims::acquire(
         [output],
         LockOptions {
-            timeout: Duration::from_secs(45 * 60),
+            timeout: {
+                #[cfg(all(feature = "embedded", unix))]
+                if embedded.is_some() {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(45 * 60)
+                }
+                #[cfg(not(all(feature = "embedded", unix)))]
+                {
+                    Duration::from_secs(45 * 60)
+                }
+            },
             ..LockOptions::default()
         },
     )
@@ -173,8 +213,30 @@ pub(crate) fn process_one(
     if let Some(queue_wait_ms) = queue_wait_ms() {
         timings.add_ms("queue_wait", queue_wait_ms);
     }
+    #[cfg(all(feature = "embedded", unix))]
+    if embedded.is_some() && facts.input_size > 16 * 1024 * 1024 {
+        return Err(TranscribeError::ParakeetCppDeferred {
+            reason: "embedded-input-budget".into(),
+            detail: "embedded audio exceeds 16 MiB input budget; original retained".into(),
+        });
+    }
     let decoded_at = Instant::now();
-    let full_audio = match decode_f32_mono(audio_path) {
+    #[cfg(all(feature = "embedded", unix))]
+    let decoded = if embedded.is_some() {
+        solstone_core_observe_audio::decode_f32_mono_bounded(audio_path, SAMPLE_RATE as usize * 30)
+    } else {
+        decode_f32_mono(audio_path)
+    };
+    #[cfg(not(all(feature = "embedded", unix)))]
+    let decoded = decode_f32_mono(audio_path);
+    let full_audio = match decoded {
+        Err(AudioError::DecodedSampleLimit { .. }) => {
+            return Err(TranscribeError::ParakeetCppDeferred {
+                reason: "embedded-duration-budget".into(),
+                detail: "embedded decoded sample budget exceeds 30 seconds; original retained"
+                    .into(),
+            });
+        }
         Ok(audio) => audio,
         Err(error) => {
             timings.add_ms("decode", elapsed_ms(decoded_at));
@@ -182,6 +244,10 @@ pub(crate) fn process_one(
                 detail: error.to_string(),
             };
             let write_at = Instant::now();
+            #[cfg(all(feature = "embedded", unix))]
+            if let Some(runtime) = embedded {
+                runtime.checkpoint()?;
+            }
             let commit = commit_input(&observation, &claim, audio_path)?;
             let terminal = decode_failure(&facts, redo, &error)?;
             drop(commit);
@@ -210,7 +276,23 @@ pub(crate) fn process_one(
     };
     timings.add_ms("decode", elapsed_ms(decoded_at));
     let audio_seconds = full_audio.len() as f64 / f64::from(SAMPLE_RATE);
+    #[cfg(all(feature = "embedded", unix))]
+    if let Some(runtime) = embedded {
+        runtime.checkpoint()?;
+    }
     let vad_at = Instant::now();
+    #[cfg(all(feature = "embedded", unix))]
+    let vad = if let Some(runtime) = embedded {
+        crate::audio::run_vad_embedded(
+            &full_audio,
+            min_speech_seconds(config),
+            runtime.models,
+            runtime.scratch,
+        )
+    } else {
+        run_vad(&full_audio, min_speech_seconds(config))
+    }?;
+    #[cfg(not(all(feature = "embedded", unix)))]
     let vad = run_vad(
         &full_audio,
         min_speech_seconds(config),
@@ -218,10 +300,18 @@ pub(crate) fn process_one(
         generation,
     )?;
     timings.add_ms("vad", elapsed_ms(vad_at));
+    #[cfg(all(feature = "embedded", unix))]
+    if let Some(runtime) = embedded {
+        runtime.checkpoint()?;
+    }
     let (sound_tags, sound_tag_status) = tag_audio(&full_audio, journal_path);
 
     if !vad.has_speech {
         let write_at = Instant::now();
+        #[cfg(all(feature = "embedded", unix))]
+        if let Some(runtime) = embedded {
+            runtime.checkpoint()?;
+        }
         let commit = commit_input(&observation, &claim, audio_path)?;
         let terminal = vad_no_speech(&facts, redo, sound_tags.as_ref(), sound_tag_status.as_ref())?;
         drop(commit);
@@ -263,7 +353,7 @@ pub(crate) fn process_one(
         .as_ref()
         .map(|audio| audio.len() as f64 / f64::from(SAMPLE_RATE));
 
-    let backend = match resolve_default_backend(
+    let resolve_backend = || match resolve_default_backend(
         explicit_backend,
         local_stt_backend(),
         read_available_bytes(),
@@ -271,7 +361,7 @@ pub(crate) fn process_one(
         confidential::confidential_channel_plausible(config),
         confidential_audio_enabled(config),
     ) {
-        Ok(resolution) => resolution.backend,
+        Ok(resolution) => Ok(resolution.backend),
         Err(error) => {
             emit_backend_error(
                 BackendErrorContext {
@@ -285,9 +375,15 @@ pub(crate) fn process_one(
                 &error,
                 None,
             );
-            return Err(error);
+            Err(error)
         }
     };
+    #[cfg(all(feature = "embedded", unix))]
+    let backend = embedded
+        .map(|runtime| runtime.asr.model_info().backend)
+        .map_or_else(resolve_backend, Ok)?;
+    #[cfg(not(all(feature = "embedded", unix)))]
+    let backend = resolve_backend()?;
     // 🔴 Reduce anyway when the confidential limit would otherwise refuse this audio.
     //
     // `reduce_audio_if_needed` declines when the VAD result is noisy AND speech-dense,
@@ -313,44 +409,55 @@ pub(crate) fn process_one(
     let statement_audio = reduced_audio.as_deref().unwrap_or(&full_audio);
 
     let mut asr_at = None;
-    let dispatched = if backend == "confidential" {
-        // 🔴 Cap on what is actually SENT, not on the whole segment. `statement_audio`
-        // below is the VAD-reduced audio, and speech is usually a fraction of a
-        // segment -- so capping on `audio_seconds` refused recordings whose speech
-        // was comfortably inside the limit.
-        //
-        // Measured on an owner's journal 2026-09-01: of 176 recent segments, 134
-        // (76%) run longer than 300 s, and V2 had transcribed only 14 of 37 long
-        // segments (38%) where V1 transcribed 503 of 503 (100%). Most of that gap is
-        // this line: a 314 s recording with a minute of speech was refused as
-        // `confidential_audio_too_long` without the reduced audio ever being measured.
-        //
-        // 🔒 The limit itself is unchanged, and audio that is genuinely too long after
-        // reduction is still refused.
-        dispatch_confidential_with_cap(
-            statement_audio.len(),
-            reduced_seconds.unwrap_or(audio_seconds),
-            || {
-                asr_at = Some(Instant::now());
-                dispatch_backend(
-                    config,
-                    journal_path,
-                    &backend,
-                    statement_audio,
-                    attestation_state,
-                )
-            },
-        )
-    } else {
+    #[cfg(all(feature = "embedded", unix))]
+    let embedded_dispatched = embedded.map(|runtime| {
         asr_at = Some(Instant::now());
-        dispatch_backend(
-            config,
-            journal_path,
-            &backend,
-            statement_audio,
-            attestation_state,
-        )
+        runtime.transcribe(statement_audio)
+    });
+    let dispatch = || {
+        if backend == "confidential" {
+            // 🔴 Cap on what is actually SENT, not on the whole segment. `statement_audio`
+            // below is the VAD-reduced audio, and speech is usually a fraction of a
+            // segment -- so capping on `audio_seconds` refused recordings whose speech
+            // was comfortably inside the limit.
+            //
+            // Measured on an owner's journal 2026-09-01: of 176 recent segments, 134
+            // (76%) run longer than 300 s, and V2 had transcribed only 14 of 37 long
+            // segments (38%) where V1 transcribed 503 of 503 (100%). Most of that gap is
+            // this line: a 314 s recording with a minute of speech was refused as
+            // `confidential_audio_too_long` without the reduced audio ever being measured.
+            //
+            // 🔒 The limit itself is unchanged, and audio that is genuinely too long after
+            // reduction is still refused.
+            dispatch_confidential_with_cap(
+                statement_audio.len(),
+                reduced_seconds.unwrap_or(audio_seconds),
+                || {
+                    asr_at = Some(Instant::now());
+                    dispatch_backend(
+                        config,
+                        journal_path,
+                        &backend,
+                        statement_audio,
+                        attestation_state,
+                    )
+                },
+            )
+        } else {
+            asr_at = Some(Instant::now());
+            dispatch_backend(
+                config,
+                journal_path,
+                &backend,
+                statement_audio,
+                attestation_state,
+            )
+        }
     };
+    #[cfg(all(feature = "embedded", unix))]
+    let dispatched = embedded_dispatched.unwrap_or_else(dispatch);
+    #[cfg(not(all(feature = "embedded", unix)))]
+    let dispatched = None.unwrap_or_else(dispatch);
     if let Some(asr_at) = asr_at {
         timings.add_ms("asr", elapsed_ms(asr_at));
     }
@@ -375,6 +482,10 @@ pub(crate) fn process_one(
 
     if transcription.words.is_empty() {
         let write_at = Instant::now();
+        #[cfg(all(feature = "embedded", unix))]
+        if let Some(runtime) = embedded {
+            runtime.checkpoint()?;
+        }
         let commit = commit_input(&observation, &claim, audio_path)?;
         let terminal =
             stt_zero_statements(&facts, redo, sound_tags.as_ref(), sound_tag_status.as_ref())?;
@@ -411,7 +522,33 @@ pub(crate) fn process_one(
         |mapping| restore_statement_timestamps(&statements, mapping),
     );
     let speakers_at = Instant::now();
-    let speaker_result = match analyze_speakers(
+    #[cfg(all(feature = "embedded", unix))]
+    let speaker_analysis = if let Some(runtime) = embedded {
+        runtime.checkpoint()?;
+        crate::speakers::analyze_speakers_embedded(
+            audio_path,
+            &full_audio,
+            statement_audio,
+            reduced_audio.as_deref(),
+            &statements,
+            &restored,
+            runtime.models,
+            runtime.scratch,
+        )
+    } else {
+        analyze_speakers(
+            audio_path,
+            &full_audio,
+            statement_audio,
+            reduced_audio.as_deref(),
+            &statements,
+            &restored,
+            SAMPLE_RATE,
+            crate::speakers::MIN_STATEMENT_DURATION_S,
+        )
+    };
+    #[cfg(not(all(feature = "embedded", unix)))]
+    let speaker_analysis = analyze_speakers(
         audio_path,
         &full_audio,
         statement_audio,
@@ -422,7 +559,8 @@ pub(crate) fn process_one(
         crate::speakers::MIN_STATEMENT_DURATION_S,
         #[cfg(windows)]
         generation,
-    ) {
+    );
+    let speaker_result = match speaker_analysis {
         Ok(result) => result,
         Err(error) => {
             timings.add_ms("speakers_analyze", elapsed_ms(speakers_at));
@@ -456,6 +594,10 @@ pub(crate) fn process_one(
         }
     })?;
     let write_at = Instant::now();
+    #[cfg(all(feature = "embedded", unix))]
+    if let Some(runtime) = embedded {
+        runtime.checkpoint()?;
+    }
     let commit = commit_input(&observation, &claim, audio_path)?;
     write_full_transcript(FullTranscriptWrite {
         raw_path: audio_path,

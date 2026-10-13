@@ -214,6 +214,7 @@ fn round(value: f64, places: i32) -> f64 {
 // Do not derive this from Display: error messages can contain provider responses.
 fn error_type_name(error: &TranscribeError) -> &'static str {
     match error {
+        TranscribeError::Cancelled => "Cancelled",
         TranscribeError::ModelAsset(_) => "ModelAssetError",
         TranscribeError::SpeakerTranscriptWrite(_) => "SpeakerTranscriptWriteError",
         TranscribeError::OrphanNpzRemove { .. } => "OrphanNpzRemove",

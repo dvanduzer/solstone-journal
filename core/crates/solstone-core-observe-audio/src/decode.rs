@@ -29,6 +29,12 @@ fn open_input(path: &Path) -> Result<ffmpeg::format::context::Input, ffmpeg::Err
 /// The `.m4a` suffix selects Python-compatible all-stream mixing. Every other
 /// suffix decodes only the first audio stream and flushes its resampler.
 pub fn decode_f32_mono(path: &Path) -> Result<Vec<f32>, AudioError> {
+    decode_f32_mono_bounded(path, usize::MAX)
+}
+
+/// Decode with a bound on the total decoded samples, including all mixed M4A
+/// tracks. Refuses before appending samples beyond the caller's memory budget.
+pub fn decode_f32_mono_bounded(path: &Path, max_samples: usize) -> Result<Vec<f32>, AudioError> {
     let metadata = fs::metadata(path).map_err(|source| AudioError::Io {
         path: path.to_path_buf(),
         source,
@@ -44,13 +50,13 @@ pub fn decode_f32_mono(path: &Path) -> Result<Vec<f32>, AudioError> {
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("m4a"))
     {
-        decode_m4a(path)
+        decode_m4a(path, max_samples)
     } else {
-        decode_non_m4a(path)
+        decode_non_m4a(path, max_samples)
     }
 }
 
-fn decode_non_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
+fn decode_non_m4a(path: &Path, max_samples: usize) -> Result<Vec<f32>, AudioError> {
     let mut input = open_input(path).map_err(|error| corrupt_input(path, error))?;
     let stream_index = first_audio_stream_index(&input, path)?;
     let parameters = input
@@ -74,7 +80,13 @@ fn decode_non_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
                     decoder
                         .send_packet(&packet)
                         .map_err(|error| corrupt_input(path, error))?;
-                    drain_non_m4a_decoder(&mut decoder, &mut resampler, &mut audio, path)?;
+                    drain_non_m4a_decoder(
+                        &mut decoder,
+                        &mut resampler,
+                        &mut audio,
+                        path,
+                        max_samples,
+                    )?;
                 }
             }
             Err(ffmpeg::Error::Eof) => break,
@@ -84,9 +96,9 @@ fn decode_non_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
     decoder
         .send_eof()
         .map_err(|error| corrupt_input(path, error))?;
-    drain_non_m4a_decoder(&mut decoder, &mut resampler, &mut audio, path)?;
+    drain_non_m4a_decoder(&mut decoder, &mut resampler, &mut audio, path, max_samples)?;
     if let Some(resampler) = resampler.as_mut() {
-        flush_non_m4a_resampler(resampler, &mut audio, path)?;
+        flush_non_m4a_resampler(resampler, &mut audio, path, max_samples)?;
     }
 
     if audio.is_empty() {
@@ -98,7 +110,7 @@ fn decode_non_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
     }
 }
 
-fn decode_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
+fn decode_m4a(path: &Path, max_samples: usize) -> Result<Vec<f32>, AudioError> {
     let input = open_input(path).map_err(|error| corrupt_input(path, error))?;
     let stream_indices: Vec<usize> = input
         .streams()
@@ -113,6 +125,7 @@ fn decode_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
     }
 
     let mut streams = Vec::new();
+    let mut remaining_samples = max_samples;
     for stream_index in stream_indices {
         // Python reopens the M4A container for every audio stream. It also
         // deliberately does not flush this per-stream resampler.
@@ -139,7 +152,13 @@ fn decode_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
                         decoder
                             .send_packet(&packet)
                             .map_err(|error| corrupt_input(path, error))?;
-                        drain_m4a_decoder(&mut decoder, &mut resampler, &mut audio, path)?;
+                        drain_m4a_decoder(
+                            &mut decoder,
+                            &mut resampler,
+                            &mut audio,
+                            path,
+                            remaining_samples,
+                        )?;
                     }
                 }
                 Err(ffmpeg::Error::Eof) => break,
@@ -149,8 +168,15 @@ fn decode_m4a(path: &Path) -> Result<Vec<f32>, AudioError> {
         decoder
             .send_eof()
             .map_err(|error| corrupt_input(path, error))?;
-        drain_m4a_decoder(&mut decoder, &mut resampler, &mut audio, path)?;
+        drain_m4a_decoder(
+            &mut decoder,
+            &mut resampler,
+            &mut audio,
+            path,
+            remaining_samples,
+        )?;
         if !audio.is_empty() {
+            remaining_samples -= audio.len();
             streams.push(audio);
         }
     }
@@ -197,6 +223,7 @@ fn drain_non_m4a_decoder(
     resampler: &mut Option<ffmpeg::software::resampling::Context>,
     audio: &mut Vec<f32>,
     path: &Path,
+    max_samples: usize,
 ) -> Result<(), AudioError> {
     loop {
         let mut decoded = ffmpeg::frame::Audio::empty();
@@ -212,7 +239,14 @@ fn drain_non_m4a_decoder(
                     .expect("resampler initialized from decoded frame")
                     .run(&decoded, &mut converted)
                     .map_err(|error| ffmpeg_error(path, error))?;
-                audio.extend_from_slice(converted.plane::<f32>(0));
+                let samples = converted.plane::<f32>(0);
+                if samples.len() > max_samples.saturating_sub(audio.len()) {
+                    return Err(AudioError::DecodedSampleLimit {
+                        path: path.to_path_buf(),
+                        max_samples,
+                    });
+                }
+                audio.extend_from_slice(samples);
             }
             Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => break,
             Err(ffmpeg::Error::Eof) => break,
@@ -227,6 +261,7 @@ fn drain_m4a_decoder(
     resampler: &mut Option<ffmpeg::software::resampling::Context>,
     audio: &mut Vec<f32>,
     path: &Path,
+    max_samples: usize,
 ) -> Result<(), AudioError> {
     loop {
         let mut decoded = ffmpeg::frame::Audio::empty();
@@ -264,7 +299,14 @@ fn drain_m4a_decoder(
                     .expect("resampler initialized from decoded frame")
                     .run(&decoded, &mut converted)
                     .map_err(|error| ffmpeg_error(path, error))?;
-                audio.extend_from_slice(converted.plane::<f32>(0));
+                let samples = converted.plane::<f32>(0);
+                if samples.len() > max_samples.saturating_sub(audio.len()) {
+                    return Err(AudioError::DecodedSampleLimit {
+                        path: path.to_path_buf(),
+                        max_samples,
+                    });
+                }
+                audio.extend_from_slice(samples);
             }
             Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => break,
             Err(ffmpeg::Error::Eof) => break,
@@ -297,6 +339,7 @@ fn flush_non_m4a_resampler(
     resampler: &mut ffmpeg::software::resampling::Context,
     audio: &mut Vec<f32>,
     path: &Path,
+    max_samples: usize,
 ) -> Result<(), AudioError> {
     let flush_sample_limit = audio
         .len()
@@ -340,7 +383,14 @@ fn flush_non_m4a_resampler(
                 remaining_samples,
             });
         }
-        audio.extend_from_slice(converted.plane::<f32>(0));
+        let samples = converted.plane::<f32>(0);
+        if samples.len() > max_samples.saturating_sub(audio.len()) {
+            return Err(AudioError::DecodedSampleLimit {
+                path: path.to_path_buf(),
+                max_samples,
+            });
+        }
+        audio.extend_from_slice(samples);
         flushed_samples = next_flushed_samples;
         // `swr_get_delay` can retain filter delay after every remaining output
         // sample has been drained. A zero-producing flush is the authoritative

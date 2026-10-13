@@ -10,6 +10,7 @@ license.workspace = true
 publish = false
 
 [features]
+embedded = ["dep:solstone-core-vad-analyze", "dep:solstone-core-speakers-analyze"]
 full-tests = []
 test-hooks = ["solstone-core-system/test-hooks"]
 test-fixture-pin = ["solstone-core-local/test-fixture-pin"]
@@ -20,6 +21,8 @@ path = "tests/transcription_transports.rs"
 required-features = ["test-hooks"]
 
 [dependencies]
+solstone-core-vad-analyze = { path = "../solstone-core-vad-analyze", optional = true }
+solstone-core-speakers-analyze = { path = "../solstone-core-speakers-analyze", optional = true }
 solstone-core-segment.workspace = true
 log.workspace = true
 thiserror.workspace = true

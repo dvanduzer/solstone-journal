@@ -1,0 +1,21 @@
+[package]
+name = "journal-mobile-audio"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace]
+
+[features]
+default = ["native"]
+native = []
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+solstone-core-assets = { path = "../../core/crates/solstone-core-assets" }
+solstone-core-transcribe = { path = "../../core/crates/solstone-core-transcribe", features = ["embedded"] }
+
+[patch.crates-io]
+ffmpeg-sys-next = { path = "../../core/vendor/ffmpeg-sys-next" }

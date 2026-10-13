@@ -82,7 +82,10 @@ pub(crate) fn restore_statement_timestamps(
 pub(crate) fn write_full_transcript(
     request: FullTranscriptWrite<'_>,
 ) -> Result<WriteResponse, TranscribeError> {
-    let payload = prepare_payload(request.speaker_result.embedding_payload.as_ref())?;
+    let payload = prepare_payload(
+        request.speaker_result.embedding_payload.as_ref(),
+        request.jsonl_path,
+    )?;
     let result = (|| {
         let bytes = build_full_request(&request, &payload)?;
         // Keep retry cleanup immediately adjacent to every publication attempt.
@@ -126,6 +129,7 @@ fn restore_timestamp_field(
 
 fn prepare_payload(
     embedding: Option<&SpeakerEmbeddingPayload>,
+    destination: &Path,
 ) -> Result<PreparedPayload, TranscribeError> {
     let (bytes, statement_ids, durations_s, encoder) = match embedding {
         Some(embedding) => (
@@ -136,14 +140,20 @@ fn prepare_payload(
         ),
         None => (&[][..], Vec::new(), Vec::new(), ENCODER_ID.to_owned()),
     };
-    let temporary = tempfile::Builder::new()
-        .prefix("solstone-speaker-transcript-")
-        .suffix(".f32le")
-        .tempfile()
-        .map_err(|error| TranscribeError::TranscriptPayload {
-            path: None,
-            detail: error.to_string(),
-        })?;
+    let temporary =
+        tempfile::Builder::new()
+            .prefix("solstone-speaker-transcript-")
+            .suffix(".f32le")
+            .tempfile_in(destination.parent().ok_or_else(|| {
+                TranscribeError::TranscriptPayload {
+                    path: Some(destination.to_path_buf()),
+                    detail: "transcript destination has no parent".into(),
+                }
+            })?)
+            .map_err(|error| TranscribeError::TranscriptPayload {
+                path: None,
+                detail: error.to_string(),
+            })?;
     let (mut file, path) =
         temporary
             .keep()
