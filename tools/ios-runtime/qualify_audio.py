@@ -137,6 +137,11 @@ def main():
         phone.owner('POST', '/init/finalize', {'name': 'Synthetic iOS audio', 'timezone': 'America/Denver'})
         link = phone.owner('POST', '/app/network/pair-start', {'device_label': 'ios-audio-laptop'})
         assert client.call('pair', link=link['pair_link'], label='ios-audio-laptop')['ok']
+        phone.control('serve-stop')
+        baseline = native(phone.control('audio-inventory'))
+        (args.output / 'baseline-inventory.json').write_text(json.dumps(baseline, indent=2))
+        phone.control('serve-start', count=args.port)
+        native(phone.control('audio-enable'))
         wait_audio(phone, lambda s: s['state'] == 'ready')
         first, fields, _ = upload('audio.m4a')
         wait_audio(phone, lambda s: s['state'] == 'processing')
@@ -307,13 +312,15 @@ def main():
                   'model_load_ms': sorted({audio_status(row)['model_load_ms'] for row in phone.rows
                                            if audio_status(row) and 'model_load_ms' in audio_status(row)}),
                   'storage_bytes': sum(file['bytes'] for file in files if 'bytes' in file),
+                  'baseline_storage_bytes': sum(file['bytes'] for file in baseline['files'] if 'bytes' in file),
                   'original_bytes': sum(manifest[name]['bytes'] for name in submitted.values()),
                   'peak_footprint_bytes': max(row['value']['resources']['footprint_bytes'] for row in beats),
                   'thermal_states': sorted({row['value']['thermal'] for row in beats}),
                   'foreground_heartbeats': len(beats)}
         (args.output / 'result.json').write_text(json.dumps(result, indent=2))
         phone.control('serve-finish')
-        print(json.dumps({k: v for k, v in result.items() if k not in ('transcripts', 'submitted', 'retrieved')}))
+        print(json.dumps({k: result[k] for k in ('passed', 'started', 'finished', 'peak_footprint_bytes',
+                                               'thermal_states', 'storage_bytes', 'baseline_storage_bytes')}))
     finally:
         client.process.stdin.close()
         client.process.wait(timeout=35)
