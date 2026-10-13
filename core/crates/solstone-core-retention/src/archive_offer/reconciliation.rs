@@ -608,7 +608,7 @@ pub(crate) mod unix {
         })
     }
 
-    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(all(test, unix, feature = "full-tests"))]
     pub(crate) fn reconcile_with_test_hook(
         operation: &PreparedArchiveOperation<'_>,
         today: NaiveDate,

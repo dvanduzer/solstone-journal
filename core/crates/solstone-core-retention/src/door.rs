@@ -1056,7 +1056,7 @@ fn stage_segment_windows(
     live: &str,
     staged: &str,
 ) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let started = std::time::Instant::now();
     loop {
         guard.before_phase(target)?;
         // Recheck on each attempt: a retry must never overwrite another claim.
@@ -1072,7 +1072,7 @@ fn stage_segment_windows(
                     &error,
                     solstone_core_journal_io::PathError::Io { source, .. }
                         if matches!(source.raw_os_error(), Some(5 | 32))
-                ) && std::time::Instant::now() < deadline
+                ) && started.elapsed() < std::time::Duration::from_secs(10)
                 {
                     #[cfg(any(test, feature = "test-hooks"))]
                     stage_test_hook::retrying();

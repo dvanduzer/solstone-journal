@@ -266,7 +266,7 @@ cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-memory-orig
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_waits_for_ordinary_and_nested_readers" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_refuses_a_claim_that_appears_during_retry" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_refuses_a_reader_that_outlives_the_retry_budget" "full-tests" || exit /b 1
-cargo clippy --manifest-path core\Cargo.toml --locked -p solstone-core-retention -p solstone-core-memory-original --all-targets --features full-tests,test-hooks -- -D warnings || exit /b 1
+cargo clippy --manifest-path core\Cargo.toml --locked -p solstone-core-retention -p solstone-core-memory-original --all-targets --no-deps --features full-tests,test-hooks -- -D warnings || exit /b 1
 echo JOURNAL_WIN_CI_MCP_ENDPOINT=executed/pass
 echo === cargo test --locked (journal doctor library, platform checks included) ===
 :: Every other leg compiles the doctor only as a dependency.
