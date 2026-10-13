@@ -4,6 +4,7 @@
 //! People lookup and journal-contained media serving for speakers.
 
 use std::fs;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,6 +15,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use solstone_core_convey_http::media::{
+    ParsedRange, media_response, mime_type, parse_range, read_bytes,
+};
 
 use crate::JournalRoot;
 use crate::speakers_calendar::{is_day, journal_principal_id, live_entities, value_truthy};
@@ -121,49 +126,65 @@ pub async fn serve_audio(
             )
             .into_response();
         };
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return media_error(
-                    "file_not_found",
-                    "that file isn't available.",
-                    "File not found",
-                    StatusCode::NOT_FOUND,
-                )
-                .into_response();
-            }
-        };
-        if bytes.is_empty() {
-            return media_response(StatusCode::OK, mimetype, &path, Vec::new(), None);
-        }
-        match headers
-            .get(header::RANGE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| parse_range(value, bytes.len()))
-        {
-            Some(ParsedRange::Valid { start, end }) => {
-                let total = bytes.len();
-                media_response(
-                    StatusCode::PARTIAL_CONTENT,
-                    mimetype,
-                    &path,
-                    bytes[start..=end].to_vec(),
-                    Some(format!("bytes {start}-{end}/{total}")),
-                )
-            }
-            Some(ParsedRange::Unsatisfiable) => media_error(
+        let response = (|| {
+            let mut file = fs::File::open(&path)?;
+            let total = file.metadata()?.len();
+            audio_response(&mut file, total, mimetype, &path, &headers)
+        })();
+        response.unwrap_or_else(|_: std::io::Error| {
+            media_error(
+                "file_not_found",
+                "that file isn't available.",
+                "File not found",
+                StatusCode::NOT_FOUND,
+            )
+        })
+    })
+    .await
+}
+
+// Length comes from the opened file. Serve only that observed interval; a
+// short read refuses the response, while growth after observation is excluded.
+fn audio_response(
+    file: &mut (impl Read + Seek),
+    total: u64,
+    mimetype: &str,
+    path: &Path,
+    headers: &HeaderMap,
+) -> std::io::Result<Response> {
+    if total == 0 {
+        return Ok(media_response(
+            StatusCode::OK,
+            mimetype,
+            path,
+            Vec::new(),
+            None,
+        ));
+    }
+    let total = usize::try_from(total).map_err(std::io::Error::other)?;
+    let (status, start, length, content_range) = match headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| parse_range(value, total))
+    {
+        Some(ParsedRange::Valid { start, end }) => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{total}")),
+        ),
+        Some(ParsedRange::Unsatisfiable) => {
+            return Ok(media_error(
                 "http_error",
                 "that request didn't finish.",
                 "",
                 StatusCode::RANGE_NOT_SATISFIABLE,
-            )
-            .into_response(),
-            Some(ParsedRange::Ignore) | None => {
-                media_response(StatusCode::OK, mimetype, &path, bytes, None)
-            }
+            ));
         }
-    })
-    .await
+        Some(ParsedRange::Ignore) | None => (StatusCode::OK, 0, total, None),
+    };
+    let bytes = read_bytes(file, start, length)?;
+    Ok(media_response(status, mimetype, path, bytes, content_range))
 }
 
 fn is_speaker_attach_candidate(
@@ -200,86 +221,6 @@ fn person_search_strings(entity: &Value) -> Vec<&str> {
     .collect()
 }
 
-enum ParsedRange {
-    Valid { start: usize, end: usize },
-    Unsatisfiable,
-    Ignore,
-}
-
-fn parse_range(value: &str, total: usize) -> ParsedRange {
-    let Some(spec) = value.strip_prefix("bytes=") else {
-        return ParsedRange::Ignore;
-    };
-    if spec.contains(',') {
-        return ParsedRange::Ignore;
-    }
-    let Some((start, end)) = spec.split_once('-') else {
-        return ParsedRange::Ignore;
-    };
-    if start.is_empty() {
-        let Ok(length) = end.parse::<usize>() else {
-            return ParsedRange::Ignore;
-        };
-        if length == 0 {
-            return ParsedRange::Unsatisfiable;
-        }
-        let start = total.saturating_sub(length);
-        return ParsedRange::Valid {
-            start,
-            end: total - 1,
-        };
-    }
-    let Ok(start) = start.parse::<usize>() else {
-        return ParsedRange::Ignore;
-    };
-    if start >= total {
-        return ParsedRange::Unsatisfiable;
-    }
-    let end = if end.is_empty() {
-        total - 1
-    } else {
-        let Ok(end) = end.parse::<usize>() else {
-            return ParsedRange::Ignore;
-        };
-        end.min(total - 1)
-    };
-    if end < start {
-        ParsedRange::Unsatisfiable
-    } else {
-        ParsedRange::Valid { start, end }
-    }
-}
-
-fn media_response(
-    status: StatusCode,
-    mimetype: &str,
-    path: &Path,
-    bytes: Vec<u8>,
-    content_range: Option<String>,
-) -> Response {
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let mut response = Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, mimetype)
-        .header(header::CONTENT_LENGTH, bytes.len())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("inline; filename={filename}"),
-        )
-        .header(header::CACHE_CONTROL, "public, max-age=300");
-    if let Some(content_range) = content_range {
-        response = response
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_RANGE, content_range);
-    }
-    response
-        .body(Body::from(bytes))
-        .expect("media response builds")
-}
-
 fn media_error(reason_code: &str, message: &str, detail: &str, status: StatusCode) -> Response {
     // Flask's jsonify appends a newline, including on these error envelopes.
     let body = format!(
@@ -291,28 +232,6 @@ fn media_error(reason_code: &str, message: &str, detail: &str, status: StatusCod
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .expect("media error response builds")
-}
-
-fn mime_type(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "flac" => Some("audio/flac"),
-        "opus" => Some("audio/opus"),
-        "ogg" => Some("audio/ogg"),
-        "m4a" => Some("audio/mp4"),
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        "webm" => Some("video/webm"),
-        "mp4" => Some("video/mp4"),
-        "mov" => Some("video/quicktime"),
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "heic" => Some("image/heic"),
-        "heif" => Some("image/heif"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "tiff" => Some("image/tiff"),
-        _ => None,
-    }
 }
 
 fn safe_day_path(day_root: &Path, rel_path: &str) -> Option<PathBuf> {
@@ -352,15 +271,49 @@ fn real_path_non_strict(path: &Path) -> Option<PathBuf> {
     Some(resolved)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::symlink;
-
-    use super::safe_day_path;
+    use super::audio_response;
+    use axum::http::{HeaderMap, StatusCode, header};
+    use std::io::{Cursor, ErrorKind};
+    use std::path::Path;
 
     #[test]
+    fn audio_uses_observed_length_and_refuses_truncation_within_selected_bytes() {
+        let mut file = Cursor::new(b"abc".to_vec());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=1-2".parse().unwrap());
+        let response =
+            audio_response(&mut file, 5, "audio/flac", Path::new("mic.flac"), &headers).unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 1-2/5");
+        headers.insert(header::RANGE, "bytes=1-4".parse().unwrap());
+        assert_eq!(
+            audio_response(&mut file, 5, "audio/flac", Path::new("mic.flac"), &headers)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        headers.clear();
+        assert_eq!(
+            audio_response(&mut file, 5, "audio/flac", Path::new("mic.flac"), &headers)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        let response =
+            audio_response(&mut file, 2, "audio/flac", Path::new("mic.flac"), &headers).unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "2");
+        assert_eq!(file.position(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn safe_day_path_refuses_a_symlink_that_escapes_the_journal() {
+        use super::safe_day_path;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
         let journal = tempfile::TempDir::new_in("/var/tmp").expect("journal root");
         let outside = tempfile::TempDir::new_in("/var/tmp").expect("outside root");
         fs::write(outside.path().join("secret.flac"), b"secret").expect("outside file");

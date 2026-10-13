@@ -538,7 +538,7 @@ pub(crate) fn voiceprint_removal_key(
 ) -> Result<VoiceprintKey, VoiceprintOperationError> {
     let value = serde_json::from_str(metadata)
         .map_err(|error| VoiceprintOperationError::MetadataJson(error.to_string()))?;
-    key_from_metadata_value(&value)
+    voiceprint_key_from_metadata(&value)
 }
 
 pub(crate) fn resolve_voiceprint_path(
@@ -645,10 +645,16 @@ fn removal_key(removal: &VoiceprintRemoval) -> Result<VoiceprintKey, VoiceprintO
     if !removal.key.is_object() {
         return Err(VoiceprintOperationError::InvalidRemovalKey);
     }
-    key_from_metadata_value(&removal.key)
+    voiceprint_key_from_metadata(&removal.key)
 }
 
-fn key_from_metadata_value(value: &Value) -> Result<VoiceprintKey, VoiceprintOperationError> {
+/// Construct a row's canonical provenance key without reading or writing an archive.
+/// Missing or empty streams use `_default`; absent/null layout is inferred from
+/// the stream. An explicit named `_default` remains distinct from direct layout.
+/// Callers with stricter metadata requirements must validate their row first.
+pub fn voiceprint_key_from_metadata(
+    value: &Value,
+) -> Result<VoiceprintKey, VoiceprintOperationError> {
     let object = value
         .as_object()
         .ok_or(VoiceprintOperationError::MetadataNotObject)?;

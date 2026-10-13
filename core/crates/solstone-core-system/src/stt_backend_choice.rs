@@ -12,6 +12,52 @@
 pub const STT_SURFACE: &str = "surface";
 pub const STT_BACKENDS: [&str; 3] = ["parakeet", "parakeet-cpp", "confidential"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SttRuntimeKind {
+    MacosCoreml,
+    LinuxCpp,
+    WindowsCpp,
+}
+
+/// Local STT host facts, independent of memory probes and backend overrides.
+/// A supported zero floor is distinct from an unsupported host's absent floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SttHostPolicy {
+    pub local_backend: Option<&'static str>,
+    pub local_floor_bytes: Option<u64>,
+    pub runtime_kind: Option<SttRuntimeKind>,
+}
+
+impl SttHostPolicy {
+    pub fn uses_parakeet_cpp(self) -> bool {
+        matches!(
+            self.runtime_kind,
+            Some(SttRuntimeKind::LinuxCpp | SttRuntimeKind::WindowsCpp)
+        )
+    }
+}
+
+/// Resolve asset platform aliases, with the separately shipped Windows runtime.
+/// CoreML support does not imply that a host can run the C++ server.
+pub fn stt_host_policy(os: &str, arch: &str) -> SttHostPolicy {
+    use solstone_core_assets::{Platform, resolve_host_platform};
+
+    let runtime_kind = match resolve_host_platform(os, arch) {
+        Ok(Platform::MacosArm64) => Some(SttRuntimeKind::MacosCoreml),
+        Ok(Platform::LinuxX64 | Platform::LinuxArm64) => Some(SttRuntimeKind::LinuxCpp),
+        Err(_) if (os, arch) == ("windows", "x86_64") => Some(SttRuntimeKind::WindowsCpp),
+        Err(_) => None,
+    };
+    SttHostPolicy {
+        local_backend: runtime_kind.map(|_| "parakeet"),
+        local_floor_bytes: runtime_kind.map(|runtime| match runtime {
+            SttRuntimeKind::MacosCoreml => 0,
+            SttRuntimeKind::LinuxCpp | SttRuntimeKind::WindowsCpp => 4 * 1024 * 1024 * 1024,
+        }),
+        runtime_kind,
+    }
+}
+
 /// Whether a configured or CLI-supplied backend names a supported STT lane.
 pub fn is_known_stt_backend(backend: &str) -> bool {
     STT_BACKENDS.contains(&backend)

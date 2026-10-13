@@ -32,7 +32,7 @@ use solstone_core_local::plan::VulkanDevice;
 #[cfg(not(windows))]
 use solstone_core_local::select_device;
 
-use crate::stt_backend_choice::configured_stt_backend;
+use crate::stt_backend_choice::{configured_stt_backend, stt_host_policy};
 
 use super::admission::{ParakeetAdmissionInput, parakeet_stt_admission_latch};
 use super::local_follow::LocalInstallerLauncher;
@@ -48,10 +48,6 @@ use super::parakeet_truth::{
 };
 use super::seams::{RuntimeStoreError, TruthObservationSeam};
 
-const GIB: u64 = 1024 * 1024 * 1024;
-const LINUX_LOCAL_FLOOR_BYTES: u64 = 4 * GIB;
-const WINDOWS_LOCAL_FLOOR_BYTES: u64 = 4 * GIB;
-const DARWIN_ARM64_LOCAL_FLOOR_BYTES: u64 = 0;
 const PARAKEET_ATT_CONTEXT_ENV: &str = "PARAKEET_ATT_CONTEXT";
 const PARAKEET_ATT_CONTEXT: &str = "128";
 
@@ -590,18 +586,11 @@ fn regular_files_exist(binary_path: &Path, model_path: &Path) -> Result<bool, st
 }
 
 fn platform_floor_bytes(platform: &str, machine: &str) -> Option<u64> {
-    match (platform, machine) {
-        ("windows", "x86_64") => Some(WINDOWS_LOCAL_FLOOR_BYTES),
-        ("darwin", "arm64") => Some(DARWIN_ARM64_LOCAL_FLOOR_BYTES),
-        (platform, "x86_64" | "aarch64" | "arm64") if platform.starts_with("linux") => {
-            Some(LINUX_LOCAL_FLOOR_BYTES)
-        }
-        _ => None,
-    }
+    stt_host_policy(platform, machine).local_floor_bytes
 }
 
 fn local_stt_backend(platform: &str, machine: &str) -> Option<&'static str> {
-    platform_floor_bytes(platform, machine).map(|_| "parakeet")
+    stt_host_policy(platform, machine).local_backend
 }
 
 fn confidential_channel_plausible(config: &Map<String, Value>) -> bool {
@@ -667,6 +656,29 @@ fn unavailable_observation(reason_code: &'static str) -> ProviderTruthObservatio
 #[cfg(test)]
 mod windows_stt_selection_tests {
     use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn admission_host_facts_do_not_enable_cpp_hosting_on_coreml_macs() {
+        for (os, arch, floor) in [
+            ("macos", "aarch64", Some(0)),
+            ("darwin", "arm64", Some(0)),
+            ("linux", "amd64", Some(4 * GIB)),
+            ("linux", "arm64", Some(4 * GIB)),
+            ("windows", "x86_64", Some(4 * GIB)),
+            ("windows", "aarch64", None),
+            ("darwin", "x86_64", None),
+            ("linux", "armv7l", None),
+            ("unknown", "x86_64", None),
+        ] {
+            assert_eq!(platform_floor_bytes(os, arch), floor, "{os}/{arch}");
+            assert_eq!(local_stt_backend(os, arch), floor.map(|_| "parakeet"));
+            if floor == Some(0) || floor.is_none() {
+                assert!(!parakeet_platform_can_host(os, arch), "{os}/{arch}");
+            }
+        }
+    }
 
     #[test]
     fn windows_default_latch_uses_cpu_floor_and_preserves_memory_refusal() {

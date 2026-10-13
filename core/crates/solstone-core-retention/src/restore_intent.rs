@@ -303,9 +303,7 @@ impl PublicationFacts {
         {
             return false;
         }
-        let file_valid = self.file_durability == next.file_durability
-            || (self.file_durability == Durability::Unproven
-                && next.file_durability == Durability::Synced);
+        let file_valid = self.file_durability == next.file_durability;
         let parent_valid = self.parent_durability == next.parent_durability
             || (self.parent_durability == Durability::Unproven
                 && next.parent_durability == Durability::Synced);

@@ -13,10 +13,11 @@ use solstone_core_generate::GenerateRequest;
 
 use crate::endpoint::EndpointTransportError;
 use crate::openai::{
-    OpenAiGenerated, OpenAiResult, RequestBodyMode, capture_provider_detail,
-    is_context_window_error, parse_response, request_body, request_timeout,
+    OpenAiGenerated, OpenAiResult, RequestBodyMode, is_context_window_error, parse_response,
+    request_body,
 };
 use crate::thinking::{byo_thinking, openai_efforts, shared_ceiling};
+use crate::transport::{capture_provider_detail, classify_ureq_error, request_timeout};
 
 const OPENAI_BASE_URL: &str = "https://api.openai.com";
 const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
@@ -62,14 +63,7 @@ impl ResponsesTransport for UreqResponsesTransport {
         bearer: &str,
         timeout: Duration,
     ) -> Result<ChatGptPost, EndpointTransportError> {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_connect(Some(timeout))
-            .timeout_recv_response(Some(timeout))
-            .timeout_recv_body(Some(timeout))
-            .timeout_global(Some(timeout))
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
+        let agent = crate::transport::agent(timeout);
         let response = agent
             .post(&format!("{base_url}{path}"))
             .header("Content-Type", "application/json")
@@ -826,19 +820,6 @@ fn failure(reason_code: &str) -> ChatGptResult {
         reason_code: Some(reason_code.to_owned()),
         detail: None,
     })
-}
-
-fn classify_ureq_error(error: ureq::Error) -> EndpointTransportError {
-    match error {
-        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed | ureq::Error::Io(_) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(_) => EndpointTransportError::Capacity,
-        _ => EndpointTransportError::Other,
-    }
 }
 
 #[cfg(test)]

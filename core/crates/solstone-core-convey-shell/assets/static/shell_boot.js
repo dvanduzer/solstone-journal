@@ -21,14 +21,7 @@
     return (shell.apps || []).find((app) => app.name === appName) || null;
   }
 
-  function escapeHtml(value) {
-    return String(value ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
+  const escapeHtml = window.AppServices.escapeHtml;
 
   function copyText(key, fallback) {
     return window.CONVEY_COPY?.[key] || fallback;

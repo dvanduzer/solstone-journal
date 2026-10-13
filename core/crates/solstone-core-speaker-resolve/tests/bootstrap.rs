@@ -1323,3 +1323,63 @@ fn ac6_commit_persists_the_alias_on_the_canonical_entity() {
         .unwrap();
     assert_eq!(canonical.value()["aka"], json!(["Alex"]));
 }
+
+#[test]
+fn bootstrap_deduplicates_canonical_keys_in_mixed_metadata_archives() {
+    for (extra, duplicates) in [
+        (json!({}), true),
+        (json!({"stream":"_default","stream_layout":"direct"}), true),
+        (json!({"stream":"_default","stream_layout":"named"}), false),
+        (json!({"stream_layout":null}), false),
+        (json!({"sentence_id":"7"}), false),
+    ] {
+        let t = Temp::new();
+        entity(t.path(), "principal", "Owner", "Person", true);
+        entity(t.path(), "target", "Alex Smith", "Person", false);
+        write_owner(t.path());
+        segment(t.path(), "120000_300", "Alex Smith");
+        fs::rename(
+            t.path().join("chronicle/20260808/mic/120000_300"),
+            t.path().join("chronicle/20260808/120000_300"),
+        )
+        .unwrap();
+        let mut metadata =
+            json!({"day":"20260808","segment_key":"120000_300","source":"audio","sentence_id":7});
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        save_voiceprints_batch(
+            t.path(),
+            "target",
+            &[
+                VoiceprintItem {
+                    embedding: vector(0., 1.),
+                    metadata: json!({}),
+                },
+                VoiceprintItem {
+                    embedding: vector(0., 1.),
+                    metadata,
+                },
+            ],
+            &encoder(),
+        )
+        .unwrap();
+        let outcome = bootstrap_voiceprints(&request(t.path())).unwrap();
+        let BootstrapOutcome::Completed(stats) = outcome else {
+            panic!("unexpected outcome: {outcome:?}")
+        };
+        assert_eq!(
+            stats.embeddings_skipped_duplicate,
+            usize::from(duplicates),
+            "{extra}"
+        );
+        assert_eq!(
+            load_entity_voiceprints_file(t.path(), "target")
+                .unwrap()
+                .rows,
+            if duplicates { 2 } else { 3 },
+            "{extra}"
+        );
+    }
+}

@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- playing a voice sample on the speakers page now reads only the part of the audio your browser asks for, using less memory for long recordings.
+
 - health now shows recorded backup attempts, successful copies and spot-checks. the backup page also shows a status summary and links to those details.
 
 - in entities, "block" is now "hide", "unblock" is "unhide", and "blocked" is "hidden". the actions work as before.
@@ -26,6 +28,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - activity filters stay visible after applying them, import source filters cover the full history, and support opens from settings on phones. chart values are available by keyboard and touch, without covering nearby bars.
 - originals waiting for approval now load in pages, each with its own selection. a single item too large to review is identified without offering a deletion action, and you can continue to the next page.
 
+- naming a voice could add the same voice sample twice from older audio. that sample is now counted once.
+- security fix: text containing quotes could be mistaken for part of a button or link in your journal's browser pages. it now displays as text.
 - a failed backup attempt no longer replaces the record of your last successful backup. the backup page shows both, including when a stored copy was incomplete.
 - each day's daily results, like your morning briefing, are made again once the day ends. since 2.0.42, your journal waited for each of the day's recordings to be checked off one by one, a few every hour or so. when recordings ran all day, those results stopped coming. days already waiting catch up soon after you update, and catching up on older recordings keeps going as each one finishes instead of a few at a time.
 - some long conversations you imported from ChatGPT, Claude, Gemini or a text file were never read. your journal kept waiting on them, so that day's daily results never finished, and nothing said why. they're now read like any other conversation, and when a day's daily results can't finish, your journal's log names the recordings or conversations holding it up.
