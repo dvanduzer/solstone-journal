@@ -530,10 +530,12 @@ mod tests {
     use std::fs;
     #[cfg(all(test, feature = "full-tests"))]
     use std::io::Cursor;
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
     #[cfg(all(test, feature = "full-tests"))]
     use chrono::{TimeZone, Utc};
+    #[cfg(unix)]
     use nix::fcntl::{Flock, FlockArg};
     use serde_json::json;
     #[cfg(all(test, feature = "full-tests"))]
@@ -740,25 +742,28 @@ mod tests {
         prepared
             .config
             .insert("output_path".to_owned(), json!(path));
-        let link = temp.path().join("journal-link");
-        std::os::unix::fs::symlink(&journal, &link).unwrap();
-        prepared.config.insert(
-            "output_path".to_owned(),
-            json!(link.join("facets/work/activities/20260101/a/out.json")),
-        );
-        assert!(
-            write_output_if_configured(
-                &prepared,
-                &ExecutionContext { journal: link },
-                "through link"
-            )
-            .unwrap()
-        );
-        assert!(
-            journal
-                .join("facets/work/activities/20260101/a/out.json")
-                .exists()
-        );
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("journal-link");
+            std::os::unix::fs::symlink(&journal, &link).unwrap();
+            prepared.config.insert(
+                "output_path".to_owned(),
+                json!(link.join("facets/work/activities/20260101/a/out.json")),
+            );
+            assert!(
+                write_output_if_configured(
+                    &prepared,
+                    &ExecutionContext { journal: link },
+                    "through link"
+                )
+                .unwrap()
+            );
+            assert!(
+                journal
+                    .join("facets/work/activities/20260101/a/out.json")
+                    .exists()
+            );
+        }
         prepared
             .config
             .insert("output_path".to_owned(), json!(path));
@@ -987,6 +992,7 @@ mod tests {
         assert_eq!(rows[1]["ts"], 7);
     }
 
+    #[cfg(unix)]
     #[test]
     fn criterion_19_accumulator_is_atomic_unlocked_and_declines_without_warning() {
         let root = tempfile::tempdir().unwrap();

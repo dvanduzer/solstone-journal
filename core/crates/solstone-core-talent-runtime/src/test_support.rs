@@ -4,15 +4,17 @@
 #![cfg(test)]
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Set only by the install probe; a stub run with it exits before its body.
 #[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
 const PROBE_ENV: &str = "SOLSTONE_TEST_STUB_PROBE";
 
-/// Write an executable `/bin/sh` stub. Under `full-tests`, where stubs run,
-/// return only once it can be executed.
+/// Write a `/bin/sh` stub. The Unix suites that execute these stubs enable
+/// `full-tests`; there, return only once it can be executed.
 pub fn install_stub(path: &Path, script: &str) {
     let body = script
         .strip_prefix("#!/bin/sh\n")
@@ -22,10 +24,13 @@ pub fn install_stub(path: &Path, script: &str) {
         format!("#!/bin/sh\n[ -z \"$SOLSTONE_TEST_STUB_PROBE\" ] || exit 0\n{body}"),
     )
     .unwrap();
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions).unwrap();
-    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+    #[cfg(all(test, unix, feature = "full-tests"))]
     wait_until_executable(path);
 }
 
@@ -35,6 +40,7 @@ pub fn install_stub(path: &Path, script: &str) {
 /// as `solstone-core-system/tests/fixture_binary.rs` does, keeps the race out
 /// of every test that runs a stub.
 #[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
 fn wait_until_executable(path: &Path) {
     use std::io::ErrorKind;
     use std::process::{Command, Stdio};
