@@ -114,6 +114,12 @@
       "path_or_field": "/app/transcripts/api/serve_file/{day}/{rel_path} \u2014 present file, unregistered extension",
       "reference": "routes.py raises an uncaught ValueError; Convey returns JSON {\"reason_code\": \"internal_error\"} with HTTP 500.",
       "why": "an unhandled exception is not a contract worth reproducing; the sibling speakers corpus already carries this same deviation for its own media route."
+    },
+    {
+      "path_or_field": "synthetic audio JSONL start/end and displayed source clocks",
+      "reference": "captured seeder uses segment-relative placeholder clocks",
+      "native": "source rows and expected display/source references use absolute wall clocks; expected numeric epochs are unchanged",
+      "why": "speaker-id writer publishes absolute wall clocks, including segment start, so fixtures must exercise that producer contract"
     }
   ],
   "phases": {
@@ -2919,7 +2925,7 @@
           "body_sha256": "d5a1225d82689af1d17b2504c1f23a7262ab999c4296e2f9a2253e6e368afbb7",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n\n## 2026-07-31 11:00:00 - 11:02:00\n\n### Transcript\nStart: 2026-07-31 11:00am\n\n## 2026-07-31 12:00:00 - 12:02:00\n\n### Transcript\nStart: 2026-07-31 12:00pm\n\n## 2026-07-31 13:00:00 - 13:01:00\n\n### audio summary\n# Preserved audio projection\n\n## 2026-07-31 13:10:00 - 13:11:00\n\n### Transcript\n# Imported note\n\nNormalizes as markdown.\n\n## 2026-07-31 13:20:00 - 13:21:00\n\n### Transcript\n# Health import\n\nRaw media remains.\n\n## 2026-07-31 13:30:00 - 13:31:00\n\n### Transcript\nStart: 2026-07-31 01:30pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 13:40:00 - 13:41:00\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[00:00:01] First.\n[00:00:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 13:50:00 - 13:51:00\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[00:00:01] First.\n[00:00:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 14:00:00 - 14:01:00\n\n### Transcript\n# Dual one\n\n### Transcript\n# Dual two\n\n## 2026-07-31 14:10:00 - 14:11:00\n\n### Transcript\nStart: 2026-07-31 02:10pm\n[00:00:01] First.\n[00:00:03] Second.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n\n## 2026-07-31 11:00:00 - 11:02:00\n\n### Transcript\nStart: 2026-07-31 11:00am\n\n## 2026-07-31 12:00:00 - 12:02:00\n\n### Transcript\nStart: 2026-07-31 12:00pm\n\n## 2026-07-31 13:00:00 - 13:01:00\n\n### audio summary\n# Preserved audio projection\n\n## 2026-07-31 13:10:00 - 13:11:00\n\n### Transcript\n# Imported note\n\nNormalizes as markdown.\n\n## 2026-07-31 13:20:00 - 13:21:00\n\n### Transcript\n# Health import\n\nRaw media remains.\n\n## 2026-07-31 13:30:00 - 13:31:00\n\n### Transcript\nStart: 2026-07-31 01:30pm\n[13:30:01] First.\n[13:30:03] Second.\n\n## 2026-07-31 13:40:00 - 13:41:00\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[13:40:01] First.\n[13:40:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[13:40:01] First.\n[13:40:03] Second.\n\n## 2026-07-31 13:50:00 - 13:51:00\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[13:50:01] First.\n[13:50:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[13:50:01] First.\n[13:50:03] Second.\n\n## 2026-07-31 14:00:00 - 14:01:00\n\n### Transcript\n# Dual one\n\n### Transcript\n# Dual two\n\n## 2026-07-31 14:10:00 - 14:11:00\n\n### Transcript\nStart: 2026-07-31 02:10pm\n[14:10:01] First.\n[14:10:03] Second.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -2957,7 +2963,7 @@
           "body_sha256": "1ce60b49177736b81dd3dfbc2b1ec07b845edaf6b0723d7f65d035286c62c274",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n## 2026-07-31 11:00:00 - 11:02:00\n\n### Transcript\nStart: 2026-07-31 11:00am\n\n## 2026-07-31 12:00:00 - 12:02:00\n\n### Transcript\nStart: 2026-07-31 12:00pm\n\n## 2026-07-31 13:10:00 - 13:11:00\n\n### Transcript\n# Imported note\n\nNormalizes as markdown.\n\n## 2026-07-31 13:20:00 - 13:21:00\n\n### Transcript\n# Health import\n\nRaw media remains.\n\n## 2026-07-31 13:30:00 - 13:31:00\n\n### Transcript\nStart: 2026-07-31 01:30pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 13:40:00 - 13:41:00\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[00:00:01] First.\n[00:00:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 13:50:00 - 13:51:00\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[00:00:01] First.\n[00:00:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 14:00:00 - 14:01:00\n\n### Transcript\n# Dual one\n\n### Transcript\n# Dual two\n\n## 2026-07-31 14:10:00 - 14:11:00\n\n### Transcript\nStart: 2026-07-31 02:10pm\n[00:00:01] First.\n[00:00:03] Second.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n## 2026-07-31 11:00:00 - 11:02:00\n\n### Transcript\nStart: 2026-07-31 11:00am\n\n## 2026-07-31 12:00:00 - 12:02:00\n\n### Transcript\nStart: 2026-07-31 12:00pm\n\n## 2026-07-31 13:10:00 - 13:11:00\n\n### Transcript\n# Imported note\n\nNormalizes as markdown.\n\n## 2026-07-31 13:20:00 - 13:21:00\n\n### Transcript\n# Health import\n\nRaw media remains.\n\n## 2026-07-31 13:30:00 - 13:31:00\n\n### Transcript\nStart: 2026-07-31 01:30pm\n[13:30:01] First.\n[13:30:03] Second.\n\n## 2026-07-31 13:40:00 - 13:41:00\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[13:40:01] First.\n[13:40:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[13:40:01] First.\n[13:40:03] Second.\n\n## 2026-07-31 13:50:00 - 13:51:00\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[13:50:01] First.\n[13:50:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[13:50:01] First.\n[13:50:03] Second.\n\n## 2026-07-31 14:00:00 - 14:01:00\n\n### Transcript\n# Dual one\n\n### Transcript\n# Dual two\n\n## 2026-07-31 14:10:00 - 14:11:00\n\n### Transcript\nStart: 2026-07-31 02:10pm\n[14:10:01] First.\n[14:10:03] Second.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -2976,7 +2982,7 @@
           "body_sha256": "8c9ea02df78d314442187b364795075ecbdbe89cc45ce206bfc8914a071c1d81",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n\n## 2026-07-31 11:00:00 - 11:02:00\n\n### Transcript\nStart: 2026-07-31 11:00am\n\n## 2026-07-31 12:00:00 - 12:02:00\n\n### Transcript\nStart: 2026-07-31 12:00pm\n\n## 2026-07-31 13:00:00 - 13:01:00\n\n### audio summary\n# Preserved audio projection\n\n## 2026-07-31 13:10:00 - 13:11:00\n\n### Transcript\n# Imported note\n\nNormalizes as markdown.\n\n## 2026-07-31 13:20:00 - 13:21:00\n\n### Transcript\n# Health import\n\nRaw media remains.\n\n## 2026-07-31 13:30:00 - 13:31:00\n\n### Transcript\nStart: 2026-07-31 01:30pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 13:40:00 - 13:41:00\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[00:00:01] First.\n[00:00:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 13:50:00 - 13:51:00\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[00:00:01] First.\n[00:00:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[00:00:01] First.\n[00:00:03] Second.\n\n## 2026-07-31 14:00:00 - 14:01:00\n\n### Transcript\n# Dual one\n\n### Transcript\n# Dual two\n\n## 2026-07-31 14:10:00 - 14:11:00\n\n### Transcript\nStart: 2026-07-31 02:10pm\n[00:00:01] First.\n[00:00:03] Second.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n\n## 2026-07-31 11:00:00 - 11:02:00\n\n### Transcript\nStart: 2026-07-31 11:00am\n\n## 2026-07-31 12:00:00 - 12:02:00\n\n### Transcript\nStart: 2026-07-31 12:00pm\n\n## 2026-07-31 13:00:00 - 13:01:00\n\n### audio summary\n# Preserved audio projection\n\n## 2026-07-31 13:10:00 - 13:11:00\n\n### Transcript\n# Imported note\n\nNormalizes as markdown.\n\n## 2026-07-31 13:20:00 - 13:21:00\n\n### Transcript\n# Health import\n\nRaw media remains.\n\n## 2026-07-31 13:30:00 - 13:31:00\n\n### Transcript\nStart: 2026-07-31 01:30pm\n[13:30:01] First.\n[13:30:03] Second.\n\n## 2026-07-31 13:40:00 - 13:41:00\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[13:40:01] First.\n[13:40:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:40pm\n[13:40:01] First.\n[13:40:03] Second.\n\n## 2026-07-31 13:50:00 - 13:51:00\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[13:50:01] First.\n[13:50:03] Second.\n\n### Transcript\nStart: 2026-07-31 01:50pm\n[13:50:01] First.\n[13:50:03] Second.\n\n## 2026-07-31 14:00:00 - 14:01:00\n\n### Transcript\n# Dual one\n\n### Transcript\n# Dual two\n\n## 2026-07-31 14:10:00 - 14:11:00\n\n### Transcript\nStart: 2026-07-31 02:10pm\n[14:10:01] First.\n[14:10:03] Second.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -2995,7 +3001,7 @@
           "body_sha256": "e47896d80205c3eb43ccc4688691807233ca9e2d0022b18c1f01fc8ac69700d7",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3033,7 +3039,7 @@
           "body_sha256": "2b090b9b7658c48ed1354594a2cc039a2a7260d443bde1776664dfd741b554fb",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3052,7 +3058,7 @@
           "body_sha256": "d63849d2d11025df8162121b19ca8f5e495d4e8524f32b4623c0d6e388b3f676",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3071,7 +3077,7 @@
           "body_sha256": "e47896d80205c3eb43ccc4688691807233ca9e2d0022b18c1f01fc8ac69700d7",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3109,7 +3115,7 @@
           "body_sha256": "2b090b9b7658c48ed1354594a2cc039a2a7260d443bde1776664dfd741b554fb",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3128,7 +3134,7 @@
           "body_sha256": "d63849d2d11025df8162121b19ca8f5e495d4e8524f32b4623c0d6e388b3f676",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3147,7 +3153,7 @@
           "body_sha256": "e47896d80205c3eb43ccc4688691807233ca9e2d0022b18c1f01fc8ac69700d7",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3185,7 +3191,7 @@
           "body_sha256": "2b090b9b7658c48ed1354594a2cc039a2a7260d443bde1776664dfd741b554fb",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### Screen Activity\n# Frame Analyses\n### 09:00:01\n\n**Category:** work\n\nA deterministic screen percept.\n\n### Browser Content\n## Seeded browser page\n\nbrowser \u00b7 example.test\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3204,7 +3210,7 @@
           "body_sha256": "d63849d2d11025df8162121b19ca8f5e495d4e8524f32b4623c0d6e388b3f676",
           "body_sha256_basis": "normalized-json",
           "json": {
-            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[00:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
+            "markdown": "## 2026-07-31 09:00:00 - 09:05:00\n\n### Transcript\nStart: 2026-07-31 09:00am\n[09:00:01] Seeded transcript.\n\n### audio summary\n# Audio projection\n\n### flow summary\n# Segment flow\n\nSeeded segment output.\n"
           },
           "method": "GET",
           "normalized_fields": [],
@@ -3534,11 +3540,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:01"
+                  "start": "09:00:01"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "mic_audio",
-                "time": "00:00:01",
+                "time": "09:00:01",
                 "timestamp": 1785488401000,
                 "type": "audio"
               },
@@ -4241,7 +4247,7 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:01"
+                  "start": "13:30:01"
                 },
                 "speaker_actionable": true,
                 "speaker_label": {
@@ -4255,7 +4261,7 @@
                   "owner_margin_declined": false
                 },
                 "speaker_source": "mic_audio",
-                "time": "00:00:01",
+                "time": "13:30:01",
                 "timestamp": 1785504601000,
                 "type": "audio"
               },
@@ -4266,7 +4272,7 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:03"
+                  "start": "13:30:03"
                 },
                 "speaker_actionable": true,
                 "speaker_label": {
@@ -4280,7 +4286,7 @@
                   "owner_margin_declined": false
                 },
                 "speaker_source": "mic_audio",
-                "time": "00:00:03",
+                "time": "13:30:03",
                 "timestamp": 1785504603000,
                 "type": "audio"
               }
@@ -4382,11 +4388,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:01"
+                  "start": "13:40:01"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "desk_audio",
-                "time": "00:00:01",
+                "time": "13:40:01",
                 "timestamp": 1785505201000,
                 "type": "audio"
               },
@@ -4397,11 +4403,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:01"
+                  "start": "13:40:01"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "mic_audio",
-                "time": "00:00:01",
+                "time": "13:40:01",
                 "timestamp": 1785505201000,
                 "type": "audio"
               },
@@ -4412,11 +4418,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:03"
+                  "start": "13:40:03"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "desk_audio",
-                "time": "00:00:03",
+                "time": "13:40:03",
                 "timestamp": 1785505203000,
                 "type": "audio"
               },
@@ -4427,11 +4433,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:03"
+                  "start": "13:40:03"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "mic_audio",
-                "time": "00:00:03",
+                "time": "13:40:03",
                 "timestamp": 1785505203000,
                 "type": "audio"
               }
@@ -4543,11 +4549,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:01"
+                  "start": "13:50:01"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "desk_audio",
-                "time": "00:00:01",
+                "time": "13:50:01",
                 "timestamp": 1785505801000,
                 "type": "audio"
               },
@@ -4558,11 +4564,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:01"
+                  "start": "13:50:01"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "mic_audio",
-                "time": "00:00:01",
+                "time": "13:50:01",
                 "timestamp": 1785505801000,
                 "type": "audio"
               },
@@ -4573,11 +4579,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:03"
+                  "start": "13:50:03"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "desk_audio",
-                "time": "00:00:03",
+                "time": "13:50:03",
                 "timestamp": 1785505803000,
                 "type": "audio"
               },
@@ -4588,11 +4594,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:03"
+                  "start": "13:50:03"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "mic_audio",
-                "time": "00:00:03",
+                "time": "13:50:03",
                 "timestamp": 1785505803000,
                 "type": "audio"
               }
@@ -4710,11 +4716,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:01"
+                  "start": "14:10:01"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "mic_audio",
-                "time": "00:00:01",
+                "time": "14:10:01",
                 "timestamp": 1785507001000,
                 "type": "audio"
               },
@@ -4725,11 +4731,11 @@
                 "source_ref": {
                   "source": null,
                   "speaker": null,
-                  "start": "00:00:03"
+                  "start": "14:10:03"
                 },
                 "speaker_actionable": false,
                 "speaker_source": "mic_audio",
-                "time": "00:00:03",
+                "time": "14:10:03",
                 "timestamp": 1785507003000,
                 "type": "audio"
               }

@@ -261,13 +261,20 @@ pub fn prepare(
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| {
+                let environment_stream = std::env::var("SOL_STREAM").ok();
                 solstone_core_talent_config::get_output_path(
                     &context.journal.join("chronicle").join(day),
                     &name,
                     composed.get("segment").and_then(Value::as_str),
                     Some(output),
                     composed.get("facet").and_then(Value::as_str),
-                    std::env::var("SOL_STREAM").ok().as_deref(),
+                    composed
+                        .get("stream")
+                        .and_then(Value::as_str)
+                        .filter(|stream| !stream.is_empty())
+                        .or(environment_stream
+                            .as_deref()
+                            .filter(|stream| !stream.is_empty())),
                 )
             });
         composed.insert(
@@ -400,6 +407,7 @@ fn reject_request_fields(
     // lower them.
     for field in [
         "max_output_tokens",
+        "timeout_s",
         "thinking_budget",
         "context_window",
         "temperature",
@@ -577,6 +585,21 @@ mod tests {
                 message
             );
         }
+    }
+
+    #[test]
+    fn request_timeout_cannot_override_the_talent_budget() {
+        let config = TalentConfig {
+            key: "sense".to_owned(),
+            file: String::new(),
+            body: String::new(),
+            metadata: Map::from_iter([("timeout_s".to_owned(), json!(480))]),
+        };
+        for timeout in [480, 900] {
+            let request = Map::from_iter([("timeout_s".to_owned(), json!(timeout))]);
+            assert!(reject_request_fields(&config, &request, "sense").is_err());
+        }
+        assert!(reject_request_fields(&config, &Map::new(), "sense").is_ok());
     }
 
     #[test]
@@ -836,9 +859,11 @@ mod tests {
         .expect("segment template");
         fs::write(
             talent_root.join("screen.md"),
-            "{\n\"type\":\"generate\",\"max_output_tokens\":1024\n}\n$segment_preamble",
+            "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"output\":\"json\"\n}\n$segment_preamble",
         )
         .expect("talent");
+        let expected_output =
+            journal.join("chronicle/20260101/import.obsidian/090000_60/talents/screen.json");
         let prepared = prepare(
             json!({
                 "name":"screen",
@@ -858,6 +883,10 @@ mod tests {
             PrepareMode::Preview,
         )
         .expect("prepare");
+        assert_eq!(
+            prepared.config["output_path"].as_str(),
+            expected_output.to_str()
+        );
         assert_eq!(
             prepared.config["user_instruction"],
             "Soleil|Thursday, January 01, 2026|20260101|9:00 AM|9:01 AM|an imported note from Obsidian"
