@@ -157,6 +157,7 @@ mod speakers_cli_owner;
 mod speakers_cli_reads;
 mod speakers_discovery;
 mod speakers_discovery_write;
+mod speakers_dismissals;
 mod speakers_known;
 mod speakers_media;
 mod speakers_npz;

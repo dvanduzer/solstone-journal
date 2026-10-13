@@ -158,6 +158,22 @@ async fn call(root: &Path, path: &str, body: Value) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&body).expect("json"))
 }
 
+async fn discovery_cache(root: &Path) -> (StatusCode, Value) {
+    let response = router(root.to_path_buf())
+        .oneshot(
+            Request::get("/app/speakers/api/discovery/cache")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, serde_json::from_slice(&body).expect("json"))
+}
+
 fn members() -> Value {
     json!([
         {"source":"audio","sentence_id":10,"stream":"b","day":"20260102","segment_key":"2_1","ignored":true},
@@ -951,4 +967,113 @@ async fn scan_hides_clusters_with_at_least_half_dismissed_provenance() {
     )
     .expect("cache json");
     assert!(cache["clusters"]["0"].is_array(), "{cache}");
+}
+
+#[tokio::test]
+async fn discovery_cache_and_scan_replay_connected_dismissals_with_layout_identity() {
+    install_discovery_helper();
+    for layout in ["named", "direct"] {
+        let journal = Journal::new();
+        journal.entity("owner", true);
+        journal.owner_centroid();
+        add_candidates(&journal, 5);
+        let mut provenance = candidate_members(7);
+        for member in provenance.as_array_mut().expect("members") {
+            member["stream_layout"] = json!(layout);
+        }
+        let history_path = journal.0.join("speakers/cluster-dismissals.jsonl");
+        let mut prior = String::new();
+        for indexes in [&[0, 5][..], &[5, 6], &[6, 3, 4]] {
+            journal.cache(Value::Array(
+                indexes
+                    .iter()
+                    .map(|index| provenance[*index].clone())
+                    .collect(),
+            ));
+            let (status, body) = call(
+                &journal.0,
+                "/app/speakers/api/discovery/dismiss",
+                json!({"cluster_id":7,"disposition":"quiet"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let history = fs::read_to_string(&history_path).expect("history");
+            assert!(
+                history.starts_with(&prior),
+                "append rewrote existing history"
+            );
+            prior = history;
+        }
+        let (status, scan) = call(&journal.0, "/app/speakers/api/discovery/scan", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{scan}");
+        let before_read = snapshot(&journal.0);
+        let (status, cache) = discovery_cache(&journal.0).await;
+        assert_eq!(status, StatusCode::OK, "{cache}");
+        let expected = usize::from(layout == "direct");
+        assert_eq!(
+            scan["clusters"].as_array().expect("scan clusters").len(),
+            expected
+        );
+        assert_eq!(
+            cache["clusters"].as_array().expect("cache clusters").len(),
+            expected
+        );
+        assert_eq!(
+            snapshot(&journal.0),
+            before_read,
+            "read changed journal state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dismissal_history_preserves_each_callers_admission_and_error_policy() {
+    install_discovery_helper();
+    let valid = json!({"members":candidate_members(5)}).to_string();
+    let mut tolerant = candidate_members(5);
+    for member in tolerant.as_array_mut().expect("members") {
+        member["sentence_id"] = json!(" 1 ");
+    }
+    for (history, read_status, scan_status) in [
+        (
+            format!("{valid}\nnot-json\n"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            format!("{valid}\n \n"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::OK,
+        ),
+        (
+            json!({"members":tolerant}).to_string(),
+            StatusCode::OK,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            json!({"members":[{}]}).to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let journal = Journal::new();
+        journal.entity("owner", true);
+        journal.owner_centroid();
+        add_candidates(&journal, 5);
+        journal.cache(candidate_members(5));
+        fs::create_dir_all(journal.0.join("speakers")).expect("speakers");
+        let history_path = journal.0.join("speakers/cluster-dismissals.jsonl");
+        fs::write(&history_path, &history).expect("history");
+        let before_read = snapshot(&journal.0);
+        let (status, body) = discovery_cache(&journal.0).await;
+        assert_eq!(status, read_status, "{body}");
+        assert_eq!(
+            snapshot(&journal.0),
+            before_read,
+            "read changed journal state"
+        );
+        let (status, body) = call(&journal.0, "/app/speakers/api/discovery/scan", json!({})).await;
+        assert_eq!(status, scan_status, "{body}");
+        assert_eq!(fs::read_to_string(&history_path).expect("history"), history);
+    }
 }
