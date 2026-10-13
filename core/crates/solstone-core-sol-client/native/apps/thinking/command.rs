@@ -6,6 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, FixedOffset};
 use serde_json::{Value, json};
 
+use crate::args::parse_args;
 use crate::command::{CommandContext, CommandOutput};
 use crate::decode::decode_response;
 use crate::error::{ClientError, SERVICE_DOWN_MESSAGE};
@@ -762,54 +763,6 @@ fn request_json(
         policy: TimeoutPolicy::Api,
     })?;
     decode_response(&response)
-}
-
-#[derive(Debug, Default)]
-struct ParsedArgs {
-    values: Vec<(String, String)>,
-    flags: Vec<String>,
-    positionals: Vec<String>,
-}
-
-impl ParsedArgs {
-    fn value(&self, name: &str) -> Option<&str> {
-        self.values
-            .iter()
-            .rev()
-            .find(|(key, _value)| key == name)
-            .map(|(_key, value)| value.as_str())
-    }
-
-    fn has_flag(&self, name: &str) -> bool {
-        self.flags.iter().any(|flag| flag == name)
-    }
-}
-
-fn parse_args(args: &[String], options: &[&str], flags: &[&str]) -> Result<ParsedArgs, String> {
-    let mut parsed = ParsedArgs::default();
-    let mut index = 0;
-    while index < args.len() {
-        let token = &args[index];
-        if let Some((name, value)) = token.split_once('=')
-            && options.contains(&name)
-        {
-            parsed.values.push((name.to_string(), value.to_string()));
-        } else if options.contains(&token.as_str()) {
-            index += 1;
-            let Some(value) = args.get(index) else {
-                return Err(format!("Error: option {token} requires an argument."));
-            };
-            parsed.values.push((token.clone(), value.clone()));
-        } else if flags.contains(&token.as_str()) {
-            parsed.flags.push(token.clone());
-        } else if token.starts_with('-') {
-            return Err(format!("Error: unknown option {token}."));
-        } else {
-            parsed.positionals.push(token.clone());
-        }
-        index += 1;
-    }
-    Ok(parsed)
 }
 
 fn parse_float_option(value: Option<&str>, default: f64) -> Result<f64, String> {
