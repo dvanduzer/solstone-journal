@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use axum::response::Response;
 use serde_json::json;
-use solstone_core_assets::{Platform, resolve_host_platform};
 use solstone_core_sense::memory::{MemoryProbe, SystemMemoryProbe};
+use solstone_core_system::stt_backend_choice::{SttRuntimeKind, stt_host_policy};
 
 use crate::{config, http::json_response};
 
@@ -31,20 +31,15 @@ pub async fn get(journal_root: PathBuf) -> Response {
     // A mac cannot host the parakeet.cpp server, so the page stops offering that
     // backend there. On Windows the server and model come with the journal and
     // run on the CPU, so there is nothing to install and no device to pick.
-    // Only those hosts add a flag; the Linux body is unchanged.
-    if !parakeet_cpp_runs_on(std::env::consts::OS) {
+    if !parakeet_uses_cpp(std::env::consts::OS, std::env::consts::ARCH) {
         response["parakeet_cpp_unavailable"] = json!(true);
     }
-    if parakeet_cpp_bundled_on(std::env::consts::OS) {
+    if parakeet_uses_cpp(std::env::consts::OS, std::env::consts::ARCH)
+        && parakeet_cpp_bundled_on(std::env::consts::OS)
+    {
         response["parakeet_cpp_bundled"] = json!(true);
     }
     json_response(response)
-}
-
-/// Whether the parakeet.cpp server can run on this OS at all. Linux and
-/// Windows host it; a mac transcribes locally through the CoreML helper.
-pub fn parakeet_cpp_runs_on(os: &str) -> bool {
-    !matches!(os, "macos" | "darwin")
 }
 
 /// Whether the parakeet.cpp server and its model ship inside the journal
@@ -53,14 +48,13 @@ pub fn parakeet_cpp_bundled_on(os: &str) -> bool {
     os == "windows"
 }
 
-const LOCAL_TRANSCRIPTION_FLOOR_GIB: u64 = 4;
-
 fn transcribe_resource(os: &str, arch: &str, available: Option<u64>) -> serde_json::Value {
     let available_gb =
         available.map(|bytes| (bytes as f64 / 1024_f64.powi(3) * 10.0).round() / 10.0);
-    if matches!(resolve_host_platform(os, arch), Ok(Platform::MacosArm64)) {
+    let floor = stt_host_policy(os, arch).local_floor_bytes;
+    if floor.is_none_or(|bytes| bytes == 0) {
         return json!({
-            "min_ram_gb": 0,
+            "min_ram_gb": floor,
             "available_memory_gb": available_gb,
             "requirement": "",
             "detected": "",
@@ -68,14 +62,14 @@ fn transcribe_resource(os: &str, arch: &str, available: Option<u64>) -> serde_js
             "notice": "",
         });
     }
-    // The same 4 GiB floor transcription admits against on Linux and Windows
-    // (`solstone-core-transcribe` `LINUX_LOCAL_FLOOR_BYTES`, `WINDOWS_LOCAL_FLOOR_BYTES`).
+    let floor_bytes = floor.expect("nonzero supported floor");
+    let floor_gb = floor_bytes / 1024_u64.pow(3);
     json!({
-        "min_ram_gb": LOCAL_TRANSCRIPTION_FLOOR_GIB,
+        "min_ram_gb": floor_gb,
         "available_memory_gb": available_gb,
-        "requirement": "local transcription needs about 4 GB of free memory.",
+        "requirement": format!("local transcription needs about {floor_gb} GB of free memory."),
         "detected": available_gb.map(|value| format!("{value} GB of free memory detected on this machine.")).unwrap_or_else(|| "free memory on this machine could not be detected.".to_owned()),
-        "needs_setup": available.is_some_and(|value| value < LOCAL_TRANSCRIPTION_FLOOR_GIB * 1024_u64.pow(3)),
+        "needs_setup": available.is_some_and(|value| value < floor_bytes),
         "notice": "",
     })
 }
@@ -88,43 +82,29 @@ fn backend_metadata() -> serde_json::Value {
 }
 
 pub fn runtime_label(os: &str, arch: &str) -> &'static str {
-    match resolve_host_platform(os, arch) {
-        Ok(Platform::MacosArm64) => "macOS CoreML helper",
-        Ok(Platform::LinuxX64 | Platform::LinuxArm64) => "Linux parakeet.cpp",
-        Err(_) if os == "windows" && arch == "x86_64" => "Windows parakeet.cpp",
-        Err(_) => "unsupported",
+    match stt_host_policy(os, arch).runtime_kind {
+        Some(SttRuntimeKind::MacosCoreml) => "macOS CoreML helper",
+        Some(SttRuntimeKind::LinuxCpp) => "Linux parakeet.cpp",
+        Some(SttRuntimeKind::WindowsCpp) => "Windows parakeet.cpp",
+        None => "unsupported",
     }
 }
 
 /// Whether the `parakeet` backend runs the parakeet.cpp server on this host:
 /// Linux on both architectures, and Windows x86_64 from its bundled package.
 pub fn parakeet_uses_cpp(os: &str, arch: &str) -> bool {
-    matches!(
-        resolve_host_platform(os, arch),
-        Ok(Platform::LinuxX64 | Platform::LinuxArm64)
-    ) || (os == "windows" && arch == "x86_64")
+    stt_host_policy(os, arch).uses_parakeet_cpp()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        parakeet_cpp_bundled_on, parakeet_cpp_runs_on, parakeet_uses_cpp, runtime_label,
-        transcribe_resource,
-    };
+    use super::{parakeet_cpp_bundled_on, parakeet_uses_cpp, runtime_label, transcribe_resource};
 
     #[test]
     fn parakeet_cpp_comes_with_the_journal_only_on_windows() {
         assert!(parakeet_cpp_bundled_on("windows"));
         assert!(!parakeet_cpp_bundled_on("linux"));
         assert!(!parakeet_cpp_bundled_on("macos"));
-    }
-
-    #[test]
-    fn parakeet_cpp_runs_everywhere_but_a_mac() {
-        assert!(parakeet_cpp_runs_on("linux"));
-        assert!(parakeet_cpp_runs_on("windows"));
-        assert!(!parakeet_cpp_runs_on("macos"));
-        assert!(!parakeet_cpp_runs_on("darwin"));
     }
 
     #[test]
@@ -178,5 +158,33 @@ mod tests {
         assert_eq!(resource["requirement"], "");
         let resource = transcribe_resource("macos", "aarch64", Some(1));
         assert_eq!(resource["needs_setup"], false);
+    }
+
+    #[test]
+    fn host_projection_keeps_support_distinct_from_memory_warnings() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for (os, arch, min_ram, cpp, label) in [
+            ("darwin", "arm64", Some(0), false, "macOS CoreML helper"),
+            ("macos", "aarch64", Some(0), false, "macOS CoreML helper"),
+            ("linux", "amd64", Some(4), true, "Linux parakeet.cpp"),
+            ("linux", "arm64", Some(4), true, "Linux parakeet.cpp"),
+            ("windows", "x86_64", Some(4), true, "Windows parakeet.cpp"),
+            ("windows", "aarch64", None, false, "unsupported"),
+            ("darwin", "x86_64", None, false, "unsupported"),
+            ("linux", "riscv64", None, false, "unsupported"),
+            ("unknown", "x86_64", None, false, "unsupported"),
+        ] {
+            assert_eq!(runtime_label(os, arch), label, "{os}/{arch}");
+            assert_eq!(parakeet_uses_cpp(os, arch), cpp, "{os}/{arch}");
+            for available in [None, Some(0), Some(4 * GIB - 1), Some(4 * GIB)] {
+                let resource = transcribe_resource(os, arch, available);
+                assert_eq!(resource["min_ram_gb"], serde_json::json!(min_ram));
+                assert_eq!(
+                    resource["needs_setup"],
+                    min_ram == Some(4) && available.is_some_and(|bytes| bytes < 4 * GIB),
+                    "{os}/{arch}, {available:?}"
+                );
+            }
+        }
     }
 }

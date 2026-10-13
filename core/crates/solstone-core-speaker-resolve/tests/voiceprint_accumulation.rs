@@ -426,3 +426,61 @@ fn ac22_one_entity_write_failure_does_not_abort_another_and_ac23_uses_segment_ti
     // 12:00 on Aug 8 in Denver is 18:00 UTC.
     assert_eq!(metadata["last_seen_ts"], 1_786_212_000_000i64);
 }
+
+#[test]
+fn accumulation_deduplicates_canonical_keys_in_mixed_metadata_archives() {
+    for (extra, duplicates) in [
+        (json!({}), true),
+        (json!({"stream":"_default","stream_layout":"direct"}), true),
+        (json!({"stream":"_default","stream_layout":"named"}), false),
+        (json!({"stream_layout":null}), false),
+        (json!({"sentence_id":"1"}), false),
+    ] {
+        let t = TempDir::new();
+        owner(&t);
+        entity(&t, "alice", "Person", false);
+        let mut metadata = json!({"day":"20260808","segment_key":"120000_300","source":"transcript","sentence_id":1});
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        save_voiceprints_batch(
+            t.path(),
+            "alice",
+            &[
+                VoiceprintItem {
+                    embedding: vector(0., 1.),
+                    metadata: json!({}),
+                },
+                VoiceprintItem {
+                    embedding: vector(0., 1.),
+                    metadata,
+                },
+            ],
+            &encoder(),
+        )
+        .unwrap();
+        let mut req = request(
+            &t,
+            vec![label(1, "alice")],
+            vec![embedding(1, vector(0., 1.))],
+            vec!["alice"],
+        );
+        req.stream_layout = SegmentLayout::Direct;
+        req.stream = "_default".into();
+        fs::create_dir_all(t.path().join("chronicle/20260808/120000_300")).unwrap();
+        let outcome = accumulate_voiceprints(&req).unwrap();
+        assert_eq!(
+            skip(&outcome, AccumulationSkipReason::ExistingVoiceprint),
+            usize::from(duplicates),
+            "{extra}"
+        );
+        assert_eq!(
+            load_entity_voiceprints_file(t.path(), "alice")
+                .unwrap()
+                .rows,
+            if duplicates { 2 } else { 3 },
+            "{extra}"
+        );
+    }
+}

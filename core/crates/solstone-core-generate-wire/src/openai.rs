@@ -11,17 +11,16 @@ use serde_json::{Map, Value, json};
 use solstone_core_generate::{ContentPart, GenerateRequest};
 use solstone_core_local::HttpResponse;
 
-use crate::NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS;
 use crate::endpoint::EndpointTransportError;
 use crate::schema_prep::prepare_provider_schema;
 use crate::thinking::{
     Thinking, byo_thinking, openai_efforts, openai_refused_thinking, shared_ceiling,
 };
+use crate::transport::{capture_provider_detail, request_timeout};
 
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const OPENAI_BASE_URL: &str = "https://api.openai.com";
 const OPENAI_RESPONSES_PATH: &str = "/v1/responses";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const OPENAI_EFFORT_SUFFIXES: &[&str] = &["-none", "-low", "-medium", "-high", "-xhigh"];
 const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
     "prompt is too long",
@@ -86,26 +85,13 @@ impl OpenAiTransport for UreqOpenAiTransport {
         api_key: &str,
         timeout: Duration,
     ) -> Result<HttpResponse, EndpointTransportError> {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_connect(Some(timeout))
-            .timeout_recv_response(Some(timeout))
-            .timeout_recv_body(Some(timeout))
-            .timeout_global(Some(timeout))
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
-        let response = agent
-            .post(&format!("{base_url}{path}"))
-            .header("Content-Type", "application/json")
-            .header("Authorization", &format!("Bearer {api_key}"))
-            .send(serde_json::to_string(body).expect("JSON value serializes"))
-            .map_err(classify_ureq_error)?;
-        let status = response.status().as_u16();
-        let body = response
-            .into_body()
-            .read_to_string()
-            .map_err(classify_ureq_error)?;
-        Ok(HttpResponse { status, body })
+        crate::transport::post_json(
+            base_url,
+            path,
+            body,
+            &[("Authorization", &format!("Bearer {api_key}"))],
+            timeout,
+        )
     }
 }
 
@@ -273,14 +259,6 @@ pub(crate) fn schema_name(schema: Option<&Value>) -> &str {
         .and_then(Value::as_str)
         .filter(|title| SCHEMA_NAME_RE.is_match(title))
         .unwrap_or("response")
-}
-
-/// The caller's timeout, else the lane default plus time for any thinking room.
-pub(crate) fn request_timeout(timeout_s: Option<f64>, thinking_room: u64) -> Duration {
-    timeout_s
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(Duration::from_secs_f64)
-        .unwrap_or(DEFAULT_TIMEOUT + crate::thinking::thinking_time(thinking_room))
 }
 
 pub(crate) fn parse_response(body: &str, secret: &str) -> OpenAiResult {
@@ -468,23 +446,6 @@ pub(crate) fn is_context_window_error(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn capture_provider_detail(body: &str, secret: &str) -> Option<String> {
-    if body.is_empty() {
-        return None;
-    }
-    let scrubbed = if secret.is_empty() {
-        body.to_owned()
-    } else {
-        body.replace(secret, "[redacted]")
-    };
-    Some(
-        scrubbed
-            .chars()
-            .take(NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS)
-            .collect(),
-    )
-}
-
 fn failure(reason_code: &str) -> OpenAiResult {
     OpenAiResult::Failed(OpenAiFailure {
         reason_code: Some(reason_code.to_owned()),
@@ -492,22 +453,11 @@ fn failure(reason_code: &str) -> OpenAiResult {
     })
 }
 
-fn classify_ureq_error(error: ureq::Error) -> EndpointTransportError {
-    match error {
-        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed | ureq::Error::Io(_) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(_) => EndpointTransportError::Capacity,
-        _ => EndpointTransportError::Other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use crate::NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS;
 
     use solstone_core_generate::{ContentPart, ReasonCodeValue};
 

@@ -203,7 +203,7 @@ where
                 });
             }
         };
-    let timeout = crate::endpoint::request_timeout(
+    let timeout = crate::transport::request_timeout(
         call.request.timeout_s,
         crate::endpoint::thinking_headroom(call.endpoint, call.config),
     );

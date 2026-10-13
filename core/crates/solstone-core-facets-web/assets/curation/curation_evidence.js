@@ -13,15 +13,7 @@
   const META_SEPARATOR = ' · ';
   // --- end owner-facing strings ---
 
-  function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, (char) => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#39;'
-    })[char]);
-  }
+  const escapeHtml = global.AppServices.escapeHtml;
 
   function samplesFor(item) {
     const samples = item?.evidence?.samples;

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
-use solstone_core_entity::{EncoderIdentity, VoiceprintItem, save_voiceprints_batch};
+use solstone_core_entity::{
+    EncoderIdentity, VoiceprintItem, load_entity_voiceprints_file, save_voiceprints_batch,
+};
 use solstone_core_npy::write_npy;
 use solstone_core_speaker_id::calibration::VP_OUTLIER_MIN_SAMPLES;
 use solstone_core_speaker_resolve::candidate_tracker::retroactive_voiceprint_metadata;
@@ -238,4 +240,79 @@ fn ac17_retroactive_plan_outlier_floor_and_threshold() {
     .unwrap();
     let at_floor = plan_retroactive_confirm(t.path(), &c, &vector(0., 1.), "target", 1).unwrap();
     assert!(at_floor.items.is_empty());
+}
+
+#[test]
+fn retroactive_plan_and_apply_deduplicate_canonical_keys_in_mixed_archives() {
+    for (extra, duplicates) in [
+        (json!({}), true),
+        (json!({"stream":"_default","stream_layout":"direct"}), true),
+        (json!({"stream":"_default","stream_layout":"named"}), false),
+        (json!({"stream_layout":null}), true),
+        (json!({"stream_layout":"other"}), false),
+        (json!({"stream_layout":1}), false),
+        (json!({"sentence_id":"7"}), false),
+    ] {
+        let t = Temp::new();
+        entity(t.path(), "principal", "Person", true);
+        entity(t.path(), "target", "Person", false);
+        owner(t.path());
+        embeddings(t.path());
+        fs::rename(
+            t.path().join("chronicle/20260808/mic/120000_300"),
+            t.path().join("chronicle/20260808/120000_300"),
+        )
+        .unwrap();
+        let mut metadata =
+            json!({"day":"20260808","segment_key":"120000_300","source":"audio","sentence_id":7});
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        save_voiceprints_batch(
+            t.path(),
+            "target",
+            &[
+                VoiceprintItem {
+                    embedding: vector(0., 1.),
+                    metadata: json!({}),
+                },
+                VoiceprintItem {
+                    embedding: vector(0., 1.),
+                    metadata,
+                },
+            ],
+            &encoder(),
+        )
+        .unwrap();
+        let mut c = candidate();
+        c.source_segments[0]["stream"] = json!("_default");
+        c.source_segments[0]["stream_layout"] = json!("direct");
+        let plan = plan_retroactive_confirm(t.path(), &c, &vector(0., 1.), "target", 1).unwrap();
+        assert_eq!(plan.items.len(), usize::from(!duplicates), "{extra}");
+        // Apply independently rechecks current archive keys, including a plan
+        // that was prepared before an equivalent legacy row was saved.
+        let mut pending = item(7);
+        pending.metadata["stream"] = json!("_default");
+        pending.metadata["stream_layout"] = json!("direct");
+        let stale = RetroactiveConfirmPlan {
+            matched: true,
+            candidate_id: None,
+            entity_id: "target".into(),
+            items: vec![pending],
+        };
+        let mut tracker = CandidateTracker::new(t.path());
+        assert_eq!(
+            apply_retroactive_confirm_plan(&mut tracker, t.path(), &stale, &encoder()).unwrap(),
+            usize::from(!duplicates),
+            "{extra}"
+        );
+        assert_eq!(
+            load_entity_voiceprints_file(t.path(), "target")
+                .unwrap()
+                .rows,
+            if duplicates { 2 } else { 3 },
+            "{extra}"
+        );
+    }
 }

@@ -10,19 +10,12 @@ pub(crate) mod parakeet_cpp;
 
 use std::env;
 
-use solstone_core_assets::{Platform, resolve_host_platform};
 use solstone_core_system::stt_backend_choice::{
-    STT_BACKENDS, STT_SURFACE, resolve_stt_backend_choice,
+    STT_BACKENDS, STT_SURFACE, resolve_stt_backend_choice, stt_host_policy,
 };
 
 use crate::TranscribeError;
 
-const GIB: u64 = 1024 * 1024 * 1024;
-const LINUX_LOCAL_FLOOR_BYTES: u64 = 4 * GIB;
-const WINDOWS_LOCAL_FLOOR_BYTES: u64 = 4 * GIB;
-// Apple Silicon: no auto free-RAM refuse. Some(0) keeps CoreML selected;
-// None would fall through to SttSurface. Unknown probe still fail-closed.
-const DARWIN_ARM64_LOCAL_FLOOR_BYTES: u64 = 0;
 pub(crate) const KNOWN_BACKENDS: [&str; 3] = STT_BACKENDS;
 
 /// Non-fatal backend-selection information for the caller to log.
@@ -90,17 +83,11 @@ pub(crate) fn resolve_default_backend(
 }
 
 fn platform_floor_bytes_for(os: &str, arch: &str) -> Option<u64> {
-    if (os, arch) == ("windows", "x86_64") {
-        return Some(WINDOWS_LOCAL_FLOOR_BYTES);
-    }
-    match resolve_host_platform(os, arch).ok()? {
-        Platform::MacosArm64 => Some(DARWIN_ARM64_LOCAL_FLOOR_BYTES),
-        Platform::LinuxX64 | Platform::LinuxArm64 => Some(LINUX_LOCAL_FLOOR_BYTES),
-    }
+    stt_host_policy(os, arch).local_floor_bytes
 }
 
 fn local_stt_backend_for(os: &str, arch: &str) -> Option<&'static str> {
-    platform_floor_bytes_for(os, arch).map(|_| "parakeet")
+    stt_host_policy(os, arch).local_backend
 }
 
 fn normalize_explicit_backend<'a>(
@@ -137,35 +124,64 @@ fn warn_if_local_below_floor(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendWarning, DARWIN_ARM64_LOCAL_FLOOR_BYTES, GIB, LINUX_LOCAL_FLOOR_BYTES,
-        local_stt_backend_for, normalize_explicit_backend, platform_floor_bytes_for,
-        resolve_default_backend, warn_if_local_below_floor,
+        BackendWarning, local_stt_backend_for, normalize_explicit_backend,
+        platform_floor_bytes_for, resolve_default_backend, warn_if_local_below_floor,
     };
     use crate::TranscribeError;
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn host_aliases_preserve_auto_admission_and_explicit_overrides() {
+        for (os, arch, floor) in [
+            ("macos", "aarch64", Some(0)),
+            ("darwin", "arm64", Some(0)),
+            ("linux", "x86_64", Some(4 * GIB)),
+            ("linux", "amd64", Some(4 * GIB)),
+            ("linux", "x64", Some(4 * GIB)),
+            ("linux", "aarch64", Some(4 * GIB)),
+            ("linux", "arm64", Some(4 * GIB)),
+            ("windows", "x86_64", Some(4 * GIB)),
+            ("macos", "x86_64", None),
+            ("windows", "aarch64", None),
+            ("linux", "armv7l", None),
+            ("unknown", "x86_64", None),
+        ] {
+            let local = local_stt_backend_for(os, arch);
+            assert_eq!(platform_floor_bytes_for(os, arch), floor, "{os}/{arch}");
+            assert_eq!(local, floor.map(|_| "parakeet"), "{os}/{arch}");
+            for available in [None, Some(0), Some(4 * GIB - 1), Some(4 * GIB)] {
+                let resolution =
+                    resolve_default_backend(None, local, available, floor, false, false);
+                let fits = available
+                    .zip(floor)
+                    .is_some_and(|(bytes, floor)| bytes >= floor);
+                assert_eq!(resolution.is_ok(), fits, "{os}/{arch}, {available:?}");
+            }
+            for explicit in ["parakeet", "parakeet-cpp"] {
+                assert_eq!(
+                    resolve_default_backend(Some(explicit), local, None, floor, false, false)
+                        .unwrap()
+                        .backend,
+                    explicit
+                );
+            }
+        }
+    }
+
     #[test]
     fn linux_platform_floor_is_four_gib() {
-        assert_eq!(
-            platform_floor_bytes_for("linux", "x86_64"),
-            Some(LINUX_LOCAL_FLOOR_BYTES)
-        );
+        assert_eq!(platform_floor_bytes_for("linux", "x86_64"), Some(4 * GIB));
     }
 
     #[test]
     fn darwin_arm64_platform_floor_is_zero() {
-        assert_eq!(
-            platform_floor_bytes_for("darwin", "arm64"),
-            Some(DARWIN_ARM64_LOCAL_FLOOR_BYTES)
-        );
-        assert_eq!(DARWIN_ARM64_LOCAL_FLOOR_BYTES, 0);
+        assert_eq!(platform_floor_bytes_for("darwin", "arm64"), Some(0));
     }
 
     #[test]
     fn macos_aarch64_platform_floor_is_zero() {
-        assert_eq!(
-            platform_floor_bytes_for("macos", "aarch64"),
-            Some(DARWIN_ARM64_LOCAL_FLOOR_BYTES)
-        );
+        assert_eq!(platform_floor_bytes_for("macos", "aarch64"), Some(0));
     }
 
     #[test]
@@ -313,8 +329,8 @@ mod tests {
         let resolution = resolve_default_backend(
             Some("not-a-backend"),
             Some("parakeet"),
-            Some(LINUX_LOCAL_FLOOR_BYTES),
-            Some(LINUX_LOCAL_FLOOR_BYTES),
+            Some(4 * GIB),
+            Some(4 * GIB),
             false,
             false,
         )

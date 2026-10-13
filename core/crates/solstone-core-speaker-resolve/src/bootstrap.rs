@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use solstone_core_entity::{
     EncoderIdentity, EntityResolutionEntity, EntityResolutionError, EntityResolutionOutcome,
-    JournalEntity, VoiceprintItem, load_all_journal_entities, load_entity_voiceprints_file,
-    record_entity_resolution_from_name_evidence, save_voiceprints_batch,
+    JournalEntity, VoiceprintItem, VoiceprintKey, load_all_journal_entities,
+    load_entity_voiceprints_file, record_entity_resolution_from_name_evidence,
+    save_voiceprints_batch,
 };
 use solstone_core_journal_io::{
     PathOrDay, SegmentIdentityError, SegmentLayout, day_dirs, iter_segments,
@@ -27,7 +28,9 @@ use crate::evidence::load_segment_speakers_with_gaps;
 use crate::owner_admission::{OwnerAdmission, admitted_owner_id};
 use crate::owner_centroid::{OwnerCentroid, OwnerCentroidError, load_owner_centroid};
 use crate::voiceprint_accumulation::read_overlap_fraction;
-use crate::voiceprint_metadata::{VoiceprintMetadata, owner_timezone, segment_start_ts_ms};
+use crate::voiceprint_metadata::{
+    VoiceprintMetadata, owner_timezone, provenance_key, segment_start_ts_ms, strict_metadata_key,
+};
 
 /// Preserved from the retired Python speaker bootstrap; consumed by the
 /// name-variant scan when identifying merge candidates.
@@ -160,7 +163,7 @@ pub fn bootstrap_voiceprints(
     let pool = admissible_person_pool(&unblocked);
     let resolution_entities = admissible_resolution_entities(&pool);
     let scope = json!({"kind": "journal"});
-    let mut existing_keys = HashMap::<String, HashSet<String>>::new();
+    let mut existing_keys = HashMap::<String, HashSet<VoiceprintKey>>::new();
     let mut batches = BTreeMap::<String, Vec<VoiceprintItem>>::new();
     let mut entity_names = HashMap::<String, String>::new();
     let mut stats = BootstrapStats::default();
@@ -245,7 +248,7 @@ pub fn bootstrap_voiceprints(
             for (sentence_id, values) in embeddings.statements {
                 let key = provenance_key(
                     &segment.day,
-                    segment.layout.as_str(),
+                    segment.layout,
                     &segment.stream,
                     &segment.name,
                     source,
@@ -321,7 +324,7 @@ pub fn seed_from_imports(
     let resolution_entities = admissible_resolution_entities(&pool);
     let scope = json!({"kind": "journal"});
     let mut speaker_entity_cache = HashMap::<String, Option<(String, String)>>::new();
-    let mut existing_keys = HashMap::<String, HashSet<String>>::new();
+    let mut existing_keys = HashMap::<String, HashSet<VoiceprintKey>>::new();
     let mut batches = BTreeMap::<String, Vec<VoiceprintItem>>::new();
     let mut stats = SeedFromImportsStats::default();
     let timezone = owner_timezone(&request.journal_root)?;
@@ -435,7 +438,7 @@ pub fn seed_from_imports(
                 });
                 let key = provenance_key(
                     &segment.day,
-                    segment.layout.as_str(),
+                    segment.layout,
                     &segment.stream,
                     &segment.name,
                     source,
@@ -734,52 +737,15 @@ fn find_speaker_at_time(entries: &[(i64, String)], target_seconds: i64) -> Optio
     index.checked_sub(1).map(|index| entries[index].1.as_str())
 }
 
-fn metadata_keys(archive: Option<solstone_core_entity::VoiceprintArchive>) -> HashSet<String> {
+fn metadata_keys(
+    archive: Option<solstone_core_entity::VoiceprintArchive>,
+) -> HashSet<VoiceprintKey> {
     archive
         .into_iter()
         .flat_map(|archive| archive.metadata)
         .filter_map(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .filter_map(|value| {
-            let day = value.get("day")?.as_str()?;
-            let stream_raw = value.get("stream").and_then(Value::as_str).unwrap_or("");
-            let (layout, stream) = if let Some(layout_val) = value.get("stream_layout") {
-                let layout_str = layout_val.as_str()?;
-                match layout_str {
-                    "direct" => ("direct", stream_raw),
-                    "named" => ("named", stream_raw),
-                    _ => return None,
-                }
-            } else if stream_raw.is_empty() || stream_raw == "_default" {
-                ("direct", "_default")
-            } else {
-                ("named", stream_raw)
-            };
-            let stream = if stream.is_empty() {
-                "_default"
-            } else {
-                stream
-            };
-            Some(provenance_key(
-                day,
-                layout,
-                stream,
-                value.get("segment_key")?.as_str()?,
-                value.get("source")?.as_str()?,
-                value.get("sentence_id")?.as_i64()?,
-            ))
-        })
+        .filter_map(|value| strict_metadata_key(&value))
         .collect()
-}
-
-fn provenance_key(
-    day: &str,
-    layout: &str,
-    stream: &str,
-    segment_key: &str,
-    source: &str,
-    sentence_id: i64,
-) -> String {
-    format!("{day}|{layout}|{stream}|{segment_key}|{source}|{sentence_id}")
 }
 
 pub(crate) fn dot(left: &[f32], right: &[f32]) -> f32 {
