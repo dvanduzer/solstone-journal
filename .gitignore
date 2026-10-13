@@ -65,3 +65,8 @@ tmp/
 /platforms/macos/snapshots/
 /platforms/macos/Sources/journal/Resources/AppIcon.iconset/
 /platforms/macos/scripts/**/__pycache__/
+# Local tool state written into the package by its release and agent tooling
+# (wrangler's auth probe in publish-preflight, agent scratch, Finder metadata).
+/platforms/macos/.wrangler/
+/platforms/macos/.hop/
+/platforms/macos/**/.DS_Store
