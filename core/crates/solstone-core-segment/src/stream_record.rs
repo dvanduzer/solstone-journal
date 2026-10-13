@@ -665,7 +665,21 @@ pub fn read_agent_memory_chain(
     let Some(marker) = read_memory_marker(segment_dir)? else {
         return Ok(None);
     };
-    if marker.stream != segment_dir.stream
+    validate_memory_marker(marker, &segment_dir.stream).map(Some)
+}
+
+/// Parse marker JSON read through the caller's retained directory.
+pub fn parse_agent_memory_chain(json: &str, stream: &str) -> Result<StreamAdvance, SegmentError> {
+    let marker = serde_json::from_str(json)
+        .map_err(|_| SegmentError::StreamInput("malformed memory segment marker"))?;
+    validate_memory_marker(marker, stream)
+}
+
+fn validate_memory_marker(
+    marker: StreamMarker,
+    stream: &str,
+) -> Result<StreamAdvance, SegmentError> {
+    if marker.stream != stream
         || marker.seq == 0
         || marker.prev_day.is_some() != marker.prev_segment.is_some()
     {
@@ -673,11 +687,11 @@ pub fn read_agent_memory_chain(
             "memory segment marker conflicts with its coordinate",
         ));
     }
-    Ok(Some(StreamAdvance {
+    Ok(StreamAdvance {
         prev_day: marker.prev_day,
         prev_segment: marker.prev_segment,
         seq: marker.seq,
-    }))
+    })
 }
 
 fn finish_agent_memory_tail(journal: &Path, record: &StreamRecord) -> Result<(), SegmentError> {

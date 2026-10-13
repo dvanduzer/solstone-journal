@@ -509,6 +509,8 @@ pub fn read_windows_observed_file_bounded(
     if entry.kind != JournalEntryKind::RegularFile {
         return Err(FlatDirectoryError::NotRegular { path });
     }
+    #[cfg(feature = "test-hooks")]
+    crate::read_test_hook::opened(&path);
     if (entry.size as u128) > (limit as u128) {
         return Err(FlatDirectoryError::SizeLimitExceeded {
             path,

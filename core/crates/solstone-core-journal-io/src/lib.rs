@@ -50,6 +50,8 @@ pub mod observation;
 #[cfg(any(unix, windows))]
 pub mod operational_log;
 pub mod paths;
+#[cfg(feature = "test-hooks")]
+pub mod read_test_hook;
 pub mod readers;
 pub mod removal;
 pub mod snapshot;

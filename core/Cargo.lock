@@ -4980,6 +4980,7 @@ dependencies = [
  "serde_json",
  "solstone-core-format",
  "solstone-core-journal-io",
+ "solstone-core-retention",
  "solstone-core-segment",
 ]
 

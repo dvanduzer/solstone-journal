@@ -16,8 +16,11 @@ solstone-core-format.workspace = true
 solstone-core-journal-io.workspace = true
 solstone-core-segment.workspace = true
 
+[dev-dependencies]
+solstone-core-retention.workspace = true
+
 [features]
-full-tests = []
+full-tests = ["solstone-core-journal-io/test-hooks"]
 
 [lints]
 workspace = true

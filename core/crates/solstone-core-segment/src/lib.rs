@@ -84,7 +84,7 @@ pub use stream_record::{
     advance_agent_memory_stream, advance_bound_stream, advance_unbound_stream,
     bind_agent_memory_stream, bind_named_stream, bind_paired_stream, delete_stream_record,
     has_unattributed_stream_record, list_stream_bindings, lookup_stream, lookup_stream_state,
-    read_agent_memory_chain, resolve_stream, retry_bound_stream,
+    parse_agent_memory_chain, read_agent_memory_chain, resolve_stream, retry_bound_stream,
 };
 // Stream identity is allocated inside this crate; other crates reach the
 // unpaired binder only from tests.

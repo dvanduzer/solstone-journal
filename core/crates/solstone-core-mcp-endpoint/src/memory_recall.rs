@@ -23,7 +23,7 @@ use solstone_core_indexer_query::{
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_journal_io::readers::read_relative_file_bounded;
 use solstone_core_journal_io::strict_segment::resolve_stream_exact;
-use solstone_core_memory_original::{OriginalRead, read_original_until, read_source_guard};
+use solstone_core_memory_original::{OriginalRead, read_original_until};
 
 use crate::references::{
     MemoryRecallCursor, ReferenceCodec, ReferenceError, ReferenceKind, ReferenceTarget,
@@ -189,11 +189,6 @@ pub(crate) fn recall_until(
     if deadline_passed(deadline) {
         return failure("memory_recall_budget_exhausted");
     }
-    let source_guard = match read_source_guard(journal, &source_key, deadline) {
-        Ok(guard) => guard,
-        Err(_) if deadline_passed(deadline) => return failure("memory_recall_budget_exhausted"),
-        Err(_) => return failure("memory_source_unavailable"),
-    };
     let busy = remaining(deadline);
     let connection = match open_own_memory_connection(journal, busy) {
         Ok(connection) => connection,
@@ -229,7 +224,6 @@ pub(crate) fn recall_until(
         &connection,
         &source_key,
         deadline,
-        source_guard.is_some(),
     )) {
         return failure(reason);
     }
@@ -565,7 +559,6 @@ fn coverage_in_view(
     connection: &Connection,
     source_key: &SourceKey,
     deadline: Instant,
-    source_is_coordinated: bool,
 ) -> Coverage {
     if deadline_passed(deadline) {
         return Coverage::Budget;
@@ -748,33 +741,19 @@ fn coverage_in_view(
                         Ok(segment) => segment,
                         Err(_) => return Coverage::SourceUnavailable,
                     };
+                    if segment.ends_with(".lock") {
+                        continue;
+                    }
                     let file_type = segment_entry.file_type();
                     if deadline_passed(deadline) {
                         return Coverage::Budget;
                     }
-                    let file_type = match file_type {
+                    let _file_type = match file_type {
                         Ok(kind) => kind,
                         Err(_) => return coverage_io_failure(deadline),
                     };
                     if segment.starts_with(".removing_") {
                         continue;
-                    }
-                    if let Some(live_name) = segment.strip_suffix(".lock") {
-                        let coordinate = Coordinate {
-                            day: day.clone(),
-                            stream: stream.clone(),
-                            segment: live_name.to_owned(),
-                        };
-                        if file_type.is_file()
-                            && solstone_core_format::agent_memory::validate_coordinate(
-                                &coordinate,
-                                source_key,
-                            )
-                            .is_ok()
-                        {
-                            continue;
-                        }
-                        return Coverage::SourceUnavailable;
                     }
                     if coordinates.len() >= MAX_COVERAGE_COORDINATES {
                         return Coverage::Budget;
@@ -792,7 +771,7 @@ fn coverage_in_view(
     if !operation_exists && !found_stream {
         return Coverage::Complete;
     }
-    if !source_is_coordinated || coordinates.is_empty() {
+    if coordinates.is_empty() {
         return Coverage::SourceUnavailable;
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -1256,7 +1235,6 @@ mod tests {
                 &actual,
                 &source,
                 Instant::now() + Duration::from_secs(5),
-                true,
             ),
             Coverage::Complete
         );
@@ -1505,18 +1483,8 @@ mod tests {
 
     #[cfg(feature = "full-tests")]
     #[test]
-    fn source_and_live_guards_share_deadline_without_creating_entries() {
+    fn recall_ignores_absent_occupied_and_held_writer_locks() {
         let (journal, source, coordinates) = recall_fixture(&[16]);
-        let source_guard =
-            solstone_core_segment::hold_agent_memory_mutation(journal.path(), source.component())
-                .unwrap();
-        let started = Instant::now();
-        assert!(
-            read_source_guard(journal.path(), &source, started + Duration::from_millis(50))
-                .is_err()
-        );
-        assert!(started.elapsed() < RECALL_DEADLINE);
-        drop(source_guard);
         let coordinate = &coordinates[0];
         let live = journal
             .path()
@@ -1524,34 +1492,56 @@ mod tests {
             .join(&coordinate.day)
             .join(&coordinate.stream)
             .join(&coordinate.segment);
+        let source_lock = journal
+            .path()
+            .join("streams")
+            .join(format!(".source-{}.mutation.lock", source.component()));
+        let segment_lock = live.with_extension("lock");
+        let codec = ReferenceCodec::new().unwrap();
+        let check = || {
+            let page = recall(
+                journal.path(),
+                &codec,
+                "connection",
+                "recall-fixture-source",
+                "recall-fixture-credential",
+                RecallArgs::default(),
+                NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+            );
+            assert_eq!(page.reason, None);
+            assert!(page.complete);
+            assert_eq!(page.notes.len(), 1);
+            assert_eq!(
+                page.notes[0].bytes,
+                fs::read(live.join("note.txt")).unwrap()
+            );
+        };
+        let source_guard =
+            solstone_core_segment::hold_agent_memory_mutation(journal.path(), source.component())
+                .unwrap();
         let live_guard = solstone_core_journal_io::hold_lock(
             &live,
             solstone_core_journal_io::LockOptions::default(),
         )
         .unwrap();
-        let before = fs::read(live.join("ready.json")).unwrap();
-        let started = Instant::now();
-        assert!(matches!(
-            read_original_until(
-                journal.path(),
-                &source,
-                coordinate,
-                started + Duration::from_millis(50)
-            ),
-            OriginalRead::Unavailable { .. }
-        ));
-        assert!(started.elapsed() < RECALL_DEADLINE);
-        assert_eq!(fs::read(live.join("ready.json")).unwrap(), before);
+        // These writer guards remain held throughout a real, complete recall.
+        check();
         drop(live_guard);
-        assert!(matches!(
-            read_original_until(
-                journal.path(),
-                &source,
-                coordinate,
-                Instant::now() + RECALL_DEADLINE
-            ),
-            OriginalRead::Ready { .. }
-        ));
+        drop(source_guard);
+        for path in [&source_lock, &segment_lock] {
+            fs::remove_file(path).unwrap();
+        }
+        check();
+        for path in [&source_lock, &segment_lock] {
+            assert!(!path.exists());
+            fs::create_dir(path).unwrap();
+        }
+        check();
+        for path in [&source_lock, &segment_lock] {
+            fs::remove_dir(path).unwrap();
+            fs::write(path, b"new unrelated sidecar").unwrap();
+        }
+        check();
     }
 
     #[cfg(feature = "full-tests")]

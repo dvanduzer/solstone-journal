@@ -17,9 +17,7 @@ use solstone_core_indexer_query::{OwnMemoryOpenError, open_own_memory_index, rea
 use solstone_core_mcp_audit::{
     Admission, AuditCoordinates, MemoryResultFacts, Outcome, ResultShape, result_shape,
 };
-use solstone_core_memory_original::{
-    OriginalRead, read_original, read_original_until, read_source_guard,
-};
+use solstone_core_memory_original::{OriginalRead, read_original, read_original_until};
 
 use crate::http1::HttpResponse;
 use crate::jsonrpc::{JsonRpcRequest, JsonRpcResponse, ToolName, tool_arguments, tool_result};
@@ -554,9 +552,6 @@ fn recall_response(
 }
 
 fn page_is_live(journal: &Path, source: &SourceKey, page: &RecallPage, deadline: Instant) -> bool {
-    let Ok(_guard) = read_source_guard(journal, source, deadline) else {
-        return false;
-    };
     page.notes.iter().all(|note| {
         let coordinate = Coordinate {
             day: note.day.clone(),

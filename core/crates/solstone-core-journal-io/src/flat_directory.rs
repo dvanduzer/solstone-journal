@@ -435,6 +435,8 @@ fn read_observed_file_from_parent(
         return Err(FlatDirectoryError::NotRegular { path });
     }
     flat_directory_test_hook(FlatDirectoryTestPrimitive::AfterObservedFileStat);
+    #[cfg(feature = "test-hooks")]
+    crate::read_test_hook::opened(&path);
     if (entry.size as u128) > (maximum as u128) {
         return Err(FlatDirectoryError::SizeLimitExceeded {
             path,

@@ -10,10 +10,11 @@ use std::io;
 use std::os::fd::AsFd;
 #[cfg(windows)]
 use std::os::windows::io::AsHandle;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(all(test, feature = "full-tests"))]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use serde::de::DeserializeOwned;
 use solstone_core_format::agent_memory::{
     ChainPredecessor, Coordinate, MAX_METADATA_BYTES, MAX_NOTE_BYTES, Origin, ReadyDocument,
     SourceKey, validate_complete_original, validate_coordinate,
@@ -21,12 +22,11 @@ use solstone_core_format::agent_memory::{
 use solstone_core_journal_io::errors::FlatDirectoryError;
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_journal_io::{
-    BoundParentLock, ExactLookupError, FlatDirectoryError as DirectoryError,
-    open_existing_parent_lock_bound, read_relative_file_bounded, resolve_segment_exact,
+    ExactLookupError, FlatDirectoryError as DirectoryError, resolve_segment_exact,
     resolve_stream_exact,
 };
 use solstone_core_segment::{
-    OwnerDeletionState, SegmentDir, owner_deletion_state, read_agent_memory_chain,
+    OwnerDeletionState, SegmentDir, owner_deletion_state, parse_agent_memory_chain,
 };
 
 /// Result of reading one original without healing or changing journal state.
@@ -70,6 +70,24 @@ pub fn read_original_until(
     coordinate: &Coordinate,
     deadline: Instant,
 ) -> OriginalRead {
+    read_original_observed(journal, source_key, coordinate, deadline, |_| {})
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadPhase {
+    BeforeLiveBinding,
+    AfterLiveBinding,
+    AfterMarkers,
+    AfterFileCheck,
+}
+
+fn read_original_observed(
+    journal: &Path,
+    source_key: &SourceKey,
+    coordinate: &Coordinate,
+    deadline: Instant,
+    mut observe: impl FnMut(ReadPhase),
+) -> OriginalRead {
     if source_key.validate().is_err() || validate_coordinate(coordinate, source_key).is_err() {
         return OriginalRead::Corrupt;
     }
@@ -100,11 +118,6 @@ pub fn read_original_until(
         Ok(None) => return OriginalRead::Absent,
         Err(error) => return lookup_unavailable_or_absent(error),
     }
-
-    let live_guard = match read_live_guard(&root, coordinate, deadline) {
-        Ok(guard) => guard,
-        Err(detail) => return OriginalRead::Unavailable { detail },
-    };
 
     let segment_path = match resolve_segment_exact(
         &namespace,
@@ -161,71 +174,99 @@ pub fn read_original_until(
         }
         Err(error) => return unavailable(error),
     }
-    if live_guard.is_none() {
-        return OriginalRead::Unavailable {
-            detail: "original live-name lock is absent".into(),
-        };
-    }
-
-    let relative_segment = PathBuf::from("chronicle")
-        .join(&coordinate.day)
-        .join(&coordinate.stream)
-        .join(&coordinate.segment);
-    let ready = match read_json_bounded::<ReadyDocument>(
-        &root,
-        &relative_segment.join("ready.json"),
-        MAX_METADATA_BYTES,
-    ) {
-        Ok(Some(document)) => document,
-        Ok(None) => return OriginalRead::Unready,
-        Err(ReadFailure::Corrupt) => return OriginalRead::Corrupt,
-        Err(ReadFailure::Unavailable(detail)) => return OriginalRead::Unavailable { detail },
+    let directory = match open_segment(&root, coordinate) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return changed("segment disappeared during open"),
+        Err(error) => return unavailable(error),
     };
-
-    let bytes =
-        match read_relative_file_bounded(&root, &relative_segment.join("note.txt"), MAX_NOTE_BYTES)
-        {
-            Ok(Some(observed)) => observed.bytes,
-            Ok(None) => return OriginalRead::Corrupt,
-            Err(FlatDirectoryError::SizeLimitExceeded { .. }) => return OriginalRead::Corrupt,
-            Err(error) => {
-                return OriginalRead::Unavailable {
-                    detail: error.to_string(),
-                };
+    let files = [
+        ("ready.json", MAX_METADATA_BYTES),
+        ("note.txt", MAX_NOTE_BYTES),
+        ("origin.json", MAX_METADATA_BYTES),
+        ("stream.json", MAX_METADATA_BYTES),
+    ];
+    let mut originals = Vec::with_capacity(files.len());
+    for (name, limit) in files {
+        match read_file(&directory, OsStr::new(name), limit) {
+            Ok(Some(observed)) => originals.push(observed),
+            Ok(None) if name == "ready.json" => return OriginalRead::Unready,
+            Ok(None) | Err(FlatDirectoryError::SizeLimitExceeded { .. }) => {
+                return OriginalRead::Corrupt;
             }
-        };
-    if bytes.is_empty() || std::str::from_utf8(&bytes).is_err() {
-        return OriginalRead::Corrupt;
+            Err(error) => return unavailable(error),
+        }
     }
-    let origin = match read_json_bounded::<Origin>(
-        &root,
-        &relative_segment.join("origin.json"),
-        MAX_METADATA_BYTES,
-    ) {
-        Ok(Some(origin)) => origin,
-        Ok(None) => return OriginalRead::Corrupt,
-        Err(ReadFailure::Corrupt) => return OriginalRead::Corrupt,
-        Err(ReadFailure::Unavailable(detail)) => return OriginalRead::Unavailable { detail },
+    let ready: ReadyDocument = match serde_json::from_slice(&originals[0].bytes) {
+        Ok(value) => value,
+        Err(_) => return OriginalRead::Corrupt,
     };
-    let chain = match read_agent_memory_chain(&segment) {
-        Ok(Some(chain)) => ChainPredecessor {
+    let bytes = &originals[1].bytes;
+    let origin: Origin = match serde_json::from_slice(&originals[2].bytes) {
+        Ok(value) => value,
+        Err(_) => return OriginalRead::Corrupt,
+    };
+    let marker = match std::str::from_utf8(&originals[3].bytes) {
+        Ok(marker) => marker,
+        Err(_) => return OriginalRead::Corrupt,
+    };
+    let chain = match parse_agent_memory_chain(marker, &coordinate.stream) {
+        Ok(chain) => ChainPredecessor {
             prev_day: chain.prev_day,
             prev_segment: chain.prev_segment,
             seq: chain.seq,
         },
-        Ok(None) => return OriginalRead::Corrupt,
-        Err(error) if segment_error_is_corrupt(&error) => return OriginalRead::Corrupt,
-        Err(error) => {
-            return OriginalRead::Unavailable {
-                detail: error.to_string(),
-            };
-        }
+        Err(_) => return OriginalRead::Corrupt,
     };
-
-    if validate_complete_original(&ready, source_key, coordinate, &origin, &chain, &bytes).is_err()
-    {
+    if bytes.is_empty() || std::str::from_utf8(bytes).is_err() {
         return OriginalRead::Corrupt;
     }
+    if validate_complete_original(&ready, source_key, coordinate, &origin, &chain, bytes).is_err() {
+        return OriginalRead::Corrupt;
+    }
+    observe(ReadPhase::BeforeLiveBinding);
+    // The fresh live-name acquisition is the read's linearization point,
+    // conditional on the subsequent checks. Keep D alive to prevent inode reuse.
+    match resolve_segment_exact(
+        &namespace,
+        &coordinate.day,
+        &coordinate.stream,
+        &coordinate.segment,
+    ) {
+        Ok(Some(path)) if path == segment_path => {}
+        Ok(_) => return changed("live segment disappeared"),
+        Err(error) => return unavailable(error),
+    }
+    let live = match open_segment(&root, coordinate) {
+        Ok(Some(live)) if directory_identity(&live) == directory_identity(&directory) => live,
+        Ok(_) => return changed("live segment identity changed"),
+        Err(error) => return unavailable(error),
+    };
+    observe(ReadPhase::AfterLiveBinding);
+    match owner_deletion_state(segment.path()) {
+        Ok(OwnerDeletionState::Live) => {}
+        Ok(OwnerDeletionState::Deleted) => return OriginalRead::Deleted,
+        Ok(OwnerDeletionState::Staged) => return OriginalRead::Staged,
+        Ok(OwnerDeletionState::Occupied) => return changed("deletion marker refused"),
+        Err(error) => return unavailable(error),
+    }
+    // Also observe the retained directory: the live path may have moved since T.
+    match read_file(&directory, OsStr::new("tombstone.json"), MAX_METADATA_BYTES) {
+        Ok(None) => {}
+        Ok(Some(_)) => return OriginalRead::Deleted,
+        Err(error) => return unavailable(error),
+    }
+    observe(ReadPhase::AfterMarkers);
+    // Reopen names, not old leaf handles. A completed removal returns the same
+    // directory with its original leaves gone, so directory identity is not enough.
+    for ((name, limit), original) in files.into_iter().zip(&originals) {
+        match read_file(&directory, OsStr::new(name), limit) {
+            Ok(Some(current)) if &current == original => {}
+            Ok(_) => return changed("original changed during read"),
+            Err(error) => return unavailable(error),
+        }
+        observe(ReadPhase::AfterFileCheck);
+    }
+    drop(live);
     if Instant::now() >= deadline {
         return OriginalRead::Unavailable {
             detail: "original read deadline exhausted".into(),
@@ -235,7 +276,7 @@ pub fn read_original_until(
         return unavailable(error);
     }
     OriginalRead::Ready {
-        bytes,
+        bytes: bytes.clone(),
         origin,
         ready,
     }
@@ -267,103 +308,46 @@ fn open_child(
     )
 }
 
-fn read_live_guard(
+fn open_segment(
     root: &JournalRoot,
     coordinate: &Coordinate,
-    deadline: Instant,
-) -> Result<Option<BoundParentLock>, String> {
-    let diagnostic = root.canonical_path();
-    let Some(chronicle) =
-        open_child(root, "chronicle", diagnostic).map_err(|error| error.to_string())?
-    else {
+) -> Result<Option<ReadDirectory>, DirectoryError> {
+    let mut diagnostic = root.canonical_path().join("chronicle");
+    let Some(mut directory) = open_child(root, "chronicle", root.canonical_path())? else {
         return Ok(None);
     };
-    let diagnostic = diagnostic.join("chronicle");
-    let Some(day) =
-        open_child(&chronicle, &coordinate.day, &diagnostic).map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
-    };
-    let diagnostic = diagnostic.join(&coordinate.day);
-    let Some(stream) =
-        open_child(&day, &coordinate.stream, &diagnostic).map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
-    };
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or("original read deadline exhausted")?;
-    open_existing_parent_lock_bound(
-        &stream,
-        OsStr::new(&format!("{}.lock", coordinate.segment)),
-        remaining,
-        Duration::from_millis(10),
-    )
-    .map_err(|error| error.to_string())
-}
-
-/// Observe and hold this source's already-published mutation sidecar.
-/// No source directory or sidecar is created by this read path.
-pub fn read_source_guard(
-    journal: &Path,
-    source_key: &SourceKey,
-    deadline: Instant,
-) -> Result<Option<BoundParentLock>, String> {
-    source_key.validate().map_err(|error| error.to_string())?;
-    if matches!(std::fs::symlink_metadata(journal), Err(error) if error.kind() == io::ErrorKind::NotFound)
-    {
-        return Ok(None);
-    }
-    let root = match JournalRoot::open(journal) {
-        Ok(root) => root,
-        Err(solstone_core_journal_io::JournalRootError::Io { source, .. })
-            if source.kind() == io::ErrorKind::NotFound =>
-        {
+    for name in [&coordinate.day, &coordinate.stream, &coordinate.segment] {
+        let Some(child) = open_child(&directory, name, &diagnostic)? else {
             return Ok(None);
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    let Some(streams) =
-        open_child(&root, "streams", root.canonical_path()).map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
-    };
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or("original read deadline exhausted")?;
-    let guard = open_existing_parent_lock_bound(
-        &streams,
-        OsStr::new(&format!(".source-{}.mutation.lock", source_key.component())),
-        remaining,
-        Duration::from_millis(10),
-    )
-    .map_err(|error| error.to_string())?;
-    root.revalidate_canonical_binding()
-        .map_err(|error| error.to_string())?;
-    Ok(guard)
+        };
+        directory = child;
+        diagnostic.push(name);
+    }
+    Ok(Some(directory))
 }
 
-enum ReadFailure {
-    Corrupt,
-    Unavailable(String),
+#[cfg(unix)]
+use solstone_core_journal_io::read_observed_file_bounded as read_file;
+#[cfg(windows)]
+use solstone_core_journal_io::read_windows_observed_file_bounded as read_file;
+
+fn directory_identity(
+    directory: &ReadDirectory,
+) -> solstone_core_journal_io::journal_root::ObjectIdentity {
+    #[cfg(unix)]
+    {
+        directory.identity()
+    }
+    #[cfg(windows)]
+    {
+        directory.object_identity()
+    }
 }
 
-fn read_json_bounded<T: DeserializeOwned>(
-    root: &JournalRoot,
-    relative: &Path,
-    maximum: usize,
-) -> Result<Option<T>, ReadFailure> {
-    let observed =
-        read_relative_file_bounded(root, relative, maximum).map_err(|error| match error {
-            FlatDirectoryError::SizeLimitExceeded { .. } => ReadFailure::Corrupt,
-            other => ReadFailure::Unavailable(other.to_string()),
-        })?;
-    let Some(observed) = observed else {
-        return Ok(None);
-    };
-    serde_json::from_slice(&observed.bytes)
-        .map(Some)
-        .map_err(|_| ReadFailure::Corrupt)
+fn changed(detail: &str) -> OriginalRead {
+    OriginalRead::Unavailable {
+        detail: detail.to_owned(),
+    }
 }
 
 fn lookup_unavailable_or_absent(error: ExactLookupError) -> OriginalRead {
@@ -381,17 +365,6 @@ fn unavailable(error: impl Error) -> OriginalRead {
     OriginalRead::Unavailable {
         detail: error.to_string(),
     }
-}
-
-fn segment_error_is_corrupt(error: &solstone_core_segment::SegmentError) -> bool {
-    matches!(
-        error,
-        solstone_core_segment::SegmentError::StreamInput(_)
-            | solstone_core_segment::SegmentError::MalformedStreamRecord { .. }
-            | solstone_core_segment::SegmentError::Read(
-                solstone_core_journal_io::ReadError::Malformed(_)
-            )
-    )
 }
 
 #[cfg(test)]
@@ -482,6 +455,147 @@ mod tests {
         )
         .unwrap();
         (source, coordinate, segment)
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn intact_original_survives_missing_lock_without_recreating_it() {
+        let root = temporary_journal("missing-lock");
+        let (source, coordinate, segment) = ready_fixture(&root);
+        let lock = segment.with_extension("lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert!(matches!(
+            read_original(&root, &source, &coordinate),
+            OriginalRead::Ready { .. }
+        ));
+        std::fs::remove_file(&lock).unwrap();
+        assert!(matches!(
+            read_original(&root, &source, &coordinate),
+            OriginalRead::Ready { .. }
+        ));
+        assert!(!lock.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "full-tests")]
+    fn delete_original(root: &Path, coordinate: &Coordinate) {
+        use solstone_core_retention::door::remove_segments;
+        use solstone_core_retention::{RemovalReason, Target};
+        let outcome = remove_segments(
+            root,
+            &[Target {
+                day: coordinate.day.clone(),
+                stream: coordinate.stream.clone(),
+                dir: coordinate.segment.clone(),
+            }],
+            "2026-01-03T00:00:00Z",
+            RemovalReason::OwnerSegmentDelete,
+            "memory-read-race",
+        );
+        assert_eq!(outcome.halted, None, "{outcome:?}");
+        assert_eq!(outcome.targets.len(), 1, "{outcome:?}");
+        assert!(!outcome.has_failures(), "{outcome:?}");
+        assert!(!outcome.targets[0].removed.is_empty(), "{outcome:?}");
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn deletion_completes_with_retained_directory_during_final_validation() {
+        for phase in [
+            ReadPhase::BeforeLiveBinding,
+            ReadPhase::AfterLiveBinding,
+            ReadPhase::AfterMarkers,
+            ReadPhase::AfterFileCheck,
+        ] {
+            let root = temporary_journal(&format!("delete-{phase:?}"));
+            let (source, coordinate, segment) = ready_fixture(&root);
+            let mut deleted = false;
+            let result = read_original_observed(
+                &root,
+                &source,
+                &coordinate,
+                Instant::now() + Duration::from_secs(5),
+                |observed| {
+                    if !deleted && observed == phase {
+                        delete_original(&root, &coordinate);
+                        deleted = true;
+                    }
+                },
+            );
+            assert!(deleted);
+            assert!(
+                !matches!(result, OriginalRead::Ready { .. }),
+                "{phase:?}: {result:?}"
+            );
+            assert!(segment.join("tombstone.json").is_file());
+            assert!(!segment.join("note.txt").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn real_deletion_completes_while_bounded_reader_holds_leaf_open() {
+        let root = temporary_journal("delete-open-leaf");
+        let (source, coordinate, segment) = ready_fixture(&root);
+        let hook_root = root.clone();
+        let hook_coordinate = coordinate.clone();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_ran = ran.clone();
+        solstone_core_journal_io::read_test_hook::after_open(segment.join("note.txt"), move || {
+            delete_original(&hook_root, &hook_coordinate);
+            hook_ran.set(true);
+        });
+        assert!(!matches!(
+            read_original(&root, &source, &coordinate),
+            OriginalRead::Ready { .. }
+        ));
+        assert!(ran.get());
+        assert!(segment.join("tombstone.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn staged_missing_replaced_and_changed_originals_are_refused() {
+        for action in ["stage", "remove", "replace", "tombstone", "leaf"] {
+            let root = temporary_journal(action);
+            let (source, coordinate, segment) = ready_fixture(&root);
+            let result = read_original_observed(
+                &root,
+                &source,
+                &coordinate,
+                Instant::now() + Duration::from_secs(5),
+                |phase| {
+                    if phase != ReadPhase::BeforeLiveBinding {
+                        return;
+                    }
+                    match action {
+                        "stage" => std::fs::rename(
+                            &segment,
+                            segment.with_file_name(format!(".removing_{}", coordinate.segment)),
+                        )
+                        .unwrap(),
+                        "remove" => std::fs::remove_dir_all(&segment).unwrap(),
+                        "replace" => {
+                            std::fs::rename(&segment, segment.with_file_name("old-segment"))
+                                .unwrap();
+                            ready_fixture(&root);
+                        }
+                        "tombstone" => {
+                            std::fs::write(segment.join("tombstone.json"), b"{}").unwrap()
+                        }
+                        "leaf" => std::fs::remove_file(segment.join("note.txt")).unwrap(),
+                        _ => unreachable!(),
+                    }
+                },
+            );
+            assert!(
+                !matches!(result, OriginalRead::Ready { .. }),
+                "{action}: {result:?}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[cfg(feature = "full-tests")]
