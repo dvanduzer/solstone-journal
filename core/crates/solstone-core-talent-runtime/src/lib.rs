@@ -1258,6 +1258,26 @@ fn generate_request(prepared: &PreparedTalent) -> Result<GenerateRequest, String
         .and_then(Value::as_u64)
         .filter(|tokens| *tokens > 0)
         .ok_or_else(|| format!("talent '{}' declares no max_output_tokens", prepared.name))?;
+    let timeout_s = match prepared.config.get("timeout_s") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let seconds = value.as_f64().ok_or_else(|| {
+                format!(
+                    "configuration '{}' declares a nonnumeric timeout_s",
+                    prepared.name
+                )
+            })?;
+            // Keep existing nonpositive wire behavior. Positive values must fit
+            // the transport's Duration before they can reach its conversion.
+            if seconds > 0.0 && std::time::Duration::try_from_secs_f64(seconds).is_err() {
+                return Err(format!(
+                    "configuration '{}' declares timeout_s outside the supported range",
+                    prepared.name
+                ));
+            }
+            Some(seconds)
+        }
+    };
     Ok(GenerateRequest {
         id: None,
         context: prepared.name.clone(),
@@ -1269,7 +1289,7 @@ fn generate_request(prepared: &PreparedTalent) -> Result<GenerateRequest, String
             .and_then(Value::as_f64)
             .unwrap_or(0.3),
         max_output_tokens,
-        timeout_s: None,
+        timeout_s,
         json_output: prepared.config.contains_key("json_schema"),
         json_schema: prepared.config.get("json_schema").cloned(),
         attempt_index: 0,
@@ -3520,6 +3540,36 @@ mod tests {
                     !matches!(cause, "success" | "schema_validation_failed")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn generate_request_preserves_and_validates_the_talent_timeout() {
+        let mut prepared = PreparedTalent {
+            name: "sense".into(),
+            config: json!({"max_output_tokens":6912,"prompt":"Assess the segment."})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        assert_eq!(generate_request(&prepared).unwrap().timeout_s, None);
+        for value in [json!(480), json!(480.5), json!(0), json!(-1)] {
+            prepared.config.insert("timeout_s".into(), value.clone());
+            let request = generate_request(&prepared).unwrap();
+            assert_eq!(request.timeout_s, value.as_f64());
+            let wire = solstone_core_generate::encode_one_shot_request(&request).unwrap();
+            assert_eq!(
+                solstone_core_generate::decode_one_shot_request(&wire)
+                    .unwrap()
+                    .timeout_s,
+                value.as_f64()
+            );
+        }
+        prepared.config.insert("timeout_s".into(), Value::Null);
+        assert_eq!(generate_request(&prepared).unwrap().timeout_s, None);
+        for value in [json!("480"), json!(true), json!([]), json!({}), json!(1e30)] {
+            prepared.config.insert("timeout_s".into(), value);
+            assert!(generate_request(&prepared).is_err());
         }
     }
 

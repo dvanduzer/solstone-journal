@@ -35,8 +35,22 @@ pub(super) fn render(rel: &str, records: &[JsonObject]) -> ProducedChunks {
             continue;
         }
         let start = record.get("start").map(display_value).unwrap_or_default();
-        let timestamp = parse_offset(&start)
-            .map(|offset| base_timestamp + offset)
+        // The transcript writer stores a wall clock, already including segment
+        // start. Anchor it to the nearest day so a small negative offset
+        // stays before the segment while a midnight crossing wraps once.
+        let timestamp = parse_clock(&start)
+            .map(|clock| {
+                let segment_clock = base_timestamp.rem_euclid(86_400_000);
+                let delta = clock - segment_clock;
+                let day_shift = if delta < -43_200_000 {
+                    86_400_000
+                } else if delta > 43_200_000 {
+                    -86_400_000
+                } else {
+                    0
+                };
+                base_timestamp + delta + day_shift
+            })
             .unwrap_or(base_timestamp);
         let mut parts = Vec::new();
         if !start.is_empty() {
@@ -133,7 +147,7 @@ fn base_timestamp_and_header(rel: &str) -> (i64, Option<String>) {
     )
 }
 
-fn parse_offset(value: &str) -> Option<i64> {
+fn parse_clock(value: &str) -> Option<i64> {
     let mut parts = value.split(':');
     let hours = parts.next()?.parse::<i64>().ok()?;
     let minutes = parts.next()?.parse::<i64>().ok()?;
@@ -152,5 +166,73 @@ fn header_value(value: &Value) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         _ => display_value(value),
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn published_absolute_clock_is_anchored_once() {
+        // Captured from the physical common English fixture.
+        let row = serde_json::json!({"start":"13:00:01","text":"Ravi explains that the blue water pump needs a new valve."});
+        let produced = render(
+            "20261012/device_audio/130001_15/audio.jsonl",
+            &[row.as_object().unwrap().clone()],
+        );
+        let expected = NaiveDate::from_ymd_opt(2026, 10, 12)
+            .unwrap()
+            .and_hms_opt(13, 0, 1)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        assert_eq!(
+            produced.chunks[0].occurrence_time_ms.map(|v| v.0),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_negative_start_offset_stays_before_the_segment() {
+        for (segment, clock, day, hour, minute, second) in [
+            ("130001_15", "12:59:59", 12, 12, 59, 59),
+            ("000001_15", "23:59:59", 11, 23, 59, 59),
+        ] {
+            let row = serde_json::json!({"start":clock,"text":"before segment"});
+            let produced = render(
+                &format!("20261012/device_audio/{segment}/audio.jsonl"),
+                &[row.as_object().unwrap().clone()],
+            );
+            let expected = NaiveDate::from_ymd_opt(2026, 10, day)
+                .unwrap()
+                .and_hms_opt(hour, minute, second)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+            assert_eq!(
+                produced.chunks[0].occurrence_time_ms.map(|v| v.0),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn a_published_clock_after_midnight_belongs_to_the_next_day() {
+        let row = serde_json::json!({"start":"00:00:02","text":"after midnight"});
+        let produced = render(
+            "20261012/device_audio/235959_15/audio.jsonl",
+            &[row.as_object().unwrap().clone()],
+        );
+        let expected = NaiveDate::from_ymd_opt(2026, 10, 13)
+            .unwrap()
+            .and_hms_opt(0, 0, 2)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        assert_eq!(
+            produced.chunks[0].occurrence_time_ms.map(|v| v.0),
+            Some(expected)
+        );
     }
 }

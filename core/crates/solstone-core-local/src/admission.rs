@@ -13,6 +13,11 @@ use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+#[cfg(target_os = "android")]
+type AdmissionLock = nix::fcntl::Flock<File>;
+#[cfg(not(target_os = "android"))]
+type AdmissionLock = File;
+
 #[derive(Debug)]
 pub enum AdmissionError {
     Timeout,
@@ -32,12 +37,12 @@ impl From<std::io::Error> for AdmissionError {
 pub struct LocalSlotPermit {
     pub slot_index: u32,
     pub queue_wait_ms: f64,
-    _locks: Vec<File>,
+    _locks: Vec<AdmissionLock>,
 }
 
 struct WaitTicket {
     path: PathBuf,
-    lock: Option<File>,
+    lock: Option<AdmissionLock>,
 }
 
 impl Drop for WaitTicket {
@@ -117,7 +122,7 @@ fn check_deadline(started: Instant, timeout: Option<Duration>) -> Result<(), Adm
     }
 }
 
-fn try_arbitrate(root: &Path) -> Result<Option<File>, AdmissionError> {
+fn try_arbitrate(root: &Path) -> Result<Option<AdmissionLock>, AdmissionError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -291,9 +296,25 @@ fn slot_file(root: &Path, slot_index: u32) -> Result<File, AdmissionError> {
         .map_err(Into::into)
 }
 
-fn lock_exclusive(file: File) -> Result<File, TryLockError> {
+#[cfg(not(target_os = "android"))]
+fn lock_exclusive(file: File) -> Result<AdmissionLock, TryLockError> {
     file.try_lock()?;
     Ok(file)
+}
+
+#[cfg(target_os = "android")]
+fn lock_exclusive(file: File) -> Result<AdmissionLock, TryLockError> {
+    // The pinned Rust standard library does not implement File::try_lock on
+    // Android. Bionic flock provides the same owned, nonblocking lock contract.
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(
+        |(_file, error)| {
+            if error == nix::errno::Errno::EWOULDBLOCK {
+                TryLockError::WouldBlock
+            } else {
+                TryLockError::Error(std::io::Error::from(error))
+            }
+        },
+    )
 }
 
 fn lock_error(error: TryLockError) -> AdmissionError {

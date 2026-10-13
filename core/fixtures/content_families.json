@@ -648,7 +648,7 @@
         }
       ],
       "input_text": "{\"model\": \"claude-3\"}\n",
-      "note": "\ud83d\udd34 dispatch fact, not an AiChat case. A conversation_transcript.jsonl outside import.{chatgpt,claude,gemini} resolves to format_audio in the reference, and to nothing natively \u2014 */*/*/*_transcript.jsonl is one of the six unported families. Consequence: ai_chat.rs's 'ai_chat' agent fallback is unreachable through classify(), because AiChat is only ever produced for a path that already contains 'import.'. The native test that covers that fallback calls produce_chunks directly and bypasses dispatch.",
+      "note": "🔴 dispatch fact, not an AiChat case. A conversation_transcript.jsonl outside import.{chatgpt,claude,gemini} resolves to format_audio in the reference, and to nothing natively — */*/*/*_transcript.jsonl is one of the six unported families. Consequence: ai_chat.rs's 'ai_chat' agent fallback is unreachable through classify(), because AiChat is only ever produced for a path that already contains 'import.'. The native test that covers that fallback calls produce_chunks directly and bypasses dispatch.",
       "rel": "20260101/misc/thread_a/conversation_transcript.jsonl"
     },
     {
@@ -1012,21 +1012,21 @@
       "agent": "audio",
       "chunks": [
         {
-          "markdown": "[00:00:01] Ada: Morning.",
+          "markdown": "[09:00:01] Ada: Morning.",
           "source": {
-            "end": "00:00:04",
+            "end": "09:00:04",
             "speaker": "Ada",
-            "start": "00:00:01",
+            "start": "09:00:01",
             "text": "Morning."
           },
           "occurrence_time_ms": 1772614801000
         },
         {
-          "markdown": "[00:00:05] Bo: Shipping today.",
+          "markdown": "[09:00:05] Bo: Shipping today.",
           "source": {
-            "end": "00:00:09",
+            "end": "09:00:09",
             "speaker": "Bo",
-            "start": "00:00:05",
+            "start": "09:00:05",
             "text": "Shipping today."
           },
           "occurrence_time_ms": 1772614805000
@@ -1042,19 +1042,19 @@
           "model": "parakeet"
         },
         {
-          "end": "00:00:04",
+          "end": "09:00:04",
           "speaker": "Ada",
-          "start": "00:00:01",
+          "start": "09:00:01",
           "text": "Morning."
         },
         {
-          "end": "00:00:09",
+          "end": "09:00:09",
           "speaker": "Bo",
-          "start": "00:00:05",
+          "start": "09:00:05",
           "text": "Shipping today."
         }
       ],
-      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\"}\n{\"start\": \"00:00:01\", \"end\": \"00:00:04\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n{\"start\": \"00:00:05\", \"end\": \"00:00:09\", \"speaker\": \"Bo\", \"text\": \"Shipping today.\"}\n",
+      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\"}\n{\"start\": \"09:00:01\", \"end\": \"09:00:04\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n{\"start\": \"09:00:05\", \"end\": \"09:00:09\", \"speaker\": \"Bo\", \"text\": \"Shipping today.\"}\n",
       "note": "the nominal raw transcript: a metadata row then timed speaker turns",
       "pending_family": "Audio",
       "rel": "20260304/workstation/090000_300/audio.jsonl"
@@ -1080,10 +1080,10 @@
       "agent": "audio",
       "chunks": [
         {
-          "markdown": "[00:00:02] Bo: kept",
+          "markdown": "[09:00:02] Bo: kept",
           "source": {
             "speaker": "Bo",
-            "start": "00:00:02",
+            "start": "09:00:02",
             "text": "kept"
           },
           "occurrence_time_ms": 1772614802000
@@ -1104,11 +1104,11 @@
         },
         {
           "speaker": "Bo",
-          "start": "00:00:02",
+          "start": "09:00:02",
           "text": "kept"
         }
       ],
-      "input_text": "{\"model\": \"parakeet\"}\n{\"speaker\": \"Ada\", \"text\": \"no start field\"}\n{\"start\": \"00:00:02\", \"speaker\": \"Bo\", \"text\": \"kept\"}\n",
+      "input_text": "{\"model\": \"parakeet\"}\n{\"speaker\": \"Ada\", \"text\": \"no start field\"}\n{\"start\": \"09:00:02\", \"speaker\": \"Bo\", \"text\": \"kept\"}\n",
       "note": "a row without a start is skipped and the count reaches meta.error",
       "pending_family": "Audio",
       "rel": "20260304/workstation/090000_300/audio.jsonl"
@@ -1117,21 +1117,21 @@
       "agent": "audio",
       "chunks": [
         {
-          "markdown": "[00:00:01] Ada: Morning.",
+          "markdown": "[09:00:01] Ada: Morning.",
           "source": {
-            "end": "00:00:04",
+            "end": "09:00:04",
             "speaker": "Ada",
-            "start": "00:00:01",
+            "start": "09:00:01",
             "text": "Morning."
           },
           "occurrence_time_ms": 1772614801000
         },
         {
-          "markdown": "[00:00:05] Bo: Shipping today.",
+          "markdown": "[09:00:05] Bo: Shipping today.",
           "source": {
-            "end": "00:00:09",
+            "end": "09:00:09",
             "speaker": "Bo",
-            "start": "00:00:05",
+            "start": "09:00:05",
             "text": "Shipping today."
           },
           "occurrence_time_ms": 1772614805000
@@ -1147,19 +1147,19 @@
           "model": "parakeet"
         },
         {
-          "end": "00:00:04",
+          "end": "09:00:04",
           "speaker": "Ada",
-          "start": "00:00:01",
+          "start": "09:00:01",
           "text": "Morning."
         },
         {
-          "end": "00:00:09",
+          "end": "09:00:09",
           "speaker": "Bo",
-          "start": "00:00:05",
+          "start": "09:00:05",
           "text": "Shipping today."
         }
       ],
-      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\"}\n{\"start\": \"00:00:01\", \"end\": \"00:00:04\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n{\"start\": \"00:00:05\", \"end\": \"00:00:09\", \"speaker\": \"Bo\", \"text\": \"Shipping today.\"}\n",
+      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\"}\n{\"start\": \"09:00:01\", \"end\": \"09:00:04\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n{\"start\": \"09:00:05\", \"end\": \"09:00:09\", \"speaker\": \"Bo\", \"text\": \"Shipping today.\"}\n",
       "note": "per-device split transcripts share the formatter with audio.jsonl",
       "pending_family": "Audio",
       "rel": "20260304/workstation/090000_300/left_audio.jsonl"
@@ -1335,21 +1335,21 @@
       "agent": "audio",
       "chunks": [
         {
-          "markdown": "[00:00:01] Ada: Morning.",
+          "markdown": "[09:00:01] Ada: Morning.",
           "source": {
-            "end": "00:00:04",
+            "end": "09:00:04",
             "speaker": "Ada",
-            "start": "00:00:01",
+            "start": "09:00:01",
             "text": "Morning."
           },
           "occurrence_time_ms": 1772614801000
         },
         {
-          "markdown": "[00:00:05] Bo: Shipping today.",
+          "markdown": "[09:00:05] Bo: Shipping today.",
           "source": {
-            "end": "00:00:09",
+            "end": "09:00:09",
             "speaker": "Bo",
-            "start": "00:00:05",
+            "start": "09:00:05",
             "text": "Shipping today."
           },
           "occurrence_time_ms": 1772614805000
@@ -1365,20 +1365,20 @@
           "model": "parakeet"
         },
         {
-          "end": "00:00:04",
+          "end": "09:00:04",
           "speaker": "Ada",
-          "start": "00:00:01",
+          "start": "09:00:01",
           "text": "Morning."
         },
         {
-          "end": "00:00:09",
+          "end": "09:00:09",
           "speaker": "Bo",
-          "start": "00:00:05",
+          "start": "09:00:05",
           "text": "Shipping today."
         }
       ],
-      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\"}\n{\"start\": \"00:00:01\", \"end\": \"00:00:04\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n{\"start\": \"00:00:05\", \"end\": \"00:00:09\", \"speaker\": \"Bo\", \"text\": \"Shipping today.\"}\n",
-      "note": "\ud83d\udd34 the fifth raw-percept pattern. */*/*/*_transcript.jsonl routes to the audio formatter, and without this case a renderer wired for the four other spellings passes every check while shipping four of five.",
+      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\"}\n{\"start\": \"09:00:01\", \"end\": \"09:00:04\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n{\"start\": \"09:00:05\", \"end\": \"09:00:09\", \"speaker\": \"Bo\", \"text\": \"Shipping today.\"}\n",
+      "note": "🔴 the fifth raw-percept pattern. */*/*/*_transcript.jsonl routes to the audio formatter, and without this case a renderer wired for the four other spellings passes every check while shipping four of five.",
       "pending_family": "Audio",
       "rel": "20260304/workstation/090000_300/session_transcript.jsonl"
     },
@@ -1386,10 +1386,10 @@
       "agent": "audio",
       "chunks": [
         {
-          "markdown": "[00:00:01] Ada: Morning.",
+          "markdown": "[09:00:01] Ada: Morning.",
           "source": {
             "speaker": "Ada",
-            "start": "00:00:01",
+            "start": "09:00:01",
             "text": "Morning."
           },
           "occurrence_time_ms": 1772614801000
@@ -1419,12 +1419,12 @@
         },
         {
           "speaker": "Ada",
-          "start": "00:00:01",
+          "start": "09:00:01",
           "text": "Morning."
         }
       ],
-      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\", \"devices\": [\"mic\", \"headset\"], \"imported\": {\"facet\": \"work\", \"import_id\": \"imp-7\"}, \"error\": \"should be skipped\", \"raw\": \"should be skipped\", \"sound_tags\": [\"should be skipped\"]}\n{\"start\": \"00:00:01\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n",
-      "note": "the header is a generic projection over metadata keys, not a fixed set. \u26d4 A renderer that hardcodes model/language passes the nominal case and is wrong on a real journal. Also pins which keys are skipped and the separate treatment of the imported dict.",
+      "input_text": "{\"model\": \"parakeet\", \"language\": \"en\", \"devices\": [\"mic\", \"headset\"], \"imported\": {\"facet\": \"work\", \"import_id\": \"imp-7\"}, \"error\": \"should be skipped\", \"raw\": \"should be skipped\", \"sound_tags\": [\"should be skipped\"]}\n{\"start\": \"09:00:01\", \"speaker\": \"Ada\", \"text\": \"Morning.\"}\n",
+      "note": "the header is a generic projection over metadata keys, not a fixed set. ⛔ A renderer that hardcodes model/language passes the nominal case and is wrong on a real journal. Also pins which keys are skipped and the separate treatment of the imported dict.",
       "pending_family": "Audio",
       "rel": "20260304/workstation/090000_300/audio.jsonl"
     },
@@ -1432,10 +1432,10 @@
       "agent": "audio",
       "chunks": [
         {
-          "markdown": "[00:00:01] Ada: No metadata row.",
+          "markdown": "[09:00:01] Ada: No metadata row.",
           "source": {
             "speaker": "Ada",
-            "start": "00:00:01",
+            "start": "09:00:01",
             "text": "No metadata row."
           },
           "occurrence_time_ms": 1772614801000
@@ -1448,12 +1448,12 @@
       "input": [
         {
           "speaker": "Ada",
-          "start": "00:00:01",
+          "start": "09:00:01",
           "text": "No metadata row."
         }
       ],
-      "input_text": "{\"start\": \"00:00:01\", \"speaker\": \"Ada\", \"text\": \"No metadata row.\"}\n",
-      "note": "audio emits a header only when there is something to put in it, while screen always emits one. \u26a0 An always-emit renderer passes every other audio case.",
+      "input_text": "{\"start\": \"09:00:01\", \"speaker\": \"Ada\", \"text\": \"No metadata row.\"}\n",
+      "note": "audio emits a header only when there is something to put in it, while screen always emits one. ⚠ An always-emit renderer passes every other audio case.",
       "pending_family": "Audio",
       "rel": "20260304/workstation/090000_300/audio.jsonl"
     },
@@ -1494,7 +1494,7 @@
         }
       ],
       "input_text": "{\"monitor\": \"primary\"}\n{\"timestamp\": 3, \"frame_id\": \"f1\", \"content\": {\"applications\": [\"nvim\"]}}\n",
-      "note": "the two metadata rules differ: audio treats any first row without a start as metadata, screen requires the raw marker too and otherwise counts the row as skipped. \u26d4 Copying the audio rule to screen passes everything else.",
+      "note": "the two metadata rules differ: audio treats any first row without a start as metadata, screen requires the raw marker too and otherwise counts the row as skipped. ⛔ Copying the audio rule to screen passes everything else.",
       "pending_family": "RawScreen",
       "rel": "20260304/workstation/090000_300/screen.jsonl"
     },
@@ -1564,19 +1564,19 @@
       "agent": "audio",
       "chunks": [
         {
-          "markdown": "[00:00:30] Ada: later in the file",
+          "markdown": "[09:00:30] Ada: later in the file",
           "source": {
             "speaker": "Ada",
-            "start": "00:00:30",
+            "start": "09:00:30",
             "text": "later in the file"
           },
           "occurrence_time_ms": 1772614830000
         },
         {
-          "markdown": "[00:00:05] Bo: earlier timestamp",
+          "markdown": "[09:00:05] Bo: earlier timestamp",
           "source": {
             "speaker": "Bo",
-            "start": "00:00:05",
+            "start": "09:00:05",
             "text": "earlier timestamp"
           },
           "occurrence_time_ms": 1772614805000
@@ -1592,16 +1592,16 @@
         },
         {
           "speaker": "Ada",
-          "start": "00:00:30",
+          "start": "09:00:30",
           "text": "later in the file"
         },
         {
           "speaker": "Bo",
-          "start": "00:00:05",
+          "start": "09:00:05",
           "text": "earlier timestamp"
         }
       ],
-      "input_text": "{\"model\": \"parakeet\"}\n{\"start\": \"00:00:30\", \"speaker\": \"Ada\", \"text\": \"later in the file\"}\n{\"start\": \"00:00:05\", \"speaker\": \"Bo\", \"text\": \"earlier timestamp\"}\n",
+      "input_text": "{\"model\": \"parakeet\"}\n{\"start\": \"09:00:30\", \"speaker\": \"Ada\", \"text\": \"later in the file\"}\n{\"start\": \"09:00:05\", \"speaker\": \"Bo\", \"text\": \"earlier timestamp\"}\n",
       "note": "the inverted twin of the screen sort: audio emits in file order.",
       "pending_family": "Audio",
       "rel": "20260304/workstation/090000_300/audio.jsonl"
@@ -1610,7 +1610,7 @@
       "agent": "screen",
       "chunks": [
         {
-          "markdown": "### 09:00:03\n\n**Meeting** (unknown)\n\n**Participants:**\n- \ud83d\udd07 Ada (unknown)\n",
+          "markdown": "### 09:00:03\n\n**Meeting** (unknown)\n\n**Participants:**\n- 🔇 Ada (unknown)\n",
           "source": {
             "content": {
               "meeting": {
@@ -1669,7 +1669,7 @@
         }
       ],
       "input_text": "{\"raw\": true}\n{\"timestamp\": 3, \"frame_id\": \"f1\", \"content\": null}\n",
-      "note": "an explicit null content is dereferenced without a guard. The frame carries a timestamp so it is not skipped, and the caller catches only ValueError and FileNotFoundError, so this escapes rather than skipping the file. \u26d4 The native renderer must treat a null content as absent.",
+      "note": "an explicit null content is dereferenced without a guard. The frame carries a timestamp so it is not skipped, and the caller catches only ValueError and FileNotFoundError, so this escapes rather than skipping the file. ⛔ The native renderer must treat a null content as absent.",
       "pending_family": "RawScreen",
       "raise_message": "'NoneType' object has no attribute 'items'",
       "raises": "AttributeError",
