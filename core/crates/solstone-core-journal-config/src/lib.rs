@@ -40,9 +40,9 @@ pub use notification_labels::{
 };
 pub use path::get_journal_config_path;
 pub use read::{
-    ConfigLoadError, JournalConfigMutationBase, JournalConfigRead,
-    entity_tier8_typo_acceptance_enabled, fingerprint_journal_config_bytes, load_mutation_base,
-    no_thinking_engine_chosen, read_journal_config,
+    ConfigLoadError, DailyInputSinceError, JournalConfigMutationBase, JournalConfigRead,
+    daily_input_since, entity_tier8_typo_acceptance_enabled, fingerprint_journal_config_bytes,
+    load_mutation_base, no_thinking_engine_chosen, parse_daily_input_day, read_journal_config,
 };
 #[cfg(unix)]
 pub use read::{

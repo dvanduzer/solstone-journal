@@ -17,7 +17,7 @@ use std::io;
 use std::path::Path;
 
 use solstone_core_assets::{RuntimeFetchQuery, catalog, mint_runtime_fetch};
-use solstone_core_journal_io::{AtomicWriteOptions, atomic_replace};
+use solstone_core_journal_io::{AtomicWriteOptions, atomic_replace, hold_daily_location_admission};
 
 use crate::accuracy::{
     INSTALLED_RECORD, Installed, InstalledFile, accuracy_root, read_installed, release_loaded,
@@ -228,7 +228,20 @@ pub fn install(
             })
             .collect(),
     };
-    let mut bytes = serde_json::to_vec_pretty(&installed).unwrap_or_default();
+    publish_installed_record(journal, &installed)?;
+    Ok(installed)
+}
+
+/// Replace `installed.json` and sweep version directories the record does not name.
+///
+/// The daily location admission lock is held around both steps. Callers that
+/// already downloaded files call this after the download returns.
+pub fn publish_installed_record(journal: &Path, installed: &Installed) -> Result<(), InstallError> {
+    let _admission = hold_daily_location_admission(journal)
+        .map_err(|error| InstallError::Write(io::Error::other(error.to_string())))?;
+    let root = accuracy_root(journal);
+    fs::create_dir_all(&root).map_err(InstallError::Write)?;
+    let mut bytes = serde_json::to_vec_pretty(installed).unwrap_or_default();
     bytes.push(b'\n');
     atomic_replace(
         root.join(INSTALLED_RECORD),
@@ -236,12 +249,14 @@ pub fn install(
         AtomicWriteOptions::default(),
     )
     .map_err(|error| InstallError::Write(io::Error::other(error.to_string())))?;
-    sweep(journal, Some(&offered.version));
-    Ok(installed)
+    sweep(journal, Some(&installed.version));
+    Ok(())
 }
 
 /// Remove the download. Names fall back to the area tier on the next pass.
 pub fn remove(journal: &Path) -> io::Result<()> {
+    let _admission = hold_daily_location_admission(journal)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     release_loaded();
     match fs::remove_file(accuracy_root(journal).join(INSTALLED_RECORD)) {
         Ok(()) => {}
@@ -255,6 +270,69 @@ pub fn remove(journal: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "full-tests")]
+    use std::sync::mpsc;
+    #[cfg(feature = "full-tests")]
+    use std::thread;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn installed_record_publish_and_remove_wait_for_the_admission_guard() {
+        let journal = tempfile::tempdir().unwrap();
+        let root = accuracy_root(journal.path());
+        fs::create_dir_all(root.join("old")).unwrap();
+        fs::write(root.join("old/venues.slpk"), b"x").unwrap();
+        let installed = Installed {
+            version: "v9".to_owned(),
+            files: vec![InstalledFile {
+                file: "venues.slpk".to_owned(),
+                sha256: "aa".to_owned(),
+                size_bytes: 1,
+            }],
+        };
+        let guard = hold_daily_location_admission(journal.path()).unwrap();
+        let path = journal.path().to_path_buf();
+        let published = installed.clone();
+        let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            publish_installed_record(&path, &published).unwrap();
+            sender.send(()).unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!root.join(INSTALLED_RECORD).exists());
+        assert!(root.join("old").exists());
+        drop(guard);
+        receiver.recv().unwrap();
+        worker.join().unwrap();
+        assert!(root.join(INSTALLED_RECORD).exists());
+        assert!(!root.join("old").exists());
+
+        let guard = hold_daily_location_admission(journal.path()).unwrap();
+        let path = journal.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            remove(&path).unwrap();
+            sender.send(()).unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(root.join(INSTALLED_RECORD).exists());
+        drop(guard);
+        receiver.recv().unwrap();
+        worker.join().unwrap();
+        assert!(!root.join(INSTALLED_RECORD).exists());
+    }
 
     #[test]
     fn removing_clears_the_record_and_the_files() {

@@ -193,7 +193,7 @@ pub use locking::{
 #[cfg(any(unix, windows))]
 pub use locking::{
     DEFAULT_LOCK_POLL_INTERVAL, DEFAULT_LOCK_TIMEOUT, ExistingParentLock, FileLock, LockOptions,
-    acquire_existing_parent_lock, hold_lock,
+    acquire_existing_parent_lock, hold_daily_location_admission, hold_lock,
 };
 pub use name_admission::{
     ClaimName, ConflictEntry, ConflictKind, NameAdmissionError, NameAdmissionReason,

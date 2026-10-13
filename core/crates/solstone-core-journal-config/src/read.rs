@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveDate;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -139,6 +140,46 @@ pub fn read_journal_config_observed_in_directory(
         None => (None, None),
     };
     parse_config_bytes(&path, bytes).map(|read| (read, entry))
+}
+
+/// A registered daily-input cutoff or its containing map is malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DailyInputSinceError;
+
+impl fmt::Display for DailyInputSinceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("daily_inputs must map input identities and versions to YYYYMMDD dates")
+    }
+}
+impl Error for DailyInputSinceError {}
+
+/// Parse exactly one `YYYYMMDD` date.
+pub fn parse_daily_input_day(day: &str) -> Result<NaiveDate, DailyInputSinceError> {
+    if day.len() != 8 || !day.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(DailyInputSinceError);
+    }
+    NaiveDate::parse_from_str(day, "%Y%m%d").map_err(|_| DailyInputSinceError)
+}
+
+/// Read an input/version's immutable activation cutoff without writing.
+pub fn daily_input_since(
+    config: &Map<String, Value>,
+    id: &str,
+    version: &str,
+) -> Result<Option<NaiveDate>, DailyInputSinceError> {
+    let Some(inputs) = config.get("daily_inputs") else {
+        return Ok(None);
+    };
+    let inputs = inputs.as_object().ok_or(DailyInputSinceError)?;
+    let Some(versions) = inputs.get(id) else {
+        return Ok(None);
+    };
+    let versions = versions.as_object().ok_or(DailyInputSinceError)?;
+    match versions.get(version) {
+        None => Ok(None),
+        Some(Value::String(day)) => parse_daily_input_day(day).map(Some),
+        Some(_) => Err(DailyInputSinceError),
+    }
 }
 
 /// Fingerprint supplied bytes using the journal configuration reader's encoding.
@@ -440,5 +481,40 @@ mod tests {
             br#"{"providers":{"active":{"provider":"anthropic"}}}"#,
         );
         assert!(!no_thinking_engine_chosen(temp.path()));
+    }
+
+    #[test]
+    fn daily_input_cutoffs_are_strict_and_reads_are_pure() {
+        let config = |value: Value| -> Map<String, Value> {
+            serde_json::from_value(serde_json::json!({"daily_inputs":{"location":{"v1":value}}}))
+                .unwrap()
+        };
+        assert_eq!(
+            daily_input_since(&Map::new(), "location", "v1").unwrap(),
+            None
+        );
+        assert_eq!(
+            daily_input_since(&config(Value::String("20261005".into())), "location", "v1").unwrap(),
+            Some(NaiveDate::from_ymd_opt(2026, 10, 5).unwrap())
+        );
+        for bad in [
+            serde_json::json!("2026-10-05"),
+            serde_json::json!("2026105"),
+            serde_json::json!("20260231"),
+            Value::Null,
+            serde_json::json!(20261005),
+        ] {
+            assert!(daily_input_since(&config(bad), "location", "v1").is_err());
+        }
+        for bad in [
+            serde_json::json!({"daily_inputs":false}),
+            serde_json::json!({"daily_inputs":{"location":false}}),
+        ] {
+            let bad: Map<String, Value> = serde_json::from_value(bad).unwrap();
+            assert!(daily_input_since(&bad, "location", "v1").is_err());
+        }
+        let temp = TempDir::new();
+        assert!(read_journal_config(temp.path()).unwrap().config.is_none());
+        assert!(!temp.path().join("config/journal.json").exists());
     }
 }

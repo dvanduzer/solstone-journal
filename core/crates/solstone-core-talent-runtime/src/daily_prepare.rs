@@ -102,9 +102,176 @@ pub fn freeze(
             ));
         }
     };
+    attach_daily_location(&mut prepared, context, &hook)?;
     Ok(
         json!({"version":1,"prepared":{"name":prepared.name,"config":prepared.config},"hook":hook,"state":state}),
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURE_BARRIER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+const LOCATION_PART_BYTE_CAP: usize = 16384;
+const LOCATION_CAVEAT: &str = "These words do not establish someone else's presence and do not establish a future commitment.";
+
+fn attach_daily_location(
+    prepared: &mut PreparedTalent,
+    context: &ExecutionContext,
+    hook: &str,
+) -> Result<(), RuntimeOutcome> {
+    use solstone_core_location::daily_location_fingerprint;
+    let Some(day) = prepared
+        .config
+        .get("day")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    if !crate::daily_location::location_applies(&context.journal, hook, &day)
+        .map_err(|error| failure(prepared, error))?
+    {
+        return Ok(());
+    }
+    // Source mutation cannot pass through capture, including an ABA returning
+    // to the same bytes after rendering transient words.
+    let _admission = solstone_core_journal_io::hold_daily_location_admission(&context.journal)
+        .map_err(|error| failure(prepared, error.to_string()))?;
+    let first = daily_location_fingerprint(&context.journal, &day)
+        .map_err(|error| failure(prepared, error.to_string()))?;
+    #[cfg(test)]
+    CAPTURE_BARRIER.with(|slot| {
+        if let Some(barrier) = slot.borrow_mut().take() {
+            barrier();
+        }
+    });
+    let rendered =
+        render_location_part(&context.journal, &day).map_err(|error| failure(prepared, error))?;
+    let ordinary = crate::ordinary_text_parts(&prepared.config);
+    let (part, omitted) = fit_location_part(hook, &day, &rendered, &ordinary, prepared, context);
+    let second = daily_location_fingerprint(&context.journal, &day)
+        .map_err(|error| failure(prepared, error.to_string()))?;
+    if first != second {
+        return Err(failure(
+            prepared,
+            "daily location changed while it was read".to_owned(),
+        ));
+    }
+    prepared.config.insert(
+        "_daily_location_fingerprint".to_owned(),
+        Value::String(second),
+    );
+    if !ordinary.is_empty()
+        && let Some(text) = part
+    {
+        prepared
+            .config
+            .insert("_daily_location_text".to_owned(), Value::String(text));
+    }
+    if omitted > 0 {
+        prepared.config.insert(
+            "_daily_location_omitted".to_owned(),
+            Value::Number(omitted.into()),
+        );
+    }
+    Ok(())
+}
+
+fn render_location_part(journal: &std::path::Path, day: &str) -> Result<String, String> {
+    let view = solstone_core_location::read_journal_day(journal, day)
+        .map_err(|error| error.to_string())?;
+    let store = solstone_core_location::places::PlaceStore::read_strict(journal)
+        .map_err(|error| error.to_string())?;
+    Ok(solstone_core_location::projection::render_day_document(
+        &view, &store,
+    ))
+}
+
+fn location_label(hook: &str, day: &str) -> String {
+    if hook == "morning_briefing" {
+        format!("Location words for {day}, the analysis day.")
+    } else {
+        format!("Location words for {day}.")
+    }
+}
+
+fn fit_location_part(
+    hook: &str,
+    day: &str,
+    rendered: &str,
+    ordinary: &[String],
+    prepared: &PreparedTalent,
+    context: &ExecutionContext,
+) -> (Option<String>, u32) {
+    use solstone_core_local::generate::{
+        compute_input_budget, estimate_tokens, launched_context_window,
+    };
+    let max_output_tokens = prepared
+        .config
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .unwrap_or(0);
+    let budget = compute_input_budget(max_output_tokens, launched_context_window(&context.journal));
+    let ordinary_tokens = ordinary.iter().fold(0u32, |total, text| {
+        total.saturating_add(estimate_tokens(text))
+    });
+    let room = budget.saturating_sub(ordinary_tokens);
+    let byte_cap = usize::try_from(room)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(3)
+        .min(LOCATION_PART_BYTE_CAP);
+    let label = location_label(hook, day);
+    if room == 0 || byte_cap == 0 {
+        return (None, clip_location_part(&label, rendered, 0).1);
+    }
+    // estimate_tokens is ceil(character_count / 3). The byte bound above is
+    // conservative for UTF-8, so whole observations fitting it also fit room.
+    // Searching byte caps would be invalid: below the first whole observation
+    // clip returns None, even though a larger cap can fit it.
+    let (part, omitted) = clip_location_part(&label, rendered, byte_cap);
+    debug_assert!(
+        part.as_ref()
+            .is_none_or(|text| estimate_tokens(text) <= room)
+    );
+    (part, omitted)
+}
+
+/// Keep a prefix of whole observation lines that fits in `max_bytes`.
+pub(crate) fn clip_location_part(
+    label: &str,
+    rendered: &str,
+    max_bytes: usize,
+) -> (Option<String>, u32) {
+    let mut heading = String::new();
+    let mut observations = Vec::new();
+    for line in rendered.split_inclusive('\n') {
+        if line.starts_with("- ") {
+            observations.push(line);
+        } else if observations.is_empty() {
+            heading.push_str(line);
+        }
+    }
+    let total = u32::try_from(observations.len()).unwrap_or(u32::MAX);
+    let prefix = format!("{label}\n{LOCATION_CAVEAT}\n{heading}");
+    if max_bytes == 0 || prefix.len() > max_bytes || observations.is_empty() {
+        return (None, total);
+    }
+    let mut kept = prefix;
+    let mut kept_count = 0u32;
+    for line in observations {
+        if kept.len() + line.len() > max_bytes {
+            break;
+        }
+        kept.push_str(line);
+        kept_count += 1;
+    }
+    if kept_count == 0 {
+        return (None, total);
+    }
+    (Some(kept), total - kept_count)
 }
 
 fn failure(prepared: &PreparedTalent, detail: String) -> RuntimeOutcome {
@@ -616,5 +783,412 @@ mod tests {
         corrupt["hook"] = json!("morning_briefing");
         corrupt["prepared"]["name"] = json!("morning_briefing");
         assert!(thaw(&corrupt).err().unwrap().contains("state mismatch"));
+    }
+
+    const LOCATION_DAY: &str = "20261001";
+
+    fn write_bytes(root: &std::path::Path, rel: &str, bytes: &[u8]) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn location_journal(root: &std::path::Path, cutoff: &str) {
+        write(
+            root,
+            "config/journal.json",
+            &format!(
+                r#"{{"identity":{{"timezone":"America/Denver"}},"daily_inputs":{{"location":{{"location-words-1":"{cutoff}"}}}}}}"#
+            ),
+        );
+        let header = r#"{"accuracy":"full","fix_count":0,"gap":false,"kind":"location","platform":"ios","schema":"solstone.location.segment/1","source":"location","tier":"full"}"#;
+        let body = format!(
+            "{header}\n{}\n{}\n{}\n",
+            r#"{"alt":null,"course":null,"h_acc":10.0,"lat":39.7555,"lon":-105.2211,"schema":"solstone.location.fix/1","speed":null,"stationary":false,"t":"2026-10-01T20:00:10Z","v_acc":null}"#,
+            r#"{"alt":null,"course":null,"h_acc":10.0,"lat":39.7556,"lon":-105.2212,"schema":"solstone.location.fix/1","speed":null,"stationary":false,"t":"2026-10-01T20:04:10Z","v_acc":null}"#,
+            r#"{"arrival":"2026-10-01T21:02:00Z","departure":"2026-10-01T22:40:00Z","h_acc":40,"lat":39.7527,"lon":-105.0001,"schema":"solstone.location.visit/1"}"#
+        );
+        write_bytes(
+            root,
+            &format!("chronicle/{LOCATION_DAY}/phone/140000_300/location.jsonl"),
+            body.as_bytes(),
+        );
+        let store = solstone_core_location::places::PlaceStore {
+            version: 1,
+            places: vec![solstone_core_location::places::Place {
+                id: "named".to_owned(),
+                latitude: 39.7527,
+                longitude: -105.0001,
+                name: Some("$source_packet".to_owned()),
+                alias: None,
+                hidden: false,
+            }],
+        };
+        store.write(root).unwrap();
+    }
+
+    fn prepared(name: &str, day: &str, extra: Value) -> PreparedTalent {
+        let mut config = Map::from_iter([
+            ("type".to_owned(), json!("generate")),
+            ("max_output_tokens".to_owned(), json!(1024)),
+            ("day".to_owned(), json!(day)),
+            ("prompt".to_owned(), json!(format!("{name} ordinary"))),
+        ]);
+        if let Some(object) = extra.as_object() {
+            for (key, value) in object {
+                config.insert(key.clone(), value.clone());
+            }
+        }
+        PreparedTalent {
+            name: name.to_owned(),
+            config,
+        }
+    }
+
+    fn text_parts(prepared: &PreparedTalent) -> Vec<String> {
+        crate::generate_contents(prepared)
+            .into_iter()
+            .map(|part| match part {
+                solstone_core_generate::ContentPart::Text { text } => text,
+                solstone_core_generate::ContentPart::Image { .. } => {
+                    panic!("location context is text")
+                }
+            })
+            .collect()
+    }
+
+    fn rendered_observations(root: &std::path::Path) -> Vec<String> {
+        let view = solstone_core_location::read_journal_day(root, LOCATION_DAY).unwrap();
+        let store = solstone_core_location::places::PlaceStore::read_strict(root).unwrap();
+        solstone_core_location::projection::render_day_document(&view, &store)
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn freeze_appends_location_for_the_five_recipients_only() {
+        assert!(crate::contract::SCHEDULE.gate.is_none());
+        assert!(crate::contract::SCHEDULE.build.is_none());
+        let root = tempfile::tempdir().unwrap();
+        location_journal(root.path(), LOCATION_DAY);
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let observations = rendered_observations(root.path());
+        assert!(observations.len() >= 2, "{observations:?}");
+        assert!(
+            observations
+                .iter()
+                .any(|line| line.contains("$source_packet")),
+            "{observations:?}"
+        );
+
+        let recipients = [
+            (
+                "schedule",
+                prepared(
+                    "schedule",
+                    LOCATION_DAY,
+                    json!({"hook":{"post":"schedule"}}),
+                ),
+            ),
+            (
+                "morning_briefing",
+                prepared(
+                    "morning_briefing",
+                    LOCATION_DAY,
+                    json!({
+                        "hook":{"pre":"morning_briefing"},
+                        "skip_reason":"no_input",
+                        "messages":[{"role":"user","content":"briefing ordinary"}]
+                    }),
+                ),
+            ),
+            (
+                "facet_newsletter",
+                prepared(
+                    "facet_newsletter",
+                    LOCATION_DAY,
+                    json!({
+                        "facet":"work",
+                        "hook":{"pre":"facet_newsletter","post":"facet_newsletter"},
+                        "prompt":"$source_packet"
+                    }),
+                ),
+            ),
+            (
+                "entities:entity_suggest",
+                prepared(
+                    "entities:entity_suggest",
+                    LOCATION_DAY,
+                    json!({
+                        "facet":"work",
+                        "hook":{"pre":"entities:entity_suggest","post":"entities:entity_suggest"}
+                    }),
+                ),
+            ),
+            (
+                "entities:entity_observer",
+                prepared(
+                    "entities:entity_observer",
+                    LOCATION_DAY,
+                    json!({
+                        "facet":"work",
+                        "hook":{"pre":"entities:entity_observer","post":"entities:entity_observer"},
+                        "skip_reason":"no_input"
+                    }),
+                ),
+            ),
+        ];
+        for (hook, talent) in recipients {
+            let ordinary = crate::ordinary_text_parts(&talent.config);
+            assert!(!ordinary.is_empty(), "{hook}");
+            let packet = freeze(talent, &context).unwrap();
+            let config = packet["prepared"]["config"].as_object().unwrap();
+            if hook == "facet_newsletter" {
+                assert_eq!(
+                    config.get("skip_reason").and_then(Value::as_str),
+                    Some("no substantive facet/day sources")
+                );
+                assert_eq!(
+                    config.get("prompt").and_then(Value::as_str),
+                    Some("$source_packet")
+                );
+            }
+            let fingerprint = config
+                .get("_daily_location_fingerprint")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{hook} missing fingerprint"));
+            assert_eq!(fingerprint.len(), 64);
+            assert!(config.get("_daily_location_omitted").is_none(), "{hook}");
+            let text = config
+                .get("_daily_location_text")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{hook} missing location text"));
+            assert!(text.contains(LOCATION_DAY), "{hook}");
+            for line in &observations {
+                assert!(text.contains(line.trim_end()), "{hook} lost {line}");
+            }
+            for coordinate in ["39.75", "105.2", "105.0"] {
+                assert!(!text.contains(coordinate), "{hook} {coordinate}");
+            }
+            let thawed = thaw(&packet).unwrap().0;
+            let parts = text_parts(&thawed);
+            assert!(parts.len() > ordinary.len(), "{hook}");
+            assert_eq!(&parts[..ordinary.len()], ordinary.as_slice(), "{hook}");
+            assert_eq!(parts.last().map(String::as_str), Some(text), "{hook}");
+            for part in &parts {
+                for coordinate in ["39.75", "105.2", "105.0"] {
+                    assert!(!part.contains(coordinate), "{hook}");
+                }
+            }
+        }
+
+        let excluded = [
+            prepared(
+                "daily_schedule",
+                LOCATION_DAY,
+                json!({"hook":{"pre":"daily_schedule","post":"daily_schedule"},"skip_reason":"no_input"}),
+            ),
+            prepared(
+                "entities:entities_review",
+                LOCATION_DAY,
+                json!({
+                    "facet":"work",
+                    "hook":{"pre":"entities:entities_review","post":"entities:entities_review"},
+                    "skip_reason":"no_input"
+                }),
+            ),
+            prepared("schedule", "20260901", json!({"hook":{"post":"schedule"}})),
+        ];
+        for talent in excluded {
+            let name = talent.name.clone();
+            let packet = freeze(talent, &context).unwrap();
+            let config = packet["prepared"]["config"].as_object().unwrap();
+            assert!(
+                config.get("_daily_location_fingerprint").is_none(),
+                "{name}"
+            );
+            assert!(config.get("_daily_location_text").is_none(), "{name}");
+            assert!(config.get("_daily_location_omitted").is_none(), "{name}");
+        }
+
+        let empty = prepared(
+            "schedule",
+            LOCATION_DAY,
+            json!({"hook":{"post":"schedule"},"prompt":""}),
+        );
+        let packet = freeze(empty, &context).unwrap();
+        let config = packet["prepared"]["config"].as_object().unwrap();
+        assert_eq!(
+            config
+                .get("_daily_location_fingerprint")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(64)
+        );
+        assert!(config.get("_daily_location_text").is_none());
+        let parts = text_parts(&thaw(&packet).unwrap().0);
+        assert_eq!(parts, vec!["No input provided.".to_owned()]);
+
+        write(
+            root.path(),
+            "config/journal.json",
+            r#"{"identity":{"timezone":"America/Denver"},"daily_inputs":{"location":{"location-words-1":"not-a-day"}}}"#,
+        );
+        let malformed = freeze(
+            prepared(
+                "schedule",
+                LOCATION_DAY,
+                json!({"hook":{"post":"schedule"}}),
+            ),
+            &context,
+        );
+        assert!(malformed.is_err());
+        let excluded_malformed = freeze(
+            prepared(
+                "daily_schedule",
+                LOCATION_DAY,
+                json!({"hook":{"pre":"daily_schedule","post":"daily_schedule"},"skip_reason":"no_input"}),
+            ),
+            &context,
+        )
+        .unwrap();
+        assert!(
+            excluded_malformed["prepared"]["config"]
+                .get("_daily_location_fingerprint")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clip_location_part_drops_whole_observations_under_the_byte_cap() {
+        let rendered = "# location\n\n- one\n- two\n- three\n";
+        let (full, omitted) = clip_location_part("Label.", rendered, 10_000);
+        assert_eq!(omitted, 0);
+        let full = full.expect("all three lines fit");
+        assert!(full.contains("- one\n") && full.contains("- three\n"));
+        let (shrunk, omitted) = clip_location_part("Label.", rendered, full.len() - 1);
+        assert_eq!(omitted, 1);
+        let shrunk = shrunk.expect("two lines fit");
+        assert!(shrunk.contains("- two\n"));
+        assert!(!shrunk.contains("- three\n"));
+        let (none, count) = clip_location_part("Label.", rendered, 1);
+        assert!(none.is_none());
+        assert_eq!(count, 3);
+        let (none, count) = clip_location_part("Label.", "# heading only\n", 10_000);
+        assert!(none.is_none());
+        assert_eq!(count, 0);
+
+        let root = tempfile::tempdir().unwrap();
+        location_journal(root.path(), LOCATION_DAY);
+        write_bytes(root.path(), "health/local.ctx", b"300");
+        let observations = rendered_observations(root.path());
+        assert!(!observations.is_empty());
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let talent = prepared(
+            "schedule",
+            LOCATION_DAY,
+            json!({"hook":{"post":"schedule"},"prompt":"keep me"}),
+        );
+        let packet = freeze(talent, &context).unwrap();
+        let config = packet["prepared"]["config"].as_object().unwrap();
+        assert_eq!(
+            config.get("prompt").and_then(Value::as_str),
+            Some("keep me")
+        );
+        assert!(config.get("_daily_location_fingerprint").is_some());
+        assert!(config.get("_daily_location_text").is_none());
+        assert_eq!(
+            config
+                .get("_daily_location_omitted")
+                .and_then(Value::as_u64),
+            Some(u64::try_from(observations.len()).unwrap())
+        );
+        let parts = text_parts(&thaw(&packet).unwrap().0);
+        assert_eq!(parts, vec!["keep me".to_owned()]);
+        for coordinate in ["39.75", "105.2", "105.0"] {
+            assert!(!parts[0].contains(coordinate));
+        }
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn capture_excludes_a_supported_place_name_aba() {
+        let root = tempfile::tempdir().unwrap();
+        location_journal(root.path(), LOCATION_DAY);
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let before =
+            solstone_core_location::daily_location_fingerprint(root.path(), LOCATION_DAY).unwrap();
+        let journal = root.path().to_path_buf();
+        let worker = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let saved_worker = worker.clone();
+        CAPTURE_BARRIER.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let (sent, received) = std::sync::mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let original =
+                        solstone_core_location::places::PlaceStore::update(&journal, |store| {
+                            store.places[0].name.replace("Transient name".into())
+                        })
+                        .unwrap();
+                    solstone_core_location::places::PlaceStore::update(&journal, |store| {
+                        store.places[0].name = original;
+                    })
+                    .unwrap();
+                    // The probe receiver ends before capture releases admission.
+                    let _ = sent.send(());
+                });
+                *saved_worker.borrow_mut() = Some(handle);
+                assert!(
+                    matches!(
+                        received.recv_timeout(std::time::Duration::from_millis(100)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "supported ABA passed through capture"
+                );
+            }))
+        });
+        let mut talent = prepared("schedule", LOCATION_DAY, json!({}));
+        attach_daily_location(&mut talent, &context, "schedule").unwrap();
+        worker.borrow_mut().take().unwrap().join().unwrap();
+        assert_eq!(
+            solstone_core_location::daily_location_fingerprint(root.path(), LOCATION_DAY).unwrap(),
+            before
+        );
+        assert_eq!(talent.config["_daily_location_fingerprint"], before);
+        assert!(
+            !talent.config["_daily_location_text"]
+                .as_str()
+                .unwrap()
+                .contains("Transient name")
+        );
+    }
+    #[test]
+    fn a_large_whole_first_observation_that_fits_is_not_discarded() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let talent = prepared("schedule", LOCATION_DAY, json!({}));
+        let rendered = format!("# location\n\n- {}\n", "長".repeat(3500));
+        let (part, omitted) = fit_location_part(
+            "schedule",
+            LOCATION_DAY,
+            &rendered,
+            &["ordinary".into()],
+            &talent,
+            &context,
+        );
+        let part = part.expect("a complete observation fits the 16 KiB and request budgets");
+        assert!(part.len() <= LOCATION_PART_BYTE_CAP);
+        assert!(part.ends_with(&format!("- {}\n", "長".repeat(3500))));
+        assert_eq!(omitted, 0);
     }
 }
