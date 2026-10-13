@@ -916,9 +916,6 @@ impl TransactionOutcome<'_, '_> {
                 || (facts.effect == PublicationEffect::Published
                     && facts.file_durability != Durability::Synced)
         });
-        if unproven_content {
-            return Err(Hold::Repair(RepairHold::UncertainContent));
-        }
         let missing_parent_sync = intent.outcome.as_ref().is_some_and(|facts| {
             matches!(
                 facts.effect,
@@ -928,6 +925,23 @@ impl TransactionOutcome<'_, '_> {
                     || facts.file_durability == Durability::Synced)
                 && facts.parent_durability != Durability::Synced
         });
+        let changed_day = intent.outcome.as_ref().is_some_and(|facts| {
+            matches!(
+                facts.effect,
+                PublicationEffect::Published | PublicationEffect::AlreadyPresent
+            )
+        });
+        // Invalidate this invocation's observed effect even if the later catalog
+        // is degraded. Replay never uses history to authorize missing media.
+        if !replay && changed_day && intent.marker != Obligation::Complete {
+            self.owner.effect_check(commit)?;
+            self.bump_marker(options)?;
+            self.record_mut()?.intent.marker = Obligation::Complete;
+            self.persist()?;
+        }
+        if unproven_content {
+            return Err(Hold::Repair(RepairHold::UncertainContent));
+        }
         if missing_parent_sync {
             if !replay {
                 return Err(Hold::Retirement);
@@ -942,21 +956,6 @@ impl TransactionOutcome<'_, '_> {
             } else {
                 return Err(Hold::Retirement);
             }
-        }
-        let intent = &self.record()?.intent;
-        let changed_day = intent.outcome.as_ref().is_some_and(|facts| {
-            matches!(
-                facts.effect,
-                PublicationEffect::Published | PublicationEffect::AlreadyPresent
-            )
-        });
-        // Invalidate this invocation's observed effect even if the later catalog
-        // is degraded. Replay never uses history to authorize missing media.
-        if !replay && changed_day && intent.marker != Obligation::Complete {
-            self.owner.effect_check(commit)?;
-            self.bump_marker(options)?;
-            self.record_mut()?.intent.marker = Obligation::Complete;
-            self.persist()?;
         }
         let decision = self.inspect()?;
         let successful = decision.event.files.iter().all(|file| {

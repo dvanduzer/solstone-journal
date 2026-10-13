@@ -647,15 +647,14 @@ fn native_claim_and_sync_uncertainty_preserve_owners_and_exact_failures() {
             let stage_path = failure.staged.as_ref().expect("stage remembered");
             assert!(f.path(stage_path).exists());
             fs::write(&raw, b"newer").unwrap();
+            drop(result);
             let activity =
                 solstone_core_journal_io::activity::ActivityLease::try_acquire(Arc::clone(&f.root))
                     .unwrap();
             let recovered = recover_interrupted_removals(&activity);
-            assert_eq!(recovered.len(), 1);
-            assert_eq!(
-                recovered[0].outcome,
-                Ok(solstone_core_journal_io::media::InterruptedRemovalResolution::Discarded)
-            );
+            assert!(recovered.is_empty());
+            crate::restore_intent::recover_abandoned_restores(&activity);
+            solstone_core_journal_io::media::retire_orphan_root_carriers(&activity);
             assert_eq!(fs::read(&raw).unwrap(), b"newer");
             assert!(!f.path(stage_path).exists());
             assert!(load_at_root(&f.root).unwrap().marks.contains_key(&mark.id));

@@ -81,10 +81,10 @@ mod local {
         IntentRead, NativeObligation, intent_filename, is_stage_namespace_name, observe_obligations,
     };
     use solstone_core_journal_io::media::{
-        Cleanup, Confirmation, Durability, InterruptedRemovalRecord, MediaDirectory, MediaEntry,
-        MediaStage, OriginalName, REMOVAL_ORIGINAL_LEAF, REMOVAL_RECORD_LEAF, RemovalEffect,
-        RemovalPhase, digest_reader, exclusive_local_activity, retire_recorded_stage,
-        retire_unrecorded_stage, retire_unrecorded_stage_where,
+        Cleanup, Confirmation, Durability, MediaDirectory, MediaEntry, MediaStage, OriginalName,
+        REMOVAL_ORIGINAL_LEAF, REMOVAL_RECORD_LEAF, RemovalEffect, RemovalPhase, digest_reader,
+        exclusive_local_activity, retire_recorded_stage, retire_unrecorded_stage,
+        retire_unrecorded_stage_where,
     };
 
     use super::super::{MarkRetirement, Obligation, RESTORE_DOWNLOAD_LEAF, selected_name};
@@ -124,7 +124,7 @@ mod local {
             })
             .collect();
         recovered.extend(retire_unrecorded_downloads(activity));
-        recovered.extend(retire_abandoned_removal_stages(activity));
+        recovered.extend(retire_empty_metadata_stages(activity));
         recovered
     }
 
@@ -361,7 +361,7 @@ mod local {
         }
     }
 
-    fn retire_abandoned_removal_stages(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
+    fn retire_empty_metadata_stages(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
         let Ok(census) = observe_obligations(activity.journal_root()) else {
             return Vec::new();
         };
@@ -369,9 +369,6 @@ mod local {
             Arc::clone(activity.journal_root()),
             Path::new("health/offload"),
         ) else {
-            return Vec::new();
-        };
-        let Ok(Some(intents)) = health.open_child(OsStr::new("restore-intents")) else {
             return Vec::new();
         };
         let mut retired = Vec::new();
@@ -385,43 +382,12 @@ mod local {
             {
                 continue;
             }
-            let Ok(Some(stage)) = health.open_child(&entry.name) else {
-                continue;
-            };
-            let Ok(Some(stage_entries)) = stage.entries(2) else {
-                continue;
-            };
-            let Some(stage_entry) = stage_entries.first() else {
-                continue;
-            };
-            if stage_entries.len() != 1
-                || stage_entry.name != OsStr::new(REMOVAL_RECORD_LEAF)
-                || stage_entry.kind != JournalEntryKind::RegularFile
-            {
-                continue;
-            }
-            let Ok(Some(record_read)) =
-                stage.read_file_bounded(OsStr::new(REMOVAL_RECORD_LEAF), 4096)
-            else {
-                continue;
-            };
-            let Ok(record) = serde_json::from_slice::<InterruptedRemovalRecord>(&record_read.bytes)
-            else {
-                continue;
-            };
-            if record.version != 1 {
-                continue;
-            }
-            match intents.observe_file(OsStr::new(&record.name)) {
-                Ok(None) => {}
-                _ => continue,
-            }
-            if let Ok(true) = retire_unrecorded_stage(
+            if let Ok(true) = retire_unrecorded_stage_where(
                 activity,
                 &health,
                 &entry.name,
                 entry.identity,
-                OsStr::new(REMOVAL_RECORD_LEAF),
+                &|_| false,
             ) {
                 retired.push(AbandonedRestore {
                     operation_id: None,

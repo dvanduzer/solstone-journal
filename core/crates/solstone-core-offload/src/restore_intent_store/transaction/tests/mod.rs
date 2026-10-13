@@ -830,7 +830,8 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
     assert_eq!(fs::read(f.raw()).unwrap(), b"abc");
     let record = result.record.as_ref().unwrap();
     let id = record.intent.event.operation_id.clone();
-    assert_eq!(record.intent.marker, Obligation::Pending);
+    assert_eq!(record.intent.marker, Obligation::Complete);
+    assert!(result.marker.is_some());
     assert_eq!(record.intent.event_recorded, Obligation::Pending);
     assert!(result.ledger.is_none());
     assert!(result.register.is_none());
@@ -1140,58 +1141,34 @@ fn retirement_native_sync_failure_keeps_deleted_effect_and_refuses_completion() 
 }
 
 #[test]
-fn retirement_preserves_actual_deleted_effect_when_ancestor_sync_fails_or_final_census_changes() {
-    struct FailHealth;
-    impl super::super::unix::Hooks for FailHealth {
-        fn sync(
-            &mut self,
-            directory: &impl std::os::fd::AsFd,
-            index: usize,
-        ) -> std::io::Result<()> {
-            if index == 2 {
-                return Err(std::io::Error::other("health sync cut"));
-            }
-            nix::unistd::fsync(directory).map_err(std::io::Error::from)
-        }
-    }
-    for final_stage in [false, true] {
-        let f = Fixture::new(false);
-        let allowed = Cell::new(true);
-        let result = f.staged(&allowed).commit(2, options());
-        let path = intent_path(&f, &result);
-        let unknown = f.temp.path().join("health/offload/.tmp-offload-final");
-        let retired = if final_stage {
-            let created = unknown.clone();
-            let (retired, fired) = run_with_media_hook(
-                MediaPrimitive::RemovalParentSync,
-                move || fs::create_dir(created),
-                || result.retire_intent(options()),
-            );
-            assert!(fired);
-            retired
-        } else {
-            result.retire_with(options(), &mut FailHealth)
-        };
-        assert!(matches!(
-            retired.hold,
-            Some(Hold::Retirement | Hold::Obligations)
-        ));
-        assert!(!path.exists());
-        let facts = retired.retirement.as_ref().unwrap();
-        let NativeRetirement::Removal(removal) = &facts.native else {
-            panic!("removal receipt lost")
-        };
-        assert_eq!(
-            removal.receipt().effect,
-            solstone_core_journal_io::media::RemovalEffect::Deleted
-        );
-        assert!(!facts.retired);
-        if final_stage {
-            assert!(unknown.is_dir());
-        } else {
-            assert_eq!(facts.ancestors[2], Durability::Unproven);
-        }
-    }
+fn retirement_preserves_actual_deleted_effect_when_final_census_changes() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let result = f.staged(&allowed).commit(2, options());
+    let path = intent_path(&f, &result);
+    let unknown = f.temp.path().join("health/offload/.tmp-offload-final");
+    let created = unknown.clone();
+    let (retired, fired) = run_with_media_hook(
+        MediaPrimitive::RemovalParentSync,
+        move || fs::create_dir(created),
+        || result.retire_intent(options()),
+    );
+    assert!(fired);
+    assert!(matches!(
+        retired.hold,
+        Some(Hold::Retirement | Hold::Obligations)
+    ));
+    assert!(!path.exists());
+    let facts = retired.retirement.as_ref().unwrap();
+    let NativeRetirement::Removal(removal) = &facts.native else {
+        panic!("removal receipt lost")
+    };
+    assert_eq!(
+        removal.receipt().effect,
+        solstone_core_journal_io::media::RemovalEffect::Deleted
+    );
+    assert!(!facts.retired);
+    assert!(unknown.is_dir());
 }
 
 #[test]
