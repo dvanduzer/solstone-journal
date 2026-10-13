@@ -442,14 +442,11 @@ pub(crate) mod unix {
             std::slice::from_ref(selection),
         )?;
         let segment = claimed.first().ok_or(OffloadOfferRefusal::Changed)?;
-        let absolute = operation
-            .journal_root()
-            .canonical_path()
-            .join(&segment.relative);
-        let commit = segment.claims.commit(&absolute)?;
+        let absolute = &segment.absolute;
+        let commit = segment.claims.commit(absolute)?;
         commit.require_outputs(
             &segment.claims,
-            &absolute,
+            absolute,
             marks
                 .iter()
                 .flat_map(|mark| &mark.proposal.names)

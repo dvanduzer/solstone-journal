@@ -1660,7 +1660,11 @@ fn execute_reviewed_mode(
             *layout,
         );
         let directory = MediaDirectory::open(Arc::clone(&root), Path::new(&relative))?;
-        let path = root.canonical_path().join(&relative);
+        let path = root
+            .canonical_path()
+            .join(&relative)
+            .components()
+            .collect::<std::path::PathBuf>();
         let claim = OutputClaims::discover(&path, options)?;
         if claim.segment_identity(&path)? != directory.object_identity() {
             return Err(ReviewedRemovalRefusal::Changed);
@@ -1676,7 +1680,12 @@ fn execute_reviewed_mode(
             &target.dir,
             *layout,
         );
-        commits.push(claim.commit(&root.canonical_path().join(relative))?);
+        let path = root
+            .canonical_path()
+            .join(relative)
+            .components()
+            .collect::<std::path::PathBuf>();
+        commits.push(claim.commit(&path)?);
     }
     let policy = ReviewedPolicy::capture(&root)?;
     let mut groups = Vec::new();
@@ -2351,12 +2360,13 @@ fn append_windows_removal_event(
     let mut contents = serde_json::to_vec(event).map_err(std::io::Error::other)?;
     contents.push(b'\n');
     parent.revalidate_bound().map_err(std::io::Error::other)?;
-    let mut file = solstone_core_journal_io::create_or_open_windows_append_file_bound(
-        parent,
-        std::ffi::OsStr::new("events.jsonl"),
-        diagnostic,
-    )
-    .map_err(std::io::Error::other)?;
+    let mut file =
+        solstone_core_journal_io::windows_sync_dir::create_or_open_windows_append_file_bound(
+            parent,
+            std::ffi::OsStr::new("events.jsonl"),
+            diagnostic,
+        )
+        .map_err(std::io::Error::other)?;
     if file.seek(SeekFrom::End(0))? != 0 {
         file.seek(SeekFrom::End(-1))?;
         let mut tail = [0];

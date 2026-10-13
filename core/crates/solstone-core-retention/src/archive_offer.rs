@@ -360,6 +360,7 @@ fn check_group(group: &ObservedOffloadGroup) -> Result<(), OffloadOfferRefusal> 
 #[cfg(any(unix, windows))]
 struct ClaimedSegment {
     relative: String,
+    absolute: std::path::PathBuf,
     directory: Arc<MediaDirectory>,
     claims: solstone_core_segment::output_attempt::OutputClaims,
 }
@@ -386,13 +387,18 @@ fn acquire_claims(
         .into_iter()
         .map(|relative| {
             let directory = MediaDirectory::open(Arc::clone(root), Path::new(&relative))?;
-            let absolute = root.canonical_path().join(&relative);
+            let absolute = root
+                .canonical_path()
+                .join(&relative)
+                .components()
+                .collect::<std::path::PathBuf>();
             let claims = OutputClaims::discover(&absolute, options)?;
             if claims.segment_identity(&absolute)? != directory.object_identity() {
                 return Err(OffloadOfferRefusal::Changed);
             }
             Ok(ClaimedSegment {
                 relative,
+                absolute,
                 directory,
                 claims,
             })
@@ -428,11 +434,11 @@ pub fn capture_offload_offers(
         let claimed = acquire_claims(&root, &selections)?;
         let mut commits = Vec::new();
         for segment in &claimed {
-            let absolute = root.canonical_path().join(&segment.relative);
-            let commit = segment.claims.commit(&absolute)?;
+            let absolute = &segment.absolute;
+            let commit = segment.claims.commit(absolute)?;
             commit.require_outputs(
                 &segment.claims,
-                &absolute,
+                absolute,
                 selections
                     .iter()
                     .filter(|selection| selection_path(selection) == segment.relative)
@@ -833,11 +839,11 @@ fn preflight_verification(
     let claimed = acquire_claims(&observed.root, &selections)?;
     let mut commits = Vec::new();
     for segment in &claimed {
-        let absolute = observed.root.canonical_path().join(&segment.relative);
-        let commit = segment.claims.commit(&absolute)?;
+        let absolute = &segment.absolute;
+        let commit = segment.claims.commit(absolute)?;
         commit.require_outputs(
             &segment.claims,
-            &absolute,
+            absolute,
             selections
                 .iter()
                 .filter(|selection| selection_path(selection) == segment.relative)
@@ -990,14 +996,11 @@ fn publish_with_approval(
     let claimed = acquire_claims(&observed.root, &selections)?;
     let mut commits = Vec::new();
     for segment in &claimed {
-        let absolute = approval
-            .journal_root()
-            .canonical_path()
-            .join(&segment.relative);
-        let commit = segment.claims.commit(&absolute)?;
+        let absolute = &segment.absolute;
+        let commit = segment.claims.commit(absolute)?;
         commit.require_outputs(
             &segment.claims,
-            &absolute,
+            absolute,
             selections
                 .iter()
                 .filter(|selection| selection_path(selection) == segment.relative)
