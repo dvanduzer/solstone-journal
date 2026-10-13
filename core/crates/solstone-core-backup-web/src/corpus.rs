@@ -2685,7 +2685,7 @@ mod held_restore_tests {
                     post_json(&deps, "/app/backup/offload/restore", Some(request)).await;
                 // Historical files without a recorded repository are reviewed
                 // inside the same admitted restore, so neither kind refuses early.
-                if cfg!(any(target_os = "linux", target_os = "macos")) {
+                if cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows")) {
                     assert_eq!(status, 200);
                     let terminal = wait_terminal(&deps).await;
                     assert_eq!(terminal["operation"]["kind"], "offload_restore");
@@ -2726,7 +2726,7 @@ mod held_restore_tests {
                 assert_eq!(status, 400);
                 assert_eq!(
                     value["reason_code"],
-                    if cfg!(any(target_os = "linux", target_os = "macos")) {
+                    if cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows")) {
                         reason
                     } else {
                         "restore_held"

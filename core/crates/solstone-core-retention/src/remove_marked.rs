@@ -395,7 +395,7 @@ fn refused(mark: &Mark, reason: &str) -> TargetOutcome {
 
 const REVIEW_REFUSED: &str =
     "the originals couldn't be deleted because their current state couldn't be confirmed.";
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const REVIEW_UNCERTAIN: &str = "deletion couldn't be completed or confirmed. recovery is needed.";
 const REVIEW_POST_COMMIT: &str =
     "this file was deleted, but the change or its records couldn't be fully saved.";
@@ -413,7 +413,7 @@ pub enum ReviewedRemovalRefusal {
     Census(solstone_core_journal_io::activity_obligations::RecoveryObservationError),
     Obligations(solstone_core_journal_io::activity_obligations::NativeObligations),
     Configuration(solstone_core_journal_config::ConfigLoadError),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Directory(solstone_core_journal_io::FlatDirectoryError),
     Changed,
     CarrierPreparation,
@@ -432,7 +432,7 @@ impl From<std::io::Error> for ReviewedRemovalRefusal {
         Self::Io(value)
     }
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl From<solstone_core_journal_io::FlatDirectoryError> for ReviewedRemovalRefusal {
     fn from(value: solstone_core_journal_io::FlatDirectoryError) -> Self {
         Self::Directory(value)
@@ -459,7 +459,7 @@ pub struct ReviewedFileRemoval {
         >,
     >,
     binding: Option<std::io::Error>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     settled: bool,
 }
 
@@ -778,9 +778,9 @@ pub fn remove_reviewed_with_archive<'a>(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> ReviewedArchiveRemoval<'a> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let selected = preflight_archive_review(&checked, &read);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let selected: Result<Vec<Mark>, ReviewedRemovalRefusal> =
         Err(ReviewedRemovalRefusal::Unsupported);
     let selected = match selected {
@@ -801,7 +801,7 @@ pub fn remove_reviewed_with_archive<'a>(
     remove_reviewed_approved(checked, approval, today, now)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn preflight_archive_review(
     checked: &crate::review_context::CheckedReviewContext,
     read: &solstone_core_backup::archive_readback::ReadOperation<'_>,
@@ -905,11 +905,11 @@ pub(crate) fn remove_reviewed_approved<'a>(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> ReviewedArchiveRemoval<'a> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         remove_reviewed_approved_with(checked, approval, today, now, |_, _| {})
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _parameters = (today, now);
         finish_archive_review(
@@ -921,7 +921,7 @@ pub(crate) fn remove_reviewed_approved<'a>(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn remove_reviewed_approved_with<'a>(
     checked: crate::review_context::CheckedReviewContext,
     approval: Result<
@@ -1021,38 +1021,76 @@ fn reviewed_mark_unsaved_deletions(outcome: &mut Outcome) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn open_windows_directory_path(
+    root: &std::sync::Arc<solstone_core_journal_io::JournalRoot>,
+    relative: &Path,
+) -> Result<solstone_core_journal_io::WindowsFlatDirectory, ReviewedRemovalRefusal> {
+    use solstone_core_journal_io::open_windows_flat_directory_bound;
+    let mut opened: Option<solstone_core_journal_io::WindowsFlatDirectory> = None;
+    let mut diagnostic = root.canonical_path().to_path_buf();
+    for component in relative.components() {
+        let next = match &opened {
+            Some(directory) => {
+                open_windows_flat_directory_bound(directory, component.as_os_str(), &diagnostic)
+            }
+            None => open_windows_flat_directory_bound(root.as_ref(), component.as_os_str(), &diagnostic),
+        }
+        .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?
+        .ok_or(ReviewedRemovalRefusal::Changed)?;
+        opened = Some(next);
+        diagnostic.push(component);
+    }
+    opened.ok_or(ReviewedRemovalRefusal::Changed)
+}
+
+#[cfg(any(unix, windows))]
 const REVIEW_MAX_ENTRIES: usize = 65_536;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const REVIEW_MAX_CONFIG: usize = 1024 * 1024;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct ReviewedPolicy {
     root: std::sync::Arc<solstone_core_journal_io::JournalRoot>,
     directory: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
+    #[cfg(unix)]
     parent: solstone_core_journal_io::FlatDirectory,
+    #[cfg(windows)]
+    parent: solstone_core_journal_io::WindowsFlatDirectory,
     lock: solstone_core_journal_io::BoundParentLock,
     read: solstone_core_journal_config::JournalConfigRead,
     entry: Option<solstone_core_journal_io::media::MediaEntry>,
     policy: Policy,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ReviewedPolicy {
     pub(crate) fn capture(
         root: &std::sync::Arc<solstone_core_journal_io::JournalRoot>,
     ) -> Result<Self, ReviewedRemovalRefusal> {
         use solstone_core_journal_io::media::MediaDirectory;
         use solstone_core_journal_io::{
-            FlatDirectory, acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
+            acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
         };
         use std::ffi::OsStr;
         use std::time::Duration;
         let directory = MediaDirectory::open(std::sync::Arc::clone(root), Path::new("config"))?;
-        let parent = FlatDirectory::open(root, Path::new("config"))?;
-        if parent.identity() != directory.object_identity() {
-            return Err(ReviewedRemovalRefusal::Changed);
-        }
+        #[cfg(unix)]
+        let parent = {
+            let parent = solstone_core_journal_io::FlatDirectory::open(root, Path::new("config"))?;
+            if parent.identity() != directory.object_identity() {
+                return Err(ReviewedRemovalRefusal::Changed);
+            }
+            parent
+        };
+        #[cfg(windows)]
+        let parent = {
+            let parent = open_windows_directory_path(root, Path::new("config"))?;
+            if parent.object_identity() != directory.object_identity() {
+                return Err(ReviewedRemovalRefusal::Changed);
+            }
+            parent
+        };
         let name = OsStr::new("journal.json.lock");
         let lock =
             match open_existing_parent_lock_bound(&parent, name, Duration::ZERO, Duration::ZERO)
@@ -1110,11 +1148,24 @@ impl ReviewedPolicy {
             .revalidate_canonical_binding()
             .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?;
         self.directory.revalidate()?;
-        self.parent.revalidate()?;
-        let current_parent =
-            solstone_core_journal_io::FlatDirectory::open(&self.root, Path::new("config"))?;
-        if current_parent.identity() != self.parent.identity() {
-            return Err(ReviewedRemovalRefusal::Changed);
+        #[cfg(unix)]
+        {
+            self.parent.revalidate()?;
+            let current_parent =
+                solstone_core_journal_io::FlatDirectory::open(&self.root, Path::new("config"))?;
+            if current_parent.identity() != self.parent.identity() {
+                return Err(ReviewedRemovalRefusal::Changed);
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.parent
+                .revalidate_bound()
+                .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?;
+            let current_parent = open_windows_directory_path(&self.root, Path::new("config"))?;
+            if current_parent.object_identity() != self.directory.object_identity() {
+                return Err(ReviewedRemovalRefusal::Changed);
+            }
         }
         self.lock
             .revalidate_bound(&self.parent, std::ffi::OsStr::new("journal.json.lock"))
@@ -1133,14 +1184,20 @@ impl ReviewedPolicy {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct ReviewedGroup {
     target: crate::Target,
     layout: solstone_core_journal_io::paths::SegmentLayout,
     directory: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
     parent: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
+    #[cfg(unix)]
     events: solstone_core_journal_io::FlatDirectory,
+    #[cfg(unix)]
     health: solstone_core_journal_io::FlatDirectory,
+    #[cfg(windows)]
+    events: solstone_core_journal_io::WindowsFlatDirectory,
+    #[cfg(windows)]
+    health: solstone_core_journal_io::WindowsFlatDirectory,
     scan: crate::scan::CheckedSegment,
     files: BTreeMap<String, (ProvenRaw, solstone_core_journal_io::media::MediaObservation)>,
     refusals: BTreeMap<String, String>,
@@ -1150,7 +1207,7 @@ struct ReviewedGroup {
     deleted: BTreeSet<String>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ReviewedGroup {
     fn relative(&self) -> String {
         crate::layout::segment_rel_with_layout(
@@ -1162,7 +1219,7 @@ impl ReviewedGroup {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_layout(mark: &Mark) -> solstone_core_journal_io::paths::SegmentLayout {
     use solstone_core_journal_io::paths::{DEFAULT_STREAM, SegmentLayout};
     mark.offload.as_ref().map_or_else(
@@ -1177,7 +1234,7 @@ fn reviewed_layout(mark: &Mark) -> solstone_core_journal_io::paths::SegmentLayou
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_relative(mark: &Mark, name: &str) -> String {
     crate::layout::content_rel_with_layout(
         &mark.target.day,
@@ -1188,7 +1245,7 @@ fn reviewed_relative(mark: &Mark, name: &str) -> String {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_scan(
     directory: &solstone_core_journal_io::media::MediaDirectory,
 ) -> std::io::Result<crate::scan::CheckedSegment> {
@@ -1200,7 +1257,7 @@ fn reviewed_scan(
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn revalidate_reviewed_group(group: &ReviewedGroup) -> Result<(), ReviewedRemovalRefusal> {
     group.directory.revalidate()?;
     group.parent.revalidate()?;
@@ -1233,7 +1290,7 @@ fn revalidate_reviewed_group(group: &ReviewedGroup) -> Result<(), ReviewedRemova
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_candidates(
     scan: &crate::scan::CheckedSegment,
     policy: &Policy,
@@ -1266,7 +1323,7 @@ fn reviewed_candidates(
     (ready_union(empty_decision, ordinary_decision), refusals)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn valid_reviewed_coordinates(marks: &[Mark]) -> bool {
     use crate::content::{ContentName, MediaClassifier};
     let plain = |s: &str| {
@@ -1294,12 +1351,12 @@ fn valid_reviewed_coordinates(marks: &[Mark]) -> bool {
         })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn valid_reviewed_selection(marks: &[Mark]) -> bool {
     valid_reviewed_coordinates(marks) && marks.iter().all(|mark| mark.offload.is_none())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_admission(
     archive: Option<crate::archive_approval::ArchiveApprovalRef<'_, '_>>,
     execution: &ReviewedExecution,
@@ -1318,7 +1375,7 @@ fn reviewed_admission(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_archive_processing<'a>(
     archive: crate::archive_approval::ArchiveApprovalRef<'_, '_>,
     mark: &'a Mark,
@@ -1367,7 +1424,7 @@ fn reviewed_archive_processing<'a>(
     Ok(file)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_archive_file(
     archive: crate::archive_approval::ArchiveApprovalRef<'_, '_>,
     mark: &Mark,
@@ -1398,7 +1455,7 @@ fn reviewed_archive_file(
 }
 
 /// Only the retained current verifier can mint the ordinary-age exception.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct ArchiveRelease<'a, 'op> {
     archive: crate::archive_approval::ArchiveApprovalRef<'a, 'op>,
     register: &'a crate::mark_mutation::CheckedMarkGuard<'a, 'op>,
@@ -1410,7 +1467,7 @@ pub(crate) struct ArchiveRelease<'a, 'op> {
     now: DateTime<Utc>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ArchiveRelease<'_, '_> {
     pub(crate) fn revalidate(&self) -> Result<(), ReviewedRemovalRefusal> {
         self.register.revalidate()?;
@@ -1457,14 +1514,14 @@ impl ArchiveRelease<'_, '_> {
 }
 
 /// Minted only by the current ordinary executor after its full retained checks.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct OrdinaryRelease {
     source: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
     proven: ProvenRaw,
     observation: solstone_core_journal_io::media::MediaObservation,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl OrdinaryRelease {
     pub(crate) fn into_parts(
         self,
@@ -1477,7 +1534,7 @@ impl OrdinaryRelease {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewedCheckpoint {
     Hashed,
@@ -1508,7 +1565,7 @@ fn execute_reviewed_with(
     execute_reviewed_mode(checked, today, now, execution, None, checkpoint)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn execute_reviewed_mode(
     checked: &crate::review_context::CheckedReviewContext,
     today: NaiveDate,
@@ -1630,6 +1687,7 @@ fn execute_reviewed_mode(
                 layout,
             )),
         )?;
+        #[cfg(unix)]
         let events = solstone_core_journal_io::FlatDirectory::open(
             &root,
             Path::new(&crate::layout::segment_rel_with_layout(
@@ -1639,11 +1697,32 @@ fn execute_reviewed_mode(
                 layout,
             )),
         )?;
+        #[cfg(windows)]
+        let events = open_windows_directory_path(
+            &root,
+            Path::new(&crate::layout::segment_rel_with_layout(
+                &target.day,
+                &target.stream,
+                &target.dir,
+                layout,
+            )),
+        )?;
+        #[cfg(unix)]
         let health = solstone_core_journal_io::FlatDirectory::open(
             &root,
             Path::new(&crate::layout::day_health_rel(&target.day)),
         )?;
+        #[cfg(windows)]
+        let health = open_windows_directory_path(
+            &root,
+            Path::new(&crate::layout::day_health_rel(&target.day)),
+        )?;
+        #[cfg(unix)]
         if events.identity() != directory.object_identity() {
+            return Err(ReviewedRemovalRefusal::Changed);
+        }
+        #[cfg(windows)]
+        if events.object_identity() != directory.object_identity() {
             return Err(ReviewedRemovalRefusal::Changed);
         }
         let scan = reviewed_scan(&directory)?;
@@ -1973,7 +2052,9 @@ fn execute_reviewed_mode(
                     relative: reviewed_relative(mark, name),
                     class: mark.class,
                     native: released.native,
+                    #[cfg(unix)]
                     append: None,
+                    #[cfg(unix)]
                     marker: None,
                     binding: None,
                     settled: false,
@@ -2138,7 +2219,7 @@ fn execute_reviewed_mode(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_not_removed(
     mark: &Mark,
     name: &str,
@@ -2152,7 +2233,7 @@ fn reviewed_not_removed(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reviewed_stage_path(removal: &solstone_core_journal_io::media::MediaRemoval) -> Option<String> {
     let stage = removal.stage_observation()?;
     let mut relative = std::path::PathBuf::new();
@@ -2255,6 +2336,153 @@ fn reviewed_bookkeeping(
     });
     attempt.settled =
         native_settled && append_settled && marker_settled && attempt.binding.is_none();
+}
+
+#[cfg(windows)]
+fn reviewed_bookkeeping(
+    root: &std::sync::Arc<solstone_core_journal_io::JournalRoot>,
+    group: &ReviewedGroup,
+    name: &str,
+    now: DateTime<Utc>,
+    attempt: &mut ReviewedFileRemoval,
+) {
+    use solstone_core_journal_io::media::{Confirmation, Durability, OriginalName, RemovalEffect};
+    use solstone_core_journal_io::{
+        DetailedAtomicOutcome, HealthMarker, acquire_existing_parent_lock_bound,
+        atomic_replace_detailed_bound, read_windows_observed_file_bounded,
+    };
+    use std::ffi::OsStr;
+    use std::time::Duration;
+
+    let bindings = || -> std::io::Result<()> {
+        root.revalidate_canonical_binding()
+            .map_err(std::io::Error::other)?;
+        group.directory.revalidate()?;
+        group.events.revalidate_bound().map_err(std::io::Error::other)?;
+        group.health.revalidate_bound().map_err(std::io::Error::other)?;
+        let events = open_windows_directory_path(root, Path::new(&group.relative()))
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let health = open_windows_directory_path(
+            root,
+            Path::new(&crate::layout::day_health_rel(&group.target.day)),
+        )
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        if events.object_identity() != group.events.object_identity()
+            || health.object_identity() != group.health.object_identity()
+        {
+            return Err(std::io::Error::other("removal bookkeeping binding changed"));
+        }
+        Ok(())
+    };
+
+    if let Err(error) = bindings() {
+        attempt.binding = Some(error);
+        return;
+    }
+
+    let class = match attempt.class {
+        RemovalClass::PolicyRawRelease => RawReleaseClass::Policy,
+        _ => RawReleaseClass::Offload,
+    };
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "name".to_owned(),
+        serde_json::Value::String(name.to_owned()),
+    );
+    extra.insert(
+        "class".to_owned(),
+        serde_json::Value::String(class.tag().to_owned()),
+    );
+    let event = solstone_core_callosum::CallosumEnvelope {
+        tract: "retention".to_owned(),
+        event: "original_deleted".to_owned(),
+        ts: Some(now.timestamp_millis()),
+        extra,
+    };
+
+    let events_path = root
+        .canonical_path()
+        .join(group.relative())
+        .join("events.jsonl");
+    let append_result = solstone_core_journal_io::append_jsonl_no_follow(&events_path, &event);
+
+    let bump_marker = || -> Result<bool, std::io::Error> {
+        let lock_name = OsStr::new("stream.updated.lock");
+        let lock = acquire_existing_parent_lock_bound(
+            &group.health,
+            lock_name,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        group
+            .health
+            .revalidate_bound()
+            .map_err(std::io::Error::other)?;
+        lock.revalidate_bound(&group.health, lock_name)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        let observed = read_windows_observed_file_bounded(
+            &group.health,
+            OsStr::new("stream.updated"),
+            1024 * 1024,
+        )
+        .map_err(std::io::Error::other)?;
+        let (generation, fingerprint) = match observed {
+            None => (0, None),
+            Some(observed) if observed.bytes.is_empty() => (0, None),
+            Some(observed) => {
+                let marker = serde_json::from_slice::<HealthMarker>(&observed.bytes)
+                    .map_err(std::io::Error::other)?;
+                if marker.version != 1 {
+                    return Err(std::io::Error::other("unexpected marker version"));
+                }
+                (marker.generation, marker.fingerprint)
+            }
+        };
+        let generation = generation
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("marker generation overflow"))?;
+        let marker = HealthMarker {
+            version: 1,
+            generation,
+            fingerprint,
+        };
+        let contents = serde_json::to_vec(&marker).map_err(std::io::Error::other)?;
+        group
+            .health
+            .revalidate_bound()
+            .map_err(std::io::Error::other)?;
+        lock.revalidate_bound(&group.health, lock_name)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+
+        let publication = atomic_replace_detailed_bound(
+            &group.health,
+            &lock,
+            OsStr::new("stream.updated"),
+            &contents,
+            0o600,
+        );
+        let confirmed = matches!(publication, Ok(DetailedAtomicOutcome::Published));
+        let bound = group.health.revalidate_bound().is_ok()
+            && lock.revalidate_bound(&group.health, lock_name).is_ok();
+        Ok(confirmed && bound)
+    };
+
+    let marker_published = bump_marker().unwrap_or(false);
+
+    attempt.binding = bindings().err();
+    let native = attempt.native.receipt();
+    attempt.settled = native.effect == RemovalEffect::Deleted
+        && native.original_name == OriginalName::Absent
+        && native.claim_confirmation == Confirmation::Confirmed
+        && (native.source_durability == Durability::Synced
+            || native.source_durability == Durability::Unproven)
+        && (native.claim_durability == Durability::Synced
+            || native.claim_durability == Durability::Unproven)
+        && append_result.is_ok()
+        && marker_published
+        && attempt.binding.is_none();
 }
 
 #[cfg(all(test, unix, feature = "full-tests"))]

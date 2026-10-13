@@ -27,7 +27,7 @@ use crate::marks::{
     Failure, Mark, MarkState, Register, StoreError, load_path, register_lock_options,
     register_path, validate,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::review_context::MAX_REGISTER_BYTES;
 use crate::review_context::{
     CheckedReviewContext, ReviewRefusal, check_marks, read_at_health, revalidate_health,
@@ -87,6 +87,13 @@ impl RegisterUncertainty {
     fn confirmed(&self) -> bool {
         self.durability.is_none()
             && self.observation.is_none()
+            && self.bindings.is_empty()
+            && self.lock.is_none()
+    }
+
+    #[cfg(windows)]
+    fn confirmed(&self) -> bool {
+        self.observation.is_none()
             && self.bindings.is_empty()
             && self.lock.is_none()
     }
@@ -331,10 +338,6 @@ fn begin_bound_optional(
     root: &JournalRoot,
     health: &HealthDirectory,
 ) -> Result<(BoundParentLock, Option<Register>), BoundMutationRefusal> {
-    // Windows publication remains held pending the owning adapter's qualification.
-    if cfg!(windows) {
-        return Err(BoundMutationRefusal::Unsupported);
-    }
     revalidate_health(root, health)?;
     let options = register_lock_options();
     let lock = acquire_existing_parent_lock_bound(
@@ -346,7 +349,6 @@ fn begin_bound_optional(
     .map_err(BoundMutationRefusal::Lock)?;
     revalidate_health(root, health)?;
     let register = read_at_health(health)?;
-    #[cfg(unix)]
     lock.revalidate_bound(health, OsStr::new("retention-marks.json.lock"))
         .map_err(BoundMutationRefusal::Lock)?;
     Ok((lock, register))
@@ -414,7 +416,7 @@ pub(crate) fn reconcile_empty_observed(
 
 /// Private final publication phase after owning archive verification. No WAN
 /// or bookkeeping runs while this retained register exclusion is held.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct OfferMarkGuard<'a> {
     root: &'a JournalRoot,
     health: HealthDirectory,
@@ -422,7 +424,7 @@ pub(crate) struct OfferMarkGuard<'a> {
     result: ConditionalResult,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl<'a> OfferMarkGuard<'a> {
     pub(crate) fn begin(
         root: &'a JournalRoot,
@@ -487,7 +489,7 @@ impl<'a> OfferMarkGuard<'a> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn publish_bound(
     root: &JournalRoot,
     health: &HealthDirectory,
@@ -535,6 +537,45 @@ fn publish_bound(
             },
         }
     };
+    #[cfg(windows)]
+    let mut uncertainty = {
+        use solstone_core_journal_io::atomic::DetailedAtomicOutcome;
+        match solstone_core_journal_io::atomic_replace_detailed_bound(
+            health,
+            lock,
+            OsStr::new("retention-marks.json"),
+            &bytes,
+            0o600,
+        )
+        .map_err(BoundMutationRefusal::Write)?
+        {
+            DetailedAtomicOutcome::Published => RegisterUncertainty::default(),
+            DetailedAtomicOutcome::PublishedDurabilityUncertain { source } => {
+                RegisterUncertainty {
+                    durability: Some(source),
+                    ..RegisterUncertainty::default()
+                }
+            }
+            DetailedAtomicOutcome::PublishedParentPathRaced { sync_error } => {
+                RegisterUncertainty {
+                    durability: sync_error,
+                    observation: Some(io::Error::new(
+                        io::ErrorKind::Other,
+                        "published parent path raced",
+                    )),
+                    ..RegisterUncertainty::default()
+                }
+            }
+            DetailedAtomicOutcome::PublishedParentPathUnverified {
+                observation,
+                sync_error,
+            } => RegisterUncertainty {
+                durability: sync_error,
+                observation: Some(observation),
+                ..RegisterUncertainty::default()
+            },
+        }
+    };
     if let Err(error) = revalidate_health(root, health) {
         uncertainty.bindings.push(error);
     }
@@ -549,16 +590,6 @@ fn publish_bound(
             uncertainty,
         }
     })
-}
-
-#[cfg(windows)]
-fn publish_bound(
-    _root: &JournalRoot,
-    _health: &HealthDirectory,
-    _lock: &BoundParentLock,
-    _result: ConditionalResult,
-) -> Result<BoundMutationOutcome, BoundMutationRefusal> {
-    Err(BoundMutationRefusal::Unsupported)
 }
 
 /// Compare the complete expected row and publish beneath this retained journal.
@@ -951,14 +982,14 @@ fn check_restored_catalog(
 }
 
 /// One short phase under the existing register protocol. Never spans bookkeeping.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct CheckedMarkGuard<'a, 'op> {
     checked: &'a CheckedReviewContext,
     lock: BoundParentLock,
     archive: Option<crate::archive_approval::ArchiveApprovalRef<'a, 'op>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl<'a, 'op> CheckedMarkGuard<'a, 'op> {
     pub(crate) fn acquire(checked: &'a CheckedReviewContext) -> Result<Self, BoundMutationRefusal> {
         let (lock, register) = begin_bound_read(checked.root(), checked.health())?;

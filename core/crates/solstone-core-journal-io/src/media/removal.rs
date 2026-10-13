@@ -381,7 +381,11 @@ impl MediaRemoval {
         leaf.file.write_all(&bytes)?;
         leaf.file.sync_all()?;
         platform::check_leaf(&directory.inner, name, identity)?;
-        directory.inner.sync()?;
+        if let Err(error) = directory.inner.sync() {
+            if !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported) {
+                return Err(error);
+            }
+        }
         directory.revalidate()
     }
 
@@ -396,12 +400,20 @@ impl MediaRemoval {
         if self.receipt.effect != RemovalEffect::NotClaimed {
             match Self::sync(&self.source, MediaPrimitive::RemovalSourceSync) {
                 Ok(()) => self.receipt.source_durability = Durability::Synced,
-                Err(error) => self.failure(RemovalPhase::SourceSync, error),
+                Err(error) => {
+                    if !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported) {
+                        self.failure(RemovalPhase::SourceSync, error);
+                    }
+                }
             }
             if let Some(directory) = &self.stage.directory {
                 match Self::sync(directory, MediaPrimitive::RemovalClaimSync) {
                     Ok(()) => self.receipt.claim_durability = Durability::Synced,
-                    Err(error) => self.failure(RemovalPhase::ClaimSync, error),
+                    Err(error) => {
+                        if !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported) {
+                            self.failure(RemovalPhase::ClaimSync, error);
+                        }
+                    }
                 }
             }
         }
@@ -409,7 +421,11 @@ impl MediaRemoval {
         if self.stage.removed {
             match Self::sync(&self.stage.parent, MediaPrimitive::RemovalParentSync) {
                 Ok(()) => self.receipt.stage_parent_durability = Durability::Synced,
-                Err(error) => self.failure(RemovalPhase::StageParentSync, error),
+                Err(error) => {
+                    if !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported) {
+                        self.failure(RemovalPhase::StageParentSync, error);
+                    }
+                }
             }
         }
         match plain_name(&self.name)
@@ -565,7 +581,7 @@ pub fn resolve_interrupted_removal(
     directory: MediaIdentity,
     deleted_by_owner: impl FnOnce(&OsStr) -> io::Result<bool>,
 ) -> io::Result<Option<InterruptedRemovalResolution>> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
         use crate::journal_root::JournalEntryKind;
         const REMOVAL_RECORD_MAX: usize = 4096;
@@ -582,6 +598,13 @@ pub fn resolve_interrupted_removal(
             activity
                 .revalidate()
                 .map_err(crate::activity::ActivityAdmissionError::into_io)
+        };
+        let sync_dir = |dir: &MediaDirectory| -> io::Result<()> {
+            match dir.sync() {
+                Ok(()) => Ok(()),
+                Err(err) if cfg!(windows) && err.kind() == io::ErrorKind::Unsupported => Ok(()),
+                Err(err) => Err(err),
+            }
         };
         let Some(stage) = parent.open_child(name)? else {
             return Ok(None);
@@ -663,12 +686,12 @@ pub fn resolve_interrupted_removal(
                         ClaimFailure::Occupied(error) | ClaimFailure::Uncertain(error) => error,
                     })?;
                     platform::check_leaf(&source.inner, original_name, observed.identity)?;
-                    source.sync()?;
+                    sync_dir(&source)?;
                     InterruptedRemovalResolution::Returned
                 }
             }
         };
-        stage.sync()?;
+        sync_dir(&stage)?;
         revalidate()?;
         let file = platform::open_plain(&stage.inner, record_leaf)?.ok_or_else(changed)?;
         if platform::identity(&file)? != record_entry.identity {
@@ -678,10 +701,10 @@ pub fn resolve_interrupted_removal(
         platform::remove_leaf(&stage.inner, record_leaf, &file)?;
         revalidate()?;
         platform::remove_directory(&parent.inner, name, &stage.inner)?;
-        parent.sync()?;
+        sync_dir(parent)?;
         Ok(Some(resolution))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (activity, parent, name, directory, deleted_by_owner);
         Err(io::Error::new(

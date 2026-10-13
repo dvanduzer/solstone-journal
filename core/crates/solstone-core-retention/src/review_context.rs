@@ -95,7 +95,7 @@ pub struct CheckedReviewContext {
 }
 
 impl CheckedReviewContext {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn root_arc(&self) -> &Arc<JournalRoot> {
         &self.root
     }

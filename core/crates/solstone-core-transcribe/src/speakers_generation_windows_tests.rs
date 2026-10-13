@@ -87,6 +87,8 @@ fn windows_generation_cleanup_bag_receipt() {
             },
             resource_limits: None,
             resources,
+            stdout_sink: None,
+            cancellation: None,
         },
         &fault,
     );
@@ -247,6 +249,8 @@ fn run_unrelated_root_probe_until(
         },
         resource_limits: None,
         resources,
+        stdout_sink: None,
+        cancellation: None,
     })
     .expect("actual unrelated root must exit with its Job and I/O settled");
     assert_eq!(output.exit_code, 0, "{mode}: {:?}", output.stderr);

@@ -83,9 +83,9 @@ pub use platform::{
 pub use platform::{
     BoundedHelperBudget, BoundedHelperCleanup, BoundedHelperError, BoundedHelperFailure,
     BoundedHelperOutput, BoundedHelperRequest, BoundedHelperResourceLimits, BoundedHelperResources,
-    HelperAdmissionStatus, HelperCleanupStatus, observe_bounded_helper_admission,
-    observe_windows_launch_cleanup, retry_bounded_helper_admission_until,
-    retry_windows_launch_cleanup_until, run_bounded_helper,
+    BoundedStdoutSink, CaptureError, HelperAdmissionStatus, HelperCleanupStatus,
+    copy_bounded_stream, observe_bounded_helper_admission, observe_windows_launch_cleanup,
+    retry_bounded_helper_admission_until, retry_windows_launch_cleanup_until, run_bounded_helper,
 };
 #[cfg(windows)]
 pub use platform::{

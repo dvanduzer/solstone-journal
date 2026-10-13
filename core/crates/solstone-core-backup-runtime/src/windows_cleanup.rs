@@ -8,6 +8,8 @@ use solstone_core_system::process::{
     BoundedHelperCleanup, BoundedHelperFailure, BoundedHelperResources,
 };
 
+use solstone_core_backup::archive_admission::ArchiveCancellation;
+
 use crate::{ToolOutput, ToolRequest, ToolRunner};
 
 /// Adds already-owned resources to a borrowed synchronous runner.
@@ -54,6 +56,25 @@ impl ToolRunner for RetainingToolRunner<'_> {
         }
         result
     }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        let mut request = request.clone();
+        request.resources.extend(&self.resources);
+        let result = self.inner.run_cancellable(&request, cancellation);
+        if let Err(error) = &result
+            && let Some(cleanup) = own_cleanup(error)
+        {
+            self.cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(cleanup);
+        }
+        result
+    }
 }
 
 /// Correlates every incomplete helper from one synchronous web operation.
@@ -88,9 +109,23 @@ impl ToolRunner for CleanupTrackingToolRunner {
         }
         result
     }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        let result = self.inner.run_cancellable(request, cancellation);
+        if let Err(error) = &result
+            && let Some(cleanup) = own_cleanup(error)
+        {
+            let _ = self.cleanup.send(cleanup);
+        }
+        result
+    }
 }
 
-fn own_cleanup(error: &io::Error) -> Option<BoundedHelperCleanup> {
+pub(crate) fn own_cleanup(error: &io::Error) -> Option<BoundedHelperCleanup> {
     error
         .get_ref()
         .and_then(|error| error.downcast_ref::<BoundedHelperFailure>())

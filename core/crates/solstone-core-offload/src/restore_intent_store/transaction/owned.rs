@@ -36,6 +36,8 @@ struct TransactionReceipts {
     >,
     #[cfg(unix)]
     marker_ancestor_sync: Vec<std::io::Result<()>>,
+    #[cfg(windows)]
+    marker_published: bool,
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
     register: Option<Result<BoundMutationOutcome, RestoreRegisterRefusal>>,
     no_effect_cleanup: Option<NoEffectCleanup>,
@@ -58,6 +60,8 @@ impl TransactionOutcome<'_, '_> {
             marker,
             #[cfg(unix)]
             marker_ancestor_sync,
+            #[cfg(windows)]
+            marker_published,
             ledger,
             register,
             no_effect_cleanup,
@@ -96,6 +100,8 @@ impl TransactionOutcome<'_, '_> {
                 marker,
                 #[cfg(unix)]
                 marker_ancestor_sync,
+                #[cfg(windows)]
+                marker_published,
                 ledger,
                 register,
                 no_effect_cleanup,

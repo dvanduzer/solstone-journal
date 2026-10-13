@@ -91,6 +91,8 @@ pub use atomic::write_bytes_exclusive_bound_detailed;
 pub use atomic::{AtomicWriteOptions, JsonWriteOptions, atomic_replace, write_json};
 #[cfg(unix)]
 pub use atomic::{BoundAtomicOutcome, atomic_replace_bound, write_bytes_exclusive_bound};
+#[cfg(windows)]
+pub use atomic::atomic_replace_detailed_bound;
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use atomic::{
     BoundPublicationPrimitive, run_with_bound_publication_barrier,

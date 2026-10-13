@@ -536,6 +536,7 @@ impl BoundedHelperFailure {
                 | BoundedHelperError::OutputLimitExceeded { .. }
                 | BoundedHelperError::OutputReadFailed { .. }
                 | BoundedHelperError::DeadlineExceeded { .. }
+                | BoundedHelperError::Cancelled { .. }
                 | BoundedHelperError::ProcessObservationFailed { .. }
                 | BoundedHelperError::JobNotQuiescent { .. }
         ));

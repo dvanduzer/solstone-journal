@@ -2435,8 +2435,11 @@ fn admit_prepared_archive_owned_read_installed_with(
         ),
     };
     effects.read_repository_requested = true;
-    let read = input
-        .admit()
+    #[cfg(unix)]
+    let read = input.admit();
+    #[cfg(windows)]
+    let read = input.admit(Some(Arc::new(crate::runner::SystemToolRunner)));
+    let read = read
         .map_err(|readback| OwnedArchiveAdmissionFailure {
             inner: Box::new(OwnedArchiveAdmissionFailureInner {
                 error: ArchiveError::Readback(readback.reason()),
@@ -3147,9 +3150,15 @@ pub fn admit_prepared_archive_owned_creator_installed(
             archives: Vec::new(),
         },
     );
+    #[cfg(unix)]
     let creator = operation
         .bind_archive_creator(capture)
         .admit()
+        .map_err(creator_admission_failure)?;
+    #[cfg(windows)]
+    let creator = operation
+        .bind_archive_creator(capture)
+        .admit(Some(Arc::new(crate::runner::SystemToolRunner)))
         .map_err(creator_admission_failure)?;
     Ok(OwnedInstalledArchiveCreator {
         archive: OwnedAdmittedArchive { creator },
@@ -4157,7 +4166,13 @@ mod tests {
                         archives: vec![],
                     },
                 ));
+                #[cfg(unix)]
                 let refusal = match input.admit() {
+                    Err(refusal) => refusal,
+                    Ok(_) => panic!("captured pair cannot reroute original configuration"),
+                };
+                #[cfg(windows)]
+                let refusal = match input.admit(Some(Arc::new(crate::runner::SystemToolRunner))) {
                     Err(refusal) => refusal,
                     Ok(_) => panic!("captured pair cannot reroute original configuration"),
                 };

@@ -171,7 +171,7 @@ pub fn start(
     #[cfg(all(
         test,
         feature = "full-tests",
-        any(target_os = "linux", target_os = "macos")
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     let control = tests::take_dispatch();
     // Keep the input in this same mutex through thread creation. The spawned
@@ -180,7 +180,7 @@ pub fn start(
         #[cfg(all(
             test,
             feature = "full-tests",
-            any(target_os = "linux", target_os = "macos")
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
         tests::install_dispatch(control);
         run_pending(&slot, &ticket);
@@ -239,7 +239,7 @@ fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
     #[cfg(all(
         test,
         feature = "full-tests",
-        any(target_os = "linux", target_os = "macos")
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
     ))]
     tests::before_pending();
     let input = {
@@ -297,7 +297,7 @@ fn run_pending(slot: &SharedOperationSlot, ticket: &ArchiveTicket) {
         #[cfg(all(
             test,
             feature = "full-tests",
-            any(target_os = "linux", target_os = "macos")
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
         tests::before_resolver();
         resolve_restic_member(&input.executable)
@@ -550,7 +550,7 @@ fn locked_response(
         #[cfg(all(
             test,
             feature = "full-tests",
-            any(target_os = "linux", target_os = "macos")
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
         tests::before_response();
         Json(&snapshot).into_response()
@@ -626,7 +626,7 @@ pub fn remove(
         #[cfg(all(
             test,
             feature = "full-tests",
-            any(target_os = "linux", target_os = "macos")
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
         tests::after_actor(&proof);
         match proof.finish() {
@@ -698,7 +698,7 @@ pub fn remove(
             #[cfg(all(
                 test,
                 feature = "full-tests",
-                any(target_os = "linux", target_os = "macos")
+                any(target_os = "linux", target_os = "macos", target_os = "windows")
             ))]
             tests::before_finish(slot);
             // Keep the genuine settled report and original custody outside
@@ -711,7 +711,7 @@ pub fn remove(
                     #[cfg(all(
                         test,
                         feature = "full-tests",
-                        any(target_os = "linux", target_os = "macos")
+                        any(target_os = "linux", target_os = "macos", target_os = "windows")
                     ))]
                     tests::before_handoff(slot);
                     ArchivePayload::ProofFinished { report, runtime }
@@ -838,5 +838,5 @@ fn project(terminal: &mut Terminal, outcome: &Outcome, report: Value) {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod tests;

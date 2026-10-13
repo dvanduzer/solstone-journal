@@ -233,6 +233,8 @@ pub fn observe_vulkan_devices() -> VulkanObservation {
                     },
                     resource_limits: None,
                     resources: BoundedHelperResources::new(),
+                    stdout_sink: None,
+                    cancellation: None,
                 };
                 match run_bounded_helper(request) {
                     Ok(output) => {

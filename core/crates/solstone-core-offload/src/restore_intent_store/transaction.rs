@@ -587,7 +587,17 @@ struct NoEffectCleanup {
 
 impl NoEffectCleanup {
     fn confirmed(&self) -> bool {
-        self.cleanup == Cleanup::Complete && self.parent_sync.as_ref().is_some_and(Result::is_ok)
+        self.cleanup == Cleanup::Complete
+            && self.parent_sync.as_ref().is_some_and(|result| {
+                if cfg!(windows) {
+                    result.is_ok()
+                        || result.as_ref().err().is_some_and(|err| {
+                            err.kind() == std::io::ErrorKind::Unsupported
+                        })
+                } else {
+                    result.is_ok()
+                }
+            })
     }
 }
 
@@ -612,9 +622,9 @@ impl Record {
         } else {
             store.create_intent(self.intent.clone())
         };
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let confirmed = written.receipt.fully_confirmed();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let confirmed = false;
         self.store = Some(written.owner);
         self.writes.push(written.receipt);
@@ -641,6 +651,8 @@ pub(crate) struct TransactionOutcome<'operation, 'clock> {
     >,
     #[cfg(unix)]
     marker_ancestor_sync: Vec<std::io::Result<()>>,
+    #[cfg(windows)]
+    marker_published: bool,
     ledger: Option<Result<LedgerWriteReceipt, LedgerWriteRefusal>>,
     register: Option<Result<BoundMutationOutcome, RestoreRegisterRefusal>>,
     no_effect_cleanup: Option<NoEffectCleanup>,
@@ -660,6 +672,8 @@ impl<'operation, 'clock> TransactionOutcome<'operation, 'clock> {
             marker: None,
             #[cfg(unix)]
             marker_ancestor_sync: Vec::new(),
+            #[cfg(windows)]
+            marker_published: false,
             ledger: None,
             register: None,
             no_effect_cleanup: None,
@@ -942,7 +956,7 @@ impl TransactionOutcome<'_, '_> {
         if unproven_content {
             return Err(Hold::Repair(RepairHold::UncertainContent));
         }
-        if missing_parent_sync {
+        if missing_parent_sync && !cfg!(windows) {
             if !replay {
                 return Err(Hold::Retirement);
             }
@@ -1058,11 +1072,7 @@ impl TransactionOutcome<'_, '_> {
             ),
             _ => return Err(Hold::Repair(RepairHold::InvalidIntent)),
         };
-        let confirmed = appended.as_ref().is_ok_and(|receipt| {
-            receipt.confirmation() == LedgerConfirmation::Confirmed
-                && receipt.durability() == [LedgerSync::Confirmed; 4]
-                && receipt.failures().is_empty()
-        });
+        let confirmed = appended.as_ref().is_ok_and(|receipt| receipt.settles());
         self.ledger = Some(appended);
         if !confirmed {
             return Err(Hold::Ledger);
@@ -1134,7 +1144,15 @@ impl TransactionOutcome<'_, '_> {
             return Err(Hold::Retirement);
         }
         let parent_sync = self.owner.destination.stage_parent().sync();
-        let synced = parent_sync.is_ok();
+        let synced = if cfg!(windows) {
+            parent_sync.is_ok()
+                || parent_sync
+                    .as_ref()
+                    .err()
+                    .is_some_and(|err| err.kind() == std::io::ErrorKind::Unsupported)
+        } else {
+            parent_sync.is_ok()
+        };
         self.no_effect_cleanup
             .as_mut()
             .ok_or(Hold::Retirement)?
@@ -1224,7 +1242,127 @@ impl TransactionOutcome<'_, '_> {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn bump_marker(&mut self, options: LockOptions) -> Result<(), Hold> {
+        use solstone_core_journal_io::atomic::DetailedAtomicOutcome;
+        use solstone_core_journal_io::media::MediaDirectory;
+        use solstone_core_journal_io::{
+            HealthMarker, acquire_existing_parent_lock_bound, atomic_replace_detailed_bound,
+            create_or_open_windows_flat_directory_bound, open_windows_flat_directory_bound,
+            read_windows_observed_file_bounded,
+        };
+        let root = Arc::clone(self.owner.root());
+        let day = &self.record()?.intent.locator.target.day;
+        let chronicle_relative = std::path::Path::new("chronicle");
+        let day_relative = chronicle_relative.join(day);
+        let chronicle_diagnostic = root.canonical_path().join("chronicle");
+        let day_diagnostic = chronicle_diagnostic.join(day);
+        let _health_diagnostic = day_diagnostic.join("health");
+        let chronicle = open_windows_flat_directory_bound(
+            root.as_ref(),
+            OsStr::new("chronicle"),
+            root.canonical_path(),
+        )
+        .map_err(|error| Hold::Admission(error.to_string()))?
+        .ok_or(Hold::Marker)?;
+        let day_parent = open_windows_flat_directory_bound(
+            &chronicle,
+            OsStr::new(day),
+            &chronicle_diagnostic,
+        )
+        .map_err(|error| Hold::Admission(error.to_string()))?
+        .ok_or(Hold::Marker)?;
+        let chronicle_guard = MediaDirectory::open(Arc::clone(&root), chronicle_relative)
+            .map_err(|error| Hold::Admission(error.to_string()))?;
+        let day_guard = MediaDirectory::open(Arc::clone(&root), &day_relative)
+            .map_err(|error| Hold::Admission(error.to_string()))?;
+        if chronicle.object_identity() != chronicle_guard.object_identity()
+            || day_parent.object_identity() != day_guard.object_identity()
+        {
+            return Err(Hold::Marker);
+        }
+        self.owner.native_check()?;
+        chronicle_guard.revalidate().map_err(|_| Hold::Marker)?;
+        day_guard.revalidate().map_err(|_| Hold::Marker)?;
+        let day_health = create_or_open_windows_flat_directory_bound(
+            &day_parent,
+            OsStr::new("health"),
+            &day_diagnostic,
+        )
+        .map_err(|error| Hold::Admission(error.to_string()))?;
+        let named = MediaDirectory::open(Arc::clone(&root), &day_relative.join("health"))
+            .map_err(|error| Hold::Admission(error.to_string()))?;
+        if day_health.object_identity() != named.object_identity() {
+            return Err(Hold::Marker);
+        }
+        self.owner.native_check()?;
+        chronicle_guard.revalidate().map_err(|_| Hold::Marker)?;
+        day_guard.revalidate().map_err(|_| Hold::Marker)?;
+        named.revalidate().map_err(|_| Hold::Marker)?;
+
+        let lock_name = OsStr::new("stream.updated.lock");
+        let lock = acquire_existing_parent_lock_bound(
+            &day_health,
+            lock_name,
+            options.timeout,
+            options.poll_interval,
+        )
+        .map_err(|_| Hold::Marker)?;
+        day_health.revalidate_bound().map_err(|_| Hold::Marker)?;
+        lock.revalidate_bound(&day_health, lock_name)
+            .map_err(|_| Hold::Marker)?;
+
+        let observed = read_windows_observed_file_bounded(
+            &day_health,
+            OsStr::new("stream.updated"),
+            1024 * 1024,
+        )
+        .map_err(|_| Hold::Marker)?;
+        let (generation, fingerprint) = match observed {
+            None => (0, None),
+            Some(observed) if observed.bytes.is_empty() => (0, None),
+            Some(observed) => {
+                let marker = serde_json::from_slice::<HealthMarker>(&observed.bytes)
+                    .map_err(|_| Hold::Marker)?;
+                if marker.version != 1 {
+                    return Err(Hold::Marker);
+                }
+                (marker.generation, marker.fingerprint)
+            }
+        };
+        let generation = generation.checked_add(1).ok_or(Hold::Marker)?;
+        let marker = HealthMarker {
+            version: 1,
+            generation,
+            fingerprint,
+        };
+        let contents = serde_json::to_vec(&marker).map_err(|_| Hold::Marker)?;
+        day_health.revalidate_bound().map_err(|_| Hold::Marker)?;
+        lock.revalidate_bound(&day_health, lock_name)
+            .map_err(|_| Hold::Marker)?;
+
+        let publication = atomic_replace_detailed_bound(
+            &day_health,
+            &lock,
+            OsStr::new("stream.updated"),
+            &contents,
+            0o600,
+        );
+        let confirmed = matches!(publication, Ok(DetailedAtomicOutcome::Published));
+        let bound = named.revalidate().is_ok()
+            && day_guard.revalidate().is_ok()
+            && chronicle_guard.revalidate().is_ok()
+            && day_health.revalidate_bound().is_ok()
+            && lock.revalidate_bound(&day_health, lock_name).is_ok()
+            && self.owner.native_check().is_ok();
+        if !confirmed || !bound {
+            return Err(Hold::Marker);
+        }
+        self.marker_published = true;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn bump_marker(&mut self, _: LockOptions) -> Result<(), Hold> {
         Err(Hold::Marker)
     }
@@ -1311,7 +1449,7 @@ fn replay_local<'operation, 'clock>(
     })
 }
 
-#[cfg(all(test, feature = "full-tests", unix))]
+#[cfg(all(test, feature = "full-tests", any(unix, windows)))]
 mod tests;
 
 pub(super) mod retirement;

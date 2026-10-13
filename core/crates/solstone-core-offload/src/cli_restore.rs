@@ -194,7 +194,7 @@ pub fn run_cli_restore(
             result,
         )
     };
-    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+    if !cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows")) {
         return not_started(None, base("refused", "restore_held", day));
     }
     let root = match JournalRoot::open(journal) {

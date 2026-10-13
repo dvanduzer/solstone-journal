@@ -12,6 +12,12 @@ use std::time::Duration;
 use serde_json::Value;
 use solstone_core_backup::archive_admission::ArchiveCancellation;
 #[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use solstone_core_backup::ReadbackError;
+#[cfg(windows)]
+use solstone_core_backup::archive_readback::{WindowsArchiveExecutor, WindowsExecutionOutput};
+#[cfg(windows)]
 use solstone_core_distribution::windows_payload::{WINDOWS_RCLONE_WORKER, WINDOWS_RESTIC_WORKER};
 use thiserror::Error;
 
@@ -158,6 +164,176 @@ fn run_unix_tool(
     })
 }
 
+
+#[cfg(windows)]
+fn launch_windows_helper(
+    program: &Path,
+    argv: &[OsString],
+    env: &BTreeMap<OsString, OsString>,
+    timeout: Duration,
+    stdin: Option<Vec<u8>>,
+    resources: solstone_core_system::process::BoundedHelperResources,
+    stdout_limit_bytes: usize,
+    stdout_sink: Option<solstone_core_system::process::BoundedStdoutSink>,
+    cancellation: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> io::Result<ToolOutput> {
+    let (bin_dir, package_root) = crate::windows_tool::resolve_package_bin_and_root()?;
+    let payload =
+        solstone_core_distribution::windows_payload::verify_windows_payload(&package_root)
+            .map_err(|error| {
+                io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+            })?;
+
+    let refused_tool =
+        |error: solstone_core_distribution::windows_payload::WindowsPayloadError| {
+            io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+        };
+    let admitted_restic = payload
+        .declared_path(WINDOWS_RESTIC_WORKER)
+        .map_err(refused_tool)?;
+    let admitted_rclone = payload
+        .declared_path(WINDOWS_RCLONE_WORKER)
+        .map_err(refused_tool)?;
+    let canonical_program = program.canonicalize()?;
+    let canonical_restic = admitted_restic.canonicalize()?;
+    let canonical_rclone = admitted_rclone.canonicalize()?;
+    if canonical_program != canonical_restic && canonical_program != canonical_rclone {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unadmitted backup executable",
+        ));
+    }
+    let arguments = argv
+        .iter()
+        .map(|arg| {
+            arg.to_str().map(str::to_owned).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "backup argument is not Unicode",
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut program_options = 0;
+    let mut args_options = 0;
+    for arg in &arguments {
+        if let Some(value) = arg.strip_prefix("rclone.program=") {
+            let unquoted = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .filter(|value| !value.contains('"'))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unadmitted rclone program option",
+                    )
+                })?;
+            if Path::new(unquoted).canonicalize()? != canonical_rclone {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unadmitted rclone executable",
+                ));
+            }
+            program_options += 1;
+        } else if let Some(value) = arg.strip_prefix("rclone.args=") {
+            if value != "serve restic --stdio --append-only --config NUL" {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unadmitted rclone arguments",
+                ));
+            }
+            args_options += 1;
+        }
+    }
+    let uses_rclone = env
+        .get(std::ffi::OsStr::new("RESTIC_REPOSITORY"))
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.starts_with("rclone:"));
+    if (uses_rclone && (program_options != 1 || args_options != 1))
+        || program_options > 1
+        || args_options > 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "rclone transport requires the declared append-only configuration",
+        ));
+    }
+
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "timeout must be non-zero",
+        ));
+    }
+
+    let budget = solstone_core_system::process::BoundedHelperBudget {
+        stdin_limit_bytes: 64 * 1024,
+        stdout_limit_bytes: stdout_limit_bytes.max(1),
+        stderr_limit_bytes: 16 * 1024 * 1024,
+        timeout,
+    };
+
+    let bounded_request = solstone_core_system::process::BoundedHelperRequest {
+        package_root,
+        executable: canonical_program,
+        arguments: arguments
+            .into_iter()
+            .map(|argument| {
+                if argument.starts_with("rclone.program=") {
+                    encode_restic_csv_option(&argument)
+                } else {
+                    argument
+                }
+            })
+            .collect(),
+        current_directory: bin_dir,
+        environment: env.clone(),
+        stdin: stdin.unwrap_or_default(),
+        budget,
+        resource_limits: None,
+        resources,
+        stdout_sink,
+        cancellation,
+    };
+
+    match solstone_core_system::process::run_bounded_helper(bounded_request) {
+        Ok(output) if output.quiescent => Ok(ToolOutput {
+            returncode: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }),
+        Ok(_) => Err(io::Error::other(
+            "backup helper did not establish quiescence",
+        )),
+        Err(failure)
+            if matches!(
+                failure.cause(),
+                solstone_core_system::process::BoundedHelperError::DeadlineExceeded {
+                    quiescent: true,
+                    ..
+                }
+            ) && failure.cleanup().is_none() =>
+        {
+            Ok(ToolOutput {
+                returncode: 124,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+        Err(failure) => {
+            let kind = if matches!(
+                failure.cause(),
+                solstone_core_system::process::BoundedHelperError::DeadlineExceeded { .. }
+            ) {
+                io::ErrorKind::TimedOut
+            } else {
+                io::ErrorKind::Other
+            };
+            Err(io::Error::new(kind, failure))
+        }
+    }
+}
+
 #[cfg(windows)]
 impl ToolRunner for SystemToolRunner {
     fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
@@ -165,90 +341,6 @@ impl ToolRunner for SystemToolRunner {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "passed file descriptors/handles are unsupported on windows",
-            ));
-        }
-
-        let (bin_dir, package_root) = crate::windows_tool::resolve_package_bin_and_root()?;
-        let payload =
-            solstone_core_distribution::windows_payload::verify_windows_payload(&package_root)
-                .map_err(|error| {
-                    io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
-                })?;
-
-        let refused_tool =
-            |error: solstone_core_distribution::windows_payload::WindowsPayloadError| {
-                io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
-            };
-        let admitted_restic = payload
-            .declared_path(WINDOWS_RESTIC_WORKER)
-            .map_err(refused_tool)?;
-        let admitted_rclone = payload
-            .declared_path(WINDOWS_RCLONE_WORKER)
-            .map_err(refused_tool)?;
-        let canonical_program = Path::new(&request.program).canonicalize()?;
-        let canonical_restic = admitted_restic.canonicalize()?;
-        let canonical_rclone = admitted_rclone.canonicalize()?;
-        if canonical_program != canonical_restic && canonical_program != canonical_rclone {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "unadmitted backup executable",
-            ));
-        }
-        let arguments = request
-            .argv
-            .iter()
-            .map(|arg| {
-                arg.to_str().map(str::to_owned).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "backup argument is not Unicode",
-                    )
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let mut program_options = 0;
-        let mut args_options = 0;
-        for arg in &arguments {
-            if let Some(value) = arg.strip_prefix("rclone.program=") {
-                let unquoted = value
-                    .strip_prefix('"')
-                    .and_then(|value| value.strip_suffix('"'))
-                    .filter(|value| !value.contains('"'))
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "unadmitted rclone program option",
-                        )
-                    })?;
-                if Path::new(unquoted).canonicalize()? != canonical_rclone {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "unadmitted rclone executable",
-                    ));
-                }
-                program_options += 1;
-            } else if let Some(value) = arg.strip_prefix("rclone.args=") {
-                if value != "serve restic --stdio --append-only --config NUL" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "unadmitted rclone arguments",
-                    ));
-                }
-                args_options += 1;
-            }
-        }
-        let uses_rclone = request
-            .env
-            .get(std::ffi::OsStr::new("RESTIC_REPOSITORY"))
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.starts_with("rclone:"));
-        if (uses_rclone && (program_options != 1 || args_options != 1))
-            || program_options > 1
-            || args_options > 1
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "rclone transport requires the declared append-only configuration",
             ));
         }
 
@@ -263,70 +355,206 @@ impl ToolRunner for SystemToolRunner {
             None => Duration::from_secs(48 * 60 * 60),
         };
 
-        let budget = solstone_core_system::process::BoundedHelperBudget {
-            stdin_limit_bytes: 64 * 1024,
-            stdout_limit_bytes: 64 * 1024 * 1024,
-            stderr_limit_bytes: 16 * 1024 * 1024,
+        launch_windows_helper(
+            Path::new(&request.program),
+            &request.argv,
+            &request.env,
             timeout,
+            request.stdin.clone(),
+            request.resources.clone(),
+            64 * 1024 * 1024,
+            None,
+            None,
+        )
+    }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        if !request.pass_fds.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "passed file descriptors/handles are unsupported on windows",
+            ));
+        }
+
+        let timeout = match request.timeout {
+            Some(d) if d.is_zero() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "timeout must be non-zero",
+                ));
+            }
+            Some(d) => d,
+            None => Duration::from_secs(48 * 60 * 60),
         };
 
-        let bounded_request = solstone_core_system::process::BoundedHelperRequest {
-            package_root,
-            executable: canonical_program,
-            arguments: arguments
-                .into_iter()
-                .map(|argument| {
-                    if argument.starts_with("rclone.program=") {
-                        encode_restic_csv_option(&argument)
-                    } else {
-                        argument
+        let cancel_fn = Some(Arc::new({
+            let cancellation = cancellation.clone();
+            move || cancellation.is_cancelled()
+        }) as Arc<dyn Fn() -> bool + Send + Sync>);
+
+        launch_windows_helper(
+            Path::new(&request.program),
+            &request.argv,
+            &request.env,
+            timeout,
+            request.stdin.clone(),
+            request.resources.clone(),
+            64 * 1024 * 1024,
+            None,
+            cancel_fn,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn map_windows_helper_result(
+    result: io::Result<ToolOutput>,
+) -> Result<WindowsExecutionOutput, ReadbackError> {
+    match result {
+        Ok(output) => Ok(WindowsExecutionOutput {
+            returncode: output.returncode,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            quiescent: true,
+        }),
+        Err(err) => {
+            if let Some(failure) = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<solstone_core_system::process::BoundedHelperFailure>())
+            {
+                if failure.cleanup().is_some() {
+                    return Err(ReadbackError::ToolFailed);
+                }
+                match failure.cause() {
+                    solstone_core_system::process::BoundedHelperError::JobNotQuiescent { .. } => {
+                        Err(ReadbackError::ToolFailed)
                     }
-                })
-                .collect(),
-            current_directory: bin_dir,
-            environment: request.env.clone(),
-            stdin: request.stdin.clone().unwrap_or_default(),
-            budget,
-            resource_limits: None,
-            resources: request.resources.clone(),
-        };
-
-        match solstone_core_system::process::run_bounded_helper(bounded_request) {
-            Ok(output) if output.quiescent => Ok(ToolOutput {
-                returncode: output.exit_code,
-                stdout: output.stdout,
-                stderr: output.stderr,
-            }),
-            Ok(_) => Err(io::Error::other(
-                "backup helper did not establish quiescence",
-            )),
-            Err(failure)
-                if matches!(
-                    failure.cause(),
-                    solstone_core_system::process::BoundedHelperError::DeadlineExceeded {
-                        quiescent: true,
+                    solstone_core_system::process::BoundedHelperError::IoWorkerStartFailed {
+                        quiescent,
                         ..
                     }
-                ) && failure.cleanup().is_none() =>
-            {
-                Ok(ToolOutput {
-                    returncode: 124,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                })
-            }
-            Err(failure) => {
-                let kind = if matches!(
-                    failure.cause(),
-                    solstone_core_system::process::BoundedHelperError::DeadlineExceeded { .. }
-                ) {
-                    io::ErrorKind::TimedOut
+                    | solstone_core_system::process::BoundedHelperError::InputWriteFailed {
+                        quiescent,
+                        ..
+                    }
+                    | solstone_core_system::process::BoundedHelperError::OutputLimitExceeded {
+                        quiescent,
+                        ..
+                    }
+                    | solstone_core_system::process::BoundedHelperError::OutputReadFailed {
+                        quiescent,
+                        ..
+                    }
+                    | solstone_core_system::process::BoundedHelperError::DeadlineExceeded {
+                        quiescent,
+                        ..
+                    }
+                    | solstone_core_system::process::BoundedHelperError::Cancelled {
+                        quiescent,
+                        ..
+                    }
+                    | solstone_core_system::process::BoundedHelperError::ProcessObservationFailed {
+                        quiescent,
+                        ..
+                    } => {
+                        if *quiescent {
+                            Ok(WindowsExecutionOutput {
+                                returncode: 1,
+                                stdout: Vec::new(),
+                                stderr: Vec::new(),
+                                quiescent: true,
+                            })
+                        } else {
+                            Err(ReadbackError::ToolFailed)
+                        }
+                    }
+                    _ => Ok(WindowsExecutionOutput {
+                        returncode: 1,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        quiescent: true,
+                    }),
+                }
+            } else {
+                let msg = err.to_string();
+                if msg.contains("did not establish quiescence") {
+                    Err(ReadbackError::ToolFailed)
                 } else {
-                    io::ErrorKind::Other
-                };
-                Err(io::Error::new(kind, failure))
+                    Ok(WindowsExecutionOutput {
+                        returncode: 1,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        quiescent: true,
+                    })
+                }
             }
         }
+    }
+}
+
+#[cfg(windows)]
+impl WindowsArchiveExecutor for SystemToolRunner {
+    fn run_cancellable(
+        &self,
+        program: &Path,
+        argv: &[OsString],
+        env: &BTreeMap<OsString, OsString>,
+        timeout: Duration,
+        capture_limit: usize,
+        cancellation: Option<&ArchiveCancellation>,
+    ) -> Result<WindowsExecutionOutput, ReadbackError> {
+        let stdout_limit = capture_limit.min(64 * 1024 * 1024).max(1);
+        let cancel_fn = cancellation.map(|c| {
+            let cancellation = c.clone();
+            Arc::new(move || cancellation.is_cancelled()) as Arc<dyn Fn() -> bool + Send + Sync>
+        });
+        map_windows_helper_result(launch_windows_helper(
+            program,
+            argv,
+            env,
+            timeout,
+            None,
+            solstone_core_system::process::BoundedHelperResources::new(),
+            stdout_limit,
+            None,
+            cancel_fn,
+        ))
+    }
+
+    fn run_dump(
+        &self,
+        program: &Path,
+        argv: &[OsString],
+        env: &BTreeMap<OsString, OsString>,
+        timeout: Duration,
+        stage: std::fs::File,
+        byte_bound: u64,
+        cancellation: Option<&ArchiveCancellation>,
+    ) -> Result<WindowsExecutionOutput, ReadbackError> {
+        let stdout_limit = 64 * 1024 * 1024;
+        let sink = solstone_core_system::process::BoundedStdoutSink {
+            file: stage,
+            limit_bytes: byte_bound,
+        };
+        let cancel_fn = cancellation.map(|c| {
+            let cancellation = c.clone();
+            Arc::new(move || cancellation.is_cancelled()) as Arc<dyn Fn() -> bool + Send + Sync>
+        });
+        map_windows_helper_result(launch_windows_helper(
+            program,
+            argv,
+            env,
+            timeout,
+            None,
+            solstone_core_system::process::BoundedHelperResources::new(),
+            stdout_limit,
+            Some(sink),
+            cancel_fn,
+        ))
     }
 }
 

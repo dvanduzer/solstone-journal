@@ -187,10 +187,7 @@ fn ledger_facts(write: &LedgerWriteReceipt) -> LedgerFacts {
     }
 }
 fn confirmed(write: &LedgerWriteReceipt) -> bool {
-    write.confirmation() == LedgerConfirmation::Confirmed
-        && write.durability() == [LedgerSync::Confirmed; 4]
-        && write.failures().is_empty()
-        && !matches!(write.effect(), LedgerWriteEffect::Attempted { .. })
+    write.settles()
 }
 
 #[must_use = "retain the original read, immutable review and all uncertain probe/write owners"]

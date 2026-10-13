@@ -99,6 +99,8 @@ pub(crate) fn run_onnx_helper(
             cpu_rate_per_10_000: 10_000,
             committed_memory_bytes: 2 * 1024 * 1024 * 1024,
         }),
+        stdout_sink: None,
+        cancellation: None,
     })?)
 }
 

@@ -663,6 +663,21 @@ impl OwnedMediaTarget {
         Err(unsupported())
     }
 
+    /// Issue the empty stage file for direct Windows helper streaming.
+    #[cfg(windows)]
+    pub fn issue_stage_file(&mut self) -> io::Result<std::fs::File> {
+        if self.helper_taken {
+            return Err(invalid("media target already used by a helper"));
+        }
+        self.revalidate()?;
+        let file = &self.stage.leaf.as_ref().expect("target leaf").file;
+        if file.metadata()?.len() != 0 {
+            return Err(invalid("helper target is not empty"));
+        }
+        self.helper_taken = true;
+        file.try_clone()
+    }
+
     /// Caller must prove the actual helper writer has quiesced with successful
     /// execution. No runner status or supplied boolean grants that proof here.
     pub fn prepare_after_successful_helper(

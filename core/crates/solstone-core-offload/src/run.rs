@@ -717,9 +717,8 @@ mod current {
             eligible: Vec::new(),
             refusals: Vec::new(),
         };
-        // The exact writable archive-readback transport currently supports Unix only.
         // Known prelaunch refusal cannot become actionable projected relief.
-        if !cfg!(unix) {
+        if !cfg!(any(unix, windows)) {
             decision.unavailable(CurrentOffloadRefusalReason::ExecutionUnavailable);
             return decision;
         }

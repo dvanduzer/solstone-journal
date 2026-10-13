@@ -288,12 +288,12 @@ pub fn verify_owned_offload_offers(
     now: DateTime<Utc>,
 ) -> Result<OwnedVerifiedOffloadOffers, OwnedOffloadOfferFailure> {
     let observed = Box::new(observed);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let candidates = candidate_marks(&observed, read.as_read(), proofs, now).and_then(|marks| {
         preflight_verification(read.as_read(), &observed, &marks, today, now)?;
         Ok(marks)
     });
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let candidates: Result<Vec<Mark>, OffloadOfferRefusal> = {
         let _parameters = (proofs, today, now);
         Err(OffloadOfferRefusal::Unsupported)
@@ -325,10 +325,10 @@ pub fn publish_owned_offload_offers(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> OwnedOffloadOfferOutcome {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let publication =
         publish_with_approval(&verified.observed, verified.approval.view(), today, now);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let publication = {
         let _parameters = (today, now);
         Err(OffloadOfferRefusal::Unsupported)

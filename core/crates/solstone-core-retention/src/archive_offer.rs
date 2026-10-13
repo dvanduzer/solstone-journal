@@ -4,7 +4,7 @@
 //! Retained current inputs for archive offers. Capture does not confirm an
 //! archive, create consent, publish a Mark or authorize removal.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use solstone_core_journal_io::paths::SegmentLayout;
 
 use crate::archive_proof::{AcceptedProcessingObservation, OffloadProof};
 use crate::marks::Mark;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::marks::{MarkId, RemovalClass};
 use crate::receipt::Target;
 
@@ -206,9 +206,9 @@ impl ObservedOffloadFile {
 pub struct ObservedOffloadGroup {
     selection: OffloadOfferSelection,
     directory: Arc<MediaDirectory>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     owner: solstone_core_segment::RetainedOwnerDeletion,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     scan: crate::scan::CheckedSegment,
     files: Vec<ObservedOffloadFile>,
     expected: Option<Mark>,
@@ -235,9 +235,9 @@ pub struct ObservedOffloadOffers {
     root: Arc<JournalRoot>,
     activity: Arc<ActivityLease>,
     groups: Vec<ObservedOffloadGroup>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     configuration: solstone_core_journal_config::JournalConfigRead,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     config_entry: Option<solstone_core_journal_io::media::MediaEntry>,
 }
 
@@ -253,7 +253,7 @@ impl ObservedOffloadOffers {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn selected_id(selection: &OffloadOfferSelection) -> MarkId {
     MarkId::derive(
         RemovalClass::OffloadRawRelease,
@@ -262,7 +262,7 @@ fn selected_id(selection: &OffloadOfferSelection) -> MarkId {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn selection_path(selection: &OffloadOfferSelection) -> String {
     crate::layout::segment_rel_with_layout(
         &selection.target.day,
@@ -272,7 +272,7 @@ fn selection_path(selection: &OffloadOfferSelection) -> String {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn validate_selections(selections: &[OffloadOfferSelection]) -> Result<(), OffloadOfferRefusal> {
     use std::collections::BTreeSet;
 
@@ -316,7 +316,7 @@ fn validate_selections(selections: &[OffloadOfferSelection]) -> Result<(), Offlo
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn scan(directory: &MediaDirectory) -> Result<crate::scan::CheckedSegment, OffloadOfferRefusal> {
     Ok(crate::scan::scan_segment_bound(
         directory,
@@ -326,7 +326,7 @@ fn scan(directory: &MediaDirectory) -> Result<crate::scan::CheckedSegment, Offlo
     )?)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn check_group(group: &ObservedOffloadGroup) -> Result<(), OffloadOfferRefusal> {
     group.directory.revalidate()?;
     if group
@@ -357,14 +357,14 @@ fn check_group(group: &ObservedOffloadGroup) -> Result<(), OffloadOfferRefusal> 
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct ClaimedSegment {
     relative: String,
     directory: Arc<MediaDirectory>,
     claims: solstone_core_segment::output_attempt::OutputClaims,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn acquire_claims(
     root: &Arc<JournalRoot>,
     selections: &[OffloadOfferSelection],
@@ -408,12 +408,12 @@ pub fn capture_offload_offers(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> Result<ObservedOffloadOffers, OffloadOfferRefusal> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _parameters = (operation, selections, today, now);
         Err(OffloadOfferRefusal::Unsupported)
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         use crate::grouped::{DecisionPurpose, inspect_grouped};
         use std::ffi::OsStr;
@@ -559,7 +559,7 @@ pub fn capture_offload_offers(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn check_capture(
     observed: &ObservedOffloadOffers,
     operation: &PreparedArchiveOperation<'_>,
@@ -590,7 +590,7 @@ fn check_capture(
         .map_err(OffloadOfferRefusal::Admission)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn candidate_marks(
     observed: &ObservedOffloadOffers,
     read: &ReadOperation<'_>,
@@ -666,7 +666,7 @@ fn candidate_marks(
     Ok(marks)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn candidate_mark(
     group: &ObservedOffloadGroup,
     proof: OffloadProof,
@@ -701,7 +701,7 @@ fn candidate_mark(
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn check_current_metadata(
     observed: &ObservedOffloadOffers,
     policy: &crate::remove_marked::ReviewedPolicy,
@@ -744,7 +744,7 @@ fn check_current_metadata(
         .map_err(|error| OffloadOfferRefusal::Policy(Box::new(error)))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn check_current_inputs(
     observed: &ObservedOffloadOffers,
     policy: &crate::remove_marked::ReviewedPolicy,
@@ -767,7 +767,7 @@ fn check_current_inputs(
     check_current_metadata(observed, policy, today, now)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn admission_refusal(error: crate::archive_approval::ArchiveApprovalError) -> OffloadOfferRefusal {
     use crate::archive_approval::ArchiveApprovalError;
     match error {
@@ -781,7 +781,7 @@ fn admission_refusal(error: crate::archive_approval::ArchiveApprovalError) -> Of
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn offer_metadata_bytes(marks: &[Mark]) -> Result<u64, OffloadOfferRefusal> {
     let initial = (crate::review_context::MAX_REGISTER_BYTES as u64)
         .checked_add(1024 * 1024)
@@ -815,7 +815,7 @@ fn offer_metadata_bytes(marks: &[Mark]) -> Result<u64, OffloadOfferRefusal> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn preflight_verification(
     read: &ReadOperation<'_>,
     observed: &ObservedOffloadOffers,
@@ -894,12 +894,12 @@ pub fn verify_offload_offers<'clock>(
     now: DateTime<Utc>,
 ) -> Result<VerifiedOffloadOffers<'clock>, OffloadOfferFailure<'clock>> {
     let observed = Box::new(observed);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let candidates = candidate_marks(&observed, &read, proofs, now).and_then(|marks| {
         preflight_verification(&read, &observed, &marks, today, now)?;
         Ok(marks)
     });
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let candidates: Result<Vec<crate::marks::Mark>, OffloadOfferRefusal> = {
         let _parameters = (proofs, today, now);
         Err(OffloadOfferRefusal::Unsupported)
@@ -925,7 +925,7 @@ pub fn verify_offload_offers<'clock>(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn check_active_witnesses(
     root: &Arc<JournalRoot>,
     marks: &[Mark],
@@ -969,7 +969,7 @@ fn check_active_witnesses(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn publish_with_approval(
     observed: &ObservedOffloadOffers,
     approval: crate::archive_approval::ArchiveApprovalRef<'_, '_>,
@@ -1048,10 +1048,10 @@ pub fn publish_offload_offers<'clock>(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> OffloadOfferOutcome<'clock> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let publication =
         publish_with_approval(&verified.observed, verified.approval.view(), today, now);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let publication = {
         let _parameters = (today, now);
         Err(OffloadOfferRefusal::Unsupported)

@@ -112,10 +112,16 @@ impl TransactionOutcome<'_, '_> {
                 })
             || !no_effect
                 && intent.outcome.as_ref().is_none_or(|facts| {
-                    facts.confirmation != Confirmation::Confirmed
-                        || (facts.effect == PublicationEffect::Published
-                            && (facts.file_durability != Durability::Synced
-                                || facts.parent_durability != Durability::Synced))
+                    if cfg!(windows) {
+                        facts.confirmation != Confirmation::Confirmed
+                            || (facts.effect == PublicationEffect::Published
+                                && facts.file_durability != Durability::Synced)
+                    } else {
+                        facts.confirmation != Confirmation::Confirmed
+                            || (facts.effect == PublicationEffect::Published
+                                && (facts.file_durability != Durability::Synced
+                                    || facts.parent_durability != Durability::Synced))
+                    }
                 })
         {
             return Err(Hold::Retirement);
@@ -279,11 +285,22 @@ impl TransactionOutcome<'_, '_> {
             if removal.receipt().effect == RemovalEffect::Deleted
                 && removal.receipt().original_name == OriginalName::Absent
                 && removal.receipt().claim_confirmation == Confirmation::Confirmed
-                && removal.receipt().source_durability == Durability::Synced
-                && removal.receipt().claim_durability == Durability::Synced
+                && if cfg!(windows) {
+                    matches!(removal.receipt().source_durability, Durability::Synced | Durability::Unproven)
+                        && matches!(removal.receipt().claim_durability, Durability::Synced | Durability::Unproven)
+                } else {
+                    removal.receipt().source_durability == Durability::Synced
+                        && removal.receipt().claim_durability == Durability::Synced
+                }
                 && !removal.receipt().failures.iter().any(|f| f.phase != RemovalPhase::Cleanup));
-        if !confirmed_removal || ancestors != [Durability::Synced; 4] || !facts.failures.is_empty()
-        {
+        let ancestors_valid = if cfg!(windows) {
+            ancestors
+                .iter()
+                .all(|d| matches!(d, Durability::Synced | Durability::Unproven))
+        } else {
+            ancestors == [Durability::Synced; 4]
+        };
+        if !confirmed_removal || !ancestors_valid || !facts.failures.is_empty() {
             return Err(Hold::Retirement);
         }
         self.record()?

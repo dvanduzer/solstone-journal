@@ -26,18 +26,18 @@ pub struct InterruptedRemoval {
 /// before creating anything: holding it proves no live owner, and only on
 /// local storage, so elsewhere nothing is done. Other stages are untouched.
 pub fn recover_interrupted_removals(activity: &Arc<ActivityLease>) -> Vec<InterruptedRemoval> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
         local::recover(activity)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = activity;
         Vec::new()
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod local {
     use std::path::Path;
 

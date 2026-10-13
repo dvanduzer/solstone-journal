@@ -176,6 +176,8 @@ fn stage_payload(test_name: &str, fake_tools: bool) {
                 stdout_limit_bytes: 4 * 1024 * 1024,
                 stderr_limit_bytes: 4 * 1024 * 1024,
             },
+            stdout_sink: None,
+            cancellation: None,
         })
         .expect("bounded staged fixture; Job cleanup includes fixture server and descendants");
         print!("{}", String::from_utf8_lossy(&output.stdout));

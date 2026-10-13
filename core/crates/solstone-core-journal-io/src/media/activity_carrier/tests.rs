@@ -234,18 +234,17 @@ fn lost_activity_refuses_before_creating_a_reservation() {
 fn windows_unproven_directory_durability_holds_created_reservation() {
     let (_temp, activity) = fixture();
     let root = activity.journal_root().clone();
-    let failed = failure(RootActivityCarrier::prepare(activity));
-    assert_eq!(failed.error().kind(), io::ErrorKind::Unsupported);
-    assert_eq!(failed.receipt().stage_durability(), Durability::Unproven);
-    assert_eq!(failed.receipt().root_durability(), Durability::Unproven);
-    assert_eq!(failed.receipt().confirmation(), Confirmation::Unverified);
-    let path = failed.diagnostic_path().unwrap();
+    let carrier = RootActivityCarrier::prepare(activity).unwrap();
+    assert_eq!(carrier.preparation().stage_durability(), Durability::Unproven);
+    assert_eq!(carrier.preparation().root_durability(), Durability::Unproven);
+    assert_eq!(carrier.preparation().confirmation(), Confirmation::Confirmed);
+    let path = carrier.diagnostic_path();
     assert!(path.is_dir());
     assert!(matches!(
         TeardownLease::try_acquire(root.clone()),
         Err(ActivityAdmissionError::Busy)
     ));
-    drop(failed);
+    drop(carrier);
     assert!(path.is_dir());
     TeardownLease::try_acquire(root).unwrap();
 }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use solstone_core_journal_io::activity::ActivityLease;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use super::RestoreIntent;
 
 /// Why an interrupted restore stays an unresolved obligation.
@@ -57,18 +57,18 @@ pub struct AbandonedRestore {
 /// freshly acquired lease, before creating anything: holding it proves no live
 /// owner, and only on local storage, so elsewhere nothing is done.
 pub fn recover_abandoned_restores(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
         local::recover(activity)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = activity;
         Vec::new()
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod local {
     use std::collections::BTreeSet;
     use std::ffi::OsStr;

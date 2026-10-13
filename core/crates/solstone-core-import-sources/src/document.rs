@@ -512,6 +512,8 @@ mod windows_worker {
                     cpu_rate_per_10_000: PDF_WORKER_CPU_RATE_PER_10_000,
                     committed_memory_bytes: PDF_WORKER_COMMITTED_MEMORY_BYTES,
                 }),
+                stdout_sink: None,
+                cancellation: None,
             })
             .map_err(|error| match error.cause() {
                 BoundedHelperError::DeadlineExceeded { .. } if error.cleanup().is_none() => {

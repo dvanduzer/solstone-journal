@@ -409,6 +409,8 @@ fn probe_windows_rfdetr_help(
             cpu_rate_per_10_000: spec.cpu_rate_per_10_000,
             committed_memory_bytes: spec.committed_memory_bytes,
         }),
+        stdout_sink: None,
+        cancellation: None,
     };
     match run_bounded_helper(request) {
         Ok(output) if output.exit_code == 0 => {

@@ -105,7 +105,8 @@ mod user_path;
 #[cfg(windows)]
 pub use bounded::{
     BoundedHelperBudget, BoundedHelperError, BoundedHelperOutput, BoundedHelperRequest,
-    BoundedHelperResourceLimits, BoundedHelperResources, run_bounded_helper,
+    BoundedHelperResourceLimits, BoundedHelperResources, BoundedStdoutSink, CaptureError,
+    copy_bounded_stream, run_bounded_helper,
 };
 #[cfg(windows)]
 pub use bounded_cleanup::{

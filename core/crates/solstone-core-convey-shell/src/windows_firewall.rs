@@ -105,6 +105,8 @@ fn read_policy(timeout: std::time::Duration) -> Result<bool, String> {
         },
         resource_limits: None,
         resources: BoundedHelperResources::new(),
+        stdout_sink: None,
+        cancellation: None,
     })
     .map_err(|error| format!("Windows policy helper: {error:?}"))?;
     if output.exit_code != 0 || !output.quiescent {

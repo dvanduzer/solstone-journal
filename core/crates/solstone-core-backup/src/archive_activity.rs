@@ -221,7 +221,7 @@ impl OwnedPreparedArchiveHold {
     pub fn release_unused(self) {
         self.activity.release_unused();
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn revalidate(&self) -> Result<(), AdmissionError> {
         revalidate_original(
             &self.activity,

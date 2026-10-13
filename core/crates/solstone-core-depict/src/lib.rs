@@ -229,6 +229,8 @@ impl Detector for SystemDetector {
                 cpu_rate_per_10_000: spec.cpu_rate_per_10_000,
                 committed_memory_bytes: spec.committed_memory_bytes,
             }),
+            stdout_sink: None,
+            cancellation: None,
         };
         let helper_output = run_bounded_helper(request).map_err(|_| rfdetr_unavailable())?;
         let parsed = map_rfdetr_detect_completion(helper_output.exit_code == 0, &output)

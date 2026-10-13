@@ -78,6 +78,8 @@ fn windows_service_capture_receipt() {
             },
             resources,
             resource_limits: None,
+            stdout_sink: None,
+            cancellation: None,
         })
         .unwrap_or_else(|error| panic!("{mode}: {error}"));
         assert!(output.quiescent, "{mode}: fixture Job is not empty");

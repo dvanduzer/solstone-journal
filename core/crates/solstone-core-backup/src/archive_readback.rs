@@ -20,13 +20,13 @@ pub const OFFLOAD_ARCHIVE_TAG: &str = "spb-offload-archive";
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use serde_json::Value;
 use solstone_core_journal_io::JournalRoot;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use solstone_core_journal_io::media::MediaDigest;
 use solstone_core_journal_io::media::{ArchiveSource, Cleanup, OwnedMediaTarget, PreparedMedia};
 
@@ -64,7 +64,12 @@ use crate::archive_activity::{
     ArchiveOperationClock, OwnedPreparedArchiveHold, OwnedPreparedArchiveOperation,
     PreparedArchiveOperation, close_owned_prepared,
 };
-#[cfg(unix)]
+#[cfg(windows)]
+mod windows_executor;
+#[cfg(windows)]
+pub use windows_executor::{WindowsArchiveExecutor, WindowsExecutionOutput};
+
+#[cfg(any(unix, windows))]
 use crate::archive_admission::ARCHIVE_LS_TIMEOUT_SECONDS;
 use crate::archive_admission::Clock;
 use crate::archive_admission::{AdmissionError, ArchiveBudget, ArchiveConfiguration};
@@ -77,9 +82,9 @@ use solstone_core_journal_io::media::RootActivityCarrier;
 
 #[cfg(unix)]
 pub(crate) const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const SUPPORTED_RESTIC_VERSION: &str = "0.19.0";
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_QUERY_BYTES: usize = 1024 * 1024;
 
 /// Captured inputs remain unverified until actual admission succeeds.
@@ -244,13 +249,13 @@ impl ReadbackAdmissionError<'_> {
 #[derive(Default)]
 struct DirectExecution {
     predecessor: Option<ArchivePredecessorCustody>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pending: u64,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     completed: [u64; 4],
     failure: Option<ReadbackError>,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum DirectInvocation {
     Version,
     Config,
@@ -258,7 +263,7 @@ enum DirectInvocation {
     Dump,
 }
 impl DirectExecution {
-    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows))]
     fn qualify_read_state(&self) -> Result<(), ReadbackError> {
         if let Some(reason) = self.failure {
             return Err(reason);
@@ -273,7 +278,7 @@ impl DirectExecution {
     }
     /// Every child this read launched was reaped and no archive writer was ever
     /// submitted. This is not readback success.
-    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows))]
     fn quiescent(&self) -> bool {
         self.pending == 0
             && self
@@ -281,7 +286,7 @@ impl DirectExecution {
                 .as_ref()
                 .is_none_or(ArchivePredecessorCustody::unwritten)
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn attempt(&mut self) {
         if let Some(next) = self.pending.checked_add(1) {
             self.pending = next;
@@ -291,7 +296,7 @@ impl DirectExecution {
     }
     /// The bounded runner returned only after killing the group and reaping the
     /// root, whatever its exit status. Failed or unknown runs stay pending.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn reaped(&mut self) {
         if let Some(next) = self.pending.checked_sub(1) {
             self.pending = next;
@@ -314,6 +319,19 @@ impl DirectExecution {
         // Only genuine owned completion reaches this compact record. The large
         // output is released after its caller has parsed/checked the result.
         drop(child);
+    }
+    #[cfg(windows)]
+    fn accept_windows(&mut self, kind: DirectInvocation, successful: bool) {
+        if !successful {
+            self.fail(ReadbackError::ToolFailed);
+            return;
+        }
+        let index = kind as usize;
+        if let Some(next) = self.completed[index].checked_add(1) {
+            self.completed[index] = next;
+        } else {
+            self.fail(ReadbackError::ToolFailed);
+        }
     }
 }
 
@@ -415,7 +433,11 @@ pub struct OwnedDirectReadHold {
     _root: Arc<JournalRoot>,
     #[cfg(unix)]
     _member: CurrentInstalledMember,
-    #[cfg(unix)]
+    #[cfg(windows)]
+    _restic_path: PathBuf,
+    #[cfg(windows)]
+    _executor: Arc<dyn WindowsArchiveExecutor>,
+    #[cfg(any(unix, windows))]
     _env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     _repository: RepositoryBinding,
     _execution: DirectExecution,
@@ -477,7 +499,14 @@ impl OwnedDirectReadHold {
             }
             Ok(())
         }
-        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            if !self._execution.quiescent() {
+                return Err(ReadbackError::ToolFailed);
+            }
+            Ok(())
+        }
+        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows)))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -655,7 +684,11 @@ pub struct ReadOperation<'a> {
     source_observations: std::cell::Cell<(usize, usize)>,
     #[cfg(unix)]
     member: CurrentInstalledMember,
-    #[cfg(unix)]
+    #[cfg(windows)]
+    restic_path: PathBuf,
+    #[cfg(windows)]
+    executor: Arc<dyn WindowsArchiveExecutor>,
+    #[cfg(any(unix, windows))]
     env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     repository: RepositoryBinding,
     execution: std::cell::RefCell<DirectExecution>,
@@ -707,9 +740,21 @@ impl OwnedPreparedArchiveOperation {
     }
 }
 impl OwnedReadAdmission {
+    #[cfg(unix)]
     pub fn admit(self) -> Result<OwnedReadOperation, OwnedReadbackAdmissionError> {
         let Self { input, clock } = self;
         match ReadOperation::admit(input) {
+            Ok(read) => Ok(OwnedReadOperation { read, clock }),
+            Err(failure) => Err(close_owned_admission(failure, clock)),
+        }
+    }
+    #[cfg(windows)]
+    pub fn admit(
+        self,
+        executor: Option<Arc<dyn WindowsArchiveExecutor>>,
+    ) -> Result<OwnedReadOperation, OwnedReadbackAdmissionError> {
+        let Self { input, clock } = self;
+        match ReadOperation::admit(input, executor) {
             Ok(read) => Ok(OwnedReadOperation { read, clock }),
             Err(failure) => Err(close_owned_admission(failure, clock)),
         }
@@ -836,7 +881,12 @@ impl OwnedSettledDirectRead {
             self.read.operation.revalidate()?;
             revalidate_member(&self.read._member)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.read.operation.revalidate()?;
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -879,7 +929,11 @@ fn close_owned_read(
             source_observations: _,
         #[cfg(unix)]
         member,
-        #[cfg(unix)]
+        #[cfg(windows)]
+        restic_path,
+        #[cfg(windows)]
+        executor,
+        #[cfg(any(unix, windows))]
         env,
         repository,
         execution,
@@ -889,7 +943,11 @@ fn close_owned_read(
         _root: root,
         #[cfg(unix)]
         _member: member,
-        #[cfg(unix)]
+        #[cfg(windows)]
+        _restic_path: restic_path,
+        #[cfg(windows)]
+        _executor: executor,
+        #[cfg(any(unix, windows))]
         _env: env,
         _repository: repository,
         _execution: execution.into_inner(),
@@ -930,15 +988,15 @@ fn close_owned_admission(
 #[derive(Clone, Copy)]
 enum WriterState {
     NotLaunched,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Unknown,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     QualifiedCompletion,
 }
 
 enum OwnedReadback {
     Target(OwnedMediaTarget),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Prepared(PreparedMedia),
 }
 
@@ -992,10 +1050,10 @@ impl ReadbackFailure {
     /// Unknown writer lifetime never grants cleanup, including on Drop.
     pub fn cleanup(&mut self) -> Cleanup {
         match (self.owned.as_mut(), self.writer) {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (_, WriterState::Unknown) => Cleanup::Refused,
             (OwnedReadback::Target(target), _) => target.cleanup_after_helper_quiescence(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             (OwnedReadback::Prepared(prepared), _) => prepared.cleanup(),
         }
     }
@@ -1083,7 +1141,7 @@ impl ExactArchiveFile {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn direct_environment(
     destination: &Destination,
     password: &str,
@@ -1144,7 +1202,11 @@ impl<'a> ReadOperation<'a> {
                 source_observations: _,
             #[cfg(unix)]
             member,
-            #[cfg(unix)]
+            #[cfg(windows)]
+            restic_path,
+            #[cfg(windows)]
+            executor,
+            #[cfg(any(unix, windows))]
             env,
             repository,
             execution,
@@ -1158,7 +1220,11 @@ impl<'a> ReadOperation<'a> {
             _root: root,
             #[cfg(unix)]
             _member: member,
-            #[cfg(unix)]
+            #[cfg(windows)]
+            _restic_path: restic_path,
+            #[cfg(windows)]
+            _executor: executor,
+            #[cfg(any(unix, windows))]
             _env: env,
             _repository: repository,
             _execution: execution.into_inner(),
@@ -1178,7 +1244,15 @@ impl<'a> ReadOperation<'a> {
             }
             execution.qualify_read_state()
         }
-        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            let execution = self.execution.borrow();
+            if let Some(predecessor) = &execution.predecessor {
+                predecessor.qualify_settlement()?;
+            }
+            execution.qualify_read_state()
+        }
+        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows)))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -1194,17 +1268,108 @@ impl<'a> ReadOperation<'a> {
 }
 
 impl<'a> ReadOperation<'a> {
+    #[cfg(not(any(unix, windows)))]
     pub fn admit(input: ReadAdmission<'a>) -> Result<Self, ReadbackAdmissionError<'a>> {
-        #[cfg(not(unix))]
-        {
-            Err(ReadbackAdmissionError {
-                reason: ReadbackError::Unsupported,
-                owned: AdmissionOwner::Input(Box::new(input)),
-            })
+        Err(ReadbackAdmissionError {
+            reason: ReadbackError::Unsupported,
+            owned: AdmissionOwner::Input(Box::new(input)),
+        })
+    }
+    #[cfg(windows)]
+    pub fn admit(
+        input: ReadAdmission<'a>,
+        executor: Option<Arc<dyn WindowsArchiveExecutor>>,
+    ) -> Result<Self, ReadbackAdmissionError<'a>> {
+        let executor = match executor {
+            Some(executor) => executor,
+            None => {
+                return Err(ReadbackAdmissionError {
+                    reason: ReadbackError::Unsupported,
+                    owned: AdmissionOwner::Input(Box::new(input)),
+                });
+            }
+        };
+        let admission = (|| {
+            input.operation.revalidate()?;
+            let configuration = input.operation.configuration();
+            if !configuration.enabled() {
+                return Err(ReadbackError::NotConfigured);
+            }
+            let keys = configuration.keys()?.ok_or(ReadbackError::NotConfigured)?;
+            if input.password != keys.daily_key {
+                return Err(ReadbackError::CredentialsUnavailable);
+            }
+            match configuration.mode() {
+                Some("byo")
+                    if configuration.destination().as_ref() == Some(&input.destination) => {}
+                Some("operated")
+                    if configuration.binding().is_some()
+                        && input.destination.backend == "s3" => {}
+                _ => return Err(ReadbackError::NotConfigured),
+            }
+            if matches!(&input.repository, RepositoryBinding::Expected(id) if !full_hex_identity(id))
+            {
+                return Err(ReadbackError::InvalidRepositoryIdentity);
+            }
+            if let Some(predecessor) = &input.predecessor {
+                predecessor.validate_input(&input)?;
+            }
+            let env = direct_environment(&input.destination, &input.password)?;
+            let restic_path = input.expected_restic_path.clone();
+            Ok((env, restic_path))
+        })();
+        let (env, restic_path) = match admission {
+            Ok(admitted) => admitted,
+            Err(reason) => {
+                return Err(ReadbackAdmissionError {
+                    reason,
+                    owned: AdmissionOwner::Input(Box::new(input)),
+                });
+            }
+        };
+        let mut admitted = Self {
+            root: Arc::clone(input.operation.journal_root()),
+            operation: input.operation,
+            #[cfg(feature = "full-tests")]
+            source_observations: std::cell::Cell::new((0, 0)),
+            restic_path,
+            executor,
+            env,
+            repository: input.repository,
+            execution: std::cell::RefCell::new(DirectExecution {
+                predecessor: input.predecessor,
+                ..DirectExecution::default()
+            }),
+        };
+        let qualification = (|| {
+            let version_output = admitted.query(vec!["version".into()])?;
+            let version = std::str::from_utf8(&version_output.stdout)
+                .map_err(|_| ReadbackError::UnsupportedToolVersion)?;
+            let mut fields = version.split_whitespace();
+            if fields.next() != Some("restic")
+                || fields.next() != Some(SUPPORTED_RESTIC_VERSION)
+            {
+                return Err(ReadbackError::UnsupportedToolVersion);
+            }
+            admitted
+                .execution
+                .borrow_mut()
+                .accept_windows(DirectInvocation::Version, version_output.successful());
+            admitted.confirm_repository()?;
+            Ok(())
+        })();
+        match qualification {
+            Ok(()) => Ok(admitted),
+            Err(reason) => Err(ReadbackAdmissionError {
+                reason,
+                owned: AdmissionOwner::Admitted(Box::new(admitted)),
+            }),
         }
-        #[cfg(unix)]
-        {
-            let admission = (|| {
+    }
+
+    #[cfg(unix)]
+    pub fn admit(input: ReadAdmission<'a>) -> Result<Self, ReadbackAdmissionError<'a>> {
+        let admission = (|| {
                 input.operation.revalidate()?;
                 let configuration = input.operation.configuration();
                 if !configuration.enabled() {
@@ -1287,7 +1452,6 @@ impl<'a> ReadOperation<'a> {
                 }),
             }
         }
-    }
 
     pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
         self.operation.carrier()
@@ -1344,11 +1508,11 @@ impl<'a> ReadOperation<'a> {
     /// This does not query the repository or establish readback or release authority.
     /// Callers still check canonical binding and current proof at their effects.
     pub fn revalidate_admission(&self) -> Result<(), ReadbackError> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.revalidate_local()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -1370,6 +1534,11 @@ impl<'a> ReadOperation<'a> {
     fn revalidate_local(&self) -> Result<(), ReadbackError> {
         self.operation.revalidate()?;
         revalidate_member(&self.member)
+    }
+
+    #[cfg(windows)]
+    fn revalidate_local(&self) -> Result<(), ReadbackError> {
+        Ok(self.operation.revalidate()?)
     }
 
     /// A failure reports whether nothing of the run is still alive.
@@ -1457,7 +1626,46 @@ impl<'a> ReadOperation<'a> {
         Ok(output)
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn query(&self, argv: Vec<std::ffi::OsString>) -> Result<WindowsExecutionOutput, ReadbackError> {
+        self.query_inner(argv)
+            .inspect_err(|reason| self.execution.borrow_mut().fail(*reason))
+    }
+    #[cfg(windows)]
+    fn query_inner(&self, argv: Vec<std::ffi::OsString>) -> Result<WindowsExecutionOutput, ReadbackError> {
+        self.revalidate_local()?;
+        let timeout = self
+            .operation
+            .budget()
+            .remaining(self.operation.clock())?
+            .min(Duration::from_secs(ARCHIVE_LS_TIMEOUT_SECONDS));
+        self.execution.borrow_mut().attempt();
+        let cancel = self.operation.budget().cancellation();
+        let output = self.executor.run_cancellable(
+            &self.restic_path,
+            &argv,
+            &self.env,
+            timeout,
+            MAX_QUERY_BYTES,
+            cancel,
+        );
+        let output = match output {
+            Ok(output) if output.quiescent => {
+                self.execution.borrow_mut().reaped();
+                output
+            }
+            Ok(_) | Err(_) => {
+                return Err(self.execution_error());
+            }
+        };
+        self.revalidate_local()?;
+        if !output.successful() {
+            return Err(ReadbackError::ToolFailed);
+        }
+        Ok(output)
+    }
+
+    #[cfg(any(unix, windows))]
     fn execution_error(&self) -> ReadbackError {
         match self.operation.budget().remaining(self.operation.clock()) {
             Err(error) => error.into(),
@@ -1492,6 +1700,33 @@ impl<'a> ReadOperation<'a> {
         Ok(())
     }
 
+    #[cfg(windows)]
+    fn confirm_repository(&mut self) -> Result<(), ReadbackError> {
+        if let Some(predecessor) = self.execution.borrow_mut().predecessor.as_mut() {
+            predecessor.mark_read_config();
+        }
+        let result = self.query(vec!["cat".into(), "config".into(), "--no-cache".into()])?;
+        let parsed: Value = serde_json::from_slice(&result.stdout)
+            .map_err(|_| ReadbackError::InvalidRepositoryIdentity)?;
+        let id = parsed
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| full_hex_identity(id))
+            .ok_or(ReadbackError::InvalidRepositoryIdentity)?;
+        if matches!(&self.repository, RepositoryBinding::Expected(expected) if expected != id) {
+            return Err(ReadbackError::RepositoryIdentityChanged);
+        }
+        self.revalidate_local()?;
+        self.repository = RepositoryBinding::Confirmed(id.to_owned());
+        if let Some(predecessor) = self.execution.borrow_mut().predecessor.as_mut() {
+            predecessor.confirm_read_config(id);
+        }
+        self.execution
+            .borrow_mut()
+            .accept_windows(DirectInvocation::Config, result.successful());
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn check_repository(&self) -> Result<(), ReadbackError> {
         let result = self.query(vec!["cat".into(), "config".into(), "--no-cache".into()])?;
@@ -1511,6 +1746,25 @@ impl<'a> ReadOperation<'a> {
         Ok(())
     }
 
+    #[cfg(windows)]
+    fn check_repository(&self) -> Result<(), ReadbackError> {
+        let result = self.query(vec!["cat".into(), "config".into(), "--no-cache".into()])?;
+        let parsed: Value = serde_json::from_slice(&result.stdout)
+            .map_err(|_| ReadbackError::InvalidRepositoryIdentity)?;
+        let id = parsed
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| full_hex_identity(id))
+            .ok_or(ReadbackError::InvalidRepositoryIdentity)?;
+        if id != self.repository_id() {
+            return Err(ReadbackError::RepositoryIdentityChanged);
+        }
+        self.execution
+            .borrow_mut()
+            .accept_windows(DirectInvocation::Config, result.successful());
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn check_node(&self, file: &ExactArchiveFile) -> Result<(), ReadbackError> {
         let output = self.query(vec![
@@ -1527,7 +1781,23 @@ impl<'a> ReadOperation<'a> {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn check_node(&self, file: &ExactArchiveFile) -> Result<(), ReadbackError> {
+        let output = self.query(vec![
+            "ls".into(),
+            "--json".into(),
+            file.snapshot_id.as_str().into(),
+            file.archive_path.as_str().into(),
+            "--no-cache".into(),
+        ])?;
+        exact_regular_node(&output.stdout, file)?;
+        self.execution
+            .borrow_mut()
+            .accept_windows(DirectInvocation::List, output.successful());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
     fn revalidate_source(&self, source: &ArchiveSource<'_>) -> Result<(), ReadbackError> {
         self.revalidate_local()?;
         let result = source.revalidate();
@@ -1557,10 +1827,42 @@ impl<'a> ReadOperation<'a> {
         snapshot_id: &str,
         source: &ArchiveSource<'_>,
     ) -> Result<ExactArchiveFile, ReadbackError> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (snapshot_id, source);
             Err(ReadbackError::Unsupported)
+        }
+        #[cfg(windows)]
+        {
+            self.revalidate_source(source)?;
+            let name = source
+                .name()
+                .to_str()
+                .filter(|name| plain_name(name))
+                .ok_or(ReadbackError::InvalidSelection)?;
+            if !full_hex_identity(snapshot_id) || !full_hex_identity(&source.digest().sha256) {
+                return Err(ReadbackError::InvalidSelection);
+            }
+            self.check_repository()?;
+            self.revalidate_source(source)?;
+            let output = self.query(vec![
+                "ls".into(),
+                "--json".into(),
+                snapshot_id.into(),
+                "--no-cache".into(),
+            ])?;
+            let file = owned_snapshot_file(
+                &output.stdout,
+                self.repository_id(),
+                snapshot_id,
+                name,
+                source.digest(),
+            )?;
+            self.revalidate_source(source)?;
+            self.execution
+                .borrow_mut()
+                .accept_windows(DirectInvocation::List, output.successful());
+            Ok(file)
         }
         #[cfg(unix)]
         {
@@ -1614,7 +1916,7 @@ impl<'a> ReadOperation<'a> {
         source: &ArchiveSource<'_>,
         target: OwnedMediaTarget,
     ) -> Result<(ExactArchiveFile, PreparedMedia), ReadbackFailure> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (snapshot_id, source);
             Err(ReadbackFailure::target(
@@ -1623,6 +1925,39 @@ impl<'a> ReadOperation<'a> {
                 target,
                 Arc::clone(self.carrier()),
             ))
+        }
+        #[cfg(windows)]
+        {
+            if target.helper_transport_issued() {
+                return Err(ReadbackFailure::target(
+                    ReadbackError::NativeFailure,
+                    WriterState::Unknown,
+                    target,
+                    Arc::clone(self.carrier()),
+                ));
+            }
+            let discovery = self.discover_owned_snapshot(snapshot_id, source);
+            let file = match discovery {
+                Ok(file) => file,
+                Err(reason) => {
+                    return Err(ReadbackFailure::target(
+                        reason,
+                        WriterState::NotLaunched,
+                        target,
+                        Arc::clone(self.carrier()),
+                    ));
+                }
+            };
+            let prepared = self.read_exact(&file, target)?;
+            if let Err(reason) = self.revalidate_source(source) {
+                return Err(ReadbackFailure {
+                    carrier: Arc::clone(self.carrier()),
+                    reason,
+                    writer: WriterState::QualifiedCompletion,
+                    owned: Box::new(OwnedReadback::Prepared(prepared)),
+                });
+            }
+            Ok((file, prepared))
         }
         #[cfg(unix)]
         {
@@ -1673,7 +2008,7 @@ impl<'a> ReadOperation<'a> {
         file: &ExactArchiveFile,
         target: OwnedMediaTarget,
     ) -> Result<PreparedMedia, ReadbackFailure> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = file;
             Err(ReadbackFailure::target(
@@ -1682,6 +2017,126 @@ impl<'a> ReadOperation<'a> {
                 target,
                 Arc::clone(self.carrier()),
             ))
+        }
+        #[cfg(windows)]
+        {
+            let mut target = target;
+            if target.helper_transport_issued() {
+                return Err(ReadbackFailure::target(
+                    ReadbackError::NativeFailure,
+                    WriterState::Unknown,
+                    target,
+                    Arc::clone(self.carrier()),
+                ));
+            }
+            let mut writer = WriterState::NotLaunched;
+            let preflight = (|| {
+                file.validate()?;
+                if file.repository_id != self.repository_id() {
+                    return Err(ReadbackError::RepositoryIdentityChanged);
+                }
+                if !Arc::ptr_eq(target.journal_root(), &self.root) {
+                    return Err(ReadbackError::TargetRootChanged);
+                }
+                target
+                    .journal_root()
+                    .revalidate_canonical_binding()
+                    .map_err(|_| ReadbackError::TargetRootChanged)?;
+                self.check_repository()?;
+                self.check_node(file)?;
+                Ok(())
+            })();
+            if let Err(reason) = preflight {
+                return Err(ReadbackFailure::target(
+                    reason,
+                    writer,
+                    target,
+                    Arc::clone(self.carrier()),
+                ));
+            }
+            let execution = (|| {
+                self.revalidate_local()?;
+                let timeout = self.operation.budget().remaining(self.operation.clock())?;
+                let stage_file = target
+                    .issue_stage_file()
+                    .map_err(|_| ReadbackError::NativeFailure)?;
+                let argv = vec![
+                    "dump".into(),
+                    file.snapshot_id.as_str().into(),
+                    file.archive_path.as_str().into(),
+                    "--no-cache".into(),
+                ];
+                writer = WriterState::Unknown;
+                self.execution.borrow_mut().attempt();
+                let cancel = self.operation.budget().cancellation();
+                let completed = self.executor.run_dump(
+                    &self.restic_path,
+                    &argv,
+                    &self.env,
+                    timeout,
+                    stage_file,
+                    file.bytes,
+                    cancel,
+                );
+                let completed = match completed {
+                    Ok(completed) if completed.quiescent => {
+                        self.execution.borrow_mut().reaped();
+                        writer = WriterState::QualifiedCompletion;
+                        completed
+                    }
+                    Ok(_) => {
+                        return Err(ReadbackError::ToolFailed);
+                    }
+                    Err(reason) => {
+                        return Err(reason);
+                    }
+                };
+                self.operation.budget().remaining(self.operation.clock())?;
+                if !completed.successful() {
+                    return Err(ReadbackError::ToolFailed);
+                }
+                self.check_repository()?;
+                self.revalidate_local()?;
+                Ok(completed)
+            })();
+            let completed = match execution {
+                Ok(completed) => completed,
+                Err(reason) => {
+                    return Err(ReadbackFailure::target(
+                        reason,
+                        writer,
+                        target,
+                        Arc::clone(self.carrier()),
+                    ));
+                }
+            };
+            let expected = MediaDigest {
+                size: file.bytes,
+                sha256: file.sha256.clone(),
+            };
+            let prepared =
+                target
+                    .prepare_after_successful_helper(&expected)
+                    .map_err(|failure| {
+                        ReadbackFailure::target(
+                            ReadbackError::NativeFailure,
+                            writer,
+                            failure.owned,
+                            Arc::clone(self.carrier()),
+                        )
+                    })?;
+            if let Err(reason) = self.revalidate_local() {
+                return Err(ReadbackFailure {
+                    carrier: Arc::clone(self.carrier()),
+                    reason,
+                    writer,
+                    owned: Box::new(OwnedReadback::Prepared(prepared)),
+                });
+            }
+            self.execution
+                .borrow_mut()
+                .accept_windows(DirectInvocation::Dump, completed.successful());
+            Ok(prepared)
         }
         #[cfg(unix)]
         {
@@ -1834,7 +2289,7 @@ fn pinned_member(member: &CurrentInstalledMember) -> Result<(), ReadbackError> {
     revalidate_member(member)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn owned_snapshot_file(
     bytes: &[u8],
     repository_id: &str,
@@ -1893,7 +2348,7 @@ fn owned_snapshot_file(
     selected.ok_or(unavailable)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn exact_regular_node(bytes: &[u8], file: &ExactArchiveFile) -> Result<(), ReadbackError> {
     let mut snapshots = 0usize;
     let mut nodes = 0usize;

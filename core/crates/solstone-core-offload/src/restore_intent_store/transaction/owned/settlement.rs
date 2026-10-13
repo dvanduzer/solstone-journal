@@ -5,9 +5,9 @@
 
 use super::*;
 use solstone_core_journal_io::media::{MediaRead, RemovalReceipt};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_journal_io::media::{OriginalName, RemovalEffect, RemovalPhase};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_retention::restore_intent::{MarkRetirement, PublicationFacts};
 
 pub(crate) struct SettlementFailure {
@@ -74,20 +74,26 @@ impl DetachedTransaction {
         {
             return Err(refusal());
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(SettlementFailure::refused("unsupported_settlement"))
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             if !record.writes.iter().all(StoreWriteReceipt::fully_confirmed) {
                 return Err(refusal());
             }
             let preparation = receipts.preparation.as_ref().ok_or_else(refusal)?;
-            if !preparation.confirmed
-                || preparation.durability != [Durability::Synced; 4]
-                || !preparation.failures.is_empty()
-            {
+            let preparation_valid = if cfg!(windows) {
+                preparation.confirmed
+                    && preparation.durability == [Durability::Unproven; 4]
+                    && preparation.failures.is_empty()
+            } else {
+                preparation.confirmed
+                    && preparation.durability == [Durability::Synced; 4]
+                    && preparation.failures.is_empty()
+            };
+            if !preparation_valid {
                 return Err(refusal());
             }
             let retired = self.retirement.as_ref().ok_or_else(refusal)?;
@@ -99,15 +105,25 @@ impl DetachedTransaction {
                 return Err(refusal());
             };
             let removed = removal.receipt();
+            let required_durabilities = if cfg!(windows) {
+                (retired.ancestors == [Durability::Synced; 4]
+                    || retired.ancestors == [Durability::Unproven; 4])
+                    && (removed.source_durability == Durability::Synced
+                        || removed.source_durability == Durability::Unproven)
+                    && (removed.claim_durability == Durability::Synced
+                        || removed.claim_durability == Durability::Unproven)
+            } else {
+                retired.ancestors == [Durability::Synced; 4]
+                    && removed.source_durability == Durability::Synced
+                    && removed.claim_durability == Durability::Synced
+            };
             if !retired.retired
                 || confirmed != Some(&retired.observed)
-                || retired.ancestors != [Durability::Synced; 4]
+                || !required_durabilities
                 || !retired.failures.is_empty()
                 || removed.effect != RemovalEffect::Deleted
                 || removed.original_name != OriginalName::Absent
                 || removed.claim_confirmation != Confirmation::Confirmed
-                || removed.source_durability != Durability::Synced
-                || removed.claim_durability != Durability::Synced
                 || removed.cleanup != Cleanup::Complete
                 || removed
                     .failures
@@ -133,14 +149,7 @@ impl DetachedTransaction {
                 .as_ref()
                 .and_then(|result| result.as_ref().ok())
                 .ok_or_else(refusal)?;
-            if ledger.confirmation() != LedgerConfirmation::Confirmed
-                || ledger.durability() != [LedgerSync::Confirmed; 4]
-                || !ledger.failures().is_empty()
-                || matches!(
-                    ledger.effect(),
-                    crate::ledger::writer::LedgerWriteEffect::Attempted { .. }
-                )
-            {
+            if !ledger.settles() {
                 return Err(refusal());
             }
             match publication.effect {
@@ -153,32 +162,48 @@ impl DetachedTransaction {
                     } else {
                         AttemptEffects::default()
                     };
+                    let durability_invalid = if cfg!(windows) {
+                        publication.effect == PublicationEffect::Published
+                            && publication.file_durability != Durability::Synced
+                    } else {
+                        publication.effect == PublicationEffect::Published
+                            && (publication.file_durability != Durability::Synced
+                                || publication.parent_durability != Durability::Synced)
+                    };
                     if effects != expected_effects
                         || publication.error.is_some()
                         || publication.confirmation != Confirmation::Confirmed
                         || publication.identity.is_none()
                         || publication.cleanup != Cleanup::Complete
                         || intent.marker != Obligation::Complete
-                        || (publication.effect == PublicationEffect::Published
-                            && (publication.file_durability != Durability::Synced
-                                || publication.parent_durability != Durability::Synced))
+                        || durability_invalid
                     {
                         return Err(refusal());
                     }
-                    let marker = receipts
-                        .marker
-                        .as_ref()
-                        .and_then(|result| result.as_ref().ok())
-                        .ok_or_else(refusal)?;
-                    if !matches!(
-                        marker.publication(),
-                        solstone_core_journal_io::atomic::BoundAtomicOutcome::Published { .. }
-                    ) || marker.binding_error().is_some()
-                        || marker.lock_error().is_some()
-                        || receipts.marker_ancestor_sync.len() != 3
-                        || !receipts.marker_ancestor_sync.iter().all(Result::is_ok)
+                    #[cfg(unix)]
                     {
-                        return Err(refusal());
+                        let marker = receipts
+                            .marker
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok())
+                            .ok_or_else(refusal)?;
+                        let marker_ancestor_sync_invalid = receipts.marker_ancestor_sync.len() != 3
+                            || !receipts.marker_ancestor_sync.iter().all(Result::is_ok);
+                        if !matches!(
+                            marker.publication(),
+                            solstone_core_journal_io::atomic::BoundAtomicOutcome::Published { .. }
+                        ) || marker.binding_error().is_some()
+                            || marker.lock_error().is_some()
+                            || marker_ancestor_sync_invalid
+                        {
+                            return Err(refusal());
+                        }
+                    }
+                    #[cfg(windows)]
+                    {
+                        if !receipts.marker_published {
+                            return Err(refusal());
+                        }
                     }
                     match &intent.retirement {
                         MarkRetirement::Exact { .. } => {
@@ -200,6 +225,13 @@ impl DetachedTransaction {
                     }
                 }
                 PublicationEffect::Conflict | PublicationEffect::NotPublished => {
+                    #[cfg(unix)]
+                    let marker_no_effect =
+                        receipts.marker.is_none() && receipts.marker_ancestor_sync.is_empty();
+                    #[cfg(windows)]
+                    let marker_no_effect = !receipts.marker_published;
+                    #[cfg(not(any(unix, windows)))]
+                    let marker_no_effect = true;
                     if !intent.no_effect_outcome()
                         || effects != AttemptEffects::default()
                         || publication.identity.is_some()
@@ -209,8 +241,7 @@ impl DetachedTransaction {
                             .is_some_and(NoEffectCleanup::confirmed)
                         || intent.marker != Obligation::NotRequired
                         || intent.register != Obligation::NotRequired
-                        || receipts.marker.is_some()
-                        || !receipts.marker_ancestor_sync.is_empty()
+                        || !marker_no_effect
                         || receipts.register.is_some()
                     {
                         return Err(refusal());

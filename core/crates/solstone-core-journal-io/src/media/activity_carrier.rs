@@ -87,11 +87,10 @@ impl CarrierOwner {
         (owner, receipt, result)
     }
 
-    /// Windows has no directory flush. A teardown carrier there is confirmed
-    /// but its durability stays `Unproven`; every other carrier still requires
-    /// a flush, so it can't be prepared on Windows.
+    /// Windows has no directory flush. Activity and teardown carriers there
+    /// are confirmed but durability stays `Unproven`.
     fn flushes_directories(&self) -> bool {
-        cfg!(not(windows)) || matches!(self.activity, StageLease::Activity(_))
+        cfg!(not(windows))
     }
 
     fn activity(&self) -> &Arc<ActivityLease> {
@@ -782,9 +781,9 @@ pub fn retire_unrecorded_stage_where(
 }
 
 enum Leaf<'a> {
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
     Exact(&'a OsStr, Option<MediaIdentity>),
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
     Accepted(&'a dyn Fn(&OsStr) -> bool),
 }
 
@@ -795,7 +794,7 @@ fn retire_stage(
     directory: MediaIdentity,
     leaf: Leaf<'_>,
 ) -> io::Result<bool> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         plain_name(name)?;
         if let Leaf::Exact(leaf_name, _) = leaf {
@@ -849,10 +848,12 @@ fn retire_stage(
             .revalidate()
             .map_err(crate::activity::ActivityAdmissionError::into_io)?;
         platform::remove_directory(&parent.inner, name, &stage)?;
-        parent.sync()?;
+        if cfg!(not(windows)) {
+            parent.sync()?;
+        }
         Ok(true)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (activity, parent, name, directory, leaf);
         Err(shared_storage())

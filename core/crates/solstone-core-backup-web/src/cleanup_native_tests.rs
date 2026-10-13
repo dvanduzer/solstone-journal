@@ -82,6 +82,8 @@ fn run_owned_fixture() {
             resources.retain(temporary.clone());
             resources
         },
+        stdout_sink: None,
+        cancellation: None,
     });
     let output = match result {
         Ok(output) => output,
@@ -155,6 +157,8 @@ fn child_request(resources: BoundedHelperResources) -> BoundedHelperRequest {
         },
         resource_limits: None,
         resources,
+        stdout_sink: None,
+        cancellation: None,
     }
 }
 

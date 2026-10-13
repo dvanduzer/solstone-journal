@@ -99,6 +99,8 @@ pub fn detect(full_png: &[u8], _journal: &Path) -> Result<Value, String> {
             cpu_rate_per_10_000: spec.cpu_rate_per_10_000,
             committed_memory_bytes: spec.committed_memory_bytes,
         }),
+        stdout_sink: None,
+        cancellation: None,
     };
     let helper_output = run_bounded_helper(request).map_err(|err| err.to_string())?;
     map_rfdetr_detect_completion(helper_output.exit_code == 0, &output)

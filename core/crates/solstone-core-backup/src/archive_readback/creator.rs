@@ -107,7 +107,7 @@ impl ArchivePredecessorCustody {
     pub(super) fn unwritten(&self) -> bool {
         self.creator_executor() && self.pending == 0 && self.capture.archives.is_empty()
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn validate_input(&self, input: &ReadAdmission<'_>) -> Result<(), ReadbackError> {
         if !self.creator_executor() {
             return Ok(());
@@ -237,6 +237,17 @@ impl ArchivePredecessorCustody {
         }
         drop(child);
     }
+    #[cfg(windows)]
+    fn accept_windows(&mut self, successful: bool) {
+        if !successful || self.pending == 0 {
+            self.refuse(ReadbackError::ToolFailed);
+            return;
+        }
+        self.pending -= 1;
+        if !matches!(self.state, CreatorState::Direct(WriterProgress::Refused(_))) {
+            self.state = CreatorState::Direct(WriterProgress::Accepted);
+        }
+    }
     fn admission_effects(&self) -> (bool, bool) {
         (
             self.capture.write_repository_requested,
@@ -278,9 +289,9 @@ impl OwnedPreparedArchiveOperation {
     }
 }
 impl OwnedArchiveCreatorAdmission {
+    #[cfg(unix)]
     pub fn admit(self) -> Result<OwnedArchiveCreator, OwnedReadbackAdmissionError> {
         let read = self.input.admit()?;
-        #[cfg(unix)]
         let paired = (|| {
             if let Some(custody) = read.read.execution.borrow_mut().predecessor.as_mut() {
                 custody.capture.write_repository_requested = true;
@@ -293,8 +304,36 @@ impl OwnedArchiveCreatorAdmission {
             }
             Ok(())
         })();
-        #[cfg(not(unix))]
-        let paired: Result<(), ReadbackError> = Err(ReadbackError::Unsupported);
+        if let Err(reason) = paired {
+            if let Some(custody) = read.read.execution.borrow_mut().predecessor.as_mut() {
+                custody.refuse(reason);
+            }
+            return Err(OwnedReadbackAdmissionError {
+                reason,
+                owned: ClosedAdmissionOwner::Admitted(Box::new(read.into_owned_hold())),
+            });
+        }
+        Ok(OwnedArchiveCreator { read })
+    }
+
+    #[cfg(windows)]
+    pub fn admit(
+        self,
+        executor: Option<Arc<dyn WindowsArchiveExecutor>>,
+    ) -> Result<OwnedArchiveCreator, OwnedReadbackAdmissionError> {
+        let read = self.input.admit(executor)?;
+        let paired = (|| {
+            if let Some(custody) = read.read.execution.borrow_mut().predecessor.as_mut() {
+                custody.capture.write_repository_requested = true;
+            }
+            read.read.check_repository()?;
+            read.read.revalidate_admission()?;
+            if let Some(custody) = read.read.execution.borrow_mut().predecessor.as_mut() {
+                custody.capture.write_repository_id = Some(read.repository_id().to_owned());
+                custody.state = CreatorState::Direct(WriterProgress::NoWriter);
+            }
+            Ok(())
+        })();
         if let Err(reason) = paired {
             if let Some(custody) = read.read.execution.borrow_mut().predecessor.as_mut() {
                 custody.refuse(reason);
@@ -420,7 +459,7 @@ impl OwnedArchiveCreator {
         }
         result.map_err(|reason| DirectArchiveFailure { reason, effects })
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn archive_inner(
         &mut self,
         _: &[ArchiveSource<'_>],
@@ -430,7 +469,87 @@ impl OwnedArchiveCreator {
     ) -> Result<DirectArchiveSnapshot, ReadbackError> {
         Err(ReadbackError::Unsupported)
     }
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn archive_inner(
+        &mut self,
+        sources: &[ArchiveSource<'_>],
+        argv: Vec<OsString>,
+        index: usize,
+        effects: &mut DirectArchiveEffects,
+    ) -> Result<DirectArchiveSnapshot, ReadbackError> {
+        let mut names = std::collections::BTreeSet::new();
+        if sources.is_empty()
+            || sources.iter().any(|source| {
+                !anchored_path(source)
+                    || source.path().to_str().is_none()
+                    || source.path().file_name() != Some(source.name())
+                    || source
+                        .name()
+                        .to_str()
+                        .is_none_or(|name| !plain_name(name) || !names.insert(name))
+            })
+        {
+            return Err(ReadbackError::InvalidSelection);
+        }
+        self.revalidate_sources(sources)?;
+        self.read.read.check_repository()?;
+        self.read.read.check_repository()?;
+        self.revalidate_sources(sources)?;
+        let timeout = self
+            .prepared_operation()
+            .budget()
+            .remaining(self.prepared_operation().clock())?;
+        let program = self.read.read.restic_path.as_os_str().to_owned();
+        {
+            let mut execution = self.read.read.execution.borrow_mut();
+            let custody = execution
+                .predecessor
+                .as_mut()
+                .ok_or(ReadbackError::Unsupported)?;
+            custody.submit()?;
+            *effects = DirectArchiveEffects::Attempted {
+                returncode: None,
+                observed_snapshot_id: None,
+            };
+            custody.capture.archives[index].effects = effects.clone();
+        }
+        let cancel = self.prepared_operation().budget().cancellation();
+        let executor = Arc::clone(&self.read.read.executor);
+        let output = executor.run_cancellable(
+            std::path::Path::new(&program),
+            &argv,
+            &self.read.read.env,
+            timeout,
+            64 * 1024 * 1024,
+            cancel,
+        );
+        let output = match output {
+            Ok(output) if output.quiescent => output,
+            _ => return Err(self.read.read.execution_error()),
+        };
+        let observed = Some(output.returncode);
+        let snapshot = parse_summary(&output.stdout).ok();
+        *effects = DirectArchiveEffects::Attempted {
+            returncode: observed,
+            observed_snapshot_id: snapshot.clone(),
+        };
+        self.revalidate_sources(sources)?;
+        self.read.read.check_repository()?;
+        self.read.read.check_repository()?;
+        self.revalidate_sources(sources)?;
+        if !output.successful() {
+            return Err(ReadbackError::ToolFailed);
+        }
+        let snapshot_id = snapshot.ok_or(ReadbackError::SnapshotNodeUnavailable)?;
+        if let Some(custody) = self.read.read.execution.borrow_mut().predecessor.as_mut() {
+            custody.accept_windows(true);
+        }
+        Ok(DirectArchiveSnapshot {
+            repository_id: self.repository_id().to_owned(),
+            snapshot_id,
+        })
+    }
+    #[cfg(any(unix, windows))]
     fn revalidate_sources(&self, sources: &[ArchiveSource<'_>]) -> Result<(), ReadbackError> {
         self.revalidate_local()?;
         let result = sources.iter().try_for_each(|source| {
@@ -585,6 +704,11 @@ fn anchored_path(source: &ArchiveSource<'_>) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn anchored_path(source: &ArchiveSource<'_>) -> bool {
+    source.path().is_absolute()
+}
+
 #[cfg(target_os = "macos")]
 fn revalidate_core(
     core: &solstone_core_installed_payload::CurrentInstalledMember,
@@ -592,7 +716,7 @@ fn revalidate_core(
     core.revalidate().map_err(|_| ReadbackError::ToolChanged)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn parse_summary(output: &[u8]) -> Result<String, ReadbackError> {
     let mut summary = None;
     for line in output

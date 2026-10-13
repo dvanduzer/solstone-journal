@@ -667,6 +667,22 @@ pub(super) fn remove_empty_child(
     Ok(true)
 }
 
+pub(super) fn remove_leaf(parent: &Directory, name: &OsStr, file: &File) -> io::Result<()> {
+    mark_delete(file)?;
+    ensure_absent(parent, name)
+}
+
+pub(super) fn remove_directory(
+    parent: &Directory,
+    name: &OsStr,
+    directory: &Directory,
+) -> io::Result<()> {
+    check_leaf(parent, name, directory.identity())?;
+    step(MediaPrimitive::NativeDirectoryRemoveCut)?;
+    mark_delete(directory.file())?;
+    ensure_absent(parent, name)
+}
+
 pub(super) fn ensure_absent(parent: &Directory, name: &OsStr) -> io::Result<()> {
     parent.revalidate()?;
     match nt_create_relative(

@@ -108,7 +108,7 @@ pub fn run_cli(args: &[String], journal: &Path) -> CliOutcome {
 /// A well-formed `offload restore` on a platform where the owned restore runs.
 /// Anything else keeps the rendered path and its usage and selection answers.
 fn owned_restore_options(args: &[String]) -> Option<(Option<String>, bool)> {
-    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+    if !cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows")) {
         return None;
     }
     let args = normalize_global_flags(args);

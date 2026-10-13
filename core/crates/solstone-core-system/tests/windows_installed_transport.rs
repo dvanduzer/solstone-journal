@@ -375,6 +375,8 @@ fn windows_installed_transport_receipt() {
                 stdout_limit_bytes: 65536,
                 stderr_limit_bytes: 65536,
             },
+            stdout_sink: None,
+            cancellation: None,
         });
         let output = match output {
             Ok(output) => output,

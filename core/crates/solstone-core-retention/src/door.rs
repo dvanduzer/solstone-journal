@@ -72,13 +72,13 @@ pub struct EvidenceTally {
     pub on_legacy_rows: usize,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct BoundOrdinaryRelease {
     pub(crate) native: solstone_core_journal_io::media::MediaRemoval,
     pub(crate) removed: Option<RemovedPath>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn release_reviewed_ordinary(
     release: crate::remove_marked::OrdinaryRelease,
     stage: solstone_core_journal_io::media::MediaStage,
@@ -88,13 +88,13 @@ pub(crate) fn release_reviewed_ordinary(
     release_reviewed_parts(&source, proven.name(), &observation, stage, relative)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct BoundArchiveRefusal {
     pub(crate) reason: crate::remove_marked::ReviewedRemovalRefusal,
     pub(crate) stage: solstone_core_journal_io::media::MediaStage,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn release_reviewed_archive(
     release: crate::remove_marked::ArchiveRelease<'_, '_>,
     stage: solstone_core_journal_io::media::MediaStage,
@@ -115,7 +115,7 @@ pub(crate) fn release_reviewed_archive(
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn release_reviewed_parts(
     source: &std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
     name: &str,

@@ -26,7 +26,7 @@ fn a_missing_journal_starts_nothing() {
     let run = run_cli_restore(&missing, Arc::new(FixedClock), Some("20261009"));
     assert_eq!(run.settlement(), CliRestoreSettlement::NotStarted);
     assert_eq!(run.result().status, "refused");
-    let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let expected = if cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows")) {
         "segment_identity"
     } else {
         "restore_held"
@@ -37,7 +37,7 @@ fn a_missing_journal_starts_nothing() {
     assert!(!missing.exists());
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[test]
 fn nothing_offloaded_is_a_no_op_without_activity() {
     let journal = tempfile::tempdir().unwrap();

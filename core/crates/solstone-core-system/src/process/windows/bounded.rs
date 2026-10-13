@@ -80,7 +80,13 @@ pub struct BoundedHelperBudget {
 /// `PATH` is refused so it cannot choose executable or DLL code. The launcher
 /// writes one empty `PATH` entry itself: Windows otherwise supplies a process
 /// `PATH` when that key is omitted from a custom block.
+/// Streaming sink configuration for bounded helper stdout.
 #[derive(Debug)]
+pub struct BoundedStdoutSink {
+    pub file: std::fs::File,
+    pub limit_bytes: u64,
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct BoundedHelperRequest {
     pub package_root: PathBuf,
@@ -93,6 +99,27 @@ pub struct BoundedHelperRequest {
     pub resource_limits: Option<BoundedHelperResourceLimits>,
     #[cfg(windows)]
     pub resources: BoundedHelperResources,
+    pub stdout_sink: Option<BoundedStdoutSink>,
+    pub cancellation: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BoundedHelperRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("BoundedHelperRequest");
+        d.field("package_root", &self.package_root)
+            .field("executable", &self.executable)
+            .field("current_directory", &self.current_directory)
+            .field("arguments", &self.arguments)
+            .field("environment", &self.environment)
+            .field("stdin", &self.stdin)
+            .field("budget", &self.budget)
+            .field("resource_limits", &self.resource_limits);
+        #[cfg(windows)]
+        d.field("resources", &self.resources);
+        d.field("stdout_sink", &self.stdout_sink)
+            .field("cancellation", &self.cancellation.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 /// The complete, bounded result returned to a helper protocol parser.
@@ -178,6 +205,11 @@ pub enum BoundedHelperError {
         identity: ProcessInstance,
         quiescent: bool,
     },
+    #[error("bounded helper was cancelled")]
+    Cancelled {
+        identity: ProcessInstance,
+        quiescent: bool,
+    },
     #[error("bounded helper process observation failed")]
     ProcessObservationFailed {
         identity: ProcessInstance,
@@ -259,11 +291,37 @@ fn canonicalize_request(
     })
 }
 
-#[cfg(windows)]
-#[derive(Debug)]
-pub(super) enum CaptureError {
+#[derive(Debug, Eq, PartialEq)]
+pub enum CaptureError {
     TooLarge,
     Io,
+}
+
+/// Copy from reader to writer under an explicit byte limit.
+pub fn copy_bounded_stream<R: std::io::Read, W: std::io::Write>(
+    mut reader: R,
+    mut writer: W,
+    limit: u64,
+) -> Result<u64, CaptureError> {
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                writer.flush().map_err(|_| CaptureError::Io)?;
+                return Ok(total);
+            }
+            Ok(count) => {
+                let count_u64 = count as u64;
+                if total.checked_add(count_u64).map_or(true, |new_total| new_total > limit) {
+                    return Err(CaptureError::TooLarge);
+                }
+                writer.write_all(&buffer[..count]).map_err(|_| CaptureError::Io)?;
+                total += count_u64;
+            }
+            Err(_) => return Err(CaptureError::Io),
+        }
+    }
 }
 
 #[cfg(all(windows, feature = "test-hooks"))]
@@ -272,7 +330,10 @@ thread_local! {
 }
 
 #[cfg(windows)]
-fn spawn_io_worker(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<()> {
+fn spawn_io_worker(
+    name: &str,
+    work: impl FnOnce() + Send + 'static,
+) -> io::Result<std::thread::JoinHandle<()>> {
     #[cfg(feature = "test-hooks")]
     if FAIL_IO_WORKER.with(|remaining| match remaining.get() {
         Some(1) => {
@@ -292,19 +353,21 @@ fn spawn_io_worker(name: &str, work: impl FnOnce() + Send + 'static) -> io::Resu
     std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(work)
-        .map(|_join| ())
 }
 
 #[cfg(windows)]
 fn capture_stream<R>(
     mut reader: R,
     limit: usize,
-) -> io::Result<std::sync::mpsc::Receiver<Result<Vec<u8>, CaptureError>>>
+) -> io::Result<(
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<Result<Vec<u8>, CaptureError>>,
+)>
 where
     R: io::Read + Send + 'static,
 {
     let (sender, receiver) = std::sync::mpsc::channel();
-    spawn_io_worker("bounded-helper-output", move || {
+    let worker = spawn_io_worker("bounded-helper-output", move || {
         let mut output = Vec::new();
         let mut buffer = [0_u8; 8192];
         let result = loop {
@@ -320,18 +383,44 @@ where
         drop(reader);
         let _ = sender.send(result);
     })?;
-    Ok(receiver)
+    Ok((worker, receiver))
+}
+
+#[cfg(windows)]
+fn stream_to_file<R>(
+    reader: R,
+    file: std::fs::File,
+    limit: u64,
+) -> io::Result<(
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<Result<Vec<u8>, CaptureError>>,
+)>
+where
+    R: io::Read + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = spawn_io_worker("bounded-helper-output", move || {
+        let result = match copy_bounded_stream(reader, file, limit) {
+            Ok(_) => Ok(Vec::new()),
+            Err(err) => Err(err),
+        };
+        let _ = sender.send(result);
+    })?;
+    Ok((worker, receiver))
 }
 
 #[cfg(windows)]
 fn write_input(
     writer: Option<std::fs::File>,
     input: Vec<u8>,
-) -> io::Result<std::sync::mpsc::Receiver<io::Result<()>>> {
+) -> io::Result<(
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<io::Result<()>>,
+)> {
     use std::io::Write;
 
     let (sender, receiver) = std::sync::mpsc::channel();
-    spawn_io_worker("bounded-helper-input", move || {
+    let worker = spawn_io_worker("bounded-helper-input", move || {
         let result = match writer {
             Some(mut writer) => {
                 let result = writer.write_all(&input);
@@ -343,7 +432,7 @@ fn write_input(
         drop(input);
         let _ = sender.send(result);
     })?;
-    Ok(receiver)
+    Ok((worker, receiver))
 }
 
 #[cfg(windows)]
@@ -413,7 +502,10 @@ pub fn run_bounded_helper(
     // drops its closure and stream; previously started streams remain in `io`.
     let mut io = HelperIo::unstarted();
     match write_input(stdin, request.stdin) {
-        Ok(receiver) => io.stdin = Completion::new(receiver),
+        Ok((worker, receiver)) => {
+            io.workers.push(worker);
+            io.stdin = Completion::new(receiver);
+        }
         Err(_) => {
             drop(stdout);
             drop(stderr);
@@ -430,8 +522,15 @@ pub fn run_bounded_helper(
             ));
         }
     }
-    match capture_stream(stdout, request.budget.stdout_limit_bytes) {
-        Ok(receiver) => io.stdout = Completion::new(receiver),
+    let stdout_spawn = match request.stdout_sink {
+        Some(sink) => stream_to_file(stdout, sink.file, sink.limit_bytes),
+        None => capture_stream(stdout, request.budget.stdout_limit_bytes),
+    };
+    match stdout_spawn {
+        Ok((worker, receiver)) => {
+            io.workers.push(worker);
+            io.stdout = Completion::new(receiver);
+        }
         Err(_) => {
             drop(stderr);
             let quiescent = stop_and_drain(&mut owner, &mut io);
@@ -448,7 +547,10 @@ pub fn run_bounded_helper(
         }
     }
     match capture_stream(stderr, request.budget.stderr_limit_bytes) {
-        Ok(receiver) => io.stderr = Completion::new(receiver),
+        Ok((worker, receiver)) => {
+            io.workers.push(worker);
+            io.stderr = Completion::new(receiver);
+        }
         Err(_) => {
             let quiescent = stop_and_drain(&mut owner, &mut io);
             return Err(reservation.failure(
@@ -480,6 +582,20 @@ pub fn run_bounded_helper(
     let mut exit_code = None;
 
     loop {
+        if let Some(cancellation) = &request.cancellation {
+            if cancellation() {
+                let quiescent = stop_and_drain(&mut owner, &mut io);
+                return Err(reservation.failure(
+                    BoundedHelperError::Cancelled {
+                        identity,
+                        quiescent,
+                    },
+                    owner,
+                    io,
+                    request.resources,
+                ));
+            }
+        }
         if !stdin_complete {
             match io.stdin.try_recv() {
                 Ok(Ok(())) => stdin_complete = true,
@@ -678,6 +794,8 @@ fn receipt_request(
             cpu_rate_per_10_000: 2_500,
             committed_memory_bytes: 512 * 1024 * 1024,
         }),
+        stdout_sink: None,
+        cancellation: None,
     })
 }
 
@@ -955,7 +1073,42 @@ mod tests {
             resource_limits: None,
             #[cfg(windows)]
             resources: BoundedHelperResources::default(),
+            stdout_sink: None,
+            cancellation: None,
         }
+    }
+
+    #[test]
+    fn test_copy_bounded_stream_short_write_succeeds() {
+        let input = b"hello bounded world";
+        let mut output = Vec::new();
+        let limit = 100;
+        let copied = copy_bounded_stream(&input[..], &mut output, limit).expect("copy succeeds");
+        assert_eq!(copied, input.len() as u64);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_copy_bounded_stream_over_bound_refuses() {
+        let input = b"this content is longer than the bound";
+        let mut output = Vec::new();
+        let limit = 10;
+        let result = copy_bounded_stream(&input[..], &mut output, limit);
+        assert_eq!(result, Err(CaptureError::TooLarge));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_copy_bounded_stream_keeps_prefix_under_the_bound() {
+        use std::io::Read;
+        let first = b"prefix";
+        let second = b"overflowing remainder";
+        let reader = (&first[..]).chain(&second[..]);
+        let mut output = Vec::new();
+        let limit = (first.len() + 5) as u64;
+        let result = copy_bounded_stream(reader, &mut output, limit);
+        assert_eq!(result, Err(CaptureError::TooLarge));
+        assert_eq!(output, first);
     }
 
     #[test]

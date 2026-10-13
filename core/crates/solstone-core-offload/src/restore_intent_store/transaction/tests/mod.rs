@@ -515,6 +515,7 @@ fn no_effect_ledger_uncertainty_stops_before_source_cleanup() {
 }
 
 #[test]
+#[cfg(unix)]
 fn no_effect_final_write_uncertainty_retains_cleanup_receipt_and_intent() {
     use solstone_core_journal_io::atomic::{
         BoundPublicationPrimitive, run_with_bound_publication_fault,
@@ -585,6 +586,7 @@ fn no_effect_changed_mark_stops_before_prepared_source_cleanup() {
 }
 
 #[test]
+#[cfg(unix)]
 fn torn_initial_write_refuses_before_native_publication() {
     let f = Fixture::new(false);
     let allowed = Cell::new(true);
@@ -812,6 +814,7 @@ fn unverified_publication_matching_bytes_never_becomes_successful_event_or_cas()
 }
 
 #[test]
+#[cfg(unix)]
 fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() {
     let f = Fixture::new(false);
     let allowed = Cell::new(true);
@@ -847,6 +850,46 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
     assert_eq!(replayed.effects, AttemptEffects::default());
     assert!(replayed.ledger.is_none());
     assert!(replayed.register.is_none());
+    assert_eq!(fs::read(f.ledger()).unwrap(), before);
+}
+
+#[test]
+#[cfg(windows)]
+fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() {
+    let f = Fixture::new(false);
+    let allowed = Cell::new(true);
+    let staged = f.staged(&allowed);
+    let (result, fired) = run_with_media_hook(
+        MediaPrimitive::ParentSync,
+        || Err(std::io::Error::other("publication parent sync cut")),
+        || staged.commit(2, options()),
+    );
+    assert!(fired);
+    let publication = result.publication.as_ref().unwrap();
+    assert_eq!(publication.confirmation, Confirmation::Confirmed);
+    assert_eq!(publication.file_durability, Durability::Synced);
+    assert_eq!(publication.parent_durability, Durability::Unproven);
+    assert_eq!(fs::read(f.raw()).unwrap(), b"abc");
+    assert!(!matches!(result.hold, Some(Hold::Retirement)));
+    let record = result.record.as_ref().unwrap();
+    let id = record.intent.event.operation_id.clone();
+    assert_eq!(record.intent.marker, Obligation::Complete);
+    assert!(result.marker.is_some());
+    if result.hold.is_none() {
+        assert_eq!(record.intent.event_recorded, Obligation::Complete);
+        assert!(result.ledger.is_some());
+    }
+    let before = fs::read(f.ledger()).unwrap();
+    let owner = result.owner;
+    drop(result.record);
+    let (replayed, _) = run_with_media_hook(
+        MediaPrimitive::ParentSync,
+        || Err(std::io::Error::other("replay parent sync cut")),
+        || replay_local(owner, &id, 3, options()),
+    );
+    assert!(!matches!(replayed.hold, Some(Hold::Retirement)));
+    assert_eq!(replayed.effects, AttemptEffects::default());
+    assert_eq!(fs::read(f.raw()).unwrap(), b"abc");
     assert_eq!(fs::read(f.ledger()).unwrap(), before);
 }
 
