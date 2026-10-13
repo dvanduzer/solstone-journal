@@ -457,7 +457,10 @@ pub(crate) fn process_one_with(
     #[cfg(all(feature = "embedded", unix))]
     let dispatched = embedded_dispatched.unwrap_or_else(dispatch);
     #[cfg(not(all(feature = "embedded", unix)))]
-    let dispatched = None.unwrap_or_else(dispatch);
+    let dispatched = {
+        let mut dispatch = dispatch;
+        dispatch()
+    };
     if let Some(asr_at) = asr_at {
         timings.add_ms("asr", elapsed_ms(asr_at));
     }
