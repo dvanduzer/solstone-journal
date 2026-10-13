@@ -407,6 +407,7 @@ function runHistoryHeaderSummary() {
   const context = makeContext({ console });
   vm.runInContext([
     "let importsCache = [];",
+    "let importSourceOptions = [];",
     "const sourceMetadataByName = {};",
     "let currentSourceFilter = '';",
     "const window = {};",
@@ -566,6 +567,7 @@ function runProgressPanelUpdatesOnCompletion() {
     "  CONVEY_COPY: { RELOAD_HINT: 'reload to try again.' },",
     "};",
     "let importsCache = [];",
+    "let importSourceOptions = [];",
     "let importEvents = {};",
     "let currentGuideSource = null;",
     "const sourceMetadataByName = {};",
@@ -2357,6 +2359,7 @@ function runEveryOwnerSinkEscapes() {
     "const sourceIconSvgByName = {};",
     "const sourceMetadataByName = {};",
     "let currentSourceFilter = '';",
+    `let importSourceOptions = [${JSON.stringify(ESCAPE_PAYLOAD)}];`,
     `let importsCache = [{ timestamp: 'h0', source_type: ${JSON.stringify(ESCAPE_PAYLOAD)}, source_display: ${JSON.stringify(ESCAPE_PAYLOAD)} }];`,
   ].join('\n'), historyContext);
   installRealEscapeHtml(historyContext);
@@ -2391,7 +2394,7 @@ function runEveryOwnerSinkEscapes() {
   assert.ok(!headerHtml.includes('<b>'), 'and no payload markup reaches the filter');
 
   vm.runInContext(
-    "importsCache = [{ source_type: 'audio', source_display: 'audio' }, { source_type: 'text', source_display: 'Text' },"
+    "importSourceOptions = ['audio', 'text', 'image']; importsCache = [{ source_type: 'audio', source_display: 'audio' }, { source_type: 'text', source_display: 'Text' },"
     + " { source_type: 'audio', source_display: 'audio' }];",
     historyContext
   );
@@ -2399,8 +2402,8 @@ function runEveryOwnerSinkEscapes() {
   const offered = [...filterHtml.matchAll(/<option value="([^"]*)"/g)].map((match) => match[1]);
   assert.deepStrictEqual(
     offered.filter(Boolean).sort(),
-    ['audio', 'text'],
-    'the source filter offers exactly the sources the listed imports carry, once each'
+    ['audio', 'image', 'text'],
+    'the source filter includes whole-history sources absent from the loaded page'
   );
   cases += 1;
 }
@@ -3308,7 +3311,59 @@ async function runThinkingRefreshKeepsControlsAndFocus() {
   cases += 1;
 }
 
+async function runHistoryFilterPaginationRaces() {
+  const requests = [];
+  const nodes = {
+    importListContent: { innerHTML: '' }, importSourceFilter: {},
+    importLoadMore: { innerHTML: '', remove() {} },
+  };
+  const tbody = { insertAdjacentHTML() {} };
+  const context = makeContext({
+    document: { getElementById: id => nodes[id] || null, querySelector: () => tbody },
+    window: {
+      apiJson: url => new Promise(resolve => requests.push({ url, resolve })),
+      SurfaceState: { replaceLoading() { throw new Error('unexpected read error'); }, error: x => x, serverMessageFrom: () => '' },
+      CONVEY_COPY: {},
+    },
+    loadSourceGrid: async () => {}, clearImportListErrors() {}, pruneImportGenerationFloor() {},
+    buildHistoryHeader: () => '', renderImportRow: () => '', sourceFilterOptionsHtml: () => '',
+    trackPendingImport() {}, clearPendingImport() {}, renderLoadMoreError() { throw new Error('unexpected paging error'); },
+  });
+  vm.runInContext(`let currentPage = 1, historyRequestGeneration = 0, loadingMoreGeneration = null;
+    let historyLoading = false, currentSourceFilter = '', importsCache = [], importSourceOptions = [], totalImports = 0;
+    const IMPORT_PAGE_SIZE = 100;`, context);
+  for (const name of ['loadImports', 'loadMoreImports']) vm.runInContext(functionSource(workspace, name), context);
+  const response = (id, page, source = 'image') => ({
+    imports: [{ timestamp: id, source_type: source, status: 'success' }],
+    source_options: ['image', 'text'], total: 2, pages: 2, page,
+  });
+  const initial = context.loadImports();
+  await new Promise(resolve => setImmediate(resolve));
+  requests[0].resolve(response('all-first', 1, 'text'));
+  await initial;
+  const staleMore = context.loadMoreImports();
+  await context.loadMoreImports();
+  assert.strictEqual(requests.length, 2, 'duplicate load-more clicks share one request');
+  vm.runInContext("currentSourceFilter = 'image'", context);
+  const filtered = context.loadImports();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(requests[2].url.includes('page=1') && requests[2].url.includes('source=image'));
+  requests[2].resolve(response('image-first', 1));
+  await filtered;
+  requests[1].resolve(response('stale-all-second', 2, 'text'));
+  await staleMore;
+  assert.strictEqual(vm.runInContext('importsCache.map(row => row.timestamp).join()', context), 'image-first');
+  const more = context.loadMoreImports();
+  assert.ok(requests[3].url.includes('page=2') && requests[3].url.includes('source=image'), 'pagination uses the same population');
+  requests[3].resolve(response('image-second', 2));
+  await more;
+  assert.strictEqual(vm.runInContext('importsCache.map(row => row.timestamp).join()', context), 'image-first,image-second');
+  assert.strictEqual(vm.runInContext('currentPage', context), 2);
+  cases += 1;
+}
+
 Promise.resolve()
+  .then(runHistoryFilterPaginationRaces)
   .then(runSourceChangeWhileUploading)
   .then(runPreviewEditRequiresNewPreview)
   .then(runThinkingRefreshKeepsControlsAndFocus)

@@ -95,7 +95,45 @@ const Dashboard = (function() {
   }
 
   function shouldLabel(i, len) {
-    return i === 0 || i === len - 1 || (i % 7 === 0);
+    return i === 0 || i === len - 1 || (i % 7 === 0 && len - 1 - i >= 4);
+  }
+
+  // These daily charts share inspection controls without changing their data.
+  function addDailyInspection(container, chart, days) {
+    container.classList.add('chart-inspectable');
+    chart.setAttribute('role', 'group');
+    const bars = Array.from(chart.children);
+    const select = el('select', {'aria-label': 'day'});
+    days.forEach((day, i) => select.appendChild(el('option', {value: String(i)}, [fmtDay(day)])));
+    const readout = el('div', {className: 'chart-day-values', 'aria-live': 'polite', 'aria-atomic': 'true'});
+    const inspect = index => {
+      bars.forEach((bar, i) => bar.setAttribute('tabindex', i === index ? '0' : '-1'));
+      select.value = String(index);
+      readout.textContent = bars[index].getAttribute('aria-label');
+    };
+    bars.forEach((bar, i) => {
+      const stack = bar.querySelector('.bar-stack');
+      bar.setAttribute('role', 'button');
+      bar.setAttribute('aria-label', stack.getAttribute('aria-label') || `${fmtDay(days[i])}: 0`);
+      stack.setAttribute('aria-hidden', 'true');
+      bar.addEventListener('focus', () => inspect(i));
+      bar.addEventListener('click', () => inspect(i));
+      bar.addEventListener('mouseenter', () => inspect(i));
+      bar.addEventListener('keydown', event => {
+        let next = i;
+        if (event.key === 'ArrowRight') next = Math.min(i + 1, bars.length - 1);
+        else if (event.key === 'ArrowLeft') next = Math.max(i - 1, 0);
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = bars.length - 1;
+        else if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        inspect(next);
+        bars[next].focus();
+      });
+    });
+    select.addEventListener('change', () => inspect(Number(select.value)));
+    container.appendChild(el('div', {className: 'chart-inspection'}, [el('label', {}, ['day ', select]), readout]));
+    inspect(bars.length - 1);
   }
 
   // Create a stat card
@@ -305,7 +343,7 @@ const Dashboard = (function() {
       });
 
       // Create stacked segments
-      const stackLabel = `${fmtDay(d.day)}: ${total.toFixed(1)}h (audio: ${d.audio.toFixed(1)}h, screen: ${d.screen.toFixed(1)}h)`;
+      const stackLabel = `${fmtDay(d.day)}: ${total.toFixed(1)}h (audio: ${d.audio.toFixed(1)}h, screen: ${d.screen.toFixed(1)}h)${d.bytes ? `, disk: ${fmtBytes(d.bytes)}` : ''}`;
       const stack = el('div', {className: 'bar-stack', style: {height: '100%'}, 'aria-label': stackLabel});
 
       // Calculate segment heights as percentages of the bar
@@ -367,6 +405,7 @@ const Dashboard = (function() {
       ])
     ]);
     container.appendChild(legend);
+    addDailyInspection(container, chart, data.map(d => d.day));
   }
 
   const HEATMAP_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -665,6 +704,7 @@ const Dashboard = (function() {
       ]));
     });
     container.appendChild(legend);
+    addDailyInspection(container, chart, days);
   }
 
   function backlogCopy() {
