@@ -25,6 +25,7 @@ mod relay_websocket;
 mod service;
 mod service_process;
 mod service_shutdown;
+pub mod service_token_renewal;
 mod service_transition;
 mod tunnel_route;
 mod ws_buffer;
@@ -33,9 +34,11 @@ mod ws_sink;
 pub use admission::RelayAdmissionGate;
 pub use callosum::{CallosumEmit, LoggingEmit, Verbosity};
 pub use health::{
-    LINK_HEALTH_EVENT, OFFLINE_TUNNEL_REASONS, REASON_HOME_MISSING_MOBILE,
-    REASON_LOCAL_PRIVATE_LISTENER_UNREACHABLE, REASON_RELAY_ADMISSION_SATURATED,
-    REASON_RELAY_TUNNEL_REJECTED, REASON_RELAY_TUNNEL_UNREACHABLE, REASON_SERVICE_TOKEN_REJECTED,
+    LINK_HEALTH_EVENT, LINK_HEALTH_FRESHNESS_MS, OFFLINE_TUNNEL_REASONS,
+    REASON_HOME_MISSING_MOBILE, REASON_LOCAL_PRIVATE_LISTENER_UNREACHABLE,
+    REASON_RELAY_ADMISSION_SATURATED, REASON_RELAY_TUNNEL_REJECTED,
+    REASON_RELAY_TUNNEL_UNREACHABLE, REASON_SERVICE_TOKEN_REJECTED, ServiceTokenHealth,
+    service_token_health_is_refused,
 };
 pub use link_state_files::{
     LinkServiceToken, LinkServiceTokenRead, LinkState, LinkStateRead, load_link_service_token,
@@ -54,8 +57,8 @@ pub use posture_gate::{
     PostureGate, PostureInput, RelayBlocked, RelayDecision, RelayPermit, ServiceToken, TokenInput,
 };
 pub use private_link::{
-    DEFAULT_RELAY_URL, EnableSplError, EnrollError, SplDisableOutcome, disable_spl, enable_spl,
-    enable_spl_with, enroll_home, relay_url, save_service_token,
+    DEFAULT_RELAY_URL, EnableSplError, EnrollError, EnrollMode, SplDisableOutcome, disable_spl,
+    enable_spl, enable_spl_with, enroll_home, relay_url, save_service_token,
 };
 pub use reconnect_backoff::{
     INITIAL_RECONNECT_BASE, MAX_RECONNECT_BASE, ReconnectBackoffError, ReconnectSchedule,
@@ -76,6 +79,11 @@ pub use relay_health::{RelayHealth, RelayHealthState, RelayTunnelFailure};
 pub use relay_status_failure::{RelayTunnelFailureSignal, classify_relay_tunnel_failure};
 pub use relay_websocket::{
     RelayWebSocket, RelayWebSocketError, RelayWebSocketReader, RelayWebSocketWriter,
+};
+pub use service_token_renewal::{
+    JwksSet, Outcome, RenewalClock, RenewalConfig, RenewalState, RenewalStep,
+    SERVICE_TOKEN_RENEWAL_TICK, SkipClass, Trigger, age_reached, classify_jwks, evaluate_once,
+    share_bp, spawn_service_token_renewal,
 };
 
 #[cfg(feature = "test-hooks")]

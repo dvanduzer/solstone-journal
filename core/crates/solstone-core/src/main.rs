@@ -5512,6 +5512,17 @@ fn run_mcp_token(command: McpTokenCommand) -> ExitCode {
                     "Save this token now. It will not be shown again and cannot be recovered:"
                 );
                 println!("{}", created.token);
+                println!();
+                println!(
+                    "Until you grant it read access, an agent using this token sees only save_memory and recall_memory. To let it read your whole journal (add --facet NAME to allow only that facet):"
+                );
+                println!(
+                    "  solstone journal mcp permission set --token {:?} --category transcripts --category entities --category facets",
+                    created.label
+                );
+                println!(
+                    "Grant before the agent connects. An agent that connected first keeps its old tool list until it reconnects."
+                );
                 ExitCode::SUCCESS
             }
             Err(error) => render_token_store_error("create", &error),

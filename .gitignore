@@ -52,3 +52,21 @@ tmp/
 !/journal/AGENTS.md
 !/journal/CLAUDE.md
 !/journal/GEMINI.md
+
+# The macOS app package (platforms/macos): SwiftPM state, assembled apps, DMGs,
+# release-gate evidence, snapshot renders and local scratch. Package.resolved,
+# the committed resources and the AX contract stay tracked.
+/platforms/macos/.build/
+/platforms/macos/.swiftpm/
+/platforms/macos/*.app/
+/platforms/macos/*.dmg
+/platforms/macos/.ja1r-gate/
+/platforms/macos/scratch/
+/platforms/macos/snapshots/
+/platforms/macos/Sources/journal/Resources/AppIcon.iconset/
+/platforms/macos/scripts/**/__pycache__/
+# Local tool state written into the package by its release and agent tooling
+# (wrangler's auth probe in publish-preflight, agent scratch, Finder metadata).
+/platforms/macos/.wrangler/
+/platforms/macos/.hop/
+/platforms/macos/**/.DS_Store

@@ -303,6 +303,11 @@ Local pairing and OAuth client registration are documented in
 [MCP OAuth](MCP_OAUTH.md) (`solstone journal mcp pairing` and `solstone journal mcp oauth`).
 `solstone journal mcp permission {show,set,clear}` manages connection read permissions
 for bearer tokens (`--token LABEL`) and OAuth clients (`--oauth CLIENT_ID`).
+A new token has no read access until you grant it: an agent using it sees only
+`save_memory` and `recall_memory`. Grant before the agent connects, for example
+`solstone journal mcp permission set --token LABEL --category transcripts --category entities --category facets`
+(no `--facet` means the whole journal). An agent that connected first keeps its
+old tool list until it reconnects.
 `solstone journal mcp probe` runs one permissioned tool call locally without starting a listener.
 `solstone journal mcp status` reports the compiled capability, the current journal
 configuration result, whether the local and LAN doors are set on, and the token

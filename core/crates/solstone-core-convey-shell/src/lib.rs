@@ -260,6 +260,7 @@ pub struct ConveyServeHandle {
     link_health_task: tokio::task::JoinHandle<()>,
     weekly_heads_up_task: tokio::task::JoinHandle<()>,
     local_network_task: tokio::task::JoinHandle<()>,
+    service_token_renewal_task: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(feature = "host")]
@@ -283,6 +284,7 @@ impl ConveyServeHandle {
         self.link_health_task.abort();
         self.weekly_heads_up_task.abort();
         self.local_network_task.abort();
+        self.service_token_renewal_task.abort();
     }
     pub async fn stop_authorization_refresh(&mut self) {
         self.door.stop_authorization_refresh().await;
@@ -536,6 +538,21 @@ pub async fn bind_with_authorization(
         options.journal_root.clone(),
         link_health_cache.clone(),
     ));
+    let renewal_health_cache = link_health_cache.clone();
+    let renewal_config = solstone_core_spl::RenewalConfig::production(
+        options.journal_root.clone(),
+        Arc::new(move || {
+            let cache = renewal_health_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            link_health_cache::service_token_health_from_cache(cache.as_ref(), now_ms)
+        }),
+    );
+    let service_token_renewal_task = solstone_core_spl::spawn_service_token_renewal(renewal_config);
     let push_portal = std::env::var("SERVICES_PORTAL_URL")
         .unwrap_or_else(|_| agents_enable::DEFAULT_PORTAL_URL.to_owned())
         .trim_end_matches('/')
@@ -581,6 +598,7 @@ pub async fn bind_with_authorization(
         link_health_task,
         weekly_heads_up_task,
         local_network_task,
+        service_token_renewal_task,
     })
 }
 

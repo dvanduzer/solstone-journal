@@ -154,7 +154,9 @@ async fn run_endpoint_topology(
             "failed",
             None,
             ("failed", "waiting", "waiting"),
-            Some("your journal could not prepare its agent address"),
+            Some(
+                "your journal couldn't set up its solstone.me address from what it keeps on this computer. this usually needs a fix, not more time. your journal's log names the step that failed: run solstone journal health logs.",
+            ),
         );
         McpServiceError::Bootstrap
     })?
@@ -360,7 +362,7 @@ where
                 FirstConnectAction::ExitTunnel => {
                     crate::owner_state::write_mcp_owner_state(
                         journal_root,
-                        "failed",
+                        "offline",
                         None,
                         ("failed", "waiting", "waiting"),
                         Some(
@@ -592,7 +594,7 @@ mod tests {
             assert_eq!(result, Err(McpServiceError::Tunnel), "{error}");
             assert_eq!(attempts.load(Ordering::SeqCst), 1, "{error}");
             let state = read_mcp_owner_state(journal.path()).expect("owner state");
-            assert_eq!(state.status, "failed", "{error}");
+            assert_eq!(state.status, "offline", "{error}");
         }
     }
 

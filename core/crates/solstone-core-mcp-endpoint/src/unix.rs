@@ -82,46 +82,49 @@ struct LoadedKey {
 pub(super) fn bootstrap(
     journal_root: &Path,
 ) -> Result<Option<McpEndpointOwnerContext>, McpEndpointBootstrapError> {
-    let root = JournalRoot::open(journal_root).map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+    use McpEndpointBootstrapError::{Capability, ConfigRead, Endpoint};
+
+    let root =
+        JournalRoot::open(journal_root).map_err(failed(SetupStep::JournalFolder, Endpoint))?;
     let config =
-        read_journal_config_bound(&root).map_err(|_| McpEndpointBootstrapError::ConfigRead)?;
-    match mcp_endpoint_capability(&config).map_err(|_| McpEndpointBootstrapError::Capability)? {
+        read_journal_config_bound(&root).map_err(failed(SetupStep::Configuration, ConfigRead))?;
+    match mcp_endpoint_capability(&config).map_err(failed(SetupStep::Configuration, Capability))? {
         McpEndpointCapability::Disabled => return Ok(None),
         McpEndpointCapability::Enabled => {}
     }
     let certificate_environment = mcp_endpoint_certificate_environment(&config)
-        .map_err(|_| McpEndpointBootstrapError::Capability)?;
+        .map_err(failed(SetupStep::Configuration, Capability))?;
     let force_staging_renewal = mcp_endpoint_force_staging_renewal(&config)
-        .map_err(|_| McpEndpointBootstrapError::Capability)?;
+        .map_err(failed(SetupStep::Configuration, Capability))?;
 
     checkpoint(OwnerBootstrapPrimitive::CommittedIdentityLoad)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
-    revalidate_root_binding(&root).map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+        .map_err(failed(SetupStep::Identity, Endpoint))?;
+    revalidate_root_binding(&root).map_err(failed(SetupStep::JournalFolder, Endpoint))?;
     let committed =
-        load_committed_identity_bound(&root).map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+        load_committed_identity_bound(&root).map_err(failed(SetupStep::Identity, Endpoint))?;
 
     checkpoint(OwnerBootstrapPrimitive::RootRevalidateBeforeEndpoint)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
-    revalidate_root_binding(&root).map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+        .map_err(failed(SetupStep::JournalFolder, Endpoint))?;
+    revalidate_root_binding(&root).map_err(failed(SetupStep::JournalFolder, Endpoint))?;
 
     checkpoint(OwnerBootstrapPrimitive::EffectiveUid)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+        .map_err(failed(SetupStep::EndpointFolder, Endpoint))?;
     let owner = geteuid().as_raw();
     let endpoint = create_or_open_endpoint_directory(&root, owner)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+        .map_err(failed(SetupStep::EndpointFolder, Endpoint))?;
     ensure_named_handle_binding(
         &root,
         OsStr::new(ENDPOINT_DIRECTORY),
         &endpoint.file,
         OwnerBootstrapPrimitive::DirectoryBindingCheckBeforeLock,
     )
-    .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
-    let lock = create_or_open_lock(&endpoint.file, owner)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
-    checkpoint(OwnerBootstrapPrimitive::LockAcquire)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+    .map_err(failed(SetupStep::EndpointFolder, Endpoint))?;
+    let lock =
+        create_or_open_lock(&endpoint.file, owner).map_err(failed(SetupStep::Lock, Endpoint))?;
+    checkpoint(OwnerBootstrapPrimitive::LockAcquire).map_err(failed(SetupStep::Lock, Endpoint))?;
     let lock = Flock::lock(lock, FlockArg::LockExclusive)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+        .map_err(|(_, errno)| errno)
+        .map_err(failed(SetupStep::Lock, Endpoint))?;
     validate_named_regular_binding(
         &endpoint.file,
         OsStr::new(CREATE_LOCK),
@@ -129,10 +132,10 @@ pub(super) fn bootstrap(
         owner,
         OwnerBootstrapPrimitive::LockBindingAfterAcquire,
     )
-    .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+    .map_err(failed(SetupStep::Lock, Endpoint))?;
 
-    let loaded = load_or_generate_key(&endpoint.file, owner)
-        .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+    let loaded =
+        load_or_generate_key(&endpoint.file, owner).map_err(failed(SetupStep::Key, Endpoint))?;
     let keypair = finalize_key(
         &root,
         &endpoint.file,
@@ -141,7 +144,7 @@ pub(super) fn bootstrap(
         loaded.identity,
         &loaded.bytes,
     )
-    .map_err(|_| McpEndpointBootstrapError::Endpoint)?;
+    .map_err(failed(SetupStep::Key, Endpoint))?;
     Ok(Some(McpEndpointOwnerContext {
         _private: (),
         committed: std::sync::Arc::new(committed),
@@ -152,6 +155,60 @@ pub(super) fn bootstrap(
         acme_account_uri: std::sync::Arc::new(std::sync::Mutex::new(None)),
         acme_account_setup: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     }))
+}
+
+/// The bootstrap step that refused, named in the log so an owner can find the
+/// entry that needs a change: most of these refusals do not clear up on their
+/// own. Each message is a fixed literal; no error detail reaches the log.
+#[derive(Clone, Copy)]
+enum SetupStep {
+    JournalFolder,
+    Configuration,
+    Identity,
+    EndpointFolder,
+    Lock,
+    Key,
+}
+
+fn failed<E>(
+    step: SetupStep,
+    class: McpEndpointBootstrapError,
+) -> impl FnOnce(E) -> McpEndpointBootstrapError {
+    move |_| {
+        match step {
+            SetupStep::JournalFolder => {
+                log::warn!(
+                    "solstone.me address setup failed: the journal folder could not be opened, or changed during setup"
+                );
+            }
+            SetupStep::Configuration => {
+                log::warn!(
+                    "solstone.me address setup failed: config/journal.json could not be read or has an invalid mcp_endpoint setting"
+                );
+            }
+            SetupStep::Identity => {
+                log::warn!(
+                    "solstone.me address setup failed: the journal identity under link/ could not be loaded"
+                );
+            }
+            SetupStep::EndpointFolder => {
+                log::warn!(
+                    "solstone.me address setup failed: mcp-endpoint/ must be a folder owned by the journal's user, not a link"
+                );
+            }
+            SetupStep::Lock => {
+                log::warn!(
+                    "solstone.me address setup failed: mcp-endpoint/.create.lock must be a file owned by the journal's user with mode 0600, not a link"
+                );
+            }
+            SetupStep::Key => {
+                log::warn!(
+                    "solstone.me address setup failed: mcp-endpoint/pop.ed25519.pk8 must be a valid key file owned by the journal's user with mode 0600, not a link"
+                );
+            }
+        }
+        class
+    }
 }
 
 /// Open the fixed `<journal>/mcp-endpoint/tls/` directory, creating it with

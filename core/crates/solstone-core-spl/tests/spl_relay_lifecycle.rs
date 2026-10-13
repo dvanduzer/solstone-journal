@@ -11,12 +11,19 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use solstone_core_sol_link::service_identity::{
+    load_or_create_service_identity, load_service_identity_ca,
+};
+use solstone_core_spl::ServiceTokenHealth;
+use solstone_core_spl::service_token_renewal::{
+    Outcome, RenewalClock, RenewalConfig, RenewalState, RenewalStep, Trigger, evaluate_once,
+};
 use solstone_core_spl::{
-    CallosumEmit, EnrollError, JournalAttemptTokenSource, LoopbackConnect, LoopbackDialer,
-    PairWindowClientError, PairWindowSecret, PostureGate, PostureInput, RelayClient,
-    RelayClientConfig, RelayDecision, RelayWebSocket, ServiceToken, StaticAttemptTokenSource,
-    TokenInput, WsByteSink, WsByteSource, attach_pair_window_tunnel, enroll_home,
-    register_pair_window, relay_tunnel_url, save_service_token, stop_relay_run,
+    CallosumEmit, EnrollError, EnrollMode, JournalAttemptTokenSource, LoopbackConnect,
+    LoopbackDialer, PairWindowClientError, PairWindowSecret, PostureGate, PostureInput,
+    RelayClient, RelayClientConfig, RelayDecision, RelayWebSocket, ServiceToken,
+    StaticAttemptTokenSource, TokenInput, WsByteSink, WsByteSource, attach_pair_window_tunnel,
+    enroll_home, register_pair_window, relay_tunnel_url, save_service_token, stop_relay_run,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -122,10 +129,11 @@ impl CallosumEmit for ConnectedEmit {
 async fn enroll_home_accepts_a_legacy_account_token() -> Result<(), String> {
     timeout(TEST_TIMEOUT, async {
         let (relay, worker) = relay_response(200, r#"{"account_token":"legacy-token"}"#).await?;
-        let result =
-            tokio::task::spawn_blocking(move || enroll_home(&relay, "instance", "ca", "home"))
-                .await
-                .map_err(|_| "enrollment task failed".to_owned())?;
+        let result = tokio::task::spawn_blocking(move || {
+            enroll_home(&relay, "instance", "ca", "home", EnrollMode::Establish)
+        })
+        .await
+        .map_err(|_| "enrollment task failed".to_owned())?;
         worker
             .await
             .map_err(|_| "relay worker failed".to_owned())??;
@@ -142,10 +150,11 @@ async fn enroll_home_accepts_a_legacy_account_token() -> Result<(), String> {
 async fn enroll_home_rejects_non_json_http_error_bodies() -> Result<(), String> {
     timeout(TEST_TIMEOUT, async {
         let (relay, worker) = relay_response(503, "temporarily unavailable").await?;
-        let result =
-            tokio::task::spawn_blocking(move || enroll_home(&relay, "instance", "ca", "home"))
-                .await
-                .map_err(|_| "enrollment task failed".to_owned())?;
+        let result = tokio::task::spawn_blocking(move || {
+            enroll_home(&relay, "instance", "ca", "home", EnrollMode::Establish)
+        })
+        .await
+        .map_err(|_| "enrollment task failed".to_owned())?;
         worker
             .await
             .map_err(|_| "relay worker failed".to_owned())??;
@@ -1600,6 +1609,598 @@ async fn rotated_service_token_is_presented_on_the_next_listen() -> Result<(), S
     })
     .await
     .map_err(|_| "rotated token lifecycle test timed out".to_owned())?
+}
+
+struct TempJournalCleanup(std::path::PathBuf);
+
+impl Drop for TempJournalCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+static NEXT_HARNESS_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn temp_harness_journal(prefix: &str) -> (std::path::PathBuf, TempJournalCleanup) {
+    let id = NEXT_HARNESS_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), id));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let cleanup = TempJournalCleanup(path.clone());
+    (path, cleanup)
+}
+
+fn write_test_journal_config(
+    journal_path: &std::path::Path,
+    posture: &str,
+    relay_url: Option<&str>,
+) {
+    let config_dir = journal_path.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let mut link = serde_json::Map::new();
+    link.insert(
+        "posture".to_owned(),
+        serde_json::Value::String(posture.to_owned()),
+    );
+    if let Some(url) = relay_url {
+        link.insert(
+            "relay_url".to_owned(),
+            serde_json::Value::String(url.to_owned()),
+        );
+    }
+    let mut root = serde_json::Map::new();
+    root.insert("link".to_owned(), serde_json::Value::Object(link));
+    std::fs::write(
+        config_dir.join("journal.json"),
+        serde_json::to_string(&root).unwrap(),
+    )
+    .unwrap();
+}
+
+fn base64_url_encode(bytes: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let mut b = (chunk[0] as u32) << 16;
+        if chunk.len() > 1 {
+            b |= (chunk[1] as u32) << 8;
+        }
+        if chunk.len() > 2 {
+            b |= chunk[2] as u32;
+        }
+        out.push(CHARS[((b >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((b >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((b >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(b & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
+fn make_unsigned_jwt(
+    kid: Option<&str>,
+    instance_id: &str,
+    iat: i64,
+    exp: i64,
+    scope: &str,
+) -> String {
+    let header = match kid {
+        Some(k) => {
+            let h = serde_json::json!({"alg": "none", "typ": "JWT", "kid": k});
+            base64_url_encode(serde_json::to_string(&h).unwrap().as_bytes())
+        }
+        None => "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0".to_owned(),
+    };
+    let payload = serde_json::json!({
+        "iss": "sol-relay",
+        "sub": format!("home:{instance_id}"),
+        "aud": "relay",
+        "scope": scope,
+        "instance_id": instance_id,
+        "iat": iat,
+        "exp": exp,
+        "jti": "jwt-test",
+    });
+    let payload_b64 = base64_url_encode(serde_json::to_string(&payload).unwrap().as_bytes());
+    format!("{header}.{payload_b64}.sig")
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), std::io::Error> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 1024];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+    while header_end.is_none() {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = Some(pos + 4);
+            let headers_str = String::from_utf8_lossy(&data[..pos]);
+            for line in headers_str.lines() {
+                let lower = line.to_ascii_lowercase();
+                if let Some(val) = lower.strip_prefix("content-length:") {
+                    content_length = val.trim().parse::<usize>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    let h_end = header_end.unwrap_or(data.len());
+    let mut body = data[h_end..].to_vec();
+    while body.len() < content_length {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..n]);
+    }
+    let req_headers = String::from_utf8_lossy(&data[..h_end]).to_string();
+    let req_body = String::from_utf8_lossy(&body[..content_length.min(body.len())]).to_string();
+    Ok((req_headers, req_body))
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    status_text: &str,
+    body: &str,
+) -> Result<(), std::io::Error> {
+    let resp = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+struct HarnessEmitter(Arc<Mutex<Option<ServiceTokenHealth>>>);
+
+impl CallosumEmit for HarnessEmitter {
+    fn emit(&self, _event: &'static str, payload: serde_json::Value) {
+        if let Some(obj) = payload.as_object() {
+            let reason = obj
+                .get("last_relay_tunnel_error")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let error_at = obj
+                .get("last_relay_tunnel_error_at")
+                .and_then(|v| v.as_i64());
+            let success_at = obj
+                .get("last_successful_relay_tunnel_at")
+                .and_then(|v| v.as_i64());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            *self.0.lock().unwrap() = Some(ServiceTokenHealth {
+                event_at_ms: Some(now),
+                reason,
+                tunnel_error_at_ms: error_at,
+                tunnel_success_at_ms: success_at,
+                now_ms: now,
+            });
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::result_large_err)]
+async fn service_token_renewal_replaces_token_and_tunnel_connects() -> Result<(), String> {
+    timeout(Duration::from_secs(10), async {
+        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-renewal-replaces-token");
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+
+        write_test_journal_config(&journal_root, "spl", Some(&format!("http://{address}")));
+        let identity = load_or_create_service_identity(&journal_root).map_err(|e| e.to_string())?;
+        let ca = load_service_identity_ca(&journal_root).map_err(|e| e.to_string())?;
+        let expected_pem = ca.public_key_spki_pem();
+        let inst_id = identity.instance_id.clone();
+
+        let now_unix_val = Arc::new(std::sync::atomic::AtomicI64::new(1_000_000));
+        let now_mono_val = Arc::new(std::sync::atomic::AtomicU64::new(1000));
+        let clock = RenewalClock {
+            now_unix: {
+                let u = now_unix_val.clone();
+                Arc::new(move || u.load(std::sync::atomic::Ordering::SeqCst))
+            },
+            now_mono: {
+                let m = now_mono_val.clone();
+                Arc::new(move || Duration::from_secs(m.load(std::sync::atomic::Ordering::SeqCst)))
+            },
+        };
+
+        // Old token: signed with kid-test-2
+        let old_token = make_unsigned_jwt(
+            Some("kid-test-2"),
+            &inst_id,
+            now_unix_val.load(std::sync::atomic::Ordering::SeqCst) - 100,
+            now_unix_val.load(std::sync::atomic::Ordering::SeqCst) + 365 * 86_400,
+            "session.listen",
+        );
+        save_service_token(&journal_root, &old_token).map_err(|e| e.to_string())?;
+
+        let enrolled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let enroll_bodies = Arc::new(Mutex::new(Vec::new()));
+        let issued_token = Arc::new(Mutex::new(None));
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let accepted_tx = Arc::new(Mutex::new(Some(accepted_tx)));
+
+        let stand_in_task = tokio::spawn({
+            let enrolled = enrolled.clone();
+            let enroll_bodies = enroll_bodies.clone();
+            let issued_token = issued_token.clone();
+            let accepted_tx = accepted_tx.clone();
+            let now_unix_val = now_unix_val.clone();
+            let inst_id = inst_id.clone();
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut peek_buf = [0u8; 128];
+                    let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                    let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
+                    if peek_str.starts_with("GET /.well-known/jwks.json") {
+                        let _ = read_http_request(&mut stream).await;
+                        // Serves without old kid before enroll, and with kid-test-1 after
+                        let body = r#"{"keys":[{"kid":"kid-test-1"}]}"#;
+                        let _ = write_http_response(&mut stream, 200, "OK", body).await;
+                    } else if peek_str.starts_with("POST /enroll/home") {
+                        let (_, body) = read_http_request(&mut stream).await.unwrap_or_default();
+                        enroll_bodies.lock().unwrap().push(body.clone());
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        let id = parsed
+                            .get("instance_id")
+                            .or_else(|| parsed.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&inst_id);
+                        let now = now_unix_val.load(std::sync::atomic::Ordering::SeqCst);
+                        let tok = make_unsigned_jwt(
+                            Some("kid-test-1"),
+                            id,
+                            now - 100,
+                            now + 365 * 86_400,
+                            "session.listen",
+                        );
+                        *issued_token.lock().unwrap() = Some(tok.clone());
+                        enrolled.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let resp_body = serde_json::json!({"service_token": tok}).to_string();
+                        let _ = write_http_response(&mut stream, 200, "OK", &resp_body).await;
+                    } else {
+                        // Tunnel WebSocket
+                        let issued_token = issued_token.clone();
+                        let accepted_tx = accepted_tx.clone();
+                        let ws = accept_hdr_async(stream, move |req: &ServerRequest, res| {
+                            let auth = req
+                                .headers()
+                                .get(AUTHORIZATION)
+                                .and_then(|h| h.to_str().ok())
+                                .map(str::to_owned);
+                            let expected = issued_token.lock().unwrap().clone();
+                            if let Some(exp) = expected
+                                && auth.as_deref() == Some(&format!("Bearer {exp}"))
+                            {
+                                if let Some(tx) = accepted_tx.lock().unwrap().take() {
+                                    let _ = tx.send(());
+                                }
+                                Ok(res)
+                            } else {
+                                Err(rejection_response(StatusCode::UNAUTHORIZED))
+                            }
+                        })
+                        .await;
+                        if let Ok(mut socket) = ws {
+                            let _ = socket.next().await;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Set up emitter to record client health
+        let client_health = Arc::new(Mutex::new(None));
+
+        let mut client = RelayClient::new(
+            RelayClientConfig {
+                instance_id: inst_id.clone(),
+                relay_endpoint: format!("http://{address}"),
+                token_source: Arc::new(JournalAttemptTokenSource::new(journal_root.clone())),
+                service_token: ServiceToken::new(String::new()),
+                dispatch_read_deadline: Duration::from_secs(1),
+                ping_interval: Duration::from_secs(3600),
+                ping_ack_timeout: Duration::from_secs(1),
+                ack_stability_window: Duration::from_secs(3600),
+                global_admission_ceiling: 1,
+            },
+            Arc::new(HarnessEmitter(client_health.clone())),
+            Arc::new(ClosedDialer),
+        );
+        let running_client = client.clone();
+        let run_task = tokio::spawn(async move { running_client.run().await });
+
+        // Wait until client attempts tunnel and records health after 401 refusal
+        for _ in 0..100 {
+            if client_health
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|h| h.reason.as_deref())
+                == Some("service_token_rejected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            client_health
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|h| h.reason.as_deref()),
+            Some("service_token_rejected")
+        );
+
+        // Build component with health closure filled from relay client's own health
+        let renewal_cfg = RenewalConfig {
+            clock,
+            ..RenewalConfig::production(journal_root.clone(), {
+                let h = client_health.clone();
+                Arc::new(move || h.lock().unwrap().clone().unwrap_or_default())
+            })
+        };
+
+        let mut renewal_state = RenewalState::default();
+        let step = evaluate_once(&renewal_cfg, &mut renewal_state);
+        assert_eq!(
+            step,
+            RenewalStep::Attempted {
+                trigger: Trigger::UnknownKey,
+                outcome: Outcome::Renewed,
+            }
+        );
+
+        // Exactly one enroll
+        assert_eq!(enroll_bodies.lock().unwrap().len(), 1);
+        let recorded_body = enroll_bodies.lock().unwrap()[0].clone();
+        assert!(recorded_body.contains(&inst_id));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recorded_body).unwrap()["ca_pubkey"]
+                .as_str(),
+            Some(expected_pem.as_str())
+        );
+
+        // Wait for next tunnel attempt presenting the new token to be accepted
+        accepted_rx.await.map_err(|e| e.to_string())?;
+
+        stop_relay_run(&mut client, run_task)
+            .await
+            .map_err(|e| e.to_string())?;
+        stand_in_task.abort();
+        Ok(())
+    })
+    .await
+    .map_err(|_| "service_token_renewal_replaces_token_and_tunnel_connects timed out".to_owned())?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::result_large_err)]
+async fn service_token_renewal_not_enrolled_rejection_backs_off_production() -> Result<(), String> {
+    timeout(Duration::from_secs(10), async {
+        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-renewal-not-enrolled");
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+
+        write_test_journal_config(&journal_root, "spl", Some(&format!("http://{address}")));
+        let identity = load_or_create_service_identity(&journal_root).map_err(|e| e.to_string())?;
+        let ca = load_service_identity_ca(&journal_root).map_err(|e| e.to_string())?;
+        let expected_pem = ca.public_key_spki_pem();
+        let inst_id = identity.instance_id.clone();
+
+        let expired_token =
+            make_unsigned_jwt(Some("kid-test-1"), &inst_id, 100, 200, "session.listen");
+        save_service_token(&journal_root, &expired_token).map_err(|e| e.to_string())?;
+        let token_bytes_before =
+            std::fs::read(journal_root.join("link/tokens/account.json")).unwrap();
+
+        let recorded_enrolls = Arc::new(Mutex::new(Vec::new()));
+        let stand_in_task = tokio::spawn({
+            let recorded_enrolls = recorded_enrolls.clone();
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut peek_buf = [0u8; 128];
+                    let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                    let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
+                    if peek_str.starts_with("POST /enroll/home") {
+                        let (_, body) = read_http_request(&mut stream).await.unwrap_or_default();
+                        recorded_enrolls.lock().unwrap().push(body.clone());
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        if parsed.get("mode").and_then(|v| v.as_str()) == Some("renew") {
+                            let _ = write_http_response(
+                                &mut stream,
+                                404,
+                                "Not Found",
+                                r#"{"error":"not_enrolled"}"#,
+                            )
+                            .await;
+                        } else {
+                            let _ = write_http_response(
+                                &mut stream,
+                                400,
+                                "Bad Request",
+                                r#"{"error":"bad_mode"}"#,
+                            )
+                            .await;
+                        }
+                    } else if peek_str.starts_with("GET /.well-known/jwks.json") {
+                        let _ = read_http_request(&mut stream).await;
+                        let _ = write_http_response(
+                            &mut stream,
+                            200,
+                            "OK",
+                            r#"{"keys":[{"kid":"kid-test-1"}]}"#,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let mono_sec = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = RenewalClock {
+            now_unix: Arc::new(|| 1_000_000), // expired (exp was 200)
+            now_mono: {
+                let m = mono_sec.clone();
+                Arc::new(move || Duration::from_secs(m.load(std::sync::atomic::Ordering::SeqCst)))
+            },
+        };
+
+        let mut renewal_cfg =
+            RenewalConfig::production(journal_root.clone(), Arc::new(ServiceTokenHealth::default));
+        renewal_cfg.clock = clock;
+
+        let mut renewal_state = RenewalState::default();
+        let step1 = evaluate_once(&renewal_cfg, &mut renewal_state);
+        assert_eq!(
+            step1,
+            RenewalStep::Attempted {
+                trigger: Trigger::Expired,
+                outcome: Outcome::NotEnrolled,
+            }
+        );
+        assert_eq!(
+            std::fs::read(journal_root.join("link/tokens/account.json")).unwrap(),
+            token_bytes_before
+        );
+        assert_eq!(recorded_enrolls.lock().unwrap().len(), 1);
+
+        // Advance injected monotonic clock by less than 6 hours
+        mono_sec.store(5 * 3600, std::sync::atomic::Ordering::SeqCst);
+        let step2 = evaluate_once(&renewal_cfg, &mut renewal_state);
+        assert_eq!(step2, RenewalStep::Blocked);
+        assert_eq!(recorded_enrolls.lock().unwrap().len(), 1);
+
+        for body in recorded_enrolls.lock().unwrap().iter() {
+            let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(parsed.get("mode").and_then(|v| v.as_str()), Some("renew"));
+            assert_eq!(
+                parsed
+                    .get("instance_id")
+                    .or_else(|| parsed.get("id"))
+                    .and_then(|v| v.as_str()),
+                Some(inst_id.as_str())
+            );
+            assert_eq!(parsed["ca_pubkey"].as_str(), Some(expected_pem.as_str()));
+        }
+
+        stand_in_task.abort();
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        "service_token_renewal_not_enrolled_rejection_backs_off_production timed out".to_owned()
+    })?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::result_large_err)]
+async fn service_token_renewal_unhealthy_jwks_skips_enrollment() -> Result<(), String> {
+    timeout(Duration::from_secs(10), async {
+        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-renewal-unhealthy-keys");
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| e.to_string())?;
+        let address = listener.local_addr().map_err(|e| e.to_string())?;
+
+        write_test_journal_config(&journal_root, "spl", Some(&format!("http://{address}")));
+        let identity = load_or_create_service_identity(&journal_root).map_err(|e| e.to_string())?;
+        let inst_id = identity.instance_id.clone();
+
+        let jwks_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let enroll_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let stand_in_task = tokio::spawn({
+            let jwks_requests = jwks_requests.clone();
+            let enroll_requests = enroll_requests.clone();
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut peek_buf = [0u8; 128];
+                    let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+                    let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
+                    if peek_str.starts_with("GET /.well-known/jwks.json") {
+                        let _ = read_http_request(&mut stream).await;
+                        jwks_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = write_http_response(
+                            &mut stream,
+                            503,
+                            "Service Unavailable",
+                            r#"{"keys":[]}"#,
+                        )
+                        .await;
+                    } else if peek_str.starts_with("POST /enroll/home") {
+                        let _ = read_http_request(&mut stream).await;
+                        enroll_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = write_http_response(
+                            &mut stream,
+                            200,
+                            "OK",
+                            r#"{"service_token":"dummy"}"#,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let now_unix = 1_000_000i64;
+        let young_token = make_unsigned_jwt(
+            Some("kid-test-1"),
+            &inst_id,
+            now_unix - 100,
+            now_unix + 365 * 86_400,
+            "session.listen",
+        );
+        save_service_token(&journal_root, &young_token).map_err(|e| e.to_string())?;
+
+        let now_ms = now_unix * 1000;
+        let health = ServiceTokenHealth {
+            event_at_ms: Some(now_ms),
+            now_ms,
+            reason: Some("service_token_rejected".into()),
+            tunnel_error_at_ms: Some(100),
+            tunnel_success_at_ms: Some(50),
+        };
+
+        let mut renewal_cfg =
+            RenewalConfig::production(journal_root.clone(), Arc::new(move || health.clone()));
+        renewal_cfg.clock = RenewalClock {
+            now_unix: Arc::new(move || now_unix),
+            now_mono: Arc::new(|| Duration::from_secs(1000)),
+        };
+
+        let mut renewal_state = RenewalState::default();
+        for _ in 0..5 {
+            let step = evaluate_once(&renewal_cfg, &mut renewal_state);
+            assert_eq!(step, RenewalStep::Current);
+        }
+
+        assert!(jwks_requests.load(std::sync::atomic::Ordering::SeqCst) >= 5);
+        assert_eq!(enroll_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        stand_in_task.abort();
+        Ok(())
+    })
+    .await
+    .map_err(|_| "service_token_renewal_unhealthy_jwks_skips_enrollment timed out".to_owned())?
 }
 
 #[path = "spl_relay_lifecycle/access_contract.rs"]

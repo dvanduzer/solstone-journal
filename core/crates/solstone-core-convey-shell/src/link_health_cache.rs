@@ -65,7 +65,7 @@ pub(crate) fn parse_relay_health_event(
     })
 }
 
-pub(crate) const LINK_HEALTH_FRESHNESS_MS: i64 = 90_000;
+pub(crate) use solstone_core_spl::LINK_HEALTH_FRESHNESS_MS;
 
 pub(crate) fn replace_if_not_stale(
     store: &RelayHealthCacheStore,
@@ -114,6 +114,32 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default()
+}
+
+pub(crate) fn service_token_health_from_cache(
+    cache: Option<&RelayHealthCache>,
+    now_ms: i64,
+) -> solstone_core_spl::ServiceTokenHealth {
+    let (event_at_ms, reason, tunnel_error_at_ms, tunnel_success_at_ms) = match cache {
+        Some(entry) => (
+            Some(entry.ts),
+            entry.last_relay_tunnel_error.clone(),
+            entry
+                .last_relay_tunnel_error_at
+                .and_then(|t| i64::try_from(t).ok()),
+            entry
+                .last_successful_relay_tunnel_at
+                .and_then(|t| i64::try_from(t).ok()),
+        ),
+        None => (None, None, None, None),
+    };
+    solstone_core_spl::ServiceTokenHealth {
+        event_at_ms,
+        reason,
+        tunnel_error_at_ms,
+        tunnel_success_at_ms,
+        now_ms,
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +296,86 @@ mod tests {
                 .listen_generation,
             Some(5)
         );
+    }
+
+    #[test]
+    fn service_token_health_is_refused() {
+        use solstone_core_spl::service_token_health_is_refused;
+
+        let now_ms = 1_000_000;
+
+        // 1. No entry (None) -> not refused
+        let health = service_token_health_from_cache(None, now_ms);
+        assert!(!service_token_health_is_refused(&health));
+
+        let make_cache =
+            |ts: i64, reason: Option<&str>, err_at: Option<u64>, succ_at: Option<u64>| {
+                RelayHealthCache {
+                    state: "listening".to_owned(),
+                    listen_generation: Some(1),
+                    last_successful_relay_tunnel_at: succ_at,
+                    last_relay_tunnel_error: reason.map(str::to_owned),
+                    last_relay_tunnel_error_at: err_at,
+                    relay_tunnel_error_status: None,
+                    relay_admission_saturated_count: 0,
+                    last_relay_listener_ack_at: None,
+                    last_relay_listener_ack_generation: None,
+                    ts,
+                }
+            };
+
+        // 2. Fresh, current service_token_rejected -> refused
+        let fresh_current = make_cache(
+            now_ms - 10_000,
+            Some("service_token_rejected"),
+            Some(100),
+            Some(50),
+        );
+        let health = service_token_health_from_cache(Some(&fresh_current), now_ms);
+        assert!(service_token_health_is_refused(&health));
+
+        // Future event_at_ms counts as fresh
+        let future_event = make_cache(
+            now_ms + 10_000,
+            Some("service_token_rejected"),
+            Some(100),
+            Some(50),
+        );
+        let health = service_token_health_from_cache(Some(&future_event), now_ms);
+        assert!(service_token_health_is_refused(&health));
+
+        // 3. Stale entry (> 90_000 ms old) -> not refused
+        let stale = make_cache(
+            now_ms - 90_001,
+            Some("service_token_rejected"),
+            Some(100),
+            Some(50),
+        );
+        let health = service_token_health_from_cache(Some(&stale), now_ms);
+        assert!(!service_token_health_is_refused(&health));
+
+        // 4. Non-current error (success after error) -> not refused
+        let non_current = make_cache(
+            now_ms - 10_000,
+            Some("service_token_rejected"),
+            Some(50),
+            Some(100),
+        );
+        let health = service_token_health_from_cache(Some(&non_current), now_ms);
+        assert!(!service_token_health_is_refused(&health));
+
+        // 5. Any other reason -> not refused
+        let other_reason = make_cache(
+            now_ms - 10_000,
+            Some("relay_tunnel_rejected"),
+            Some(100),
+            Some(50),
+        );
+        let health = service_token_health_from_cache(Some(&other_reason), now_ms);
+        assert!(!service_token_health_is_refused(&health));
+
+        let no_reason = make_cache(now_ms - 10_000, None, Some(100), Some(50));
+        let health = service_token_health_from_cache(Some(&no_reason), now_ms);
+        assert!(!service_token_health_is_refused(&health));
     }
 }

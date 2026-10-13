@@ -1,10 +1,11 @@
 # solstone Developer Guide
 
-This file is the **developer guide** for the solstone-journal repository. Read it before writing code. The Rust conversion is closed: there is no Python reference implementation and no Python product code remains in this repository. Every write path lives in a crate under `core/crates/`.
+This file is the **developer guide** for the solstone-journal repository. Read it before writing code. The Rust conversion is closed: there is no Python reference implementation and no Python product code remains in this repository. Every write path lives in a crate under `core/crates/`. The journal app for mac, in `platforms/macos/`, is a Swift lifecycle and window adapter around that runtime; it never writes what the journal holds.
 
 Audience:
 
 - **Coders** (cwd = repo root, editing `core/crates/`, `core/native-sol/`, `core/payload/solstone/talent/`) — you're in the right place.
+- **Mac app work** (Swift, `platforms/macos/`) — read `platforms/macos/AGENTS.md`; it is a separate Swift package with its own Makefile, built on a Mac.
 - **Generate talents** (running inside the live system) — `docs/GENERATE.md` defines the completion boundary; `docs/CORTEX.md` and `docs/THINK.md` describe preparation, hooks and publication. Rust supplies their context and applies their output and domain-write rules. Neither this file nor the journal's skills are loaded into a talent's context.
 - **Operators** debugging a running system — see `docs/DOCTOR.md`.
 
@@ -42,6 +43,7 @@ Read, in order, when you enter the repo for a coding task:
 | `tools/journal_device_sim/` | Dependency-free linked-device fixture simulator; native `solstone link` remains the PL/SPL and identity boundary | composed ingest, reconciliation, recovery, and field-journal validation through a disposable receiver | `tools/journal_device_sim/README.md` |
 | `tests/` | `tests/fixtures/journal/` mock journal. Rust tests live beside their crates under `core/crates/*/tests/`; there is no separate top-level Python test tree | `make dev` / `make sandbox` use the fixtures as the journal | `docs/testing.md` |
 | `docs/` | All longform documentation | reference lookups; never your first stop | §11 below |
+| `platforms/macos/` | The journal app for mac: a Swift package (`SolstoneJournalMac`) that installs, starts, supervises and shows the native runtime, plus its packaging, signing and release targets. Shared Mac libraries come from solstone-macos at a pinned commit | changing the mac app, its first run, updates or packaging | `platforms/macos/README.md`, `platforms/macos/AGENTS.md` |
 | `journal/` | The live journal (journal contents). Git-ignored content; checked-in template (`AGENTS.md`, skills symlinks) | **rarely as a coder** — modify `core/crates/` or `core/payload/solstone/talent/`, not journal data | `core/payload/solstone/talent/journal/SKILL.md` |
 
 Top-level dirs intentionally not in the table: `.venv/`, `scratch/`, `logs/`, `tmp/`, `observers/`, `routines/`, `skills/` — not active coder surfaces. `solstone/` is not a coder surface either: it now holds exactly three files (`solstone/apps/devices/ingest.schema.json`, `solstone/think/detect_created.md`, `solstone/think/detect_created.schema.json`) and no product code.
@@ -185,6 +187,17 @@ On Linux, `solstone journal setup` is the runtime install path once you have the
 | `make pre-commit` | Install pre-commit hooks (optional). |
 | `make versions` | Print the Python version and key package versions from the `.venv` the remaining `scripts/` tooling uses (not a product dependency). Diagnostic. |
 | `make agent-setup` | Alias for `ci-full-prep-cargo`; a coding agent's one-shot cargo-side prep before a `ci-full`-adjacent run. |
+
+### Mac app (on a Mac only)
+
+The journal app's own Makefile in `platforms/macos/` holds its build, test, packaging and release targets. `make ci`, `ci-full` and `build` never touch it. These delegates run its entrypoints from the root:
+
+| Target | When to use |
+|--------|-------------|
+| `make macos-app-ci` | The mac app's unit gate: brand assets, `swift test`, and its packaging Python tests. |
+| `make macos-app-build` | Debug build of the app, its watchdog helper and the icon generator. |
+| `make macos-app-dev` | A local `journal.app` with a runtime built from this checkout. |
+| `make macos-app-integration-native` | The mac app's opt-in integration tier against a real native runtime. |
 
 ### Release and transparency
 

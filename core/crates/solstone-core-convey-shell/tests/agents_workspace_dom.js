@@ -613,6 +613,19 @@ async function test(name, body) {
       has(view, words, status);
       lacks(view, 'turning on', status);
     }
+    // 8c. A failed solstone.me shows the journal's own words, never the transient "keeps trying" copy.
+    {
+      const words = 'failed words from the journal';
+      const {view, click} = await boot(baseState({
+        enabled: true,
+        status: 'failed',
+        owner_state: {status: 'failed', detail: words},
+        ...door({listening: true}),
+      }));
+      await click({lane: 'me'});
+      has(view, words);
+      lacks(view, 'not reaching it right now');
+    }
     for (const [label, localDoor] of [
       ['soon', null],
       ['port', door({listening: false, reason: 'port_in_use'})],

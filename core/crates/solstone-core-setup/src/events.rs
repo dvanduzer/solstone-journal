@@ -346,4 +346,211 @@ mod tests {
             "{\"event\":\"step.started\",\"ts\":\"2026-01-01T00:00:00Z\",\"step\":\"journal\"}\n"
         );
     }
+
+    /// The Journal Mac app (platforms/macos) reads setup's JSONL. This fixture is
+    /// what it promises to understand: every value of the closed vocabularies and
+    /// one line per event type as this crate's emitter writes it. The Swift tests
+    /// decode it; this test keeps it equal to the native authority. Regenerate with
+    /// `SOLSTONE_UPDATE_SETUP_CONTRACT=1 cargo test -p solstone-core-setup` and
+    /// commit the result.
+    #[test]
+    fn mac_app_setup_contract_fixture_matches_the_native_vocabulary() {
+        use serde_json::Value;
+
+        fn every<T: Copy>(values: &[T], exhaustive: impl Fn(T)) -> Vec<T> {
+            values.iter().copied().for_each(&exhaustive);
+            values.to_vec()
+        }
+        // The matches have no wildcard arm: a new variant fails to compile here
+        // until it is listed, so the fixture cannot silently fall behind.
+        let events = every(
+            &[
+                EventType::SetupStarted,
+                EventType::SetupCompleted,
+                EventType::StepStarted,
+                EventType::StepCompleted,
+                EventType::StepFailed,
+                EventType::StepWarning,
+                EventType::DoctorStarted,
+                EventType::CheckCompleted,
+                EventType::DoctorCompleted,
+            ],
+            |event| match event {
+                EventType::SetupStarted
+                | EventType::SetupCompleted
+                | EventType::StepStarted
+                | EventType::StepCompleted
+                | EventType::StepFailed
+                | EventType::StepWarning
+                | EventType::DoctorStarted
+                | EventType::CheckCompleted
+                | EventType::DoctorCompleted => {}
+            },
+        );
+        let steps = every(
+            &[
+                StepName::Doctor,
+                StepName::Journal,
+                StepName::InstallModels,
+                StepName::SkillsUser,
+                StepName::SkillsJournal,
+                StepName::Wrapper,
+                StepName::Service,
+                StepName::Brain,
+            ],
+            |step| match step {
+                StepName::Doctor
+                | StepName::Journal
+                | StepName::InstallModels
+                | StepName::SkillsUser
+                | StepName::SkillsJournal
+                | StepName::Wrapper
+                | StepName::Service
+                | StepName::Brain => {}
+            },
+        );
+        let errors = every(
+            &[
+                ErrorCode::DoctorFailed,
+                ErrorCode::DoctorJsonlIncomplete,
+                ErrorCode::DoctorTimeout,
+                ErrorCode::JournalDirInvalid,
+                ErrorCode::JournalExistingBlocked,
+                ErrorCode::InstallationIdentityRefused,
+                ErrorCode::InstallationIdentityUnavailable,
+                ErrorCode::LegacySupervisorLockRefused,
+                ErrorCode::ServiceUpFailed,
+                ErrorCode::SetupUnhandledException,
+                ErrorCode::StepSubprocessFailed,
+                ErrorCode::StepSubprocessTimeout,
+                ErrorCode::WrapperProvisionFailed,
+            ],
+            |code| match code {
+                ErrorCode::DoctorFailed
+                | ErrorCode::DoctorJsonlIncomplete
+                | ErrorCode::DoctorTimeout
+                | ErrorCode::JournalDirInvalid
+                | ErrorCode::JournalExistingBlocked
+                | ErrorCode::InstallationIdentityRefused
+                | ErrorCode::InstallationIdentityUnavailable
+                | ErrorCode::LegacySupervisorLockRefused
+                | ErrorCode::ServiceUpFailed
+                | ErrorCode::SetupUnhandledException
+                | ErrorCode::StepSubprocessFailed
+                | ErrorCode::StepSubprocessTimeout
+                | ErrorCode::WrapperProvisionFailed => {}
+            },
+        );
+        let reasons = every(
+            &[
+                SkipReason::SkipModels,
+                SkipReason::SkipBrain,
+                SkipReason::SkipModelsImpliesSkipBrain,
+                SkipReason::SkipSkills,
+                SkipReason::SkipService,
+                SkipReason::SkipWrapper,
+                SkipReason::WindowsPackageOwnsCommands,
+                SkipReason::MacAppOwnsCommands,
+                SkipReason::WindowsAgentSkillsUnavailable,
+                SkipReason::ProviderAlreadyConfigured,
+                SkipReason::ProviderConfigUnexpectedShape,
+                SkipReason::LocalProviderUnavailable,
+                SkipReason::LocalBootstrapDidNotStart,
+                SkipReason::JournalNotCreatedYet,
+                SkipReason::SolAlreadyKeepsJournal,
+                SkipReason::PriorRunOk,
+                SkipReason::ResumedAfterRestart,
+            ],
+            |reason| match reason {
+                SkipReason::SkipModels
+                | SkipReason::SkipBrain
+                | SkipReason::SkipModelsImpliesSkipBrain
+                | SkipReason::SkipSkills
+                | SkipReason::SkipService
+                | SkipReason::SkipWrapper
+                | SkipReason::WindowsPackageOwnsCommands
+                | SkipReason::MacAppOwnsCommands
+                | SkipReason::WindowsAgentSkillsUnavailable
+                | SkipReason::ProviderAlreadyConfigured
+                | SkipReason::ProviderConfigUnexpectedShape
+                | SkipReason::LocalProviderUnavailable
+                | SkipReason::LocalBootstrapDidNotStart
+                | SkipReason::JournalNotCreatedYet
+                | SkipReason::SolAlreadyKeepsJournal
+                | SkipReason::PriorRunOk
+                | SkipReason::ResumedAfterRestart => {}
+            },
+        );
+        let statuses: Vec<&str> = [
+            ForeignStatus::Ok,
+            ForeignStatus::Warn,
+            ForeignStatus::Fail,
+            ForeignStatus::Skip,
+        ]
+        .into_iter()
+        .map(translate_status)
+        .collect();
+
+        let ts = "2026-01-01T00:00:00Z";
+        let mut emitter = JsonlEmitter::new(Vec::new());
+        for event in &events {
+            let fields = match event {
+                EventType::SetupStarted => {
+                    json!({"started_at": ts, "version": "2.0.0", "mode": "non_interactive"})
+                }
+                EventType::SetupCompleted => {
+                    json!({"status": "failed", "failed_step": "journal", "duration_ms": 12})
+                }
+                EventType::StepStarted => json!({"step": "journal", "index": 2, "total": 8}),
+                EventType::StepCompleted => {
+                    json!({"step": "wrapper", "outcome": "skipped", "reason": SkipReason::MacAppOwnsCommands.as_str(), "duration_ms": 0})
+                }
+                EventType::StepFailed => {
+                    json!({"step": "journal", "duration_ms": 0, "error": {"code": ErrorCode::JournalDirInvalid, "message": "journal directory is not usable", "details": "", "exit_code": 1}})
+                }
+                EventType::StepWarning => {
+                    json!({"step": "brain", "text": "local bootstrap did not start", "fix_hint": "install the local model from the thinking page"})
+                }
+                EventType::DoctorStarted => json!({"version": "2.0.0"}),
+                EventType::CheckCompleted => {
+                    json!({"name": "disk_space", "severity": "advisory", "status": "warning", "detail": "low disk space", "fix": ""})
+                }
+                EventType::DoctorCompleted => {
+                    json!({"status": "warning", "duration_ms": 42, "summary": {"total": 17, "failed": 0, "warnings": 1, "skipped": 2}})
+                }
+            };
+            let Value::Object(fields) = fields else {
+                unreachable!()
+            };
+            emitter.emit(*event, ts, fields).unwrap();
+        }
+        let lines: Vec<String> = String::from_utf8(emitter.into_inner())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+
+        let contract = json!({
+            "schema_version": 1,
+            "authority": "core/crates/solstone-core-setup/src/events.rs",
+            "event_types": events.iter().map(|e| e.as_str()).collect::<Vec<_>>(),
+            "step_names": steps.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "error_codes": errors,
+            "skip_reasons": reasons.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            "statuses": statuses,
+            "lines": lines,
+        });
+        let rendered = serde_json::to_string_pretty(&contract).unwrap() + "\n";
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../platforms/macos/Tests/JournalRuntimeTests/Fixtures/native-setup-contract.json");
+        if std::env::var_os("SOLSTONE_UPDATE_SETUP_CONTRACT").is_some() {
+            std::fs::write(&fixture, &rendered).unwrap();
+        }
+        let committed = std::fs::read_to_string(&fixture).unwrap_or_default();
+        assert_eq!(
+            committed, rendered,
+            "the Mac app's setup contract fixture is stale; regenerate it with \
+             SOLSTONE_UPDATE_SETUP_CONTRACT=1 cargo test -p solstone-core-setup"
+        );
+    }
 }

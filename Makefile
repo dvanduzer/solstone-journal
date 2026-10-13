@@ -1375,6 +1375,23 @@ clean:
 	find . -type f -name ".DS_Store" -delete
 	rm -f .installed
 
+# The Journal app for macOS lives in platforms/macos: its own Swift package and
+# Makefile, built and released on a Mac (Swift 6, Xcode, the sol-signing keychain).
+# Nothing in `make ci`, `ci-full` or `build` touches it. These delegates run its
+# entrypoints from the repository root; release targets stay in its Makefile.
+.PHONY: macos-app-ci macos-app-build macos-app-dev macos-app-integration-native
+macos-app-ci:
+	$(MAKE) -C platforms/macos ci
+
+macos-app-build:
+	$(MAKE) -C platforms/macos build
+
+macos-app-dev:
+	$(MAKE) -C platforms/macos journal-app-dev
+
+macos-app-integration-native:
+	$(MAKE) -C platforms/macos integration-native
+
 # Follow installed service logs
 service-logs:
 	$(RUST_BIN)/solstone-core-sol journal service logs -f
