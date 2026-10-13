@@ -4,7 +4,7 @@ Read this before changing anything in `platforms/macos/`. The repository's root 
 
 ## Ground rules
 
-- **The app never writes the journal.** Setup, first run (`/init`), and every journal write belong to the native runtime. The Swift side starts, supervises, stops and shows it.
+- **The app never writes what the journal holds.** Setup, first run (`/init`), and every journal write belong to the native runtime. The Swift side starts, supervises, stops and shows it; on restart it only moves stale runtime state files under `health/` aside.
 - **Two roots.** This directory is the Swift package root: sources, resources, `.build`, `journal.app` and DMGs. The repository root (`../..`) is the native runtime's source and the Git identity. Resolve paths from one or the other explicitly. Tests use `journalPackageRoot()` or `#filePath`, never the working directory.
 - **Shared code lives in solstone-macos.** `SolstoneCore`, `JournalMarkKit`, `UpdateKit`, `WatchdogKit` and the test-only `MacTestSupport` come from that repository at the exact commit pinned in `Package.swift` and `Package.resolved`. Fix shared behavior there, then move the pin here. Don't copy shared code into this package. Don't depend on the solstone app's own targets.
 - **Embedded runtimes are accepted bytes.** Release packaging embeds a published native archive by digest and verifies its signed manifest. Never rebuild a runtime to package a release, and never point the app at a runtime outside its bundle.

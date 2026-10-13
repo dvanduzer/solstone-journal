@@ -1,6 +1,6 @@
 # The journal app for mac
 
-`journal.app` is how the journal runs on a mac. It is a Swift app around the native journal runtime this repository builds: it sets the runtime up, starts it and keeps it running, opens your journal in a window, and updates itself. Everything that writes your journal is the native runtime in [`core/`](../../core); this app never writes the journal itself.
+`journal.app` is how the journal runs on a mac. It is a Swift app around the journal this repository builds: it sets the journal up, starts it and keeps it running, opens your journal in a window, and updates itself. Everything that writes your journal is built from [`core/`](../../core); this app never writes what your journal holds.
 
 Most people should download the app from <https://solstone.app/download/journal>.
 

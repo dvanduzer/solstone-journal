@@ -1,6 +1,6 @@
 # solstone Developer Guide
 
-This file is the **developer guide** for the solstone-journal repository. Read it before writing code. The Rust conversion is closed: there is no Python reference implementation and no Python product code remains in this repository. Every write path lives in a crate under `core/crates/`. The journal app for mac, in `platforms/macos/`, is a Swift lifecycle and window adapter around that runtime; it never writes the journal itself.
+This file is the **developer guide** for the solstone-journal repository. Read it before writing code. The Rust conversion is closed: there is no Python reference implementation and no Python product code remains in this repository. Every write path lives in a crate under `core/crates/`. The journal app for mac, in `platforms/macos/`, is a Swift lifecycle and window adapter around that runtime; it never writes what the journal holds.
 
 Audience:
 
