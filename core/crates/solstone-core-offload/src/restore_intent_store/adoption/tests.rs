@@ -6,6 +6,9 @@
 use super::*;
 use crate::test_restore_intent::{fixture, register};
 use solstone_core_journal_io::JournalRoot;
+use solstone_core_journal_io::atomic::{
+    BoundPublicationPrimitive, run_with_bound_publication_fault,
+};
 use solstone_core_journal_io::media::{
     Cleanup, Confirmation, Durability, PublicationEffect, PublicationReceipt,
 };
@@ -13,7 +16,6 @@ use solstone_core_retention::archive_catalog::codec::Event;
 use solstone_core_retention::archive_proof::ArchiveFileProof;
 use solstone_core_retention::restore_intent::{Obligation, PublicationDecision};
 use std::fs;
-use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
 
@@ -525,13 +527,6 @@ impl super::super::unix::Hooks for LateHook {
             self.fired = true;
         }
     }
-    fn sync(&mut self, directory: &impl AsFd, index: usize) -> io::Result<()> {
-        if self.cut == 0 && index == 2 {
-            self.fired = true;
-            return Err(io::Error::other("ancestor sync cut"));
-        }
-        nix::unistd::fsync(directory).map_err(io::Error::from)
-    }
 }
 
 #[test]
@@ -547,8 +542,20 @@ fn late_sync_named_replacement_and_new_stage_keep_actual_publication_without_con
             cut,
             fired: false,
         };
-        let result = review.confirm_with(&nonce, &mut hook);
-        assert!(hook.fired);
+        let result = if cut == 0 {
+            let (result, fired) = run_with_bound_publication_fault(
+                BoundPublicationPrimitive::ParentSync,
+                1,
+                nix::libc::EIO,
+                || review.confirm_with(&nonce, &mut hook),
+            );
+            assert!(fired);
+            result
+        } else {
+            let result = review.confirm_with(&nonce, &mut hook);
+            assert!(hook.fired);
+            result
+        };
         assert!(result.continuity.is_none());
         let write = result.review.owner.write.as_ref().unwrap();
         assert!(write.receipt.native.is_some());
@@ -565,7 +572,7 @@ fn late_sync_named_replacement_and_new_stage_keep_actual_publication_without_con
         assert!(Arc::ptr_eq(&write.owner.activity, &f.activity));
         if cut == 0 {
             assert!(!write.receipt.fully_confirmed());
-            assert_eq!(write.receipt.durability[2], Some(Durability::Unproven));
+            assert_eq!(write.receipt.durability[0], Some(Durability::Unproven));
         }
         if cut == 1 {
             assert!(!write.receipt.fully_confirmed());

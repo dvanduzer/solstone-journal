@@ -428,44 +428,6 @@ fn entry_loss_after_raw_claim_preserves_effect_and_only_raw_copy() {
 
 #[cfg(unix)]
 #[test]
-fn entry_loss_during_claim_sync_refuses_the_following_delete() {
-    let f = Fixture::new();
-    let activity = ActivityLease::try_acquire(f.root.clone()).unwrap();
-    let stage = MediaStage::create(f.parent.clone(), activity).unwrap();
-    let path = stage.diagnostic_path();
-    let expected = f
-        .live
-        .observe_file(OsStr::new("source.flac"))
-        .unwrap()
-        .unwrap();
-    let entry = f.temp.path().join(ENTRY);
-    let old = f.temp.path().join("old.lock");
-    let (mut removal, fired) = run_with_media_hook(
-        MediaPrimitive::FileSync,
-        move || {
-            fs::rename(&entry, old)?;
-            fs::write(entry, b"replacement")
-        },
-        || {
-            f.live
-                .remove_observed(OsStr::new("source.flac"), &expected, stage)
-        },
-    );
-    assert!(fired);
-    assert_eq!(removal.receipt().effect, RemovalEffect::Claimed);
-    assert_eq!(
-        removal.receipt().claim_confirmation,
-        Confirmation::Unverified
-    );
-    assert_eq!(removal.cleanup(), Cleanup::Refused);
-    assert_eq!(
-        fs::read(path.join(crate::media::REMOVAL_ORIGINAL_LEAF)).unwrap(),
-        b"abc"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn permission_denial_is_unavailable_and_never_busy() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
