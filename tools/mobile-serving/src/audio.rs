@@ -122,22 +122,22 @@ fn run(
     index(root)?;
     *state.status.lock().unwrap() = json!({"state":"ready","model_load_ms":load_ms});
     let mut failures = HashSet::new();
-    let mut was_cancelled = false;
+    let mut retry_generation = state.generation.load(Ordering::Acquire);
     while !state.stop.load(Ordering::Acquire) {
         authority
             .revalidate_canonical_binding()
             .map_err(|e| e.to_string())?;
+        let current_generation = state.generation.load(Ordering::Acquire);
+        if current_generation != retry_generation {
+            failures.clear();
+            retry_generation = current_generation;
+        }
         if state.cancel.load(Ordering::Acquire) {
-            was_cancelled = true;
             let mut status = state.status.lock().unwrap();
             if status["state"] != "failed" {
                 status["state"] = json!("cancelled");
             }
         } else {
-            if was_cancelled {
-                failures.clear();
-                was_cancelled = false;
-            }
             let mut errors = Vec::new();
             let inputs = discover_audio_files(root, &mut |_| {}, &mut |day, error| {
                 errors.push(format!("{}: {error}", day.display()))
