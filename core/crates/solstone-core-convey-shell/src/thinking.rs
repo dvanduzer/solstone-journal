@@ -1308,7 +1308,7 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
     };
     let value = value.trim();
     let provider = key_provider(env_var).expect("checked provider");
-    let validator = match one_shot_validator() {
+    let validator = match one_shot_validator(&journal.0) {
         Ok(validator) => validator,
         Err(response) => return *response,
     };
@@ -1332,7 +1332,7 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
 }
 
 async fn persist_key_validations(Extension(journal): Extension<Arc<JournalRoot>>) -> Response {
-    let validator = match one_shot_validator() {
+    let validator = match one_shot_validator(&journal.0) {
         Ok(validator) => validator,
         Err(_) => return key_check_failed(),
     };
@@ -1346,7 +1346,7 @@ async fn persist_key_validations(Extension(journal): Extension<Arc<JournalRoot>>
     }
 }
 
-async fn check_key(body: Bytes) -> Response {
+async fn check_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) -> Response {
     let Some(request) = request_object(&body) else {
         return missing_request_body();
     };
@@ -1370,7 +1370,7 @@ async fn check_key(body: Bytes) -> Response {
     if value.is_empty() {
         return invalid_request("value must not be empty");
     }
-    let validator = match one_shot_validator() {
+    let validator = match one_shot_validator(&journal.0) {
         Ok(value) => value,
         Err(response) => return *response,
     };
@@ -1433,7 +1433,7 @@ async fn validate_model(Extension(journal): Extension<Arc<JournalRoot>>, body: B
             identity,
         );
     };
-    let validator = match one_shot_validator() {
+    let validator = match one_shot_validator(&journal.0) {
         Ok(value) => value,
         Err(response) => return *response,
     };
@@ -1774,10 +1774,19 @@ fn key_provider(env_var: &str) -> Option<&'static str> {
     }
 }
 
-fn one_shot_validator()
--> Result<solstone_core_thinking::providers::OneShotKeyValidator, Box<Response>> {
-    solstone_core_thinking::providers::OneShotKeyValidator::sibling()
-        .map_err(|_error| Box::new(thinking_failure()))
+fn one_shot_validator(
+    journal: &Path,
+) -> Result<solstone_core_thinking::providers::OneShotKeyValidator, Box<Response>> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        Ok(solstone_core_thinking::providers::OneShotKeyValidator::embedded(journal.to_path_buf()))
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = journal;
+        solstone_core_thinking::providers::OneShotKeyValidator::sibling()
+            .map_err(|_error| Box::new(thinking_failure()))
+    }
 }
 
 fn browser_validation(result: Value, identity: Value) -> Response {
@@ -3515,7 +3524,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(
             roots_seen.lock().unwrap().as_slice(),
-            [root.clone()],
+            std::slice::from_ref(&root),
             "the check runs against the route's own journal root"
         );
         let body_str = serde_json::to_string(&body).unwrap();

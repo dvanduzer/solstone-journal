@@ -6,6 +6,7 @@
 use std::io::Write;
 
 use serde_json::{Map, Value, json};
+#[cfg(test)]
 use solstone_core_generate::OneShotClient;
 use solstone_core_journal_io::{
     AcceptedDailyResult, DailyUnitAuthority, DailyUnitIdentity, DailyUnitRecord, DailyUnitStatus,
@@ -112,7 +113,7 @@ fn finished(record: &DailyUnitRecord) -> Result<RuntimeOutcome, String> {
 pub(crate) fn execute(
     request: Map<String, Value>,
     context: &ExecutionContext,
-    generate: &OneShotClient,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
 ) -> RuntimeOutcome {
     execute_with_paths(request, context, generate, writer, None)
@@ -121,7 +122,7 @@ pub(crate) fn execute(
 pub(crate) fn execute_with_paths(
     request: Map<String, Value>,
     context: &ExecutionContext,
-    generate: &OneShotClient,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
     paths: Option<&crate::prepare::RuntimePaths>,
 ) -> RuntimeOutcome {

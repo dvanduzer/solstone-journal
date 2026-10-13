@@ -749,9 +749,12 @@ async fn write_callosum_line(
     line: Vec<u8>,
 ) {
     if connection.is_none() {
+        let Ok(endpoint) = solstone_core_callosum::endpoint_path(socket_path) else {
+            return;
+        };
         *connection = match timeout(
             CALLOSUM_IO_TIMEOUT,
-            tokio::net::UnixStream::connect(socket_path),
+            tokio::net::UnixStream::connect(endpoint.as_ref()),
         )
         .await
         {

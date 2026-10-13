@@ -57,6 +57,9 @@ fn config(v: &Value) -> Result<Arc<ClientConfig>, Error> {
     )?))
 }
 async fn connect(v: &Value) -> Result<Stream, Error> {
+    if !matches!(v["carrier"].as_str(), None | Some("direct")) {
+        return Err("held and fault carriers require direct mode".into());
+    }
     let port = u16::try_from(v["port"].as_u64().ok_or("missing port")?)?;
     let tcp = TcpStream::connect((field(v, "host")?, port)).await?;
     tcp.set_nodelay(true)?;
@@ -163,12 +166,15 @@ async fn command(
     match field(v, "op")? {
         "pair" => {
             let link = field(v, "link")?;
-            // This qualification is LAN-only; reject relay links before dialing.
-            if !matches!(
+            // Require the chosen carrier before dialing. Relay qualification
+            // cannot silently use direct endpoints from a pairing link.
+            match (
+                v["carrier"].as_str().unwrap_or("direct"),
                 spl_core::pairlink::parse(link)?,
-                spl_core::pairlink::ParsedPairLink::Direct(_)
             ) {
-                return Err("qualification accepts direct pair links only".into());
+                ("direct", spl_core::pairlink::ParsedPairLink::Direct(_))
+                | ("relay", spl_core::pairlink::ParsedPairLink::Relay(_)) => {}
+                _ => return Err("pair link does not match selected carrier".into()),
             }
             let credential = spl_transport::pairing::pair_from_link(
                 link,
@@ -192,6 +198,26 @@ async fn command(
             )
         }
         "request" => {
+            if v["carrier"].as_str() == Some("relay") {
+                let c = credentials(v)?;
+                let result = spl_transport::relay::request_once_relay(
+                    config(v)?,
+                    c.relay_origin.as_deref().ok_or("missing relay origin")?,
+                    &c.instance_id,
+                    c.device_token
+                        .as_deref()
+                        .ok_or("missing relay device token")?,
+                    field(v, "method")?,
+                    field(v, "uri")?,
+                    &headers(v),
+                    &body(v)?,
+                )
+                .await?;
+                return Ok(response(result));
+            }
+            if !matches!(v["carrier"].as_str(), None | Some("direct")) {
+                return Err("unknown carrier".into());
+            }
             let port = u16::try_from(v["port"].as_u64().ok_or("missing port")?)?;
             let result = spl_transport::connection::request_once(
                 config(v)?,
@@ -211,6 +237,9 @@ async fn command(
             Ok(json!({"connected":true}))
         }
         "held" => {
+            if !matches!(v["carrier"].as_str(), None | Some("direct")) {
+                return Err("held and fault carriers require direct mode".into());
+            }
             exchange(
                 held.as_mut().ok_or("no held carrier")?,
                 dialer.allocate(),

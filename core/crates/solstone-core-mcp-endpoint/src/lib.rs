@@ -93,7 +93,9 @@ pub use permissions::{
     PermissionStoreError, PermissionsFile, ReadPermission, ReadScope, evaluate_connection_read,
     resolve_permission_facet_names,
 };
-pub use service_process::{McpServiceError, run_native_service_with_hosted_parent};
+pub use service_process::{
+    McpServiceError, run_embedded_service, run_native_service_with_hosted_parent,
+};
 /// The closed audit vocabulary, re-exported for the owner's CLI.
 ///
 /// ⛔ This is the record *type*, not a reader: `solstone-core-mcp-audit` stays a

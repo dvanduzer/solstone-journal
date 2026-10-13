@@ -34,6 +34,27 @@ pub use types::{
     RefusalReason, RefusedResponse, SessionTerminal, UnknownReasonCode,
 };
 
+/// A synchronous Generate boundary used by talent execution. Process clients
+/// and app-owned provider dispatch preserve the same typed request and reply.
+pub trait GenerateExecutor: Send + Sync {
+    fn execute(&self, request: &GenerateRequest) -> Result<GenerateResponse, ClientError>;
+}
+
+impl GenerateExecutor for OneShotClient {
+    fn execute(&self, request: &GenerateRequest) -> Result<GenerateResponse, ClientError> {
+        OneShotClient::execute(self, request)
+    }
+}
+
+impl<F> GenerateExecutor for F
+where
+    F: Fn(&GenerateRequest) -> Result<GenerateResponse, ClientError> + Send + Sync,
+{
+    fn execute(&self, request: &GenerateRequest) -> Result<GenerateResponse, ClientError> {
+        self(request)
+    }
+}
+
 /// The Windows launch-protocol environment names a child may only receive fresh
 /// from its own launcher (`solstone_core_system::process::launch_only_environment_names`).
 /// This crate is publishable and cannot depend on `solstone-core-system`, so it keeps
