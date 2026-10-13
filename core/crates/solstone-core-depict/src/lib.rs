@@ -409,7 +409,6 @@ fn build_generate_request(prepared_png: &[u8]) -> GenerateRequest {
         timeout_s: None,
         json_output: false,
         json_schema: None,
-        enforce_responsiveness: true,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: None,
@@ -1265,7 +1264,6 @@ mod tests {
         assert_eq!(request.timeout_s, None);
         assert!(!request.json_output);
         assert_eq!(request.json_schema, None);
-        assert!(request.enforce_responsiveness);
         assert_eq!(request.attempt_index, 0);
         assert!(!request.exclusive_admission);
         assert_eq!(request.transport_retries, None);

@@ -211,7 +211,7 @@ fn acceptance_19_concurrent_and_refresh_recovery() {
     });
 
     let request_payload = json!({
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "id": "test-req",
         "attempt_index": 0,
         "context": "test",
@@ -220,7 +220,6 @@ fn acceptance_19_concurrent_and_refresh_recovery() {
         "json_schema": {"type": "object", "properties": {"msg": {"type": "string"}}, "additionalProperties": false},
         "temperature": 0.3,
         "max_output_tokens": 100,
-        "enforce_responsiveness": true,
         "exclusive_admission": false
     });
 

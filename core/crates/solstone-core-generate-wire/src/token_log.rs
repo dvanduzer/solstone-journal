@@ -12,11 +12,6 @@ use solstone_core_journal_config::owner_zone;
 
 static TOKEN_LOG_LOCK: Mutex<()> = Mutex::new(());
 
-pub struct GenerateUsageMetadata<'a> {
-    pub non_responsive_output: Option<&'a str>,
-    pub non_responsive_matched_signal: Option<&'a str>,
-}
-
 struct UsageRecord<'a> {
     journal_path: &'a Path,
     model: &'a str,
@@ -24,7 +19,6 @@ struct UsageRecord<'a> {
     usage: &'a Value,
     entry_type: &'a str,
     segment: Option<&'a str>,
-    metadata: Option<&'a GenerateUsageMetadata<'a>>,
 }
 
 pub fn record_generate_usage(
@@ -32,9 +26,8 @@ pub fn record_generate_usage(
     model: &str,
     context: &str,
     usage: &Value,
-    metadata: Option<&GenerateUsageMetadata<'_>>,
 ) -> io::Result<()> {
-    record_generate_usage_at(journal_path, model, context, usage, metadata, Utc::now())
+    record_generate_usage_at(journal_path, model, context, usage, Utc::now())
 }
 
 fn record_generate_usage_at(
@@ -42,7 +35,6 @@ fn record_generate_usage_at(
     model: &str,
     context: &str,
     usage: &Value,
-    metadata: Option<&GenerateUsageMetadata<'_>>,
     now: chrono::DateTime<Utc>,
 ) -> io::Result<()> {
     record_usage_at(
@@ -53,7 +45,6 @@ fn record_generate_usage_at(
             usage,
             entry_type: "generate",
             segment: None,
-            metadata,
         },
         now,
     )
@@ -66,7 +57,6 @@ pub fn record_usage(
     usage: &Value,
     entry_type: &str,
     segment: Option<&str>,
-    metadata: Option<&GenerateUsageMetadata<'_>>,
 ) -> io::Result<()> {
     record_usage_at(
         UsageRecord {
@@ -76,7 +66,6 @@ pub fn record_usage(
             usage,
             entry_type,
             segment,
-            metadata,
         },
         Utc::now(),
     )
@@ -99,14 +88,6 @@ fn record_usage_at(record: UsageRecord<'_>, now: chrono::DateTime<Utc>) -> io::R
         entry.insert("segment".into(), json!(segment));
     }
     entry.insert("type".into(), json!(record.entry_type));
-    if let Some(metadata) = record.metadata {
-        if let Some(output) = metadata.non_responsive_output {
-            entry.insert("non_responsive_output".into(), json!(output));
-        }
-        if let Some(signal) = metadata.non_responsive_matched_signal {
-            entry.insert("non_responsive_matched_signal".into(), json!(signal));
-        }
-    }
     let mut line = serde_json::to_vec(&Value::Object(entry)).expect("token log values serialize");
     line.push(b'\n');
     let directory = record.journal_path.join("tokens");
@@ -223,7 +204,6 @@ mod tests {
             usage: &usage,
             entry_type: "generate",
             segment: None,
-            metadata: None,
         };
         record_usage_at(record(), now).unwrap();
         record_usage_at(record(), now).unwrap();
@@ -237,42 +217,7 @@ mod tests {
         for line in lines {
             let value: Value = serde_json::from_str(line).unwrap();
             assert_generate_line(&value);
-            assert!(value.get("non_responsive_output").is_none());
-            assert!(value.get("non_responsive_matched_signal").is_none());
         }
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn writes_non_responsive_metadata_only_when_present() {
-        let directory = crate::validation::isolated_journal_dir("token-log-metadata");
-        let now = fixed_utc();
-        let usage = json!({});
-        let metadata = GenerateUsageMetadata {
-            non_responsive_output: Some("I cannot do that."),
-            non_responsive_matched_signal: Some("i cannot"),
-        };
-        record_usage_at(
-            UsageRecord {
-                journal_path: &directory,
-                model: "model",
-                context: "context",
-                usage: &usage,
-                entry_type: "generate",
-                segment: None,
-                metadata: Some(&metadata),
-            },
-            now,
-        )
-        .unwrap();
-        let zone = owner_zone(&directory);
-        let path = directory
-            .join("tokens")
-            .join(now.with_timezone(&zone).format("%Y%m%d").to_string() + ".jsonl");
-        let value: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_generate_line(&value);
-        assert_eq!(value["non_responsive_output"], "I cannot do that.");
-        assert_eq!(value["non_responsive_matched_signal"], "i cannot");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -282,8 +227,7 @@ mod tests {
         let generic_directory = crate::validation::isolated_journal_dir("token-generic");
         let now = fixed_utc();
         let usage = json!({"input_tokens": 2});
-        record_generate_usage_at(&wrapper_directory, "model", "context", &usage, None, now)
-            .unwrap();
+        record_generate_usage_at(&wrapper_directory, "model", "context", &usage, now).unwrap();
         record_usage_at(
             UsageRecord {
                 journal_path: &generic_directory,
@@ -292,7 +236,6 @@ mod tests {
                 usage: &usage,
                 entry_type: "generate",
                 segment: None,
-                metadata: None,
             },
             now,
         )
@@ -329,7 +272,6 @@ mod tests {
                 usage: &usage,
                 entry_type: "generate",
                 segment: None,
-                metadata: None,
             },
             now,
         )

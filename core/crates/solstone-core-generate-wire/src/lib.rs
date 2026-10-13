@@ -16,7 +16,6 @@ pub mod overrides;
 mod pool;
 mod refusal;
 mod request;
-mod responsiveness;
 mod schema_prep;
 mod schema_validation;
 pub mod session;
@@ -57,15 +56,11 @@ pub use openai::{
 pub use pool::{ConfidentialChannelPool, PoolClock, SystemPoolClock};
 pub use refusal::refusal_for;
 pub use request::parse_one_shot_request;
-pub use responsiveness::{
-    NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS, ResponsivenessSignal, ResponsivenessVerdict,
-    classify_output_responsiveness,
-};
 pub use schema_prep::{anthropic_schema_violations, prepare_provider_schema};
 pub use schema_validation::{SchemaValidationResult, validate_schema_with_annotations};
 pub use session::{SessionConfig, SessionHost, SessionOutcome, run_session};
 pub use thinking::{BYO_THINKING_BUDGET_KEY, BYO_THINKING_BUDGETS, Thinking, byo_thinking};
-pub use token_log::{GenerateUsageMetadata, record_generate_usage, record_usage, usage_for_log};
+pub use token_log::{record_generate_usage, record_usage, usage_for_log};
 pub use validation::{
     ProviderResultAssessment, ProviderResultView, SanitizedFinishReason, ValidationFailure,
     assess_provider_result,

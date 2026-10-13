@@ -226,7 +226,6 @@ fn validation_request() -> GenerateRequest {
         timeout_s: Some(30.0),
         json_output: false,
         json_schema: None,
-        enforce_responsiveness: true,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: Some(0),
@@ -1768,8 +1767,8 @@ mod tests {
     }
 
     // The prompt, token budget, thinking budget, retry count, timeout, schema,
-    // responsiveness, attempt index, and exclusive admission values retain the
-    // retired Python validation request contract.
+    // attempt index, and exclusive admission values retain the retired Python
+    // validation request contract.
     fn expected_validation_request() -> GenerateRequest {
         GenerateRequest {
             id: None,
@@ -1783,7 +1782,6 @@ mod tests {
             timeout_s: Some(30.0),
             json_output: false,
             json_schema: None,
-            enforce_responsiveness: true,
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: Some(0),

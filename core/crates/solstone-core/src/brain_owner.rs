@@ -573,7 +573,6 @@ fn generate_component(now: DateTime<Utc>, probe: &impl BrainOwnerProbe) -> Value
         timeout_s: Some(30.0),
         json_output: false,
         json_schema: None,
-        enforce_responsiveness: false,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: Some(0),

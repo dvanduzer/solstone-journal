@@ -447,7 +447,7 @@ def run_generate_proof(
     case_dir: Path,
 ) -> tuple[bool, str, str]:
     request_payload = {
-        "schema": "solstone-generate-request-v2",
+        "schema": "solstone-generate-request-v3",
         "id": "portal-bootstrap-proof",
         "context": "portal.bootstrap.validation",
         "contents": [
@@ -458,7 +458,6 @@ def run_generate_proof(
         ],
         "max_output_tokens": 128,
         "timeout_s": 120,
-        "enforce_responsiveness": False,
         "temperature": 0.3,
         "json_output": False,
         "json_schema": None,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Shared usage logging, strict result validation, and responsiveness handling.
+//! Shared usage logging and strict result validation.
 
 use std::io;
 use std::path::Path;
@@ -12,10 +12,7 @@ use serde_json::Value;
 
 pub use crate::token_log::usage_for_log;
 
-use crate::responsiveness::{
-    NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS, ResponsivenessSignal, classify_output_responsiveness,
-};
-use crate::token_log::{GenerateUsageMetadata, record_generate_usage};
+use crate::token_log::record_generate_usage;
 
 const MAX_SAFE_FINISH_REASON_LENGTH: usize = 64;
 
@@ -33,7 +30,6 @@ pub struct ProviderResultView<'a> {
     pub finish_reason: &'a str,
     pub usage: &'a Value,
     pub json_output: bool,
-    pub enforce_responsiveness: bool,
     pub raw_response_snippet: Option<&'a str>,
     /// The provider returned thinking content, which marks a thinking-consumed
     /// reply even when no token count for it comes back (Anthropic's thinking
@@ -58,11 +54,8 @@ pub enum ValidationFailure {
     IncompleteJson {
         finish_reason: SanitizedFinishReason,
     },
-    NonResponsiveOutput,
     /// The model reached its ceiling while thinking and wrote no visible output.
-    ThinkingConsumedBudget {
-        json_output: bool,
-    },
+    ThinkingConsumedBudget { json_output: bool },
 }
 
 #[derive(Debug)]
@@ -72,31 +65,12 @@ pub struct ProviderResultAssessment {
 }
 
 pub fn assess_provider_result(view: ProviderResultView<'_>) -> ProviderResultAssessment {
-    let verdict = view
-        .enforce_responsiveness
-        .then(|| classify_output_responsiveness(view.text));
-    let non_responsive = verdict.is_some_and(|verdict| verdict.non_responsive);
-    let capped_output = non_responsive.then(|| {
-        view.text
-            .chars()
-            .take(NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS)
-            .collect::<String>()
-    });
-    let matched_signal = verdict
-        .and_then(|verdict| verdict.matched_signal)
-        .map(ResponsivenessSignal::as_log_value);
-
-    let token_log_error = if has_usage(view.usage) || non_responsive {
-        let metadata = GenerateUsageMetadata {
-            non_responsive_output: capped_output.as_deref(),
-            non_responsive_matched_signal: matched_signal,
-        };
+    let token_log_error = if has_usage(view.usage) {
         record_generate_usage(
             view.journal_path,
             view.model,
             view.context,
             &usage_for_log(view.usage),
-            non_responsive.then_some(&metadata),
         )
         .err()
     } else {
@@ -122,8 +96,6 @@ pub fn assess_provider_result(view: ProviderResultView<'_>) -> ProviderResultAss
         Some(ValidationFailure::ProviderResponseInvalid {
             raw_response_snippet: view.raw_response_snippet.map(str::to_owned),
         })
-    } else if non_responsive {
-        Some(ValidationFailure::NonResponsiveOutput)
     } else {
         None
     };
@@ -212,7 +184,6 @@ mod tests {
             finish_reason,
             usage,
             json_output: false,
-            enforce_responsiveness: true,
             raw_response_snippet: None,
             thinking_seen: false,
         }
@@ -242,15 +213,10 @@ mod tests {
     }
 
     #[test]
-    fn json_truncation_wins_over_responsiveness_after_logging() {
+    fn json_truncation_is_reported_after_logging() {
         let journal = temp_journal();
         let usage = json!({"input_tokens": 2});
-        let mut result = view(
-            &journal,
-            "I cannot complete that request.",
-            "max_tokens",
-            &usage,
-        );
+        let mut result = view(&journal, "{\"partial\": ", "max_tokens", &usage);
         result.json_output = true;
         let assessment = assess_provider_result(result);
         assert_eq!(
@@ -270,7 +236,7 @@ mod tests {
         )
         .unwrap();
         let line: Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(line["non_responsive_matched_signal"], "i cannot");
+        assert_eq!(line["usage"]["input_tokens"], 2);
         let _ = fs::remove_dir_all(journal);
     }
 
@@ -366,35 +332,6 @@ mod tests {
         assert_eq!(
             assess_provider_result(view(&journal, "", "tool_calls", &usage)).failure,
             None
-        );
-        let _ = fs::remove_dir_all(journal);
-    }
-
-    #[test]
-    fn cap_is_utf8_safe_and_exactly_512_characters() {
-        let journal = temp_journal();
-        let usage = json!({});
-        let text = format!("I cannot {}", "界".repeat(600));
-        let assessment = assess_provider_result(view(&journal, &text, "stop", &usage));
-        assert_eq!(
-            assessment.failure,
-            Some(ValidationFailure::NonResponsiveOutput)
-        );
-        let token_file = fs::read_dir(journal.join("tokens"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let line: Value =
-            serde_json::from_str(fs::read_to_string(token_file).unwrap().trim()).unwrap();
-        assert_eq!(
-            line["non_responsive_output"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count(),
-            512
         );
         let _ = fs::remove_dir_all(journal);
     }

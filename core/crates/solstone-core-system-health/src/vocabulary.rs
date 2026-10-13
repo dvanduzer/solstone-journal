@@ -78,7 +78,6 @@ pub const DETERMINISTIC_FAILURE_REASON_CODES: &[&str] = &[
     "max_turns_exhausted",
     "model_not_found",
     "no_output",
-    "non_responsive",
     "provider_request_rejected",
     "schema_invalid",
     "token_budget_exceeded",

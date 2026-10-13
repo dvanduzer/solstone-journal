@@ -81,7 +81,6 @@ fn request() -> GenerateRequest {
         timeout_s: Some(3.0),
         json_output: false,
         json_schema: None,
-        enforce_responsiveness: true,
         attempt_index: 0,
         exclusive_admission: false,
         transport_retries: None,
@@ -471,19 +470,6 @@ fn bundled_local_truncated_text_generates_and_carries_its_finish_reason() {
     assert_eq!(
         generated.finish_reason, "max_tokens",
         "the caller's only signal that the answer was cut off must survive the boundary"
-    );
-}
-
-#[test]
-fn bundled_local_non_responsive_output_refuses() {
-    bundled_refusal(
-        Completion {
-            text: "I cannot help with that request.",
-            finish_reason: "stop",
-        },
-        |_| {},
-        RefusalReason::NonResponsiveOutput,
-        Some("non_responsive"),
     );
 }
 

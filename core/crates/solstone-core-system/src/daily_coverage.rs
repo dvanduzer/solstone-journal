@@ -530,6 +530,8 @@ pub fn daily_failure_capped(reason: &str, count: u32) -> bool {
         | "context_window_exceeded"
         | "max_turns_exhausted"
         | "no_output"
+        // No longer emitted; day-unit records already on disk from earlier
+        // versions can carry it and must stay capped so coverage and dispatch agree.
         | "non_responsive"
         | "token_budget_exceeded"
         | "wall_clock_exceeded" => 2,

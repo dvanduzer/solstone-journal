@@ -484,7 +484,6 @@ mod tests {
             timeout_s: None,
             json_output: false,
             json_schema: None,
-            enforce_responsiveness: false,
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: None,
@@ -956,7 +955,6 @@ mod tests {
             finish_reason: &zero.finish_reason,
             usage: &zero.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: None,
             thinking_seen: false,
         });
@@ -976,7 +974,6 @@ mod tests {
             finish_reason: &nonzero.finish_reason,
             usage: &nonzero.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: None,
             thinking_seen: false,
         });
@@ -1160,7 +1157,6 @@ mod tests {
             finish_reason: &generated.finish_reason,
             usage: &generated.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: generated.raw_response_snippet.as_deref(),
             thinking_seen: false,
         });
@@ -1869,7 +1865,6 @@ mod tests {
             finish_reason: &success.finish_reason,
             usage: &success.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: success.raw_response_snippet.as_deref(),
             thinking_seen: false,
         });
@@ -1904,7 +1899,6 @@ mod tests {
             finish_reason: &success_invalid.finish_reason,
             usage: &success_invalid.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: success_invalid.raw_response_snippet.as_deref(),
             thinking_seen: false,
         });

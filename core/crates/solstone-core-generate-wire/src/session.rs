@@ -391,7 +391,6 @@ mod tests {
                 timeout_s: Some(30.0),
                 json_output: false,
                 json_schema: None,
-                enforce_responsiveness: true,
                 attempt_index: 0,
                 exclusive_admission: false,
                 transport_retries: None,

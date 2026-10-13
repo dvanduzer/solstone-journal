@@ -375,7 +375,6 @@ mod tests {
             timeout_s: None,
             json_output: false,
             json_schema: None,
-            enforce_responsiveness: false,
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: None,
@@ -487,7 +486,6 @@ mod tests {
             finish_reason: &generated.finish_reason,
             usage: &generated.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: None,
             thinking_seen: false,
         });
@@ -607,7 +605,6 @@ mod tests {
             finish_reason: &generated.finish_reason,
             usage: &generated.usage,
             json_output: false,
-            enforce_responsiveness: false,
             raw_response_snippet: generated.raw_response_snippet.as_deref(),
             thinking_seen: false,
         });

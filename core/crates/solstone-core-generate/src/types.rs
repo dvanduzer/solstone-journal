@@ -24,7 +24,6 @@ pub struct GenerateRequest {
     pub timeout_s: Option<f64>,
     pub json_output: bool,
     pub json_schema: Option<Value>,
-    pub enforce_responsiveness: bool,
     pub attempt_index: u64,
     pub exclusive_admission: bool,
     pub transport_retries: Option<u64>,
@@ -56,7 +55,6 @@ pub enum RefusalReason {
     ProviderResponseInvalid,
     ConfidentialChannelClosed,
     SchemaValidationFailed,
-    NonResponsiveOutput,
     Unknown,
 }
 
@@ -72,7 +70,6 @@ impl RefusalReason {
             Self::ProviderResponseInvalid => "provider-response-invalid",
             Self::ConfidentialChannelClosed => "confidential-channel-closed",
             Self::SchemaValidationFailed => "schema-validation-failed",
-            Self::NonResponsiveOutput => "non-responsive-output",
             Self::Unknown => "unknown",
         }
     }
@@ -88,7 +85,6 @@ impl RefusalReason {
             "provider-response-invalid" => Self::ProviderResponseInvalid,
             "confidential-channel-closed" => Self::ConfidentialChannelClosed,
             "schema-validation-failed" => Self::SchemaValidationFailed,
-            "non-responsive-output" => Self::NonResponsiveOutput,
             _ => Self::Unknown,
         }
     }

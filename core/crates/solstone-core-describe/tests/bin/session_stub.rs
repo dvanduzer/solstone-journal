@@ -163,8 +163,6 @@ fn main() {
             refused(&id, true, true, Some("binary_missing"));
         } else if mode == "no_engine_configured" {
             no_engine(&id);
-        } else if mode == "non_responsive" {
-            refused(&id, false, false, Some("non_responsive"));
         } else if mode == "unknown_code" {
             refused(&id, false, true, Some("future_code"));
         } else if mode == "generated_unknown_finish" {

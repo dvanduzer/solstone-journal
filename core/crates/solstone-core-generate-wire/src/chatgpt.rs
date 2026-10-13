@@ -915,7 +915,6 @@ mod tests {
             timeout_s: None,
             json_output: false,
             json_schema: None,
-            enforce_responsiveness: true,
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: None,
@@ -1233,7 +1232,6 @@ mod tests {
                     finish_reason: &g.finish_reason,
                     usage: &g.usage,
                     json_output: true,
-                    enforce_responsiveness: false,
                     raw_response_snippet: g.raw_response_snippet.as_deref(),
                     thinking_seen: g.thinking.is_some(),
                 };

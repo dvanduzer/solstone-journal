@@ -945,7 +945,6 @@ mod tests {
             timeout_s,
             json_output: false,
             json_schema: None,
-            enforce_responsiveness: false,
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: None,
@@ -1722,7 +1721,6 @@ mod tests {
                 &generated.model,
                 &request.context,
                 &crate::usage_for_log(&usage),
-                None,
             )
             .expect("token log write");
             let tokens = journal.join("tokens");
