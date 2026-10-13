@@ -19,7 +19,13 @@ pub fn after_open(path: PathBuf, callback: impl FnOnce() + 'static) {
 pub(crate) fn opened(path: &Path) {
     let callback = HOOK.with(|hook| {
         let mut hook = hook.borrow_mut();
-        if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
+        // Readers report their own spelling of the leaf (on Windows, a plain
+        // diagnostic path), while `after_open` stored the canonical one (on
+        // Windows, a `\\?\` verbatim path), so compare canonically too.
+        if hook.as_ref().is_some_and(|(expected, _)| {
+            expected == path
+                || std::fs::canonicalize(path).is_ok_and(|canonical| &canonical == expected)
+        }) {
             hook.take().map(|(_, callback)| callback)
         } else {
             None
