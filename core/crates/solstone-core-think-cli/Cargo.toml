@@ -22,6 +22,7 @@ test-hooks = []
 chrono.workspace = true
 glob.workspace = true
 log.workspace = true
+rapidfuzz.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

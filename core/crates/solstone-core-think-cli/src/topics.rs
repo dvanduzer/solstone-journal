@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,8 @@ struct TranscriptToken {
     _token_idx: usize,
     word: String,
     normalized: String,
+    /// The normalized word as a small id, so a passage compares as a sequence.
+    id: u32,
     speaker: Option<String>,
 }
 
@@ -50,6 +53,15 @@ fn normalize_token(token: &str) -> String {
         .filter(|&c| !is_drop_punct(c))
         .collect::<String>()
         .to_lowercase()
+}
+
+fn word_id(vocabulary: &mut HashMap<String, u32>, word: &str) -> u32 {
+    if let Some(id) = vocabulary.get(word) {
+        return *id;
+    }
+    let id = u32::try_from(vocabulary.len()).unwrap_or(u32::MAX);
+    vocabulary.insert(word.to_owned(), id);
+    id
 }
 
 fn collapse_crlf(s: &str) -> String {
@@ -137,6 +149,72 @@ fn parse_file_speech(content: &str) -> Vec<SpeechRecord> {
     }
 
     records
+}
+
+/// The lowest word-sequence similarity at which a quote that is not word for
+/// word still finds its passage. The passage is shown in the transcript's own
+/// words, never the quote's.
+const FUZZY_QUOTE_FLOOR: f64 = 0.85;
+
+/// How many words longer or shorter than the quote a passage may be.
+const FUZZY_QUOTE_SLACK: usize = 4;
+
+/// The passage closest to a quote that is not word for word, if any reaches
+/// [`FUZZY_QUOTE_FLOOR`]. Like an exact match it stays in one file, crosses
+/// only consecutive records, and runs 3 to 30 words. The first best wins.
+fn fuzzy_match_quote(
+    model_ids: &[u32],
+    files_tokens: &[Vec<TranscriptToken>],
+) -> Option<MatchedQuote> {
+    if model_ids.is_empty() {
+        return None;
+    }
+    let shortest = model_ids.len().saturating_sub(FUZZY_QUOTE_SLACK).max(3);
+    let longest = (model_ids.len() + FUZZY_QUOTE_SLACK).min(30);
+    let mut best: Option<(f64, usize, usize, usize)> = None;
+    for (file_idx, tokens) in files_tokens.iter().enumerate() {
+        for start in 0..tokens.len() {
+            for len in shortest..=longest {
+                let end = start + len;
+                if end > tokens.len() {
+                    break;
+                }
+                let window = &tokens[start..end];
+                if !window
+                    .windows(2)
+                    .all(|pair| pair[1].record_idx <= pair[0].record_idx + 1)
+                {
+                    break;
+                }
+                let score = rapidfuzz::fuzz::ratio(
+                    model_ids.iter().copied(),
+                    window.iter().map(|token| token.id),
+                );
+                if score >= FUZZY_QUOTE_FLOOR && best.is_none_or(|(top, ..)| score > top) {
+                    best = Some((score, file_idx, start, end));
+                }
+            }
+        }
+    }
+    let (_, file_idx, start, end) = best?;
+    let tokens = &files_tokens[file_idx][start..end];
+    let first_speaker = tokens[0].speaker.as_ref();
+    let speaker = first_speaker
+        .filter(|label| {
+            tokens
+                .iter()
+                .all(|token| token.speaker.as_ref() == Some(*label))
+        })
+        .map(|label| collapse_crlf(label).trim().to_string());
+    let span = tokens
+        .iter()
+        .map(|token| token.word.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(MatchedQuote {
+        speaker,
+        span: collapse_crlf(&span).trim().to_string(),
+    })
 }
 
 // Whole-word matching assumes spaces between words, so a quote from a transcript with no spaces between words does not match and is dropped.
@@ -266,6 +344,7 @@ pub(crate) fn evaluate_topics(segment_dir: &Path, sense: &Map<String, Value>) ->
     }
 
     // 2. Read and parse speech files
+    let mut vocabulary = HashMap::new();
     let mut files_tokens: Vec<Vec<TranscriptToken>> = Vec::new();
     if unreadable.is_empty() {
         for (file_idx, path) in speech_paths.iter().enumerate() {
@@ -282,12 +361,14 @@ pub(crate) fn evaluate_topics(segment_dir: &Path, sense: &Map<String, Value>) ->
             for (record_idx, record) in records.into_iter().enumerate() {
                 for (token_idx, word) in record.words.into_iter().enumerate() {
                     let normalized = normalize_token(&word);
+                    let id = word_id(&mut vocabulary, &normalized);
                     file_tokens.push(TranscriptToken {
                         _file_idx: file_idx,
                         record_idx,
                         _token_idx: token_idx,
                         word,
                         normalized,
+                        id,
                         speaker: record.speaker.clone(),
                     });
                 }
@@ -349,7 +430,13 @@ pub(crate) fn evaluate_topics(segment_dir: &Path, sense: &Map<String, Value>) ->
                 .map(normalize_token)
                 .collect::<Vec<_>>();
 
-            if let Some(matched) = match_quote_in_files(&model_norm, &files_tokens) {
+            let model_ids = model_norm
+                .iter()
+                .map(|word| word_id(&mut vocabulary, word))
+                .collect::<Vec<_>>();
+            if let Some(matched) = match_quote_in_files(&model_norm, &files_tokens)
+                .or_else(|| fuzzy_match_quote(&model_ids, &files_tokens))
+            {
                 if surviving_quotes.len() < 8 {
                     kept_quotes += 1;
                     surviving_quotes.push(matched);
@@ -582,6 +669,62 @@ mod tests {
         let eval = evaluate_topics(dir.path(), sense.as_object().unwrap());
         assert_eq!(eval.kept_quotes, 0);
         assert_eq!(eval.dropped_quotes, 1);
+    }
+
+    #[test]
+    fn a_near_quote_is_kept_in_the_transcripts_words_and_label() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("audio.jsonl"),
+            r#"{"start": 1.0, "speaker": 1, "text": "So um we will ship it on Friday."}"#,
+        )
+        .unwrap();
+        let sense =
+            json!({"quotes": [{"speaker": "unknown", "text": "So we will ship it on Friday"}]});
+
+        let eval = evaluate_topics(dir.path(), sense.as_object().unwrap());
+        assert_eq!((eval.kept_quotes, eval.dropped_quotes), (1, 0));
+        let md = eval.markdown.unwrap();
+        assert!(
+            md.contains("- Speaker 1: So um we will ship it on Friday.\n"),
+            "got {md}"
+        );
+    }
+
+    #[test]
+    fn a_near_quote_never_shows_words_the_transcript_does_not_have() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("audio.jsonl"),
+            r#"{"start": 1.0, "text": "We are not going to ship on Friday."}"#,
+        )
+        .unwrap();
+        let sense =
+            json!({"quotes": [{"speaker": "unknown", "text": "We are going to ship on Friday"}]});
+
+        let eval = evaluate_topics(dir.path(), sense.as_object().unwrap());
+        assert_eq!(eval.kept_quotes, 1);
+        let md = eval.markdown.unwrap();
+        assert!(
+            md.contains("- We are not going to ship on Friday.\n"),
+            "got {md}"
+        );
+    }
+
+    #[test]
+    fn a_quote_far_from_every_passage_is_dropped() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("audio.jsonl"),
+            r#"{"start": 1.0, "text": "We will ship it on Friday."}"#,
+        )
+        .unwrap();
+        let sense =
+            json!({"quotes": [{"speaker": "unknown", "text": "We will ship the beta on Monday"}]});
+
+        let eval = evaluate_topics(dir.path(), sense.as_object().unwrap());
+        assert_eq!((eval.kept_quotes, eval.dropped_quotes), (0, 1));
+        assert!(eval.markdown.is_none());
     }
 
     #[test]
