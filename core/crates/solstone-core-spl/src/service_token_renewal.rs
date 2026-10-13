@@ -134,11 +134,13 @@ impl RenewalClock {
     }
 }
 
+pub type EnrollFn =
+    Arc<dyn Fn(&str, &str, &str, EnrollMode) -> Result<String, EnrollError> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct RenewalConfig {
     pub journal_root: PathBuf,
-    pub enroll:
-        Arc<dyn Fn(&str, &str, &str, EnrollMode) -> Result<String, EnrollError> + Send + Sync>,
+    pub enroll: EnrollFn,
     pub jwks_fetch: Arc<dyn Fn(&str) -> JwksSet + Send + Sync>,
     pub health_read: Arc<dyn Fn() -> ServiceTokenHealth + Send + Sync>,
     pub clock: RenewalClock,
@@ -606,7 +608,7 @@ pub fn spawn_service_token_renewal(config: RenewalConfig) -> tokio::task::JoinHa
                 (step, s)
             })
             .await
-            .unwrap_or_else(|_| (RenewalStep::Blocked, state));
+            .unwrap_or((RenewalStep::Blocked, state));
             state = new_state;
             let _ = step;
         }
