@@ -157,6 +157,11 @@ class Element {
   }
 
   append(...children) { children.forEach((child) => this.appendChild(child)); }
+  prepend(child) {
+    if (child.parentElement) child.parentElement.removeChild(child);
+    child.parentElement = this;
+    this.children.unshift(child);
+  }
 
   replaceChildren(...children) {
     this.children.forEach((child) => { child.parentElement = null; });
@@ -460,7 +465,7 @@ test('failing search prevents an otherwise healthy headline; catching up does no
 test('loaded search status reaches the headline and survives a later state-read error', async () => {
   const { context } = createEnvironment();
   const source = loadHealthSource();
-  const loaderStart = source.indexOf('async function loadHealthState(');
+  const loaderStart = source.indexOf('let healthStateRequest = null;');
   const loaderEnd = source.indexOf('let timeoutFired', loaderStart);
   const errorsStart = source.indexOf('function renderAgentErrorsState(');
   const errorsEnd = source.indexOf('function renderMediaBacklog(', errorsStart);
@@ -528,7 +533,7 @@ function createDeviceEnvironment() {
     document: doc, elements, state, Date: ControlledDate, clock, console: { warn() {} },
     window: { location: { hash: '' }, JournalFormat: { sinceDay: () => 'synthetic day' } },
     requestAnimationFrame: fn => fn(), CustomEvent: class { constructor(type) { this.type = type; } },
-    STALE_MS: 30000, brainSnapshot: null, connectError: false,
+    STALE_MS: 30000, brainSnapshot: null, connectError: false, updateClients() {},
     serviceName: value => value, relativeTime: value => String(value), ageAgo: value => String(value),
     fetch: async () => ({ ok: true, json: async () => ({ clients: [] }) }),
   });
@@ -778,6 +783,51 @@ function createHeldWorkEnvironment() {
   return env;
 }
 
+test('large hold lists stay bounded and every page is reachable', async () => {
+  const env = createHeldWorkEnvironment();
+  const pager = env.doc.createElement('nav');
+  pager.setAttribute('data-held-work-pages', '');
+  for (const attr of ['data-held-previous', null, 'data-held-next']) {
+    const element = env.doc.createElement(attr ? 'button' : 'span');
+    if (attr) element.setAttribute(attr, '');
+    pager.appendChild(element);
+  }
+  env.section.appendChild(pager);
+  env.state.work = { inventory: { as_of_ms: env.clock.now, holds: Array.from({length: 75}, (_, i) => ({
+    day: String(i), reason: 'spending_confirmation', count: 1000,
+  })) } };
+  env.receive({ queues: {} });
+  assert.strictEqual(env.doc.querySelectorAll('.held-work-row').length, 30);
+  assert.strictEqual(pager.hidden, false);
+  assert.strictEqual(pager.querySelector('[data-held-previous]').disabled, true);
+  pager.querySelector('[data-held-next]').onclick();
+  pager.querySelector('[data-held-next]').onclick();
+  assert.strictEqual(env.doc.querySelectorAll('.held-work-row').length, 15);
+  assert.strictEqual(pager.querySelector('[data-held-next]').disabled, true);
+  assert.ok(env.doc.querySelector('.held-work-row pre').textContent.includes('1000'));
+});
+
+test('live sources tolerate unloaded names and keep equal labels as separate devices', async () => {
+  const { doc, context } = createEnvironment();
+  context.elements = { clientsCard: doc.createElement('div'), clientsGrid: doc.createElement('div') };
+  context.STALE_MS = 30000;
+  context.state = { registeredClients: null, clients: new Map([
+    ['opaque', { cid: 'one', lastSeen: Date.now() }],
+    ['other', { cid: 'two', lastSeen: Date.now() }],
+  ]) };
+  vm.runInContext(sourceBlock(loadHealthSource(), 'function updateClients(', 'const sinceDay ='), context);
+  vm.runInContext('updateClients()', context);
+  assert.strictEqual(context.elements.clientsGrid.children.length, 2);
+  const unknown = context.elements.clientsGrid.querySelector('.client-stream-qualifier').textContent;
+  context.state.registeredClients = ['one', 'two'].map(cid => ({ cid, display_label: 'my device', reported: {device_type:'phone'} }));
+  vm.runInContext('updateClients()', context);
+  assert.strictEqual(context.elements.clientsGrid.children.length, 2);
+  assert.notStrictEqual(context.elements.clientsGrid.querySelector('.client-stream-qualifier').textContent, unknown);
+  context.state.clients.get('opaque').source = 'watch-audio';
+  vm.runInContext('updateClients()', context);
+  assert.strictEqual(context.elements.clientsGrid.querySelector('.client-stream-qualifier').textContent, 'watch');
+});
+
 test('holds require queued work at their scope even while unrelated work is active', async () => {
   const env = createHeldWorkEnvironment();
   const hold = { partition: 'daily', ref: 'day-task', reasons: ['root_live'] };
@@ -891,7 +941,7 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   context.Date = class extends Date { static now() { return now; } };
   let refreshed = 0;
   context.loadHealthState = async () => { refreshed += 1; };
-  vm.runInContext(sourceBlock(loadHealthSource(), 'function renderWorkProgress(', 'async function loadHealthState('), context);
+  vm.runInContext(sourceBlock(loadHealthSource(), 'function renderWorkProgress(', 'let healthStateRequest = null;'), context);
   context.work = { inventory: null, history_confirmed: false, confirmation_available: true };
   vm.runInContext('renderWorkProgress(work)', context);
   assert.strictEqual(section.querySelector('[data-work-bands]').children.length, 0);

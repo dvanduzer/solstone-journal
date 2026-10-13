@@ -198,11 +198,22 @@ pub(crate) mod tests {
                         .into_bytes();
                 }
                 let body_matches = if let Some(expected) = case.get("json") {
+                    let mut expected = expected.clone();
+                    // The recorded list predates whole-history source choices.
+                    // Add that intentional field while retaining strict equality
+                    // for every recorded field and all other response shapes.
+                    if path == "/app/import/api/list" && matches!(phase, "empty" | "populated") {
+                        expected["source_options"] = if phase == "populated" {
+                            json!(["chatgpt"])
+                        } else {
+                            json!([])
+                        };
+                    }
                     serde_json::from_slice::<Value>(&actual_body)
                         .map(|value| normalize(value, CTIME_PATHS))
                         .ok()
                         .as_ref()
-                        == Some(expected)
+                        == Some(&expected)
                 } else if let Some(recorded) = case.get("body_sha256").and_then(Value::as_str) {
                     actual_body.len() == case["body_bytes"].as_u64().expect("body bytes") as usize
                         && format!("{:x}", Sha256::digest(&actual_body)) == recorded

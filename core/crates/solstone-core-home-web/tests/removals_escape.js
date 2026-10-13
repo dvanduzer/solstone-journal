@@ -137,15 +137,17 @@ async function boot(source, lists, responses) {
     clearTimeout(id) { timers.delete(id); },
     apiJson(url, options) {
       calls.push({ url, options: options || null });
-      if (url === '/app/home/api/removals') {
+      if (url.startsWith('/app/home/api/removals?')) {
         let response = listResponses[Math.min(listIndex, listResponses.length - 1)];
         if (typeof response === 'function') response = response();
-        if (response && !Object.prototype.hasOwnProperty.call(response, 'review_context')
-            && (response.state === 'list.ready' || response.state === 'list.empty')) {
-          response = { ...response, review_context: JSON.stringify({ root_observation: 'fixture', marks: response.removals }) };
-        }
         listIndex += 1;
-        return Promise.resolve(response);
+        return Promise.resolve(response).then(response => {
+          if (response && !Object.prototype.hasOwnProperty.call(response, 'review_context')
+              && (response.state === 'list.ready' || response.state === 'list.empty')) {
+            response = { ...response, review_context: JSON.stringify({ root_observation: 'fixture', marks: response.removals }) };
+          }
+          return response && { offset: 0, next_offset: null, total_rows: response.removals?.length || 0, ...response };
+        });
       }
       if (url === '/app/home/api/approve') return Promise.resolve(typeof responses.approve === 'function' ? responses.approve() : responses.approve);
       if (url.startsWith('/app/home/api/approve/')) return Promise.resolve(responses.receive(url, options));
@@ -515,17 +517,35 @@ async function main() {
   assert.strictEqual(posts(overCard, '/app/home/api/approve').length, 0);
 
   const pagedRows = Array.from({ length: 25 }, (_, index) => marked(`page-${index}`, 'policy', 1, 'mic'));
-  const pagedCard = await boot(source, { state: 'list.ready', removals: pagedRows }, { approve: { state: 'approve.refused_before_start', refusals: [] } });
+  const pagedCard = await boot(source, [{ state: 'list.ready', removals: pagedRows.slice(0, 20), offset: 0, next_offset: 20, total_rows: 25 }, { state: 'list.ready', removals: pagedRows.slice(20), offset: 20, next_offset: null, total_rows: 25 }], { approve: { state: 'approve.refused_before_start', refusals: [] } });
   assert.strictEqual(pagedCard.selects.length, 20);
   clickSelect(pagedCard, 'page-0');
+  click(pagedCard, 'delete-selected');
+  const previousPageConfirm = pagedCard.controls.find(control => control.dataset.removalAction === 'confirm');
   click(pagedCard, 'next');
+  previousPageConfirm.click();
+  assert.strictEqual(posts(pagedCard, '/app/home/api/approve').length, 0, 'old page confirmation cannot submit during navigation');
+  await settle();
   assert.strictEqual(pagedCard.selects.length, 5);
+  assert(pagedCard.calls.some(call => call.url.endsWith('?offset=20')));
+  assert(!pagedCard.innerHTML.includes('1 selected'), 'page navigation clears selection');
   clickSelect(pagedCard, 'page-24');
   click(pagedCard, 'delete-selected');
   assert.strictEqual(posts(pagedCard, '/app/home/api/approve').length, 0);
   click(pagedCard, 'confirm');
   await settle();
-  assert.deepStrictEqual(JSON.parse(posts(pagedCard, '/app/home/api/approve')[0].options.body).mark_ids, ['page-0', 'page-24']);
+  assert.deepStrictEqual(JSON.parse(posts(pagedCard, '/app/home/api/approve')[0].options.body).mark_ids, ['page-24'], 'approval includes only the explicitly selected current-page item');
+
+  const oversizedCard = await boot(source, [
+    { state: 'list.review_too_large', removals: [pagedRows[0]], review_context: null, offset: 0, next_offset: 1, total_rows: 2 },
+    { state: 'list.ready', removals: [pagedRows[1]], offset: 1, next_offset: null, total_rows: 2 },
+  ], {});
+  assert(oversizedCard.innerHTML.includes(copy['card.too_large']));
+  assert(oversizedCard.innerHTML.includes('/app/support/'));
+  assert(!oversizedCard.controls.some(control => ['approve', 'decline', 'select-all'].includes(control.dataset.removalAction)), 'oversized evidence never grants an action');
+  click(oversizedCard, 'next');
+  await settle();
+  assert.strictEqual(oversizedCard.selects.length, 1, 'an unavailable item does not block reviewing the next item');
 
   const failedOnly = { id: 'failed-only', state: 'failed', day: '20260101', stream: 'kitchen-mic' };
   const recoverCard = await boot(

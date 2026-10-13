@@ -36,6 +36,15 @@ struct ScanOutcome {
     fingerprints: Option<Vec<FileFingerprint>>,
 }
 
+/// Read the horizon without creating or refreshing a journal cache.
+pub fn read_connections_horizon(journal_root: &Path) -> Option<ConnectionsHorizon> {
+    let day = match read_hit(journal_root) {
+        Some(cached) => cached,
+        None => scan(journal_root)?.horizon_day,
+    };
+    publish(journal_root, day)
+}
+
 pub fn refresh_connections_horizon(journal_root: &Path) -> Option<ConnectionsHorizon> {
     if let Some(cached) = read_hit(journal_root) {
         return publish(journal_root, cached);

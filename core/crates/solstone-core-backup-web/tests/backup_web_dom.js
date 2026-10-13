@@ -813,6 +813,15 @@ asyncCase('initial settings stay hidden until status is known', async () => {
   assert.ok(!harness.root.querySelector('[data-backup-panel="intro"]').hidden);
 });
 
+asyncCase('backup settings become usable while storage measurement is pending', async () => {
+  const harness = createHarness({ respond(call) {
+    if (call.url === '/app/backup/offload/status') return new Promise(() => {});
+  } });
+  await settle();
+  assert.ok(harness.root.querySelector('[data-backup-loading]').hidden);
+  assert.ok(!harness.root.querySelector('[data-backup-panel="intro"]').hidden);
+});
+
 asyncCase('an initial status failure never reveals assumed settings', async () => {
   const harness = createHarness({ respond(call) {
     if (call.url === '/app/backup/status') return Promise.reject(new Error('status unavailable'));

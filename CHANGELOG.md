@@ -22,6 +22,12 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- backup settings appear before the storage measurement finishes. health groups repeated items on hold and pages the list.
+- a failed voice-status check now shows an error instead of asking you to teach your voice again. health uses reported device information instead of assuming an unnamed source is a desktop.
+- on phones, transcripts have a segment picker and more room for text, import history keeps filenames and statuses visible, and dialogs stay above navigation. long names, facet details and settings explanations fit more comfortably.
+- activity filters stay visible after applying them, import source filters cover the full history, and support opens from settings on phones. chart values are available by keyboard and touch, without covering nearby bars.
+- originals waiting for approval now load in pages, each with its own selection. a single item too large to review is identified without offering a deletion action, and you can continue to the next page.
+
 - naming a voice could add the same voice sample twice from older audio. that sample is now counted once.
 - security fix: text containing quotes could be mistaken for part of a button or link in your journal's browser pages. it now displays as text.
 - dismissed voices could reappear in the speakers app after a scan. the list now applies your earlier dismissals consistently.
