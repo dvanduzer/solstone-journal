@@ -2189,30 +2189,32 @@ mod tests {
         let bed = Bed::new();
         let segment = populated(&bed, "070000_17");
         let root = bed.root.clone();
-        let guard = solstone_core_journal_io::hold_daily_location_admission(&root).unwrap();
         let (started_sender, started) = mpsc::channel();
         let (done_sender, done) = mpsc::channel();
-        let removal = thread::spawn(move || {
-            started_sender.send(()).unwrap();
-            let result = remove_segments(
-                &root,
-                &[target("20260805", "field.audio", "070000_17")],
-                "2026-08-05T21:00:00Z",
-                RemovalReason::OwnerSegmentDelete,
-                "sha256:abc",
-            );
-            done_sender.send(()).unwrap();
-            result
-        });
-        started
-            .recv_timeout(Duration::from_secs(2))
-            .expect("removal started");
-        assert!(matches!(
-            done.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        assert!(segment.join("audio.flac").is_file());
-        drop(guard);
+        let removal = {
+            let _guard = solstone_core_journal_io::hold_daily_location_admission(&root).unwrap();
+            let removal = thread::spawn(move || {
+                started_sender.send(()).unwrap();
+                let result = remove_segments(
+                    &root,
+                    &[target("20260805", "field.audio", "070000_17")],
+                    "2026-08-05T21:00:00Z",
+                    RemovalReason::OwnerSegmentDelete,
+                    "sha256:abc",
+                );
+                done_sender.send(()).unwrap();
+                result
+            });
+            started
+                .recv_timeout(Duration::from_secs(2))
+                .expect("removal started");
+            assert!(matches!(
+                done.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(segment.join("audio.flac").is_file());
+            removal
+        };
         let outcome = removal.join().unwrap();
         assert!(outcome.halted.is_none());
         assert!(outcome.targets[0].not_removed.is_empty());

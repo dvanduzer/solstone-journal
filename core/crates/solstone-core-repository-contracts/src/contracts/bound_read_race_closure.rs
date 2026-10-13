@@ -1863,10 +1863,10 @@ fn feature_members(document: &DocumentMut, feature: &str) -> Option<Vec<String>>
         })
 }
 
-fn target_dev_dependencies(document: &DocumentMut) -> &Table {
-    document["target"]["cfg(unix)"]["dev-dependencies"]
+fn native_dev_dependencies(document: &DocumentMut) -> &Table {
+    document["target"]["cfg(any(unix, windows))"]["dev-dependencies"]
         .as_table()
-        .expect("Unix dev-dependencies table exists")
+        .expect("native dev-dependencies table exists")
 }
 
 fn inline_feature_members(item: &Item) -> Vec<String> {
@@ -2326,9 +2326,9 @@ fn bound_read_feature_closures_and_leaf_process_target_remain_narrow() {
         journal_config.get("features").is_none(),
         "journal-config must not expose a feature table"
     );
-    let dependency = target_dev_dependencies(&journal_config)
+    let dependency = native_dev_dependencies(&journal_config)
         .get("solstone-core-journal-io")
-        .expect("journal-io is a Unix dev dependency");
+        .expect("journal-io is a native dev dependency");
     assert_eq!(inline_feature_members(dependency), ["test-hooks"]);
 
     let graph = graph();
