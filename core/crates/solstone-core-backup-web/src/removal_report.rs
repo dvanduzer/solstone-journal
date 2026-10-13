@@ -607,7 +607,7 @@ fn refusal_facts(error: &ReviewedRemovalRefusal) -> Value {
         Refusal::Census(_) => "census",
         Refusal::Obligations(_) => "obligations",
         Refusal::Configuration(_) => "configuration",
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Refusal::Directory(error) => {
             return json!({"kind":"directory", "detail":directory_facts(error)});
         }

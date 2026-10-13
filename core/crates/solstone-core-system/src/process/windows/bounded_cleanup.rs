@@ -29,17 +29,29 @@ thread_local! {
 /// launched owner. It grants no handle/identity and cannot synthesize a failure.
 #[cfg(feature = "test-hooks")]
 #[derive(Clone, Debug)]
-pub struct HelperCleanupObservationFault(Arc<std::sync::atomic::AtomicBool>);
+pub struct HelperCleanupObservationFault {
+    active: Arc<std::sync::atomic::AtomicBool>,
+    fail_after_io: bool,
+}
 #[cfg(feature = "test-hooks")]
 impl HelperCleanupObservationFault {
     pub fn new() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            fail_after_io: true,
+        }
+    }
+    pub(super) fn cleanup_only() -> Self {
+        Self {
+            fail_after_io: false,
+            ..Self::new()
+        }
     }
     pub fn release(&self) {
-        self.0.store(false, Ordering::Release);
+        self.active.store(false, Ordering::Release);
     }
     fn active(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.active.load(Ordering::Acquire)
     }
 }
 #[cfg(feature = "test-hooks")]
@@ -73,6 +85,21 @@ pub(super) fn current_observation_fault_active() -> bool {
             slot.borrow()
                 .as_ref()
                 .is_some_and(HelperCleanupObservationFault::active)
+        })
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        false
+    }
+}
+
+pub(super) fn current_after_io_fault_active() -> bool {
+    #[cfg(feature = "test-hooks")]
+    {
+        OBSERVATION_FAULT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|fault| fault.fail_after_io && fault.active())
         })
     }
     #[cfg(not(feature = "test-hooks"))]

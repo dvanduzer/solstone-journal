@@ -571,7 +571,7 @@ pub fn run_bounded_helper(
             ));
         }
     }
-    if super::bounded_cleanup::current_observation_fault_active() {
+    if super::bounded_cleanup::current_after_io_fault_active() {
         return Err(reservation.failure(
             BoundedHelperError::ProcessObservationFailed {
                 identity,
@@ -805,9 +805,10 @@ fn receipt_request(
     })
 }
 
-// The request bag is the ONLY file-capability owner in this control. The child
-// receives ordinary stdio only. This proves resource retention independently of
-// the separate descendant generation-borrowing acceptance.
+// The request bag is the only owner of the resource file in this control.
+// A streaming sink has its separate worker-owned file; the child receives
+// ordinary stdio only. This proves resource retention independently of the
+// separate descendant generation-borrowing acceptance.
 #[cfg(all(windows, feature = "test-hooks"))]
 fn retained_resource_receipt_for_test(
     fixture: &std::path::Path,
@@ -826,7 +827,11 @@ fn retained_resource_receipt_for_test(
         "primary-thread-close",
         "process-birth",
         "after-io",
+        "stream-bound",
+        "stream-write",
     ] {
+        let streaming = matches!(stage, "stream-bound" | "stream-write");
+        let provisional = !streaming && stage != "after-io";
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
@@ -845,12 +850,40 @@ fn retained_resource_receipt_for_test(
                 .map_err(|error| error.to_string())?,
         );
         let weak = Arc::downgrade(&resource);
-        let mut request = receipt_request(fixture, "sleep", &[], Vec::new(), budget)?;
+        let mut request = receipt_request(
+            fixture,
+            if streaming { "write-stdout" } else { "sleep" },
+            if streaming { &["9"] } else { &[] },
+            Vec::new(),
+            budget,
+        )?;
+        let sink_path = path.with_extension("stage");
+        if streaming {
+            let sink = if stage == "stream-bound" {
+                std::fs::File::create(&sink_path)
+            } else {
+                std::fs::write(&sink_path, b"").map_err(|error| error.to_string())?;
+                std::fs::File::open(&sink_path)
+            }
+            .map_err(|error| error.to_string())?;
+            request.stdout_sink = Some(BoundedStdoutSink {
+                file: sink,
+                limit_bytes: if stage == "stream-bound" { 8 } else { 9 },
+            });
+        }
         request.resources.retain(resource); // no outer or child-owned duplicate
-        let fault = HelperCleanupObservationFault::new();
-        let result = super::job_process::with_finalization_fault(stage, || {
+        let fault = if streaming {
+            HelperCleanupObservationFault::cleanup_only()
+        } else {
+            HelperCleanupObservationFault::new()
+        };
+        let result = if streaming {
             run_bounded_helper_with_observation_fault_for_test(request, &fault)
-        });
+        } else {
+            super::job_process::with_finalization_fault(stage, || {
+                run_bounded_helper_with_observation_fault_for_test(request, &fault)
+            })
+        };
         let failure = result.err();
         let retained = (|| {
             let failure = failure
@@ -860,7 +893,8 @@ fn retained_resource_receipt_for_test(
                 .cleanup()
                 .ok_or("resource control returned no native owner")?;
             if cleanup.process_id().is_none()
-                || (stage != "after-io" && cleanup.identity().is_some())
+                || (provisional && cleanup.identity().is_some())
+                || (streaming && cleanup.identity().is_none())
                 || cleanup.observe() != HelperCleanupStatus::Pending
                 || weak.upgrade().is_none()
             {
@@ -868,13 +902,33 @@ fn retained_resource_receipt_for_test(
                     "{stage} did not retain unknown-birth native/resource authority"
                 ));
             }
-            if stage != "after-io"
+            if provisional
                 && !matches!(failure.cause(),
                 BoundedHelperError::LaunchFinalizationFailed { detail, .. } if detail.contains(stage))
             {
                 return Err(format!(
                     "{stage} did not preserve its actual launch failure"
                 ));
+            }
+            if streaming {
+                let correct = match failure.cause() {
+                    BoundedHelperError::OutputLimitExceeded {
+                        stream: "stdout",
+                        quiescent: false,
+                        ..
+                    } => stage == "stream-bound",
+                    BoundedHelperError::OutputReadFailed {
+                        stream: "stdout",
+                        quiescent: false,
+                        ..
+                    } => stage == "stream-write",
+                    _ => false,
+                };
+                if !correct {
+                    return Err(format!(
+                        "{stage} lost its actual stream refusal: {failure:?}"
+                    ));
+                }
             }
             match std::fs::OpenOptions::new()
                 .read(true)
@@ -914,6 +968,18 @@ fn retained_resource_receipt_for_test(
         retained?;
         released?;
         removed?;
+        if streaming {
+            let length = std::fs::metadata(&sink_path)
+                .map_err(|error| error.to_string())?
+                .len();
+            std::fs::remove_file(&sink_path).map_err(|error| error.to_string())?;
+            if (stage == "stream-bound" && length > 8) || (stage == "stream-write" && length != 0) {
+                return Err(format!(
+                    "{stage} wrote outside its stage allowance: {length}"
+                ));
+            }
+            println!("BOUNDED_HELPER_{stage}_RETAINED_RELEASED_PASS");
+        }
     }
     Ok(())
 }
