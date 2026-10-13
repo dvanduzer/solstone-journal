@@ -597,61 +597,22 @@
     grid-template-columns: 1fr;
   }
 
-  .import-table th:nth-child(2),
-  .import-table td:nth-child(2),
-  .import-table th:nth-child(4),
-  .import-table td:nth-child(4),
-  .import-table th:nth-child(6),
-  .import-table td:nth-child(6) {
-    display: none;
+  .import-table thead { display: none; }
+  .import-table, .import-table tbody { display: block; }
+  .import-table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 12px 4px;
+    border-bottom: 1px solid var(--hairline);
   }
-
-  .import-table th,
-  .import-table td {
-    padding: 8px 4px;
-  }
-
-  .import-table tr[tabindex] {
-    min-height: 44px;
-  }
-
-  /* keep the status column visible without a horizontal scroll: it is the
-     one column that answers "did it work" (G3-13). */
-  .import-table td.source-cell {
-    max-width: 38vw;
-  }
-
-  .import-table td.source-cell .import-source-inline span:last-child {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    display: inline-block;
-    max-width: 100%;
-    vertical-align: middle;
-  }
-
-  .import-table th:nth-child(5),
-  .import-table td:nth-child(5) {
-    position: sticky;
-    right: 0;
-    background: var(--cream-bright);
-  }
-
-  .import-table tr:hover td:nth-child(5) {
-    background: var(--orange-wash);
-  }
-
-  .import-table tr.import-row--stalled td:nth-child(5) {
-    background: color-mix(in srgb, var(--warn) 8%, transparent);
-  }
-
-  .import-table tr.import-row--stalled:hover td:nth-child(5) {
-    background: color-mix(in srgb, var(--warn) 12%, transparent);
-  }
-
-  .import-table tbody tr:active td:nth-child(5) {
-    background: var(--hairline);
-  }
+  .import-table td { border: 0; padding: 4px; min-width: 0; white-space: normal; }
+  .import-table td:nth-child(2) { grid-column: 1 / -1; grid-row: 1; overflow-wrap: anywhere; font-weight: 600; }
+  .import-table td.status-cell { grid-column: 1 / -1; grid-row: 2; }
+  .import-table td:nth-child(1) { grid-column: 1 / -1; }
+  .import-table td:nth-child(1)::before { content: 'imported to '; color: var(--ink-soft); }
+  .import-table td:nth-child(6) { grid-column: 1 / -1; font-size: .85em; color: var(--ink-soft); }
+  .import-table td:nth-child(6)::before { content: 'imported at '; }
+  .import-table td.source-cell { overflow-wrap: anywhere; }
 }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
@@ -773,6 +734,10 @@ const importGenerationFloor = {};
 // starts dropping the oldest entry nothing is using.
 const IMPORT_GENERATION_FLOOR_CAP = 500;
 let importsCache = [];
+let importSourceOptions = [];
+let historyRequestGeneration = 0;
+let loadingMoreGeneration = null;
+let historyLoading = false;
 let currentSourceFilter = '';
 // G3-310: 417 imports at 25 a page took sixteen clicks to reach the oldest, and
 // paging was the only way through. 100 is the route's own ceiling; the real fix
@@ -1125,15 +1090,10 @@ function getImportById(importId) {
   return importsCache.find(item => item.timestamp === importId) || null;
 }
 
-// The filter offers the sources the listed imports carry, named as their rows
-// name them. Offering the upload tiles instead meant choosing "meeting audio" or
-// "quick import" matched nothing: those imports are recorded by what they hold.
+// Sources describe the whole history, independently of this page or filter.
 function sourceFilterOptionsHtml() {
-  const labels = new Map();
-  importsCache.forEach(imp => {
-    const name = imp.source_type || '';
-    if (name && !labels.has(name)) labels.set(name, sourceLabel(imp) || name);
-  });
+  const labels = new Map(importSourceOptions.map(name => [name,
+    sourceLabel({ source_type: name, source_display: name }) || name]));
   return [
     '<option value="">all sources</option>',
     ...[...labels].sort((a, b) => a[1].localeCompare(b[1])).map(([name, label]) => {
@@ -1254,21 +1214,28 @@ function scrollToGrid() {
 }
 
 async function loadImports() {
+  const generation = ++historyRequestGeneration;
+  historyLoading = true;
   currentPage = 1;
+  loadingMoreGeneration = null;
+  const url = `/app/import/api/list?page=1&per_page=${IMPORT_PAGE_SIZE}&source=${encodeURIComponent(currentSourceFilter)}`;
   await loadSourceGrid();
+  if (generation !== historyRequestGeneration) return;
   try {
-    const data = await window.apiJson(`/app/import/api/list?page=1&per_page=${IMPORT_PAGE_SIZE}`);
-    if (!Array.isArray(data.imports) || typeof data.total !== 'number' || typeof data.page !== 'number' || typeof data.pages !== 'number') {
-      throw malformedImportHistoryResponse(`/app/import/api/list?page=1&per_page=${IMPORT_PAGE_SIZE}`);
+    const data = await window.apiJson(url);
+    if (generation !== historyRequestGeneration) return;
+    if (!Array.isArray(data.imports) || !Array.isArray(data.source_options) || typeof data.total !== 'number' || typeof data.page !== 'number' || typeof data.pages !== 'number') {
+      throw malformedImportHistoryResponse(url);
     }
     const imports = data.imports;
     importsCache = imports;
+    importSourceOptions = data.source_options;
     pruneImportGenerationFloor();
     totalImports = data.total;
     const container = document.getElementById('importListContent');
     clearImportListErrors();
 
-    if (imports.length === 0) {
+    if (imports.length === 0 && !currentSourceFilter) {
       container.innerHTML = window.SurfaceState.empty({
         icon: window.ConveyIcons.svg('inbox'),
         heading: 'no imports yet',
@@ -1294,6 +1261,9 @@ async function loadImports() {
     });
 
     html += '</tbody></table>';
+    if (!imports.length) html += window.SurfaceState.empty({
+      icon: window.ConveyIcons.svg('search'), heading: 'no imports match this filter'
+    });
     if (data.page < data.pages) {
       html += `
         <div id="importLoadMore" style="text-align: center; margin: 1.5rem 0;">
@@ -1303,13 +1273,15 @@ async function loadImports() {
         </div>
       `;
     }
+    const restoreFilterFocus = document.activeElement?.id === 'importSourceFilter';
     container.innerHTML = html;
 
     const sourceFilter = document.getElementById('importSourceFilter');
     if (sourceFilter) {
+      if (restoreFilterFocus) sourceFilter.focus();
       sourceFilter.onchange = event => {
         currentSourceFilter = event.target.value;
-        filterImportsBySource();
+        loadImports();
       };
     }
 
@@ -1320,15 +1292,16 @@ async function loadImports() {
         clearPendingImport(imp.timestamp);
       }
     });
-
-    filterImportsBySource();
   } catch (err) {
+    if (generation !== historyRequestGeneration) return;
     window.SurfaceState.replaceLoading('importListContent', window.SurfaceState.error({
       heading: 'couldn\'t load your import history',
       desc: window.CONVEY_COPY.RELOAD_HINT,
       serverMessage: window.SurfaceState.serverMessageFrom(err),
       detail: err,
     }));
+  } finally {
+    if (generation === historyRequestGeneration) historyLoading = false;
   }
 }
 
@@ -1357,13 +1330,20 @@ function renderLoadMoreError(err) {
 }
 
 async function loadMoreImports() {
-  currentPage++;
+  const generation = historyRequestGeneration;
+  if (historyLoading || loadingMoreGeneration === generation) return;
+  loadingMoreGeneration = generation;
+  const nextPage = currentPage + 1;
+  const url = `/app/import/api/list?page=${nextPage}&per_page=${IMPORT_PAGE_SIZE}&source=${encodeURIComponent(currentSourceFilter)}`;
   try {
-    const data = await window.apiJson(`/app/import/api/list?page=${currentPage}&per_page=${IMPORT_PAGE_SIZE}`);
-    if (!Array.isArray(data.imports) || typeof data.total !== 'number' || typeof data.page !== 'number' || typeof data.pages !== 'number') {
-      throw malformedImportHistoryResponse(`/app/import/api/list?page=${currentPage}&per_page=${IMPORT_PAGE_SIZE}`);
+    const data = await window.apiJson(url);
+    if (generation !== historyRequestGeneration) return;
+    if (!Array.isArray(data.imports) || !Array.isArray(data.source_options) || typeof data.total !== 'number' || typeof data.page !== 'number' || typeof data.pages !== 'number') {
+      throw malformedImportHistoryResponse(url);
     }
 
+    currentPage = data.page;
+    importSourceOptions = data.source_options;
     importsCache = importsCache.concat(data.imports);
     const sourceFilter = document.getElementById('importSourceFilter');
     if (sourceFilter) sourceFilter.innerHTML = sourceFilterOptionsHtml();
@@ -1400,47 +1380,10 @@ async function loadMoreImports() {
         clearPendingImport(imp.timestamp);
       }
     });
-
-    filterImportsBySource();
   } catch (err) {
-    currentPage--;
-    renderLoadMoreError(err);
-  }
-}
-
-function filterImportsBySource() {
-  const rows = document.querySelectorAll('.import-table tbody tr');
-  if (rows.length === 0) return;
-
-  let visibleCount = 0;
-  rows.forEach(row => {
-    const sourceMatches = !currentSourceFilter || row.dataset.sourceType === currentSourceFilter;
-    if (sourceMatches) {
-      row.style.display = '';
-      visibleCount++;
-    } else {
-      row.style.display = 'none';
-    }
-  });
-
-  const container = document.getElementById('importListContent');
-  if (visibleCount === 0 && rows.length > 0) {
-    let noMatchEl = container.querySelector('.no-imports-filtered');
-    if (!noMatchEl) {
-      noMatchEl = document.createElement('div');
-      noMatchEl.className = 'no-imports-filtered';
-      container.appendChild(noMatchEl);
-    }
-    noMatchEl.innerHTML = window.SurfaceState.empty({
-      icon: window.ConveyIcons.svg('search'),
-      heading: 'no imports match this filter'
-    });
-    noMatchEl.style.display = '';
-  } else {
-    const noMatchEl = container.querySelector('.no-imports-filtered');
-    if (noMatchEl) {
-      noMatchEl.style.display = 'none';
-    }
+    if (generation === historyRequestGeneration) renderLoadMoreError(err);
+  } finally {
+    if (loadingMoreGeneration === generation) loadingMoreGeneration = null;
   }
 }
 

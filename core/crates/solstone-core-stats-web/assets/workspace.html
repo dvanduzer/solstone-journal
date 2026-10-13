@@ -422,12 +422,14 @@ h1 {
   border-radius: 4px 4px 0 0;
   transition: filter 0.2s;
   position: relative;
-  min-width: 20px;
+  min-width: 0;
 }
 
-.bar:hover {
+.bar:hover, .bar:focus-visible {
   filter: brightness(1.1);
+  z-index: 21;
 }
+.bar:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
 
 .bar::after {
   content: "";
@@ -447,10 +449,20 @@ h1 {
   z-index: 20;
 }
 
-.bar:hover::after {
+.bar:hover::after, .bar:focus-visible::after {
   content: attr(data-tip);
   opacity: 1;
 }
+
+.chart.chart-inspectable { height: auto; }
+.chart-inspectable .bar-chart { flex: none; height: 220px; }
+/* The persistent readout stays outside the plot and cannot cover nearby bars. */
+.chart-inspectable .bar::after { display: none; }
+.chart-inspection { margin-top: 12px; font-size: .875rem; }
+.chart-inspection select { min-height: 44px; margin-left: 8px; color: var(--ink); background: var(--paper); border: 1px solid var(--hairline); border-radius: 6px; padding: 4px 10px; }
+.chart-day-values { margin-top: 8px; overflow-wrap: anywhere; }
+.bar:first-child::after { left: 0; transform: none; }
+.bar:last-child::after { left: auto; right: 0; transform: none; }
 
 .bar-label {
   position: absolute;
@@ -959,7 +971,7 @@ h1 {
     grid-template-columns: 30px repeat(24, minmax(0, 1fr));
   }
   .bar {
-    min-width: 10px;
+    min-width: 0;
   }
   .bar-value {
     top: -18px;

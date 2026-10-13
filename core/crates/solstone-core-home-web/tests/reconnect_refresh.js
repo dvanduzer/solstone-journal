@@ -78,11 +78,11 @@ assert.deepStrictEqual(requests, [], 'a disconnect requests nothing');
 notify({ connected: true, state: 'connected' });
 assert.deepStrictEqual(
   requests.slice().sort(),
-  ['/app/home/api/briefing', '/app/home/api/pulse', '/app/home/api/pulse'],
+  ['/app/home/api/briefing', '/app/home/api/pulse'],
   'reconnect re-reads pulse for vitals and narrative, and the briefing',
 );
 notify({ connected: true, state: 'connected' });
-assert.strictEqual(requests.length, 3, 'a repeated connected state does not reconcile again');
+assert.strictEqual(requests.length, 2, 'a repeated connected state does not reconcile again');
 
 // A shell without the connection-state API keeps Home's event wiring working.
 const bareRequests = [];

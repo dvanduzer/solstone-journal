@@ -3,8 +3,8 @@ use std::path::Path;
 
 use serde_json::Value;
 use solstone_core_entity::{
-    EncoderIdentity, VoiceprintItem, is_admissible_person, load_all_journal_entities,
-    load_entity_voiceprints_file, save_voiceprints_batch,
+    CanonicalKeyField, EncoderIdentity, VoiceprintItem, VoiceprintKey, is_admissible_person,
+    load_all_journal_entities, load_entity_voiceprints_file, save_voiceprints_batch,
 };
 use solstone_core_journal_io::SegmentLayout;
 use solstone_core_speaker_id::calibration::{
@@ -18,7 +18,9 @@ use crate::candidate_tracker::{
 use crate::owner_admission::{OwnerAdmission, admitted_owner_id};
 use crate::owner_centroid::load_owner_centroid;
 use crate::voiceprint_accumulation::read_overlap_fraction;
-use crate::voiceprint_metadata::{owner_timezone, segment_start_ts_ms};
+use crate::voiceprint_metadata::{
+    metadata_key, owner_timezone, provenance_key, segment_start_ts_ms,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetroactiveConfirmPlan {
@@ -147,8 +149,7 @@ pub fn plan_retroactive_confirm(
             if dot(&normal, &owner.centroid) >= owner.threshold {
                 continue;
             };
-            let layout_str = stream_layout.as_str();
-            let key = format!("{day}|{layout_str}|{stream}|{segment_key}|{kind}|{id}");
+            let key = provenance_key(day, stream_layout, stream, segment_key, kind, id);
             if keys.contains(&key)
                 || (existing_count >= VP_OUTLIER_MIN_SAMPLES
                     && existing_centroid
@@ -223,7 +224,10 @@ fn matched_empty(c: &CandidateProfile, entity: &str) -> RetroactiveConfirmPlan {
         items: vec![],
     }
 }
-fn voiceprint_snapshot(journal: &Path, entity: &str) -> (HashSet<String>, usize, Option<Vec<f32>>) {
+fn voiceprint_snapshot(
+    journal: &Path,
+    entity: &str,
+) -> (HashSet<VoiceprintKey>, usize, Option<Vec<f32>>) {
     let Some(archive) = load_entity_voiceprints_file(journal, entity) else {
         return (HashSet::new(), 0, None);
     };
@@ -242,19 +246,19 @@ fn voiceprint_snapshot(journal: &Path, entity: &str) -> (HashSet<String>, usize,
     let center = centroid(&rows);
     (keys, archive.rows, center)
 }
-fn key_for_metadata(value: &Value) -> Option<String> {
-    let day = value.get("day")?.as_str()?;
-    let layout = value
-        .get("stream_layout")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let stream = value.get("stream").and_then(Value::as_str).unwrap_or("");
-    let segment_key = value.get("segment_key")?.as_str()?;
-    let source = value.get("source")?.as_str()?;
-    let sentence_id = value.get("sentence_id")?.as_i64()?;
-    Some(format!(
-        "{day}|{layout}|{stream}|{segment_key}|{source}|{sentence_id}"
-    ))
+fn key_for_metadata(value: &Value) -> Option<VoiceprintKey> {
+    if let Some(key) = metadata_key(value) {
+        return Some(key);
+    }
+    // This reader historically retains unsupported layout strings and treats
+    // other layout values as an empty string. Preserve those inert keys rather
+    // than widening the stricter bootstrap/accumulation admission policy.
+    let layout = value.get("stream_layout")?;
+    let mut without_layout = value.clone();
+    without_layout.as_object_mut()?.remove("stream_layout");
+    let mut key = metadata_key(&without_layout)?;
+    key.0[5] = CanonicalKeyField::Str(layout.as_str().unwrap_or("").to_owned());
+    Some(key)
 }
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()

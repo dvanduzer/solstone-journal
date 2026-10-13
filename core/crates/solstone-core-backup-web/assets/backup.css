@@ -22,6 +22,19 @@
   line-height: 1.2;
 }
 
+.backup-general-status {
+  margin-bottom: 1rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.backup-general-status p { margin: 0 0 0.5rem; overflow-wrap: anywhere; }
+.backup-general-status a { display: inline-flex; align-items: center; min-height: 44px; }
+.backup-general-status [data-tone="attention"],
+.backup-general-status [data-tone="unavailable"] { color: var(--warn-ink); }
+
 /* the journal-bound brand-lock — the trust promise, always visible */
 .backup-lock {
   display: flex;

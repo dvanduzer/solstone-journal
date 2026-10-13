@@ -79,7 +79,7 @@ pub use store::{
     save_entity_identity, save_voiceprints_batch, scan_identity_census, serialize_observation_rows,
     standing_merge_for_suggestion, sweep_entity_review_policy, try_load_entity_voiceprints_file,
     try_load_entity_voiceprints_in_dir, unblock_journal_entity, unrecognized_entity_files,
-    validate_review_object,
+    validate_review_object, voiceprint_key_from_metadata,
 };
 pub use trust_lock::{
     EntityTrustLock, EntityTrustLockError, FacetTrustLock, FacetTrustLockError,

@@ -6,9 +6,7 @@
 use std::path::Path;
 
 use serde_json::Value;
-use solstone_core_entity::{
-    JournalEntity, is_admissible_person, read_entity_identity, read_identity_map,
-};
+use solstone_core_entity::{is_admissible_person, load_all_journal_entities};
 
 /// Machine-readable reason for an inadmissible configured owner identity.
 pub const OWNER_IDENTITY_INVALID_REASON: &str = "speaker_owner_identity_invalid";
@@ -37,21 +35,14 @@ pub enum OwnerAdmissionFailure {
 /// Resolve the configured owner only when exactly one identity-map winner is an
 /// unblocked `Person` explicitly marked `is_principal`.
 pub fn admitted_owner_id(journal_root: &Path) -> OwnerAdmission {
-    let Ok(map) = read_identity_map(journal_root) else {
+    let Ok(entities) = load_all_journal_entities(journal_root) else {
         return OwnerAdmission::Invalid;
     };
     let mut owner_id = None;
-    for (effective_id, entity_dir) in &map.resolved {
-        let Ok(Some(identity)) = read_entity_identity(journal_root, entity_dir) else {
-            return OwnerAdmission::Invalid;
-        };
-        let entity = JournalEntity {
-            id: effective_id.clone(),
-            value: identity.value().clone(),
-        };
+    for entity in entities {
         if entity.value.get("is_principal") == Some(&Value::Bool(true))
             && is_admissible_person(&entity)
-            && owner_id.replace(effective_id.clone()).is_some()
+            && owner_id.replace(entity.id.clone()).is_some()
         {
             return OwnerAdmission::Invalid;
         }

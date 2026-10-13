@@ -6,7 +6,7 @@
 use super::*;
 use solstone_core_journal_io::media::{MediaRead, RemovalReceipt};
 #[cfg(unix)]
-use solstone_core_journal_io::media::{OriginalName, RemovalEffect};
+use solstone_core_journal_io::media::{OriginalName, RemovalEffect, RemovalPhase};
 #[cfg(unix)]
 use solstone_core_retention::restore_intent::{MarkRetirement, PublicationFacts};
 
@@ -106,18 +106,23 @@ impl DetachedTransaction {
                 || removed.effect != RemovalEffect::Deleted
                 || removed.original_name != OriginalName::Absent
                 || removed.claim_confirmation != Confirmation::Confirmed
-                || removed.file_durability != Durability::Synced
                 || removed.source_durability != Durability::Synced
                 || removed.claim_durability != Durability::Synced
-                || removed.stage_parent_durability != Durability::Synced
                 || removed.cleanup != Cleanup::Complete
-                || !removed.failures.is_empty()
+                || removed
+                    .failures
+                    .iter()
+                    .any(|f| f.phase != RemovalPhase::Cleanup)
                 || removed.restoration_attempted
             {
                 return Err(refusal());
             }
             let publication = receipts.publication.as_ref().ok_or_else(refusal)?;
-            if intent.outcome.as_ref() != Some(&PublicationFacts::from(publication))
+            let publication_facts = PublicationFacts::from(publication);
+            if !intent
+                .outcome
+                .as_ref()
+                .is_some_and(|facts| facts.matches_ignoring_cleanup(&publication_facts))
                 || intent.event_recorded != Obligation::Complete
                 || intent.cleanup != Obligation::Complete
             {

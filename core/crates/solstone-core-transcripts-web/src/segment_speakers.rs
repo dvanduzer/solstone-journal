@@ -9,9 +9,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use solstone_core_entity::{
-    is_admissible_person, load_all_journal_entities, read_journal_principal,
-};
+use solstone_core_entity::{is_admissible_person, load_all_journal_entities};
 use solstone_core_npy::parse_npy;
 use zip::ZipArchive;
 
@@ -87,7 +85,12 @@ impl SpeakerJoin {
     }
 }
 
-pub(crate) fn load(dir: &Path, journal_root: &Path, now: DateTime<Utc>) -> SpeakerJoin {
+pub(crate) fn load(
+    dir: &Path,
+    journal_root: &Path,
+    now: DateTime<Utc>,
+    has_audio_transcript: bool,
+) -> SpeakerJoin {
     let path = dir.join("talents/speaker_labels.json");
     let present = path.is_file();
     let (source, ambiguous) = if present {
@@ -105,7 +108,11 @@ pub(crate) fn load(dir: &Path, journal_root: &Path, now: DateTime<Utc>) -> Speak
     }
     let mut labels = BTreeMap::new();
     let mut loaded = false;
-    let entities = match load_all_journal_entities(journal_root) {
+    let entities = match if present || has_audio_transcript {
+        load_all_journal_entities(journal_root)
+    } else {
+        Ok(Vec::new())
+    } {
         Ok(entities) => entities,
         Err(_) => {
             // Without the entity store no label can be named, so say so.
@@ -136,10 +143,13 @@ pub(crate) fn load(dir: &Path, journal_root: &Path, now: DateTime<Utc>) -> Speak
             (entity.id.clone(), name.to_owned())
         })
         .collect::<BTreeMap<_, _>>();
-    let principal = read_journal_principal(journal_root)
-        .ok()
-        .flatten()
-        .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_owned));
+    let mut principals = entities
+        .iter()
+        .filter(|entity| entity.is_principal() && !entity.is_blocked());
+    let principal = principals
+        .next()
+        .map(|entity| entity.id.clone())
+        .filter(|_| principals.next().is_none());
     if present {
         match fs_read_json(&path) {
             Some(Value::Object(payload)) => match payload.get("labels").and_then(Value::as_array) {
@@ -274,6 +284,29 @@ mod tests {
     use super::load;
 
     #[test]
+    fn screen_only_segment_does_not_join_unrelated_people() {
+        let root = tempfile::tempdir().unwrap();
+        let entity = root.path().join("entities/person");
+        fs::create_dir_all(&entity).unwrap();
+        fs::write(
+            entity.join("entity.json"),
+            r#"{"id":"person","type":"Person","name":"Person","is_principal":true}"#,
+        )
+        .unwrap();
+        let segment = root.path().join("segment");
+        fs::create_dir_all(&segment).unwrap();
+        let screen = load(&segment, root.path(), Utc::now(), false);
+        assert!(screen.person_names.is_empty());
+        assert!(screen.principal.is_none());
+        let audio = load(&segment, root.path(), Utc::now(), true);
+        assert_eq!(
+            audio.person_names.get("person").map(String::as_str),
+            Some("Person")
+        );
+        assert_eq!(audio.principal.as_deref(), Some("person"));
+    }
+
+    #[test]
     fn load_omits_labels_for_ineligible_speakers() {
         let root = std::env::temp_dir().join(format!(
             "solstone-transcript-speaker-admission-{}",
@@ -309,7 +342,7 @@ mod tests {
         )
         .expect("labels");
 
-        let join = load(&segment, &root, Utc::now());
+        let join = load(&segment, &root, Utc::now(), true);
         assert!(join.labels.contains_key(&1));
         assert!(!join.labels.contains_key(&2));
         let _ = fs::remove_dir_all(root);
@@ -339,7 +372,7 @@ mod tests {
         )
         .expect("labels");
 
-        let join = load(&segment, &root, Utc::now());
+        let join = load(&segment, &root, Utc::now(), true);
         assert!(join.labels.is_empty());
         assert_eq!(join.warnings.len(), 1);
         assert_eq!(join.warnings[0].kind, "speaker_labels");

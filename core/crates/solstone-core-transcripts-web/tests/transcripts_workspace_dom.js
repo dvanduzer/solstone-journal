@@ -518,6 +518,9 @@ function createTranscriptsDOM() {
   const zoomSegments = doc.createElement('div');
   zoomSegments.id = 'trZoomSegments';
   zoom.appendChild(zoomSegments);
+  const segmentPicker = doc.createElement('select');
+  segmentPicker.id = 'trSegmentPicker';
+  doc.body.appendChild(segmentPicker);
 
   const titleEl = doc.createElement('div');
   titleEl.className = 'tr-title';
@@ -983,6 +986,25 @@ const tests = [];
 function test(name, fn) {
   tests.push({ name, fn });
 }
+
+test('segment picker selects the right stream and follows browser back', async () => {
+  const env = await createEnvironment();
+  const picker = env.doc.getElementById('trSegmentPicker');
+  const pills = getZoomPills(env.doc);
+  const baseline = env.history.length;
+  for (const pill of [pills[0], pills[2]]) {
+    picker.value = JSON.stringify([pill.dataset.stream, pill.dataset.key]);
+    picker.dispatchEvent({ type: 'change' });
+    await env.releasePendingSegmentGets();
+    assert.ok(env.window.location.search.includes('stream=' + pill.dataset.stream));
+    assert.ok(env.window.location.hash.includes(pill.dataset.key));
+  }
+  assert.strictEqual(env.history.length, baseline + 2);
+  env.history.back();
+  await env.flushHashchanges();
+  await env.releasePendingSegmentGets();
+  assert.strictEqual(picker.value, JSON.stringify([pills[0].dataset.stream, pills[0].dataset.key]));
+});
 
 // 1. Post-load length is the baseline. Click A's pill (first 114500_300), release the segment GET.
 // Click B's pill (115500_300), release. Length is baseline+2. back, flush hashchange, release:

@@ -4469,13 +4469,13 @@
     });
   }
 
-  function ownerStatusError() {
-    ownerPanel.innerHTML = `
-      <strong>${escapeHtml(COPY.SPK_OVERVIEW_OWNER_STATUS_ERROR)}</strong>
-      <div class="spk-overview-actions">
-        <a class="spk-overview-btn spk-overview-btn-primary" href="/app/speakers/${TODAY}#owner-teach">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_HELP_LABEL)}</a>
-      </div>
-    `;
+  function ownerStatusError(err) {
+    ownerPanel.innerHTML = window.SurfaceState.error({
+      heading: COPY.SPK_OVERVIEW_OWNER_STATUS_ERROR,
+      desc: window.CONVEY_COPY.RELOAD_HINT,
+      serverMessage: window.SurfaceState.serverMessageFrom(err),
+      detail: err,
+    });
   }
 
   function ownerCandidate(data) {
@@ -4812,8 +4812,7 @@
     const throwOnError = Boolean(options?.throwOnError);
     const requestSeq = qualityRequestSeq + 1;
     qualityRequestSeq = requestSeq;
-    return fetch('/app/speakers/api/quality')
-      .then((response) => response.json())
+    return window.apiJson('/app/speakers/api/quality')
       .then((data) => {
         if (requestSeq !== qualityRequestSeq) return false;
         renderQuality(data);
@@ -4834,8 +4833,7 @@
   }
 
   function loadOwner() {
-    return fetch('/app/speakers/api/owner/status')
-      .then((response) => response.json())
+    return window.apiJson('/app/speakers/api/owner/status')
       .then((data) => {
         if (data.status === OWNER_STATUS_ROUTING.candidate) ownerCandidate(data);
         else if (data.status === OWNER_STATUS_ROUTING.confirmed) ownerConfirmed(data);

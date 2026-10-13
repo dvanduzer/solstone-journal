@@ -1571,8 +1571,27 @@ h2.card-title {
   <section class="dashboard-card" id="processingHolds" aria-labelledby="processingHoldsTitle" hidden>
     <h2 class="card-title" id="processingHoldsTitle">set-aside work</h2>
     <p data-held-work-notice></p>
+    <details data-held-work-list><summary>review items on hold</summary>
     <div data-held-work-rows></div>
+    <nav data-held-work-pages aria-label="set-aside work pages" hidden><button type="button" data-held-previous>previous</button> <span></span> <button type="button" data-held-next>next</button></nav></details>
     <p data-held-work-support><a href="https://support.solstone.app/">get help →</a></p>
+  </section>
+
+  <style>
+    .backup-health-card dl { margin: 1rem 0; }
+    .backup-health-card dl > div { display: grid; grid-template-columns: minmax(8rem, 1fr) 3fr; gap: 0.5rem 1rem; padding: 0.4rem 0; }
+    .backup-health-card dt, .backup-health-card .backup-history-note { color: var(--ink-soft-paper); }
+    .backup-health-card dd { margin: 0; overflow-wrap: anywhere; }
+    .backup-health-card details p { overflow-wrap: anywhere; }
+    .backup-health-card > a, .backup-health-card summary { display: flex; align-items: center; min-height: 44px; }
+    .backup-health-card [data-tone="attention"], .backup-health-card [data-tone="unavailable"] { color: var(--warn-ink); }
+    @media (max-width: 480px) { .backup-health-card dl > div { grid-template-columns: 1fr; gap: 0.15rem; } }
+  </style>
+  <section class="dashboard-card backup-health-card" id="backup" aria-labelledby="backupTitle">
+    <h2 class="card-title" id="backupTitle">backup</h2>
+    <p data-backup-summary role="status">checking backup status…</p>
+    <div data-backup-facts></div>
+    <a href="/app/backup/">manage backup →</a>
   </section>
 
   <div class="dashboard-card activity-section hidden" id="errorSummary">
@@ -1637,7 +1656,7 @@ h2.card-title {
   <div class="dashboard-card clients-card hidden" id="clientsCard">
     <div class="card-header">
       <div class="card-title">
-        what's going into your journal
+        sources adding to your journal
       </div>
     </div>
     <div class="clients-grid" id="clientsGrid"></div>
@@ -1731,4 +1750,5 @@ h2.card-title {
   </div>
   <section id="healthSystemDetails" class="dashboard-card"><h2 class="card-title">journal status details</h2></section>
 </div>
+<script src="/app/backup/static/backup-status.js"></script>
 <script src="/app/health/static/health.js"></script>

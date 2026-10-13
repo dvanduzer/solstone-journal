@@ -147,24 +147,6 @@
         "ok": "{duration} ago",
         "failed": "spot-check failed {duration} ago",
         "skipped": "spot-check couldn't run {duration} ago"
-      },
-      "error_reasons": {
-        "incomplete": "some of your journal couldn't be read, so the copy that was stored is incomplete.",
-        "repo_missing": "your backup destination couldn't be found.",
-        "locked": "the backup lock was already held.",
-        "auth_failed": "your destination credentials were refused.",
-        "timeout": "it ran out of time.",
-        "_missing": "the reason wasn't recorded.",
-        "restic_unavailable": "encrypted backup can't run on this computer.",
-        "rclone_unavailable": "encrypted backup can't reach storage from this computer.",
-        "backup_unavailable": "this computer can't set up or restore encrypted backup.",
-        "failed": "the backup tool stopped with an error.",
-        "unknown": "the backup tool stopped for a reason it didn't give.",
-        "broker_unreachable": "encrypted backup couldn't be reached.",
-        "broker_error": "encrypted backup didn't return usable settings.",
-        "hosted_entitlement_inactive": "encrypted backup isn't turned on in the services portal.",
-        "binding_invalid": "this computer's link to encrypted backup was refused.",
-        "binding_superseded": "this computer's link to encrypted backup was replaced."
       }
     },
     "offload": {
@@ -362,6 +344,7 @@
   const BYTES_PER_MB = 1048576;
   const MAX_OFFLOAD_DAY_ROWS = 21;
   let state = {};
+  let backupStatusCurrent = false;
   let offloadState = { status: 'loading', payload: null };
   let currentRecoveryDisplay = '';
   let offloadDaysExpanded = false;
@@ -591,7 +574,7 @@
   }
 
   function backupErrorReasonLine(errorReason) {
-    const labels = (copy.status && copy.status.error_reasons) || {};
+    const labels = window.BackupStatus.errorReasons;
     if (errorReason === null || errorReason === undefined) {
       return labels._missing || null;
     }
@@ -1279,7 +1262,7 @@
     if (reason === 'integrity_failed' || reason === 'read_data_mismatch') {
       return offloadCopy.verification_integrity_failed || '';
     }
-    const labels = (copy.status && copy.status.error_reasons) || {};
+    const labels = window.BackupStatus.errorReasons;
     return Object.prototype.hasOwnProperty.call(labels, reason)
       ? labels[reason] : offloadCopy.reason_unavailable || '';
   }
@@ -1774,6 +1757,7 @@
   }
 
   function renderStatus() {
+    window.BackupStatus.renderSummary(root.querySelector('[data-backup-summary]'), backupStatusCurrent ? state : null);
     root.setAttribute(
       'data-state',
       operationActive(state.operation) ? state.operation.phase : managedMode() ? 'done' : 'empty',
@@ -1879,11 +1863,21 @@
   }
 
   async function refreshStatus() {
-    const payload = await readJson(
-      await fetch('/app/backup/status', { headers: { Accept: 'application/json' } }),
-    );
-    applyPayload(payload);
-    return payload;
+    try {
+      const payload = await readJson(
+        await fetch('/app/backup/status', { headers: { Accept: 'application/json' } }),
+      );
+      if (payload?.success !== true) {
+        throw new Error('backup status unavailable');
+      }
+      backupStatusCurrent = Boolean(window.BackupStatus.select(payload).snapshot);
+      applyPayload(payload);
+      return payload;
+    } catch (error) {
+      backupStatusCurrent = false;
+      window.BackupStatus.renderSummary(root.querySelector('[data-backup-summary]'), null);
+      throw error;
+    }
   }
 
   function applyOffloadPayload(payload) {
@@ -2408,6 +2402,8 @@
       loading.textContent = "couldn't load backup settings. reload this page to try again.";
       return;
     }
+    root.querySelector('[data-backup-loading]').hidden = true;
+    showPanel(initialPanel());
     try {
       await refreshOffloadStatus();
     } catch (err) {
@@ -2416,8 +2412,6 @@
       }
       renderOffloadUnavailable();
     }
-    root.querySelector('[data-backup-loading]').hidden = true;
-    showPanel(initialPanel());
   }
 
   if (document.readyState === 'loading') {

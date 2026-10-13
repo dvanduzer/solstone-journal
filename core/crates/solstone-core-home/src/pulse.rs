@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::{Map, Value, json};
 use solstone_core_entity::read_journal_principal;
-use solstone_core_facets::{ConnectionsHorizon, refresh_connections_horizon};
+use solstone_core_facets::{ConnectionsHorizon, read_connections_horizon};
 
 use crate::HomeContext;
 use crate::briefing;
@@ -250,7 +250,7 @@ fn build_pulse_context(context: &HomeContext) -> PulseContext {
         transcription_issue.as_ref(),
     );
     let yesterday_processing = summarize_yesterday_processing(context, journal_age_days);
-    let horizon = refresh_connections_horizon(context.journal_root());
+    let horizon = read_connections_horizon(context.journal_root());
     let connections = load_connections_card(context, horizon);
 
     let narrative_summary = narrative_content.as_ref().map_or_else(String::new, |_| {
@@ -1392,8 +1392,8 @@ mod tests {
 
     fn assert_horizon_failure_does_not_change_card(root: &Path) {
         let ctx = horizon_context(root);
-        assert!(refresh_connections_horizon(root).is_none());
-        let with_refresh = load_connections_card(&ctx, refresh_connections_horizon(root));
+        assert!(read_connections_horizon(root).is_none());
+        let with_refresh = load_connections_card(&ctx, read_connections_horizon(root));
         let with_none = load_connections_card(&ctx, None);
         assert_eq!(with_refresh, with_none);
         assert!(with_refresh.get("horizon_day").is_none());
@@ -1468,7 +1468,7 @@ mod tests {
         fs::write(&day, "{\"name\":\"Ada\",\"segments\":[\"seg-1\"]}\n").unwrap();
         fs::create_dir_all(root.path().join("chronicle/20260101")).unwrap();
         let ctx = horizon_context(root.path());
-        let horizon = refresh_connections_horizon(root.path());
+        let horizon = read_connections_horizon(root.path());
         assert!(horizon.is_none());
         let card = load_connections_card(&ctx, horizon);
         assert!(card.get("horizon_day").is_none());

@@ -242,7 +242,7 @@ function add(parent, tagName, attributes = {}) {
 }
 
 function status(operation = null, hosted = { bound: false }) {
-  return { success: true, enabled: false, mode: 'byo', hosted, operation };
+  return { success: true, enabled: false, mode: 'byo', hosted, operation, last_backup: null, last_verification: null };
 }
 
 function response(body, statusCode = 200) {
@@ -368,6 +368,9 @@ function fixture(document) {
 function createHarness(options = {}) {
   const document = new Document();
   const elements = fixture(document);
+  const summary = document.createElement('p');
+  summary.setAttribute('data-backup-summary', '');
+  elements.root.appendChild(summary);
   const calls = [];
   const timers = [];
   const popups = [];
@@ -438,6 +441,7 @@ function createHarness(options = {}) {
   }
   vm.runInContext(navJs, context, { filename: 'external-navigation.js' });
   const source = fs.readFileSync(path.join(crateDir, 'assets', 'backup.js'), 'utf8');
+  vm.runInContext(fs.readFileSync(path.join(crateDir, 'assets', 'backup-status.js'), 'utf8'), context, { filename: 'backup-status.js' });
   vm.runInContext(source, context, { filename: 'backup.js' });
   return {
     ...elements,
@@ -804,6 +808,15 @@ asyncCase('initial settings stay hidden until status is known', async () => {
   assert.ok(panels.every((panel) => panel.hidden));
   assert.ok(!harness.root.querySelector('[data-backup-loading]').hidden);
   release(response(status()));
+  await settle();
+  assert.ok(harness.root.querySelector('[data-backup-loading]').hidden);
+  assert.ok(!harness.root.querySelector('[data-backup-panel="intro"]').hidden);
+});
+
+asyncCase('backup settings become usable while storage measurement is pending', async () => {
+  const harness = createHarness({ respond(call) {
+    if (call.url === '/app/backup/offload/status') return new Promise(() => {});
+  } });
   await settle();
   assert.ok(harness.root.querySelector('[data-backup-loading]').hidden);
   assert.ok(!harness.root.querySelector('[data-backup-panel="intro"]').hidden);
@@ -1812,6 +1825,44 @@ for (const phase of ['restoring', 'done', 'error', 'cleanup_pending', 'refused',
     } else assert.strictEqual(harness.reopen.href, '');
   });
 }
+
+asyncCase('general backup summary replaces a reassuring result after failed polling and recovers on reload', async () => {
+  let reads = 0;
+  const success = { status: 'ok', time: 1770000000, snapshot_id: 'copy-a' };
+  const harness = createHarness({ respond(call) {
+    if (call.url !== '/app/backup/status') return undefined;
+    reads += 1;
+    if (reads === 2) throw new Error('temporary failed read');
+    return response({ ...status(reads < 3 ? restoreOperation('restoring') : restoreOperation('done')),
+      enabled: true, last_backup: success });
+  } });
+  await ready(harness);
+  const summary = harness.root.querySelector('[data-backup-summary]');
+  assert.strictEqual(summary.dataset.tone, 'neutral');
+  await harness.runTimer(800);
+  assert.strictEqual(summary.dataset.tone, 'unavailable');
+  const reloaded = createHarness({ statusQueue: [{ ...status(), enabled: true, last_backup: success }] });
+  await ready(reloaded);
+  assert.strictEqual(reloaded.root.querySelector('[data-backup-summary]').dataset.tone, 'neutral');
+});
+
+asyncCase('a malformed fresh status cannot borrow successful facts from the previous status', async () => {
+  const success = { status: 'ok', time: 1770000000, snapshot_id: 'copy-a' };
+  for (const malformed of [{ success: true }, { success: true, enabled: true }]) {
+    const harness = createHarness({ statusQueue: [
+      { ...status(restoreOperation('restoring')), enabled: true, last_backup: success },
+      malformed,
+      { ...status(restoreOperation('done')), enabled: true, last_backup: success },
+    ] });
+    await ready(harness);
+    const summary = harness.root.querySelector('[data-backup-summary]');
+    assert.strictEqual(summary.dataset.tone, 'neutral');
+    await harness.runTimer(800);
+    assert.strictEqual(summary.dataset.tone, 'unavailable');
+    await harness.runTimer(800);
+    assert.strictEqual(summary.dataset.tone, 'neutral');
+  }
+});
 
 async function runAsyncCases() {
   for (const runCase of asyncCases) await runCase();

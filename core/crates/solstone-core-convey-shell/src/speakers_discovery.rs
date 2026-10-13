@@ -22,6 +22,7 @@ use crate::JournalRoot;
 use crate::speakers_calendar::{
     journal_principal_id, live_entities, load_segment_speakers, load_speaker_labels, value_truthy,
 };
+use crate::speakers_dismissals::{DiscoveryMember, dismissal_suppressed, fold_dismissal_members};
 use crate::speakers_review::{find_matching_entity, is_admissible_speaker_entity};
 use solstone_core_speaker_resolve::audio_sample::audio_info;
 use solstone_core_speaker_resolve::segment_catalog::{
@@ -280,6 +281,7 @@ fn serialize_clusters(
     clusters: &serde_json::Map<String, Value>,
 ) -> Result<Vec<Value>, String> {
     let mut rows = Vec::new();
+    let mut dismissals = None;
     for (raw_id, members) in clusters {
         let cluster_id = raw_id
             .parse::<i64>()
@@ -292,7 +294,15 @@ fn serialize_clusters(
             .map(normalize_member)
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| format!("invalid discovery cluster member: {raw_id}"))?;
-        if !members.is_empty() && !dismissal_suppressed(root, &members)? {
+        if members.is_empty() {
+            continue;
+        }
+        if dismissals.is_none() {
+            dismissals = Some(folded_dismissal_members(root)?);
+        }
+        let dismissals = dismissals.as_ref().expect("dismissals were loaded");
+        let candidate = members.iter().map(Member::dismissal_key).collect();
+        if !dismissal_suppressed(&candidate, dismissals) {
             rows.push(serialize_cluster(root, cluster_id, &members));
         }
     }
@@ -881,15 +891,11 @@ fn cluster_not_found(cluster_id: &str) -> Response {
     .into_response()
 }
 
-fn dismissal_suppressed(root: &Path, members: &[Member]) -> Result<bool, String> {
-    let candidate = members.iter().cloned().collect::<BTreeSet<_>>();
-    if candidate.is_empty() {
-        return Ok(false);
-    }
+fn folded_dismissal_members(root: &Path) -> Result<Vec<BTreeSet<DiscoveryMember>>, String> {
     let path = root.join("speakers/cluster-dismissals.jsonl");
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
     };
     let mut dismissals = Vec::new();
@@ -902,17 +908,26 @@ fn dismissal_suppressed(root: &Path, members: &[Member]) -> Result<bool, String>
             .ok_or_else(|| format!("invalid dismissal members on line {}", index + 1))?;
         let dismissed = members
             .iter()
-            .map(normalize_member)
+            .map(|member| normalize_member(member).map(|member| member.dismissal_key()))
             .collect::<Option<BTreeSet<_>>>()
             .ok_or_else(|| format!("invalid dismissal member on line {}", index + 1))?;
         dismissals.push(dismissed);
     }
-    Ok(dismissals.into_iter().any(|dismissed| {
-        !dismissed.is_empty() && candidate.intersection(&dismissed).count() * 2 >= candidate.len()
-    }))
+    Ok(fold_dismissal_members(&dismissals))
 }
 
 impl Member {
+    fn dismissal_key(&self) -> DiscoveryMember {
+        (
+            self.day.clone(),
+            self.layout.flag().to_owned(),
+            self.stream.clone(),
+            self.segment_key.clone(),
+            self.source.clone(),
+            self.sentence_id,
+        )
+    }
+
     fn segment(&self) -> (String, String, String, &'static str) {
         (
             self.day.clone(),

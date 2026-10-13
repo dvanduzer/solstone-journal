@@ -6,6 +6,11 @@
     <h1 data-copy="intro.title"></h1>
   </header>
 
+  <div class="backup-general-status">
+    <p data-backup-summary role="status">checking backup status…</p>
+    <a class="backup-link" href="/app/health/#backup">backup details in health →</a>
+  </div>
+
   <div class="backup-operation" data-operation-banner hidden>
     <span class="backup-spinner" aria-hidden="true"></span>
     <span data-operation-phase data-copy="phase_labels.loading"></span>
@@ -464,4 +469,5 @@
   </div>
 </section>
 
+<script defer src="/app/backup/static/backup-status.js"></script>
 <script defer src="/app/backup/static/backup.js"></script>

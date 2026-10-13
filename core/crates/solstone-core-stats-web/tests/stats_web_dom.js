@@ -383,6 +383,43 @@ test('stats hero renders nothing for unfinished line when template is missing', 
   assert.strictEqual(unfinishedLine, null);
 });
 
+test('daily charts expose exact values through keyboard and touch selection', () => {
+  const { doc, context } = createEnvironment();
+  const source = loadDashboardSource();
+  vm.runInContext(source.slice(source.indexOf('  function shouldLabel('), source.indexOf('  // Create a stat card')), context);
+  vm.runInContext('function fmtDay(day) { return day; }', context);
+  const container = doc.createElement('div');
+  const chart = doc.createElement('div');
+  container.appendChild(chart);
+  ['20261001: audio 2h, screen 1h', '20261002: audio 0h, screen 0h', '20261003: audio 4h, screen 2h'].forEach(label => {
+    const bar = doc.createElement('div');
+    const stack = doc.createElement('div');
+    stack.className = 'bar-stack';
+    stack.setAttribute('aria-label', label);
+    bar.appendChild(stack);
+    chart.appendChild(bar);
+  });
+  context.container = container;
+  context.chart = chart;
+  vm.runInContext("addDailyInspection(container, chart, ['20261001', '20261002', '20261003'])", context);
+  const bars = chart.children;
+  const select = container.querySelector('select');
+  const readout = container.querySelector('.chart-day-values');
+  assert.strictEqual(chart.getAttribute('role'), 'group', 'interactive descendants remain exposed');
+  assert.strictEqual(bars.filter(bar => bar.getAttribute('tabindex') === '0').length, 1);
+  bars[2].dispatchEvent({ type: 'keydown', key: 'ArrowLeft', preventDefault() {} });
+  assert.strictEqual(doc.activeElement, bars[1]);
+  assert.strictEqual(readout.textContent, bars[1].getAttribute('aria-label'), 'zero days are inspectable too');
+  select.value = '0';
+  select.dispatchEvent({ type: 'change' });
+  assert.strictEqual(readout.textContent, bars[0].getAttribute('aria-label'), 'native touch selector reads the same exact day');
+  bars[0].dispatchEvent({ type: 'keydown', key: 'End', preventDefault() {} });
+  assert.strictEqual(doc.activeElement, bars[2]);
+  assert.strictEqual(select.value, '2');
+  assert.strictEqual(vm.runInContext('shouldLabel(28, 30)', context), false, 'weekly tick leaves room for endpoint');
+  assert.strictEqual(vm.runInContext('shouldLabel(29, 30)', context), true);
+});
+
 async function runAsyncCases() {
   for (const runCase of asyncCases) await runCase();
   console.log('DOM CASES: ' + cases + ' passed');

@@ -78,11 +78,11 @@ mod local {
     use solstone_core_journal_io::journal_root::JournalEntryKind;
 
     use solstone_core_journal_io::activity_obligations::{
-        IntentRead, NativeObligation, intent_filename, observe_obligations,
+        IntentRead, NativeObligation, intent_filename, is_stage_namespace_name, observe_obligations,
     };
     use solstone_core_journal_io::media::{
-        Cleanup, Confirmation, MediaDirectory, MediaEntry, MediaStage, OriginalName,
-        REMOVAL_ORIGINAL_LEAF, REMOVAL_RECORD_LEAF, RemovalEffect, digest_reader,
+        Cleanup, Confirmation, Durability, MediaDirectory, MediaEntry, MediaStage, OriginalName,
+        REMOVAL_ORIGINAL_LEAF, REMOVAL_RECORD_LEAF, RemovalEffect, RemovalPhase, digest_reader,
         exclusive_local_activity, retire_recorded_stage, retire_unrecorded_stage,
         retire_unrecorded_stage_where,
     };
@@ -124,6 +124,7 @@ mod local {
             })
             .collect();
         recovered.extend(retire_unrecorded_downloads(activity));
+        recovered.extend(retire_empty_metadata_stages(activity));
         recovered
     }
 
@@ -338,18 +339,63 @@ mod local {
         }
         let claim = MediaStage::create(Arc::clone(&health), Arc::clone(activity))
             .map_err(|_| Hold::Native)?;
-        let removal = intents.remove_observed(&name, &observed, claim);
+        let mut removal = intents.remove_observed(&name, &observed, claim);
+        if removal.receipt().cleanup != Cleanup::Complete {
+            removal.cleanup();
+        }
         let receipt = removal.receipt();
         if receipt.effect == RemovalEffect::Deleted
             && receipt.original_name == OriginalName::Absent
             && receipt.claim_confirmation == Confirmation::Confirmed
             && receipt.cleanup == Cleanup::Complete
-            && receipt.failures.is_empty()
+            && receipt.source_durability == Durability::Synced
+            && receipt.claim_durability == Durability::Synced
+            && !receipt
+                .failures
+                .iter()
+                .any(|f| f.phase != RemovalPhase::Cleanup)
         {
             Ok(())
         } else {
             Err(Hold::Native)
         }
+    }
+
+    fn retire_empty_metadata_stages(activity: &Arc<ActivityLease>) -> Vec<AbandonedRestore> {
+        let Ok(census) = observe_obligations(activity.journal_root()) else {
+            return Vec::new();
+        };
+        let Ok(health) = MediaDirectory::open(
+            Arc::clone(activity.journal_root()),
+            Path::new("health/offload"),
+        ) else {
+            return Vec::new();
+        };
+        let mut retired = Vec::new();
+        for obligation in census.entries() {
+            let NativeObligation::Stage { relative, entry } = obligation else {
+                continue;
+            };
+            if entry.kind != JournalEntryKind::Directory
+                || !is_stage_namespace_name(&entry.name)
+                || relative.parent() != Some(Path::new("health/offload"))
+            {
+                continue;
+            }
+            if let Ok(true) = retire_unrecorded_stage_where(
+                activity,
+                &health,
+                &entry.name,
+                entry.identity,
+                &|_| false,
+            ) {
+                retired.push(AbandonedRestore {
+                    operation_id: None,
+                    outcome: Ok(AbandonedRestoreRelease::Undone),
+                });
+            }
+        }
+        retired
     }
 }
 

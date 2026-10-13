@@ -307,6 +307,26 @@ fn empty_stage_without_intent_in_a_restore_location_is_removed() {
 }
 
 #[test]
+fn empty_metadata_stage_after_intent_removal_is_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let empty = unrecorded(temp.path(), "health/offload/.tmp-offload-empty", &[]);
+    let retained = unrecorded(
+        temp.path(),
+        "health/offload/.tmp-offload-retained",
+        &[solstone_core_journal_io::media::REMOVAL_ORIGINAL_LEAF],
+    );
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+    let activity = ActivityLease::try_acquire(Arc::clone(&root)).unwrap();
+    assert_eq!(recover_abandoned_restores(&activity).len(), 1);
+    assert!(!empty.exists());
+    assert_eq!(
+        fs::read(retained.join(solstone_core_journal_io::media::REMOVAL_ORIGINAL_LEAF)).unwrap(),
+        RESTORED
+    );
+    assert!(recover_abandoned_restores(&activity).is_empty());
+}
+
+#[test]
 fn readback_stage_without_intent_at_the_root_is_recovered() {
     let temp = tempfile::tempdir().unwrap();
     let readback = unrecorded(

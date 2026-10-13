@@ -8,6 +8,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- playing a voice sample on the speakers page now reads only the part of the audio your browser asks for, using less memory for long recordings.
+
+- health now shows recorded backup attempts, successful copies and spot-checks. the backup page also shows a status summary and links to those details.
+
 - in entities, "block" is now "hide", "unblock" is "unhide", and "blocked" is "hidden". the actions work as before.
 
 - confidential processing now finishes older recordings and day updates automatically. with your own key, you still choose whether to allow this work and any provider charges.
@@ -24,6 +28,15 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - when a recording can't be transcribed because its original audio is damaged, doctor no longer suggests a retry command that wouldn't run. the warning remains.
 
 - fixed a problem that made saved agent notes unreadable after restoring or copying your journal.
+- backup settings appear before the storage measurement finishes. health groups repeated items on hold and pages the list.
+- a failed voice-status check now shows an error instead of asking you to teach your voice again. health uses reported device information instead of assuming an unnamed source is a desktop.
+- on phones, transcripts have a segment picker and more room for text, import history keeps filenames and statuses visible, and dialogs stay above navigation. long names, facet details and settings explanations fit more comfortably.
+- activity filters stay visible after applying them, import source filters cover the full history, and support opens from settings on phones. chart values are available by keyboard and touch, without covering nearby bars.
+- originals waiting for approval now load in pages, each with its own selection. a single item too large to review is identified without offering a deletion action, and you can continue to the next page.
+
+- naming a voice could add the same voice sample twice from older audio. that sample is now counted once.
+- security fix: text containing quotes could be mistaken for part of a button or link in your journal's browser pages. it now displays as text.
+- dismissed voices could reappear in the speakers app after a scan. the list now applies your earlier dismissals consistently.
 
 - a failed backup attempt no longer replaces the record of your last successful backup. the backup page shows both, including when a stored copy was incomplete.
 - each day's daily results, like your morning briefing, are made again once the day ends. since 2.0.42, your journal waited for each of the day's recordings to be checked off one by one, a few every hour or so. when recordings ran all day, those results stopped coming. days already waiting catch up soon after you update, and catching up on older recordings keeps going as each one finishes instead of a few at a time.

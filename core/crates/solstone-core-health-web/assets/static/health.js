@@ -25,7 +25,8 @@
     "HEALTH_GLANCE_DEVICES_UNKNOWN": "delivery from some of your devices isn't known right now.",
     "HEALTH_GLANCE_WORK_HELD": "some queued work is on hold for a safety check.",
     "HEALTH_GLANCE_WORK_UNAVAILABLE": "queued work status is unavailable right now.",
-    "HEALTH_GLANCE_OK": "everything's working. the solstone app last added to your journal {age}.",
+    "HEALTH_GLANCE_OK": "the journal's live services and processing are working. the solstone app last added to your journal {age}.",
+    "HEALTH_GLANCE_BACKUP": "{headline}",
     "HEALTH_GLANCE_BRAIN_ATTENTION": "{headline}",
     "HEALTH_GLANCE_CHECKIN_STALE": "a journal run on {name} stopped checking in with your journal.",
     "HEALTH_GLANCE_CHECKINS_STALE": "{n} journal runs stopped checking in with your journal: {names}.",
@@ -78,6 +79,7 @@
   let connectError = false;
 
   const state = {
+    backupView: { tone: 'unavailable', text: 'checking backup status…' },
     heldWorkSnapshot: null,
     heldWorkCurrent: false,
     supervisorSeen: false,
@@ -212,14 +214,50 @@
     });
   }
 
-  async function getJson(path) {
+  async function getJson(path, options = {}) {
     if (window.apiJson) {
-      return window.apiJson(path);
+      return window.apiJson(path, options);
     }
-    const response = await fetch(path, { headers: { Accept: 'application/json' } });
+    const response = await fetch(path, { headers: { Accept: 'application/json' }, ...options });
     const payload = await response.json();
     if (!response.ok) throw payload;
     return payload;
+  }
+
+  const backupSection = document.getElementById('backup');
+  let backupReadPending = false;
+  async function loadBackupStatus() {
+    const section = backupSection;
+    if (!section?.isConnected || document.hidden || backupReadPending) return;
+    backupReadPending = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    let snapshot = null;
+    try {
+      const payload = await getJson('/app/backup/status', { signal: controller.signal });
+      if (payload?.success === true) snapshot = payload;
+    } catch (error) {
+      logHealthError(error, 'backup status fetch failed');
+    } finally {
+      clearTimeout(timeout);
+      backupReadPending = false;
+    }
+    // A read started on a removed workspace cannot repaint its replacement.
+    if (!section.isConnected) return;
+    state.backupView = window.BackupStatus.renderSummary(section.querySelector('[data-backup-summary]'), snapshot);
+    window.BackupStatus.renderFacts(section.querySelector('[data-backup-facts]'), snapshot);
+    updateStatusSummary();
+  }
+
+  function focusBackupDetails() {
+    if (window.location.hash === '#backup' && backupSection?.isConnected) {
+      backupSection.scrollIntoView({ block: 'start' });
+    }
+  }
+
+  function refreshStatusReads() {
+    loadRegisteredClients();
+    loadBackupStatus();
   }
 
   function clearHealthStateError() {
@@ -464,7 +502,15 @@
     };
   }
 
-  async function loadHealthState() {
+  let healthStateRequest = null;
+  function loadHealthState() {
+    if (!healthStateRequest) {
+      healthStateRequest = readHealthState().finally(() => { healthStateRequest = null; });
+    }
+    return healthStateRequest;
+  }
+
+  async function readHealthState() {
     clearHealthStateError();
     loadMediaBacklog();
     try {
@@ -809,7 +855,7 @@
     const records = new Map((state.work?.retry_records || []).map(record => [record.id, record]));
     const holds = (inventory?.holds || []).map((hold, index) => ({
       key: hold.retry_unit ? 'unit:' + hold.retry_unit : 'work:' + [hold.day, hold.stream, hold.segment, hold.reason].join(':'),
-      unit: hold.retry_unit, day: hold.day, reason: hold.reason,
+      unit: hold.retry_unit, day: hold.day, reason: hold.reason, count: hold.count || 1,
       label: [hold.day, hold.segment, talentName(records.get(hold.retry_unit)?.unit?.talent)].filter(Boolean).join(' · '),
       evidence: records.get(hold.retry_unit) || hold,
     }));
@@ -849,6 +895,8 @@
   }
 
   let heldWorkDeepLinkScrolled = false;
+  let heldWorkPage = 0;
+  const HELD_WORK_PAGE_SIZE = 30;
 
   function renderHeldWork() {
     const section = document.getElementById('processingHolds');
@@ -867,12 +915,26 @@
       : 'queued work status is unavailable.';
     notice.hidden = current;
     const rows = section.querySelector('[data-held-work-rows]');
-    const keys = new Set(holds.map(hold => hold.key));
+    heldWorkPage = Math.min(heldWorkPage, Math.max(0, Math.ceil(holds.length / HELD_WORK_PAGE_SIZE) - 1));
+    const visible = holds.slice(heldWorkPage * HELD_WORK_PAGE_SIZE, (heldWorkPage + 1) * HELD_WORK_PAGE_SIZE);
+    const pager = section.querySelector('[data-held-work-pages]');
+    if (pager) {
+      pager.hidden = holds.length <= HELD_WORK_PAGE_SIZE;
+      pager.querySelector('span').textContent = 'page ' + (heldWorkPage + 1) + ' of ' + Math.max(1, Math.ceil(holds.length / HELD_WORK_PAGE_SIZE));
+      const previous = pager.querySelector('[data-held-previous]');
+      const next = pager.querySelector('[data-held-next]');
+      previous.disabled = heldWorkPage === 0;
+      next.disabled = (heldWorkPage + 1) * HELD_WORK_PAGE_SIZE >= holds.length;
+      previous.onclick = () => { heldWorkPage -= 1; renderHeldWork(); };
+      next.onclick = () => { heldWorkPage += 1; renderHeldWork(); };
+    }
+    const keys = new Set(visible.map(hold => hold.key));
     for (const row of Array.from(rows.children)) {
       if (!keys.has(row.dataset.key)) rows.removeChild(row);
     }
-    for (const hold of holds) {
-      let row = Array.from(rows.children).find(row => row.dataset.key === hold.key);
+    const existingRows = new Map(Array.from(rows.children).map(row => [row.dataset.key, row]));
+    for (const hold of visible) {
+      let row = existingRows.get(hold.key);
       if (!row) {
         row = document.createElement('div');
         row.className = 'held-work-row';
@@ -897,7 +959,7 @@
       const scope = hold.partition
         ? names[hold.partition] || scheduleName(hold.partition) || 'queued processing'
         : 'all queued work';
-      row.querySelector('p').textContent = hold.label ? hold.label + ': ' + heldReason(hold.reason) : scope + ': ' + hold.count
+      row.querySelector('p').textContent = hold.label ? hold.label + (hold.count > 1 ? ' · ' + hold.count + ' items' : '') + ': ' + heldReason(hold.reason) : scope + ': ' + hold.count
         + (hold.count === 1 ? ' task' : ' tasks')
         + (state.heldWorkCurrent ? ' on hold for a safety check.' : ' on hold at the last check.');
       row.querySelector('pre').textContent = JSON.stringify(hold.evidence, null, 2);
@@ -921,6 +983,8 @@
     section.querySelector('[data-held-work-support]').hidden = holds.length === 0;
     if (!section.hidden && !heldWorkDeepLinkScrolled && window.location.hash === '#processingHolds') {
       heldWorkDeepLinkScrolled = true;
+      const list = section.querySelector('[data-held-work-list]');
+      if (list) list.open = true;
       requestAnimationFrame(() => section.scrollIntoView({ block: 'start' }));
     }
   }
@@ -989,8 +1053,17 @@
       };
     }
 
+    const backupVerdict = state.backupView.tone !== 'neutral'
+      ? { key: 'HEALTH_GLANCE_BACKUP', vars: { headline: state.backupView.text },
+        action: { href: '#backup', label: 'view backup details' } } : null;
+    if (state.backupView.tone === 'attention') return backupVerdict;
+
     if (deviceVerdict) return deviceVerdict;
     if (workVerdict) return workVerdict;
+    if (backupVerdict) {
+      return { key: 'HEALTH_GLANCE_BACKUP', vars: { headline: state.backupView.text },
+        action: { href: '#backup', label: 'view backup details' } };
+    }
 
 	    if (activeAgents > 0 || activeImports > 0) {
       const catchingUp = activeAgents + activeImports;
@@ -1027,6 +1100,7 @@
   }
 
   const GLANCE_ATTENTION_KEYS = new Set([
+    'HEALTH_GLANCE_BACKUP',
     'HEALTH_GLANCE_SERVICES_UNREACHABLE',
     'HEALTH_GLANCE_SERVICE_ATTENTION',
     'HEALTH_GLANCE_SERVICES_ATTENTION',
@@ -2235,9 +2309,12 @@
 
     const byHost = new Map();
     for (const [stream, data] of state.clients) {
-      const host = data.host || stream;
+      const registered = data.cid && (state.registeredClients || []).find(client => client.cid === data.cid);
+      const reported = registered?.reported || data.reported;
+      const named = registered?.display_label || reported?.name || data.host;
+      const host = data.cid || data.host || stream;
       if (!byHost.has(host)) byHost.set(host, []);
-      byHost.get(host).push({ stream, data });
+      byHost.get(host).push({ stream, data, named, reported });
     }
 
     const now = Date.now();
@@ -2253,7 +2330,8 @@
 
       const nameEl = document.createElement('div');
       nameEl.className = 'client-host-name';
-      nameEl.textContent = host;
+      nameEl.textContent = streams[0]?.named || 'journal source';
+      nameEl.title = host;
       const statusIcon = document.createElement('span');
       statusIcon.className = 'status-indicator ' + (anyActive ? 'active' : 'stale');
       statusIcon.setAttribute('aria-label', anyActive ? 'active' : 'stale');
@@ -2263,7 +2341,7 @@
       nameEl.style.gap = '0.4em';
       card.appendChild(nameEl);
 
-      const platform = streams[0]?.data?.platform || '';
+      const platform = streams[0]?.reported?.platform || streams[0]?.data?.platform || '';
       if (platform) {
         const platEl = document.createElement('div');
         platEl.className = 'client-host-platform';
@@ -2271,12 +2349,16 @@
         card.appendChild(platEl);
       }
 
-      for (const { stream, data } of streams) {
+      for (const { stream, data, reported } of streams) {
         const row = document.createElement('div');
         row.className = 'client-stream-row';
 
         const dotIdx = stream.indexOf('.');
-        const qualifier = dotIdx >= 0 ? stream.slice(dotIdx + 1) : 'desktop';
+        const sourceKind = { 'watch-audio': 'watch', tmux: 'terminal', 'mobile-segment': 'phone' }[data.source]
+          || (data.source?.startsWith('browser') ? 'browser' : null);
+        const ownSource = !data.source || ['audio', 'screen', 'camera', 'location'].includes(data.source);
+        const qualifier = sourceKind || (dotIdx >= 0 ? stream.slice(dotIdx + 1)
+          : ownSource ? reported?.device_type || data.device_type || 'source' : 'source');
 
         const stale = (now - data.lastSeen) >= STALE_MS;
         if (stale) row.classList.add('stale');
@@ -2565,6 +2647,7 @@
       state.registeredClientsObservedAt = Date.now();
       renderRegisteredClients(state.registeredClients);
       updateObserve();
+      updateClients();
       document.dispatchEvent(new CustomEvent('health:devices-loaded'));
     } catch (err) {
       state.registeredClientsFailed = true;
@@ -3515,9 +3598,15 @@
 	    if (healthInitialized) return;
 	    healthInitialized = true;
 	    applyHealthCopy();
-    Promise.all([healthInfoReady, registeredClientsReady, loadHealthState()]).then(() => {
+    // Do not hold the first Health paint or its existing readiness signal on
+    // this independent read. Later reads share the existing visible-tab cycle.
+    const backupReady = new Promise(resolve => requestAnimationFrame(() => resolve(loadBackupStatus())));
+    window.addEventListener('hashchange', focusBackupDetails);
+    const initialReady = Promise.all([healthInfoReady, registeredClientsReady, loadHealthState()]);
+    initialReady.then(() => {
       document.dispatchEvent(new CustomEvent('health:initial-ready'));
     });
+    Promise.all([initialReady, backupReady]).then(() => requestAnimationFrame(focusBackupDetails));
 	    focusRecentErrors();
 	    window.addEventListener('hashchange', focusRecentErrors);
 	    document.getElementById('glanceErrors')?.addEventListener('click', (e) => {
@@ -3602,7 +3691,7 @@
   // Sweep stale agents and imports every 60s
   let staleSweepTimer = setInterval(sweepStale, 60000);
 
-  let registeredClientsTimer = setInterval(loadRegisteredClients, 60000);
+  let registeredClientsTimer = setInterval(refreshStatusReads, 60000);
 
   // Connection health indicator — updated every 5s
   let connectionHealthTimer = setInterval(updateConnectionHealth, 5000);
@@ -3628,8 +3717,8 @@
         startElapsedTimer();
       }
       staleSweepTimer = setInterval(sweepStale, 60000);
-      loadRegisteredClients();
-      registeredClientsTimer = setInterval(loadRegisteredClients, 60000);
+      refreshStatusReads();
+      registeredClientsTimer = setInterval(refreshStatusReads, 60000);
       connectionHealthTimer = setInterval(updateConnectionHealth, 5000);
     }
   });

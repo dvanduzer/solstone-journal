@@ -118,18 +118,6 @@ fn prepare_segment(
         })
         .collect();
     let mut media = discover(&dir, markdown_only, &unclaimed_image_names);
-    let mut speakers = load(&dir, root, now);
-    let mut warnings = std::mem::take(&mut speakers.warnings);
-    let audio_capture = crate::audio_capture::read_audio_capture(&dir);
-    if let Some(capture) = &audio_capture {
-        warnings.extend(crate::audio_capture::warnings(capture, now));
-    }
-    let mut chunks = Vec::<Value>::new();
-    let mut has_jsonl = BTreeMap::from([("audio".to_owned(), false), ("screen".to_owned(), false)]);
-    let mut records: BTreeMap<String, Option<Value>> =
-        BTreeMap::from([("audio".to_owned(), None), ("screen".to_owned(), None)]);
-    let mut duration = 0.0_f64;
-    let mut markdown_added = false;
     let mut files = fs::read_dir(&dir)
         .map_err(|error| {
             legacy_error_response(
@@ -143,6 +131,23 @@ fn prepare_segment(
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     files.sort();
+    let has_audio_transcript = files.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("audio.jsonl"))
+    });
+    let mut speakers = load(&dir, root, now, has_audio_transcript);
+    let mut warnings = std::mem::take(&mut speakers.warnings);
+    let audio_capture = crate::audio_capture::read_audio_capture(&dir);
+    if let Some(capture) = &audio_capture {
+        warnings.extend(crate::audio_capture::warnings(capture, now));
+    }
+    let mut chunks = Vec::<Value>::new();
+    let mut has_jsonl = BTreeMap::from([("audio".to_owned(), false), ("screen".to_owned(), false)]);
+    let mut records: BTreeMap<String, Option<Value>> =
+        BTreeMap::from([("audio".to_owned(), None), ("screen".to_owned(), None)]);
+    let mut duration = 0.0_f64;
+    let mut markdown_added = false;
     for path in &files {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;

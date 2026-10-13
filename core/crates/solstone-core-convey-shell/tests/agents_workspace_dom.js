@@ -48,12 +48,18 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
   const timers = new Map();
   let timerId = 0;
   const watched = journal || {now: '2026-09-24T12:00:00Z', today: '20260924', pairing: null, connections: []};
+  const fields = Object.fromEntries(['outcome', 'tool', 'agent', 'from', 'to'].map(key => [`a-${key}`, {value: ''}]));
   const view = {
-    innerHTML: '',
+    _html: '',
+    get innerHTML() { return this._html; },
+    set innerHTML(value) { this._html = value; for (const field of Object.values(fields)) field.value = ''; },
     listeners: {},
     addEventListener(name, listener) { (this.listeners[name] ||= []).push(listener); },
-    querySelector() { return null; },
-    insertAdjacentHTML(_, text) { this.innerHTML += text; },
+    querySelector(selector) {
+      if (selector === '.modal' && this._html.includes('<div class="modal"')) return {remove: () => { this._html = this._html.slice(0, this._html.indexOf('<div class="modal"')); }};
+      return null;
+    },
+    insertAdjacentHTML(_, text) { this._html += text; },
   };
   const location = {
     origin: 'http://127.0.0.1:8080',
@@ -107,7 +113,7 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
   window.window = window;
   window.top = window;
   const document = {
-    getElementById: id => (id === 'agents-view' ? view : id.startsWith('a-') ? {value: ''} : null),
+    getElementById: id => (id === 'agents-view' ? view : id.startsWith('a-') ? fields[id] : null),
     querySelectorAll: () => [],
     addEventListener(name, listener) { (view.listeners[name] ||= []).push(listener); },
   };
@@ -146,7 +152,13 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
     for (const callback of due) await callback();
     await settle();
   };
-  return {view, calls, click, opened, popups, location, tick, journal: watched};
+  const keydown = async key => {
+    const event = {key, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }};
+    for (const listener of view.listeners.keydown || []) await listener(event);
+    await settle();
+    return event;
+  };
+  return {view, calls, click, opened, popups, location, tick, fields, keydown, journal: watched};
 }
 async function settle() { for (let i = 0; i < 6; i += 1) await new Promise(resolve => setImmediate(resolve)); }
 function has(view, text, why) { assert(view.innerHTML.includes(text), why || `missing: ${text}`); }
@@ -157,6 +169,38 @@ async function test(name, body) {
 }
 
 (async () => {
+  await test('applied activity filters survive rendering and preserve the request scope', async () => {
+    const agent = connection('oauth', 'g1', 'Claude', null);
+    const {click, fields, calls} = await boot(baseState({...ME_ON, connections: [agent]}));
+    await click({activityConnection: agent.key});
+    assert.strictEqual(fields['a-agent'].value, agent.key);
+    const filters = {outcome: 'refused', tool: 'search', agent: agent.key, from: '2026-09-01', to: '2026-09-24'};
+    for (const [key, value] of Object.entries(filters)) fields[`a-${key}`].value = value;
+    await click({action: 'filter-activity'});
+    const query = new URL(calls.at(-1).url, 'http://journal.test').searchParams;
+    assert.deepStrictEqual(Object.fromEntries(query), {outcome: 'refused', tool: 'search', connection: agent.key, from: '20260901', to: '20260924'});
+    for (const [key, value] of Object.entries(filters)) assert.strictEqual(fields[`a-${key}`].value, value);
+    // Applying again must query the displayed scope, not silently return to all requests.
+    await click({action: 'filter-activity'});
+    assert.strictEqual(calls.at(-1).url, calls.at(-2).url);
+  });
+
+  await test('Escape dismisses connect and request details without a write', async () => {
+    const activity = {entries: [{agent_identity: 'test-agent', timestamp: '2026-09-24T12:01:30Z', tool: 'search', outcome: 'served', request: {arguments: {}}}], counts: {served: 1}, examination_complete: true};
+    const {view, click, calls, keydown} = await boot(baseState(ME_ON), {activity});
+    await click({action: 'connect'});
+    assert(view.querySelector('.modal'));
+    assert.strictEqual((await keydown('Escape')).defaultPrevented, true);
+    assert.strictEqual(view.querySelector('.modal'), null);
+    await click({route: 'activity'});
+    await click({activityIndex: '0'});
+    assert(view.querySelector('.modal'));
+    await keydown('Escape');
+    assert.strictEqual(view.querySelector('.modal'), null);
+    assert.strictEqual((await keydown('Escape')).defaultPrevented, false);
+    assert(calls.every(call => call.method === 'GET'), 'dismissal must not create or revoke a pairing code');
+  });
+
   await test('no local door: your own is coming later, solstone.me is the live way in', async () => {
     const {view, click} = await boot(baseState());
     has(view, 'coming later');

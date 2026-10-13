@@ -2083,6 +2083,11 @@ fn assemble_journal_entity_records(
     only: Option<&str>,
 ) -> Result<Vec<Value>, solstone_core_facets::FacetEntityWriteError> {
     let groups = solstone_core_entity::read_identity_group_map(root)?;
+    let resolved = groups
+        .groups
+        .iter()
+        .filter_map(|(id, dirs)| dirs.first().map(|dir| (id.clone(), dir.clone())))
+        .collect();
     let mut records = Vec::new();
     let zone = solstone_core_journal_config::owner_zone(root);
     let today = chrono::Utc::now()
@@ -2143,9 +2148,14 @@ fn assemble_journal_entity_records(
             .get("emoji")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let scoped_entities = solstone_core_facets::list_scoped_facet_entities_tolerant(
-            root, &facet_dir, true, true,
-        )?;
+        let mut scoped_entities =
+            solstone_core_facets::list_scoped_facet_entities_tolerant_with_resolved_ids(
+                root, &facet_dir, true, true, &resolved,
+            )?;
+        scoped_entities.retain(|scoped| record_indexes.contains_key(&scoped.entity_dir));
+        if scoped_entities.is_empty() {
+            continue;
+        }
         let summaries: Vec<_> = scoped_entities
             .iter()
             .map(|scoped| {
@@ -5294,8 +5304,7 @@ fn network_plate_work(
             let mut value = serde_json::to_value(&response)
                 .map_err(|error| IndexPlateError::OperationFailed(error.to_string()))?;
             if principal_id.as_deref() == Some(entity_dir.as_str())
-                && let Some(horizon) =
-                    solstone_core_facets::refresh_connections_horizon(journal_root)
+                && let Some(horizon) = solstone_core_facets::read_connections_horizon(journal_root)
             {
                 let object = value
                     .as_object_mut()

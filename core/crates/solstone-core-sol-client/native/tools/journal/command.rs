@@ -3,6 +3,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::args::{ParsedArgs, parse_args};
 use crate::command::{CommandContext, CommandOutput};
 use crate::decode::decode_response;
 use crate::error::{ClientError, SERVICE_DOWN_MESSAGE};
@@ -11,7 +12,7 @@ use crate::transport::{ApiRequest, HttpMethod, QueryParam, TimeoutPolicy};
 
 #[must_use]
 pub fn agents(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &["--day", "-d", "--segment", "-s"], &[]) {
+    let parsed = match parse_args(ctx.args, &["--day", "-d", "--segment", "-s"], &[]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
@@ -34,7 +35,7 @@ pub fn agents(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn facet_create(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(
+    let parsed = match parse_args(
         ctx.args,
         &["--emoji", "--color", "--description", "--icon"],
         &["--consent"],
@@ -50,21 +51,21 @@ pub fn facet_create(ctx: CommandContext<'_>) -> CommandOutput {
         HttpMethod::Post,
         "/app/settings/api/facet",
         Some(
-            json!({"title": title, "emoji": parsed.value("--emoji").unwrap_or("📦"), "color": parsed.value("--color").unwrap_or("#667eea"), "description": parsed.value("--description").unwrap_or(""), "icon": parsed.value("--icon").unwrap_or(""), "consent": parsed.flag("--consent")}),
+            json!({"title": title, "emoji": parsed.value("--emoji").unwrap_or("📦"), "color": parsed.value("--color").unwrap_or("#667eea"), "description": parsed.value("--description").unwrap_or(""), "icon": parsed.value("--icon").unwrap_or(""), "consent": parsed.has_flag("--consent")}),
         ),
     )
 }
 
 #[must_use]
 pub fn facet_delete(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &[], &["--yes", "--consent"]) {
+    let parsed = match parse_args(ctx.args, &[], &["--yes", "--consent"]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
     let Some(name) = parsed.positionals.first() else {
         return stderr("Error: missing argument NAME");
     };
-    if !parsed.flag("--yes") {
+    if !parsed.has_flag("--yes") {
         return stderr("Error: --yes is required to delete a facet.");
     }
     post(
@@ -86,7 +87,7 @@ pub fn facet_unmute(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn facet_rename(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &[], &["--consent"]) {
+    let parsed = match parse_args(ctx.args, &[], &["--consent"]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
@@ -98,13 +99,13 @@ pub fn facet_rename(ctx: CommandContext<'_>) -> CommandOutput {
         ctx,
         HttpMethod::Post,
         &format!("/app/settings/api/facet/{name}/rename"),
-        Some(json!({"new_name": new_name, "consent": parsed.flag("--consent")})),
+        Some(json!({"new_name": new_name, "consent": parsed.has_flag("--consent")})),
     )
 }
 
 #[must_use]
 pub fn facet_show(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &[], &[]) {
+    let parsed = match parse_args(ctx.args, &[], &[]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
@@ -116,7 +117,7 @@ pub fn facet_show(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn facet_update(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(
+    let parsed = match parse_args(
         ctx.args,
         &["--title", "--description", "--emoji", "--color", "--icon"],
         &[],
@@ -152,11 +153,11 @@ pub fn facet_update(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn facets(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &[], &["--all"]) {
+    let parsed = match parse_args(ctx.args, &[], &["--all"]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
-    let query = if parsed.flag("--all") {
+    let query = if parsed.has_flag("--all") {
         vec![QueryParam::single("all", "true")]
     } else {
         vec![]
@@ -166,7 +167,7 @@ pub fn facets(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn import(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &[], &[]) {
+    let parsed = match parse_args(ctx.args, &[], &[]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
@@ -178,7 +179,7 @@ pub fn import(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn imports(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &["--limit", "-n", "--source", "-s"], &["--json"]) {
+    let parsed = match parse_args(ctx.args, &["--limit", "-n", "--source", "-s"], &["--json"]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
@@ -199,7 +200,7 @@ pub fn imports(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn news(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(
+    let parsed = match parse_args(
         ctx.args,
         &["--facet", "-f", "--day", "-d", "--limit", "-n", "--cursor"],
         &[],
@@ -232,7 +233,7 @@ pub fn news(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn read(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(
+    let parsed = match parse_args(
         ctx.args,
         &[
             "--day",
@@ -270,11 +271,11 @@ pub fn read(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn retention_config(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &["--mode", "--days", "--stream"], &["--clear"]) {
+    let parsed = match parse_args(ctx.args, &["--mode", "--days", "--stream"], &["--clear"]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
-    let clear = parsed.flag("--clear");
+    let clear = parsed.has_flag("--clear");
     let mode = parsed.value("--mode");
     let days = parsed.value("--days");
     let stream = parsed.value("--stream");
@@ -351,7 +352,7 @@ pub fn retention_config(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn retention_list(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(ctx.args, &["--stream"], &[]) {
+    let parsed = match parse_args(ctx.args, &["--stream"], &[]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
@@ -365,7 +366,7 @@ pub fn retention_list(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn search(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse(
+    let parsed = match parse_args(
         ctx.args,
         &[
             "--query",
@@ -453,14 +454,14 @@ pub fn search(ctx: CommandContext<'_>) -> CommandOutput {
 
 #[must_use]
 pub fn storage_summary(ctx: CommandContext<'_>) -> CommandOutput {
-    if let Err(error) = parse(ctx.args, &[], &["--json", "--check"]) {
+    if let Err(error) = parse_args(ctx.args, &[], &["--json", "--check"]) {
         return stderr(error);
     }
     get(ctx, "/app/settings/api/storage", vec![])
 }
 
 fn facet_muted(ctx: CommandContext<'_>, muted: bool) -> CommandOutput {
-    let parsed = match parse(ctx.args, &[], &[]) {
+    let parsed = match parse_args(ctx.args, &[], &[]) {
         Ok(value) => value,
         Err(error) => return stderr(error),
     };
@@ -475,58 +476,14 @@ fn facet_muted(ctx: CommandContext<'_>, muted: bool) -> CommandOutput {
     )
 }
 
-#[derive(Default)]
-struct Parsed {
-    values: Vec<(String, String)>,
-    flags: Vec<String>,
-    positionals: Vec<String>,
-}
-impl Parsed {
-    fn value(&self, name: &str) -> Option<&str> {
-        self.values
-            .iter()
-            .rev()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-    }
-    fn flag(&self, name: &str) -> bool {
-        self.flags.iter().any(|value| value == name)
-    }
-}
-fn last_value<'a>(parsed: &'a Parsed, spellings: &[&str]) -> Option<(&'a str, &'a str)> {
+fn last_value<'a>(parsed: &'a ParsedArgs, spellings: &[&str]) -> Option<(&'a str, &'a str)> {
     parsed.values.iter().rev().find_map(|(name, value)| {
         spellings
             .contains(&name.as_str())
             .then_some((name.as_str(), value.as_str()))
     })
 }
-fn parse(args: &[String], options: &[&str], flags: &[&str]) -> Result<Parsed, String> {
-    let mut parsed = Parsed::default();
-    let mut index = 0;
-    while index < args.len() {
-        let token = &args[index];
-        if let Some((name, value)) = token.split_once('=')
-            && options.contains(&name)
-        {
-            parsed.values.push((name.to_string(), value.to_string()));
-        } else if options.contains(&token.as_str()) {
-            index += 1;
-            let Some(value) = args.get(index) else {
-                return Err(format!("Error: option {token} requires an argument."));
-            };
-            parsed.values.push((token.clone(), value.clone()));
-        } else if flags.contains(&token.as_str()) {
-            parsed.flags.push(token.clone());
-        } else if token.starts_with('-') {
-            return Err(format!("Error: unknown option {token}."));
-        } else {
-            parsed.positionals.push(token.clone());
-        }
-        index += 1;
-    }
-    Ok(parsed)
-}
-fn query_values(parsed: &Parsed, values: &[(&str, &str)]) -> Vec<QueryParam> {
+fn query_values(parsed: &ParsedArgs, values: &[(&str, &str)]) -> Vec<QueryParam> {
     let mut params = Vec::new();
     let mut seen_keys = Vec::new();
     for (_, key) in values {
