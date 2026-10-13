@@ -16,7 +16,7 @@ mod unix_tests {
         run_with_bound_publication_fault,
     };
 
-    use super::super::unix::{Hooks, NativePublication, Point};
+    use super::super::native::{Hooks, NativePublication, Point};
     use crate::recovery::{RecoveryObligation, observe_obligations};
     use crate::test_restore_intent::fixture;
     use solstone_core_journal_io::activity_obligations::MAX_INTENT_BYTES;

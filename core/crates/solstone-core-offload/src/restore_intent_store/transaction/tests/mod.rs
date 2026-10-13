@@ -68,6 +68,17 @@ fn with_hook<T>(point: Point, hook: impl FnOnce() + 'static, operation: impl FnO
     result
 }
 
+fn marker_published(result: &TransactionOutcome<'_, '_>) -> bool {
+    #[cfg(unix)]
+    {
+        result.marker.as_ref().is_some_and(Result::is_ok)
+    }
+    #[cfg(windows)]
+    {
+        result.marker_published
+    }
+}
+
 fn options() -> LockOptions {
     LockOptions {
         timeout: Duration::ZERO,
@@ -245,6 +256,7 @@ fn actual_publish_records_intent_marker_and_exact_event_without_recount_on_repla
         panic!("restore must publish the canonical stream marker");
     };
     assert_eq!(marker.generation, 1);
+    #[cfg(unix)]
     assert_eq!(
         result
             .marker
@@ -265,8 +277,11 @@ fn actual_publish_records_intent_marker_and_exact_event_without_recount_on_repla
             .join("health/20261009/stream.updated")
             .exists()
     );
-    assert_eq!(result.marker_ancestor_sync.len(), 3);
-    assert!(result.marker_ancestor_sync.iter().all(Result::is_ok));
+    #[cfg(unix)]
+    {
+        assert_eq!(result.marker_ancestor_sync.len(), 3);
+        assert!(result.marker_ancestor_sync.iter().all(Result::is_ok));
+    }
     let id = record.intent.event.operation_id.clone();
     let before = fs::read(f.ledger()).unwrap();
     let owner = result.owner;
@@ -368,7 +383,7 @@ fn settled_conflict_preserves_original_mark_and_late_matching_bytes_without_recl
         assert_eq!(result.effects, AttemptEffects::default());
         assert!(result.retirement.as_ref().unwrap().retired);
         assert!(result.no_effect_cleanup.as_ref().unwrap().confirmed());
-        assert!(result.marker.is_none());
+        assert!(!marker_published(&result));
         assert!(result.register.is_none());
         assert!(!f.marker().exists());
         assert_eq!(fs::read(register).unwrap(), original);
@@ -798,7 +813,7 @@ fn unverified_publication_matching_bytes_never_becomes_successful_event_or_cas()
         result.record.as_ref().unwrap().intent.event_recorded,
         Obligation::Pending
     );
-    assert!(result.marker.is_some()); // invalidate the real effect without claiming restore success
+    assert!(marker_published(&result)); // invalidate the real effect without claiming restore success
     let before = fs::read(f.ledger()).unwrap();
     let owner = result.owner;
     drop(result.record);
@@ -834,7 +849,7 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
     let record = result.record.as_ref().unwrap();
     let id = record.intent.event.operation_id.clone();
     assert_eq!(record.intent.marker, Obligation::Complete);
-    assert!(result.marker.is_some());
+    assert!(marker_published(&result));
     assert_eq!(record.intent.event_recorded, Obligation::Pending);
     assert!(result.ledger.is_none());
     assert!(result.register.is_none());
@@ -855,13 +870,13 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
 
 #[test]
 #[cfg(windows)]
-fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() {
+fn unsupported_directory_sync_permits_publication_and_replay() {
     let f = Fixture::new(false);
     let allowed = Cell::new(true);
     let staged = f.staged(&allowed);
     let (result, fired) = run_with_media_hook(
         MediaPrimitive::ParentSync,
-        || Err(std::io::Error::other("publication parent sync cut")),
+        || Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         || staged.commit(2, options()),
     );
     assert!(fired);
@@ -874,7 +889,7 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
     let record = result.record.as_ref().unwrap();
     let id = record.intent.event.operation_id.clone();
     assert_eq!(record.intent.marker, Obligation::Complete);
-    assert!(result.marker.is_some());
+    assert!(marker_published(&result));
     if result.hold.is_none() {
         assert_eq!(record.intent.event_recorded, Obligation::Complete);
         assert!(result.ledger.is_some());
@@ -884,7 +899,7 @@ fn published_parent_sync_failure_holds_event_and_replay_even_when_bytes_match() 
     drop(result.record);
     let (replayed, _) = run_with_media_hook(
         MediaPrimitive::ParentSync,
-        || Err(std::io::Error::other("replay parent sync cut")),
+        || Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         || replay_local(owner, &id, 3, options()),
     );
     assert!(!matches!(replayed.hold, Some(Hold::Retirement)));

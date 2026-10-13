@@ -781,9 +781,15 @@ pub fn retire_unrecorded_stage_where(
 }
 
 enum Leaf<'a> {
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        allow(dead_code)
+    )]
     Exact(&'a OsStr, Option<MediaIdentity>),
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        allow(dead_code)
+    )]
     Accepted(&'a dyn Fn(&OsStr) -> bool),
 }
 
@@ -808,7 +814,7 @@ fn retire_stage(
         if !exclusive_local_activity(activity)? {
             return Err(shared_storage());
         }
-        let Some(stage) = parent.inner.open_child(name)? else {
+        let Some(stage) = platform::open_removal_directory(&parent.inner, name)? else {
             return Ok(false);
         };
         if stage.identity() != directory {
@@ -835,12 +841,14 @@ fn retire_stage(
                 activity
                     .revalidate()
                     .map_err(crate::activity::ActivityAdmissionError::into_io)?;
-                let file = platform::open_plain(&stage, leaf_name)?.ok_or_else(changed)?;
+                let file = platform::open_removal(&stage, leaf_name)?.ok_or_else(changed)?;
                 if platform::identity(&file)? != leaf {
                     return Err(changed());
                 }
                 platform::check_leaf(&stage, leaf_name, leaf)?;
                 platform::remove_leaf(&stage, leaf_name, &file)?;
+                drop(file);
+                platform::ensure_absent(&stage, leaf_name)?;
             }
             _ => return Err(changed()),
         }
@@ -848,6 +856,8 @@ fn retire_stage(
             .revalidate()
             .map_err(crate::activity::ActivityAdmissionError::into_io)?;
         platform::remove_directory(&parent.inner, name, &stage)?;
+        drop(stage);
+        platform::ensure_absent(&parent.inner, name)?;
         if cfg!(not(windows)) {
             parent.sync()?;
         }

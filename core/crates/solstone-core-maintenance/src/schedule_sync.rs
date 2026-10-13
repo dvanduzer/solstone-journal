@@ -584,7 +584,7 @@ mod tests {
         );
         assert_eq!(
             solstone_core_offload::cli_run::PRODUCER_SUPPORTED,
-            cfg!(any(target_os = "linux", target_os = "macos"))
+            cfg!(any(target_os = "linux", target_os = "macos", windows))
         );
         let root = tempfile::tempdir().expect("temporary journal");
         let config = root.path().join("config/schedules.json");

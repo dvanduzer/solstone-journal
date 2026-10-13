@@ -257,10 +257,10 @@ impl TransactionReceipts {
                     .map(|write| IntentWriteFacts {
                         #[cfg(unix)]
                         publication: write.native.as_ref().map(|native| match native {
-                            super::super::unix::NativePublication::Create(result) => {
+                            super::super::native::NativePublication::Create(result) => {
                                 crate::restore::owned::IntentPublication::Create(result)
                             }
-                            super::super::unix::NativePublication::Update(result) => {
+                            super::super::native::NativePublication::Update(result) => {
                                 crate::restore::owned::IntentPublication::Update(result)
                             }
                         }),

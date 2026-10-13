@@ -52,13 +52,9 @@ struct RestoreIntentStore {
     activity: Arc<ActivityLease>,
     anchor: Arc<()>,
     preparation: PreparationReceipt,
-    #[cfg(unix)]
-    chain: Vec<unix::Binding>,
-    #[cfg(unix)]
-    lock: Option<solstone_core_journal_io::locking::BoundParentLock>,
-    #[cfg(windows)]
-    chain: Vec<solstone_core_journal_io::windows_sync_dir::WindowsFlatDirectory>,
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
+    chain: Vec<native::Binding>,
+    #[cfg(any(unix, windows))]
     lock: Option<solstone_core_journal_io::locking::BoundParentLock>,
 }
 
@@ -70,10 +66,8 @@ struct StoreAdmissionFailure {
 
 struct ObservedIntent {
     anchor: Arc<()>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     read: MediaRead,
-    #[cfg(windows)]
-    read: solstone_core_journal_io::observation::FileObservation,
     intent: RestoreIntent,
 }
 
@@ -86,14 +80,10 @@ struct StoreWrite {
 
 #[derive(Default)]
 struct StoreWriteReceipt {
-    #[cfg(unix)]
-    native: Option<unix::NativePublication>,
-    #[cfg(windows)]
-    native: Option<windows::NativePublication>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    native: Option<native::NativePublication>,
+    #[cfg(any(unix, windows))]
     confirmation: Option<MediaRead>,
-    #[cfg(windows)]
-    confirmation: Option<solstone_core_journal_io::observation::FileObservation>,
     durability: [Option<Durability>; 4],
     failures: Vec<StoreProblem>,
 }
@@ -104,27 +94,19 @@ impl RestoreIntentStore {
             activity,
             anchor: Arc::new(()),
             preparation: PreparationReceipt::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             chain: Vec::new(),
-            #[cfg(unix)]
-            lock: None,
-            #[cfg(windows)]
-            chain: Vec::new(),
-            #[cfg(windows)]
+            #[cfg(any(unix, windows))]
             lock: None,
         }
     }
 
     fn create(activity: Arc<ActivityLease>) -> Result<Self, StoreAdmissionFailure> {
         let owner = Self::unprepared(activity);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut owner = owner;
-        #[cfg(unix)]
-        let result = owner.prepare(&mut unix::NativeHooks);
-        #[cfg(windows)]
-        let mut owner = owner;
-        #[cfg(windows)]
-        let result = owner.prepare();
+        #[cfg(any(unix, windows))]
+        let result = owner.prepare(&mut native::NativeHooks);
         #[cfg(not(any(unix, windows)))]
         let result = Err(StoreProblem::Unsupported);
         match result {
@@ -138,14 +120,10 @@ impl RestoreIntentStore {
 
     fn open_existing(activity: Arc<ActivityLease>) -> Result<Self, StoreAdmissionFailure> {
         let owner = Self::unprepared(activity);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut owner = owner;
-        #[cfg(unix)]
-        let result = owner.prepare_existing(&mut unix::NativeHooks);
-        #[cfg(windows)]
-        let mut owner = owner;
-        #[cfg(windows)]
-        let result = owner.prepare_existing();
+        #[cfg(any(unix, windows))]
+        let result = owner.prepare_existing(&mut native::NativeHooks);
         #[cfg(not(any(unix, windows)))]
         let result = Err(StoreProblem::Unsupported);
         match result {
@@ -162,11 +140,7 @@ impl RestoreIntentStore {
     }
 
     fn read(&self, operation: &str) -> Result<Option<ObservedIntent>, StoreProblem> {
-        #[cfg(unix)]
-        {
-            self.read_bound(operation)
-        }
-        #[cfg(windows)]
+        #[cfg(any(unix, windows))]
         {
             self.read_bound(operation)
         }
@@ -186,13 +160,9 @@ impl RestoreIntentStore {
     }
 
     fn write(self, candidate: RestoreIntent, expected: Option<&ObservedIntent>) -> StoreWrite {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            self.write_bound(candidate, expected, &mut unix::NativeHooks)
-        }
-        #[cfg(windows)]
-        {
-            self.write_bound(candidate, expected)
+            self.write_bound(candidate, expected, &mut native::NativeHooks)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -209,28 +179,45 @@ impl RestoreIntentStore {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[allow(clippy::indexing_slicing)] // Fixed three-parent chain, checked before use.
-mod unix {
+mod native {
     use super::*;
     use std::ffi::OsStr;
+    #[cfg(unix)]
     use std::os::fd::AsFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsHandle;
     use std::path::Path;
     use std::time::Duration;
 
+    #[cfg(windows)]
     use solstone_core_journal_io::atomic::{
-        BoundAtomicOutcome, DetailedAtomicError, ExclusivePublication, FinalNameConfirmation,
-        MetadataDurability, atomic_replace_bound, write_bytes_exclusive_bound_detailed,
+        AtomicWriteOptions, DetailedAtomicOutcome, StageCleanup, atomic_replace_detailed,
+        write_bytes_exclusive_detailed,
+    };
+    #[cfg(unix)]
+    use solstone_core_journal_io::atomic::{
+        BoundAtomicOutcome, atomic_replace_bound, write_bytes_exclusive_bound_detailed,
+    };
+    use solstone_core_journal_io::atomic::{
+        DetailedAtomicError, ExclusivePublication, FinalNameConfirmation, MetadataDurability,
     };
     use solstone_core_journal_io::errors::ExistingParentLockError;
+    #[cfg(unix)]
     use solstone_core_journal_io::flat_directory::{
         FlatDirectory, create_or_open_flat_directory_bound, open_flat_directory_bound,
     };
     use solstone_core_journal_io::locking::{
         acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
     };
-    use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity};
+    use solstone_core_journal_io::media::MediaDirectory;
     use solstone_core_journal_io::observation::FileObservation;
+    #[cfg(windows)]
+    use solstone_core_journal_io::windows_sync_dir::{
+        WindowsFlatDirectory as FlatDirectory, create_or_open_windows_flat_directory_bound,
+        open_windows_flat_directory_bound,
+    };
 
     use solstone_core_journal_io::activity_obligations::{MAX_INTENT_BYTES, intent_filename};
 
@@ -244,7 +231,10 @@ mod unix {
 
     pub(super) enum NativePublication {
         Create(Result<ExclusivePublication, DetailedAtomicError>),
+        #[cfg(unix)]
         Update(Result<BoundAtomicOutcome, DetailedAtomicError>),
+        #[cfg(windows)]
+        Update(Result<DetailedAtomicOutcome, DetailedAtomicError>),
     }
 
     impl NativePublication {
@@ -253,8 +243,9 @@ mod unix {
                 Self::Create(Ok(ExclusivePublication {
                     final_name: FinalNameConfirmation::Confirmed { observation },
                     ..
-                }))
-                | Self::Update(Ok(
+                })) => Some(observation),
+                #[cfg(unix)]
+                Self::Update(Ok(
                     BoundAtomicOutcome::Published { observation }
                     | BoundAtomicOutcome::PublishedDurabilityUncertain { observation, .. }
                     | BoundAtomicOutcome::PublishedObservationUncertain { observation, .. },
@@ -263,25 +254,54 @@ mod unix {
             }
         }
 
+        fn confirms(&self, read: &MediaRead, bytes: &[u8]) -> bool {
+            #[cfg(windows)]
+            if matches!(self, Self::Update(Ok(DetailedAtomicOutcome::Published))) {
+                return read.bytes == bytes;
+            }
+            self.observation().is_some_and(|published| {
+                read.bytes == bytes
+                    && published.bytes == bytes
+                    && read.entry.identity.matches_flat_entry(&published.entry)
+                    && published.entry.size == read.entry.size
+            })
+        }
+
         fn fully_confirmed(&self) -> bool {
             match self {
+                #[cfg(unix)]
                 Self::Create(Ok(receipt)) => receipt.is_fully_confirmed(),
+                #[cfg(windows)]
+                Self::Create(Ok(receipt)) => {
+                    matches!(receipt.cleanup, StageCleanup::Removed)
+                        && matches!(receipt.final_name, FinalNameConfirmation::Confirmed { .. })
+                        && matches!(
+                            receipt.durability,
+                            MetadataDurability::Unproven { source: None }
+                        )
+                }
+                #[cfg(unix)]
                 Self::Update(Ok(BoundAtomicOutcome::Published { .. })) => true,
+                #[cfg(windows)]
+                Self::Update(Ok(DetailedAtomicOutcome::Published)) => true,
                 _ => false,
             }
         }
 
         fn directory_durability(&self) -> Durability {
+            #[cfg(unix)]
             match self {
-                Self::Create(Ok(receipt)) => {
-                    if matches!(receipt.durability, MetadataDurability::Confirmed) {
-                        Durability::Synced
-                    } else {
-                        Durability::Unproven
-                    }
+                Self::Create(Ok(receipt))
+                    if matches!(receipt.durability, MetadataDurability::Confirmed) =>
+                {
+                    Durability::Synced
                 }
                 Self::Update(Ok(BoundAtomicOutcome::Published { .. })) => Durability::Synced,
                 _ => Durability::Unproven,
+            }
+            #[cfg(windows)]
+            {
+                Durability::Unproven
             }
         }
     }
@@ -295,6 +315,7 @@ mod unix {
 
     pub(super) trait Hooks {
         fn checkpoint(&mut self, _point: Point) {}
+        #[cfg(unix)]
         fn sync(&mut self, directory: &impl AsFd, _index: usize) -> std::io::Result<()> {
             nix::unistd::fsync(directory).map_err(std::io::Error::from)
         }
@@ -312,6 +333,7 @@ mod unix {
         Existing,
     }
 
+    #[cfg(unix)]
     fn open_parent(
         parent: &impl AsFd,
         leaf: &OsStr,
@@ -326,6 +348,37 @@ mod unix {
             StoreMode::Existing => open_flat_directory_bound(parent, leaf, diagnostic)
                 .map_err(io_problem)?
                 .ok_or(StoreProblem::Changed),
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_parent(
+        parent: &impl AsHandle,
+        leaf: &OsStr,
+        diagnostic: &Path,
+        mode: StoreMode,
+    ) -> Result<FlatDirectory, StoreProblem> {
+        match mode {
+            StoreMode::Create => {
+                create_or_open_windows_flat_directory_bound(parent, leaf, diagnostic)
+                    .map_err(io_problem)
+            }
+            StoreMode::Existing => open_windows_flat_directory_bound(parent, leaf, diagnostic)
+                .map_err(io_problem)?
+                .ok_or(StoreProblem::Changed),
+        }
+    }
+
+    fn flat_identity(
+        flat: &FlatDirectory,
+    ) -> solstone_core_journal_io::journal_root::ObjectIdentity {
+        #[cfg(unix)]
+        {
+            flat.identity()
+        }
+        #[cfg(windows)]
+        {
+            flat.object_identity()
         }
     }
 
@@ -386,7 +439,7 @@ mod unix {
                         return Err(io_problem(error));
                     }
                 };
-                let equal = flat.identity() == media.object_identity();
+                let equal = flat_identity(&flat) == media.object_identity();
                 self.chain.push(Binding {
                     flat,
                     media: Some(media),
@@ -445,10 +498,13 @@ mod unix {
                 return Err(StoreProblem::Changed);
             }
             for binding in &self.chain {
+                #[cfg(unix)]
                 binding.flat.revalidate().map_err(io_problem)?;
+                #[cfg(windows)]
+                binding.flat.revalidate_bound().map_err(io_problem)?;
                 let media = binding.media.as_ref().ok_or(StoreProblem::Changed)?;
                 media.revalidate().map_err(io_problem)?;
-                if binding.flat.identity() != media.object_identity() {
+                if flat_identity(&binding.flat) != media.object_identity() {
                     return Err(StoreProblem::Changed);
                 }
             }
@@ -464,19 +520,27 @@ mod unix {
             &self,
             hooks: &mut impl Hooks,
         ) -> ([Durability; 4], Vec<StoreProblem>) {
-            let mut facts = [Durability::Unproven; 4];
-            let mut failures = Vec::new();
-            for (index, binding) in self.chain.iter().rev().enumerate() {
-                match hooks.sync(&binding.flat, index) {
-                    Ok(()) => facts[index] = Durability::Synced,
+            #[cfg(windows)]
+            {
+                let _ = hooks;
+                ([Durability::Unproven; 4], Vec::new())
+            }
+            #[cfg(unix)]
+            {
+                let mut facts = [Durability::Unproven; 4];
+                let mut failures = Vec::new();
+                for (index, binding) in self.chain.iter().rev().enumerate() {
+                    match hooks.sync(&binding.flat, index) {
+                        Ok(()) => facts[index] = Durability::Synced,
+                        Err(error) => failures.push(io_problem(error)),
+                    }
+                }
+                match hooks.sync(self.activity.journal_root().as_ref(), 3) {
+                    Ok(()) => facts[3] = Durability::Synced,
                     Err(error) => failures.push(io_problem(error)),
                 }
+                (facts, failures)
             }
-            match hooks.sync(self.activity.journal_root().as_ref(), 3) {
-                Ok(()) => facts[3] = Durability::Synced,
-                Err(error) => failures.push(io_problem(error)),
-            }
-            (facts, failures)
         }
 
         pub(super) fn read_bound(
@@ -564,22 +628,49 @@ mod unix {
                     return result;
                 }
             };
-            let directory = &result.owner.chain[2].flat;
-            result.receipt.native = Some(if expected.is_some() {
-                NativePublication::Update(atomic_replace_bound(
-                    directory,
-                    OsStr::new(&name),
-                    &bytes,
-                    0o600,
-                ))
-            } else {
-                NativePublication::Create(write_bytes_exclusive_bound_detailed(
-                    directory,
-                    OsStr::new(&name),
-                    &bytes,
-                    0o600,
-                ))
-            });
+            #[cfg(unix)]
+            {
+                let directory = &result.owner.chain[2].flat;
+                result.receipt.native = Some(if expected.is_some() {
+                    NativePublication::Update(atomic_replace_bound(
+                        directory,
+                        OsStr::new(&name),
+                        &bytes,
+                        0o600,
+                    ))
+                } else {
+                    NativePublication::Create(write_bytes_exclusive_bound_detailed(
+                        directory,
+                        OsStr::new(&name),
+                        &bytes,
+                        0o600,
+                    ))
+                });
+            }
+            #[cfg(windows)]
+            {
+                // The shared binding holds every admitted ancestor against
+                // replacement; native publication retains its own parent too.
+                let path = result
+                    .owner
+                    .activity
+                    .journal_root()
+                    .canonical_path()
+                    .join("health/offload/restore-intents")
+                    .join(&name);
+                result.receipt.native = Some(if expected.is_some() {
+                    NativePublication::Update(atomic_replace_detailed(&path, &bytes, 0o600))
+                } else {
+                    NativePublication::Create(write_bytes_exclusive_detailed(
+                        &path,
+                        &bytes,
+                        AtomicWriteOptions {
+                            mode: Some(0o600),
+                            ..Default::default()
+                        },
+                    ))
+                });
+            }
             hooks.checkpoint(Point::AfterWrite);
             // Keep all native errors and every independent subsequent failure.
             if let Err(error) = result.owner.revalidate() {
@@ -605,20 +696,11 @@ mod unix {
                     .owner
                     .read_bound(&result.candidate.event.operation_id)?
                     .ok_or(StoreProblem::Changed)?;
-                let published = result
+                if !result
                     .receipt
                     .native
                     .as_ref()
-                    .and_then(NativePublication::observation)
-                    .ok_or(StoreProblem::Changed)?;
-                let MediaIdentity::Unix { device, inode } = observed.read.entry.identity else {
-                    return Err(StoreProblem::Changed);
-                };
-                if observed.read.bytes != bytes
-                    || published.bytes != bytes
-                    || published.entry.device != device
-                    || published.entry.inode != inode
-                    || published.entry.size != observed.read.entry.size
+                    .is_some_and(|native| native.confirms(&observed.read, &bytes))
                 {
                     return Err(StoreProblem::Changed);
                 }
@@ -639,317 +721,13 @@ mod unix {
                 .as_ref()
                 .is_some_and(NativePublication::fully_confirmed)
                 && self.confirmation.is_some()
-                && self.durability == [Some(Durability::Synced); 4]
+                && self.durability
+                    == [Some(if cfg!(windows) {
+                        Durability::Unproven
+                    } else {
+                        Durability::Synced
+                    }); 4]
                 && self.failures.is_empty()
-        }
-    }
-}
-
-#[cfg(windows)]
-#[allow(clippy::indexing_slicing)] // Fixed three-parent chain, checked before use.
-mod windows {
-    use super::*;
-    use std::ffi::OsStr;
-    use std::os::windows::io::AsHandle;
-    use std::path::Path;
-    use std::time::Duration;
-
-    use solstone_core_journal_io::activity_obligations::{MAX_INTENT_BYTES, intent_filename};
-    use solstone_core_journal_io::atomic::{
-        AtomicWriteOptions, BoundAtomicPublishError, DetailedAtomicError, DetailedAtomicOutcome,
-        ExclusivePublication, FinalNameConfirmation, MetadataDurability, StageCleanup,
-        atomic_replace_detailed_bound, write_bytes_exclusive_detailed,
-    };
-    use solstone_core_journal_io::errors::ExistingParentLockError;
-    use solstone_core_journal_io::locking::acquire_existing_parent_lock_bound;
-    use solstone_core_journal_io::observation::FileObservation;
-    use solstone_core_journal_io::windows_sync_dir::{
-        WindowsFlatDirectory, create_or_open_windows_flat_directory_bound,
-        open_windows_flat_directory_bound, read_windows_observed_file_bounded,
-    };
-
-    const LOCK: &str = "restore-intents.lock";
-    const PARENTS: [&str; 3] = ["health", "health/offload", "health/offload/restore-intents"];
-
-    pub(super) enum NativePublication {
-        Create(Result<ExclusivePublication, DetailedAtomicError>),
-        Update(Result<DetailedAtomicOutcome, BoundAtomicPublishError>),
-    }
-
-    fn name(operation: &str) -> Result<std::ffi::OsString, StoreProblem> {
-        intent_filename(operation).ok_or(StoreProblem::Invalid(RepairHold::InvalidIntent))
-    }
-
-    #[derive(Clone, Copy)]
-    enum StoreMode {
-        Create,
-        Existing,
-    }
-
-    fn open_parent(
-        parent: &impl AsHandle,
-        leaf: &OsStr,
-        diagnostic: &Path,
-        mode: StoreMode,
-    ) -> Result<WindowsFlatDirectory, StoreProblem> {
-        match mode {
-            StoreMode::Create => {
-                create_or_open_windows_flat_directory_bound(parent, leaf, diagnostic)
-                    .map_err(io_problem)
-            }
-            StoreMode::Existing => open_windows_flat_directory_bound(parent, leaf, diagnostic)
-                .map_err(io_problem)?
-                .ok_or(StoreProblem::Changed),
-        }
-    }
-
-    impl RestoreIntentStore {
-        pub(super) fn prepare(&mut self) -> Result<(), StoreProblem> {
-            self.prepare_mode(StoreMode::Create)
-        }
-
-        pub(super) fn prepare_existing(&mut self) -> Result<(), StoreProblem> {
-            self.prepare_mode(StoreMode::Existing)
-        }
-
-        fn prepare_mode(&mut self, mode: StoreMode) -> Result<(), StoreProblem> {
-            self.activity.revalidate().map_err(io_problem)?;
-            for (index, relative) in PARENTS.into_iter().enumerate() {
-                self.activity.revalidate().map_err(io_problem)?;
-                for dir in &self.chain {
-                    dir.revalidate_bound().map_err(io_problem)?;
-                }
-                self.preparation.attempted.push(relative);
-                let leaf = Path::new(relative)
-                    .file_name()
-                    .ok_or(StoreProblem::Changed)?;
-                let parent = Path::new(relative).parent().ok_or(StoreProblem::Changed)?;
-                let diagnostic = self.activity.journal_root().canonical_path().join(parent);
-                let flat = if index == 0 {
-                    open_parent(
-                        self.activity.journal_root().as_ref(),
-                        leaf,
-                        &diagnostic,
-                        mode,
-                    )
-                } else {
-                    open_parent(&self.chain[index - 1], leaf, &diagnostic, mode)
-                }?;
-                self.chain.push(flat);
-            }
-            let lock = acquire_existing_parent_lock_bound(
-                &self.chain[2],
-                OsStr::new(LOCK),
-                Duration::ZERO,
-                Duration::from_millis(1),
-            )
-            .map_err(|error| match error {
-                ExistingParentLockError::Timeout(_) => StoreProblem::Busy,
-                other => io_problem(other),
-            })?;
-            self.lock = Some(lock);
-            self.preparation.durability = [Durability::Unproven; 4];
-            self.preparation.failures = Vec::new();
-            match self.revalidate() {
-                Ok(()) => self.preparation.confirmed = true,
-                Err(error) => self.preparation.failures.push(error),
-            }
-            if !self.preparation.failures.is_empty() {
-                return Err(StoreProblem::Changed);
-            }
-            Ok(())
-        }
-
-        pub(super) fn revalidate(&self) -> Result<(), StoreProblem> {
-            self.activity.revalidate().map_err(io_problem)?;
-            if self.chain.len() != 3 {
-                return Err(StoreProblem::Changed);
-            }
-            for directory in &self.chain {
-                directory.revalidate_bound().map_err(io_problem)?;
-            }
-            self.lock
-                .as_ref()
-                .ok_or(StoreProblem::Changed)?
-                .revalidate_bound(&self.chain[2], OsStr::new(LOCK))
-                .map_err(io_problem)?;
-            self.activity.revalidate().map_err(io_problem)
-        }
-
-        pub(super) fn read_bound(
-            &self,
-            operation: &str,
-        ) -> Result<Option<ObservedIntent>, StoreProblem> {
-            let name = name(operation)?;
-            self.revalidate()?;
-            let observation = read_windows_observed_file_bounded(
-                &self.chain[2],
-                OsStr::new(&name),
-                MAX_INTENT_BYTES,
-            )
-            .map_err(io_problem)?;
-            self.revalidate()?;
-            let Some(observation) = observation else {
-                return Ok(None);
-            };
-            let intent =
-                RestoreIntent::decode(Ok(&observation.bytes)).map_err(StoreProblem::Invalid)?;
-            if intent.event.operation_id != operation {
-                return Err(StoreProblem::Invalid(RepairHold::InvalidIntent));
-            }
-            Ok(Some(ObservedIntent {
-                anchor: Arc::clone(&self.anchor),
-                read: observation,
-                intent,
-            }))
-        }
-
-        pub(super) fn write_bound(
-            self,
-            candidate: RestoreIntent,
-            expected: Option<&ObservedIntent>,
-        ) -> StoreWrite {
-            let mut result = StoreWrite {
-                owner: self,
-                candidate,
-                receipt: StoreWriteReceipt::default(),
-            };
-            let preflight = (|| {
-                let bytes = result.candidate.encode().map_err(StoreProblem::Invalid)?;
-                if result.candidate.destination.root
-                    != result
-                        .owner
-                        .activity
-                        .journal_root()
-                        .identity()
-                        .observation_id()
-                {
-                    return Err(StoreProblem::Changed);
-                }
-                let operation = &result.candidate.event.operation_id;
-                let name = name(operation)?;
-                if let Some(expected) = expected {
-                    if !Arc::ptr_eq(&result.owner.anchor, &expected.anchor) {
-                        return Err(StoreProblem::Changed);
-                    }
-                    expected
-                        .intent
-                        .validate_successor(&result.candidate)
-                        .map_err(StoreProblem::Invalid)?;
-                }
-                result.owner.revalidate()?;
-                if let Some(expected) = expected {
-                    let current = result
-                        .owner
-                        .read_bound(operation)?
-                        .ok_or(StoreProblem::Changed)?;
-                    if current.read != expected.read || current.intent != expected.intent {
-                        return Err(StoreProblem::Changed);
-                    }
-                }
-                result.owner.revalidate()?;
-                Ok((name, bytes))
-            })();
-            let (name, bytes) = match preflight {
-                Ok(value) => value,
-                Err(error) => {
-                    result.receipt.failures.push(error);
-                    return result;
-                }
-            };
-            let lock = match result.owner.lock.as_ref() {
-                Some(lock) => lock,
-                None => {
-                    result.receipt.failures.push(StoreProblem::Changed);
-                    return result;
-                }
-            };
-            let directory = &result.owner.chain[2];
-            result.receipt.native = Some(if expected.is_some() {
-                NativePublication::Update(atomic_replace_detailed_bound(
-                    directory,
-                    lock,
-                    OsStr::new(&name),
-                    &bytes,
-                    0o600,
-                ))
-            } else {
-                let path = result
-                    .owner
-                    .activity
-                    .journal_root()
-                    .canonical_path()
-                    .join("health/offload/restore-intents")
-                    .join(&name);
-                NativePublication::Create(write_bytes_exclusive_detailed(
-                    &path,
-                    &bytes,
-                    AtomicWriteOptions {
-                        mode: Some(0o600),
-                        ..Default::default()
-                    },
-                ))
-            });
-            if let Err(error) = result.owner.revalidate() {
-                result.receipt.failures.push(error);
-            }
-            result.receipt.durability = [Some(Durability::Unproven); 4];
-            let confirmation = (|| {
-                result.owner.revalidate()?;
-                let observed = result
-                    .owner
-                    .read_bound(&result.candidate.event.operation_id)?
-                    .ok_or(StoreProblem::Changed)?;
-                if observed.read.bytes != bytes {
-                    return Err(StoreProblem::Changed);
-                }
-                if let Some(NativePublication::Create(Ok(publ))) = &result.receipt.native {
-                    match &publ.final_name {
-                        FinalNameConfirmation::Confirmed { observation } => {
-                            if observed.read.bytes != observation.bytes
-                                || observed.read.entry.device != observation.entry.device
-                                || observed.read.entry.inode != observation.entry.inode
-                                || observed.read.entry.size != observation.entry.size
-                            {
-                                return Err(StoreProblem::Changed);
-                            }
-                        }
-                        _ => return Err(StoreProblem::Changed),
-                    }
-                }
-                result.owner.revalidate()?;
-                Ok(observed.read)
-            })();
-            match confirmation {
-                Ok(read) => result.receipt.confirmation = Some(read),
-                Err(error) => result.receipt.failures.push(error),
-            }
-            result
-        }
-    }
-
-    impl StoreWriteReceipt {
-        pub(super) fn fully_confirmed(&self) -> bool {
-            self.failures.is_empty()
-                && self.durability == [Some(Durability::Unproven); 4]
-                && self.confirmation.as_ref().is_some_and(|read| match &self.native {
-                    Some(NativePublication::Create(Ok(publ))) => {
-                        matches!(publ.cleanup, StageCleanup::Removed)
-                            && matches!(
-                                &publ.final_name,
-                                FinalNameConfirmation::Confirmed { observation }
-                                    if observation.bytes == read.bytes
-                            )
-                            && matches!(
-                                publ.durability,
-                                MetadataDurability::Unproven { source: None }
-                            )
-                    }
-                    Some(NativePublication::Update(Ok(DetailedAtomicOutcome::Published))) => {
-                        true
-                    }
-                    _ => false,
-                })
         }
     }
 }

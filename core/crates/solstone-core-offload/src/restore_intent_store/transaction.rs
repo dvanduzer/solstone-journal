@@ -20,7 +20,7 @@ use solstone_core_retention::archive_catalog::{
     ArchiveWitness, LegacyRestoreBinding, RestoreDisposition, RestoreOperation, SegmentCatalog,
     read_complete_catalog,
 };
-#[cfg(all(test, feature = "full-tests", unix))]
+#[cfg(all(test, feature = "full-tests", any(unix, windows)))]
 use solstone_core_retention::mark_mutation::conditional_mutate_at_root;
 use solstone_core_retention::mark_mutation::{
     BoundMutationOutcome, MutationStatus, RestoredMarkMutation, conditional_retire_restored,
@@ -62,7 +62,7 @@ enum Admission<'operation, 'clock> {
         &'operation OwnedReadOperation,
         &'operation QualifiedArchiveRecoveryBinding,
     ),
-    #[cfg(all(test, feature = "full-tests", unix))]
+    #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
     LocalTest(&'operation std::cell::Cell<bool>),
 }
 
@@ -81,7 +81,7 @@ impl<'operation, 'clock> Admission<'operation, 'clock> {
         match self {
             Self::Readback(operation) => Some(operation),
             Self::Recovery(operation, _) => Some(operation.as_read()),
-            #[cfg(all(test, feature = "full-tests", unix))]
+            #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
             Self::LocalTest(_) => None,
         }
     }
@@ -127,9 +127,9 @@ impl<'operation, 'clock> Admission<'operation, 'clock> {
             Self::Readback(operation) => operation
                 .revalidate_admission()
                 .map_err(|error| Hold::Admission(error.to_string())),
-            #[cfg(all(test, feature = "full-tests", unix))]
+            #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
             Self::LocalTest(allowed) if allowed.get() => Ok(()),
-            #[cfg(all(test, feature = "full-tests", unix))]
+            #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
             Self::LocalTest(_) => Err(Hold::Admission("test admission stopped".into())),
         }
     }
@@ -591,9 +591,10 @@ impl NoEffectCleanup {
             && self.parent_sync.as_ref().is_some_and(|result| {
                 if cfg!(windows) {
                     result.is_ok()
-                        || result.as_ref().err().is_some_and(|err| {
-                            err.kind() == std::io::ErrorKind::Unsupported
-                        })
+                        || result
+                            .as_ref()
+                            .err()
+                            .is_some_and(|err| err.kind() == std::io::ErrorKind::Unsupported)
                 } else {
                     result.is_ok()
                 }
@@ -798,7 +799,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             }
             .map_err(Hold::Repair)?;
             result.owner.admission.attach(&mut intent)?;
-            #[cfg(all(test, feature = "full-tests", unix))]
+            #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
             tests::checkpoint(tests::Point::AfterInitialMark);
             let claims = OutputClaims::acquire(
                 intent.output_paths(result.owner.root().canonical_path()),
@@ -850,7 +851,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
                 writes: Vec::new(),
             });
             result.persist()?;
-            #[cfg(all(test, feature = "full-tests", unix))]
+            #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
             tests::checkpoint(tests::Point::AfterInitialIntent);
             result.effect_check(&commit)?;
             if result.inspect()?.publication == PublicationDecision::HistoricalOnly {
@@ -874,7 +875,7 @@ impl<'operation, 'clock> StagedRestore<'operation, 'clock> {
             };
             let recorded = result.record_mut()?.intent.record_outcome(&publication);
             result.publication = Some(publication);
-            #[cfg(all(test, feature = "full-tests", unix))]
+            #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
             tests::checkpoint(tests::Point::AfterPublication);
             let recorded = recorded.map_err(|failure| Hold::Repair(failure.hold));
             // Preserve the native receipt/effect even when successor validation fails.
@@ -1011,7 +1012,7 @@ impl TransactionOutcome<'_, '_> {
                 else {
                     return Err(Hold::Register);
                 };
-                #[cfg(all(test, feature = "full-tests", unix))]
+                #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
                 tests::checkpoint(tests::Point::BeforeRestoredCas);
                 let outcome = match &self.owner.admission {
                     Admission::Readback(read) => {
@@ -1036,7 +1037,7 @@ impl TransactionOutcome<'_, '_> {
                         })
                         .map_err(RestoreRegisterRefusal::Restored)
                     }
-                    #[cfg(all(test, feature = "full-tests", unix))]
+                    #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
                     Admission::LocalTest(_) => conditional_mutate_at_root(self.owner.root(), plan)
                         .map_err(RestoreRegisterRefusal::Bound),
                 };
@@ -1160,7 +1161,7 @@ impl TransactionOutcome<'_, '_> {
         if !synced {
             return Err(Hold::Retirement);
         }
-        #[cfg(all(test, feature = "full-tests", unix))]
+        #[cfg(all(test, feature = "full-tests", any(unix, windows)))]
         tests::checkpoint(tests::Point::BeforeNoEffectPersist);
         self.effect_check(commit)?;
         self.unchanged_mark()?;
@@ -1265,13 +1266,10 @@ impl TransactionOutcome<'_, '_> {
         )
         .map_err(|error| Hold::Admission(error.to_string()))?
         .ok_or(Hold::Marker)?;
-        let day_parent = open_windows_flat_directory_bound(
-            &chronicle,
-            OsStr::new(day),
-            &chronicle_diagnostic,
-        )
-        .map_err(|error| Hold::Admission(error.to_string()))?
-        .ok_or(Hold::Marker)?;
+        let day_parent =
+            open_windows_flat_directory_bound(&chronicle, OsStr::new(day), &chronicle_diagnostic)
+                .map_err(|error| Hold::Admission(error.to_string()))?
+                .ok_or(Hold::Marker)?;
         let chronicle_guard = MediaDirectory::open(Arc::clone(&root), chronicle_relative)
             .map_err(|error| Hold::Admission(error.to_string()))?;
         let day_guard = MediaDirectory::open(Arc::clone(&root), &day_relative)

@@ -566,7 +566,6 @@ mod plan {
     }
 }
 
-
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsStr;
@@ -584,11 +583,9 @@ mod unix {
         locking::acquire_existing_parent_lock_bound,
     };
 
-    use super::*;
     use super::plan::{self, AppendMode, Request};
-    use solstone_core_retention::archive_catalog::{
-        codec::fold_lines, read_complete_catalog,
-    };
+    use super::*;
+    use solstone_core_retention::archive_catalog::{codec::fold_lines, read_complete_catalog};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Point {
@@ -1034,6 +1031,8 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use std::ffi::OsStr;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1041,16 +1040,15 @@ mod windows {
     use solstone_core_journal_io::{
         errors::ExistingParentLockError,
         locking::acquire_existing_parent_lock_bound,
-        open_windows_regular_file_from_bound_parent,
         read_windows_observed_file_bounded,
-        windows_sync_dir::create_or_open_windows_flat_directory_bound,
+        windows_sync_dir::{
+            create_or_open_windows_append_file_bound, create_or_open_windows_flat_directory_bound,
+        },
     };
-    use solstone_core_retention::archive_catalog::{
-        codec::fold_lines, read_complete_catalog,
-    };
+    use solstone_core_retention::archive_catalog::{codec::fold_lines, read_complete_catalog};
 
-    use super::*;
     use super::plan::{self, AppendMode, Request};
+    use super::*;
 
     pub(super) fn append_archive(
         root: &Arc<JournalRoot>,
@@ -1118,6 +1116,15 @@ mod windows {
         )
         .map_err(io_refusal)?;
 
+        let media = solstone_core_journal_io::media::MediaDirectory::open(
+            Arc::clone(root),
+            Path::new("health/offload"),
+        )
+        .map_err(io_refusal)?;
+        if media.object_identity() != offload.object_identity() {
+            return Err(LedgerWriteRefusal::Changed);
+        }
+
         let _lock = acquire_existing_parent_lock_bound(
             &offload,
             OsStr::new("ledger.lock"),
@@ -1132,8 +1139,8 @@ mod windows {
         offload.revalidate_bound().map_err(io_refusal)?;
         let name = format!("{}.jsonl", request.target.day);
         let name = OsStr::new(&name);
-        let observation = read_windows_observed_file_bounded(&offload, name, usize::MAX)
-            .map_err(io_refusal)?;
+        let observation =
+            read_windows_observed_file_bounded(&offload, name, usize::MAX).map_err(io_refusal)?;
         let bytes = observation.map(|o| o.bytes).unwrap_or_default();
         offload.revalidate_bound().map_err(io_refusal)?;
 
@@ -1162,12 +1169,18 @@ mod windows {
             return Err(LedgerWriteRefusal::InvalidInput);
         }
 
+        let mut file = create_or_open_windows_append_file_bound(
+            &offload,
+            name,
+            &root.canonical_path().join("health/offload"),
+        )
+        .map_err(io_refusal)?;
+
         let prewrite = (|| {
             offload.revalidate_bound().map_err(io_refusal)?;
-            let current_observation =
-                read_windows_observed_file_bounded(&offload, name, usize::MAX)
-                    .map_err(io_refusal)?;
-            let current_bytes = current_observation.map(|o| o.bytes).unwrap_or_default();
+            media.revalidate().map_err(io_refusal)?;
+            let mut current_bytes = Vec::new();
+            file.read_to_end(&mut current_bytes).map_err(io_refusal)?;
             if current_bytes != bytes
                 || read_complete_catalog(root).map_err(LedgerWriteRefusal::HistoryUnavailable)?
                     != baseline
@@ -1196,50 +1209,32 @@ mod windows {
         }
 
         if !already {
-            let path = root.canonical_path().join("health/offload").join(name);
-            match solstone_core_journal_io::append_jsonl_no_follow(&path, &request.event) {
-                Ok(()) => {
-                    receipt.effect = LedgerWriteEffect::Appended { bytes: line.len() };
-                    receipt.file_sync = LedgerSync::Confirmed;
-                }
+            match file
+                .seek(SeekFrom::End(0))
+                .and_then(|_| file.write_all(&line))
+            {
+                Ok(()) => receipt.effect = LedgerWriteEffect::Appended { bytes: line.len() },
                 Err(error) => {
                     receipt.effect = LedgerWriteEffect::Attempted { written: None };
                     receipt.failures.push(format!("append: {error}"));
                 }
             }
-        } else {
-            let parent_diagnostic = root.canonical_path().join("health/offload");
-            match solstone_core_journal_io::open_windows_regular_file_from_bound_parent(
-                &offload,
-                name,
-                &parent_diagnostic,
-            ) {
-                Ok(Some(file)) => match file.sync_all() {
-                    Ok(()) => {
-                        receipt.file_sync = LedgerSync::Confirmed;
-                    }
-                    Err(error) => {
-                        receipt.failures.push(format!("sync file: {error}"));
-                    }
-                },
-                Ok(None) => {
-                    receipt.failures.push("ledger file absent for sync".to_string());
-                }
-                Err(error) => {
-                    receipt.failures.push(format!("open regular file: {error}"));
-                }
-            }
+        }
+        match file.sync_all() {
+            Ok(()) => receipt.file_sync = LedgerSync::Confirmed,
+            Err(error) => receipt.failures.push(format!("sync file: {error}")),
         }
 
         let confirmation = (|| {
             offload.revalidate_bound().map_err(io_refusal)?;
-            let after_observation =
-                read_windows_observed_file_bounded(&offload, name, usize::MAX)
-                    .map_err(io_refusal)?;
-            let after_bytes = after_observation.map(|o| o.bytes).unwrap_or_default();
+            media.revalidate().map_err(io_refusal)?;
+            file.seek(SeekFrom::Start(0)).map_err(io_refusal)?;
+            let mut after_bytes = Vec::new();
+            file.read_to_end(&mut after_bytes).map_err(io_refusal)?;
             if after_bytes != expected_bytes {
                 return Err(LedgerWriteRefusal::Changed);
             }
+            media.revalidate().map_err(io_refusal)?;
             offload.revalidate_bound().map_err(io_refusal)
         })();
         match confirmation {

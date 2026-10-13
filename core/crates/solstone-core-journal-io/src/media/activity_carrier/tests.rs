@@ -235,9 +235,18 @@ fn windows_unproven_directory_durability_holds_created_reservation() {
     let (_temp, activity) = fixture();
     let root = activity.journal_root().clone();
     let carrier = RootActivityCarrier::prepare(activity).unwrap();
-    assert_eq!(carrier.preparation().stage_durability(), Durability::Unproven);
-    assert_eq!(carrier.preparation().root_durability(), Durability::Unproven);
-    assert_eq!(carrier.preparation().confirmation(), Confirmation::Confirmed);
+    assert_eq!(
+        carrier.preparation().stage_durability(),
+        Durability::Unproven
+    );
+    assert_eq!(
+        carrier.preparation().root_durability(),
+        Durability::Unproven
+    );
+    assert_eq!(
+        carrier.preparation().confirmation(),
+        Confirmation::Confirmed
+    );
     let path = carrier.diagnostic_path();
     assert!(path.is_dir());
     assert!(matches!(

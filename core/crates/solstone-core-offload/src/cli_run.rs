@@ -260,8 +260,11 @@ impl OwnedOffloadCliRun {
 
 /// Whether this host runs the installed offload producer. Elsewhere every
 /// non-preview run is refused before it opens the journal.
-pub const PRODUCER_SUPPORTED: bool =
-    cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows"));
+pub const PRODUCER_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+));
 
 /// Run the installed offload producer while retaining its complete outcome.
 pub fn run_cli_offload(

@@ -267,11 +267,11 @@ pub fn create_offload_offers<'clock>(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> OffloadCreation<'clock> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        unix::create(operation, services, selections, today, now)
+        native::create(operation, services, selections, today, now)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _parameters = (services, selections, today, now);
         OffloadCreation {
@@ -286,8 +286,8 @@ pub fn create_offload_offers<'clock>(
     }
 }
 
-#[cfg(unix)]
-mod unix {
+#[cfg(any(unix, windows))]
+mod native {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
     use std::path::Path;
@@ -746,9 +746,7 @@ mod unix {
                 receipt.effect(),
                 LedgerWriteEffect::Appended { .. } | LedgerWriteEffect::AlreadyRecorded
             )
-        }) && receipt.durability() == [LedgerSync::Confirmed; 4]
-            && receipt.confirmation() == LedgerConfirmation::Confirmed
-            && receipt.failures().is_empty()
+        }) && receipt.settles()
     }
 
     pub(super) fn create<'clock>(
@@ -1165,6 +1163,6 @@ mod unix {
         }
     }
 
-    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(all(test, unix, feature = "full-tests"))]
     mod tests;
 }

@@ -112,11 +112,15 @@ impl Directory {
     }
 
     pub(super) fn open_child(&self, name: &OsStr) -> io::Result<Option<Self>> {
+        self.open_child_with_access(name, DIRECTORY_ACCESS)
+    }
+
+    fn open_child_with_access(&self, name: &OsStr, access: u32) -> io::Result<Option<Self>> {
         self.revalidate()?;
         let file = match nt_create_relative_deny_delete_sharing(
             self.handle(),
             name,
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+            access,
             FILE_OPEN,
             OPTIONS | FILE_DIRECTORY_FILE,
         ) {
@@ -512,6 +516,13 @@ pub(super) fn open_removal(directory: &Directory, name: &OsStr) -> io::Result<Op
     open_file(directory, name, true, true)
 }
 
+pub(super) fn open_removal_directory(
+    parent: &Directory,
+    name: &OsStr,
+) -> io::Result<Option<Directory>> {
+    parent.open_child_with_access(name, DIRECTORY_ACCESS | DELETE)
+}
+
 pub(super) fn claim(
     source: &Directory,
     source_name: &OsStr,
@@ -667,9 +678,9 @@ pub(super) fn remove_empty_child(
     Ok(true)
 }
 
-pub(super) fn remove_leaf(parent: &Directory, name: &OsStr, file: &File) -> io::Result<()> {
-    mark_delete(file)?;
-    ensure_absent(parent, name)
+// The caller closes the owned handle, then confirms name absence.
+pub(super) fn remove_leaf(_parent: &Directory, _name: &OsStr, file: &File) -> io::Result<()> {
+    mark_delete(file)
 }
 
 pub(super) fn remove_directory(
@@ -679,8 +690,7 @@ pub(super) fn remove_directory(
 ) -> io::Result<()> {
     check_leaf(parent, name, directory.identity())?;
     step(MediaPrimitive::NativeDirectoryRemoveCut)?;
-    mark_delete(directory.file())?;
-    ensure_absent(parent, name)
+    mark_delete(directory.file())
 }
 
 pub(super) fn ensure_absent(parent: &Directory, name: &OsStr) -> io::Result<()> {

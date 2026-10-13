@@ -2269,7 +2269,11 @@ fn admit_prepared_archive_read_with<'a>(
         ),
     };
     effects.read_repository_requested = true;
-    ReadOperation::admit(input).map_err(|readback| ArchiveAdmissionFailure {
+    #[cfg(not(windows))]
+    let read = ReadOperation::admit(input);
+    #[cfg(windows)]
+    let read = ReadOperation::admit(input, Some(Arc::new(crate::runner::SystemToolRunner)));
+    read.map_err(|readback| ArchiveAdmissionFailure {
         inner: Box::new(ArchiveAdmissionFailureInner {
             error: ArchiveError::Readback(readback.reason()),
             effects,
@@ -2439,14 +2443,13 @@ fn admit_prepared_archive_owned_read_installed_with(
     let read = input.admit();
     #[cfg(windows)]
     let read = input.admit(Some(Arc::new(crate::runner::SystemToolRunner)));
-    let read = read
-        .map_err(|readback| OwnedArchiveAdmissionFailure {
-            inner: Box::new(OwnedArchiveAdmissionFailureInner {
-                error: ArchiveError::Readback(readback.reason()),
-                effects,
-                owned: ClosedArchiveAdmissionOwner::Readback(Box::new(readback)),
-            }),
-        })?;
+    let read = read.map_err(|readback| OwnedArchiveAdmissionFailure {
+        inner: Box::new(OwnedArchiveAdmissionFailureInner {
+            error: ArchiveError::Readback(readback.reason()),
+            effects,
+            owned: ClosedArchiveAdmissionOwner::Readback(Box::new(readback)),
+        }),
+    })?;
     #[cfg(feature = "test-support")]
     crate::test_support::after_owned_read_admission();
     Ok(OwnedInstalledArchiveRead {
@@ -3264,6 +3267,9 @@ impl<'a> AdmittedArchive<'a> {
         if unsupported {
             return Err(input.refuse(ReadbackError::UnsupportedBackend));
         }
+        #[cfg(windows)]
+        return ReadOperation::admit(input, Some(Arc::new(crate::runner::SystemToolRunner)));
+        #[cfg(not(windows))]
         ReadOperation::admit(input)
     }
 

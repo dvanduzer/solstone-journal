@@ -83,17 +83,10 @@ pub struct RegisterUncertainty {
 }
 
 impl RegisterUncertainty {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn confirmed(&self) -> bool {
         self.durability.is_none()
             && self.observation.is_none()
-            && self.bindings.is_empty()
-            && self.lock.is_none()
-    }
-
-    #[cfg(windows)]
-    fn confirmed(&self) -> bool {
-        self.observation.is_none()
             && self.bindings.is_empty()
             && self.lock.is_none()
     }
@@ -355,7 +348,7 @@ fn begin_bound_optional(
 }
 
 /// Withdraw only the strict subsets minted by retained kept-empty inspection.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn reconcile_empty_observed(
     observation: &crate::archive_offer::reconciliation::unix::ReconciliationObservation<'_, '_>,
 ) -> Result<
@@ -550,22 +543,18 @@ fn publish_bound(
         .map_err(BoundMutationRefusal::Write)?
         {
             DetailedAtomicOutcome::Published => RegisterUncertainty::default(),
-            DetailedAtomicOutcome::PublishedDurabilityUncertain { source } => {
-                RegisterUncertainty {
-                    durability: Some(source),
-                    ..RegisterUncertainty::default()
-                }
-            }
-            DetailedAtomicOutcome::PublishedParentPathRaced { sync_error } => {
-                RegisterUncertainty {
-                    durability: sync_error,
-                    observation: Some(io::Error::new(
-                        io::ErrorKind::Other,
-                        "published parent path raced",
-                    )),
-                    ..RegisterUncertainty::default()
-                }
-            }
+            DetailedAtomicOutcome::PublishedDurabilityUncertain { source } => RegisterUncertainty {
+                durability: Some(source),
+                ..RegisterUncertainty::default()
+            },
+            DetailedAtomicOutcome::PublishedParentPathRaced { sync_error } => RegisterUncertainty {
+                durability: sync_error,
+                observation: Some(io::Error::new(
+                    io::ErrorKind::Other,
+                    "published parent path raced",
+                )),
+                ..RegisterUncertainty::default()
+            },
             DetailedAtomicOutcome::PublishedParentPathUnverified {
                 observation,
                 sync_error,
@@ -661,7 +650,7 @@ impl From<BoundMutationRefusal> for RestoredMarkRefusal {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum RestoredAdmission<'a, 'clock> {
     Live(&'a solstone_core_backup::archive_readback::ReadOperation<'clock>),
     #[cfg(target_os = "linux")]
@@ -671,7 +660,7 @@ enum RestoredAdmission<'a, 'clock> {
     },
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl RestoredAdmission<'_, '_> {
     fn root(&self) -> &std::sync::Arc<JournalRoot> {
         match self {
@@ -728,7 +717,7 @@ impl RestoredAdmission<'_, '_> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct RestoredFacts<'a, 'clock> {
     admission: RestoredAdmission<'a, 'clock>,
     operation: &'a crate::archive_catalog::RestoreOperation,
@@ -739,7 +728,7 @@ struct RestoredFacts<'a, 'clock> {
 }
 
 // Keep the actual exclusion and descendant handles through a recovered postcheck.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct RestoredMutationGuard {
     _directory: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
     _parent: std::sync::Arc<solstone_core_journal_io::media::MediaDirectory>,
@@ -753,12 +742,12 @@ struct RestoredMutationGuard {
 pub fn conditional_retire_restored(
     input: RestoredMarkMutation<'_, '_>,
 ) -> Result<BoundMutationOutcome, RestoredMarkRefusal> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _input = input;
         Err(RestoredMarkRefusal::Unsupported)
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let facts = RestoredFacts {
             admission: RestoredAdmission::Live(input.read),
@@ -772,7 +761,7 @@ pub fn conditional_retire_restored(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn mutate_restored(
     input: &RestoredFacts<'_, '_>,
 ) -> Result<(BoundMutationOutcome, RestoredMutationGuard), RestoredMarkRefusal> {
@@ -878,7 +867,7 @@ fn mutate_restored(
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn revalidate_restored(
     input: &RestoredFacts<'_, '_>,
     file: &crate::archive_proof::ArchiveFileProof,
@@ -933,7 +922,7 @@ fn revalidate_restored(
     input.admission.revalidate()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn check_restored_catalog(
     catalog: &crate::archive_catalog::JournalCatalog,
     proof: &crate::archive_proof::OffloadProof,

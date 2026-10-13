@@ -238,12 +238,19 @@ impl ArchivePredecessorCustody {
         drop(child);
     }
     #[cfg(windows)]
-    fn accept_windows(&mut self, successful: bool) {
-        if !successful || self.pending == 0 {
+    fn reaped_windows(&mut self) {
+        if let Some(pending) = self.pending.checked_sub(1) {
+            self.pending = pending;
+        } else {
+            self.refuse(ReadbackError::ToolFailed);
+        }
+    }
+    #[cfg(windows)]
+    fn accept_windows(&mut self) {
+        if self.pending != 0 {
             self.refuse(ReadbackError::ToolFailed);
             return;
         }
-        self.pending -= 1;
         if !matches!(self.state, CreatorState::Direct(WriterProgress::Refused(_))) {
             self.state = CreatorState::Direct(WriterProgress::Accepted);
         }
@@ -493,13 +500,21 @@ impl OwnedArchiveCreator {
         }
         self.revalidate_sources(sources)?;
         self.read.read.check_repository()?;
-        self.read.read.check_repository()?;
         self.revalidate_sources(sources)?;
         let timeout = self
             .prepared_operation()
             .budget()
             .remaining(self.prepared_operation().clock())?;
         let program = self.read.read.restic_path.as_os_str().to_owned();
+        let mut retained: Vec<Arc<dyn Send + Sync>> =
+            vec![Arc::clone(self.carrier()) as Arc<dyn Send + Sync>];
+        for source in sources {
+            retained.push(Arc::new(
+                source
+                    .retain_for_helper()
+                    .map_err(|_| ReadbackError::NativeFailure)?,
+            ));
+        }
         {
             let mut execution = self.read.read.execution.borrow_mut();
             let custody = execution
@@ -516,17 +531,26 @@ impl OwnedArchiveCreator {
         let cancel = self.prepared_operation().budget().cancellation();
         let executor = Arc::clone(&self.read.read.executor);
         let output = executor.run_cancellable(
-            std::path::Path::new(&program),
-            &argv,
-            &self.read.read.env,
-            timeout,
+            WindowsArchiveRequest {
+                program: std::path::Path::new(&program),
+                argv: &argv,
+                env: &self.read.read.env,
+                timeout,
+                cancellation: cancel,
+                retained,
+            },
             64 * 1024 * 1024,
-            cancel,
         );
-        let output = match output {
-            Ok(output) if output.quiescent => output,
-            _ => return Err(self.read.read.execution_error()),
-        };
+        {
+            let mut execution = self.read.read.execution.borrow_mut();
+            execution.retain_cleanup(&output);
+            if let Some(custody) = execution.predecessor.as_mut() {
+                custody.reaped_windows();
+            }
+        }
+        if !output.quiescent() {
+            return Err(self.read.read.execution_error());
+        }
         let observed = Some(output.returncode);
         let snapshot = parse_summary(&output.stdout).ok();
         *effects = DirectArchiveEffects::Attempted {
@@ -535,14 +559,13 @@ impl OwnedArchiveCreator {
         };
         self.revalidate_sources(sources)?;
         self.read.read.check_repository()?;
-        self.read.read.check_repository()?;
         self.revalidate_sources(sources)?;
         if !output.successful() {
             return Err(ReadbackError::ToolFailed);
         }
         let snapshot_id = snapshot.ok_or(ReadbackError::SnapshotNodeUnavailable)?;
         if let Some(custody) = self.read.read.execution.borrow_mut().predecessor.as_mut() {
-            custody.accept_windows(true);
+            custody.accept_windows();
         }
         Ok(DirectArchiveSnapshot {
             repository_id: self.repository_id().to_owned(),

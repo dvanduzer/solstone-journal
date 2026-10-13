@@ -158,11 +158,11 @@ pub fn create_planned_offload_offers<'clock>(
     services: &BackupServices<'clock>,
     at: DateTime<FixedOffset>,
 ) -> OffloadCreation<'clock> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         bound::create(operation, services, at)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _parameters = (services, at);
         OffloadCreation {
@@ -178,7 +178,7 @@ pub fn create_planned_offload_offers<'clock>(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod bound {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
@@ -227,16 +227,16 @@ mod bound {
         operation: &PreparedArchiveOperation<'_>,
         observed: &ObservedOffloadOffers,
     ) -> Result<Arc<MediaDirectory>, OffloadCreationRefusal> {
-        #[cfg(all(test, feature = "full-tests"))]
+        #[cfg(all(test, unix, feature = "full-tests"))]
         if PAYLOAD_CAPACITY_FAULT.with(|armed| armed.replace(false)) {
             return solstone_core_journal_io::media::run_with_media_hook(
                 solstone_core_journal_io::media::MediaPrimitive::CapacityQuery,
                 || Err(std::io::Error::from_raw_os_error(13)),
-                || unix::capacity(operation, observed),
+                || native::capacity(operation, observed),
             )
             .0;
         }
-        unix::capacity(operation, observed)
+        native::capacity(operation, observed)
     }
 
     pub(super) fn candidates(
@@ -298,14 +298,14 @@ mod bound {
                 SegmentLayout::Named => parent.join(&stream).join(&dir),
             };
             let directory = MediaDirectory::open(Arc::clone(admitted.journal_root()), &relative)
-                .map_err(|error| unix::inputs(error.into()))?;
+                .map_err(|error| native::inputs(error.into()))?;
             let scan = scan_segment_bound(
                 &directory,
                 &ClosedHandlerSet,
                 &JournalMedia,
                 MAX_CURRENT_ENTRIES,
             )
-            .map_err(|error| unix::inputs(error.into()))?;
+            .map_err(|error| native::inputs(error.into()))?;
             let target = Target { day, stream, dir };
             let inspected = inspect_grouped(
                 &scan,
@@ -326,7 +326,7 @@ mod bound {
             let mut selected_names = Vec::new();
             for file in inspected.eligible() {
                 if names.get(file.name()).copied() != Some(file.bytes()) {
-                    return Err(unix::inputs(OffloadOfferRefusal::Changed));
+                    return Err(native::inputs(OffloadOfferRefusal::Changed));
                 }
                 if !credited.contains(&(key.clone(), file.name().to_owned())) {
                     increment = increment
@@ -368,7 +368,7 @@ mod bound {
         let now = at.with_timezone(&Utc);
         operation
             .revalidate()
-            .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
+            .map_err(|error| native::inputs(OffloadOfferRefusal::Admission(error)))?;
         if !operation.configuration().offload_enabled() {
             return Err(planning(OffloadPlanningRefusal::Disabled));
         }
@@ -379,12 +379,12 @@ mod bound {
         report.budget = operation
             .configuration()
             .offload_budget_bytes()
-            .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
+            .map_err(|error| native::inputs(OffloadOfferRefusal::Admission(error)))?;
         report.local = Some(measure_local_media(
             operation.journal_root().canonical_path(),
         ));
         complete(report.local.as_ref().expect("local measurement"))?;
-        unix::capacity_for_payload(operation, 0)?;
+        native::capacity_for_payload(operation, 0)?;
         Ok(())
     }
 
@@ -394,7 +394,7 @@ mod bound {
         at: DateTime<FixedOffset>,
     ) -> Result<Option<Vec<OffloadOfferSelection>>, OffloadCreationRefusal> {
         let register = load_at_root(admitted.journal_root())
-            .map_err(|error| unix::inputs(OffloadOfferRefusal::Review(error)))?;
+            .map_err(|error| native::inputs(OffloadOfferRefusal::Review(error)))?;
         let expected = register
             .marks
             .values()
@@ -414,7 +414,7 @@ mod bound {
         if measure_local_media(admitted.journal_root().canonical_path())
             != *report.local.as_ref().expect("complete local population")
         {
-            return Err(unix::inputs(OffloadOfferRefusal::Changed));
+            return Err(native::inputs(OffloadOfferRefusal::Changed));
         }
         admitted
             .revalidate()
@@ -441,7 +441,7 @@ mod bound {
         let prepared = preflight(&operation, &mut report, at);
         if let Err(reason) = prepared {
             resources.planning = Some(report);
-            return unix::fail(Owner::Prepared(Box::new(operation)), resources, reason);
+            return native::fail(Owner::Prepared(Box::new(operation)), resources, reason);
         }
         let admitted =
             match solstone_core_backup_runtime::admit_prepared_archive(operation, services) {
@@ -449,7 +449,7 @@ mod bound {
                 Err(failure) => {
                     let reason = OffloadCreationRefusal::Archive(failure.error());
                     resources.planning = Some(report);
-                    return unix::fail(
+                    return native::fail(
                         Owner::AdmissionFailure(Box::new(failure)),
                         resources,
                         reason,
@@ -460,7 +460,7 @@ mod bound {
         let selections = match inspected {
             Err(reason) => {
                 resources.planning = Some(report);
-                return unix::fail(Owner::Admitted(Box::new(admitted)), resources, reason);
+                return native::fail(Owner::Admitted(Box::new(admitted)), resources, reason);
             }
             Ok(None) => {
                 report.phase = OffloadPlanningPhase::AlreadySatisfied;
@@ -477,24 +477,25 @@ mod bound {
         resources.planning = Some(report);
         let captured = (|| {
             let catalog = read_complete_catalog(admitted.journal_root())
-                .map_err(|error| unix::inputs(OffloadOfferRefusal::Catalog(error)))?;
+                .map_err(|error| native::inputs(OffloadOfferRefusal::Catalog(error)))?;
             let register = load_at_root(admitted.journal_root())
-                .map_err(|error| unix::inputs(OffloadOfferRefusal::Review(error)))?;
-            let selections = unix::partition(&catalog, &register, &selections)?;
+                .map_err(|error| native::inputs(OffloadOfferRefusal::Review(error)))?;
+            let selections = native::partition(&catalog, &register, &selections)?;
             let operation = admitted.prepared_operation();
             resources.observed = Some(
-                capture_offload_offers(operation, &selections, today, now).map_err(unix::inputs)?,
+                capture_offload_offers(operation, &selections, today, now)
+                    .map_err(native::inputs)?,
             );
             let parent = payload_capacity(
                 operation,
                 resources.observed.as_ref().expect("captured inputs"),
             )?;
-            unix::copy_inputs(operation, parent, &mut resources)?;
+            native::copy_inputs(operation, parent, &mut resources)?;
             Ok(catalog)
         })();
         match captured {
-            Ok(catalog) => unix::continue_creation(admitted, resources, catalog, today, now),
-            Err(reason) => unix::fail(Owner::Admitted(Box::new(admitted)), resources, reason),
+            Ok(catalog) => native::continue_creation(admitted, resources, catalog, today, now),
+            Err(reason) => native::fail(Owner::Admitted(Box::new(admitted)), resources, reason),
         }
     }
 
@@ -509,7 +510,7 @@ mod bound {
             },
             Err(failure) => {
                 let reason = OffloadCreationRefusal::Readback(failure.reason());
-                unix::fail(
+                native::fail(
                     Owner::ReadAdmissionFailure(Box::new(failure)),
                     resources,
                     reason,

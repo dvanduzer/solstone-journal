@@ -196,6 +196,7 @@ pub fn is_busy(slot: &SharedOperationSlot) -> bool {
         let Ok(mut guard) = slot.try_lock() else {
             return true;
         };
+        crate::archive_worker::observe_retained(&mut guard);
         return guard.archive.is_busy()
             || observe(&mut guard.current)
                 .is_some_and(|current| !is_terminal(&current.view.phase));
@@ -213,6 +214,7 @@ pub fn is_busy(slot: &SharedOperationSlot) -> bool {
 #[cfg(windows)]
 pub(crate) fn observed_current(slot: &SharedOperationSlot) -> Result<Option<Operation>, ()> {
     let mut guard = slot.try_lock().map_err(|_| ())?;
+    crate::archive_worker::observe_retained(&mut guard);
     Ok(observe(&mut guard.current).map(|slot| slot.view.clone()))
 }
 
@@ -225,6 +227,7 @@ pub(crate) fn observed_generation(
     if guard.current.as_ref().map(|current| current.generation) != generation {
         return Err(());
     }
+    crate::archive_worker::observe_retained(&mut guard);
     Ok(observe(&mut guard.current).map(|current| current.view.clone()))
 }
 
@@ -405,7 +408,10 @@ pub(crate) fn fail_handoff_poll(
 
 #[cfg(any(not(windows), test))]
 pub fn current(slot: &SharedOperationSlot) -> Option<Operation> {
-    observe(&mut slot.lock().expect("operation slot lock").current).map(|slot| slot.view.clone())
+    let mut guard = slot.lock().expect("operation slot lock");
+    #[cfg(windows)]
+    crate::archive_worker::observe_retained(&mut guard);
+    observe(&mut guard.current).map(|slot| slot.view.clone())
 }
 
 pub fn busy_response() -> Response {
@@ -478,6 +484,8 @@ pub(crate) fn lock_for_begin(
     let mut guard = slot.try_lock().map_err(|_| ())?;
     #[cfg(not(windows))]
     let mut guard = slot.lock().map_err(|_| ())?;
+    #[cfg(windows)]
+    crate::archive_worker::observe_retained(&mut guard);
     if guard.archive.is_busy()
         || observe(&mut guard.current).is_some_and(|slot| !is_terminal(&slot.view.phase))
     {

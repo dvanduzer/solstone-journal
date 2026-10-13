@@ -67,7 +67,9 @@ use crate::archive_activity::{
 #[cfg(windows)]
 mod windows_executor;
 #[cfg(windows)]
-pub use windows_executor::{WindowsArchiveExecutor, WindowsExecutionOutput};
+pub use windows_executor::{
+    WindowsArchiveCleanup, WindowsArchiveExecutor, WindowsArchiveRequest, WindowsExecutionOutput,
+};
 
 #[cfg(any(unix, windows))]
 use crate::archive_admission::ARCHIVE_LS_TIMEOUT_SECONDS;
@@ -249,6 +251,8 @@ impl ReadbackAdmissionError<'_> {
 #[derive(Default)]
 struct DirectExecution {
     predecessor: Option<ArchivePredecessorCustody>,
+    #[cfg(windows)]
+    cleanup: Vec<Arc<dyn WindowsArchiveCleanup>>,
     #[cfg(any(unix, windows))]
     pending: u64,
     #[cfg(any(unix, windows))]
@@ -263,12 +267,16 @@ enum DirectInvocation {
     Dump,
 }
 impl DirectExecution {
-    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows))]
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        target_os = "macos",
+        windows
+    ))]
     fn qualify_read_state(&self) -> Result<(), ReadbackError> {
         if let Some(reason) = self.failure {
             return Err(reason);
         }
-        if self.pending != 0 || self.completed[0] == 0 || self.completed[1] == 0 {
+        if !self.helpers_quiescent() || self.completed[0] == 0 || self.completed[1] == 0 {
             return Err(ReadbackError::ToolFailed);
         }
         Ok(())
@@ -278,13 +286,31 @@ impl DirectExecution {
     }
     /// Every child this read launched was reaped and no archive writer was ever
     /// submitted. This is not readback success.
-    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows))]
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        target_os = "macos",
+        windows
+    ))]
     fn quiescent(&self) -> bool {
-        self.pending == 0
+        self.helpers_quiescent()
             && self
                 .predecessor
                 .as_ref()
                 .is_none_or(ArchivePredecessorCustody::unwritten)
+    }
+    #[cfg(any(unix, windows))]
+    fn helpers_quiescent(&self) -> bool {
+        #[cfg(windows)]
+        if self.cleanup.iter().any(|cleanup| !cleanup.quiescent()) {
+            return false;
+        }
+        self.pending == 0
+    }
+    #[cfg(windows)]
+    fn retain_cleanup(&mut self, output: &WindowsExecutionOutput) {
+        if let Some(cleanup) = &output.cleanup {
+            self.cleanup.push(Arc::clone(cleanup));
+        }
     }
     #[cfg(any(unix, windows))]
     fn attempt(&mut self) {
@@ -294,10 +320,10 @@ impl DirectExecution {
             self.fail(ReadbackError::ToolFailed);
         }
     }
-    /// The bounded runner returned only after killing the group and reaping the
-    /// root, whatever its exit status. Failed or unknown runs stay pending.
+    /// The synchronous call returned. Any Windows Job or output worker still
+    /// stopping remains separately owned by its native cleanup receipt.
     #[cfg(any(unix, windows))]
-    fn reaped(&mut self) {
+    fn returned(&mut self) {
         if let Some(next) = self.pending.checked_sub(1) {
             self.pending = next;
         } else {
@@ -506,7 +532,11 @@ impl OwnedDirectReadHold {
             }
             Ok(())
         }
-        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows)))]
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            target_os = "macos",
+            windows
+        )))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -985,9 +1015,11 @@ fn close_owned_admission(
     OwnedReadbackAdmissionError { reason, owned }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum WriterState {
     NotLaunched,
+    #[cfg(windows)]
+    Pending(Arc<dyn WindowsArchiveCleanup>),
     #[cfg(any(unix, windows))]
     Unknown,
     #[cfg(any(unix, windows))]
@@ -1049,7 +1081,14 @@ impl ReadbackFailure {
 
     /// Unknown writer lifetime never grants cleanup, including on Drop.
     pub fn cleanup(&mut self) -> Cleanup {
-        match (self.owned.as_mut(), self.writer) {
+        #[cfg(windows)]
+        if let WriterState::Pending(cleanup) = &self.writer {
+            if !cleanup.quiescent() {
+                return Cleanup::Pending;
+            }
+            self.writer = WriterState::QualifiedCompletion;
+        }
+        match (self.owned.as_mut(), &self.writer) {
             #[cfg(any(unix, windows))]
             (_, WriterState::Unknown) => Cleanup::Refused,
             (OwnedReadback::Target(target), _) => target.cleanup_after_helper_quiescence(),
@@ -1252,7 +1291,11 @@ impl<'a> ReadOperation<'a> {
             }
             execution.qualify_read_state()
         }
-        #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos", windows)))]
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            target_os = "macos",
+            windows
+        )))]
         {
             Err(ReadbackError::Unsupported)
         }
@@ -1300,11 +1343,10 @@ impl<'a> ReadOperation<'a> {
                 return Err(ReadbackError::CredentialsUnavailable);
             }
             match configuration.mode() {
-                Some("byo")
-                    if configuration.destination().as_ref() == Some(&input.destination) => {}
+                Some("byo") if configuration.destination().as_ref() == Some(&input.destination) => {
+                }
                 Some("operated")
-                    if configuration.binding().is_some()
-                        && input.destination.backend == "s3" => {}
+                    if configuration.binding().is_some() && input.destination.backend == "s3" => {}
                 _ => return Err(ReadbackError::NotConfigured),
             }
             if matches!(&input.repository, RepositoryBinding::Expected(id) if !full_hex_identity(id))
@@ -1330,7 +1372,7 @@ impl<'a> ReadOperation<'a> {
         let mut admitted = Self {
             root: Arc::clone(input.operation.journal_root()),
             operation: input.operation,
-            #[cfg(feature = "full-tests")]
+            #[cfg(all(unix, feature = "full-tests"))]
             source_observations: std::cell::Cell::new((0, 0)),
             restic_path,
             executor,
@@ -1346,9 +1388,7 @@ impl<'a> ReadOperation<'a> {
             let version = std::str::from_utf8(&version_output.stdout)
                 .map_err(|_| ReadbackError::UnsupportedToolVersion)?;
             let mut fields = version.split_whitespace();
-            if fields.next() != Some("restic")
-                || fields.next() != Some(SUPPORTED_RESTIC_VERSION)
-            {
+            if fields.next() != Some("restic") || fields.next() != Some(SUPPORTED_RESTIC_VERSION) {
                 return Err(ReadbackError::UnsupportedToolVersion);
             }
             admitted
@@ -1370,88 +1410,85 @@ impl<'a> ReadOperation<'a> {
     #[cfg(unix)]
     pub fn admit(input: ReadAdmission<'a>) -> Result<Self, ReadbackAdmissionError<'a>> {
         let admission = (|| {
-                input.operation.revalidate()?;
-                let configuration = input.operation.configuration();
-                if !configuration.enabled() {
-                    return Err(ReadbackError::NotConfigured);
-                }
-                let keys = configuration.keys()?.ok_or(ReadbackError::NotConfigured)?;
-                if input.password != keys.daily_key {
-                    return Err(ReadbackError::CredentialsUnavailable);
-                }
-                match configuration.mode() {
-                    Some("byo")
-                        if configuration.destination().as_ref() == Some(&input.destination) => {}
-                    Some("operated")
-                        if configuration.binding().is_some()
-                            && input.destination.backend == "s3" => {}
-                    _ => return Err(ReadbackError::NotConfigured),
-                }
-                if matches!(&input.repository, RepositoryBinding::Expected(id) if !full_hex_identity(id))
-                {
-                    return Err(ReadbackError::InvalidRepositoryIdentity);
-                }
-                if let Some(predecessor) = &input.predecessor {
-                    predecessor.validate_input(&input)?;
-                }
-                let env = direct_environment(&input.destination, &input.password)?;
-                let member = solstone_core_installed_payload::resolve_current_member(RESTIC_MEMBER)
-                    .map_err(|_| ReadbackError::ToolUnavailable)?;
-                if member.path() != input.expected_restic_path {
-                    return Err(ReadbackError::ToolChanged);
-                }
-                if let Some(predecessor) = &input.predecessor {
-                    predecessor.validate_member(&member)?;
-                }
-                Ok((env, member))
-            })();
-            let (env, member) = match admission {
-                Ok(admitted) => admitted,
-                Err(reason) => {
-                    return Err(ReadbackAdmissionError {
-                        reason,
-                        owned: AdmissionOwner::Input(Box::new(input)),
-                    });
-                }
-            };
-            let mut admitted = Self {
-                root: Arc::clone(input.operation.journal_root()),
-                operation: input.operation,
-                #[cfg(feature = "full-tests")]
-                source_observations: std::cell::Cell::new((0, 0)),
-                member,
-                env,
-                repository: input.repository,
-                execution: std::cell::RefCell::new(DirectExecution {
-                    predecessor: input.predecessor,
-                    ..DirectExecution::default()
-                }),
-            };
-            let qualification = (|| {
-                let version_child = admitted.query(vec!["version".into()])?;
-                let version = std::str::from_utf8(&version_child.output().stdout)
-                    .map_err(|_| ReadbackError::UnsupportedToolVersion)?;
-                let mut fields = version.split_whitespace();
-                if fields.next() != Some("restic")
-                    || fields.next() != Some(SUPPORTED_RESTIC_VERSION)
-                {
-                    return Err(ReadbackError::UnsupportedToolVersion);
-                }
-                admitted
-                    .execution
-                    .borrow_mut()
-                    .accept(DirectInvocation::Version, version_child);
-                admitted.confirm_repository()?;
-                Ok(())
-            })();
-            match qualification {
-                Ok(()) => Ok(admitted),
-                Err(reason) => Err(ReadbackAdmissionError {
-                    reason,
-                    owned: AdmissionOwner::Admitted(Box::new(admitted)),
-                }),
+            input.operation.revalidate()?;
+            let configuration = input.operation.configuration();
+            if !configuration.enabled() {
+                return Err(ReadbackError::NotConfigured);
             }
+            let keys = configuration.keys()?.ok_or(ReadbackError::NotConfigured)?;
+            if input.password != keys.daily_key {
+                return Err(ReadbackError::CredentialsUnavailable);
+            }
+            match configuration.mode() {
+                Some("byo") if configuration.destination().as_ref() == Some(&input.destination) => {
+                }
+                Some("operated")
+                    if configuration.binding().is_some() && input.destination.backend == "s3" => {}
+                _ => return Err(ReadbackError::NotConfigured),
+            }
+            if matches!(&input.repository, RepositoryBinding::Expected(id) if !full_hex_identity(id))
+            {
+                return Err(ReadbackError::InvalidRepositoryIdentity);
+            }
+            if let Some(predecessor) = &input.predecessor {
+                predecessor.validate_input(&input)?;
+            }
+            let env = direct_environment(&input.destination, &input.password)?;
+            let member = solstone_core_installed_payload::resolve_current_member(RESTIC_MEMBER)
+                .map_err(|_| ReadbackError::ToolUnavailable)?;
+            if member.path() != input.expected_restic_path {
+                return Err(ReadbackError::ToolChanged);
+            }
+            if let Some(predecessor) = &input.predecessor {
+                predecessor.validate_member(&member)?;
+            }
+            Ok((env, member))
+        })();
+        let (env, member) = match admission {
+            Ok(admitted) => admitted,
+            Err(reason) => {
+                return Err(ReadbackAdmissionError {
+                    reason,
+                    owned: AdmissionOwner::Input(Box::new(input)),
+                });
+            }
+        };
+        let mut admitted = Self {
+            root: Arc::clone(input.operation.journal_root()),
+            operation: input.operation,
+            #[cfg(feature = "full-tests")]
+            source_observations: std::cell::Cell::new((0, 0)),
+            member,
+            env,
+            repository: input.repository,
+            execution: std::cell::RefCell::new(DirectExecution {
+                predecessor: input.predecessor,
+                ..DirectExecution::default()
+            }),
+        };
+        let qualification = (|| {
+            let version_child = admitted.query(vec!["version".into()])?;
+            let version = std::str::from_utf8(&version_child.output().stdout)
+                .map_err(|_| ReadbackError::UnsupportedToolVersion)?;
+            let mut fields = version.split_whitespace();
+            if fields.next() != Some("restic") || fields.next() != Some(SUPPORTED_RESTIC_VERSION) {
+                return Err(ReadbackError::UnsupportedToolVersion);
+            }
+            admitted
+                .execution
+                .borrow_mut()
+                .accept(DirectInvocation::Version, version_child);
+            admitted.confirm_repository()?;
+            Ok(())
+        })();
+        match qualification {
+            Ok(()) => Ok(admitted),
+            Err(reason) => Err(ReadbackAdmissionError {
+                reason,
+                owned: AdmissionOwner::Admitted(Box::new(admitted)),
+            }),
         }
+    }
 
     pub fn carrier(&self) -> &Arc<RootActivityCarrier> {
         self.operation.carrier()
@@ -1582,12 +1619,12 @@ impl<'a> ReadOperation<'a> {
         };
         match completed {
             Ok(completed) => {
-                self.execution.borrow_mut().reaped();
+                self.execution.borrow_mut().returned();
                 Ok(completed)
             }
             Err(failure) => {
                 if failure.settled() {
-                    self.execution.borrow_mut().reaped();
+                    self.execution.borrow_mut().returned();
                 }
                 Err((self.execution_error(), failure.settled()))
             }
@@ -1627,12 +1664,18 @@ impl<'a> ReadOperation<'a> {
     }
 
     #[cfg(windows)]
-    fn query(&self, argv: Vec<std::ffi::OsString>) -> Result<WindowsExecutionOutput, ReadbackError> {
+    fn query(
+        &self,
+        argv: Vec<std::ffi::OsString>,
+    ) -> Result<WindowsExecutionOutput, ReadbackError> {
         self.query_inner(argv)
             .inspect_err(|reason| self.execution.borrow_mut().fail(*reason))
     }
     #[cfg(windows)]
-    fn query_inner(&self, argv: Vec<std::ffi::OsString>) -> Result<WindowsExecutionOutput, ReadbackError> {
+    fn query_inner(
+        &self,
+        argv: Vec<std::ffi::OsString>,
+    ) -> Result<WindowsExecutionOutput, ReadbackError> {
         self.revalidate_local()?;
         let timeout = self
             .operation
@@ -1642,22 +1685,24 @@ impl<'a> ReadOperation<'a> {
         self.execution.borrow_mut().attempt();
         let cancel = self.operation.budget().cancellation();
         let output = self.executor.run_cancellable(
-            &self.restic_path,
-            &argv,
-            &self.env,
-            timeout,
+            WindowsArchiveRequest {
+                program: &self.restic_path,
+                argv: &argv,
+                env: &self.env,
+                timeout,
+                cancellation: cancel,
+                retained: vec![Arc::clone(self.carrier()) as Arc<dyn Send + Sync>],
+            },
             MAX_QUERY_BYTES,
-            cancel,
         );
-        let output = match output {
-            Ok(output) if output.quiescent => {
-                self.execution.borrow_mut().reaped();
-                output
-            }
-            Ok(_) | Err(_) => {
-                return Err(self.execution_error());
-            }
-        };
+        {
+            let mut execution = self.execution.borrow_mut();
+            execution.returned();
+            execution.retain_cleanup(&output);
+        }
+        if !output.quiescent() {
+            return Err(self.execution_error());
+        }
         self.revalidate_local()?;
         if !output.successful() {
             return Err(ReadbackError::ToolFailed);
@@ -1801,7 +1846,7 @@ impl<'a> ReadOperation<'a> {
     fn revalidate_source(&self, source: &ArchiveSource<'_>) -> Result<(), ReadbackError> {
         self.revalidate_local()?;
         let result = source.revalidate();
-        #[cfg(feature = "full-tests")]
+        #[cfg(all(unix, feature = "full-tests"))]
         {
             let (observed, failed) = self.source_observations.get();
             self.source_observations
@@ -2057,6 +2102,9 @@ impl<'a> ReadOperation<'a> {
             let execution = (|| {
                 self.revalidate_local()?;
                 let timeout = self.operation.budget().remaining(self.operation.clock())?;
+                let retained = target
+                    .retain_for_helper()
+                    .map_err(|_| ReadbackError::NativeFailure)?;
                 let stage_file = target
                     .issue_stage_file()
                     .map_err(|_| ReadbackError::NativeFailure)?;
@@ -2070,27 +2118,34 @@ impl<'a> ReadOperation<'a> {
                 self.execution.borrow_mut().attempt();
                 let cancel = self.operation.budget().cancellation();
                 let completed = self.executor.run_dump(
-                    &self.restic_path,
-                    &argv,
-                    &self.env,
-                    timeout,
+                    WindowsArchiveRequest {
+                        program: &self.restic_path,
+                        argv: &argv,
+                        env: &self.env,
+                        timeout,
+                        cancellation: cancel,
+                        retained: vec![
+                            Arc::clone(self.carrier()) as Arc<dyn Send + Sync>,
+                            Arc::new(retained),
+                        ],
+                    },
                     stage_file,
                     file.bytes,
-                    cancel,
                 );
-                let completed = match completed {
-                    Ok(completed) if completed.quiescent => {
-                        self.execution.borrow_mut().reaped();
-                        writer = WriterState::QualifiedCompletion;
-                        completed
-                    }
-                    Ok(_) => {
-                        return Err(ReadbackError::ToolFailed);
-                    }
-                    Err(reason) => {
-                        return Err(reason);
-                    }
-                };
+                {
+                    let mut execution = self.execution.borrow_mut();
+                    execution.returned();
+                    execution.retain_cleanup(&completed);
+                }
+                if let Some(cleanup) = &completed.cleanup {
+                    writer = WriterState::Pending(Arc::clone(cleanup));
+                } else {
+                    writer = WriterState::QualifiedCompletion;
+                }
+                if !completed.quiescent() {
+                    return Err(ReadbackError::ToolFailed);
+                }
+                writer = WriterState::QualifiedCompletion;
                 self.operation.budget().remaining(self.operation.clock())?;
                 if !completed.successful() {
                     return Err(ReadbackError::ToolFailed);
@@ -2120,7 +2175,7 @@ impl<'a> ReadOperation<'a> {
                     .map_err(|failure| {
                         ReadbackFailure::target(
                             ReadbackError::NativeFailure,
-                            writer,
+                            writer.clone(),
                             failure.owned,
                             Arc::clone(self.carrier()),
                         )
@@ -2245,7 +2300,7 @@ impl<'a> ReadOperation<'a> {
                     .map_err(|failure| {
                         ReadbackFailure::target(
                             ReadbackError::NativeFailure,
-                            writer,
+                            writer.clone(),
                             failure.owned,
                             Arc::clone(self.carrier()),
                         )
@@ -2414,7 +2469,7 @@ mod tests {
         state.attempt();
         assert!(!state.quiescent());
         // A reaped child releases whatever its exit status; it never qualifies.
-        state.reaped();
+        state.returned();
         state.fail(ReadbackError::ToolFailed);
         assert!(state.quiescent());
         assert_eq!(state.qualify_read_state(), Err(ReadbackError::ToolFailed));
@@ -2445,7 +2500,7 @@ mod tests {
             let (stage, target) = issued();
             let mut failure = ReadbackFailure::target(
                 ReadbackError::ToolFailed,
-                writer,
+                writer.clone(),
                 target,
                 Arc::clone(&carrier),
             );

@@ -555,6 +555,26 @@ fn discharge_released(state: &mut operation::OperationState, returned: &Rejected
     }
 }
 
+/// Retry the same valid return after its native helper finishes stopping.
+/// Release still requires the owner's proof that no effects remain; rejected
+/// handoffs and uncertain effects keep their original custody.
+#[cfg(windows)]
+pub(crate) fn observe_retained(state: &mut operation::OperationState) {
+    for mut returned in std::mem::take(&mut state.archive.retained) {
+        if returned.reason.is_none() && state.archive.matches(&returned.ticket) {
+            let payload = std::mem::replace(&mut returned.payload, ArchivePayload::Released);
+            match payload.release() {
+                Ok(()) => {
+                    discharge_released(state, &returned);
+                    continue;
+                }
+                Err(payload) => returned.payload = payload,
+            }
+        }
+        state.archive.retained.push(returned);
+    }
+}
+
 /// Retention alone may recover a poisoned mutex. It never applies success.
 pub fn park_rejected(slot: &SharedOperationSlot, rejected: Box<RejectedArchiveReturn>) {
     let (mut state, poisoned) = match slot.lock() {

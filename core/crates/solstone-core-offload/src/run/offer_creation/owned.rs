@@ -88,8 +88,8 @@ pub fn prepare_owned_offload_inputs(
         today,
         now,
     )?;
-    #[cfg(unix)]
-    if let Err(reason) = unix::capacity(original.as_prepared(), inputs.observed()) {
+    #[cfg(any(unix, windows))]
+    if let Err(reason) = native::capacity(original.as_prepared(), inputs.observed()) {
         return Err(inputs.refuse(reason));
     }
     Ok(inputs)
@@ -105,7 +105,7 @@ pub(super) fn capture_inputs(
     now: DateTime<Utc>,
 ) -> Result<OwnedOffloadInputs, OwnedOffloadInputFailure> {
     let mut resources = Resources::default();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let result = (|| {
         use solstone_core_retention::{
             archive_catalog::read_complete_catalog, archive_offer::capture_offload_offers,
@@ -113,17 +113,18 @@ pub(super) fn capture_inputs(
         };
         operation
             .revalidate()
-            .map_err(|error| unix::inputs(OffloadOfferRefusal::Admission(error)))?;
+            .map_err(|error| native::inputs(OffloadOfferRefusal::Admission(error)))?;
         let catalog = read_complete_catalog(operation.journal_root())
-            .map_err(|error| unix::inputs(OffloadOfferRefusal::Catalog(error)))?;
+            .map_err(|error| native::inputs(OffloadOfferRefusal::Catalog(error)))?;
         let register = load_at_root(operation.journal_root())
-            .map_err(|error| unix::inputs(OffloadOfferRefusal::Review(error)))?;
-        let selections = unix::partition(&catalog, &register, selections)?;
-        resources.observed =
-            Some(capture_offload_offers(operation, &selections, today, now).map_err(unix::inputs)?);
+            .map_err(|error| native::inputs(OffloadOfferRefusal::Review(error)))?;
+        let selections = native::partition(&catalog, &register, selections)?;
+        resources.observed = Some(
+            capture_offload_offers(operation, &selections, today, now).map_err(native::inputs)?,
+        );
         Ok(catalog)
     })();
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let result: Result<JournalCatalog, OffloadCreationRefusal> = {
         let _parameters = (operation, selections, today, now);
         Err(OffloadCreationRefusal::Inputs(
@@ -593,7 +594,7 @@ pub fn create_owned_offload_offers(
         );
     }
     drop(input_carrier);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _parameters = (catalog, today, now);
         fail(
@@ -603,18 +604,18 @@ pub fn create_owned_offload_offers(
             OffloadCreationRefusal::Inputs(OffloadOfferRefusal::Unsupported),
         )
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let copied = (|| {
             admitted
                 .revalidate_local()
                 .map_err(OffloadCreationRefusal::Archive)?;
             let original = admitted.prepared_operation();
-            let parent = unix::capacity(
+            let parent = native::capacity(
                 original,
                 resources.observed.as_ref().expect("captured inputs"),
             )?;
-            unix::copy_inputs(original, parent, &mut resources)
+            native::copy_inputs(original, parent, &mut resources)
         })();
         if let Err(reason) = copied {
             return fail(
@@ -624,8 +625,8 @@ pub fn create_owned_offload_offers(
                 reason,
             );
         }
-        let plan = match unix::archive_groups(
-            unix::ArchiveBorrow::Owned(&mut admitted),
+        let plan = match native::archive_groups(
+            native::ArchiveBorrow::Owned(&mut admitted),
             &mut resources,
             &catalog,
         ) {
@@ -651,18 +652,21 @@ pub fn create_owned_offload_offers(
                 );
             }
         };
-        let (proofs, writes) =
-            match unix::discover_proofs(unix::ReadBorrow::Owned(&mut read), &mut resources, plan) {
-                Ok(discovered) => discovered,
-                Err(reason) => {
-                    return fail(
-                        ActiveOwner::Read(Box::new(read)),
-                        carrier,
-                        resources,
-                        reason,
-                    );
-                }
-            };
+        let (proofs, writes) = match native::discover_proofs(
+            native::ReadBorrow::Owned(&mut read),
+            &mut resources,
+            plan,
+        ) {
+            Ok(discovered) => discovered,
+            Err(reason) => {
+                return fail(
+                    ActiveOwner::Read(Box::new(read)),
+                    carrier,
+                    resources,
+                    reason,
+                );
+            }
+        };
         let observed = resources.observed.take().expect("captured inputs");
         let verified = match solstone_core_retention::archive_offer::verify_owned_offload_offers(
             read, observed, proofs, today, now,
@@ -677,7 +681,7 @@ pub fn create_owned_offload_offers(
                 );
             }
         };
-        if let Err(reason) = unix::register_metadata(verified.journal_root(), verified.marks()) {
+        if let Err(reason) = native::register_metadata(verified.journal_root(), verified.marks()) {
             return fail(
                 ActiveOwner::Verified(Box::new(verified)),
                 carrier,
@@ -686,7 +690,7 @@ pub fn create_owned_offload_offers(
             );
         }
         if let Err(reason) =
-            unix::write_witnesses(verified.journal_root(), &mut resources, writes, now)
+            native::write_witnesses(verified.journal_root(), &mut resources, writes, now)
         {
             return fail(
                 ActiveOwner::Verified(Box::new(verified)),
@@ -698,7 +702,7 @@ pub fn create_owned_offload_offers(
         let outcome = solstone_core_retention::archive_offer::publish_owned_offload_offers(
             verified, today, now,
         );
-        unix::record_publication(&mut resources, outcome.publication());
+        native::record_publication(&mut resources, outcome.publication());
         OwnedOffloadCreation {
             carrier,
             owner: ActiveOwner::Published(Box::new(outcome)),

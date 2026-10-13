@@ -58,9 +58,9 @@ pub fn prepare_owned_offload_plan(
 ) -> Result<OwnedOffloadPlanInputs, OwnedOffloadPlanInputFailure> {
     let carrier = Arc::clone(original.carrier());
     let mut planning = OffloadPlanning::new();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let result = bound::preflight(original.as_prepared(), &mut planning, at);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let result = Err(OffloadCreationRefusal::Inputs(
         OffloadOfferRefusal::Unsupported,
     ));
@@ -423,7 +423,7 @@ pub fn create_owned_planned_offload_offers(
         )));
         return plan;
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _parameters = (admitted, at);
         plan.reason = Some(Box::new(OffloadCreationRefusal::Inputs(
@@ -431,7 +431,7 @@ pub fn create_owned_planned_offload_offers(
         )));
         plan
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let inspected = bound::inspect_plan(
             crate::run::current::CurrentArchive::Owned(admitted),

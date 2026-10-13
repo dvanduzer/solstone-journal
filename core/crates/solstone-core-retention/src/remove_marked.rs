@@ -1034,7 +1034,9 @@ fn open_windows_directory_path(
             Some(directory) => {
                 open_windows_flat_directory_bound(directory, component.as_os_str(), &diagnostic)
             }
-            None => open_windows_flat_directory_bound(root.as_ref(), component.as_os_str(), &diagnostic),
+            None => {
+                open_windows_flat_directory_bound(root.as_ref(), component.as_os_str(), &diagnostic)
+            }
         }
         .map_err(|e| ReviewedRemovalRefusal::Io(std::io::Error::other(e)))?
         .ok_or(ReviewedRemovalRefusal::Changed)?;
@@ -2346,7 +2348,9 @@ fn reviewed_bookkeeping(
     now: DateTime<Utc>,
     attempt: &mut ReviewedFileRemoval,
 ) {
-    use solstone_core_journal_io::media::{Confirmation, Durability, OriginalName, RemovalEffect};
+    use solstone_core_journal_io::media::{
+        Confirmation, Durability, OriginalName, RemovalEffect, RemovalPhase,
+    };
     use solstone_core_journal_io::{
         DetailedAtomicOutcome, HealthMarker, acquire_existing_parent_lock_bound,
         atomic_replace_detailed_bound, read_windows_observed_file_bounded,
@@ -2358,8 +2362,14 @@ fn reviewed_bookkeeping(
         root.revalidate_canonical_binding()
             .map_err(std::io::Error::other)?;
         group.directory.revalidate()?;
-        group.events.revalidate_bound().map_err(std::io::Error::other)?;
-        group.health.revalidate_bound().map_err(std::io::Error::other)?;
+        group
+            .events
+            .revalidate_bound()
+            .map_err(std::io::Error::other)?;
+        group
+            .health
+            .revalidate_bound()
+            .map_err(std::io::Error::other)?;
         let events = open_windows_directory_path(root, Path::new(&group.relative()))
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         let health = open_windows_directory_path(
@@ -2480,6 +2490,10 @@ fn reviewed_bookkeeping(
             || native.source_durability == Durability::Unproven)
         && (native.claim_durability == Durability::Synced
             || native.claim_durability == Durability::Unproven)
+        && native
+            .failures
+            .iter()
+            .all(|failure| failure.phase == RemovalPhase::Cleanup)
         && append_result.is_ok()
         && marker_published
         && attempt.binding.is_none();

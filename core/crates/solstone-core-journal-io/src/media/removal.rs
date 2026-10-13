@@ -381,10 +381,10 @@ impl MediaRemoval {
         leaf.file.write_all(&bytes)?;
         leaf.file.sync_all()?;
         platform::check_leaf(&directory.inner, name, identity)?;
-        if let Err(error) = directory.inner.sync() {
-            if !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported) {
-                return Err(error);
-            }
+        if let Err(error) = directory.inner.sync()
+            && !(cfg!(windows) && error.kind() == io::ErrorKind::Unsupported)
+        {
+            return Err(error);
         }
         directory.revalidate()
     }
@@ -606,9 +606,10 @@ pub fn resolve_interrupted_removal(
                 Err(err) => Err(err),
             }
         };
-        let Some(stage) = parent.open_child(name)? else {
+        let Some(inner) = platform::open_removal_directory(&parent.inner, name)? else {
             return Ok(None);
         };
+        let stage = Arc::new(MediaDirectory { inner });
         if stage.identity() != directory {
             return Err(changed());
         }
@@ -656,7 +657,7 @@ pub fn resolve_interrupted_removal(
                 }
                 revalidate()?;
                 let file =
-                    platform::open_plain(&stage.inner, original_leaf)?.ok_or_else(changed)?;
+                    platform::open_removal(&stage.inner, original_leaf)?.ok_or_else(changed)?;
                 if platform::identity(&file)? != observed.identity {
                     return Err(changed());
                 }
@@ -664,6 +665,8 @@ pub fn resolve_interrupted_removal(
                     revalidate()?;
                     platform::check_leaf(&stage.inner, original_leaf, observed.identity)?;
                     platform::remove_leaf(&stage.inner, original_leaf, &file)?;
+                    drop(file);
+                    platform::ensure_absent(&stage.inner, original_leaf)?;
                     InterruptedRemovalResolution::Finished
                 } else {
                     let source = parent
@@ -693,14 +696,18 @@ pub fn resolve_interrupted_removal(
         };
         sync_dir(&stage)?;
         revalidate()?;
-        let file = platform::open_plain(&stage.inner, record_leaf)?.ok_or_else(changed)?;
+        let file = platform::open_removal(&stage.inner, record_leaf)?.ok_or_else(changed)?;
         if platform::identity(&file)? != record_entry.identity {
             return Err(changed());
         }
         platform::check_leaf(&stage.inner, record_leaf, record_entry.identity)?;
         platform::remove_leaf(&stage.inner, record_leaf, &file)?;
+        drop(file);
+        platform::ensure_absent(&stage.inner, record_leaf)?;
         revalidate()?;
         platform::remove_directory(&parent.inner, name, &stage.inner)?;
+        drop(stage);
+        platform::ensure_absent(&parent.inner, name)?;
         sync_dir(parent)?;
         Ok(Some(resolution))
     }

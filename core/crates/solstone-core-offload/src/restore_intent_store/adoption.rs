@@ -7,29 +7,29 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_journal_io::LockOptions;
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::activity_obligations::{
     IntentRead, NativeObligation, RecoveryObservationError, intent_filename,
 };
 use solstone_core_journal_io::media::MediaObservation;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_journal_io::paths::{PathOrDay, iter_segments};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_journal_io::{activity_obligations::observe_obligations, media::MediaRead};
 use solstone_core_retention::Register;
 use solstone_core_retention::archive_catalog::{JournalCatalog, SegmentCatalog};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_retention::{archive_catalog::read_complete_catalog, review_context};
 
 use super::{ObservedIntent, RestoreIntentStore, StoreProblem, StoreWrite};
 use crate::restore_prepared::{PreparedRefusal, PreparedRestore};
 use solstone_core_retention::restore_intent::{RecoveryDecision, RepairHold, RestoreIntent};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_retention::restore_intent::{
     content_observation, inspect_recovery, selected_name,
 };
@@ -202,7 +202,7 @@ impl ReviewOwner {
             .ok_or(ReviewProblem::Changed)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn revalidate(&self) -> Result<(), ReviewProblem> {
         self.activity
             .revalidate()
@@ -215,7 +215,7 @@ impl ReviewOwner {
             .map_err(ReviewProblem::Prepared)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn capture(&self, intent: &RestoreIntent) -> (Evidence, Result<(), ReviewProblem>) {
         let mut evidence = Evidence::default();
         let result = (|| {
@@ -332,7 +332,7 @@ impl RestartIntentReview {
                     return Err(ReviewProblem::Store(failure.problem));
                 }
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
                 let observed = owner
                     .store()?
@@ -392,7 +392,7 @@ impl RestartIntentReview {
                 getrandom::fill(&mut nonce).map_err(|_| ReviewProblem::Entropy)?;
                 Ok(nonce)
             }
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             {
                 let _ = operation;
                 Err(ReviewProblem::Store(StoreProblem::Unsupported))
@@ -408,16 +408,16 @@ impl RestartIntentReview {
         &self.nonce
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn confirm(self, nonce: &[u8; 32]) -> RestartConfirmation {
-        self.confirm_with(nonce, &mut super::unix::NativeHooks)
+        self.confirm_with(nonce, &mut super::native::NativeHooks)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn confirm_with(
         mut self,
         nonce: &[u8; 32],
-        hooks: &mut impl super::unix::Hooks,
+        hooks: &mut impl super::native::Hooks,
     ) -> RestartConfirmation {
         let result = (|| {
             if nonce != &self.nonce {
@@ -472,7 +472,7 @@ impl RestartIntentReview {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn compare(&self, published: bool) -> Result<(), ReviewProblem> {
         let before = &self.owner.original;
         let after = &self.owner.latest;

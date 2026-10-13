@@ -617,6 +617,19 @@ pub struct HelperTransport<'a> {
 }
 
 impl OwnedMediaTarget {
+    #[cfg(windows)]
+    pub fn retain_for_helper(&self) -> io::Result<MediaHelperHold> {
+        Ok(MediaHelperHold {
+            _directory: Arc::clone(self.stage.directory.as_ref().ok_or_else(changed)?),
+            _file: self
+                .stage
+                .leaf
+                .as_ref()
+                .ok_or_else(changed)?
+                .file
+                .try_clone()?,
+        })
+    }
     /// Actual retained destination root; observations do not mint this handle.
     pub fn journal_root(&self) -> &Arc<JournalRoot> {
         self.stage.parent.inner.journal_root()
@@ -793,7 +806,17 @@ pub struct ArchiveSource<'a> {
     path: PathBuf,
 }
 
+#[cfg(windows)]
+pub struct MediaHelperHold {
+    _directory: Arc<MediaDirectory>,
+    _file: File,
+}
+
 impl ArchiveSource<'_> {
+    #[cfg(windows)]
+    pub fn retain_for_helper(&self) -> io::Result<MediaHelperHold> {
+        self.prepared.target.retain_for_helper()
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -29,11 +29,11 @@ impl TransactionOutcome<'_, '_> {
         if self.hold.is_some() || self.retirement.is_some() {
             return self;
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            self = self.retire_with(options, &mut super::super::unix::NativeHooks);
+            self = self.retire_with(options, &mut super::super::native::NativeHooks);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = options;
             self.hold = Some(Hold::Store(StoreProblem::Unsupported));
@@ -41,11 +41,11 @@ impl TransactionOutcome<'_, '_> {
         self
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn retire_with(
         mut self,
         options: LockOptions,
-        hooks: &mut impl super::super::unix::Hooks,
+        hooks: &mut impl super::super::native::Hooks,
     ) -> Self {
         let result = self.retire_bound(options, hooks);
         if let Err(hold) = result {
@@ -54,11 +54,11 @@ impl TransactionOutcome<'_, '_> {
         self
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn retire_bound(
         &mut self,
         options: LockOptions,
-        _hooks: &mut impl super::super::unix::Hooks,
+        _hooks: &mut impl super::super::native::Hooks,
     ) -> Result<(), Hold> {
         use sha2::{Digest, Sha256};
         use solstone_core_journal_io::activity_obligations::{

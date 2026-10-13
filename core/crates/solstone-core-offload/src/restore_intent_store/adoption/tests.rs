@@ -503,9 +503,9 @@ struct LateHook {
     cut: usize,
     fired: bool,
 }
-impl super::super::unix::Hooks for LateHook {
-    fn checkpoint(&mut self, point: super::super::unix::Point) {
-        if point != super::super::unix::Point::AfterWrite {
+impl super::super::native::Hooks for LateHook {
+    fn checkpoint(&mut self, point: super::super::native::Point) {
+        if point != super::super::native::Point::AfterWrite {
             return;
         }
         if self.cut == 1 {
@@ -560,7 +560,7 @@ fn late_sync_named_replacement_and_new_stage_keep_actual_publication_without_con
         let write = result.review.owner.write.as_ref().unwrap();
         assert!(write.receipt.native.is_some());
         let published = match write.receipt.native.as_ref().unwrap() {
-            super::super::unix::NativePublication::Update(Ok(
+            super::super::native::NativePublication::Update(Ok(
                 solstone_core_journal_io::atomic::BoundAtomicOutcome::Published { observation }
                 | solstone_core_journal_io::atomic::BoundAtomicOutcome::PublishedDurabilityUncertain { observation, .. }
                 | solstone_core_journal_io::atomic::BoundAtomicOutcome::PublishedObservationUncertain { observation, .. }

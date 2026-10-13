@@ -12,13 +12,13 @@ use std::time::Duration;
 use serde_json::Value;
 use solstone_core_backup::archive_admission::ArchiveCancellation;
 #[cfg(windows)]
-use std::sync::Arc;
-#[cfg(windows)]
-use solstone_core_backup::ReadbackError;
-#[cfg(windows)]
-use solstone_core_backup::archive_readback::{WindowsArchiveExecutor, WindowsExecutionOutput};
+use solstone_core_backup::archive_readback::{
+    WindowsArchiveCleanup, WindowsArchiveExecutor, WindowsArchiveRequest, WindowsExecutionOutput,
+};
 #[cfg(windows)]
 use solstone_core_distribution::windows_payload::{WINDOWS_RCLONE_WORKER, WINDOWS_RESTIC_WORKER};
+#[cfg(windows)]
+use std::sync::Arc;
 use thiserror::Error;
 
 /// An inherited OS handle explicitly passed to a backup child process.
@@ -164,7 +164,6 @@ fn run_unix_tool(
     })
 }
 
-
 #[cfg(windows)]
 fn launch_windows_helper(
     program: &Path,
@@ -180,14 +179,11 @@ fn launch_windows_helper(
     let (bin_dir, package_root) = crate::windows_tool::resolve_package_bin_and_root()?;
     let payload =
         solstone_core_distribution::windows_payload::verify_windows_payload(&package_root)
-            .map_err(|error| {
-                io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
-            })?;
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
 
-    let refused_tool =
-        |error: solstone_core_distribution::windows_payload::WindowsPayloadError| {
-            io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
-        };
+    let refused_tool = |error: solstone_core_distribution::windows_payload::WindowsPayloadError| {
+        io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+    };
     let admitted_restic = payload
         .declared_path(WINDOWS_RESTIC_WORKER)
         .map_err(refused_tool)?;
@@ -411,86 +407,39 @@ impl ToolRunner for SystemToolRunner {
 }
 
 #[cfg(windows)]
-fn map_windows_helper_result(
-    result: io::Result<ToolOutput>,
-) -> Result<WindowsExecutionOutput, ReadbackError> {
+struct WindowsArchiveCleanupOwner(solstone_core_system::process::BoundedHelperCleanup);
+
+#[cfg(windows)]
+impl WindowsArchiveCleanup for WindowsArchiveCleanupOwner {
+    fn quiescent(&self) -> bool {
+        self.0.observe() == solstone_core_system::process::HelperCleanupStatus::Quiescent
+    }
+}
+
+#[cfg(windows)]
+fn map_windows_helper_result(result: io::Result<ToolOutput>) -> WindowsExecutionOutput {
     match result {
-        Ok(output) => Ok(WindowsExecutionOutput {
+        Ok(output) => WindowsExecutionOutput {
             returncode: output.returncode,
             stdout: output.stdout,
             stderr: output.stderr,
-            quiescent: true,
-        }),
-        Err(err) => {
-            if let Some(failure) = err
+            cleanup: None,
+        },
+        Err(error) => {
+            let cleanup = error
                 .get_ref()
-                .and_then(|e| e.downcast_ref::<solstone_core_system::process::BoundedHelperFailure>())
-            {
-                if failure.cleanup().is_some() {
-                    return Err(ReadbackError::ToolFailed);
-                }
-                match failure.cause() {
-                    solstone_core_system::process::BoundedHelperError::JobNotQuiescent { .. } => {
-                        Err(ReadbackError::ToolFailed)
-                    }
-                    solstone_core_system::process::BoundedHelperError::IoWorkerStartFailed {
-                        quiescent,
-                        ..
-                    }
-                    | solstone_core_system::process::BoundedHelperError::InputWriteFailed {
-                        quiescent,
-                        ..
-                    }
-                    | solstone_core_system::process::BoundedHelperError::OutputLimitExceeded {
-                        quiescent,
-                        ..
-                    }
-                    | solstone_core_system::process::BoundedHelperError::OutputReadFailed {
-                        quiescent,
-                        ..
-                    }
-                    | solstone_core_system::process::BoundedHelperError::DeadlineExceeded {
-                        quiescent,
-                        ..
-                    }
-                    | solstone_core_system::process::BoundedHelperError::Cancelled {
-                        quiescent,
-                        ..
-                    }
-                    | solstone_core_system::process::BoundedHelperError::ProcessObservationFailed {
-                        quiescent,
-                        ..
-                    } => {
-                        if *quiescent {
-                            Ok(WindowsExecutionOutput {
-                                returncode: 1,
-                                stdout: Vec::new(),
-                                stderr: Vec::new(),
-                                quiescent: true,
-                            })
-                        } else {
-                            Err(ReadbackError::ToolFailed)
-                        }
-                    }
-                    _ => Ok(WindowsExecutionOutput {
-                        returncode: 1,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        quiescent: true,
-                    }),
-                }
-            } else {
-                let msg = err.to_string();
-                if msg.contains("did not establish quiescence") {
-                    Err(ReadbackError::ToolFailed)
-                } else {
-                    Ok(WindowsExecutionOutput {
-                        returncode: 1,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        quiescent: true,
-                    })
-                }
+                .and_then(|error| {
+                    error.downcast_ref::<solstone_core_system::process::BoundedHelperFailure>()
+                })
+                .and_then(|failure| failure.cleanup().cloned())
+                .map(|cleanup| {
+                    Arc::new(WindowsArchiveCleanupOwner(cleanup)) as Arc<dyn WindowsArchiveCleanup>
+                });
+            WindowsExecutionOutput {
+                returncode: 1,
+                stdout: Vec::new(),
+                stderr: error.to_string().into_bytes(),
+                cleanup,
             }
         }
     }
@@ -500,60 +449,53 @@ fn map_windows_helper_result(
 impl WindowsArchiveExecutor for SystemToolRunner {
     fn run_cancellable(
         &self,
-        program: &Path,
-        argv: &[OsString],
-        env: &BTreeMap<OsString, OsString>,
-        timeout: Duration,
+        request: WindowsArchiveRequest<'_>,
         capture_limit: usize,
-        cancellation: Option<&ArchiveCancellation>,
-    ) -> Result<WindowsExecutionOutput, ReadbackError> {
-        let stdout_limit = capture_limit.min(64 * 1024 * 1024).max(1);
-        let cancel_fn = cancellation.map(|c| {
-            let cancellation = c.clone();
+    ) -> WindowsExecutionOutput {
+        let mut resources = solstone_core_system::process::BoundedHelperResources::new();
+        resources.retain(Arc::new(request.retained));
+        let cancellation = request.cancellation.map(|cancellation| {
+            let cancellation = cancellation.clone();
             Arc::new(move || cancellation.is_cancelled()) as Arc<dyn Fn() -> bool + Send + Sync>
         });
         map_windows_helper_result(launch_windows_helper(
-            program,
-            argv,
-            env,
-            timeout,
+            request.program,
+            request.argv,
+            request.env,
+            request.timeout,
             None,
-            solstone_core_system::process::BoundedHelperResources::new(),
-            stdout_limit,
+            resources,
+            capture_limit.clamp(1, 64 * 1024 * 1024),
             None,
-            cancel_fn,
+            cancellation,
         ))
     }
 
     fn run_dump(
         &self,
-        program: &Path,
-        argv: &[OsString],
-        env: &BTreeMap<OsString, OsString>,
-        timeout: Duration,
+        request: WindowsArchiveRequest<'_>,
         stage: std::fs::File,
         byte_bound: u64,
-        cancellation: Option<&ArchiveCancellation>,
-    ) -> Result<WindowsExecutionOutput, ReadbackError> {
-        let stdout_limit = 64 * 1024 * 1024;
-        let sink = solstone_core_system::process::BoundedStdoutSink {
-            file: stage,
-            limit_bytes: byte_bound,
-        };
-        let cancel_fn = cancellation.map(|c| {
-            let cancellation = c.clone();
+    ) -> WindowsExecutionOutput {
+        let mut resources = solstone_core_system::process::BoundedHelperResources::new();
+        resources.retain(Arc::new(request.retained));
+        let cancellation = request.cancellation.map(|cancellation| {
+            let cancellation = cancellation.clone();
             Arc::new(move || cancellation.is_cancelled()) as Arc<dyn Fn() -> bool + Send + Sync>
         });
         map_windows_helper_result(launch_windows_helper(
-            program,
-            argv,
-            env,
-            timeout,
+            request.program,
+            request.argv,
+            request.env,
+            request.timeout,
             None,
-            solstone_core_system::process::BoundedHelperResources::new(),
-            stdout_limit,
-            Some(sink),
-            cancel_fn,
+            resources,
+            64 * 1024 * 1024,
+            Some(solstone_core_system::process::BoundedStdoutSink {
+                file: stage,
+                limit_bytes: byte_bound,
+            }),
+            cancellation,
         ))
     }
 }

@@ -82,6 +82,8 @@ pub use append::append_jsonl;
 pub use append::append_jsonl_no_follow;
 #[cfg(any(unix, windows))]
 pub use append::append_text;
+#[cfg(windows)]
+pub use atomic::atomic_replace_detailed_bound;
 #[cfg(any(unix, windows))]
 pub use atomic::install_file;
 pub use atomic::is_publication_candidate_name;
@@ -91,8 +93,6 @@ pub use atomic::write_bytes_exclusive_bound_detailed;
 pub use atomic::{AtomicWriteOptions, JsonWriteOptions, atomic_replace, write_json};
 #[cfg(unix)]
 pub use atomic::{BoundAtomicOutcome, atomic_replace_bound, write_bytes_exclusive_bound};
-#[cfg(windows)]
-pub use atomic::atomic_replace_detailed_bound;
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use atomic::{
     BoundPublicationPrimitive, run_with_bound_publication_barrier,

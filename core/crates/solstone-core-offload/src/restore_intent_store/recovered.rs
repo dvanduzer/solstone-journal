@@ -191,7 +191,7 @@ impl Owner {
         >,
     > {
         match self.write.as_ref()?.receipt.native.as_ref()? {
-            super::unix::NativePublication::Update(result) => Some(result.as_ref()),
+            super::native::NativePublication::Update(result) => Some(result.as_ref()),
             _ => None,
         }
     }
@@ -408,7 +408,7 @@ impl Owner {
         #[cfg(all(test, feature = "full-tests"))]
         let mut hooks = tests::Hooks;
         #[cfg(not(all(test, feature = "full-tests")))]
-        let mut hooks = super::unix::NativeHooks;
+        let mut hooks = super::native::NativeHooks;
         self.execute_with(prior, options, &mut hooks)
     }
 
@@ -417,7 +417,7 @@ impl Owner {
         &mut self,
         prior: &RecoveredRestoreOutcome,
         options: LockOptions,
-        hooks: &mut impl super::unix::Hooks,
+        hooks: &mut impl super::native::Hooks,
     ) -> Result<(), Refusal> {
         let population = prior.reservation().revalidate_current_population();
         let complete = population.is_ok();
@@ -539,7 +539,7 @@ impl Owner {
         commit: &SegmentCommit<'_>,
         intent: &RestoreIntent,
         confirmed: &MediaRead,
-        _hooks: &mut impl super::unix::Hooks,
+        _hooks: &mut impl super::native::Hooks,
     ) -> Result<(), Refusal> {
         use sha2::{Digest, Sha256};
         self.retirement = Some(RetirementFacts {

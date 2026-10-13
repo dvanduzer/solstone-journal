@@ -17,8 +17,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtQueryDirectoryFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
-    RtlNtStatusToDosError, STATUS_SUCCESS,
+    ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, GENERIC_READ,
+    GENERIC_WRITE, RtlNtStatusToDosError, STATUS_SUCCESS,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -37,7 +37,7 @@ use crate::errors::FlatDirectoryError;
 use crate::journal_root::JournalEntryKind;
 use crate::name_admission::{NameAdmissionReason, check_portable_component};
 use crate::observation::{FileObservation, FlatDirectoryEntry, NativeMtime, same_entry_metadata};
-use crate::windows_identity::{WindowsFileIdentity, file_identity};
+use crate::windows_identity::{WindowsFileIdentity, file_identity, file_link_count};
 use crate::windows_ntcreate::{
     nt_create_relative, nt_create_relative_exact, nt_create_relative_share_read,
 };
@@ -221,6 +221,38 @@ pub fn open_windows_regular_file_from_bound_parent(
     };
     validate_windows_regular_handle(handle.as_raw_handle(), &path)?;
     Ok(Some(File::from(handle)))
+}
+
+/// Create or open one direct regular file for a held append and file flush.
+/// Competing writes and replacement are excluded while the handle is retained.
+pub fn create_or_open_windows_append_file_bound(
+    parent: &impl AsHandle,
+    name: &OsStr,
+    parent_diagnostic: &Path,
+) -> Result<File, FlatDirectoryError> {
+    let name = validate_portable_name(name)?;
+    let path = parent_diagnostic.join(&name);
+    let failure = |source| FlatDirectoryError::Io {
+        operation: "open direct writable file",
+        path: path.clone(),
+        source,
+    };
+    let handle = nt_create_relative_share_read(
+        parent.as_handle().as_raw_handle(),
+        &name,
+        GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+        FILE_OPEN_IF,
+        FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
+    )
+    .map_err(failure)?;
+    validate_windows_regular_handle(handle.as_raw_handle(), &path)?;
+    if file_link_count(handle.as_raw_handle()).map_err(failure)? != 1 {
+        return Err(failure(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "writable file has multiple links",
+        )));
+    }
+    Ok(File::from(handle))
 }
 
 /// List direct entries, returning `None` instead of a partial list above `maximum`.

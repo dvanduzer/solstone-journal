@@ -73,6 +73,14 @@ pub struct BoundedHelperBudget {
     pub stderr_limit_bytes: usize,
 }
 
+/// Streaming sink configuration for bounded helper stdout.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug)]
+pub struct BoundedStdoutSink {
+    pub file: std::fs::File,
+    pub limit_bytes: u64,
+}
+
 /// One package-rooted helper invocation.
 ///
 /// `environment` is the complete child environment: the launch never copies
@@ -80,13 +88,6 @@ pub struct BoundedHelperBudget {
 /// `PATH` is refused so it cannot choose executable or DLL code. The launcher
 /// writes one empty `PATH` entry itself: Windows otherwise supplies a process
 /// `PATH` when that key is omitted from a custom block.
-/// Streaming sink configuration for bounded helper stdout.
-#[derive(Debug)]
-pub struct BoundedStdoutSink {
-    pub file: std::fs::File,
-    pub limit_bytes: u64,
-}
-
 #[cfg_attr(not(windows), allow(dead_code))]
 pub struct BoundedHelperRequest {
     pub package_root: PathBuf,
@@ -313,10 +314,15 @@ pub fn copy_bounded_stream<R: std::io::Read, W: std::io::Write>(
             }
             Ok(count) => {
                 let count_u64 = count as u64;
-                if total.checked_add(count_u64).map_or(true, |new_total| new_total > limit) {
+                if total
+                    .checked_add(count_u64)
+                    .is_none_or(|new_total| new_total > limit)
+                {
                     return Err(CaptureError::TooLarge);
                 }
-                writer.write_all(&buffer[..count]).map_err(|_| CaptureError::Io)?;
+                writer
+                    .write_all(&buffer[..count])
+                    .map_err(|_| CaptureError::Io)?;
                 total += count_u64;
             }
             Err(_) => return Err(CaptureError::Io),

@@ -108,7 +108,7 @@ fn legacy_sequential_native_publication_records_adoption_and_preserves_whole_mar
                 assert_eq!(outcome.effects, AttemptEffects::default());
                 // Create-only: a differing local file is kept byte for byte.
                 assert_eq!(fs::read(f.raw()).unwrap(), b"old");
-                assert!(outcome.marker.is_none());
+                assert!(!marker_published(&outcome));
                 assert!(outcome.no_effect_cleanup.as_ref().unwrap().confirmed());
                 assert!(!f.marker().exists());
             } else {
@@ -172,7 +172,7 @@ fn legacy_late_whole_mark_change_invalidates_actual_publication_but_holds_event_
         Some(Hold::Repair(RepairHold::MarkChanged))
     ));
     assert_eq!(result.effects, AttemptEffects { files: 1, bytes: 3 });
-    assert!(result.marker.as_ref().is_some_and(Result::is_ok));
+    assert!(marker_published(&result));
     assert_eq!(
         result.record.as_ref().unwrap().intent.marker,
         Obligation::Complete

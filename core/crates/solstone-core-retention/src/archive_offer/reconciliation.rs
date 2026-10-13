@@ -130,11 +130,11 @@ pub fn reconcile_offload_empty(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> Result<OffloadReconciliation, OffloadReconciliationFailure> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         unix::reconcile(operation, today, now, &mut unix::Hooks::default())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _parameters = (today, now);
         Err(OffloadReconciliationFailure {
@@ -148,7 +148,7 @@ pub fn reconcile_offload_empty(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod unix {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};

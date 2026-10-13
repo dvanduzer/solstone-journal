@@ -16,14 +16,14 @@ thread_local! { static CHECKPOINT: RefCell<Option<(Checkpoint, Hook)>> = RefCell
 thread_local! { static FAIL_SYNC: Cell<bool> = const { Cell::new(false) }; }
 
 pub(crate) struct Hooks;
-impl super::super::unix::Hooks for Hooks {
+impl super::super::native::Hooks for Hooks {
     fn sync(&mut self, directory: &impl AsFd, index: usize) -> io::Result<()> {
         if FAIL_SYNC.with(|fault| fault.replace(false)) {
             return Err(io::Error::other(
                 "injected recovered intent ancestor sync failure",
             ));
         }
-        super::super::unix::Hooks::sync(&mut super::super::unix::NativeHooks, directory, index)
+        super::super::native::Hooks::sync(&mut super::super::native::NativeHooks, directory, index)
     }
 }
 
