@@ -480,6 +480,14 @@ fn detection_runs_for_unselected_media_and_preserves_unfiltered_objects() {
     assert!(requests[0]["input_bytes"].as_u64().expect("input bytes") > 0);
     assert_eq!(requests[0]["threshold"], "0.25");
     assert_eq!(requests[0]["threads"], "4");
+    for request in &requests {
+        assert!(
+            !Path::new(request["input"].as_str().expect("input path"))
+                .parent()
+                .expect("temp directory")
+                .exists()
+        );
+    }
     fs::remove_dir_all(root).expect("remove root");
 }
 
@@ -499,7 +507,12 @@ fn detection_secondary_gate_uses_secondary_label() {
 
 #[test]
 fn detection_failures_latch_after_one_attempt() {
-    for mode in ["invalid_json", "exit_failure"] {
+    for mode in [
+        "invalid_json",
+        "missing_output",
+        "exit_failure",
+        "exit_failure_with_output",
+    ] {
         let root = temporary_root(mode);
         let video = copied_video(&root, "mixed_vp8_screen.webm");
         let detector_log = root.join("detector.jsonl");
@@ -510,7 +523,15 @@ fn detection_failures_latch_after_one_attempt() {
             .env("SOLSTONE_DESCRIBE_DETECT_STUB_REQUESTS_PATH", &detector_log);
         let output = command.output().expect("describe");
         assert!(output.status.success(), "{mode}");
-        assert_eq!(detector_requests(&detector_log).len(), 1, "{mode}");
+        let requests = detector_requests(&detector_log);
+        assert_eq!(requests.len(), 1, "{mode}");
+        assert!(
+            !Path::new(requests[0]["input"].as_str().expect("input path"))
+                .parent()
+                .expect("temp directory")
+                .exists(),
+            "{mode}"
+        );
         let rows = read_jsonl(&video.with_extension("jsonl"));
         assert_eq!(rows[0]["_solstone_processing"]["state"], "analyzed");
         assert!(rows[1..].iter().all(|row| row.get("detections").is_none()));
