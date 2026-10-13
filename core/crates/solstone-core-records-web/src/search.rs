@@ -14,14 +14,14 @@ use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use solstone_core_convey_http::envelope::error_envelope;
-use solstone_core_format::agent_memory::{
-    ChainPredecessor, Coordinate, Origin, ReadyDocument, SourceKey,
-};
+use solstone_core_format::agent_memory::{Coordinate, SourceKey};
 use solstone_core_indexer_query::{
     IndexAccessError, IndexedEntry, OwnerBoundary, OwnerIndex, QueryBoundary, SearchRequest,
     open_owner_index, read_indexed_entry,
 };
-use solstone_core_indexer_query::{MemoryOriginalRow, open_own_memory_index, read_own_memory_row};
+use solstone_core_indexer_query::{
+    memory_row_matches_original, open_own_memory_index, read_own_memory_row,
+};
 use solstone_core_journal_io::bounded_read::{JournalReadError, MAX_BYTES, read_text};
 use solstone_core_memory_original::{OriginalRead, read_original};
 
@@ -266,47 +266,11 @@ fn owner_memory_descriptor(
         _ => return None,
     };
     let row = read_own_memory_row(connection, source_key.as_str(), path).ok()??;
-    if !owner_row_matches(&row, &source_key, &coordinate, &bytes, &origin, &ready) {
+    if !memory_row_matches_original(&row, &source_key, &coordinate, &bytes, &origin, &ready) {
         return None;
     }
     let origin_value = serde_json::to_value(&origin).ok()?;
     Some((origin.creation_label, origin_value))
-}
-
-fn owner_row_matches(
-    row: &MemoryOriginalRow,
-    source_key: &SourceKey,
-    coordinate: &Coordinate,
-    bytes: &[u8],
-    origin: &Origin,
-    ready: &ReadyDocument,
-) -> bool {
-    let Ok(cached_origin) = serde_json::from_str::<Origin>(&row.origin_json) else {
-        return false;
-    };
-    let Ok(cached_chain) = serde_json::from_str::<ChainPredecessor>(&row.chain_json) else {
-        return false;
-    };
-    let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(&row.created_at) else {
-        return false;
-    };
-    row.path
-        == format!(
-            "{}/{}/{}/note.txt",
-            coordinate.day, coordinate.stream, coordinate.segment
-        )
-        && row.day == coordinate.day
-        && row.stream == coordinate.stream
-        && row.segment == coordinate.segment
-        && row.source_key == source_key.as_str()
-        && row.bytes == bytes
-        && row.digest == ready.digest
-        && row.byte_count == bytes.len()
-        && row.byte_count == ready.byte_count
-        && row.creation_label == origin.creation_label
-        && cached_origin == *origin
-        && created_at.with_timezone(&chrono::Utc) == ready.created_at
-        && cached_chain == ready.chain
 }
 
 #[derive(Default, Deserialize)]

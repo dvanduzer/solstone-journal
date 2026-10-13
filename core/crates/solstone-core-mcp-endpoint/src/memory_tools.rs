@@ -13,7 +13,9 @@ use solstone_core_callosum::CallosumOneShotSender;
 use solstone_core_format::agent_memory::{
     Coordinate, MAX_NOTE_BYTES, SourceKey, digest, validate_operation_id,
 };
-use solstone_core_indexer_query::{OwnMemoryOpenError, open_own_memory_index, read_own_memory_row};
+use solstone_core_indexer_query::{
+    OwnMemoryOpenError, memory_row_matches_original, open_own_memory_index, read_own_memory_row,
+};
 use solstone_core_mcp_audit::{
     Admission, AuditCoordinates, MemoryResultFacts, Outcome, ResultShape, result_shape,
 };
@@ -312,7 +314,7 @@ fn indexed_readiness(journal: &Path, receipt: &AppendReceipt) -> &'static str {
         &note_path(&receipt.coordinate),
     ) {
         Ok(Some(row))
-            if crate::dispatch::memory_row_matches_live(
+            if memory_row_matches_original(
                 &row,
                 source,
                 &receipt.coordinate,

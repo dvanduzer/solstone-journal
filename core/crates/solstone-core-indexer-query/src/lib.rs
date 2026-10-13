@@ -39,8 +39,8 @@ pub use execute::{
 pub use own_memory::{
     MemoryOriginalRow, OwnMemoryDateFilters, OwnMemoryOpenError, OwnMemoryQuery,
     OwnMemoryQueryMode, compile_own_memory_query, inspect_own_memory_index,
-    open_own_memory_connection, open_own_memory_index, own_memory_candidate_statement,
-    own_memory_candidates, read_own_memory_row,
+    memory_row_matches_original, open_own_memory_connection, open_own_memory_index,
+    own_memory_candidate_statement, own_memory_candidates, read_own_memory_row,
 };
 pub use predicate::{EffectiveDateConstraint, PredicateInput, QueryPredicate};
 pub use temporal::{TemporalExtraction, extract_temporal_references};
