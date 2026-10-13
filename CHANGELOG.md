@@ -12,6 +12,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [2.0.44] - 2026-10-13
 
+2.0.44 isn't available on windows. on windows, your journal stays on 2.0.43 and gets these changes, including the windows ones below, in a later version.
+
 ### Changed
 
 - playing a voice sample on the speakers page now reads only the part of the audio your browser asks for, using less memory for long recordings.
