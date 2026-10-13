@@ -57,7 +57,9 @@ fn main() {
         }
         println!("cargo:rustc-link-lib=c++");
     } else if target == "android" {
-        for name in ["c++_static", "log", "dl", "m", "atomic"] {
+        println!("cargo:rustc-link-lib=static=c++_static");
+        println!("cargo:rustc-link-lib=static=c++abi");
+        for name in ["log", "dl", "m", "atomic"] {
             println!("cargo:rustc-link-lib={name}");
         }
     } else {
