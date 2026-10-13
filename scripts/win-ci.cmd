@@ -102,6 +102,8 @@ del /q "%JOURNAL_WIN_CI_FFMPEG_ENV%" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\win-ci-ffmpeg-tools.ps1 -Mode assert -RepositoryRoot "%CD%" -ToolsRoot "%JOURNAL_WIN_CI_FFMPEG_TOOLS_ROOT%" || ( echo ERROR: staged FFmpeg build toolchain did not verify in this run's environment & exit /b 1 )
 
 call :phase portable
+echo === cargo test --locked (retention architecture contract) ===
+cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-retention --test architecture || exit /b 1
 echo === cargo build --locked (portable journal substrate and CI runner) ===
 cargo build --manifest-path core\Cargo.toml --locked -p solstone-core-journal -p solstone-core-journal-config -p solstone-core-journal-io -p solstone-core-system -p solstone-core-win-owner-rail || exit /b 1
 cargo build --manifest-path core\Cargo.toml --locked -p solstone-core-repository-contracts --bin solstone-ci || exit /b 1

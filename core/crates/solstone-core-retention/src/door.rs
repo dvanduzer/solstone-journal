@@ -1056,7 +1056,9 @@ fn stage_segment_windows(
     live: &str,
     staged: &str,
 ) -> Result<(), String> {
-    let started = std::time::Instant::now();
+    // Bound the I/O retries without reading the clock inside retention. The
+    // wait budget is ten seconds; claim checks and filesystem calls add time.
+    let mut retries = 400_u16;
     loop {
         guard.before_phase(target)?;
         // Recheck on each attempt: a retry must never overwrite another claim.
@@ -1072,8 +1074,9 @@ fn stage_segment_windows(
                     &error,
                     solstone_core_journal_io::PathError::Io { source, .. }
                         if matches!(source.raw_os_error(), Some(5 | 32))
-                ) && started.elapsed() < std::time::Duration::from_secs(10)
+                ) && retries > 0
                 {
+                    retries = retries.saturating_sub(1);
                     #[cfg(any(test, feature = "test-hooks"))]
                     stage_test_hook::retrying();
                     std::thread::sleep(std::time::Duration::from_millis(25));
@@ -2263,7 +2266,9 @@ mod tests {
             let bed = Bed::new();
             let segment = populated(&bed, "070000_17");
             let reader = fs::File::open(segment.join(name)).unwrap();
-            stage_test_hook::on_retry(move || drop(reader));
+            stage_test_hook::on_retry(move || {
+                let _reader = reader;
+            });
             let outcome = remove(&bed, &[target("20260805", "field.audio", "070000_17")]);
             assert!(!outcome.has_failures(), "{outcome:?}");
             assert!(!segment.join(name).exists());
@@ -2280,9 +2285,9 @@ mod tests {
         let staged = segment.with_file_name(".removing_070000_17");
         let hook_staged = staged.clone();
         stage_test_hook::on_retry(move || {
+            let _reader = reader;
             fs::create_dir(&hook_staged).unwrap();
             fs::write(hook_staged.join("keep"), b"another claim").unwrap();
-            drop(reader);
         });
         let outcome = remove(&bed, &[target("20260805", "field.audio", "070000_17")]);
         assert!(outcome.has_failures(), "{outcome:?}");
@@ -2296,15 +2301,16 @@ mod tests {
     fn segment_delete_refuses_a_reader_that_outlives_the_retry_budget() {
         let bed = Bed::new();
         let segment = populated(&bed, "070000_17");
-        let reader = fs::File::open(segment.join("audio.flac")).unwrap();
-        let started = std::time::Instant::now();
-        let outcome = remove(&bed, &[target("20260805", "field.audio", "070000_17")]);
-        assert!(outcome.has_failures(), "{outcome:?}");
-        assert!(started.elapsed() < Duration::from_secs(15));
-        assert!(segment.join("audio.flac").is_file());
-        assert!(!segment.join(TOMBSTONE_NAME).exists());
-        assert!(!segment.with_file_name(".removing_070000_17").exists());
-        drop(reader);
+        {
+            let _reader = fs::File::open(segment.join("audio.flac")).unwrap();
+            let started = std::time::Instant::now();
+            let outcome = remove(&bed, &[target("20260805", "field.audio", "070000_17")]);
+            assert!(outcome.has_failures(), "{outcome:?}");
+            assert!(started.elapsed() < Duration::from_secs(20));
+            assert!(segment.join("audio.flac").is_file());
+            assert!(!segment.join(TOMBSTONE_NAME).exists());
+            assert!(!segment.with_file_name(".removing_070000_17").exists());
+        }
         assert!(!remove(&bed, &[target("20260805", "field.audio", "070000_17")]).has_failures());
     }
 
