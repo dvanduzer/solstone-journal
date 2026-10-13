@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- health now shows recorded backup attempts, successful copies and spot-checks. the backup page also shows a status summary and links to those details.
+
 - in entities, "block" is now "hide", "unblock" is "unhide", and "blocked" is "hidden". the actions work as before.
 
 - confidential processing now finishes older recordings and day updates automatically. with your own key, you still choose whether to allow this work and any provider charges.

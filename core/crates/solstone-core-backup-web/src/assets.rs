@@ -10,6 +10,7 @@ use axum::{
 const WORKSPACE: &[u8] = include_bytes!("../assets/workspace.html");
 const SHELL: &[u8] = include_bytes!("../../solstone-core-convey-shell/assets/static/shell.html");
 const JS: &[u8] = include_bytes!("../assets/backup.js");
+const STATUS_JS: &[u8] = include_bytes!("../assets/backup-status.js");
 const CSS: &[u8] = include_bytes!("../assets/backup.css");
 const NOT_FOUND: &str = "<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>\n";
 
@@ -36,6 +37,7 @@ pub async fn background() -> Response {
 pub async fn static_asset(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
     match name.as_str() {
         "backup.js" => bytes(StatusCode::OK, JS, "text/javascript; charset=utf-8"),
+        "backup-status.js" => bytes(StatusCode::OK, STATUS_JS, "text/javascript; charset=utf-8"),
         "backup.css" => bytes(StatusCode::OK, CSS, "text/css; charset=utf-8"),
         _ => background().await,
     }
@@ -47,8 +49,27 @@ mod tests {
 
     use super::{JS, WORKSPACE};
 
+    #[tokio::test]
+    async fn shared_status_presentation_is_served_as_javascript() {
+        let response =
+            super::static_asset(axum::extract::Path("backup-status.js".to_owned())).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), super::STATUS_JS);
+    }
+
     fn embedded_js_object(prefix: &str) -> Value {
-        let source = std::str::from_utf8(JS).expect("embedded backup.js is UTF-8");
+        embedded_object(JS, prefix)
+    }
+
+    fn embedded_object(bytes: &[u8], prefix: &str) -> Value {
+        let source = std::str::from_utf8(bytes).expect("embedded asset is UTF-8");
         let payload =
             &source[source.find(prefix).expect("embedded object prefix") + prefix.len()..];
         let end = payload.find(";\n").expect("embedded object terminator");
@@ -89,8 +110,7 @@ mod tests {
 
     #[test]
     fn backup_status_reason_labels_are_closed() {
-        let copy = embedded_js_object("  const BACKUP_COPY = ");
-        let reasons = &copy["status"]["error_reasons"];
+        let reasons = embedded_object(super::STATUS_JS, "  const BACKUP_ERROR_REASONS = ");
         assert_eq!(
             reasons
                 .as_object()

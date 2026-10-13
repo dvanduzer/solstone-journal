@@ -117,6 +117,58 @@ mod tests {
     use crate::{operation::Operation, test_support::hosted_binding};
     use solstone_core_backup::save_hosted_binding;
 
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn persisted_status_reaches_the_shared_health_backup_renderer() {
+        use serde_json::json;
+        use std::process::Command;
+        let root = crate::test_support::root("healthy");
+        let slot = crate::operation::new_slot();
+        let success = json!({"status":"ok","time":1770000000,"snapshot_id":"copy-a","error_reason":"incomplete"});
+        let mut fixtures = Vec::new();
+        for (enabled, attempt, tone) in [
+            (
+                true,
+                json!({"status":"error","time":1770000200,"error_reason":"timeout","last_success":success}),
+                "attention",
+            ),
+            (
+                true,
+                json!({"status":"ok","time":1770000300,"last_success":null}),
+                "neutral",
+            ),
+            (true, json!({"status":null,"time":null}), "unavailable"),
+            (false, json!({"status":null,"time":null}), "neutral"),
+        ] {
+            crate::config::mutate(root.path(), |backup| {
+                backup.insert("enabled".into(), json!(enabled));
+                backup.insert("last_backup".into(), attempt.clone());
+                (true, ())
+            })
+            .expect("persist fixture");
+            let payload = super::status(root.path(), &slot).expect("actual status producer");
+            fixtures.push(json!({"payload":payload,"tone":tone,
+                "success_time": if attempt["last_success"]["status"] == "ok" { Some(1770000000_u64) } else { None }}));
+        }
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let health = crate_dir.parent().unwrap().join("solstone-core-health-web");
+        let output = Command::new("node")
+            .arg(health.join("tests/health_web_dom.js"))
+            .arg(&health)
+            .env(
+                "BACKUP_STATUS_FIXTURES",
+                serde_json::to_string(&fixtures).unwrap(),
+            )
+            .output()
+            .expect("Health DOM consumer starts");
+        assert!(
+            output.status.success(),
+            "Health backup consumer failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(feature = "full-tests")]
     #[test]
     fn offload_keeps_actual_media_and_cached_geometry_when_catalog_is_uncertain() {

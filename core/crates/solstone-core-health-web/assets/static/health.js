@@ -25,7 +25,8 @@
     "HEALTH_GLANCE_DEVICES_UNKNOWN": "delivery from some of your devices isn't known right now.",
     "HEALTH_GLANCE_WORK_HELD": "some queued work is on hold for a safety check.",
     "HEALTH_GLANCE_WORK_UNAVAILABLE": "queued work status is unavailable right now.",
-    "HEALTH_GLANCE_OK": "everything's working. the solstone app last added to your journal {age}.",
+    "HEALTH_GLANCE_OK": "the journal's live services and processing are working. the solstone app last added to your journal {age}.",
+    "HEALTH_GLANCE_BACKUP": "{headline}",
     "HEALTH_GLANCE_BRAIN_ATTENTION": "{headline}",
     "HEALTH_GLANCE_CHECKIN_STALE": "a journal run on {name} stopped checking in with your journal.",
     "HEALTH_GLANCE_CHECKINS_STALE": "{n} journal runs stopped checking in with your journal: {names}.",
@@ -78,6 +79,7 @@
   let connectError = false;
 
   const state = {
+    backupView: { tone: 'unavailable', text: 'checking backup status…' },
     heldWorkSnapshot: null,
     heldWorkCurrent: false,
     supervisorSeen: false,
@@ -212,14 +214,50 @@
     });
   }
 
-  async function getJson(path) {
+  async function getJson(path, options = {}) {
     if (window.apiJson) {
-      return window.apiJson(path);
+      return window.apiJson(path, options);
     }
-    const response = await fetch(path, { headers: { Accept: 'application/json' } });
+    const response = await fetch(path, { headers: { Accept: 'application/json' }, ...options });
     const payload = await response.json();
     if (!response.ok) throw payload;
     return payload;
+  }
+
+  const backupSection = document.getElementById('backup');
+  let backupReadPending = false;
+  async function loadBackupStatus() {
+    const section = backupSection;
+    if (!section?.isConnected || document.hidden || backupReadPending) return;
+    backupReadPending = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    let snapshot = null;
+    try {
+      const payload = await getJson('/app/backup/status', { signal: controller.signal });
+      if (payload?.success === true) snapshot = payload;
+    } catch (error) {
+      logHealthError(error, 'backup status fetch failed');
+    } finally {
+      clearTimeout(timeout);
+      backupReadPending = false;
+    }
+    // A read started on a removed workspace cannot repaint its replacement.
+    if (!section.isConnected) return;
+    state.backupView = window.BackupStatus.renderSummary(section.querySelector('[data-backup-summary]'), snapshot);
+    window.BackupStatus.renderFacts(section.querySelector('[data-backup-facts]'), snapshot);
+    updateStatusSummary();
+  }
+
+  function focusBackupDetails() {
+    if (window.location.hash === '#backup' && backupSection?.isConnected) {
+      backupSection.scrollIntoView({ block: 'start' });
+    }
+  }
+
+  function refreshStatusReads() {
+    loadRegisteredClients();
+    loadBackupStatus();
   }
 
   function clearHealthStateError() {
@@ -989,8 +1027,17 @@
       };
     }
 
+    const backupVerdict = state.backupView.tone !== 'neutral'
+      ? { key: 'HEALTH_GLANCE_BACKUP', vars: { headline: state.backupView.text },
+        action: { href: '#backup', label: 'view backup details' } } : null;
+    if (state.backupView.tone === 'attention') return backupVerdict;
+
     if (deviceVerdict) return deviceVerdict;
     if (workVerdict) return workVerdict;
+    if (backupVerdict) {
+      return { key: 'HEALTH_GLANCE_BACKUP', vars: { headline: state.backupView.text },
+        action: { href: '#backup', label: 'view backup details' } };
+    }
 
 	    if (activeAgents > 0 || activeImports > 0) {
       const catchingUp = activeAgents + activeImports;
@@ -1027,6 +1074,7 @@
   }
 
   const GLANCE_ATTENTION_KEYS = new Set([
+    'HEALTH_GLANCE_BACKUP',
     'HEALTH_GLANCE_SERVICES_UNREACHABLE',
     'HEALTH_GLANCE_SERVICE_ATTENTION',
     'HEALTH_GLANCE_SERVICES_ATTENTION',
@@ -3515,9 +3563,15 @@
 	    if (healthInitialized) return;
 	    healthInitialized = true;
 	    applyHealthCopy();
-    Promise.all([healthInfoReady, registeredClientsReady, loadHealthState()]).then(() => {
+    // Do not hold the first Health paint or its existing readiness signal on
+    // this independent read. Later reads share the existing visible-tab cycle.
+    const backupReady = new Promise(resolve => requestAnimationFrame(() => resolve(loadBackupStatus())));
+    window.addEventListener('hashchange', focusBackupDetails);
+    const initialReady = Promise.all([healthInfoReady, registeredClientsReady, loadHealthState()]);
+    initialReady.then(() => {
       document.dispatchEvent(new CustomEvent('health:initial-ready'));
     });
+    Promise.all([initialReady, backupReady]).then(() => requestAnimationFrame(focusBackupDetails));
 	    focusRecentErrors();
 	    window.addEventListener('hashchange', focusRecentErrors);
 	    document.getElementById('glanceErrors')?.addEventListener('click', (e) => {
@@ -3602,7 +3656,7 @@
   // Sweep stale agents and imports every 60s
   let staleSweepTimer = setInterval(sweepStale, 60000);
 
-  let registeredClientsTimer = setInterval(loadRegisteredClients, 60000);
+  let registeredClientsTimer = setInterval(refreshStatusReads, 60000);
 
   // Connection health indicator — updated every 5s
   let connectionHealthTimer = setInterval(updateConnectionHealth, 5000);
@@ -3628,8 +3682,8 @@
         startElapsedTimer();
       }
       staleSweepTimer = setInterval(sweepStale, 60000);
-      loadRegisteredClients();
-      registeredClientsTimer = setInterval(loadRegisteredClients, 60000);
+      refreshStatusReads();
+      registeredClientsTimer = setInterval(refreshStatusReads, 60000);
       connectionHealthTimer = setInterval(updateConnectionHealth, 5000);
     }
   });
