@@ -219,6 +219,10 @@ set "JOURNAL_WIN_CI_ORDINARY_OWNER_EVIDENCE=passed"
 
 echo === cargo test --locked (journal-io library) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-journal-io --lib || exit /b 1
+echo === cargo test --locked (offload library with filesystem contracts) ===
+cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-offload --lib --features full-tests -- --test-threads=1 || exit /b 1
+echo === native backup page cleanup ownership ===
+call :run_exact_library "solstone-core-backup-web" "cleanup::native_tests::backup_native_cleanup_ownership" "full-tests" "ignored" || exit /b 1
 echo === checking required journal portability tests ===
 call :require_journal_test tests::config_strip_matches_python_control_whitespace || exit /b 1
 call :require_journal_test tests::ensure_journal_dir_reports_non_directory_parent || exit /b 1
@@ -340,7 +344,9 @@ exit /b 0
 set "JOURNAL_WIN_CI_EXACT_LOG=core\target\journal-win-ci-library-%RANDOM%%RANDOM%.log"
 set "JOURNAL_WIN_CI_EXACT_FEATURES="
 if not "%~3"=="" set "JOURNAL_WIN_CI_EXACT_FEATURES=--features %~3"
-cargo test --manifest-path core\Cargo.toml --locked -p "%~1" --lib %JOURNAL_WIN_CI_EXACT_FEATURES% -- --exact "%~2" --show-output > "%JOURNAL_WIN_CI_EXACT_LOG%" 2>&1
+set "JOURNAL_WIN_CI_EXACT_IGNORED="
+if "%~4"=="ignored" set "JOURNAL_WIN_CI_EXACT_IGNORED=--ignored"
+cargo test --manifest-path core\Cargo.toml --locked -p "%~1" --lib %JOURNAL_WIN_CI_EXACT_FEATURES% -- --exact "%~2" %JOURNAL_WIN_CI_EXACT_IGNORED% --show-output > "%JOURNAL_WIN_CI_EXACT_LOG%" 2>&1
 set "JOURNAL_WIN_CI_EXACT_EXIT=%ERRORLEVEL%"
 type "%JOURNAL_WIN_CI_EXACT_LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-win-exact-result.ps1 -LogPath "%JOURNAL_WIN_CI_EXACT_LOG%" -TestName "%~2" -TestExitCode %JOURNAL_WIN_CI_EXACT_EXIT% || exit /b 1

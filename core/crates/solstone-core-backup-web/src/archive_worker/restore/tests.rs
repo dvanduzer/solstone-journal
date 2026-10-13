@@ -141,7 +141,7 @@ pub(super) fn before_handoff(slot: &SharedOperationSlot) {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[derive(Deserialize)]
 struct Input {
     mode: Cut,
@@ -164,7 +164,7 @@ impl Clock for LiveClock {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn seed(input: &Input, root: &Arc<JournalRoot>) -> PathBuf {
     let proof = OffloadProof {
         journal_id: root.identity().observation_id(),

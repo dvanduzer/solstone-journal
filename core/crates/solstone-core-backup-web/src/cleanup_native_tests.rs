@@ -93,7 +93,9 @@ fn run_owned_fixture() {
             panic!("native cleanup fixture failed: {failure}; cleanup={settled:?}");
         }
     };
-    print!("{}", String::from_utf8_lossy(&output.stdout));
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        println!("native cleanup: {line}");
+    }
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         output.quiescent,

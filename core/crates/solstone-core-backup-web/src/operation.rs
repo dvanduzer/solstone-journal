@@ -707,7 +707,6 @@ where
 }
 
 #[cfg(all(test, feature = "full-tests"))]
-#[cfg(not(windows))]
 thread_local! {
     static FAIL_WORKER_START: Cell<bool> = const { Cell::new(false) };
 }
@@ -716,7 +715,6 @@ pub(crate) fn spawn_thread(
     work: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     #[cfg(all(test, feature = "full-tests"))]
-    #[cfg(not(windows))]
     if FAIL_WORKER_START.with(|fail| fail.replace(false)) {
         return Err(std::io::Error::other(
             "injected backup worker creation failure",
@@ -726,7 +724,6 @@ pub(crate) fn spawn_thread(
 }
 
 #[cfg(all(test, feature = "full-tests"))]
-#[cfg(not(windows))]
 pub(crate) fn fail_next_worker_start() {
     FAIL_WORKER_START.with(|fail| fail.set(true));
 }
