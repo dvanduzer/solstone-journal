@@ -20,7 +20,7 @@ solstone-core-segment.workspace = true
 solstone-core-retention.workspace = true
 
 [features]
-full-tests = ["solstone-core-journal-io/test-hooks"]
+full-tests = ["solstone-core-journal-io/test-hooks", "solstone-core-retention/test-hooks"]
 
 [lints]
 workspace = true

@@ -2371,7 +2371,7 @@ fn append_windows_removal_event(
         file.seek(SeekFrom::End(-1))?;
         let mut tail = [0];
         file.read_exact(&mut tail)?;
-        if tail != [b'\n'] {
+        if tail != *b"\n" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "removal event log has an unfinished record",

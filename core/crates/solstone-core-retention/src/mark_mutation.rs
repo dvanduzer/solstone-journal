@@ -549,10 +549,7 @@ fn publish_bound(
             },
             DetailedAtomicOutcome::PublishedParentPathRaced { sync_error } => RegisterUncertainty {
                 durability: sync_error,
-                observation: Some(io::Error::new(
-                    io::ErrorKind::Other,
-                    "published parent path raced",
-                )),
+                observation: Some(io::Error::other("published parent path raced")),
                 ..RegisterUncertainty::default()
             },
             DetailedAtomicOutcome::PublishedParentPathUnverified {

@@ -29,7 +29,7 @@ use solstone_core_sol_link::ledger::{
 };
 use solstone_core_sol_link::pairing::addresses::{is_allowed_direct_ipv4, is_usable_ipv4};
 use solstone_core_sol_link::service_identity::ServiceIdentity;
-use solstone_core_spl::{EnrollError, disable_spl, enable_spl_with, enroll_home};
+use solstone_core_spl::{EnrollError, EnrollMode, disable_spl, enable_spl_with, enroll_home};
 use solstone_core_thinking::confidential::{
     HandoffResult, OperationHandle, OperationRegistry, Phase,
 };
@@ -158,6 +158,7 @@ impl SplEnrollment for RelayEnrollment {
             &identity.instance_id,
             ca_pubkey,
             &identity.home_label,
+            EnrollMode::Establish,
         )
     }
 }

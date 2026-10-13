@@ -3,8 +3,8 @@
 
 use serde_json::Value;
 use serde_json::json;
-use solstone_core_spl::enroll_home;
 use solstone_core_spl::relay_access::*;
+use solstone_core_spl::{EnrollMode, enroll_home};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -553,37 +553,39 @@ fn test_enroll_home_payload_has_no_home_label() {
 
     let (body_tx, body_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut request = Vec::new();
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..n]);
-                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let header_part = String::from_utf8_lossy(&request[..pos]);
-                    let cl: usize = header_part
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            if k.trim().eq_ignore_ascii_case("content-length") {
-                                v.trim().parse().ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= pos + 4 + cl {
-                        let body =
-                            String::from_utf8_lossy(&request[pos + 4..pos + 4 + cl]).to_string();
-                        let _ = body_tx.send(body);
+        for _ in 0..2 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
                         break;
                     }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header_part = String::from_utf8_lossy(&request[..pos]);
+                        let cl: usize = header_part
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= pos + 4 + cl {
+                            let body = String::from_utf8_lossy(&request[pos + 4..pos + 4 + cl])
+                                .to_string();
+                            let _ = body_tx.send(body);
+                            break;
+                        }
+                    }
                 }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\n\r\n{\"service_token\":\"tok123\"}";
+                let _ = stream.write_all(resp.as_bytes());
             }
-            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\n\r\n{\"service_token\":\"tok123\"}";
-            let _ = stream.write_all(resp.as_bytes());
         }
     });
 
@@ -592,6 +594,7 @@ fn test_enroll_home_payload_has_no_home_label() {
         "inst-test",
         "ca-pubkey-abc",
         "my home label",
+        EnrollMode::Establish,
     );
     assert!(res.is_ok());
 
@@ -605,6 +608,36 @@ fn test_enroll_home_payload_has_no_home_label() {
     assert!(
         !obj.contains_key("home_label"),
         "enroll_home payload must not contain home_label"
+    );
+    assert!(
+        !obj.contains_key("mode"),
+        "enroll_home Establish payload must not contain mode"
+    );
+
+    let res_renew = enroll_home(
+        &format!("http://127.0.0.1:{port}"),
+        "inst-test-renew",
+        "ca-pubkey-xyz",
+        "my home label",
+        EnrollMode::Renew,
+    );
+    assert!(res_renew.is_ok());
+
+    let body_str2 = body_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let body_val2: Value = serde_json::from_str(&body_str2).unwrap();
+    let obj2 = body_val2.as_object().unwrap();
+    assert_eq!(obj2.get("instance_id").unwrap(), "inst-test-renew");
+    assert_eq!(obj2.get("ca_pubkey").unwrap(), "ca-pubkey-xyz");
+    assert!(
+        !obj2.contains_key("home_label"),
+        "enroll_home payload must not contain home_label"
+    );
+    assert_eq!(
+        obj2.get("mode").and_then(Value::as_str),
+        Some("renew"),
+        "enroll_home Renew payload must contain mode=renew"
     );
 }
 

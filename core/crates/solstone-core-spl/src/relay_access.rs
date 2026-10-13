@@ -36,7 +36,7 @@ pub(crate) fn build_isolated_ureq_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64url(input: &str) -> Option<Vec<u8>> {
     let mut clean = input.trim_end_matches('=').to_string();
     while !clean.len().is_multiple_of(4) {
         clean.push('=');
