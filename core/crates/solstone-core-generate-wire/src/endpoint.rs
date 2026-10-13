@@ -22,9 +22,8 @@ use solstone_core_local::{
 };
 use solstone_core_spp_ratls::AttestationStateStore;
 
-use crate::NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS;
+use crate::transport::{capture_provider_detail, classify_ureq_error, request_timeout};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const ENDPOINT_MODELS_TIMEOUT: Duration = Duration::from_millis(2_500);
 pub const ENDPOINT_SERVED_WINDOW_CACHE_TTL: Duration = Duration::from_secs(300);
 const SERVED_CONTEXT_WINDOW_MIN_TOKENS: u32 = 2_048;
@@ -641,31 +640,6 @@ fn request_contents(request: &GenerateRequest) -> Value {
     )
 }
 
-/// The caller's timeout, else the lane default plus time for any thinking room.
-pub(crate) fn request_timeout(timeout_s: Option<f64>, thinking_room: u64) -> Duration {
-    timeout_s
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(Duration::from_secs_f64)
-        .unwrap_or(DEFAULT_TIMEOUT + crate::thinking::thinking_time(thinking_room))
-}
-
-fn capture_provider_detail(body: &str, secret: &str) -> Option<String> {
-    if body.is_empty() {
-        return None;
-    }
-    let scrubbed = if secret.is_empty() {
-        body.to_owned()
-    } else {
-        body.replace(secret, "[redacted]")
-    };
-    Some(
-        scrubbed
-            .chars()
-            .take(NON_RESPONSIVE_RAW_OUTPUT_CAP_CHARS)
-            .collect(),
-    )
-}
-
 /// The reason for a non-success reply from the endpoint. An owner-supplied
 /// endpoint that answers 401 is refusing the credential, which the owner can fix,
 /// so it is named as a key problem, the same as the OpenAI and Anthropic presets:
@@ -704,14 +678,7 @@ fn endpoint_request(
     credential: Option<&str>,
     timeout: Duration,
 ) -> Result<HttpResponse, EndpointTransportError> {
-    let config = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(timeout))
-        .timeout_recv_response(Some(timeout))
-        .timeout_recv_body(Some(timeout))
-        .timeout_global(Some(timeout))
-        .build();
-    let agent = ureq::Agent::new_with_config(config);
+    let agent = crate::transport::agent(timeout);
     let url = format!("{base_url}{path}");
     let response = match (method, body) {
         ("get", None) => {
@@ -737,19 +704,6 @@ fn endpoint_request(
         .read_to_string()
         .map_err(classify_ureq_error)?;
     Ok(HttpResponse { status, body })
-}
-
-fn classify_ureq_error(error: ureq::Error) -> EndpointTransportError {
-    match error {
-        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed | ureq::Error::Io(_) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => {
-            EndpointTransportError::Connection
-        }
-        ureq::Error::Timeout(_) => EndpointTransportError::Capacity,
-        _ => EndpointTransportError::Other,
-    }
 }
 
 #[cfg(test)]
@@ -1053,7 +1007,7 @@ mod tests {
     #[test]
     fn zero_or_absent_request_timeout_uses_the_default() {
         for timeout_s in [None, Some(0.0)] {
-            assert_eq!(request_timeout(timeout_s, 0), DEFAULT_TIMEOUT);
+            assert_eq!(request_timeout(timeout_s, 0), Duration::from_secs(120));
         }
     }
 
