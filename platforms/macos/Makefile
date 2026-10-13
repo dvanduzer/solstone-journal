@@ -641,6 +641,7 @@ endef
 verify-ja1r-gate-journal: ja1r-gate-clean-tree
 	$(call require_gate_vars,journal,JA1R_GATE_SOL_VERSION JA1R_GATE_SOL_BUILD JA1R_GATE_JOURNAL_BASELINE_VERSION JA1R_GATE_JOURNAL_BASELINE_BUILD JA1R_GATE_JOURNAL_RUNTIME_PIN JA1R_GATE_JOURNAL_BASELINE_RUNTIME_PIN DMG_NAME)
 	@test -n '$(SOL_CONTRACT_HEAD)' || { echo "error: SOL_CONTRACT_CHECKOUT=$(SOL_CONTRACT_CHECKOUT) is not a solstone-macos git checkout" >&2; exit 1; }
+	@test -n '$(JOURNAL_DMG_NAME)' || { echo "error: JOURNAL_DMG_NAME is empty: $(SUPPORT_SCRIPTS)/release_identity.py derives it; set MACOS_SUPPORT_ROOT or JOURNAL_DMG_NAME" >&2; exit 1; }
 	python3 '$(GATE_TOOLS)/verify-ja1r-linkage-gate.py' --profile journal \
 		--pin-file scripts/ja1r-gate/extro-tools.rev \
 		--sol-commit '$(SOL_CONTRACT_HEAD)' --journal-commit '$(PRODUCT_HEAD)' \
