@@ -457,7 +457,13 @@ fn owned_teardown_boundaries(case: &str) {
                             "late_binding"=>{let mut changed=binding.clone();changed.bucket="different".into();save_hosted_binding(&journal,&changed).unwrap();},
                             "expiry"=>server_clock.0.store(1_700_000_600,Ordering::SeqCst),
                             "backward"=>server_clock.0.store(1_699_999_999,Ordering::SeqCst),
-                            "cancel_post"=>server_cancel.cancel(),
+                            "cancel_post"=>{
+                                server_cancel.cancel();
+                                // Cancellation must close the in-flight request without
+                                // waiting for a response. Windows may reset this socket.
+                                closed(&mut peer);
+                                continue;
+                            },
                             _=>{},
                         }
                         respond(&mut peer,b"<DeleteResult><Deleted><Key>owner/&amp;/one&amp;two</Key></Deleted></DeleteResult>");
@@ -500,6 +506,10 @@ fn owned_teardown_boundaries(case: &str) {
     assert_eq!(server.join().unwrap(), expected);
     let remote = result.remote().unwrap();
     assert_eq!(remote.delete_attempts(), 1);
+    if case == "cancel_post" {
+        assert_eq!(remote.delete_confirmations(), 0);
+        assert_eq!(remote.abort_attempts(), 0);
+    }
     if ["late_catalog", "cancel_body", "oversize_body"].contains(&case.as_str()) {
         assert_eq!(remote.delete_confirmations(), 1);
         assert_eq!(remote.abort_attempts(), 0);
