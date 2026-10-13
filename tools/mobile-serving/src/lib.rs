@@ -27,6 +27,8 @@ pub struct OwnerResponse {
 pub struct MobileServing {
     #[cfg(feature = "audio")]
     audio: Option<audio::AudioWorker>,
+    #[cfg(feature = "audio")]
+    bus: solstone_core_callosum::CallosumSocketServer,
     handle: EmbeddedConveyHandle,
     runtime: tokio::runtime::Runtime,
     root: JournalRoot,
@@ -66,6 +68,14 @@ impl MobileServing {
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
+        // Keep the production ingest notification boundary live. Durable receipt
+        // discovery provides restart recovery independently of this transient bus.
+        #[cfg(feature = "audio")]
+        let bus = runtime
+            .block_on(solstone_core_callosum::CallosumSocketServer::bind(
+                root.canonical_path().join("health/callosum.sock"),
+            ))
+            .map_err(|e| e.to_string())?;
         let handle = runtime
             .block_on(async {
                 match payload_root {
@@ -87,6 +97,8 @@ impl MobileServing {
         Ok(Self {
             #[cfg(feature = "audio")]
             audio: None,
+            #[cfg(feature = "audio")]
+            bus,
             handle,
             runtime,
             root,
@@ -195,6 +207,8 @@ impl MobileServing {
             audio.stop();
         }
         self.handle.shutdown();
+        #[cfg(feature = "audio")]
+        self.runtime.block_on(self.bus.stop());
     }
 }
 
