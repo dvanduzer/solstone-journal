@@ -116,6 +116,32 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+pub(crate) fn service_token_health_from_cache(
+    cache: Option<&RelayHealthCache>,
+    now_ms: i64,
+) -> solstone_core_spl::ServiceTokenHealth {
+    let (event_at_ms, reason, tunnel_error_at_ms, tunnel_success_at_ms) = match cache {
+        Some(entry) => (
+            Some(entry.ts),
+            entry.last_relay_tunnel_error.clone(),
+            entry
+                .last_relay_tunnel_error_at
+                .and_then(|t| i64::try_from(t).ok()),
+            entry
+                .last_successful_relay_tunnel_at
+                .and_then(|t| i64::try_from(t).ok()),
+        ),
+        None => (None, None, None, None),
+    };
+    solstone_core_spl::ServiceTokenHealth {
+        event_at_ms,
+        reason,
+        tunnel_error_at_ms,
+        tunnel_success_at_ms,
+        now_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,31 +377,5 @@ mod tests {
         let no_reason = make_cache(now_ms - 10_000, None, Some(100), Some(50));
         let health = service_token_health_from_cache(Some(&no_reason), now_ms);
         assert!(!service_token_health_is_refused(&health));
-    }
-}
-
-pub(crate) fn service_token_health_from_cache(
-    cache: Option<&RelayHealthCache>,
-    now_ms: i64,
-) -> solstone_core_spl::ServiceTokenHealth {
-    let (event_at_ms, reason, tunnel_error_at_ms, tunnel_success_at_ms) = match cache {
-        Some(entry) => (
-            Some(entry.ts),
-            entry.last_relay_tunnel_error.clone(),
-            entry
-                .last_relay_tunnel_error_at
-                .and_then(|t| i64::try_from(t).ok()),
-            entry
-                .last_successful_relay_tunnel_at
-                .and_then(|t| i64::try_from(t).ok()),
-        ),
-        None => (None, None, None, None),
-    };
-    solstone_core_spl::ServiceTokenHealth {
-        event_at_ms,
-        reason,
-        tunnel_error_at_ms,
-        tunnel_success_at_ms,
-        now_ms,
     }
 }

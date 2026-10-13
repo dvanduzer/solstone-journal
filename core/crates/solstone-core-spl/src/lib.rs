@@ -58,7 +58,7 @@ pub use posture_gate::{
 };
 pub use private_link::{
     DEFAULT_RELAY_URL, EnableSplError, EnrollError, EnrollMode, SplDisableOutcome, disable_spl,
-    enable_spl, enable_spl_with, enroll_home, enroll_home_renew, relay_url, save_service_token,
+    enable_spl, enable_spl_with, enroll_home, relay_url, save_service_token,
 };
 pub use reconnect_backoff::{
     INITIAL_RECONNECT_BASE, MAX_RECONNECT_BASE, ReconnectBackoffError, ReconnectSchedule,

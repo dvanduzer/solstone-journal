@@ -1623,11 +1623,7 @@ static NEXT_HARNESS_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 fn temp_harness_journal(prefix: &str) -> (std::path::PathBuf, TempJournalCleanup) {
     let id = NEXT_HARNESS_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::path::PathBuf::from("/var/tmp").join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        id
-    ));
+    let path = std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), id));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     let cleanup = TempJournalCleanup(path.clone());
@@ -1793,10 +1789,11 @@ impl CallosumEmit for HarnessEmitter {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::result_large_err)]
 async fn service_token_renewal_replaces_token_and_tunnel_connects() -> Result<(), String> {
     timeout(Duration::from_secs(10), async {
-        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-lifecycle-14");
+        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-renewal-replaces-token");
         let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;
@@ -1971,9 +1968,13 @@ async fn service_token_renewal_replaces_token_and_tunnel_connects() -> Result<()
 
         // Exactly one enroll
         assert_eq!(enroll_bodies.lock().unwrap().len(), 1);
-        let recorded_body = &enroll_bodies.lock().unwrap()[0];
+        let recorded_body = enroll_bodies.lock().unwrap()[0].clone();
         assert!(recorded_body.contains(&inst_id));
-        assert!(recorded_body.contains(&expected_pem));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recorded_body).unwrap()["ca_pubkey"]
+                .as_str(),
+            Some(expected_pem.as_str())
+        );
 
         // Wait for next tunnel attempt presenting the new token to be accepted
         accepted_rx.await.map_err(|e| e.to_string())?;
@@ -1988,10 +1989,11 @@ async fn service_token_renewal_replaces_token_and_tunnel_connects() -> Result<()
     .map_err(|_| "service_token_renewal_replaces_token_and_tunnel_connects timed out".to_owned())?
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::result_large_err)]
 async fn service_token_renewal_not_enrolled_rejection_backs_off_production() -> Result<(), String> {
     timeout(Duration::from_secs(10), async {
-        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-lifecycle-14a");
+        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-renewal-not-enrolled");
         let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;
@@ -2097,7 +2099,7 @@ async fn service_token_renewal_not_enrolled_rejection_backs_off_production() -> 
                     .and_then(|v| v.as_str()),
                 Some(inst_id.as_str())
             );
-            assert!(body.contains(&expected_pem));
+            assert_eq!(parsed["ca_pubkey"].as_str(), Some(expected_pem.as_str()));
         }
 
         stand_in_task.abort();
@@ -2109,10 +2111,11 @@ async fn service_token_renewal_not_enrolled_rejection_backs_off_production() -> 
     })?
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::result_large_err)]
 async fn service_token_renewal_unhealthy_jwks_skips_enrollment() -> Result<(), String> {
     timeout(Duration::from_secs(10), async {
-        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-lifecycle-15");
+        let (journal_root, _cleanup) = temp_harness_journal("solstone-spl-renewal-unhealthy-keys");
         let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;

@@ -410,7 +410,8 @@ pub fn evaluate_once(config: &RenewalConfig, state: &mut RenewalState) -> Renewa
 
     // 3. Triggers check (now_unix)
     let now_unix = (config.clock.now_unix)();
-    let claims_opt = spl_core::jwt::decode_unverified_claims(token.as_str());
+    let claims_opt = spl_core::jwt::decode_unverified_claims(token.as_str())
+        .filter(|_| parse_token_metadata(token.as_str()).kid.is_some());
     let trigger = match claims_opt {
         None => Some(Trigger::Undecodable),
         Some(claims) => {
@@ -602,15 +603,22 @@ pub fn spawn_service_token_renewal(config: RenewalConfig) -> tokio::task::JoinHa
             tokio::time::sleep(config.tick).await;
             let config_clone = config.clone();
             let state_clone = state.clone();
-            let (step, new_state) = tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 let mut s = state_clone;
                 let step = evaluate_once(&config_clone, &mut s);
                 (step, s)
             })
             .await
-            .unwrap_or((RenewalStep::Blocked, state));
-            state = new_state;
-            let _ = step;
+            {
+                Ok((_, new_state)) => state = new_state,
+                Err(_) => {
+                    // An evaluation that did not finish may already have called the
+                    // relay, so wait the longest backoff before trying again.
+                    let wait = (config.jitter)(Duration::from_secs(6 * 3600));
+                    state.backoff_deadline = (config.clock.now_mono)() + wait;
+                    log::warn!("private-link service token renewal evaluation did not complete");
+                }
+            }
         }
     })
 }
@@ -633,7 +641,7 @@ mod tests {
     impl TempJournal {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = PathBuf::from("/var/tmp").join(format!(
+            let path = std::env::temp_dir().join(format!(
                 "solstone-spl-renewal-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -803,7 +811,10 @@ mod tests {
             classify_jwks(200, br#"{"keys":[{"kid":123}]}"#),
             JwksSet::Unhealthy
         );
-        let large = vec![b' '; 64 * 1024 + 1];
+        let mut large = br#"{"keys":[{"kid":"kid-test-2"}],"pad":""#.to_vec();
+        large.resize(64 * 1024 + 1, b'a');
+        large.extend_from_slice(br#""}"#);
+        assert!(serde_json::from_slice::<Value>(&large).is_ok());
         assert_eq!(classify_jwks(200, &large), JwksSet::Unhealthy);
 
         // evaluate_once with young token and refused health
@@ -1112,6 +1123,20 @@ mod tests {
             }
         );
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+
+        // 2b. Decodable claims without a header key id: renews as undecodable
+        let no_kid = make_test_jwt(None, &inst_id, iat, exp, "session.listen", None);
+        save_service_token(journal.path(), &no_kid).unwrap();
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let mut state = RenewalState::default();
+        let step = evaluate_once(&make_cfg(iat + 100, fetch_count.clone()), &mut state);
+        assert_eq!(
+            step,
+            RenewalStep::Attempted {
+                trigger: Trigger::Undecodable,
+                outcome: Outcome::Renewed
+            }
+        );
 
         // 3. Missing token: no enroll, no fetch, file untouched
         std::fs::remove_file(journal.path().join("link/tokens/account.json")).unwrap();

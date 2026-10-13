@@ -131,20 +131,6 @@ pub fn enroll_home(
     map_enroll_response(status, &body)
 }
 
-pub fn enroll_home_renew(
-    relay_base_url: &str,
-    instance_id: &str,
-    ca_pubkey: &str,
-) -> Result<String, EnrollError> {
-    enroll_home(
-        relay_base_url,
-        instance_id,
-        ca_pubkey,
-        "",
-        EnrollMode::Renew,
-    )
-}
-
 fn map_enroll_response(status: u16, body: &str) -> Result<String, EnrollError> {
     if !(200..300).contains(&status) {
         let reason = serde_json::from_str::<Value>(body).ok().and_then(|value| {
