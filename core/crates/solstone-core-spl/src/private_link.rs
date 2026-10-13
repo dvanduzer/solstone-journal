@@ -80,16 +80,30 @@ pub fn relay_url(journal_root: &Path) -> String {
     DEFAULT_RELAY_URL.to_owned()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnrollMode {
+    Establish,
+    Renew,
+}
+
 pub fn enroll_home(
     relay_base_url: &str,
     instance_id: &str,
     ca_pubkey: &str,
     _home_label: &str,
+    mode: EnrollMode,
 ) -> Result<String, EnrollError> {
     let agent = crate::relay_access::build_isolated_ureq_agent(Duration::from_secs(30));
-    let payload =
-        serde_json::to_string(&json!({"instance_id": instance_id, "ca_pubkey": ca_pubkey}))
-            .expect("enrollment payload serializes");
+    let payload = match mode {
+        EnrollMode::Establish => {
+            serde_json::to_string(&json!({"instance_id": instance_id, "ca_pubkey": ca_pubkey}))
+                .expect("enrollment payload serializes")
+        }
+        EnrollMode::Renew => serde_json::to_string(
+            &json!({"instance_id": instance_id, "ca_pubkey": ca_pubkey, "mode": "renew"}),
+        )
+        .expect("enrollment payload serializes"),
+    };
     let response = agent
         .post(&format!(
             "{}/enroll/home",
@@ -115,6 +129,20 @@ pub fn enroll_home(
         }
     })?;
     map_enroll_response(status, &body)
+}
+
+pub fn enroll_home_renew(
+    relay_base_url: &str,
+    instance_id: &str,
+    ca_pubkey: &str,
+) -> Result<String, EnrollError> {
+    enroll_home(
+        relay_base_url,
+        instance_id,
+        ca_pubkey,
+        "",
+        EnrollMode::Renew,
+    )
 }
 
 fn map_enroll_response(status: u16, body: &str) -> Result<String, EnrollError> {
@@ -145,6 +173,7 @@ pub fn enable_spl(journal_root: &Path) -> Result<(), EnableSplError> {
             &identity.instance_id,
             ca_pubkey,
             &identity.home_label,
+            EnrollMode::Establish,
         )
     })
 }
@@ -169,7 +198,10 @@ pub fn save_service_token(journal_root: &Path, token: &str) -> Result<(), Atomic
     })
 }
 
-fn save_service_token_unlocked(journal_root: &Path, token: &str) -> Result<(), AtomicWriteError> {
+pub(crate) fn save_service_token_unlocked(
+    journal_root: &Path,
+    token: &str,
+) -> Result<(), AtomicWriteError> {
     let path = journal_root
         .join("link")
         .join("tokens")

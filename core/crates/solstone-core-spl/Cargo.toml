@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 bytes = { workspace = true }
 futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
+log = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 spl-core = { workspace = true }

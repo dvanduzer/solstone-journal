@@ -9,6 +9,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - on windows, media offload runs again. you can approve its proposals from the home page and bring the media back from the backup page or with `solstone journal backup offload restore`, including media an earlier version offloaded.
+- your journal renews its private link service token automatically before it expires or when the relay stops publishing the key that signed the token, keeping remote connections alive without having to turn private link off and on.
 
 ## [2.0.44] - 2026-10-13
 
