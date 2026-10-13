@@ -3,11 +3,12 @@
 # Copyright (c) 2026 sol pbc
 """Bench lock must already be held. Launch the app; wait for its completion event."""
 import argparse,hashlib,json,os,pathlib,subprocess,threading,time
-p=argparse.ArgumentParser();p.add_argument('scenario');p.add_argument('--install',action='store_true');p.add_argument('--serial',default=os.environ.get('ANDROID_SERIAL','RZGL11XCS9D'));a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('scenario');p.add_argument('--install',action='store_true');p.add_argument('--package',default='app.solstone.development.journal');p.add_argument('--serial',default=os.environ.get('ANDROID_SERIAL','RZGL11XCS9D'));a=p.parse_args()
+if a.package not in ('app.solstone.development.journal','app.solstone.development.journal.audio'):p.error('development application required')
 run_id=str(time.time_ns())
 root=pathlib.Path(__file__).resolve().parent
 adb=[str(pathlib.Path(os.environ['ANDROID_HOME'])/'platform-tools/adb'),'-s',a.serial]
-pkg='app.solstone.development.journal'; out=root/'evidence'/f'{a.scenario}-{int(time.time())}';out.mkdir(parents=True)
+pkg=a.package; out=root/'evidence'/f'{a.scenario}-{int(time.time())}';out.mkdir(parents=True)
 receipts=[]
 def run(name,args,binary=False):
  t=time.time();r=subprocess.run(adb+args,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
@@ -38,7 +39,7 @@ try:
  run('stop-experiment',['shell','am','force-stop',pkg])
  run('wake',['shell','input','keyevent','KEYCODE_WAKEUP'])
  run('dismiss-keyguard',['shell','wm','dismiss-keyguard'])
- run('launch',['shell','am','start','-W','-n',pkg+'/.MainActivity','--es','scenario',a.scenario,'--es','run_id',run_id])
+ run('launch',['shell','am','start','-W','-n',pkg+'/app.solstone.development.journal.MainActivity','--es','scenario',a.scenario,'--es','run_id',run_id])
  assert done.wait(2400 if a.scenario=="mixed" else 600),'app completion timeout'
  data=run('events',['exec-out','run-as',pkg,'cat','files/'+report[-1]])
  events=[json.loads(line) for line in data.splitlines()]

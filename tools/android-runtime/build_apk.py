@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 sol pbc
 """Build the isolated operator harness using SDK tools, no product Gradle tree."""
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, time, zipfile
+import argparse, hashlib, json, os, pathlib, re, shutil, subprocess, time, zipfile
+import xml.etree.ElementTree as ET
 from provenance import source_manifest
-p=argparse.ArgumentParser(); p.add_argument('--root',required=True); p.add_argument('--sdk',required=True); p.add_argument('--java',required=True); args=p.parse_args()
+p=argparse.ArgumentParser(); p.add_argument('--root',required=True); p.add_argument('--sdk',required=True); p.add_argument('--java',required=True); p.add_argument('--application-id', default='app.solstone.development.journal'); args=p.parse_args()
+if not re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+', args.application_id): p.error('invalid application id')
 root=pathlib.Path(args.root).resolve(); sdk=pathlib.Path(args.sdk); java=pathlib.Path(args.java); build=root/'build'; build.mkdir(exist_ok=True)
 (build/'source-manifest.json').write_text(json.dumps(source_manifest(root.parents[1]),indent=2)+'\n')
 tools=sdk/'build-tools/35.0.0'; jar=sdk/'platforms/android-36/android.jar'; commands=[]
@@ -20,8 +22,14 @@ for generated in [classes,dex]:
 run([java/'bin/javac','-source','8','-target','8','-cp',jar,'-d',classes,*sorted((root/'src').rglob('*.java'))])
 env=os.environ.copy(); env['JAVA_HOME']=str(java); env['PATH']=str(java/'bin')+':'+env.get('PATH',''); os.environ.update(env)
 run([tools/'d8','--lib',jar,'--min-api','31','--output',dex,*sorted(classes.rglob('*.class'))])
+manifest=ET.parse(root/'AndroidManifest.xml'); original=manifest.getroot().attrib['package']
+manifest.getroot().set('package',args.application_id)
+for element in manifest.iter():
+  name=element.get('{http://schemas.android.com/apk/res/android}name')
+  if name and name.startswith('.'): element.set('{http://schemas.android.com/apk/res/android}name',original+name)
+manifest_path=build/'AndroidManifest.xml'; manifest.write(manifest_path,encoding='utf-8',xml_declaration=True)
 unsigned=build/'unsigned.apk'
-run([tools/'aapt2','link','-I',jar,'--manifest',root/'AndroidManifest.xml','--min-sdk-version','31','--target-sdk-version','36','--version-code','1','--version-name','development-1','-o',unsigned])
+run([tools/'aapt2','link','-I',jar,'--manifest',manifest_path,'--min-sdk-version','31','--target-sdk-version','36','--version-code','1','--version-name','development-1','-o',unsigned])
 with zipfile.ZipFile(unsigned,'a',compression=zipfile.ZIP_DEFLATED) as z:
   z.write(dex/'classes.dex','classes.dex')
   for native in sorted((root/'lib').rglob('*.so')): z.write(native,str(native.relative_to(root)))
@@ -39,5 +47,5 @@ run([tools/'apksigner','verify','--verbose','--print-certs',signed]); run([tools
 members=[]
 with zipfile.ZipFile(signed) as z:
   for i in z.infolist(): members.append({'name':i.filename,'bytes':i.file_size,'compressed_bytes':i.compress_size,'sha256':hashlib.sha256(z.read(i)).hexdigest()})
-(build/'artifact-manifest.json').write_text(json.dumps({'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'members':members},indent=2))
-print(json.dumps({'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'commands':len(commands)}))
+(build/'artifact-manifest.json').write_text(json.dumps({'application_id':args.application_id,'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'members':members},indent=2))
+print(json.dumps({'application_id':args.application_id,'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'commands':len(commands)}))

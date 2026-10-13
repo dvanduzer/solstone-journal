@@ -6,7 +6,7 @@ The package is `app.solstone.development.journal`. It requests Internet and netw
 
 ## Build and install
 
-Install the repository's pinned Rust toolchain and `aarch64-linux-android` target, JDK 17, Android SDK platform 36, build-tools 35.0.0 and NDK r30. The [Android cross-build instructions](../../docs/ANDROID_CROSS_BUILD.md) provide the pinned NDK acquisition recipe. Set `ANDROID_HOME`, `JAVA_HOME` and `JOURNAL_NDK` to those installations. Cache the Cargo dependencies before the offline build.
+Install the repository's pinned Rust toolchain and `aarch64-linux-android` target, JDK 17, Android SDK platform 36, build-tools 35.0.0 and NDK r30. The [Android cross-build instructions](../../docs/ANDROID_CROSS_BUILD.md) provide the pinned NDK acquisition recipe. Set `ANDROID_HOME`, `JAVA_HOME` and `JOURNAL_NDK` to those installations. Cache the Cargo dependencies before the offline build. All native builds require `PARAKEET_LIB_DIR`, `SOLSTONE_FFMPEG_SOURCE_ARCHIVE` and `JOURNAL_ONNX_LIBRARY`, as described below.
 
 From this directory:
 
@@ -43,7 +43,7 @@ Android ancestor witnesses use `O_PATH` with directory, no-follow and identity c
 
 The native harness enables existing Journal IO test hooks for precise crash boundaries. The SQLite interruption is an explicit uncommitted transaction in the real index, rather than a crash inside the scanner. Complete unpublished stages may remain after death; automatic orphan deletion is not promised. Process-kill checks do not establish power-loss durability.
 
-The ordinary service shares the app's file authority. The isolated-UID control service cannot open those private files. Models, media, GPU work, background residency, every other Journal writer and store distribution remain outside this development app.
+The ordinary service shares the app's file authority. The isolated-UID control service cannot open those private files. The audio mode described below adds bounded local media processing. GPU execution, background residency, other journal writers and store distribution remain outside this development app.
 
 ## Authenticated LAN serving
 
@@ -94,3 +94,66 @@ The output includes resource samples and a stopped private-file snapshot checked
 by host SQLite. It retains a mode-600 test credential; keep that directory private.
 The script force-stops only this development package at completion. It does not
 request diagnostic garbage collection.
+
+## Local audio development mode
+
+Build the maintained Parakeet archives with `scripts/mobile_native_build.py
+--platform android --components parakeet --work-dir NATIVE_BUILD --cache-dir
+DOWNLOAD_CACHE`. Set `PARAKEET_LIB_DIR` to `NATIVE_BUILD/build/parakeet`.
+Set `SOLSTONE_FFMPEG_SOURCE_ARCHIVE` to the pinned FFmpeg archive and
+`JOURNAL_ONNX_LIBRARY` to the Android `libonnxruntime.so` produced by the
+[pinned native preparation](../../docs/ANDROID_CROSS_BUILD.md).
+The build records the hashes of these inputs.
+
+Build the APK with `--application-id app.solstone.development.journal.audio`.
+This installs alongside the storage development app and the capture app.
+After installation, provision the maintained Parakeet model and the checked-in
+VAD and speaker models from the repository root:
+
+```sh
+python3 tools/android-runtime/provision_audio.py --serial DEVICE_SERIAL \
+  --parakeet /path/to/tdt-0.6b-v3-q8_0.gguf
+adb shell am start -n app.solstone.development.journal.audio/app.solstone.development.journal.ServingActivity
+```
+
+The foreground serving worker automatically discovers accepted audio inputs,
+checks their durable ingest receipt and byte identity, runs native decode,
+VAD, Parakeet and speaker analysis, and publishes the normal transcript and speaker sidecar.
+A paired client reads the result through the existing transcript API. The network contract
+remains production multipart `/app/devices/ingest`, protocol version 3, over
+paired TLS/SPL. No private command is needed to complete an accepted recording.
+
+This embedded mode admits at most 16 MiB of encoded audio and 30 seconds of
+decoded mono 16 kHz samples per input. It retains originals and reports failures.
+A failed input is skipped for the rest of that worker's run; cancel/resume or
+restart retries it. A model-load failure pauses the worker until resume or
+restart. Cancellation is cooperative between stages and before publication;
+it cannot interrupt a native inference already running. Serving uses separate
+threads, and stopping the worker waits for active native work to return.
+These are development-mode bounds, not changes to desktop import support.
+
+`qualify_audio.py` uploads supplied fixtures from a separate LAN client and
+checks authenticated transcript retrieval, source bytes, transcript provenance
+and SQLite integrity. Raw transcripts remain excluded from search; searchable
+summaries require the later Generate pipeline. Run the existing
+`qualify_serving.py --package app.solstone.development.journal.audio` separately
+for search and serving regressions. The audio qualification
+also exercises denied access, retries, lost replies, active cancellation and
+worker recovery, silence, malformed media and missing/corrupt model recovery.
+Generate the declared fixtures with [audio_fixtures.py](audio_fixtures.py), using
+host FFmpeg. The source WAV has a documented expected sentence. The population
+includes stereo 44.1 kHz AAC, repeated speech, silence, truncated media and
+encoded-size and decoded-duration controls.
+
+```sh
+python3 tools/android-runtime/audio_fixtures.py --output /var/tmp/audio-fixtures
+python3 tools/android-runtime/qualify_audio.py \
+  --host PHONE_WIFI_IPV4 --apk-sha256 INSTALLED_APK_SHA256 \
+  --client tools/mobile-serving/client/target/debug/ios-serving-client \
+  --fixtures /var/tmp/audio-fixtures --output /var/tmp/android-audio-qualification
+python3 tools/android-runtime/run_device.py full \
+  --package app.solstone.development.journal.audio
+```
+
+The qualification output contains private test credentials and synthetic journal
+snapshots. Keep it private. The scripts stop only the selected development app.

@@ -10,7 +10,7 @@ license = "AGPL-3.0-only"
 crate-type = ["cdylib"]
 
 [dependencies]
-journal-mobile-serving = { path = "../../mobile-serving" }
+journal-mobile-serving = { path = "../../mobile-serving", features = ["audio-native"] }
 solstone-core-journal-io = { path = "../../../core/crates/solstone-core-journal-io", features = ["test-hooks"] }
 solstone-core-indexer-store = { path = "../../../core/crates/solstone-core-indexer-store" }
 solstone-core-indexer-query = { path = "../../../core/crates/solstone-core-indexer-query" }
@@ -18,3 +18,8 @@ serde_json = "1"
 chrono = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 libc = "0.2"
+
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "std"] }
+
+[patch.crates-io]
+ffmpeg-sys-next = { path = "../../../core/vendor/ffmpeg-sys-next" }
