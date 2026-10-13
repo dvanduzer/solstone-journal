@@ -1,12 +1,12 @@
-# Journal on a dedicated iOS device
+# journal on a dedicated iOS device
 
-This development app exercises Journal storage, indexing and search with a standard bundled ExtensionFoundation helper. Keep the device plugged in and the host app in the foreground. It requires iOS 26 and a development signing identity. It can serve the production authenticated Journal API over a private Wi-Fi interface. It does not integrate with the capture app.
+This development app exercises journal storage, indexing and search with a standard bundled ExtensionFoundation helper. Keep the device plugged in and the host app in the foreground. It requires iOS 26 and a development signing identity. It can serve the production authenticated journal API over a private Wi-Fi interface. It does not integrate with the capture app.
 
-The helper owns persistent files in its private `Documents/journal-<suite>` directory. The host sends typed operations over XPC and receives results. A supplied host path conveys no file authority. The bridge retains an admitted `JournalRoot` and checks its canonical binding before each operation; bound publication uses the production Journal IO primitives. Indexing and queries use the production crates. For LAN serving, the foreground host retains the shared [mobile serving runtime](../mobile-serving/README.md). The host and helper independently select the same dedicated app-group journal; the helper performs indexing and export. The maintained router payload is bundled as a signed resource. Exported synthetic results go to the host's Documents directory for independent checking.
+The helper owns persistent files in its private `Documents/journal-<suite>` directory. The host sends typed operations over XPC and receives results. A supplied host path conveys no file authority. The bridge retains an admitted `JournalRoot` and checks its canonical binding before each operation; bound publication uses the production journal IO primitives. Indexing and queries use the production crates. For LAN serving, the foreground host retains the shared [mobile serving runtime](../mobile-serving/README.md). The host and helper independently select the same dedicated app-group journal; the helper performs indexing and export. The maintained router payload is bundled as a signed resource. Exported synthetic results go to the host's Documents directory for independent checking.
 
 ## Build and install
 
-On a Mac with Xcode 26, XcodeGen, Rust's `aarch64-apple-ios` target and a paired device in Developer Mode:
+On a mac with Xcode 26, XcodeGen, Rust's `aarch64-apple-ios` target and a paired device in Developer Mode:
 
 ```sh
 cd tools/ios-runtime
@@ -43,7 +43,7 @@ All data generated here is synthetic. The fault interface and test-hook dependen
 
 The listener and production owner router run on a serial native queue in the foreground host. The standard non-UI helper has a measured 35 MiB dirty-memory limit, below the existing journal mark's 64 MiB Argon2 allocation. Host placement preserves that derivation. The host retains the helper process and private XPC connection for indexing and export. Both derive `Documents/journal-<suite>` from the dedicated signed app-group container; host-supplied paths confer no authority. The earlier storage qualification continues to use the helper's private container. Local owner setup and consent stay inside the app; it opens no unauthenticated loopback port. The host selects its private `en0` IPv4 address and binds only that address. A changed Wi-Fi address requires a restart. Keep the host foreground and the phone plugged in for this development capability.
 
-Build the separate laptop client and run the physical qualification from the Mac connected to the phone:
+Build the separate laptop client and run the physical qualification from the mac connected to the phone:
 
 ```sh
 cargo build --locked --manifest-path tools/mobile-serving/client/Cargo.toml
@@ -60,3 +60,22 @@ Activity creation uses a stable `since_segment`. A repeated create returns a con
 The host accepts qualification commands from its own `Documents/owner-command.json`, dispatches owner requests in process, sends index/export operations over private XPC, and writes `owner-reply.json`. Each command has an ID, the launched suite name and the `serving` storage selection. The host records consumption before execution and retains the command file through the USB transfer check. A host death can leave an uncertain owner-control reply; it never automatically replays that command. These files are development operator controls inside the app container, with no network route. `serve-stop` closes the listener before the harness snapshots source records and exports SQLite. The verifier independently checks exact source fields, record IDs, FTS population and database integrity, including a deliberately wrong-payload control. Receipts retain source hashes, process IDs, foreground heartbeats, thermal states and resource counters. Credentials remain in a separate mode-0600 file and must stay out of shared receipts.
 
 Incoming TCP listening does not require Local Network privilege on iOS, as described in [Apple TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy). This adapter performs no Bonjour discovery. Outbound connections and discovery have separate permission rules. Physical qualification covers the observed foreground listener lifetime; background serving and unattended endurance remain unqualified.
+
+## Local audio processing
+
+The optional audio build runs local inference on a dedicated thread in the foreground host. It uses the maintained Parakeet C API and the production decoder, VAD, speaker analysis and transcript publication. The [mobile audio adapter](../mobile-audio/README.md) verifies the pinned model before loading it. The app bundles the models; the helper continues to own storage checks and database export.
+
+Stage verified native libraries and models, then build on the mac:
+
+```sh
+python3 tools/mobile-audio/prepare.py --retained <ios-native-build-directory> --output /var/tmp/audio-inputs
+export PARAKEET_LIB_DIR=/var/tmp/audio-inputs/parakeet
+export ORT_LIB_PATH=/var/tmp/audio-inputs/onnx
+export ORT_PREFER_DYNAMIC_LINK=false
+make -C tools/ios-runtime install AUDIO_MODELS_DIR=/var/tmp/audio-inputs/models DEVICE=<device-identifier>
+python3 tools/ios-runtime/qualify_audio.py --device <id> --host <phone-wifi-ip> --suite audio1 --client tools/mobile-serving/client/target/debug/ios-serving-client --output /var/tmp/audio1
+```
+
+The [audio qualification](qualify_audio.py) generates synthetic speech on the mac and uploads it through the production protocol-v3 device-ingest route over paired SPL. The phone discovers inputs with accepted custody receipts, decodes and transcribes them locally, and writes normal transcript and speaker outputs. The paired client reads the transcript through the existing segment API. The verifier compares raw-file hashes, persisted and retrieved transcript content, custody records and exported embedding sidecars. Raw transcripts stay out of search; searchable summaries require Generate integration. It records native stage timing, foreground resource counters, thermal state and request latency during processing. Use a fresh suite and output directory; `--smoke` runs only the first speech case.
+
+The embedded processing pass accepts at most 16 MiB of encoded input and 30 seconds of decoded mono audio at 16 kHz. Over-limit or failed input keeps its original file. These processing limits do not change the ingest format contract. Restarting the process retries failed inputs. Model failure leaves the authenticated listener available. Cancellation takes effect at native stage boundaries; an active inference call may finish before cancellation is observed. The default build and serving startup leave audio processing disabled.

@@ -8,9 +8,9 @@ RUST_LIB := $(BUILD_ROOT)/rust/aarch64-apple-ios/debug/libsolstone_ios_runtime.a
 APP := $(BUILD_ROOT)/derived/Build/Products/Debug-iphoneos/JournalRuntimeDev.app
 .PHONY: build rust payload project finalize install run check
 rust:
-	cargo build --locked --manifest-path native/Cargo.toml --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/rust
+	cargo build --locked --manifest-path native/Cargo.toml $(if $(AUDIO_MODELS_DIR),--features audio,) --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/rust
 payload:
-	python3 package_payload.py
+	AUDIO_MODELS_DIR='$(AUDIO_MODELS_DIR)' python3 package_payload.py
 project: payload
 	xcodegen generate
 build: rust project

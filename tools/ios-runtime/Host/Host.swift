@@ -172,6 +172,10 @@ final class PendingReply: @unchecked Sendable {
     let port = Int(argument("--port", "37657")) ?? 37657
     _ = try await servingCall(request("open"), "serve.open")
     _ = try await servingCall(request("serve-start", count: port), "serve.start")
+    if args.contains("--audio") {
+      _ = try await servingCall(
+        request("audio-enable", mode: argument("--audio-mode", "reopen")), "audio.enabled")
+    }
     let deadline = ProcessInfo.processInfo.systemUptime + Double(duration)
     let commandFile = output.appendingPathComponent("owner-command.json")
     let replyFile = output.appendingPathComponent("owner-reply.json")
@@ -260,6 +264,9 @@ final class PendingReply: @unchecked Sendable {
       while !finished {
         try? await Task.sleep(for: .seconds(1))
         if !finished {
+          if args.contains("--audio") && servingActive {
+            _ = try? await servingCall(request("serve-status"), "audio.status")
+          }
           log(
             "host.heartbeat",
             [
