@@ -20,6 +20,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- naming a voice could add the same voice sample twice from older audio. that sample is now counted once.
 - a failed backup attempt no longer replaces the record of your last successful backup. the backup page shows both, including when a stored copy was incomplete.
 - each day's daily results, like your morning briefing, are made again once the day ends. since 2.0.42, your journal waited for each of the day's recordings to be checked off one by one, a few every hour or so. when recordings ran all day, those results stopped coming. days already waiting catch up soon after you update, and catching up on older recordings keeps going as each one finishes instead of a few at a time.
 - some long conversations you imported from ChatGPT, Claude, Gemini or a text file were never read. your journal kept waiting on them, so that day's daily results never finished, and nothing said why. they're now read like any other conversation, and when a day's daily results can't finish, your journal's log names the recordings or conversations holding it up.
