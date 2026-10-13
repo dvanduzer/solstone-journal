@@ -1460,7 +1460,24 @@ mod tests {
             .unwrap();
         scan_journal(&journal, false).unwrap();
         assert_eq!(recall_now().notes.len(), 1);
-        #[cfg(feature = "test-hooks")]
+        // Windows refuses to rename a segment directory while a bounded reader
+        // holds one of its leaves, so the swap staged below cannot happen there;
+        // prove that refusal instead, and that the read still completes.
+        #[cfg(all(feature = "test-hooks", windows))]
+        {
+            let from = segment.clone();
+            let moved = outer.path().join("moved-refused");
+            let refused = std::rc::Rc::new(std::cell::Cell::new(None));
+            let seen = refused.clone();
+            solstone_core_journal_io::read_test_hook::after_open(
+                segment.join("ready.json"),
+                move || seen.set(Some(fs::rename(&from, &moved).is_err())),
+            );
+            rescan_file(&journal, &note).unwrap();
+            assert_eq!(refused.get(), Some(true), "rename under a held leaf");
+            assert_eq!(recall_now().notes[0].bytes, b"needle exact original");
+        }
+        #[cfg(all(feature = "test-hooks", unix))]
         for bulk in [false, true] {
             let snapshot = || {
                 let conn =
