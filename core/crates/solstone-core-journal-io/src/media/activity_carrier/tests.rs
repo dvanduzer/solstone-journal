@@ -25,16 +25,23 @@ fn teardown_fixture() -> (tempfile::TempDir, Arc<TeardownLease>) {
     (temp, lease)
 }
 
-#[cfg(unix)]
+/// Windows has no directory flush: there the teardown carrier is confirmed
+/// with its durability unproven, before and after retirement.
+#[cfg(any(unix, windows))]
 #[test]
 fn teardown_carrier_keeps_original_role_through_census_and_confirmed_retirement() {
+    let flushed = if cfg!(windows) {
+        Durability::Unproven
+    } else {
+        Durability::Synced
+    };
     let (_temp, teardown) = teardown_fixture();
     let root = teardown.journal_root().clone();
     let carrier = RootTeardownCarrier::prepare(teardown.clone()).unwrap();
     assert!(Arc::ptr_eq(carrier.teardown(), &teardown));
     assert!(Arc::ptr_eq(carrier.journal_root(), &root));
-    assert_eq!(carrier.preparation().stage_durability(), Durability::Synced);
-    assert_eq!(carrier.preparation().root_durability(), Durability::Synced);
+    assert_eq!(carrier.preparation().stage_durability(), flushed);
+    assert_eq!(carrier.preparation().root_durability(), flushed);
     assert_eq!(
         carrier.preparation().confirmation(),
         Confirmation::Confirmed
@@ -55,7 +62,7 @@ fn teardown_carrier_keeps_original_role_through_census_and_confirmed_retirement(
         result.receipt.effect(),
         ActivityCarrierRetirementEffect::Removed
     );
-    assert_eq!(result.receipt.root_durability(), Durability::Synced);
+    assert_eq!(result.receipt.root_durability(), flushed);
     assert_eq!(result.receipt.confirmation(), Confirmation::Confirmed);
     assert!(result.receipt.failures().is_empty());
     assert!(!path.exists());
@@ -200,31 +207,6 @@ fn replaced_lock_splits_exclusion_but_old_teardown_recognition_and_retirement_re
     assert_eq!(fs::read(old).unwrap(), b"");
     assert_eq!(fs::read(entry).unwrap(), b"replacement");
     new.revalidate().unwrap();
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_teardown_directory_durability_refusal_keeps_original_role_and_stage() {
-    let (_temp, teardown) = teardown_fixture();
-    let root = teardown.journal_root().clone();
-    let failed = RootTeardownCarrier::prepare(teardown.clone())
-        .err()
-        .unwrap();
-    assert!(Arc::ptr_eq(failed.teardown(), &teardown));
-    assert_eq!(failed.error().kind(), io::ErrorKind::Unsupported);
-    assert_eq!(failed.receipt().stage_durability(), Durability::Unproven);
-    assert_eq!(failed.receipt().root_durability(), Durability::Unproven);
-    assert_eq!(failed.receipt().confirmation(), Confirmation::Unverified);
-    let path = failed.diagnostic_path().unwrap();
-    drop(teardown);
-    assert!(matches!(
-        ActivityLease::try_acquire(root.clone()),
-        Err(ActivityAdmissionError::Busy)
-    ));
-    assert!(path.is_dir());
-    drop(failed);
-    assert!(path.is_dir());
-    TeardownLease::try_acquire(root).unwrap();
 }
 
 fn failure(
@@ -632,7 +614,7 @@ fn ended_owners_empty_reservation_is_retired_by_the_next_lease_holder() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn occupied_nested_and_intent_bound_reservations_stay_held() {
     let (temp, activity) = fixture();
@@ -666,5 +648,29 @@ fn occupied_nested_and_intent_bound_reservations_stay_held() {
             .entries()
             .len(),
         2
+    );
+}
+
+/// A teardown that ended mid-run leaves its empty reservation; the next
+/// teardown retires it under its own lease before observing anything.
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn ended_teardowns_empty_reservation_is_retired_by_the_next_teardown() {
+    let (temp, teardown) = teardown_fixture();
+    let root = teardown.journal_root().clone();
+    let carrier = RootTeardownCarrier::prepare(teardown.clone()).unwrap();
+    let path = carrier.diagnostic_path();
+    drop(carrier);
+    drop(teardown);
+    assert!(path.is_dir());
+    let occupied = temp.path().join(".tmp-offload-occupied");
+    fs::create_dir(&occupied).unwrap();
+    fs::write(occupied.join("payload"), b"unpublished copy").unwrap();
+    let next = TeardownLease::try_acquire(root.clone()).unwrap();
+    assert_eq!(retire_orphan_root_carriers_for_teardown(&next), 1);
+    assert!(!path.exists());
+    assert_eq!(
+        fs::read(occupied.join("payload")).unwrap(),
+        b"unpublished copy"
     );
 }

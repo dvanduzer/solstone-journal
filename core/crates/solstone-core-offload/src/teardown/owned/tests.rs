@@ -323,31 +323,51 @@ fn operated_destination_without_a_binding_is_not_called_unsupported() {
     );
 }
 
+const BOUNDARY_CASES: [&str; 11] = [
+    "complete",
+    "late_catalog",
+    "late_binding",
+    "cancel_body",
+    "oversize_body",
+    "panic_remote",
+    "panic_transfer",
+    "panic_postretire",
+    "expiry",
+    "backward",
+    "cancel_post",
+];
+
 #[test]
 #[ignore = "requires the copied installed package with the actual owned DNS member"]
 #[cfg(all(test, feature = "full-tests"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn packaged_owned_teardown_boundaries() {
     let case = std::env::var("SOLSTONE_OWNED_TEARDOWN_CASE").unwrap();
-    assert!(
-        [
-            "complete",
-            "late_catalog",
-            "late_binding",
-            "cancel_body",
-            "oversize_body",
-            "panic_remote",
-            "panic_transfer",
-            "panic_postretire",
-            "expiry",
-            "backward",
-            "cancel_post"
-        ]
-        .contains(&case.as_str())
-    );
+    owned_teardown_boundaries(&case);
+}
+
+/// Windows resolves in process, so every case runs here without a package.
+#[test]
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(windows)]
+fn owned_teardown_boundaries_on_windows() {
+    for case in BOUNDARY_CASES {
+        owned_teardown_boundaries(case);
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+fn owned_teardown_boundaries(case: &str) {
+    let case = case.to_owned();
+    assert!(BOUNDARY_CASES.contains(&case.as_str()));
+    #[cfg(unix)]
+    let parent = fs::canonicalize("/var/tmp").unwrap();
+    #[cfg(windows)]
+    let parent = std::env::temp_dir();
     let temp = tempfile::Builder::new()
         .prefix("owned-teardown-journal-")
         // macOS links /var to /private/var; the journal root binds its real path.
-        .tempdir_in(fs::canonicalize("/var/tmp").unwrap())
+        .tempdir_in(parent)
         .unwrap();
     fs::create_dir(temp.path().join("config")).unwrap();
     fs::write(
@@ -496,7 +516,15 @@ fn packaged_owned_teardown_boundaries() {
             retirement.effect(),
             ActivityCarrierRetirementEffect::Removed
         );
-        assert_eq!(retirement.root_durability(), Durability::Synced);
+        // Windows has no directory flush; there the removal is confirmed unflushed.
+        assert_eq!(
+            retirement.root_durability(),
+            if cfg!(windows) {
+                Durability::Unproven
+            } else {
+                Durability::Synced
+            }
+        );
         assert_eq!(retirement.confirmation(), Confirmation::Confirmed);
         assert!(retirement.failures().is_empty());
         assert!(!temp.path().join("backup/hosted/binding.json").exists());

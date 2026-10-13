@@ -40,7 +40,7 @@ solstone-core-journal-io.workspace = true
 solstone-core-journal-config-write.workspace = true
 solstone-core-system.workspace = true
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
 socket2.workspace = true
 

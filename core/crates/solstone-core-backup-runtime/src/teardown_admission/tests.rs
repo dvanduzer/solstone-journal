@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+#[cfg(not(windows))]
 use super::*;
 
 #[cfg(unix)]
@@ -196,7 +197,7 @@ mod unix {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[test]
 fn unsupported_refuses_before_lock_or_state_read() {
     let temp = tempfile::tempdir().unwrap();

@@ -59,13 +59,28 @@ pub enum BoundConfigConfirmationRefusal {
     Different,
 }
 
+/// Whether the parent directory entry of a publication was flushed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryFlush {
+    Synced,
+    /// The flush ran and failed; `durability_uncertainty` holds why.
+    Failed,
+    /// This platform has no directory flush (Windows), so none was attempted.
+    Unavailable,
+}
+
 /// Independent facts after an actual retained-parent publication.
 #[derive(Debug)]
 pub struct BoundConfigPublication {
     /// Fingerprint of the actual serialized candidate, including its final newline.
     pub candidate_sha256: String,
-    /// Metadata only. Configuration content is deliberately excluded.
-    pub published_file: solstone_core_journal_io::FlatDirectoryEntry,
+    /// Metadata only. Configuration content is deliberately excluded. None only
+    /// when the published file could not be observed again (Windows), in which
+    /// case `confirmation_refusal` says why.
+    pub published_file: Option<solstone_core_journal_io::FlatDirectoryEntry>,
+    /// The full native identity of the published file, under the same rule.
+    pub published_identity: Option<solstone_core_journal_io::media::MediaIdentity>,
+    pub directory_flush: DirectoryFlush,
     pub durability_uncertainty: Option<io::Error>,
     pub observation_uncertainty: Option<io::Error>,
     pub confirmation_refusal: Option<BoundConfigConfirmationRefusal>,
@@ -90,7 +105,7 @@ pub fn conditional_update_journal_config_at_root(
     update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
     options: LockOptions,
 ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         root.revalidate_canonical_binding()
             .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
@@ -107,7 +122,7 @@ pub fn conditional_update_journal_config_at_root(
             options,
         )
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, expected_sha256, update, options);
         Err(BoundConfigRefusal::Unsupported)
@@ -126,7 +141,11 @@ pub fn conditional_update_journal_config_in_directory(
     {
         unix::update(root, directory, expected_sha256, update, options)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::update(root, directory, expected_sha256, update, options)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (root, directory, expected_sha256, update, options);
         Err(BoundConfigRefusal::Unsupported)
@@ -208,9 +227,19 @@ mod unix {
         };
         run_hook(Checkpoint::BeforeConfirmation);
         let confirmation_refusal = confirm(root, directory, &parent, &observation, &bytes).err();
+        let published_identity = MediaIdentity::Unix {
+            device: observation.entry.device,
+            inode: observation.entry.inode,
+        };
         Ok(BoundConfigOutcome::Published(BoundConfigPublication {
             candidate_sha256,
-            published_file: observation.entry,
+            published_file: Some(observation.entry),
+            published_identity: Some(published_identity),
+            directory_flush: if durability_uncertainty.is_some() {
+                DirectoryFlush::Failed
+            } else {
+                DirectoryFlush::Synced
+            },
             durability_uncertainty,
             observation_uncertainty,
             confirmation_refusal,
@@ -274,6 +303,178 @@ mod unix {
             return Err(BoundConfigConfirmationRefusal::Different);
         }
         validate(root, directory, parent).map_err(BoundConfigConfirmationRefusal::Admission)
+    }
+}
+
+/// Windows publishes through the same retained parent and lock. It has no
+/// directory flush, so a publication reports `DirectoryFlush::Unavailable`.
+#[cfg(windows)]
+mod windows {
+    use std::ffi::OsStr;
+
+    use solstone_core_journal_config::{
+        JournalConfigRead, fingerprint_journal_config_bytes, read_journal_config_in_directory,
+    };
+    use solstone_core_journal_io::atomic::{
+        BoundAtomicPublishError, atomic_replace_detailed_bound,
+    };
+    use solstone_core_journal_io::media::MediaDirectory;
+    use solstone_core_journal_io::{
+        DetailedAtomicOutcome, WindowsFlatDirectory, acquire_existing_parent_lock_bound,
+        open_windows_flat_directory_bound, read_windows_observed_file_bounded,
+    };
+
+    use super::*;
+
+    pub(super) fn update(
+        root: &Arc<JournalRoot>,
+        directory: &MediaDirectory,
+        expected: &str,
+        update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
+        options: LockOptions,
+    ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+        root.revalidate_canonical_binding().map_err(admission)?;
+        directory.revalidate().map_err(admission)?;
+        let parent = open_parent(root).map_err(BoundConfigRefusal::Admission)?;
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        let initial = read_journal_config_in_directory(directory, MAX_BOUND_CONFIG_BYTES)
+            .map_err(BoundConfigRefusal::Load)?;
+        require_expected(&initial, expected)?;
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        let lock = acquire_existing_parent_lock_bound(
+            &parent,
+            OsStr::new("journal.json.lock"),
+            options.timeout,
+            options.poll_interval,
+        )
+        .map_err(BoundConfigRefusal::Lock)?;
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        let locked = read_journal_config_in_directory(directory, MAX_BOUND_CONFIG_BYTES)
+            .map_err(BoundConfigRefusal::Load)?;
+        require_expected(&locked, expected)?;
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        let config = locked.config.as_ref().ok_or(BoundConfigRefusal::Missing)?;
+        let Some(replacement) = update(config) else {
+            return Ok(BoundConfigOutcome::Unchanged);
+        };
+        let mut bytes =
+            serde_json::to_vec_pretty(&replacement).map_err(BoundConfigRefusal::Serialize)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_BOUND_CONFIG_BYTES {
+            return Err(BoundConfigRefusal::TooLarge);
+        }
+        let candidate_sha256 = fingerprint_journal_config_bytes(&bytes);
+        validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
+        let outcome = atomic_replace_detailed_bound(
+            &parent,
+            &lock,
+            OsStr::new("journal.json"),
+            &bytes,
+            0o600,
+        )
+        .map_err(|error| match error {
+            BoundAtomicPublishError::Atomic(error) => BoundConfigRefusal::Write(error),
+            other => BoundConfigRefusal::Admission(Box::new(other)),
+        })?;
+        // Windows has no directory flush: `Published` here names a rename that
+        // landed, never a synced parent.
+        let (durability_uncertainty, path_uncertainty) = match outcome {
+            DetailedAtomicOutcome::Published => (None, None),
+            DetailedAtomicOutcome::PublishedDurabilityUncertain { source } => (Some(source), None),
+            DetailedAtomicOutcome::PublishedParentPathRaced { sync_error } => (
+                sync_error,
+                Some(io::Error::other("retained config parent path changed")),
+            ),
+            DetailedAtomicOutcome::PublishedParentPathUnverified {
+                observation,
+                sync_error,
+            } => (sync_error, Some(observation)),
+        };
+        let observed = (|| {
+            validate(root, directory, &parent).map_err(io::Error::other)?;
+            let current = directory
+                .read_file_bounded(OsStr::new("journal.json"), MAX_BOUND_CONFIG_BYTES)?
+                .ok_or_else(|| io::Error::other("published config is missing"))?;
+            let flat = read_windows_observed_file_bounded(
+                &parent,
+                OsStr::new("journal.json"),
+                MAX_BOUND_CONFIG_BYTES,
+            )
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("published config is missing"))?;
+            validate(root, directory, &parent).map_err(io::Error::other)?;
+            Ok::<_, io::Error>((current, flat))
+        })();
+        // The rename landed: from here every outcome is a publication.
+        let (published_file, published_identity, confirmation_refusal) = match observed {
+            Ok((current, flat)) => {
+                let refusal = (!current.complete
+                    || current.bytes != bytes
+                    || flat.bytes != bytes
+                    || current.entry.size != flat.entry.size
+                    || !current.entry.identity.matches_flat_entry(&flat.entry))
+                .then_some(BoundConfigConfirmationRefusal::Different);
+                (Some(flat.entry), Some(current.entry.identity), refusal)
+            }
+            Err(error) => (
+                None,
+                None,
+                Some(BoundConfigConfirmationRefusal::Read(error)),
+            ),
+        };
+        Ok(BoundConfigOutcome::Published(BoundConfigPublication {
+            candidate_sha256,
+            published_file,
+            published_identity,
+            directory_flush: if durability_uncertainty.is_some() {
+                DirectoryFlush::Failed
+            } else {
+                DirectoryFlush::Unavailable
+            },
+            durability_uncertainty,
+            observation_uncertainty: path_uncertainty,
+            confirmation_refusal,
+        }))
+    }
+
+    fn open_parent(
+        root: &Arc<JournalRoot>,
+    ) -> Result<WindowsFlatDirectory, Box<dyn Error + Send + Sync>> {
+        open_windows_flat_directory_bound(&**root, OsStr::new("config"), root.canonical_path())?
+            .ok_or_else(|| io::Error::other("retained config parent is missing").into())
+    }
+
+    fn require_expected(
+        read: &JournalConfigRead,
+        expected: &str,
+    ) -> Result<(), BoundConfigRefusal> {
+        let actual = read.sha256.as_deref().ok_or(BoundConfigRefusal::Missing)?;
+        if actual != expected {
+            return Err(BoundConfigRefusal::Conflict);
+        }
+        Ok(())
+    }
+
+    fn admission(error: impl Error + Send + Sync + 'static) -> BoundConfigRefusal {
+        BoundConfigRefusal::Admission(Box::new(error))
+    }
+
+    fn validate(
+        root: &Arc<JournalRoot>,
+        directory: &MediaDirectory,
+        parent: &WindowsFlatDirectory,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        root.revalidate_canonical_binding()?;
+        directory.revalidate()?;
+        parent.revalidate_bound()?;
+        let current = open_parent(root)?;
+        if current.object_identity() != parent.object_identity()
+            || directory.object_identity() != parent.object_identity()
+        {
+            return Err(io::Error::other("retained config parent changed").into());
+        }
+        root.revalidate_canonical_binding()?;
+        Ok(())
     }
 }
 
@@ -907,6 +1108,96 @@ mod tests {
                 .join("config")
                 .join(error.orphan_stage.unwrap())
                 .is_dir()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(windows)]
+mod windows_tests {
+    use std::fs;
+
+    use serde_json::json;
+    use solstone_core_journal_config::read_journal_config_observed_in_directory;
+    use solstone_core_journal_io::media::MediaDirectory;
+
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        Arc<JournalRoot>,
+        Arc<MediaDirectory>,
+        String,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("config")).unwrap();
+        fs::write(
+            temp.path().join("config/journal.json"),
+            br#"{"backup":{"enabled":true},"other":7}"#,
+        )
+        .unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let directory = MediaDirectory::open(root.clone(), std::path::Path::new("config")).unwrap();
+        let (read, _) =
+            read_journal_config_observed_in_directory(&directory, MAX_BOUND_CONFIG_BYTES).unwrap();
+        (temp, root, directory, read.sha256.unwrap())
+    }
+
+    #[test]
+    fn windows_publishes_unflushed_through_the_retained_parent_and_confirms_it() {
+        let (temp, root, directory, sha) = fixture();
+        let outcome = conditional_update_journal_config_in_directory(
+            &root,
+            &directory,
+            &sha,
+            |config| {
+                let mut config = config.clone();
+                config.insert("backup".into(), json!({"enabled": false}));
+                Some(config)
+            },
+            LockOptions::default(),
+        )
+        .unwrap();
+        let BoundConfigOutcome::Published(publication) = outcome else {
+            panic!("expected a publication");
+        };
+        assert_eq!(publication.directory_flush, DirectoryFlush::Unavailable);
+        assert!(publication.durability_uncertainty.is_none());
+        assert!(publication.observation_uncertainty.is_none());
+        assert!(publication.confirmation_refusal.is_none());
+        let (read, entry) =
+            read_journal_config_observed_in_directory(&directory, MAX_BOUND_CONFIG_BYTES).unwrap();
+        assert_eq!(
+            read.sha256.as_deref(),
+            Some(publication.candidate_sha256.as_str())
+        );
+        let entry = entry.unwrap();
+        assert_eq!(Some(entry.identity), publication.published_identity);
+        assert!(
+            publication
+                .published_identity
+                .unwrap()
+                .matches_flat_entry(publication.published_file.as_ref().unwrap())
+        );
+        let written = fs::read_to_string(temp.path().join("config/journal.json")).unwrap();
+        assert!(written.contains("\"other\": 7") && written.contains("\"enabled\": false"));
+    }
+
+    #[test]
+    fn windows_refuses_a_changed_fingerprint_without_writing() {
+        let (temp, root, directory, _) = fixture();
+        let before = fs::read(temp.path().join("config/journal.json")).unwrap();
+        let refused = conditional_update_journal_config_in_directory(
+            &root,
+            &directory,
+            "sha256:0000",
+            |config| Some(config.clone()),
+            LockOptions::default(),
+        );
+        assert!(matches!(refused, Err(BoundConfigRefusal::Conflict)));
+        assert_eq!(
+            fs::read(temp.path().join("config/journal.json")).unwrap(),
+            before
         );
     }
 }

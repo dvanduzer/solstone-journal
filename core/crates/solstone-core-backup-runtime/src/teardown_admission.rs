@@ -55,9 +55,9 @@ pub struct TeardownAdmission {
     configuration: TeardownConfiguration,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod binding;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use binding::{
     BindingTeardownAdmission, BoundTeardownAdmission, TeardownBindingFailure,
     TeardownBindingRefusal, TeardownFinishAdmission,
@@ -67,9 +67,12 @@ pub use binding::{
 pub fn admit_teardown(
     root: Arc<JournalRoot>,
 ) -> Result<TeardownAdmission, TeardownAdmissionRefusal> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let lease = TeardownLease::try_acquire(root).map_err(activity_refusal)?;
+        // A teardown that ended mid-run left only an empty reservation; it
+        // must not hold this one.
+        solstone_core_journal_io::media::retire_orphan_root_carriers_for_teardown(&lease);
         let configuration = TeardownConfiguration::capture(lease.journal_root())
             .map_err(TeardownAdmissionRefusal::Configuration)?;
         let admitted = TeardownAdmission {
@@ -79,7 +82,7 @@ pub fn admit_teardown(
         admitted.revalidate()?;
         Ok(admitted)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = root;
         Err(TeardownAdmissionRefusal::Unsupported)
@@ -451,6 +454,8 @@ impl ClearedTeardownAdmission {
     }
 }
 
+/// A flush that ran and failed is refused. Windows has no directory flush, so
+/// its publication (`DirectoryFlush::Unavailable`) is accepted as it is.
 fn outcome_refusal(outcome: &BoundConfigOutcome) -> Option<TeardownClearRefusal> {
     let BoundConfigOutcome::Published(publication) = outcome else {
         return Some(TeardownClearRefusal::Unchanged);

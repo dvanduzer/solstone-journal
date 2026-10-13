@@ -143,11 +143,14 @@ mod unix {
         assert_eq!(cleared.check(&mut read_teardown_coverage), Ok(()));
         assert_eq!(fs::read(media).unwrap(), b"abc");
         drop(cleared);
-        assert_eq!(
-            check(&f.admit()),
-            Err(TeardownAdmissionRefusal::Reader(
-                TeardownReaderRefusal::RecoveryHeld
-            ))
+        // The next teardown retires the ended one's empty reservation before
+        // it observes anything, so that reservation doesn't hold it.
+        assert_eq!(check(&f.admit()), Ok(()));
+        assert!(
+            solstone_core_journal_io::activity_obligations::observe_obligations(&f.root)
+                .unwrap()
+                .entries()
+                .is_empty()
         );
     }
 

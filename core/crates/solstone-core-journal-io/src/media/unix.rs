@@ -448,6 +448,21 @@ pub(super) fn remove_leaf(parent: &Directory, name: &OsStr, _file: &File) -> io:
     unlinkat(parent, name, UnlinkatFlags::NoRemoveDir).map_err(Into::into)
 }
 
+/// Remove one empty child directory that still has `identity`. False when it
+/// is absent or another object; a directory holding anything refuses.
+pub(super) fn remove_empty_child(
+    parent: &Directory,
+    name: &OsStr,
+    identity: MediaIdentity,
+) -> io::Result<bool> {
+    match parent.open_child(name)? {
+        Some(child) if child.identity() == identity => {
+            remove_directory(parent, name, &child).map(|()| true)
+        }
+        _ => Ok(false),
+    }
+}
+
 pub(super) fn remove_directory(
     parent: &Directory,
     name: &OsStr,
