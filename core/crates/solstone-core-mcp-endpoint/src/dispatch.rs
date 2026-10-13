@@ -10,14 +10,12 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use solstone_core_format::agent_memory::{
-    ChainPredecessor, Coordinate, Origin, ReadyDocument, SourceKey,
-};
+use solstone_core_format::agent_memory::{Coordinate, Origin, SourceKey};
 use solstone_core_indexer_query::{
     AdmittedCategory, ConnectionBoundary, ConnectionScope, ConnectionSearchRequest,
-    ConnectionStartAfter, IndexedEntry, MemoryOriginalRow, OwnMemoryOpenError, QueryBoundary,
-    open_own_memory_index, read_indexed_entry, read_indexed_path_entries, read_own_memory_row,
-    search_connection,
+    ConnectionStartAfter, IndexedEntry, OwnMemoryOpenError, QueryBoundary,
+    memory_row_matches_original, open_own_memory_index, read_indexed_entry,
+    read_indexed_path_entries, read_own_memory_row, search_connection,
 };
 use solstone_core_indexer_store::classification::{FacetDeclarationSet, classify_source};
 use solstone_core_journal_io::paths::{
@@ -1451,48 +1449,12 @@ fn memory_hit_origin(journal_root: &Path, path: &str, stream: &str) -> Option<Or
     let row = read_own_memory_row(&connection, source_key.as_str(), path)
         .ok()
         .flatten()?;
-    memory_row_matches_live(&row, &source_key, &coordinate, &live.0, &live.1, &live.2)
+    memory_row_matches_original(&row, &source_key, &coordinate, &live.0, &live.1, &live.2)
         .then_some(live.1)
 }
 
 fn public_memory_origin(origin: &Origin) -> Value {
     json!({"kind": origin.kind, "creation_label": origin.creation_label, "created_at": origin.created_at})
-}
-
-pub(crate) fn memory_row_matches_live(
-    row: &MemoryOriginalRow,
-    source_key: &SourceKey,
-    coordinate: &Coordinate,
-    bytes: &[u8],
-    origin: &Origin,
-    ready: &ReadyDocument,
-) -> bool {
-    let Ok(cached_origin) = serde_json::from_str::<Origin>(&row.origin_json) else {
-        return false;
-    };
-    let Ok(cached_chain) = serde_json::from_str::<ChainPredecessor>(&row.chain_json) else {
-        return false;
-    };
-    let Ok(cached_created_at) = chrono::DateTime::parse_from_rfc3339(&row.created_at) else {
-        return false;
-    };
-    row.path
-        == format!(
-            "{}/{}/{}/note.txt",
-            coordinate.day, coordinate.stream, coordinate.segment
-        )
-        && row.day == coordinate.day
-        && row.stream == coordinate.stream
-        && row.segment == coordinate.segment
-        && row.source_key == source_key.as_str()
-        && row.bytes == bytes
-        && cached_origin == *origin
-        && row.digest == ready.digest
-        && row.byte_count == bytes.len()
-        && row.byte_count == ready.byte_count
-        && row.creation_label == origin.creation_label
-        && cached_created_at.with_timezone(&Utc) == ready.created_at
-        && cached_chain == ready.chain
 }
 
 fn list_facets(

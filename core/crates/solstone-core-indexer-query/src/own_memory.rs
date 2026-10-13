@@ -9,6 +9,9 @@ use std::time::Duration;
 use chrono::NaiveDate;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
+use solstone_core_format::agent_memory::{
+    ChainPredecessor, Coordinate, Origin, ReadyDocument, SourceKey,
+};
 use solstone_core_indexer_store::db::{IndexBuildLifecycle, db_path, read_index_build_state};
 
 use crate::compile::{CompileOutcome, compile_query};
@@ -36,6 +39,46 @@ pub struct MemoryOriginalRow {
     pub created_at: String,
     pub creation_label: String,
     pub chain_json: String,
+}
+
+/// Compare a cached row to an original already validated by the memory reader.
+/// Call only with the bytes, origin and readiness from `OriginalRead::Ready`.
+/// Cached timestamps compare by instant, and cached JSON compares as typed data.
+/// This does not validate originals, authorize access or read journal state.
+pub fn memory_row_matches_original(
+    row: &MemoryOriginalRow,
+    source_key: &SourceKey,
+    coordinate: &Coordinate,
+    bytes: &[u8],
+    origin: &Origin,
+    ready: &ReadyDocument,
+) -> bool {
+    let Ok(cached_origin) = serde_json::from_str::<Origin>(&row.origin_json) else {
+        return false;
+    };
+    let Ok(cached_chain) = serde_json::from_str::<ChainPredecessor>(&row.chain_json) else {
+        return false;
+    };
+    let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(&row.created_at) else {
+        return false;
+    };
+    row.path
+        == format!(
+            "{}/{}/{}/note.txt",
+            coordinate.day, coordinate.stream, coordinate.segment
+        )
+        && row.day == coordinate.day
+        && row.stream == coordinate.stream
+        && row.segment == coordinate.segment
+        && row.source_key == source_key.as_str()
+        && row.bytes == bytes
+        && row.digest == ready.digest
+        && row.byte_count == bytes.len()
+        && row.byte_count == ready.byte_count
+        && row.creation_label == origin.creation_label
+        && cached_origin == *origin
+        && created_at.with_timezone(&chrono::Utc) == ready.created_at
+        && cached_chain == ready.chain
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -312,12 +355,149 @@ fn append_date_predicate(sql: &mut String, values: &mut Vec<Value>, query: &OwnM
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use solstone_core_format::agent_memory::{
+        OperationRecord, OriginKind, Readiness, digest, ready_document, validate_complete_original,
+    };
 
     use super::*;
 
     fn reference_date() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()
+    }
+
+    fn original_fixture() -> (MemoryOriginalRow, ReadyDocument) {
+        let source = SourceKey::from_verified_id("test connection");
+        let bytes = b"a saved memory".to_vec();
+        let record = OperationRecord {
+            operation_id: "op:1".into(),
+            digest: digest(&bytes),
+            byte_count: bytes.len(),
+            created_at: Utc.with_ymd_and_hms(2026, 9, 1, 3, 4, 5).unwrap(),
+            origin_kind: OriginKind::AgentMemory,
+            creation_label: "test connection".into(),
+            coordinate: Coordinate {
+                day: "20260901".into(),
+                stream: format!("agent-memory-{}", source.component()),
+                segment: "030405_1".into(),
+            },
+            phase: Readiness::Chained,
+            chain: Some(ChainPredecessor {
+                prev_day: None,
+                prev_segment: None,
+                seq: 1,
+            }),
+        };
+        let ready = ready_document(&record, &source).unwrap();
+        validate_complete_original(
+            &ready,
+            &source,
+            &ready.coordinate,
+            &ready.origin,
+            &ready.chain,
+            &bytes,
+        )
+        .unwrap();
+        let row = MemoryOriginalRow {
+            path: format!(
+                "{}/{}/{}/note.txt",
+                ready.coordinate.day, ready.coordinate.stream, ready.coordinate.segment
+            ),
+            day: ready.coordinate.day.clone(),
+            stream: ready.coordinate.stream.clone(),
+            segment: ready.coordinate.segment.clone(),
+            source_key: source.as_str().into(),
+            bytes,
+            origin_json: serde_json::to_string(&ready.origin).unwrap(),
+            digest: ready.digest.clone(),
+            byte_count: ready.byte_count,
+            created_at: ready.created_at.to_rfc3339(),
+            creation_label: ready.origin.creation_label.clone(),
+            chain_json: serde_json::to_string(&ready.chain).unwrap(),
+        };
+        (row, ready)
+    }
+
+    fn matches_original(row: &MemoryOriginalRow, ready: &ReadyDocument) -> bool {
+        memory_row_matches_original(
+            row,
+            &ready.source_key,
+            &ready.coordinate,
+            b"a saved memory",
+            &ready.origin,
+            ready,
+        )
+    }
+
+    #[test]
+    fn cached_memory_equality_rejects_each_changed_row_field() {
+        let (row, ready) = original_fixture();
+        assert!(matches_original(&row, &ready));
+        type RowChange = (&'static str, fn(&mut MemoryOriginalRow));
+        let changes: [RowChange; 12] = [
+            ("path", |row| row.path.push('x')),
+            ("day", |row| row.day = "20260902".into()),
+            ("stream", |row| row.stream.push('x')),
+            ("segment", |row| row.segment = "030406_1".into()),
+            ("source_key", |row| {
+                row.source_key = SourceKey::from_verified_id("other connection")
+                    .as_str()
+                    .into();
+            }),
+            ("bytes", |row| row.bytes[0] = b'A'),
+            ("origin_json", |row| {
+                let mut origin: Origin = serde_json::from_str(&row.origin_json).unwrap();
+                origin.creation_label = "other label".into();
+                row.origin_json = serde_json::to_string(&origin).unwrap();
+            }),
+            ("digest", |row| row.digest = digest(b"other memory")),
+            ("byte_count", |row| row.byte_count += 1),
+            ("created_at", |row| {
+                row.created_at = "2026-09-01T03:04:06Z".into()
+            }),
+            ("creation_label", |row| {
+                row.creation_label = "other label".into()
+            }),
+            ("chain_json", |row| {
+                let mut chain: ChainPredecessor = serde_json::from_str(&row.chain_json).unwrap();
+                chain.seq += 1;
+                row.chain_json = serde_json::to_string(&chain).unwrap();
+            }),
+        ];
+        for (field, change) in changes {
+            let mut changed = row.clone();
+            change(&mut changed);
+            assert!(!matches_original(&changed, &ready), "changed {field}");
+        }
+    }
+
+    #[test]
+    fn cached_memory_equality_compares_timestamp_instants_and_typed_json() {
+        let (mut row, ready) = original_fixture();
+        for timestamp in [
+            "2026-09-01T03:04:05Z",
+            "2026-09-01T03:04:05+00:00",
+            "2026-08-31T21:04:05-06:00",
+        ] {
+            row.created_at = timestamp.into();
+            row.origin_json = serde_json::to_string_pretty(&ready.origin).unwrap();
+            row.chain_json = serde_json::to_string_pretty(&ready.chain).unwrap();
+            assert!(matches_original(&row, &ready), "{timestamp}");
+        }
+    }
+
+    #[test]
+    fn cached_memory_equality_rejects_malformed_cached_metadata() {
+        let (row, ready) = original_fixture();
+        for field in ["origin", "chain", "created_at"] {
+            let mut changed = row.clone();
+            match field {
+                "origin" => changed.origin_json = "{".into(),
+                "chain" => changed.chain_json = "{".into(),
+                _ => changed.created_at = "not a timestamp".into(),
+            }
+            assert!(!matches_original(&changed, &ready), "malformed {field}");
+        }
     }
 
     #[test]
