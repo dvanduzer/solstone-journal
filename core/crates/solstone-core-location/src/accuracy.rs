@@ -284,6 +284,19 @@ pub fn read_installed(journal: &Path) -> Option<Installed> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Read the install record for a fingerprint.
+///
+/// A missing file is no install. Other IO and invalid JSON are errors.
+pub fn read_installed_strict(journal: &Path) -> std::io::Result<Option<Installed>> {
+    match std::fs::read(accuracy_root(journal).join(INSTALLED_RECORD)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn open_installed(journal: &Path, installed: &Installed) -> Packs {
     let directory = installed.directory(journal);
     let mut venues = None;

@@ -28,6 +28,11 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                 .ok_or("interface address required")?
                 .parse()
                 .map_err(|e: std::net::AddrParseError| e.to_string())?;
+            // Android loads the packaged runtime from its read-only native library directory.
+            let library = command["onnx_library"]
+                .as_str()
+                .ok_or("ONNX runtime library required")?;
+            ort::init_from(library).map_err(|e| e.to_string())?.commit();
             *server = Some(journal_mobile_serving::MobileServing::start_with_payload(
                 root.to_path_buf(),
                 address,
@@ -43,6 +48,23 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
         }
         "status" => Ok(server.as_ref().ok_or("server stopped")?.status()),
         "index" => server.as_ref().ok_or("server stopped")?.index(),
+        "audio-enable" => {
+            let files = root.parent().ok_or("app files missing")?;
+            server.as_mut().ok_or("server stopped")?.enable_audio(
+                files.join("audio-models"),
+                files.join("audio-models/tdt-0.6b-v3-q8_0.gguf"),
+                files.join("audio-scratch"),
+            )?;
+            Ok(server.as_ref().unwrap().status())
+        }
+        "audio-cancel" => {
+            server.as_ref().ok_or("server stopped")?.cancel_audio()?;
+            Ok(json!({"cancel_requested":true}))
+        }
+        "audio-resume" => {
+            server.as_ref().ok_or("server stopped")?.resume_audio()?;
+            Ok(json!({"resumed":true}))
+        }
         "owner" => {
             let response = server.as_ref().ok_or("server stopped")?.request_owner(
                 command["method"].as_str().ok_or("method required")?,

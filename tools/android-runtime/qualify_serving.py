@@ -224,7 +224,7 @@ class Qualification:
         self.control('stop')
         self.network(method='GET', uri='/api/system/status', allow_error=True)
         self.shell('am', 'force-stop', PACKAGE)
-        snapshot = self.command(self.adb + ['exec-out', 'run-as', PACKAGE, 'tar', '-cf', '-', 'files']).stdout
+        snapshot = self.command(self.adb + ['exec-out', 'run-as', PACKAGE, 'tar', '-cf', '-', 'files/synthetic-serving-journal', 'files/worker-evidence.jsonl']).stdout
         (self.out / 'files.tar').write_bytes(snapshot)
         self.verify_snapshot()
         self.event('complete', passed=True, source_records=len(self.expected))
@@ -273,6 +273,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--adb', default='adb')
     p.add_argument('--serial', default='RZGL11XCS9D')
+    p.add_argument('--package', default=PACKAGE)
     p.add_argument('--host', required=True)
     p.add_argument('--port', type=int, default=7657)
     p.add_argument('--client', required=True)
@@ -281,6 +282,10 @@ def main():
     p.add_argument('--duration', type=float, default=1200)
     p.add_argument('--interval', type=float, default=5)
     args = p.parse_args()
+    if args.package not in ('app.solstone.development.journal','app.solstone.development.journal.audio'):
+        p.error('development application required')
+    globals()['PACKAGE'] = args.package
+    globals()['ACTIVITY'] = args.package + '/app.solstone.development.journal.ServingActivity'
     q = Qualification(args)
     try:
         q.run()

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solstone_core_journal_io::{
-    AtomicWriteOptions, DailyUnitAuthority, LockOptions, atomic_replace, hold_lock,
+    AtomicWriteOptions, DailyUnitAuthority, FileLock, LockOptions, atomic_replace, hold_lock,
 };
 
 use super::WriteIntent;
@@ -543,6 +543,7 @@ pub fn publish_daily_publication(
     publication: &PreparedDailyPublication,
     context: &ExecutionContext,
     changed_paths: &mut Vec<String>,
+    admission: Option<FileLock>,
 ) -> Result<CommitDisposition, StageError> {
     let record = authority
         .record()
@@ -578,6 +579,7 @@ pub fn publish_daily_publication(
     authority
         .checkpoint()
         .map_err(|e| make_error(e.to_string()))?;
+    let admission = std::cell::RefCell::new(admission);
     for (index, action) in publication.actions.iter().enumerate() {
         authority
             .require_token(token)
@@ -606,6 +608,7 @@ pub fn publish_daily_publication(
             authority
                 .checkpoint()
                 .map_err(|e| make_error(e.to_string()))?;
+            drop(admission.borrow_mut().take());
         }
         let auth_cell = std::cell::RefCell::new(&mut *authority);
         let start = || -> Result<(), String> {
@@ -627,6 +630,7 @@ pub fn publish_daily_publication(
                     "state": "started"
                 }));
                 auth.checkpoint().map_err(|e| e.to_string())?;
+                drop(admission.borrow_mut().take());
             }
             Ok(())
         };
@@ -993,7 +997,7 @@ mod tests {
             record.action_plan = Some(serde_json::to_value(&plan).unwrap());
             *authority.record_mut() = Some(record);
             authority.checkpoint()?;
-            publish_daily_publication(authority, "attempt", &plan, &context, &mut Vec::new())
+            publish_daily_publication(authority, "attempt", &plan, &context, &mut Vec::new(), None)
                 .unwrap();
             Ok(())
         })
@@ -1018,11 +1022,25 @@ mod tests {
             authority.record_mut().as_mut().unwrap().lock_token = Some("replacement".into());
             authority.checkpoint()?;
             assert!(
-                publish_daily_publication(authority, "attempt", &plan, &context, &mut Vec::new())
-                    .is_err()
+                publish_daily_publication(
+                    authority,
+                    "attempt",
+                    &plan,
+                    &context,
+                    &mut Vec::new(),
+                    None
+                )
+                .is_err()
             );
-            publish_daily_publication(authority, "replacement", &plan, &context, &mut Vec::new())
-                .unwrap();
+            publish_daily_publication(
+                authority,
+                "replacement",
+                &plan,
+                &context,
+                &mut Vec::new(),
+                None,
+            )
+            .unwrap();
             Ok(())
         })
         .unwrap();
@@ -1114,8 +1132,15 @@ mod tests {
         with_daily_unit_authority(journal, &identity, |authority| {
             authority.record_mut().as_mut().unwrap().lock_token = Some("replacement".into());
             authority.checkpoint()?;
-            publish_daily_publication(authority, "replacement", &plan, &context, &mut Vec::new())
-                .unwrap();
+            publish_daily_publication(
+                authority,
+                "replacement",
+                &plan,
+                &context,
+                &mut Vec::new(),
+                None,
+            )
+            .unwrap();
             let record = authority.record().unwrap();
             assert_eq!(
                 record.action_plan.as_ref(),
@@ -1150,8 +1175,15 @@ mod tests {
         assert_eq!(history_after.len(), history_before.len() + 1);
         let history_finished = history_after;
         with_daily_unit_authority(journal, &identity, |authority| {
-            publish_daily_publication(authority, "replacement", &plan, &context, &mut Vec::new())
-                .unwrap();
+            publish_daily_publication(
+                authority,
+                "replacement",
+                &plan,
+                &context,
+                &mut Vec::new(),
+                None,
+            )
+            .unwrap();
             Ok(())
         })
         .unwrap();
@@ -1213,6 +1245,7 @@ mod tests {
                 &plan,
                 &context,
                 &mut Vec::new(),
+                None,
             )
             .unwrap_err();
             assert_eq!(error.phase, "conflict");
@@ -1326,9 +1359,15 @@ mod tests {
             *authority.record_mut() = Some(record);
             authority.checkpoint()?;
 
-            let err =
-                publish_daily_publication(authority, "attempt-1", &plan, &context, &mut Vec::new())
-                    .unwrap_err();
+            let err = publish_daily_publication(
+                authority,
+                "attempt-1",
+                &plan,
+                &context,
+                &mut Vec::new(),
+                None,
+            )
+            .unwrap_err();
             assert_eq!(err.talent, "entities:entities_review");
             assert_eq!(err.day(), "20260910");
             assert_eq!(err.facet(), Some("work"));
@@ -1414,6 +1453,7 @@ mod tests {
                 &plan,
                 &context,
                 &mut Vec::new(),
+                None,
             )
             .unwrap_err();
             assert_eq!(err.phase, "conflict");
@@ -2165,6 +2205,7 @@ mod tests {
                         journal: root.path().into(),
                     },
                     &mut Vec::new(),
+                    None,
                 )
                 .unwrap_err();
                 assert_eq!(error.phase, "conflict", "{kind}: {error:?}");
@@ -2536,9 +2577,15 @@ mod tests {
             record.action_plan = Some(serde_json::to_value(&plan).unwrap());
             *authority.record_mut() = Some(record);
             authority.checkpoint()?;
-            let err =
-                publish_daily_publication(authority, "attempt-1", &plan, &context, &mut Vec::new())
-                    .unwrap_err();
+            let err = publish_daily_publication(
+                authority,
+                "attempt-1",
+                &plan,
+                &context,
+                &mut Vec::new(),
+                None,
+            )
+            .unwrap_err();
             assert_eq!(err.phase, "conflict");
             assert_eq!(err.talent, "entities:entities_review");
             assert_eq!(err.day(), "20260910");
@@ -2599,7 +2646,8 @@ mod tests {
             record.action_plan = Some(serde_json::to_value(&plan).unwrap());
             *authority.record_mut() = Some(record);
             authority.checkpoint()?;
-            publish_daily_publication(authority, "noop", &plan, &context, &mut Vec::new()).unwrap();
+            publish_daily_publication(authority, "noop", &plan, &context, &mut Vec::new(), None)
+                .unwrap();
             let binding = authority.record();
             let current = binding.as_ref().unwrap();
             assert!(!current.has_uncommitted_started_receipt());
@@ -2752,9 +2800,15 @@ mod tests {
             record.action_plan = Some(serde_json::to_value(&plan).unwrap());
             *authority.record_mut() = Some(record);
             authority.checkpoint()?;
-            let error =
-                publish_daily_publication(authority, "guard", &plan, &context, &mut Vec::new())
-                    .unwrap_err();
+            let error = publish_daily_publication(
+                authority,
+                "guard",
+                &plan,
+                &context,
+                &mut Vec::new(),
+                None,
+            )
+            .unwrap_err();
             assert_eq!(error.owner_conflict_kind(), Some("owning_facet_changed"));
             assert!(
                 !authority
@@ -2826,9 +2880,15 @@ mod tests {
             record.action_plan = Some(serde_json::to_value(&plan).unwrap());
             *authority.record_mut() = Some(record);
             authority.checkpoint()?;
-            let error =
-                publish_daily_publication(authority, "malformed", &plan, &context, &mut Vec::new())
-                    .unwrap_err();
+            let error = publish_daily_publication(
+                authority,
+                "malformed",
+                &plan,
+                &context,
+                &mut Vec::new(),
+                None,
+            )
+            .unwrap_err();
             assert_eq!(error.phase, "publication");
             assert_eq!(error.reason_code(), "talent_stage_failed");
             assert_eq!(error.owner_conflict_kind(), None);

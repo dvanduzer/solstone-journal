@@ -203,6 +203,48 @@ pub(crate) fn execute_with_paths(
         return finished(&record)
             .unwrap_or_else(|error| RuntimeOutcome::StageFailed(failure(name, error)));
     }
+    // Refuse a stale receipt-free packet before spending a model call or retry
+    // permission. The final check repeats under the source admission guard.
+    let ready = with_daily_unit_authority(&context.journal, &identity, |authority| {
+        authority.require_token(token)?;
+        let record = authority.record().expect("token requires record");
+        if crate::daily_location::has_owner_actions(record) {
+            return Ok(None);
+        }
+        let freshness = crate::daily_location::daily_location_freshness(
+            &context.journal,
+            name,
+            day,
+            record.frozen_packet.as_ref(),
+        );
+        match freshness {
+            Ok(
+                crate::daily_location::DailyLocationFreshness::Reuse
+                | crate::daily_location::DailyLocationFreshness::NotApplicable,
+            ) => Ok(None),
+            Ok(crate::daily_location::DailyLocationFreshness::Stale) => {
+                let record = authority.record_mut().as_mut().expect("authority");
+                record.frozen_packet = None;
+                record.packet_digest = None;
+                record.generated_result = None;
+                record.action_plan = None;
+                authority.checkpoint()?;
+                Ok(Some("daily location stale"))
+            }
+            _ => Ok(Some("daily location unreadable")),
+        }
+    });
+    match ready {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            return RuntimeOutcome::Skipped {
+                stage: "daily".into(),
+                talent: name.into(),
+                reason: reason.into(),
+            };
+        }
+        Err(error) => return RuntimeOutcome::StageFailed(failure(name, error)),
+    }
     if let Some(value) = request.get("_work_retry") {
         let permission = (|| -> Result<(), String> {
             use solstone_core_system::work_retry::{self, Attempt, Unit};
@@ -265,8 +307,87 @@ pub(crate) fn execute_with_paths(
     };
     // Model execution holds no publication lock. The check below is repeated
     // while holding the authority through every actual owner write and receipt.
+    let first_publication = !crate::daily_location::has_owner_actions(&record);
+    let needs_admission = first_publication
+        && match crate::daily_location::location_applies(&context.journal, name, day) {
+            Ok(applies) => applies,
+            Err(_) => {
+                return RuntimeOutcome::Skipped {
+                    stage: "daily".into(),
+                    talent: name.into(),
+                    reason: "daily location unreadable".into(),
+                };
+            }
+        };
+    let mut admission = if needs_admission {
+        match solstone_core_journal_io::hold_daily_location_admission(&context.journal) {
+            Ok(lock) => Some(lock),
+            Err(_) => {
+                return RuntimeOutcome::Skipped {
+                    stage: "daily".into(),
+                    talent: name.into(),
+                    reason: "daily location admission unavailable".into(),
+                };
+            }
+        }
+    } else {
+        None
+    };
     let result = with_daily_unit_authority(&context.journal, &identity, |authority| {
         authority.require_token(token)?;
+        let stored_packet = authority
+            .record()
+            .and_then(|record| record.frozen_packet.clone());
+        let recovering = authority
+            .record()
+            .is_some_and(crate::daily_location::has_owner_actions);
+        let freshness = if recovering {
+            Ok(crate::daily_location::DailyLocationFreshness::NotApplicable)
+        } else if crate::daily_location::location_applies(&context.journal, name, day)
+            .unwrap_or(true)
+            && admission.is_none()
+        {
+            Err("first publication requires location admission".into())
+        } else {
+            crate::daily_location::publication_location_freshness(
+                &context.journal,
+                name,
+                day,
+                stored_packet.as_ref(),
+            )
+        };
+        match freshness {
+            Err(_) | Ok(crate::daily_location::DailyLocationFreshness::Unreadable) => {
+                return Ok(Ok(RuntimeOutcome::Skipped {
+                    stage: "daily".to_owned(),
+                    talent: name.to_owned(),
+                    reason: "daily location unreadable".to_owned(),
+                }));
+            }
+            Ok(crate::daily_location::DailyLocationFreshness::Stale) => {
+                let record = authority.record_mut().as_mut().expect("authority");
+                let receipt = record
+                    .receipts
+                    .iter()
+                    .any(|item| item.get("kind").and_then(Value::as_str) == Some("owner_action"));
+                if !receipt {
+                    record.frozen_packet = None;
+                    record.packet_digest = None;
+                    record.generated_result = None;
+                    record.action_plan = None;
+                    authority.checkpoint()?;
+                }
+                return Ok(Ok(RuntimeOutcome::Skipped {
+                    stage: "daily".to_owned(),
+                    talent: name.to_owned(),
+                    reason: "daily location stale".to_owned(),
+                }));
+            }
+            Ok(
+                crate::daily_location::DailyLocationFreshness::Reuse
+                | crate::daily_location::DailyLocationFreshness::NotApplicable,
+            ) => {}
+        }
         let usage = generated.1.clone();
         let degraded = generated.2.clone();
         let outcome = publish(
@@ -278,6 +399,7 @@ pub(crate) fn execute_with_paths(
             generated,
             skip,
             writer,
+            admission.take(),
         );
         Ok(match outcome {
             Ok(outcome) => Ok(outcome),
@@ -376,6 +498,7 @@ fn publish(
     generated: crate::GeneratedTalentResponse,
     skip: bool,
     writer: &mut (impl Write + ?Sized),
+    mut admission: Option<solstone_core_journal_io::FileLock>,
 ) -> Result<RuntimeOutcome, StageError> {
     let name = &prepared.name;
     let record = authority.record().expect("checked publication authority");
@@ -429,6 +552,7 @@ fn publish(
         &publication,
         context,
         &mut changed_paths,
+        admission.take(),
     );
     // This branch is the configured writer, as in preparation above. Derive
     // ownership from the stage contract rather than adding it to retained plans.
@@ -497,6 +621,7 @@ mod tests {
     use super::*;
     use solstone_core_journal_io::{load_daily_unit_record, save_daily_unit_record};
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
     #[cfg(all(test, feature = "full-tests"))]
     use std::time::{Duration, Instant};
@@ -573,6 +698,7 @@ mod tests {
                     ("unused generated response".into(), None, None),
                     false,
                     &mut events,
+                    None,
                 );
                 let error = result.unwrap_err();
                 if mode != "later_action" {
@@ -2853,5 +2979,661 @@ mod tests {
         assert_every_action_committed(&outcome, &record);
         assert_eq!(aliases_of(&context.journal, "alice_smith"), ["AS"]);
         assert_eq!(aliases_of(&context.journal, "alan_shore"), ["Shore"]);
+    }
+
+    struct ClearPublicationBarrier;
+    impl Drop for ClearPublicationBarrier {
+        fn drop(&mut self) {
+            crate::daily_location::set_publication_location_barrier(None);
+        }
+    }
+
+    fn write_location_bytes(journal: &Path, bytes: &[u8]) -> std::path::PathBuf {
+        let path = journal.join("chronicle/20260101/phone/120000_1/location.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn activate_location(journal: &Path) {
+        fs::create_dir_all(journal.join("config")).unwrap();
+        fs::write(
+            journal.join("config/journal.json"),
+            r#"{"identity":{"timezone":"UTC"},"daily_inputs":{"location":{"location-words-1":"20260101"}}}"#,
+        )
+        .unwrap();
+    }
+
+    fn stamp_fingerprint(journal: &Path, identity: &DailyUnitIdentity, failure_count: u32) {
+        let mut record = load_daily_unit_record(journal, identity).unwrap().unwrap();
+        let fingerprint =
+            solstone_core_location::daily_location_fingerprint(journal, "20260101").unwrap();
+        let packet = record.frozen_packet.as_mut().unwrap();
+        packet["prepared"]["config"]["_daily_location_fingerprint"] = json!(fingerprint);
+        record.packet_digest = Some(crate::daily_prepare::packet_digest(packet));
+        record.failure_count = failure_count;
+        save_daily_unit_record(journal, &record).unwrap();
+    }
+
+    #[test]
+    fn receipt_free_matching_fingerprint_resumes_stored_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(root.path(), true);
+        activate_location(&context.journal);
+        stamp_fingerprint(&context.journal, &identity, 4);
+        let before = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::daily_location::daily_location_freshness(
+                &context.journal,
+                "morning_briefing",
+                "20260101",
+                before.frozen_packet.as_ref(),
+            ),
+            Ok(crate::daily_location::DailyLocationFreshness::Reuse)
+        );
+        let stored = before.frozen_packet.clone();
+        let generated = before.generated_result.clone();
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(root.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Finished { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert_ne!(record.status, DailyUnitStatus::Capped);
+        assert_eq!(record.status, DailyUnitStatus::Committed);
+        assert_eq!(record.frozen_packet, stored);
+        assert!(record.generated_result.is_some());
+        assert_eq!(
+            record
+                .generated_result
+                .as_ref()
+                .and_then(|value| value.get("response")),
+            generated.as_ref().and_then(|value| value.get("response"))
+        );
+        let output = fs::read_to_string(
+            context
+                .journal
+                .join("chronicle/20260101/talents/morning_briefing.md"),
+        )
+        .unwrap();
+        assert!(output.contains("retained evidence result"));
+        assert!(record.receipts.iter().any(|receipt| {
+            receipt["kind"] == "owner_action" && receipt["state"] == "committed"
+        }));
+    }
+
+    #[test]
+    fn fingerprint_change_before_dispatch_during_generation_and_before_saved_response_refuses_without_spending_failure_count()
+     {
+        let _barrier = ClearPublicationBarrier;
+        let during = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(during.path(), true);
+        activate_location(&context.journal);
+        let path = write_location_bytes(&context.journal, b"one\n");
+        stamp_fingerprint(&context.journal, &identity, 4);
+        crate::daily_location::set_publication_location_barrier(Some(Box::new(move || {
+            fs::write(&path, b"two\n").unwrap();
+        })));
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(during.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert_eq!(record.status, DailyUnitStatus::Unfinished);
+        assert!(record.frozen_packet.is_none());
+        assert!(record.packet_digest.is_none());
+        assert!(record.generated_result.is_none());
+        assert!(record.action_plan.is_none());
+        assert!(
+            !record
+                .receipts
+                .iter()
+                .any(|receipt| receipt["kind"] == "owner_action")
+        );
+        crate::daily_location::set_publication_location_barrier(None);
+
+        let saved = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(saved.path(), true);
+        activate_location(&context.journal);
+        write_location_bytes(&context.journal, b"one\n");
+        stamp_fingerprint(&context.journal, &identity, 4);
+        write_location_bytes(&context.journal, b"two\n");
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(saved.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert_ne!(record.status, DailyUnitStatus::Capped);
+        assert!(record.frozen_packet.is_none());
+        assert!(record.generated_result.is_none());
+    }
+
+    #[test]
+    fn entities_review_prewrite_conflict_still_reprepares() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ExecutionContext {
+            journal: root.path().join("journal"),
+        };
+        fs::create_dir_all(&context.journal).unwrap();
+        activate_location(&context.journal);
+        solstone_core_facets::create_facet(&context.journal, "work", "Work", "", "", "", None)
+            .unwrap();
+        for (day, name) in [("20260101", "Ada"), ("20260102", "Ada Lovelace")] {
+            solstone_core_facets::upsert_detection_segment(
+                &context.journal,
+                "work",
+                day,
+                "090000_300",
+                &[solstone_core_facets::DetectedEntityInput {
+                    entity_type: "Person".to_owned(),
+                    name: name.to_owned(),
+                    description: "Recurring collaborator.".to_owned(),
+                }],
+            )
+            .unwrap();
+        }
+        let source = solstone_core_entity_matching::entity_slug("Ada");
+        let target = solstone_core_entity_matching::entity_slug("Ada Lovelace");
+        let propose = |day: &str, summary: &str| {
+            let proposal = json!({"facet":"work", "day":day, "source":"Ada", "source_slug":source,
+                "target":"Ada Lovelace", "target_slug":target, "summary":summary});
+            let batch =
+                solstone_core_entity::prepare_merge_proposals(&context.journal, &[proposal])
+                    .unwrap();
+            solstone_core_entity::publish_merge_proposals(
+                &context.journal,
+                &batch,
+                true,
+                || Ok(()),
+                || Ok(()),
+            )
+            .unwrap();
+        };
+        propose("20260105", "first");
+        let location = context
+            .journal
+            .join("chronicle/20260108/phone/120000_1/location.jsonl");
+        fs::create_dir_all(location.parent().unwrap()).unwrap();
+        fs::write(&location, b"before\n").unwrap();
+        let prepared = PreparedTalent {
+            name: "entities:entities_review".to_owned(),
+            config: json!({
+                "day":"20260108", "facet":"work", "type":"generate", "max_output_tokens":1024,
+                "prompt":"review", "model":"test-model", "provider":"test",
+                "hook":{"pre":"entities:entities_review", "post":"entities:entities_review"},
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let packet = crate::daily_prepare::freeze(prepared, &context).unwrap();
+        assert!(
+            packet["prepared"]["config"]
+                .get("_daily_location_fingerprint")
+                .is_none()
+        );
+        let identity =
+            DailyUnitIdentity::new("20260108", "entities:entities_review", Some("work".into()));
+        let mut record = DailyUnitRecord::new(identity.clone(), "E", "C");
+        record.lock_token = Some("attempt".to_owned());
+        record.packet_digest = Some(crate::daily_prepare::packet_digest(&packet));
+        record.frozen_packet = Some(packet);
+        record.failure_count = 0;
+        record.generated_result = Some(json!({"response":json!({"promotions":[],
+            "merges":[{"source":"Ada", "canonical":"Ada Lovelace", "evidence":"same person"}]})
+        .to_string()}));
+        save_daily_unit_record(&context.journal, &record).unwrap();
+        fs::write(&location, b"after\n").unwrap();
+        propose("20260106", "second");
+        let outcome = execute(
+            json!({"name":"entities:entities_review","day":"20260108","facet":"work","lock_token":"attempt"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            &context,
+            &OneShotClient::at_path(root.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        let RuntimeOutcome::StageFailed(error) = outcome else {
+            panic!("expected a merge proposal conflict, got {outcome:?}")
+        };
+        assert_eq!(error.phase, "conflict");
+        assert_eq!(
+            error.owner_conflict_kind(),
+            Some("merge_proposal_preparation")
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 1);
+        assert_ne!(record.status, DailyUnitStatus::Capped);
+        assert!(record.frozen_packet.is_none());
+        assert!(record.generated_result.is_none());
+    }
+
+    #[test]
+    fn unreadable_place_store_accuracy_record_and_segment_listing_leave_failure_count() {
+        let places = tempfile::tempdir().unwrap();
+        let (context, identity, _) = fixture(places.path(), true);
+        activate_location(&context.journal);
+        stamp_fingerprint(&context.journal, &identity, 4);
+        fs::create_dir_all(context.journal.join("solstone/apps/map")).unwrap();
+        fs::write(context.journal.join("solstone/apps/map/places.json"), b"{").unwrap();
+        let (outcome, record) = {
+            let request =
+                json!({"name":"morning_briefing","day":"20260101","lock_token":"attempt-1"})
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            let outcome = execute(
+                request,
+                &context,
+                &OneShotClient::at_path(places.path().join("no-model")),
+                &mut Vec::new(),
+            );
+            let record = load_daily_unit_record(&context.journal, &identity)
+                .unwrap()
+                .unwrap();
+            (outcome, record)
+        };
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(record.failure_count, 4);
+        assert!(record.frozen_packet.is_some());
+        assert_eq!(record.status, DailyUnitStatus::Unfinished);
+
+        let accuracy = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(accuracy.path(), true);
+        activate_location(&context.journal);
+        stamp_fingerprint(&context.journal, &identity, 4);
+        let installed = context
+            .journal
+            .join("cache/location/accuracy/installed.json");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, b"{").unwrap();
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(accuracy.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert!(record.frozen_packet.is_some());
+        assert!(record.generated_result.is_some());
+
+        let listing = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(listing.path(), true);
+        activate_location(&context.journal);
+        stamp_fingerprint(&context.journal, &identity, 4);
+        let odd = context
+            .journal
+            .join("chronicle/20260101")
+            .join(std::ffi::OsStr::from_bytes(&[0xff]));
+        fs::create_dir_all(&odd).unwrap();
+        fs::write(odd.join("location.jsonl"), b"bytes").unwrap();
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(listing.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert_ne!(record.status, DailyUnitStatus::Capped);
+        assert!(record.frozen_packet.is_some());
+        assert!(record.generated_result.is_some());
+    }
+
+    #[test]
+    fn deleting_location_jsonl_with_stream_updated_unmoved_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(root.path(), true);
+        activate_location(&context.journal);
+        let location = write_location_bytes(&context.journal, b"present\n");
+        stamp_fingerprint(&context.journal, &identity, 4);
+        let marker = context
+            .journal
+            .join("chronicle/20260101/health/stream.updated");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"{\"generation\":7}").unwrap();
+        fs::remove_file(&location).unwrap();
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(root.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"{\"generation\":7}");
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert_eq!(record.status, DailyUnitStatus::Unfinished);
+        assert!(record.frozen_packet.is_none());
+        assert!(record.generated_result.is_none());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn publication_holds_the_admission_guard_until_the_started_receipt() {
+        let _barrier = ClearPublicationBarrier;
+        let held = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(held.path(), true);
+        activate_location(&context.journal);
+        stamp_fingerprint(&context.journal, &identity, 4);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let journal = context.journal.clone();
+        crate::daily_location::set_publication_location_barrier(Some(Box::new(move || {
+            let error = solstone_core_journal_io::hold_lock(
+                journal.join("health").join("daily-location-admission"),
+                solstone_core_journal_io::LockOptions {
+                    timeout: std::time::Duration::from_millis(50),
+                    ..solstone_core_journal_io::LockOptions::default()
+                },
+            );
+            let timed_out = matches!(
+                error,
+                Err(solstone_core_journal_io::LockError::Timeout(timeout))
+                    if timeout.timeout == std::time::Duration::from_millis(50)
+            );
+            sender.send(timed_out).unwrap();
+        })));
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(held.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(receiver.recv().unwrap());
+        assert!(
+            matches!(outcome, RuntimeOutcome::Finished { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert!(record.receipts.iter().any(|receipt| {
+            receipt["kind"] == "owner_action" && receipt["state"] == "committed"
+        }));
+        assert!(
+            !record
+                .receipts
+                .iter()
+                .any(|receipt| receipt["kind"] == "owner_action" && receipt["state"] == "started")
+        );
+        assert!(
+            context
+                .journal
+                .join("chronicle/20260101/talents/morning_briefing.md")
+                .is_file()
+        );
+        crate::daily_location::set_publication_location_barrier(None);
+
+        let changed = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(changed.path(), true);
+        activate_location(&context.journal);
+        let path = write_location_bytes(&context.journal, b"one\n");
+        stamp_fingerprint(&context.journal, &identity, 4);
+        crate::daily_location::set_publication_location_barrier(Some(Box::new(move || {
+            fs::write(&path, b"two\n").unwrap();
+        })));
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(changed.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.failure_count, 4);
+        assert_ne!(record.status, DailyUnitStatus::Capped);
+        assert!(
+            !record
+                .receipts
+                .iter()
+                .any(|receipt| receipt["kind"] == "owner_action")
+        );
+        assert!(record.frozen_packet.is_none());
+        assert!(record.generated_result.is_none());
+    }
+    #[test]
+    fn stale_before_generation_does_not_call_the_model() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(root.path(), false);
+        activate_location(&context.journal);
+        stamp_fingerprint(&context.journal, &identity, 4);
+        write_location_bytes(&context.journal, b"late arrival\n");
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(root.path().join("must-not-be-called")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert!(record.generated_result.is_none());
+        assert!(record.frozen_packet.is_none());
+        assert_eq!(record.failure_count, 4);
+    }
+
+    #[test]
+    fn owner_action_recovery_ignores_deleted_and_unreadable_location_without_replay() {
+        for state in ["committed", "started"] {
+            let root = tempfile::tempdir().unwrap();
+            let (context, identity, request) = fixture(root.path(), true);
+            activate_location(&context.journal);
+            let raw = write_location_bytes(&context.journal, b"present\n");
+            stamp_fingerprint(&context.journal, &identity, 4);
+            let client = OneShotClient::at_path(root.path().join("must-not-be-called"));
+            let first = execute(request.clone(), &context, &client, &mut Vec::new());
+            assert!(
+                matches!(first, RuntimeOutcome::Finished { .. }),
+                "{first:?}"
+            );
+            let mut before = load_daily_unit_record(&context.journal, &identity)
+                .unwrap()
+                .unwrap();
+            before.status = DailyUnitStatus::Unfinished;
+            before.accepted = None;
+            for receipt in &mut before.receipts {
+                if receipt["kind"] == "owner_action" {
+                    receipt["state"] = json!(state);
+                }
+            }
+            save_daily_unit_record(&context.journal, &before).unwrap();
+            fs::remove_file(raw).unwrap();
+            let accuracy = solstone_core_location::accuracy::accuracy_root(&context.journal);
+            fs::create_dir_all(&accuracy).unwrap();
+            fs::write(accuracy.join("installed.json"), b"{").unwrap();
+            let output = context
+                .journal
+                .join("chronicle/20260101/talents/morning_briefing.md");
+            let bytes = fs::read(&output).unwrap();
+            let recovered = execute(request, &context, &client, &mut Vec::new());
+            assert!(
+                matches!(recovered, RuntimeOutcome::Finished { .. }),
+                "{state}: {recovered:?}"
+            );
+            let after = load_daily_unit_record(&context.journal, &identity)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.frozen_packet, before.frozen_packet);
+            assert_eq!(after.packet_digest, before.packet_digest);
+            assert_eq!(after.action_plan, before.action_plan);
+            assert_eq!(
+                after.generated_result.as_ref().unwrap()["response"],
+                before.generated_result.as_ref().unwrap()["response"]
+            );
+            assert_eq!(fs::read(output).unwrap(), bytes);
+            assert!(!after.has_uncommitted_started_receipt());
+        }
+    }
+
+    #[test]
+    fn moved_named_place_refuses_saved_response_without_raw_changes() {
+        use solstone_core_location::places::{Place, PlaceStore};
+        let root = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(root.path(), true);
+        activate_location(&context.journal);
+        write_location_bytes(&context.journal, b"{\"schema\":\"solstone.location.segment/1\",\"source\":\"location\",\"kind\":\"location\",\"accuracy\":\"full\"}\n{\"schema\":\"solstone.location.visit/1\",\"arrival\":\"2026-01-01T12:00:00Z\",\"departure\":\"2026-01-01T13:00:00Z\",\"lat\":39.7527,\"lon\":-105.0001,\"h_acc\":25}\n");
+        PlaceStore {
+            version: 1,
+            places: vec![Place {
+                id: "same".into(),
+                latitude: 39.7527,
+                longitude: -105.0001,
+                name: Some("Studio".into()),
+                alias: None,
+                hidden: false,
+            }],
+        }
+        .write(&context.journal)
+        .unwrap();
+        stamp_fingerprint(&context.journal, &identity, 4);
+        PlaceStore::update(&context.journal, |store| store.places[0].latitude += 1.0).unwrap();
+        let outcome = execute(
+            request,
+            &context,
+            &OneShotClient::at_path(root.path().join("no-model")),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(outcome, RuntimeOutcome::Skipped { .. }),
+            "{outcome:?}"
+        );
+        let after = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert!(after.frozen_packet.is_none());
+        assert!(after.receipts.is_empty());
+        assert_eq!(after.failure_count, 4);
+    }
+    #[test]
+    fn unusable_advertised_accuracy_pack_refuses_and_restoration_publishes() {
+        for broken in ["missing", "truncated", "unreadable"] {
+            let root = tempfile::tempdir().unwrap();
+            let (context, identity, request) = fixture(root.path(), true);
+            activate_location(&context.journal);
+            let bytes = fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../solstone-core-location/fixtures/accuracy/venues.slpk"),
+            )
+            .unwrap();
+            let accuracy = solstone_core_location::accuracy::accuracy_root(&context.journal);
+            let pack = accuracy.join("test/venues.slpk");
+            fs::create_dir_all(pack.parent().unwrap()).unwrap();
+            fs::write(&pack, &bytes).unwrap();
+            fs::write(accuracy.join("installed.json"), serde_json::to_vec(&json!({"version":"test","files":[{"file":"venues.slpk","sha256":"fixture","size_bytes":bytes.len()}]})).unwrap()).unwrap();
+            stamp_fingerprint(&context.journal, &identity, 4);
+            let before = load_daily_unit_record(&context.journal, &identity)
+                .unwrap()
+                .unwrap();
+            match broken {
+                "missing" => fs::remove_file(&pack).unwrap(),
+                "truncated" => fs::write(&pack, &bytes[..12]).unwrap(),
+                _ => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&pack, fs::Permissions::from_mode(0o000)).unwrap();
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        fs::remove_file(&pack).unwrap();
+                        fs::create_dir(&pack).unwrap();
+                    }
+                }
+            }
+            let client = OneShotClient::at_path(root.path().join("no-model"));
+            let refused = execute(request.clone(), &context, &client, &mut Vec::new());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if pack.exists() {
+                    fs::set_permissions(&pack, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if pack.is_dir() {
+                    fs::remove_dir(&pack).unwrap();
+                }
+            }
+            assert!(
+                matches!(refused, RuntimeOutcome::Skipped { .. }),
+                "{broken}: {refused:?}"
+            );
+            let after = load_daily_unit_record(&context.journal, &identity)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after, before,
+                "unreadability retains pending bytes and allowances"
+            );
+            fs::write(&pack, &bytes).unwrap();
+            let restored = execute(request, &context, &client, &mut Vec::new());
+            assert!(
+                matches!(restored, RuntimeOutcome::Finished { .. }),
+                "{broken}: {restored:?}"
+            );
+        }
     }
 }

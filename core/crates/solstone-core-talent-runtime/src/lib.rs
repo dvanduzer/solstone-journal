@@ -19,6 +19,7 @@ pub mod activity_contract;
 pub mod assemble;
 pub mod contract;
 mod daily_execution;
+pub mod daily_location;
 pub mod daily_prepare;
 pub mod daily_schedule;
 pub mod documents;
@@ -1196,37 +1197,42 @@ pub(crate) fn schema_validation_failed(validation: Option<&Value>) -> bool {
     })
 }
 
-pub(crate) fn generate_contents(prepared: &PreparedTalent) -> Vec<ContentPart> {
-    let contents: Vec<ContentPart> = prepared
-        .config
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(|messages| {
-            messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .map(|text| ContentPart::Text {
-                    text: text.to_owned(),
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            ["transcript", "user_instruction", "prompt"]
-                .into_iter()
-                .filter_map(|key| prepared.config.get(key).and_then(Value::as_str))
-                .filter(|text| !text.is_empty())
-                .map(|text| ContentPart::Text {
-                    text: text.to_owned(),
-                })
-                .collect()
-        });
-    if contents.is_empty() {
-        vec![ContentPart::Text {
-            text: "No input provided.".to_owned(),
-        }]
-    } else {
-        contents
+pub(crate) fn ordinary_text_parts(config: &Map<String, Value>) -> Vec<String> {
+    if let Some(messages) = config.get("messages").and_then(Value::as_array) {
+        return messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
     }
+    ["transcript", "user_instruction", "prompt"]
+        .into_iter()
+        .filter_map(|key| config.get(key).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn generate_contents(prepared: &PreparedTalent) -> Vec<ContentPart> {
+    let mut contents: Vec<ContentPart> = ordinary_text_parts(&prepared.config)
+        .into_iter()
+        .map(|text| ContentPart::Text { text })
+        .collect();
+    if contents.is_empty() {
+        return vec![ContentPart::Text {
+            text: "No input provided.".to_owned(),
+        }];
+    }
+    if let Some(text) = prepared
+        .config
+        .get("_daily_location_text")
+        .and_then(Value::as_str)
+    {
+        contents.push(ContentPart::Text {
+            text: text.to_owned(),
+        });
+    }
+    contents
 }
 
 // Persist the assembled talent input alongside this run. The generate worker may

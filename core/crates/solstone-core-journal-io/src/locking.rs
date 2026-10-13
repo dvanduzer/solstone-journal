@@ -2032,6 +2032,19 @@ fn io_error(path: &Path, source: io::Error) -> LockError {
     }
 }
 
+/// Hold the daily location admission lock.
+///
+/// The protected path is `journal/health/daily-location-admission`. The flock
+/// sidecar is that name plus `.lock`. One writer of location input holds this
+/// before its own file lock.
+#[cfg(any(unix, windows))]
+pub fn hold_daily_location_admission(journal: &Path) -> Result<FileLock, LockError> {
+    hold_lock(
+        journal.join("health").join("daily-location-admission"),
+        LockOptions::default(),
+    )
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::cell::RefCell;
@@ -2190,6 +2203,35 @@ mod tests {
         match error {
             LockError::Timeout(timeout) => {
                 assert_eq!(timeout.path, path);
+                assert_eq!(timeout.timeout, Duration::from_millis(50));
+            }
+            LockError::Io { .. } => panic!("expected timeout"),
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn daily_location_admission_lock_times_out_on_its_sidecar() {
+        let temporary = TempDir::new();
+        let protected = temporary
+            .path()
+            .join("health")
+            .join("daily-location-admission");
+        let first = hold_daily_location_admission(temporary.path()).unwrap();
+        assert_eq!(first.path(), protected);
+        assert!(
+            protected
+                .with_file_name("daily-location-admission.lock")
+                .exists()
+        );
+        let options = LockOptions {
+            timeout: Duration::from_millis(50),
+            ..LockOptions::default()
+        };
+        let error = hold_lock(&protected, options).unwrap_err();
+        match error {
+            LockError::Timeout(timeout) => {
+                assert_eq!(timeout.path, protected);
                 assert_eq!(timeout.timeout, Duration::from_millis(50));
             }
             LockError::Io { .. } => panic!("expected timeout"),

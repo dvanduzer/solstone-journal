@@ -28,6 +28,7 @@ use solstone_core_ingest_resolve::{
     AppliedDisposition, AppliedFile, ApplyError, ApplyResult, ConflictPlan, FailedPlan, IngestFile,
     IngestNotice, IngestNotifier, Resolution, apply_plan, quarantine_failed, resolve_ingest,
 };
+use solstone_core_journal_io::hold_daily_location_admission;
 use solstone_core_segment::{
     ContentName, Kind, SegmentDir, StreamHints, advance_bound_stream, hold_source_mutation,
     retry_bound_stream,
@@ -599,6 +600,33 @@ fn required_string(
 /// outcome; it is self-healing the same way, since the content and its event
 /// are already durably written and idempotent by the time it can occur.
 fn write_envelope(state: &IngestState, cid: &str, envelope: Envelope) -> Response {
+    // Location uploads share the daily admission lock with place, accuracy,
+    // removal, and publication writers. Other sources do not take it. It is
+    // acquired before the source lock and is not taken again inside the write.
+    let _location_admission = if envelope.source == "location" {
+        match hold_daily_location_admission(&state.journal_root) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                log::warn!("location admission lock unavailable: {error}");
+                return finish_ingest_completion(
+                    state,
+                    cid,
+                    IngestCompletion::rejected(
+                        ReasonCode::LocationLockUnavailable,
+                        outcome_error(
+                            "retryable",
+                            ReasonCode::LocationLockUnavailable,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "location uploads are temporarily unavailable; try again",
+                        ),
+                    )
+                    .with_source(Some(envelope.source.clone())),
+                );
+            }
+        }
+    } else {
+        None
+    };
     // Keep resolve/apply and notification receipts in one source mutation.
     // Stream, registry, segment and manifest locks are acquired inside this
     // existing source-lock boundary, never before it.
@@ -609,7 +637,7 @@ fn write_envelope(state: &IngestState, cid: &str, envelope: Envelope) -> Respons
             let (code, detail) = if envelope.source == "location" {
                 (
                     ReasonCode::LocationLockUnavailable,
-                    "location ingest is temporarily unavailable; retry the request",
+                    "location uploads are temporarily unavailable; try again",
                 )
             } else {
                 (
@@ -1424,6 +1452,8 @@ mod tests {
         set_before_apply_hook, wall_clock_ms, write_envelope,
     };
     use crate::model::IncomingFile;
+    #[cfg(feature = "full-tests")]
+    use solstone_core_journal_io::hold_daily_location_admission;
     use solstone_core_segment::{SegmentError, hold_source_mutation};
     use solstone_core_sol_link::ledger::{
         AuthorizationLedger, ClientEntry, ClientRole, DeviceActivityRead, SourceRecord,
@@ -1944,6 +1974,69 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(stream_record_count(&journal), 1);
+    }
+
+    #[cfg(feature = "full-tests")]
+    fn chronicle_named(root: &Path, name: &str) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        fn walk(dir: &Path, name: &str, found: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, name, found);
+                } else if path.file_name().and_then(|item| item.to_str()) == Some(name) {
+                    found.push(path);
+                }
+            }
+        }
+        walk(&root.join("chronicle"), name, &mut found);
+        found
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn location_upload_waits_for_the_admission_guard_and_other_sources_do_not() {
+        let directory = root();
+        let journal = directory.path().to_path_buf();
+        let guard = hold_daily_location_admission(&journal).unwrap();
+        let (started_sender, started) = mpsc::channel();
+        let (done_sender, done) = mpsc::channel();
+        let location_state = direct_state(&journal);
+        let location = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let status = write_envelope(
+                &location_state,
+                CID_A,
+                direct_envelope("location", "location.jsonl"),
+            )
+            .status();
+            done_sender.send(()).unwrap();
+            status
+        });
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("location upload started");
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let audio = write_envelope(
+            &direct_state(&journal),
+            CID_A,
+            direct_envelope("audio", "audio.flac"),
+        );
+        assert_eq!(audio.status(), StatusCode::OK);
+        assert!(!chronicle_named(&journal, "audio.flac").is_empty());
+        assert!(
+            chronicle_named(&journal, "location.jsonl").is_empty(),
+            "location bytes landed while the admission guard was held"
+        );
+        drop(guard);
+        assert_eq!(location.join().unwrap(), StatusCode::OK);
+        assert_eq!(chronicle_named(&journal, "location.jsonl").len(), 1);
     }
 
     #[tokio::test]

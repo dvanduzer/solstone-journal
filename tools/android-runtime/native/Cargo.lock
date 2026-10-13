@@ -44,6 +44,7 @@ dependencies = [
  "chrono",
  "journal-mobile-serving",
  "libc",
+ "ort",
  "rusqlite",
  "serde_json",
  "solstone-core-indexer-query",
@@ -269,6 +270,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags 2.13.1",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 1.3.0",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -381,7 +400,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "509591b7bcd67f4ef775afad7662703b4935daaa6ec0e5605cfb1090b32a2b6d"
 dependencies = [
  "find-msvc-tools",
- "shlex",
+ "shlex 2.0.1",
+]
+
+[[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom 7.1.3",
 ]
 
 [[package]]
@@ -428,6 +456,17 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+]
+
+[[package]]
+name = "clang-sys"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -686,6 +725,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "either"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
 name = "elliptic-curve"
 version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -813,6 +858,33 @@ checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
 dependencies = [
  "rand_core 0.6.4",
  "subtle",
+]
+
+[[package]]
+name = "ffmpeg-next"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6380599799e175191eb7ffe82c97f36a2a90a36cbc54c738a903e5287d7f516a"
+dependencies = [
+ "bitflags 2.13.1",
+ "ffmpeg-sys-next",
+ "libc",
+]
+
+[[package]]
+name = "ffmpeg-sys-next"
+version = "9.0.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "flate2",
+ "libc",
+ "num_cpus",
+ "pkg-config",
+ "sha2",
+ "solstone-core-ffmpeg-build-support",
+ "tar",
+ "vcpkg",
 ]
 
 [[package]]
@@ -1023,10 +1095,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdbscan"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "466aa8bfaa22c81efcf67c84e6ad046de13a05c6cc9d41a5094361bff464247a"
+dependencies = [
+ "kdtree",
+ "num-traits",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hermit-abi"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "hkdf"
@@ -1347,6 +1435,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,15 +1487,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "journal-mobile-audio"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "solstone-core-assets",
+ "solstone-core-transcribe",
+]
+
+[[package]]
 name = "journal-mobile-serving"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "journal-mobile-audio",
  "serde_json",
+ "sha2",
+ "solstone-core-callosum",
  "solstone-core-convey-shell",
  "solstone-core-indexer-store",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
+ "solstone-core-transcribe",
  "tokio",
 ]
 
@@ -1466,6 +1577,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kdtree"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f0a0e9f770b65bac9aad00f97a67ab5c5319effed07f6da385da3c2115e47ba"
+dependencies = [
+ "num-traits",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1476,6 +1597,26 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libredox"
@@ -1573,6 +1714,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
 
 [[package]]
 name = "minimal-lexical"
@@ -1786,6 +1937,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_cpus"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
+dependencies = [
+ "hermit-abi",
+ "libc",
+]
+
+[[package]]
 name = "objc2-core-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1823,6 +1984,25 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "ort"
+version = "2.0.0-rc.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7de3af33d24a745ffb8fab904b13478438d1cd52868e6f17735ef6e1f8bf133"
+dependencies = [
+ "libloading 0.9.0",
+ "ndarray",
+ "ort-sys",
+ "smallvec",
+ "tracing",
+]
+
+[[package]]
+name = "ort-sys"
+version = "2.0.0-rc.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7b497d21a8b6fbb4b5a544f8fadb77e801a09ae0add9e411d31c6f89e3c1e90"
 
 [[package]]
 name = "outref"
@@ -2342,6 +2522,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
 name = "rusticata-macros"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2547,6 +2733,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"
@@ -3592,6 +3784,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-observe-audio"
+version = "2.0.43"
+dependencies = [
+ "ffmpeg-next",
+ "ffmpeg-sys-next",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "solstone-core-offload"
 version = "2.0.43"
 dependencies = [
@@ -3853,6 +4054,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-sound-tags"
+version = "2.0.43"
+dependencies = [
+ "log",
+ "serde_json",
+ "solstone-core-assets",
+ "solstone-core-check",
+ "solstone-core-local",
+ "tempfile",
+]
+
+[[package]]
 name = "solstone-core-speaker-id"
 version = "2.0.43"
 dependencies = [
@@ -3892,6 +4105,35 @@ dependencies = [
  "solstone-core-system",
  "thiserror 2.0.20",
  "zip",
+]
+
+[[package]]
+name = "solstone-core-speakers"
+version = "2.0.43"
+dependencies = [
+ "hdbscan",
+]
+
+[[package]]
+name = "solstone-core-speakers-analyze"
+version = "2.0.43"
+dependencies = [
+ "env_logger",
+ "log",
+ "serde_json",
+ "solstone-core-speakers",
+ "solstone-core-speakers-onnx",
+ "solstone-core-system",
+]
+
+[[package]]
+name = "solstone-core-speakers-onnx"
+version = "2.0.43"
+dependencies = [
+ "ort",
+ "solstone-core-local",
+ "solstone-core-speakers",
+ "solstone-core-win-dll-load",
 ]
 
 [[package]]
@@ -4080,6 +4322,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-transcribe"
+version = "2.0.43"
+dependencies = [
+ "chrono",
+ "getrandom 0.3.4",
+ "log",
+ "nix",
+ "rustix",
+ "serde_json",
+ "sha2",
+ "solstone-core-assets",
+ "solstone-core-brain",
+ "solstone-core-callosum",
+ "solstone-core-journal-config",
+ "solstone-core-journal-io",
+ "solstone-core-local",
+ "solstone-core-observe-audio",
+ "solstone-core-processing-record",
+ "solstone-core-segment",
+ "solstone-core-sound-tags",
+ "solstone-core-speaker-id",
+ "solstone-core-speakers-analyze",
+ "solstone-core-spp-ratls",
+ "solstone-core-system",
+ "solstone-core-system-health",
+ "solstone-core-vad-analyze",
+ "tempfile",
+ "thiserror 2.0.20",
+ "ureq",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "solstone-core-transcripts"
 version = "2.0.43"
 dependencies = [
@@ -4122,6 +4397,24 @@ dependencies = [
  "solstone-core-transcripts",
  "tokio",
  "zip",
+]
+
+[[package]]
+name = "solstone-core-vad-analyze"
+version = "2.0.43"
+dependencies = [
+ "ort",
+ "serde_json",
+ "sha2",
+ "solstone-core-speakers-onnx",
+]
+
+[[package]]
+name = "solstone-core-win-dll-load"
+version = "2.0.43"
+dependencies = [
+ "libloading 0.8.9",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4676,7 +4969,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d"
 dependencies = [
  "base64 0.23.1",
+ "getrandom 0.4.3",
  "log",
+ "mime_guess",
  "percent-encoding",
  "rustls",
  "rustls-pki-types",

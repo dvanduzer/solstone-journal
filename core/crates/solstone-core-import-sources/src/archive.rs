@@ -2549,6 +2549,15 @@ fn stage_and_publish(
     stage_imports(source, target, state)?;
     #[cfg(test)]
     run_before_publish();
+    // Staging is read-only with respect to live raw sources. Admission stays
+    // outermost through publication, rollback and stream-marker failure.
+    let _admission =
+        solstone_core_journal_io::hold_daily_location_admission(target).map_err(|error| {
+            ImportSourcesError::MergePublishFailed {
+                detail: error.to_string(),
+                mutation: MergeMutationState::NotMutated,
+            }
+        })?;
     let chronicle_units = state.chronicle_units.clone();
     let import_units = state.import_units.clone();
     if let Err(error) = publish_units(target, state, &chronicle_units)
@@ -4136,6 +4145,83 @@ mod tests {
         })));
         merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap();
         assert!(held.get());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn raw_archive_publication_and_rollback_hold_location_admission() {
+        let _reset = FaultReset;
+        let tree = PlanTree::new();
+        let target = tree.path.join("target");
+        fs::create_dir(&target).unwrap();
+        let archive = write_zip(
+            &tree.path,
+            &[
+                (
+                    "chronicle/20260311/120000_60/location.jsonl",
+                    b"synthetic location",
+                ),
+                ("facets/new/facet.json", br#"{"title":"New"}"#),
+            ],
+        );
+        let assert_held = |root: &Path| {
+            assert!(
+                hold_lock(
+                    root.join("health/daily-location-admission"),
+                    LockOptions {
+                        timeout: Duration::ZERO,
+                        ..LockOptions::default()
+                    }
+                )
+                .is_err(),
+                "archive lost location admission"
+            );
+        };
+        let publish_seen = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = publish_seen.clone();
+        let root = target.clone();
+        inject_while_locked(Some(Box::new(move || {
+            assert!(
+                root.join("chronicle/20260311/120000_60/location.jsonl")
+                    .exists()
+            );
+            assert_held(&root);
+            seen.set(true);
+        })));
+        let undo_seen = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = undo_seen.clone();
+        let root = target.clone();
+        BEFORE_RAW_UNDO.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_held(&root);
+                for lock in ["health/locks/entity-trust", "health/locks/facet-trust"] {
+                    hold_lock(
+                        root.join(lock),
+                        LockOptions {
+                            timeout: Duration::ZERO,
+                            ..LockOptions::default()
+                        },
+                    )
+                    .expect("owned locks released before raw rollback");
+                }
+                seen.set(true);
+            }))
+        });
+        inject_publish_fail_after(Some(2));
+        assert!(merge_journal_archive(&archive, &target, &merge_options(&tree), None).is_err());
+        assert!(publish_seen.get() && undo_seen.get());
+        assert!(
+            !target.join("chronicle/20260311/120000_60").exists(),
+            "ABA restored absent raw state"
+        );
+        hold_lock(
+            target.join("health/daily-location-admission"),
+            LockOptions {
+                timeout: Duration::ZERO,
+                ..LockOptions::default()
+            },
+        )
+        .expect("admission released after rollback");
     }
 
     #[test]
