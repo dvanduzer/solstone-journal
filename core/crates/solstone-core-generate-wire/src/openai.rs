@@ -100,6 +100,13 @@ pub fn openai_generate(request: &GenerateRequest, config: &Map<String, Value>) -
     openai_generate_with(request, config, &mut transport)
 }
 
+pub(crate) fn openai_generate_from_config(
+    request: &GenerateRequest,
+    config: &Map<String, Value>,
+) -> OpenAiResult {
+    openai_generate_with_lookup(request, config, &mut UreqOpenAiTransport, |_| None)
+}
+
 fn openai_generate_with<T: OpenAiTransport>(
     request: &GenerateRequest,
     config: &Map<String, Value>,

@@ -133,22 +133,42 @@ impl ManagedKeyValidator for UnavailableValidator {
     }
 }
 
-/// Native one-shot validation whose candidate credentials are child-only
-/// environment overrides, never GenerateRequest data.
+/// Production Generate validation with candidates confined to child-only
+/// overrides or call-local configuration, never GenerateRequest data.
 pub struct OneShotKeyValidator {
-    client: OneShotClient,
+    client: ProbeClient,
+}
+
+enum ProbeClient {
+    Process(OneShotClient),
+    Embedded {
+        journal: std::path::PathBuf,
+        runtime: Box<solstone_core_generate_wire::EndpointRuntime>,
+    },
 }
 
 impl OneShotKeyValidator {
     pub fn sibling() -> Result<Self, ClientError> {
         Ok(Self {
-            client: OneShotClient::sibling()?,
+            client: ProbeClient::Process(OneShotClient::sibling()?),
         })
     }
 
     pub fn at_path(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            client: OneShotClient::at_path(path),
+            client: ProbeClient::Process(OneShotClient::at_path(path)),
+        }
+    }
+
+    /// Validate candidate credentials through the production provider dispatch
+    /// in an app process. Candidate values stay in this call's configuration;
+    /// they never enter process environment or the persisted active selection.
+    pub fn embedded(journal: std::path::PathBuf) -> Self {
+        Self {
+            client: ProbeClient::Embedded {
+                journal,
+                runtime: Box::new(solstone_core_generate_wire::EndpointRuntime::default()),
+            },
         }
     }
 
@@ -162,12 +182,40 @@ impl OneShotKeyValidator {
         model: &str,
         key: &str,
     ) -> Result<GenerateResponse, ClientError> {
-        self.client
-            .clone()
-            .with_env(API_KEY_OVERRIDE_ENV, key)
-            .with_env(PROVIDER_OVERRIDE_ENV, provider)
-            .with_env(MODEL_OVERRIDE_ENV, model)
-            .execute(&validation_request())
+        match &self.client {
+            ProbeClient::Process(client) => client
+                .clone()
+                .with_env(API_KEY_OVERRIDE_ENV, key)
+                .with_env(PROVIDER_OVERRIDE_ENV, provider)
+                .with_env(MODEL_OVERRIDE_ENV, model)
+                .execute(&validation_request()),
+            ProbeClient::Embedded { journal, runtime } => {
+                let env_key = match provider {
+                    "google" => "GOOGLE_API_KEY",
+                    "openai" => "OPENAI_API_KEY",
+                    "anthropic" => "ANTHROPIC_API_KEY",
+                    _ => {
+                        return Err(ClientError::Decode(
+                            "unsupported credential probe provider".into(),
+                        ));
+                    }
+                };
+                let mut config =
+                    read_config(journal).map_err(|e| ClientError::Decode(e.to_string()))?;
+                object_at(&mut config, "env").insert(env_key.into(), Value::String(key.into()));
+                let active = object_at(object_at(&mut config, "providers"), "active");
+                active.insert("provider".into(), Value::String(provider.into()));
+                active.insert("model".into(), Value::String(model.into()));
+                solstone_core_generate_wire::respond_with_config(
+                    &validation_request(),
+                    runtime,
+                    journal,
+                    &config,
+                    |_| None,
+                )
+                .map_err(ClientError::Decode)
+            }
+        }
     }
 }
 

@@ -98,6 +98,17 @@ pub fn chatgpt_generate(
     chatgpt_generate_with(request, config, &auth, &mut transport)
 }
 
+pub(crate) fn chatgpt_generate_from_config(
+    request: &GenerateRequest,
+    config: &Map<String, Value>,
+    journal: &Path,
+) -> ChatGptResult {
+    let auth = ChatGptAuthManager::with_default_transport(journal.to_path_buf());
+    chatgpt_generate_with_lookup(request, config, &auth, &mut UreqResponsesTransport, |_| {
+        None
+    })
+}
+
 pub(crate) fn chatgpt_generate_with<C: ChatGptCredential, T: ResponsesTransport>(
     request: &GenerateRequest,
     config: &Map<String, Value>,

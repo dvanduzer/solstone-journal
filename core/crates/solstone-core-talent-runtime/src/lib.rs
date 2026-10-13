@@ -455,7 +455,7 @@ pub fn execute_request(
     request: Map<String, Value>,
     paths: &prepare::RuntimePaths,
     context: &ExecutionContext,
-    generate: &OneShotClient,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
 ) -> RuntimeOutcome {
     if request.contains_key("lock_token") {
@@ -585,7 +585,7 @@ fn execute_unclaimed(
     request: Map<String, Value>,
     paths: &prepare::RuntimePaths,
     context: &ExecutionContext,
-    generate: &OneShotClient,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
 ) -> RuntimeOutcome {
     let mut prepared =
@@ -873,7 +873,7 @@ fn finish_unavailable(
 fn generate_response(
     prepared: &mut PreparedTalent,
     context: &ExecutionContext,
-    generate: &OneShotClient,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
 ) -> Result<GeneratedTalentResponse, RuntimeOutcome> {
     let _ = prepared.config.remove(INPUT_BUDGET_KEY);
@@ -937,7 +937,7 @@ fn generate_response(
 pub(crate) fn generate_and_write(
     prepared: &mut PreparedTalent,
     context: &ExecutionContext,
-    generate: &OneShotClient,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
     stage: Option<(&'static contract::StageSpec, PrePostState)>,
 ) -> RuntimeOutcome {

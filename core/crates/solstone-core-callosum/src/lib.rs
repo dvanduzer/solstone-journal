@@ -16,12 +16,20 @@ pub mod windows;
 mod wire;
 mod writer;
 
-// iOS container paths can exceed sockaddr_un even when the socket's app-owned
-// target is short. Following a final socket symlink preserves Unix path semantics.
+/// Resolve an app-owned Callosum endpoint before opening a Unix socket.
+/// iOS container paths can exceed sockaddr_un even when their final symlink
+/// points to a short app-private endpoint. Other Unix platforms keep the path.
+///
+/// # Errors
+/// Returns an error when an iOS alias is missing, relative or too long.
 #[cfg(unix)]
-fn endpoint_path(path: &std::path::Path) -> std::io::Result<std::borrow::Cow<'_, std::path::Path>> {
+pub fn endpoint_path(
+    path: &std::path::Path,
+) -> std::io::Result<std::borrow::Cow<'_, std::path::Path>> {
     #[cfg(target_os = "ios")]
-    if path.as_os_str().len() >= 104 {
+    if path.as_os_str().len() >= 104
+        || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
         return short_socket_alias(path).map(std::borrow::Cow::Owned);
     }
     Ok(std::borrow::Cow::Borrowed(path))

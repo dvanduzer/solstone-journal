@@ -96,6 +96,13 @@ pub fn anthropic_generate(
     anthropic_generate_with(request, config, &mut transport)
 }
 
+pub(crate) fn anthropic_generate_from_config(
+    request: &GenerateRequest,
+    config: &Map<String, Value>,
+) -> AnthropicResult {
+    anthropic_generate_with_lookup(request, config, &mut UreqAnthropicTransport, |_| None)
+}
+
 fn anthropic_generate_with<T: AnthropicTransport>(
     request: &GenerateRequest,
     config: &Map<String, Value>,

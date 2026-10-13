@@ -8,6 +8,7 @@ mod bundled;
 pub mod chatgpt;
 mod confidential;
 mod confidential_pacing;
+mod dispatch;
 mod endpoint;
 mod google;
 mod lane;
@@ -38,6 +39,7 @@ pub use confidential::confidential_generate_in_package;
 #[doc(hidden)]
 pub use confidential::test_support;
 pub use confidential::{ConfidentialResult, confidential_generate};
+pub use dispatch::{respond, respond_with_config};
 pub use endpoint::{
     ENDPOINT_SERVED_WINDOW_CACHE_TTL, EndpointFailure, EndpointGenerated, EndpointResult,
     EndpointRuntime, EndpointTransport, EndpointTransportError, OverflowDecision,

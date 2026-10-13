@@ -65,6 +65,38 @@ impl fmt::Display for McpServiceError {
 
 impl std::error::Error for McpServiceError {}
 
+/// Run the existing endpoint topology on an embedding app's Tokio runtime.
+///
+/// The app owns shutdown; no process-wide signal handlers are installed. A true
+/// shutdown value or a closed channel stops the listener, bridge and renewal
+/// tasks and waits for their normal cleanup before returning.
+///
+/// # Errors
+///
+/// Returns the same startup and operation failures as the native service.
+pub async fn run_embedded_service(
+    journal_root: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), McpServiceError> {
+    if shutdown_requested(&shutdown) || shutdown.has_changed().is_err() {
+        return Ok(());
+    }
+    let (stop, receiver) = watch::channel(false);
+    let topology = run_endpoint_topology(journal_root, stop.clone(), receiver);
+    tokio::pin!(topology);
+    loop {
+        tokio::select! {
+            result = &mut topology => return result,
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() {
+                    stop.send_replace(true);
+                    return topology.await;
+                }
+            }
+        }
+    }
+}
+
 /// Run the production MCP service with optional supervisor parent tracking.
 ///
 /// # Errors
@@ -459,6 +491,51 @@ async fn wait_for_hosted_parent(
 async fn wait_for_shutdown_signal(shutdown: watch::Sender<bool>) {
     crate::signals::termination_requested().await;
     let _ = shutdown.send(true);
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod embedded_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn embedded_idle_service_stops_on_request_or_owner_loss() {
+        for close_sender in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (stop, receiver) = watch::channel(false);
+            let task = tokio::spawn(run_embedded_service(root.path().to_path_buf(), receiver));
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            stop.send_replace(false);
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+            if close_sender {
+                drop(stop);
+            } else {
+                stop.send_replace(true);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_service_does_not_start_after_shutdown() {
+        for close_sender in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (stop, receiver) = watch::channel(!close_sender);
+            if close_sender {
+                drop(stop);
+            }
+            run_embedded_service(root.path().to_path_buf(), receiver)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
 }
 
 #[cfg(all(test, not(feature = "full-tests")))]
