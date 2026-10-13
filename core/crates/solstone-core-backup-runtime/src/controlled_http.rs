@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! One Linux HTTP request owns its resolver child, socket and runtime until join.
+//! One HTTP request owns its resolver, socket and runtime until join. On Linux
+//! and macOS the resolver is an installed child; Windows has none yet.
 
 use crate::hosted_runtime::{HttpError, HttpRequest, HttpResponse};
 use solstone_core_backup::archive_admission::ArchiveCancellation;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use solstone_core_backup::owned_dns::{OwnedDnsFamily, resolve_owned_http_host};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, Read};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +29,7 @@ pub(crate) const TEARDOWN_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum RequestPolicy {
+    #[cfg_attr(windows, allow(dead_code))]
     Archive,
     Teardown,
 }
@@ -139,6 +143,82 @@ impl Control {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_host(
+    host: &str,
+    port: u16,
+    family: ureq::config::IpFamily,
+    end: Instant,
+    cancellation: &ArchiveCancellation,
+) -> io::Result<Vec<SocketAddr>> {
+    let family = match family {
+        ureq::config::IpFamily::Any => OwnedDnsFamily::Any,
+        ureq::config::IpFamily::Ipv4Only => OwnedDnsFamily::Ipv4,
+        ureq::config::IpFamily::Ipv6Only => OwnedDnsFamily::Ipv6,
+    };
+    resolve_owned_http_host(host, port, family, end, cancellation)
+}
+
+/// Windows has no owned resolver child yet. The system resolver runs on a
+/// helper thread, waited on with this request's own end and cancellation; if
+/// either comes first the thread is left to finish alone, holding nothing.
+#[cfg(windows)]
+fn resolve_host(
+    host: &str,
+    port: u16,
+    family: ureq::config::IpFamily,
+    end: Instant,
+    cancellation: &ArchiveCancellation,
+) -> io::Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    const MAX_ADDRESSES: usize = 16;
+    let (sender, receiver) = channel();
+    // Keep ureq's authority.host():port form, including [IPv6] brackets.
+    let target = format!("{host}:{port}");
+    std::thread::Builder::new()
+        .name("controlled-http-dns".into())
+        .spawn(move || {
+            let _ = sender.send(
+                target
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>()),
+            );
+        })?;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "HTTP operation cancelled",
+            ));
+        }
+        let now = Instant::now();
+        if now >= end {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP DNS deadline reached",
+            ));
+        }
+        match receiver.recv_timeout(CANCEL_POLL.min(end - now)) {
+            Ok(addresses) => {
+                return Ok(addresses?
+                    .into_iter()
+                    .filter(|address| match family {
+                        ureq::config::IpFamily::Any => true,
+                        ureq::config::IpFamily::Ipv4Only => address.is_ipv4(),
+                        ureq::config::IpFamily::Ipv6Only => address.is_ipv6(),
+                    })
+                    .take(MAX_ADDRESSES)
+                    .collect());
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("HTTP DNS resolver ended"));
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OwnedResolver(Arc<Control>);
 impl Resolver for OwnedResolver {
@@ -160,15 +240,10 @@ impl Resolver for OwnedResolver {
                 _ => None,
             })
             .ok_or_else(|| io::Error::other("unsupported HTTP scheme"))?;
-        let family = match config.ip_family() {
-            ureq::config::IpFamily::Any => OwnedDnsFamily::Any,
-            ureq::config::IpFamily::Ipv4Only => OwnedDnsFamily::Ipv4,
-            ureq::config::IpFamily::Ipv6Only => OwnedDnsFamily::Ipv6,
-        };
-        let addresses = resolve_owned_http_host(
+        let addresses = resolve_host(
             authority.host(),
             port,
-            family,
+            config.ip_family(),
             self.0.phase_end(timeout),
             &self.0.cancellation,
         );
@@ -313,6 +388,7 @@ fn supported(request: &HttpRequest, config: &ureq::config::Config, policy: Reque
             .is_none_or(|proxy| proxy.protocol() == ureq::ProxyProtocol::Http)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn execute(
     request: &HttpRequest,
     cancellation: &ArchiveCancellation,

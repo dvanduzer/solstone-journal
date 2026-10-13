@@ -57,6 +57,18 @@ enum Engine {
               .base64EncodedString()
           }
         }
+        // Only synthetic embedding sidecars are exported here; original media is hashed in place.
+        let chronicle = URL(fileURLWithPath: root + "/chronicle")
+        if let entries = FileManager.default.enumerator(
+          at: chronicle, includingPropertiesForKeys: [.isRegularFileKey], options: []) {
+          for case let file as URL in entries where file.pathExtension == "npz" {
+            guard try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+              throw NSError(domain: "unexpected-sidecar-type", code: 1)
+            }
+            out[String(file.path.dropFirst(root.count + 1))] = try Data(contentsOf: file)
+              .base64EncodedString()
+          }
+        }
       } else {
         guard message.root.isEmpty else {
           throw NSError(domain: "host-path-is-not-authority", code: 1)
@@ -68,6 +80,12 @@ enum Engine {
             throw NSError(domain: "packaged-payload-missing", code: 1)
           }
           request.payload = payload.path
+        }
+        if request.op == "audio-enable" {
+          guard let models = Bundle.main.url(forResource: "AudioModels", withExtension: nil) else {
+            throw NSError(domain: "packaged-audio-models-missing", code: 1)
+          }
+          request.payload = models.path
         }
         let input = String(data: try JSONEncoder().encode(request), encoding: .utf8)!
         guard let p = input.withCString({ journal_runtime($0) }) else {

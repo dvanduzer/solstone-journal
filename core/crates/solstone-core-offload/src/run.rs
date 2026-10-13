@@ -1145,35 +1145,35 @@ mod current {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::cell::RefCell;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::collections::VecDeque;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::io;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use chrono::DateTime;
     #[cfg(all(unix, feature = "full-tests"))]
     use chrono::FixedOffset;
     use serde_json::json;
     #[cfg(unix)]
     use sha2::{Digest, Sha256};
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use solstone_core_backup::{
         Destination, generate_and_store_keys, record_backup_result, record_verification_result,
         set_destination, set_enabled, set_offload,
     };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use solstone_core_backup_runtime::BackupServices;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use solstone_core_backup_runtime::hosted_runtime::HttpError;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use solstone_core_backup_runtime::{
         Clock, HttpRequest, HttpResponse, HttpTransport, JournalMaintenance,
         JournalMaintenanceError, ToolOutput, ToolRequest, ToolRunner,
     };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use solstone_core_journal_io::JournalRoot;
     #[cfg(unix)]
     use solstone_core_retention::{
@@ -1181,9 +1181,9 @@ mod tests {
         content::{ClosedHandlerSet, JournalMedia},
         policy::policy_from_journal_config,
     };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::fs;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::path::Path;
     #[cfg(unix)]
     use std::path::PathBuf;
@@ -1266,12 +1266,12 @@ mod tests {
         assert_eq!(check(&transient), None);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct Script {
         outputs: RefCell<VecDeque<ToolOutput>>,
         calls: RefCell<Vec<Vec<String>>>,
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl ToolRunner for Script {
         fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
             self.calls.borrow_mut().push(
@@ -1288,19 +1288,19 @@ mod tests {
                 .expect("fixture output"))
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct Http;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl HttpTransport for Http {
         fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
             unreachable!("BYO offload does not use HTTP")
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct TestClock {
         now: i64,
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Clock for TestClock {
         fn now_unix(&self) -> i64 {
             self.now
@@ -1309,9 +1309,9 @@ mod tests {
             1
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct Maintenance;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl JournalMaintenance for Maintenance {
         fn rebuild_body_history(&self, _: &Path) -> Result<(), JournalMaintenanceError> {
             Ok(())
@@ -1320,7 +1320,7 @@ mod tests {
             Ok(())
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn output(stdout: String) -> ToolOutput {
         ToolOutput {
             returncode: 0,
@@ -1361,7 +1361,7 @@ mod tests {
         fs::write(raw.with_extension("jsonl"), format!("{header}\n")).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn configure_offload(journal: &Path, now: i64, budget_bytes: Option<u64>) {
         set_destination(
             journal,
@@ -1389,7 +1389,7 @@ mod tests {
         )
         .unwrap();
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn services<'a>(
         runner: &'a Script,
         http: &'a Http,

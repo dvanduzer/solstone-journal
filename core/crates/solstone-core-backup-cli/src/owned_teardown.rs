@@ -130,7 +130,7 @@ fn reason(outcome: &OwnedTeardownOutcome) -> &'static str {
         Some(TeardownRunRefusal::Remote(_)) => "remote_refused",
         Some(TeardownRunRefusal::Clear) => "configuration_refused",
         Some(TeardownRunRefusal::Binding) => "binding_refused",
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Some(TeardownRunRefusal::Finish(_)) => "finish_refused",
         Some(TeardownRunRefusal::CarrierShared) => "carrier_shared",
         Some(TeardownRunRefusal::RetirementUncertain) => "retirement_uncertain",
@@ -163,11 +163,11 @@ fn render(outcome: &OwnedTeardownOutcome) -> CliRun {
     )
     .unwrap();
     if let Some(publication) = outcome.publication() {
-        writeln!(stdout, "configuration_published=true durability_uncertain={} observation_uncertain={} confirmation_refused={}",
-            publication.durability_uncertainty.is_some(), publication.observation_uncertainty.is_some(),
-            publication.confirmation_refusal.is_some()).unwrap();
+        writeln!(stdout, "configuration_published=true directory_flush={:?} durability_uncertain={} observation_uncertain={} confirmation_refused={}",
+            publication.directory_flush, publication.durability_uncertainty.is_some(),
+            publication.observation_uncertainty.is_some(), publication.confirmation_refusal.is_some()).unwrap();
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Some(binding) = outcome.binding() {
         writeln!(stdout, "binding_receipt_available=true removal_attempted={} removal_complete={} confirmation_refused={}",
             binding.attempted(), binding.complete(), binding.confirmation().is_err()).unwrap();
@@ -243,7 +243,7 @@ mod tests {
                 panic!("whole teardown outcome required")
             };
             let native = owned.outcome();
-            if cfg!(any(target_os = "linux", target_os = "macos")) {
+            if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
                 assert_eq!(native.phase(), TeardownRunPhase::Admission);
                 assert!(matches!(
                     native.refusal(),

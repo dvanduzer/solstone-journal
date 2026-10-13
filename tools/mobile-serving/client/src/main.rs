@@ -70,11 +70,11 @@ fn response(r: spl_core::http::HttpResponse) -> Value {
 // Fault and held-carrier controls use the same SPL framing/assembly library.
 // Bound small synthetic requests fit in the initial stream window.
 async fn exchange(stream: &mut Stream, id: u32, v: &Value) -> Result<Value, Error> {
-    let body = v["body"].as_str().unwrap_or("").as_bytes();
-    if body.len() > 4096 {
-        return Err("qualification body exceeds 4096 bytes".into());
+    let body = body(v)?;
+    if body.len() > 512 * 1024 {
+        return Err("fault-injection body exceeds 512 KiB".into());
     }
-    let headers = vec![("content-type".to_owned(), "application/json".to_owned())];
+    let headers = headers(v);
     let mut bytes = spl_core::http::build_request_head(
         field(v, "method")?,
         field(v, "uri")?,
@@ -85,11 +85,14 @@ async fn exchange(stream: &mut Stream, id: u32, v: &Value) -> Result<Value, Erro
     bytes.extend_from_slice(if loss == "before" {
         &body[..body.len() / 2]
     } else {
-        body
+        &body
     });
-    stream
-        .write_all(&Frame::new(id, FLAG_OPEN | FLAG_DATA, bytes).encode()?)
-        .await?;
+    for (index, chunk) in bytes.chunks(32 * 1024).enumerate() {
+        let flags = FLAG_DATA | if index == 0 { FLAG_OPEN } else { 0 };
+        stream
+            .write_all(&Frame::new(id, flags, chunk.to_vec()).encode()?)
+            .await?;
+    }
     if loss == "before" {
         stream.flush().await?;
         return Ok(
@@ -131,6 +134,26 @@ async fn exchange(stream: &mut Stream, id: u32, v: &Value) -> Result<Value, Erro
         }
     }
     Ok(response(assembler.into_response()?))
+}
+fn body(v: &Value) -> Result<Vec<u8>, Error> {
+    if let Some(file) = v["body_file"].as_str() {
+        Ok(std::fs::read(file)?)
+    } else {
+        Ok(v["body"].as_str().unwrap_or("").as_bytes().to_vec())
+    }
+}
+fn headers(v: &Value) -> Vec<(String, String)> {
+    let mut headers = vec![(
+        "content-type".into(),
+        v["content_type"]
+            .as_str()
+            .unwrap_or("application/json")
+            .into(),
+    )];
+    if let Some(version) = v["protocol_version"].as_str() {
+        headers.push(("x-solstone-protocol-version".into(), version.into()));
+    }
+    headers
 }
 async fn command(
     v: &Value,
@@ -176,8 +199,8 @@ async fn command(
                 port,
                 field(v, "method")?,
                 field(v, "uri")?,
-                &[("content-type".into(), "application/json".into())],
-                v["body"].as_str().unwrap_or("").as_bytes(),
+                &headers(v),
+                &body(v)?,
             )
             .await?;
             Ok(response(result))

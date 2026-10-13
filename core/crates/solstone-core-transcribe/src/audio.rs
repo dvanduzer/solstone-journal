@@ -106,6 +106,47 @@ pub(crate) fn run_vad(
     }
 }
 
+/// Run the same VAD request and response contract in process.
+#[cfg(all(feature = "embedded", unix))]
+pub(crate) fn run_vad_embedded(
+    audio: &[f32],
+    min_speech_seconds: f64,
+    models: &Path,
+    scratch: &Path,
+) -> Result<VadResult, TranscribeError> {
+    let model = crate::model_assets::verify_digest(
+        "silero_vad_v6.onnx",
+        models.join("silero_vad_v6.onnx"),
+    )?;
+    let temporary = tempfile::Builder::new()
+        .prefix(VAD_TEMP_PREFIX)
+        .tempdir_in(scratch)
+        .map_err(|error| TranscribeError::VadTemporary {
+            detail: error.to_string(),
+        })?;
+    let input = temporary.path().join("audio.f32le");
+    write_f32le_exclusive(&input, audio).map_err(|error| TranscribeError::VadTemporary {
+        detail: error.to_string(),
+    })?;
+    let request = vad_request(&input, &model, min_speech_seconds)?;
+    let request = String::from_utf8(request).map_err(|error| TranscribeError::VadTemporary {
+        detail: error.to_string(),
+    })?;
+    let response = solstone_core_vad_analyze::run_request(&request).map_err(|error| {
+        TranscribeError::VadTemporary {
+            detail: error.to_string(),
+        }
+    })?;
+    let result = parse_vad_response(&response.to_string())
+        .map_err(|detail| vad_contract_error(Some(0), response.to_string().as_bytes(), detail));
+    temporary
+        .close()
+        .map_err(|error| TranscribeError::VadTemporary {
+            detail: error.to_string(),
+        })?;
+    result
+}
+
 /// Return the local VAD input's speech fraction, avoiding a zero-duration NaN.
 pub(crate) fn speech_ratio(vad: &VadResult) -> f64 {
     if vad.duration_s == 0.0 {

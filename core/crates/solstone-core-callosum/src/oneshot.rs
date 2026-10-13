@@ -66,11 +66,14 @@ impl CallosumOneShotSender {
             use std::io::Write;
             use std::os::unix::net::UnixStream;
 
+            let address_path = crate::endpoint_path(&self.socket_path)
+                .map_err(|_| CallosumOneShotError::Unavailable)?;
+
             let mut stream = if expected.is_some() {
                 let socket =
                     socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
                         .map_err(|_| CallosumOneShotError::Unavailable)?;
-                let address = socket2::SockAddr::unix(&self.socket_path)
+                let address = socket2::SockAddr::unix(&address_path)
                     .map_err(|_| CallosumOneShotError::Unavailable)?;
                 socket
                     .connect_timeout(&address, self.timeout)
@@ -78,8 +81,7 @@ impl CallosumOneShotSender {
                 let descriptor: std::os::fd::OwnedFd = socket.into();
                 UnixStream::from(descriptor)
             } else {
-                UnixStream::connect(&self.socket_path)
-                    .map_err(|_| CallosumOneShotError::Unavailable)?
+                UnixStream::connect(&address_path).map_err(|_| CallosumOneShotError::Unavailable)?
             };
             stream
                 .set_write_timeout(Some(self.timeout))

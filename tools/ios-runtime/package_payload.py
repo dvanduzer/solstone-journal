@@ -4,6 +4,7 @@
 """Stage the maintained router payload as a signed helper bundle resource."""
 from pathlib import Path
 import shutil
+import os
 
 adapter = Path(__file__).resolve().parent
 source = adapter.parents[1] / 'core/payload/solstone'
@@ -14,3 +15,11 @@ for marker in ('talent/journal/contract/bundle.json', 'think/contract/layout.jso
 if destination.exists():
     shutil.rmtree(destination)
 shutil.copytree(source, destination / 'solstone')
+models = adapter / 'Resources/AudioModels'
+if models.exists():
+    shutil.rmtree(models)
+models.mkdir()
+if directory := os.environ.get('AUDIO_MODELS_DIR'):
+    for name in ('tdt-0.6b-v3-q8_0.gguf', 'silero_vad_v6.onnx',
+                 'wespeaker-resnet34-256.onnx', 'pyannote-segmentation-3.0.onnx'):
+        shutil.copyfile(Path(directory) / name, models / name)

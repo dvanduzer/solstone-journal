@@ -27,7 +27,7 @@ mod test_support;
 pub use bound_commit::conditional_update_journal_config_in_directory;
 pub use bound_commit::{
     BoundConfigConfirmationRefusal, BoundConfigOutcome, BoundConfigPublication, BoundConfigRefusal,
-    MAX_BOUND_CONFIG_BYTES, conditional_update_journal_config_at_root,
+    DirectoryFlush, MAX_BOUND_CONFIG_BYTES, conditional_update_journal_config_at_root,
 };
 pub use commit::{
     CommitConfigError, ConfigConflict, ConfigExpectation, ConfigFingerprint, commit_journal_config,

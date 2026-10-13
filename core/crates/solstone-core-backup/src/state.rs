@@ -1557,7 +1557,7 @@ mod retained_clear_tests {
             let BoundConfigOutcome::Published(receipt) = result.unwrap() else {
                 panic!("rename landed")
             };
-            assert!(receipt.published_file.size > 0);
+            assert!(receipt.published_file.as_ref().unwrap().size > 0);
             assert!(receipt.durability_uncertainty.is_some());
             assert!(receipt.observation_uncertainty.is_some());
             assert!(receipt.confirmation_refusal.is_some());

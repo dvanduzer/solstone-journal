@@ -802,7 +802,11 @@ async fn run_connection(run: ConnectionRun) {
 async fn connect_stream(
     socket_path: &Path,
 ) -> std::io::Result<(ConnectionReadHalf, ConnectionWriteHalf)> {
-    Ok(UnixStream::connect(socket_path).await?.into_split())
+    Ok(
+        UnixStream::connect(crate::endpoint_path(socket_path)?.as_ref())
+            .await?
+            .into_split(),
+    )
 }
 
 #[cfg(windows)]

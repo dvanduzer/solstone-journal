@@ -32,6 +32,10 @@ mod audio;
 mod backend;
 #[allow(dead_code)]
 mod config;
+#[cfg(all(feature = "embedded", unix))]
+mod embedded;
+#[cfg(all(feature = "embedded", unix))]
+pub use embedded::{EmbeddedAsr, EmbeddedModelInfo, process_embedded};
 #[allow(dead_code)]
 mod event;
 mod model_assets;
@@ -402,7 +406,7 @@ where
 /// shape. A day whose segment listing cannot be read (for example, a permission
 /// error) reports that failure through `on_day_error` instead of silently yielding
 /// zero files for the day; discovery of the remaining days is unaffected.
-fn discover_audio_files<'a>(
+pub fn discover_audio_files<'a>(
     journal_path: &'a Path,
     on_day: &'a mut dyn FnMut(&Path),
     on_day_error: &'a mut dyn FnMut(&Path, String),
@@ -459,6 +463,8 @@ fn read_child_directories(parent: &Path) -> Vec<PathBuf> {
 /// Errors currently emitted by the native transcription contract.
 #[derive(Debug)]
 pub enum TranscribeError {
+    /// Cooperative cancellation stopped an embedded attempt before publication.
+    Cancelled,
     /// A bundled model asset could not be resolved.
     ModelAsset(ModelAssetError),
     /// The transcript writer refused or could not publish its requested output.
@@ -528,6 +534,7 @@ impl TranscribeError {
     /// Process exit status for this error.
     pub const fn exit_code(&self) -> i32 {
         match self {
+            Self::Cancelled => 75,
             Self::ModelAsset(_) => 78,
             Self::SpeakerTranscriptWrite(error) => match error {
                 SpeakerTranscriptWriteError::PayloadUnreadable { .. }
@@ -589,6 +596,9 @@ impl From<SpeakerTranscriptWriteError> for TranscribeError {
 impl std::fmt::Display for TranscribeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => {
+                formatter.write_str("embedded transcription cancelled before publication")
+            }
             Self::ModelAsset(error) => error.fmt(formatter),
             Self::SpeakerTranscriptWrite(error) => error.fmt(formatter),
             Self::OrphanNpzRemove { path, detail } => {
@@ -705,6 +715,7 @@ impl std::fmt::Display for TranscribeError {
 impl std::error::Error for TranscribeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Cancelled => None,
             Self::ModelAsset(error) => Some(error),
             Self::SpeakerTranscriptWrite(error) => Some(error),
             Self::SpeakerAnalysis(error) => Some(error),

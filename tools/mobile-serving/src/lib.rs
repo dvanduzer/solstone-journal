@@ -14,6 +14,9 @@ use solstone_core_convey_shell::{
 use solstone_core_journal_io::JournalRoot;
 use std::{net::SocketAddrV4, path::PathBuf};
 
+#[cfg(feature = "audio")]
+mod audio;
+
 pub struct OwnerResponse {
     pub status: u16,
     pub body: String,
@@ -22,6 +25,10 @@ pub struct OwnerResponse {
 /// Retain this value in the app's ordinary worker, alongside its private root.
 /// Owner requests must be admitted by private in-process or app-owned IPC.
 pub struct MobileServing {
+    #[cfg(feature = "audio")]
+    audio: Option<audio::AudioWorker>,
+    #[cfg(feature = "audio")]
+    bus: solstone_core_callosum::CallosumSocketServer,
     handle: EmbeddedConveyHandle,
     runtime: tokio::runtime::Runtime,
     root: JournalRoot,
@@ -61,6 +68,14 @@ impl MobileServing {
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
+        // Keep the production ingest notification boundary live. Durable receipt
+        // discovery provides restart recovery independently of this transient bus.
+        #[cfg(feature = "audio")]
+        let bus = runtime
+            .block_on(solstone_core_callosum::CallosumSocketServer::bind(
+                root.canonical_path().join("health/callosum.sock"),
+            ))
+            .map_err(|e| e.to_string())?;
         let handle = runtime
             .block_on(async {
                 match payload_root {
@@ -80,6 +95,10 @@ impl MobileServing {
             })
             .map_err(|e| e.to_string())?;
         Ok(Self {
+            #[cfg(feature = "audio")]
+            audio: None,
+            #[cfg(feature = "audio")]
+            bus,
             handle,
             runtime,
             root,
@@ -87,8 +106,50 @@ impl MobileServing {
     }
 
     pub fn status(&self) -> Value {
-        json!({"root_current": self.root.revalidate_canonical_binding().is_ok(),
-            "door_address": self.handle.live_door_addr().map(|a| a.to_string())})
+        #[allow(unused_mut)]
+        let mut value = json!({"root_current": self.root.revalidate_canonical_binding().is_ok(),
+            "door_address": self.handle.live_door_addr().map(|a| a.to_string())});
+        #[cfg(feature = "audio")]
+        {
+            value["audio"] = self
+                .audio
+                .as_ref()
+                .map_or(json!({"state":"disabled"}), |a| a.status());
+        }
+        value
+    }
+
+    /// Enable the dedicated foreground app's local processing pass. Successful
+    /// input never needs a private command to trigger transcription.
+    #[cfg(feature = "audio")]
+    pub fn enable_audio(
+        &mut self,
+        models: PathBuf,
+        model: PathBuf,
+        scratch: PathBuf,
+    ) -> Result<(), String> {
+        if self.audio.is_some() {
+            return Err("audio worker already enabled".into());
+        }
+        self.audio = Some(audio::AudioWorker::start(
+            self.root.canonical_path().to_path_buf(),
+            models,
+            model,
+            scratch,
+        )?);
+        Ok(())
+    }
+
+    #[cfg(feature = "audio")]
+    pub fn cancel_audio(&self) -> Result<(), String> {
+        self.audio.as_ref().ok_or("audio worker disabled")?.cancel();
+        Ok(())
+    }
+
+    #[cfg(feature = "audio")]
+    pub fn resume_audio(&self) -> Result<(), String> {
+        self.audio.as_ref().ok_or("audio worker disabled")?.resume();
+        Ok(())
     }
 
     /// Dispatch only a request already admitted by the app's private owner boundary.
@@ -141,7 +202,13 @@ impl MobileServing {
     }
 
     pub fn shutdown(&self) {
+        #[cfg(feature = "audio")]
+        if let Some(audio) = &self.audio {
+            audio.stop();
+        }
         self.handle.shutdown();
+        #[cfg(feature = "audio")]
+        self.runtime.block_on(self.bus.stop());
     }
 }
 

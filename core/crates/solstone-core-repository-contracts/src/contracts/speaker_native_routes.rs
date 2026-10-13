@@ -20,6 +20,86 @@ fn read_repo_file(relative: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
+pub(super) fn dependency_keys(manifest: &str) -> BTreeSet<String> {
+    let manifest = manifest
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse Cargo manifest");
+    let mut active = BTreeSet::new();
+    let mut pending = vec!["default".to_owned()];
+    while let Some(feature) = pending.pop() {
+        if !active.insert(feature.clone()) {
+            continue;
+        }
+        if let Some(members) = manifest
+            .get("features")
+            .and_then(|f| f.get(&feature))
+            .and_then(toml_edit::Item::as_array)
+        {
+            pending.extend(
+                members
+                    .iter()
+                    .map(|m| m.as_str().expect("feature member").to_owned()),
+            );
+        }
+    }
+    fn add(
+        table: Option<&toml_edit::Item>,
+        active: &BTreeSet<String>,
+        keys: &mut BTreeSet<String>,
+    ) {
+        if let Some(table) = table.and_then(toml_edit::Item::as_table_like) {
+            for (key, value) in table.iter() {
+                let optional =
+                    value.get("optional").and_then(toml_edit::Item::as_bool) == Some(true);
+                if !optional
+                    || active.contains(key)
+                    || active.contains(&format!("dep:{key}"))
+                    || active.iter().any(|f| f.starts_with(&format!("{key}/")))
+                {
+                    keys.insert(key.to_owned());
+                }
+            }
+        }
+    }
+    let mut keys = BTreeSet::new();
+    add(manifest.get("dependencies"), &active, &mut keys);
+    if let Some(targets) = manifest
+        .get("target")
+        .and_then(toml_edit::Item::as_table_like)
+    {
+        for (_, target) in targets.iter() {
+            add(target.get("dependencies"), &active, &mut keys);
+        }
+    }
+    keys
+}
+
+#[test]
+fn dependency_keys_respect_optional_default_features_and_target_tables() {
+    let manifest = r#"
+[features]
+default = ["local"]
+local = ["dep:enabled", "forwarded/mode"]
+embedded = ["dep:disabled"]
+[dependencies]
+always = "1"
+enabled = { version = "1", optional = true }
+disabled = { version = "1", optional = true }
+forwarded = { version = "1", optional = true }
+[target.'cfg(unix)'.dependencies.extra]
+version = "1"
+[dev-dependencies]
+not_normal = "1"
+"#;
+    assert_eq!(
+        dependency_keys(manifest),
+        ["always", "enabled", "extra", "forwarded"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+}
+
 fn lock_dependencies() -> BTreeMap<String, Vec<String>> {
     let lock = read_repo_file("core/Cargo.lock")
         .parse::<toml_edit::DocumentMut>()
@@ -30,7 +110,7 @@ fn lock_dependencies() -> BTreeMap<String, Vec<String>> {
     let mut by_name = BTreeMap::new();
     for package in packages {
         let name = package["name"].as_str().expect("package name").to_owned();
-        let dependencies = package
+        let dependencies: Vec<String> = package
             .get("dependencies")
             .and_then(toml_edit::Item::as_array)
             .into_iter()
@@ -46,6 +126,50 @@ fn lock_dependencies() -> BTreeMap<String, Vec<String>> {
             })
             .collect();
         by_name.insert(name, dependencies);
+    }
+    // Lockfiles include every optional edge, even when its feature is disabled.
+    // Remove disabled optional workspace edges before walking the default closure.
+    for entry in fs::read_dir(repository_root().join("core/crates")).expect("read crates") {
+        let path = entry.expect("crate entry").path().join("Cargo.toml");
+        if !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(path).expect("read manifest");
+        let manifest = text
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse manifest");
+        let enabled = dependency_keys(&text);
+        let name = manifest["package"]["name"].as_str().expect("package name");
+        let Some(dependencies) = by_name.get_mut(name) else {
+            continue;
+        };
+        let mut tables = vec![manifest.get("dependencies")];
+        if let Some(targets) = manifest
+            .get("target")
+            .and_then(toml_edit::Item::as_table_like)
+        {
+            tables.extend(targets.iter().map(|(_, target)| target.get("dependencies")));
+        }
+        for table in tables
+            .into_iter()
+            .flatten()
+            .filter_map(toml_edit::Item::as_table_like)
+        {
+            for (key, dependency) in table.iter() {
+                if dependency
+                    .get("optional")
+                    .and_then(toml_edit::Item::as_bool)
+                    == Some(true)
+                    && !enabled.contains(key)
+                {
+                    let package = dependency
+                        .get("package")
+                        .and_then(toml_edit::Item::as_str)
+                        .unwrap_or(key);
+                    dependencies.retain(|name| name != package);
+                }
+            }
+        }
     }
     by_name
 }

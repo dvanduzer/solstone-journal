@@ -39,16 +39,15 @@ pub use notification_labels::{
     SYSTEM_NOTIFICATIONS, SYSTEM_NOTIFICATIONS_LINUX, SYSTEM_NOTIFICATIONS_MACOS,
 };
 pub use path::get_journal_config_path;
+#[cfg(unix)]
+pub use read::read_journal_config_bound;
 pub use read::{
     ConfigLoadError, DailyInputSinceError, JournalConfigMutationBase, JournalConfigRead,
     daily_input_since, entity_tier8_typo_acceptance_enabled, fingerprint_journal_config_bytes,
     load_mutation_base, no_thinking_engine_chosen, parse_daily_input_day, read_journal_config,
 };
-#[cfg(unix)]
-pub use read::{
-    read_journal_config_bound, read_journal_config_in_directory,
-    read_journal_config_observed_in_directory,
-};
+#[cfg(any(unix, windows))]
+pub use read::{read_journal_config_in_directory, read_journal_config_observed_in_directory};
 pub use zone::{Tz, host_zone, owner_zone, parse_zone, zone_label};
 
 #[cfg(test)]

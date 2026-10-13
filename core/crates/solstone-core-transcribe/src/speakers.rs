@@ -299,6 +299,60 @@ pub(crate) fn analyze_speakers(
     ))
 }
 
+#[cfg(all(feature = "embedded", unix))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_speakers_embedded(
+    raw_path: &Path,
+    full_audio: &[f32],
+    statement_audio: &[f32],
+    reduced_audio: Option<&[f32]>,
+    statements_pre_restore: &[Map<String, Value>],
+    statements_restored: &[Map<String, Value>],
+    models: &Path,
+    scratch: &Path,
+) -> Result<SpeakerAnalyzeResult, SpeakerAnalyzeError> {
+    let model = |name: &str| {
+        crate::model_assets::verify_digest(name, models.join(name))
+            .map_err(|error| SpeakerAnalyzeError::new(raw_path, "model", error.to_string(), None))
+    };
+    let wespeaker = model("wespeaker-resnet34-256.onnx")?;
+    let pyannote = model("pyannote-segmentation-3.0.onnx")?;
+    let temporary = tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempdir_in(scratch)
+        .map_err(|error| SpeakerAnalyzeError::new(raw_path, "scratch", error.to_string(), None))?;
+    let result = analyze_in_temp_dir(
+        raw_path,
+        temporary.path(),
+        full_audio,
+        statement_audio,
+        reduced_audio,
+        statements_pre_restore,
+        statements_restored,
+        16_000,
+        MIN_STATEMENT_DURATION_S,
+        &wespeaker,
+        &pyannote,
+        |input| {
+            let input = std::str::from_utf8(input).map_err(|error| {
+                SpeakerAnalyzeError::new(raw_path, "request", error.to_string(), None)
+            })?;
+            let output = solstone_core_speakers_analyze::run_request(input).map_err(|error| {
+                SpeakerAnalyzeError::new(raw_path, "inference", error.to_string(), None)
+            })?;
+            Ok(HelperInvocationResult {
+                returncode: 0,
+                stdout: output.to_string(),
+                stderr: String::new(),
+            })
+        },
+    );
+    temporary
+        .close()
+        .map_err(|error| SpeakerAnalyzeError::new(raw_path, "cleanup", error.to_string(), None))?;
+    result
+}
+
 fn with_cleaned_temp_dir<T, F>(
     raw_path: &Path,
     temporary: &Path,

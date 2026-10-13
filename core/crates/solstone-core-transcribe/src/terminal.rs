@@ -79,7 +79,7 @@ where
     O: FnOnce(&Path, &Path) -> Result<(), TranscribeError>,
     C: FnOnce(&Path) -> Result<(), TranscribeError>,
 {
-    let payload_path = empty_payload_path()?;
+    let payload_path = empty_payload_path(request.jsonl_path)?;
     let result = (|| {
         let bytes = build_terminal_request(&request, &payload_path)?;
         // This must be the final operation before the writer is called so retry
@@ -105,11 +105,18 @@ fn remove_temporary_payload(payload_path: &Path) -> Result<(), TranscribeError> 
     })
 }
 
-fn empty_payload_path() -> Result<PathBuf, TranscribeError> {
+fn empty_payload_path(destination: &Path) -> Result<PathBuf, TranscribeError> {
     let temporary = tempfile::Builder::new()
         .prefix("solstone-speaker-transcript-")
         .suffix(".f32le")
-        .tempfile()
+        .tempfile_in(
+            destination
+                .parent()
+                .ok_or_else(|| TranscribeError::TerminalPayload {
+                    path: Some(destination.to_path_buf()),
+                    detail: "transcript destination has no parent".into(),
+                })?,
+        )
         .map_err(|error| TranscribeError::TerminalPayload {
             path: None,
             detail: error.to_string(),

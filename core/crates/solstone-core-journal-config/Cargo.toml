@@ -16,10 +16,10 @@ sha2.workspace = true
 solstone-core-journal.workspace = true
 whoami.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, windows))'.dependencies]
 solstone-core-journal-io.workspace = true
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(any(unix, windows))'.dev-dependencies]
 solstone-core-journal-io = { workspace = true, features = ["test-hooks"] }
 
 [lints]

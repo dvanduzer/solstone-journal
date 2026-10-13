@@ -115,6 +115,10 @@ impl CallosumSocketServer {
         #[cfg(any(test, feature = "test-hooks"))] hooks: Option<Arc<ServerTestHooks>>,
         #[cfg(not(any(test, feature = "test-hooks")))] _hooks: Option<()>,
     ) -> Result<Self, CallosumSocketServerError> {
+        #[cfg(unix)]
+        let socket_path = crate::endpoint_path(&socket_path)
+            .map_err(CallosumSocketServerError::Io)?
+            .into_owned();
         #[cfg(windows)]
         crate::windows::resolve_pipe_namespace(&socket_path)
             .map_err(CallosumSocketServerError::Io)?;

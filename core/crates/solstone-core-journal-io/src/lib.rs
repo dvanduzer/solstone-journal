@@ -164,7 +164,8 @@ pub use inventory_budget::{InventoryBudget, InventoryBudgetLimit};
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use journal_root::{AcquisitionPrimitive, run_with_acquisition_fault};
 pub use journal_root::{
-    JournalEntryKind, JournalRoot, JournalRootError, ObjectIdentity, WindowsRefusalCategory,
+    DirectoryIdentityWitness, JournalEntryKind, JournalRoot, JournalRootError, ObjectIdentity,
+    WindowsRefusalCategory,
 };
 #[cfg(all(windows, feature = "test-hooks"))]
 pub use journal_root::{
@@ -256,5 +257,5 @@ pub use windows_lock::{
 pub use windows_sync_dir::{
     WindowsFlatDirectory, create_or_open_windows_flat_directory_bound, list_windows_flat_directory,
     open_windows_flat_directory_bound, open_windows_regular_file_from_bound_parent,
-    read_windows_observed_file_bounded,
+    read_windows_observed_file_bounded, remove_windows_observed_file_bounded,
 };

@@ -313,6 +313,32 @@ pub struct JournalRoot {
     inner: windows::WindowsRoot,
 }
 
+/// A retained directory identity and canonical binding, without publication authority.
+/// Mobile sandbox ancestors can be searchable without being listable. Unlike a
+/// `JournalRoot`, this witness exposes no descriptor for reads, writes or sync.
+pub struct DirectoryIdentityWitness {
+    root: JournalRoot,
+}
+
+impl DirectoryIdentityWitness {
+    /// Retain an identity using search-only authority where the platform supports it.
+    pub fn open(path: &Path) -> Result<Self, JournalRootError> {
+        Ok(Self {
+            root: JournalRoot {
+                #[cfg(unix)]
+                inner: unix::acquire_identity(path)?,
+                #[cfg(windows)]
+                inner: windows::acquire(path)?,
+            },
+        })
+    }
+
+    /// Refuse canonical replacement, including a different directory with the same name.
+    pub fn revalidate_canonical_binding(&self) -> Result<(), JournalRootError> {
+        self.root.revalidate_canonical_binding()
+    }
+}
+
 impl JournalRoot {
     /// Acquire `root` once and retain its directory descriptor.
     pub fn open(root: &Path) -> Result<Self, JournalRootError> {

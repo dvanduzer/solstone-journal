@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::error::Error;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDate;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use solstone_core_journal_io::media::{MediaDirectory, MediaEntry};
 #[cfg(unix)]
 use solstone_core_journal_io::{JournalRoot, open_flat_directory_bound, read_bytes_bound};
@@ -111,7 +111,7 @@ pub fn read_journal_config_bound(root: &JournalRoot) -> Result<JournalConfigRead
 /// Strictly decode bounded, complete bytes from a retained configuration parent.
 /// The directory's spelling is diagnostic only; Native checks its chain and
 /// the final file name around the read. Missing files never materialize defaults.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn read_journal_config_in_directory(
     directory: &MediaDirectory,
     max_bytes: usize,
@@ -120,7 +120,7 @@ pub fn read_journal_config_in_directory(
 }
 
 /// Decode and fingerprint the same complete byte buffer as its retained file observation.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn read_journal_config_observed_in_directory(
     directory: &MediaDirectory,
     max_bytes: usize,

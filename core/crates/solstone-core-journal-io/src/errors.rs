@@ -640,6 +640,9 @@ pub enum ClaimRemovalOutcome {
     Removed,
     /// The exact observed object was unlinked, but directory sync failed.
     RemovedDurabilityUncertain,
+    /// The exact observed object was deleted on a platform with no directory
+    /// flush (Windows), so none was attempted.
+    RemovedUnflushed,
     /// This invocation proved it did not mutate either supplied name.
     Unchanged { reason: ClaimUnchangedReason },
     /// The observed object changed, was restored, or has an unknown location.

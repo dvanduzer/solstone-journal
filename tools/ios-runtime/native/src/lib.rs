@@ -3,6 +3,7 @@
 //! Development-only iOS helper bridge. Fault operations never enter a release binary.
 use chrono::NaiveDate;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use solstone_core_indexer_query::{
     OwnerBoundary, OwnerIndex, SearchRequest, open_owner_index, search,
 };
@@ -176,6 +177,27 @@ fn run(v: Value) -> Result<Value, String> {
                 .ok_or("port must be between 1024 and 65535")? as u16;
             let address = std::net::SocketAddrV4::new(wifi_address()?, port);
             let payload = PathBuf::from(v["payload"].as_str().ok_or("missing bundled payload")?);
+            #[cfg(all(target_os = "ios", feature = "audio"))]
+            {
+                let target = std::env::temp_dir().join("callosum.sock");
+                if !target.is_absolute() || target.as_os_str().len() >= 104 {
+                    return Err("app-private Callosum target exceeds Unix socket path bound".into());
+                }
+                let alias = p.join("health/callosum.sock");
+                std::fs::create_dir_all(alias.parent().ok_or("missing health directory")?)
+                    .map_err(|e| e.to_string())?;
+                match std::fs::symlink_metadata(&alias) {
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && std::fs::read_link(&alias).map_err(|e| e.to_string())? == target => {
+                    }
+                    Ok(_) => return Err("Callosum endpoint already has another binding".into()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::os::unix::fs::symlink(&target, &alias).map_err(|e| e.to_string())?
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
             let runtime = journal_mobile_serving::MobileServing::start_with_payload(
                 p.to_owned(),
                 address,
@@ -184,6 +206,41 @@ fn run(v: Value) -> Result<Value, String> {
             let status = runtime.status();
             *serving = Some(runtime);
             Ok(json!({"address":address.to_string(),"status":status}))
+        }
+        #[cfg(feature = "audio")]
+        "audio-enable" => {
+            let models = PathBuf::from(
+                v["payload"]
+                    .as_str()
+                    .ok_or("missing bundled audio models")?,
+            );
+            let scratch = p.join(".audio-scratch");
+            let model = match v["mode"].as_str().unwrap_or("reopen") {
+                "missing-model" => scratch.join("missing.gguf"),
+                "corrupt-model" => {
+                    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+                    let model = scratch.join("corrupt.gguf");
+                    std::fs::write(&model, b"synthetic corrupt model")
+                        .map_err(|e| e.to_string())?;
+                    model
+                }
+                _ => models.join("tdt-0.6b-v3-q8_0.gguf"),
+            };
+            let mut serving = SERVING.lock().map_err(|e| e.to_string())?;
+            let serving = serving.as_mut().ok_or("serving is stopped")?;
+            serving.enable_audio(models.clone(), model, scratch)?;
+            Ok(serving.status())
+        }
+        #[cfg(feature = "audio")]
+        "audio-cancel" | "audio-resume" => {
+            let serving = SERVING.lock().map_err(|e| e.to_string())?;
+            let serving = serving.as_ref().ok_or("serving is stopped")?;
+            if op == "audio-cancel" {
+                serving.cancel_audio()?;
+            } else {
+                serving.resume_audio()?;
+            }
+            Ok(serving.status())
         }
         "serve-stop" => {
             if let Some(serving) = SERVING.lock().map_err(|e| e.to_string())?.take() {
@@ -252,6 +309,50 @@ fn run(v: Value) -> Result<Value, String> {
             }
             let (count, bytes) = storage(p)?;
             Ok(json!({"files":files,"storage_files":count,"storage_bytes":bytes}))
+        }
+        "audio-inventory" => {
+            if SERVING.lock().map_err(|e| e.to_string())?.is_some() {
+                return Err("stop serving before snapshotting audio files".into());
+            }
+            fn collect(root: &Path, path: &Path, files: &mut Vec<Value>) -> Result<(), String> {
+                for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    let kind = entry.file_type().map_err(|e| e.to_string())?;
+                    if kind.is_symlink() {
+                        if entry.path() == root.join("health/callosum.sock") {
+                            files.push(json!({"path":"health/callosum.sock","socket_alias":
+                                std::fs::read_link(entry.path()).map_err(|e| e.to_string())?}));
+                            continue;
+                        }
+                        return Err("unexpected synthetic journal symlink".into());
+                    }
+                    if kind.is_dir() {
+                        collect(root, &entry.path(), files)?;
+                    } else if kind.is_file() {
+                        let path = entry.path();
+                        let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+                        let size = file.metadata().map_err(|e| e.to_string())?.len();
+                        let mut hash = Sha256::new();
+                        std::io::copy(&mut file, &mut hash).map_err(|e| e.to_string())?;
+                        let text = (path.starts_with(root.join("chronicle"))
+                            && matches!(
+                                path.extension().and_then(|e| e.to_str()),
+                                Some("jsonl" | "json")
+                            ))
+                        .then(|| std::fs::read_to_string(&path))
+                        .transpose()
+                        .map_err(|e| e.to_string())?;
+                        files.push(
+                            json!({"path":path.strip_prefix(root).map_err(|e| e.to_string())?,
+                            "bytes":size,"sha256":format!("{:x}",hash.finalize()),"text":text}),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            let mut files = Vec::new();
+            collect(p, p, &mut files)?;
+            Ok(json!({"files":files}))
         }
         "prepare-export" => {
             if SERVING.lock().map_err(|e| e.to_string())?.is_some() {
