@@ -61,6 +61,9 @@ def multipart(directory, segment, media):
 def audio_status(row):
     if row.get('event') != 'audio.status':
         return None
+    result = row['value']['reply']['journal']['result']
+    if not result['ok'] and result.get('error') == 'serving is stopped':
+        return None
     return native(row['value']['reply'])['audio']
 
 
