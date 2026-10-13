@@ -12,6 +12,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- when an older day has daily results that were never made, your journal now makes them after finishing that day's recordings, before moving on to older recordings. before, those results waited until every older recording was finished.
+
 - when your journal can't set up its solstone.me address, the agents app now says the problem is on this computer and needs a fix, instead of saying this computer isn't reaching solstone.me and will keep trying. `solstone journal health logs` names the step that failed.
 - `solstone journal mcp token create` now says that an agent using a new token can't read your journal until you grant it access, and prints the command to do that.
 - on windows, media offload runs again. you can approve its proposals from the home page and bring the media back from the backup page or with `solstone journal backup offload restore`, including media an earlier version offloaded.

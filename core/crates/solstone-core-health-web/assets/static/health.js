@@ -459,7 +459,7 @@
       reach.textContent = `${inventory.days_inspected} of ${inventory.days_total} days checked (${range}). `
         + (!fresh ? 'last known progress, checked ' + new Date(inventory.as_of_ms).toLocaleString() + '.'
           : inventory.complete ? 'the inspection covers the whole journal.' : 'the inspection is incomplete.');
-      const names = ['today', 'your requests and yesterday', 'recent days', 'imports', 'older recordings', 'older day updates'];
+      const names = ['today', 'your requests and yesterday', 'recent days', 'imports', 'finishing older days', 'updating older days'];
       inventory.bands.forEach((band, i) => {
         const row = document.createElement('li');
         row.textContent = names[i] + ': ' + band.segments_complete + ' recordings ready, '
