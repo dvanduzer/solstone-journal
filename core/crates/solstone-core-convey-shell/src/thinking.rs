@@ -181,11 +181,15 @@ pub struct ConfidentialRuntimeOverride {
     pub access: Option<Arc<dyn ConfidentialAccess + Send + Sync>>,
 }
 
+/// Runs one image check against the journal at the given root. `Err` means the
+/// check could not be started.
+pub type EndpointImageCheckFn = dyn Fn(&std::path::Path) -> Result<solstone_core_thinking::endpoint_image::ImageCheck, ()>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub struct EndpointImageCheckOverride {
-    pub check: Arc<
-        dyn Fn() -> Result<solstone_core_thinking::endpoint_image::ImageCheck, ()> + Send + Sync,
-    >,
+    pub check: Arc<EndpointImageCheckFn>,
 }
 
 #[derive(Clone)]
@@ -1587,7 +1591,7 @@ async fn check_local_endpoint_image(
     let journal_root = journal.0.clone();
     let check = tokio::task::spawn_blocking(move || {
         if let Some(Extension(custom)) = image_check_override {
-            (custom.check)()
+            (custom.check)(&journal_root)
         } else {
             solstone_core_thinking::endpoint_image::check_endpoint_images(&journal_root)
         }
@@ -3460,8 +3464,14 @@ mod tests {
 
         let counter_for_override = counter.clone();
         let mode_for_override = mode.clone();
+        let roots_seen = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
+        let roots_for_override = roots_seen.clone();
         let image_override = super::EndpointImageCheckOverride {
-            check: Arc::new(move || {
+            check: Arc::new(move |journal_root: &std::path::Path| {
+                roots_for_override
+                    .lock()
+                    .unwrap()
+                    .push(journal_root.to_path_buf());
                 counter_for_override.fetch_add(1, Ordering::SeqCst);
                 match mode_for_override.load(Ordering::SeqCst) {
                     MODE_SUCCESS => Ok(solstone_core_thinking::endpoint_image::ImageCheck::Read),
@@ -3503,6 +3513,11 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["image_check"]["status"], "read");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            roots_seen.lock().unwrap().as_slice(),
+            [root.clone()],
+            "the check runs against the route's own journal root"
+        );
         let body_str = serde_json::to_string(&body).unwrap();
         assert!(!body_str.contains("secret-credential-value"));
         assert!(!body_str.contains("http://endpoint.example:9/v1"));

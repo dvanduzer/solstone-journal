@@ -142,9 +142,9 @@ impl ImageProbe for OneShotClient {
         journal: &Path,
         request: &GenerateRequest,
     ) -> Result<GenerateResponse, ClientError> {
-        // Child-only exception: the parent process environment is not altered, and
-        // SOLSTONE_JOURNAL is set solely on the child process command invocation.
-        // .envs replaces any inherited variables for the spawned subprocess.
+        // The parent process environment is not altered: the provider override and
+        // the journal root are set on the child command only. Variables the parent
+        // already carries still reach the child.
         let client = self
             .clone()
             .with_env(
@@ -170,6 +170,14 @@ pub fn check_endpoint_images(journal: &Path) -> Result<ImageCheck, ()> {
 }
 
 pub fn check_with_hue<P: ImageProbe>(probe: &mut P, journal: &Path, hue: Hue) -> ImageCheck {
+    // The child learns its journal from an environment variable, which can only
+    // carry valid UTF-8. A root it cannot carry must not silently fall back to
+    // another journal, so the check is not made.
+    if journal.to_str().is_none() {
+        return ImageCheck::Unchecked {
+            reason: CheckReason::Unavailable,
+        };
+    }
     let png_bytes = encode_png(hue);
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
     let request = image_request(&base64_data);
@@ -240,13 +248,13 @@ pub fn classify_image_reply(
                 };
             }
 
-            let text = &generated.text;
-            let text_after_think = match text.rfind("</think>") {
-                Some(index) => &text[index + "</think>".len()..],
-                None => text.as_str(),
+            // Lowercase first so the closing tag is found in any case, then keep only
+            // what follows the last one.
+            let whole = generated.text.to_lowercase();
+            let lower = match whole.rfind("</think>") {
+                Some(index) => &whole[index + "</think>".len()..],
+                None => whole.as_str(),
             };
-
-            let lower = text_after_think.to_lowercase();
             let mut detected_families = BTreeSet::new();
             for word in lower.split(|c: char| !c.is_alphabetic()) {
                 if let Some(family) = word_to_family(word) {
@@ -715,6 +723,85 @@ mod tests {
             distinct_hues.len() >= 3,
             "200 draws must yield at least 3 distinct hues, got {}",
             distinct_hues.len()
+        );
+    }
+
+    /// Name the color a flat test picture shows, from literal values and not from
+    /// the production table, so a picture painted with the wrong hue is caught.
+    fn name_of_painted_pixel(pixel: [u8; 3]) -> &'static str {
+        match pixel {
+            [255, 140, 0] => "orange",
+            [130, 40, 160] => "purple",
+            [255, 130, 180] => "pink",
+            [250, 220, 0] => "yellow",
+            [20, 160, 40] => "green",
+            _ => "unrecognized",
+        }
+    }
+
+    #[test]
+    fn the_color_painted_is_the_color_judged() {
+        for hue in [Hue::Orange, Hue::Purple, Hue::Pink, Hue::Yellow, Hue::Green] {
+            let mut probe = InMemoryProbe::new(|_, request| {
+                let data = request
+                    .contents
+                    .iter()
+                    .find_map(|part| match part {
+                        ContentPart::Image { data, .. } => Some(data.clone()),
+                        _ => None,
+                    })
+                    .expect("the request carries an image");
+                let png = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("standard base64");
+                let img = image::load_from_memory(&png)
+                    .expect("PNG decodes")
+                    .to_rgb8();
+                let name = name_of_painted_pixel(img.get_pixel(0, 0).0);
+                generated_response(&format!("It's solid {name}."), "stop")
+            });
+            assert_eq!(
+                check_with_hue(&mut probe, Path::new("/tmp/journal"), hue),
+                ImageCheck::Read,
+                "a model that names the color actually painted must read for {hue:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_think_tag_is_found_in_any_case_and_the_last_one_wins() {
+        for (text, hue, want) in [
+            (
+                "<THINK>maybe orange</THINK> purple",
+                Hue::Purple,
+                ImageCheck::Read,
+            ),
+            (
+                "</think>orange</think>purple",
+                Hue::Purple,
+                ImageCheck::Read,
+            ),
+            ("orange</think>", Hue::Orange, ImageCheck::NotRead),
+        ] {
+            assert_eq!(
+                classify_image_reply(hue, generated_response(text, "stop")),
+                want,
+                "{text}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_root_the_child_cannot_carry_is_not_checked() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/journal-\xff"));
+        let mut probe = InMemoryProbe::new(|_, _| panic!("the child must not be asked"));
+        assert_eq!(
+            check_with_hue(&mut probe, root, Hue::Orange),
+            ImageCheck::Unchecked {
+                reason: CheckReason::Unavailable
+            }
         );
     }
 

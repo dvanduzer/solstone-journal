@@ -3579,6 +3579,16 @@ async function main() {
   assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
   assert.strictEqual(statusNode.dataset.tone, 'error');
 
+  // Case 8b: an unknown status never borrows the reason that rode along with it
+  resetForm();
+  nextCheckHandler = Promise.resolve({ image_check: { status: 'Read', reason: 'timeout' } });
+  await thinking.saveLocalEndpoint();
+  assertButtonsRestoredAndNoChecking();
+  assert.strictEqual(window.location.hash, '#byo-setup');
+  assert(statusNode.textContent.includes('endpoint_image_unchecked:model-sentinel:endpoint_reason_other'));
+  assert(!statusNode.textContent.includes('endpoint_reason_timeout'));
+  assert.strictEqual(statusNode.dataset.tone, 'error');
+
   // Case 9: apiJson returns non-JSON failure (throw with no status, or status 200 and a non-object)
   resetForm();
   nextCheckHandler = () => Promise.reject(new Error('throw with no status'));
@@ -3700,61 +3710,63 @@ async function main() {
   assertButtonsRestoredAndNoChecking();
   assert.strictEqual(checkCalls, checkCallsBefore14 + 1, 'check count increases by one on second save');
 
-  // Case 15: leave the form
-  resetForm();
-  let deferredResolve;
-  const pendingPromise = new Promise((resolve) => {
-    deferredResolve = resolve;
-  });
-  nextCheckHandler = pendingPromise;
+  // Case 15: leave the form while the check is pending, for a late not_read and a late read
+  for (const lateStatus of ['not_read', 'read']) {
+    resetForm();
+    let deferredResolve;
+    const pendingPromise = new Promise((resolve) => {
+      deferredResolve = resolve;
+    });
+    nextCheckHandler = pendingPromise;
 
-  let showViewCount = 0;
-  const origQSA = document.querySelectorAll;
-  document.querySelectorAll = function (selector) {
-    if (selector === '#providers [data-view]') showViewCount += 1;
-    return origQSA.call(this, selector);
-  };
+    let showViewCount = 0;
+    const origQSA = document.querySelectorAll;
+    document.querySelectorAll = function (selector) {
+      if (selector === '#providers [data-view]') showViewCount += 1;
+      return origQSA.call(this, selector);
+    };
 
-  const savePromise = thinking.saveLocalEndpoint();
-  await advance(0);
-  await settle();
+    const savePromise = thinking.saveLocalEndpoint();
+    await advance(0);
+    await settle();
 
-  assert.strictEqual(saveBtn.disabled, true, 'save disabled while pending');
-  assert.strictEqual(clearBtn.disabled, true, 'clear disabled while pending');
-  assert.strictEqual(
-    clearFromLocalBtn.disabled,
-    true,
-    'clearFromLocal disabled while pending'
-  );
-  assert.strictEqual(
-    statusNode.textContent,
-    'endpoint_image_checking:model-sentinel',
-    'status is checking key while pending'
-  );
+    assert.strictEqual(saveBtn.disabled, true, 'save disabled while pending');
+    assert.strictEqual(clearBtn.disabled, true, 'clear disabled while pending');
+    assert.strictEqual(
+      clearFromLocalBtn.disabled,
+      true,
+      'clearFromLocal disabled while pending'
+    );
+    assert.strictEqual(
+      statusNode.textContent,
+      'endpoint_image_checking:model-sentinel',
+      'status is checking key while pending'
+    );
 
-  thinking.showView('main');
-  assert.strictEqual(window.location.hash, '#main');
-  const showViewCountAtLeave = showViewCount;
+    thinking.showView('main');
+    assert.strictEqual(window.location.hash, '#main');
+    const showViewCountAtLeave = showViewCount;
 
-  deferredResolve({ image_check: { status: 'not_read' } });
-  await savePromise;
-  await settle();
+    deferredResolve({ image_check: { status: lateStatus } });
+    await savePromise;
+    await settle();
 
-  assert.strictEqual(saveBtn.disabled, false, 'save re-enabled after leave');
-  assert.strictEqual(clearBtn.disabled, false, 'clear re-enabled after leave');
-  assert.strictEqual(
-    clearFromLocalBtn.disabled,
-    false,
-    'clearFromLocal re-enabled after leave'
-  );
-  assert(!statusNode.textContent.includes('endpoint_image_not_read'));
-  assert(!statusNode.textContent.includes('endpoint_image_checking'));
-  assert.strictEqual(
-    showViewCount,
-    showViewCountAtLeave,
-    'showView was not called again by the result'
-  );
-  document.querySelectorAll = origQSA;
+    assert.strictEqual(saveBtn.disabled, false, 'save re-enabled after leave');
+    assert.strictEqual(clearBtn.disabled, false, 'clear re-enabled after leave');
+    assert.strictEqual(
+      clearFromLocalBtn.disabled,
+      false,
+      'clearFromLocal re-enabled after leave'
+    );
+    assert(!statusNode.textContent.includes('endpoint_image_not_read'));
+    assert(!statusNode.textContent.includes('endpoint_image_checking'));
+    assert.strictEqual(
+      showViewCount,
+      showViewCountAtLeave,
+      'showView was not called again by the result'
+    );
+    document.querySelectorAll = origQSA;
+  }
 
   window.apiJson = originalApiJson;
 

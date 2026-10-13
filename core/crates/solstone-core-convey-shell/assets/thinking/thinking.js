@@ -4333,7 +4333,7 @@
         checkLine = formatCopy(copy.byo_setup?.endpoint_image_not_read, {model});
       } else {
         let reasonKey = 'endpoint_reason_other';
-        const reason = check?.reason;
+        const reason = status === 'unchecked' ? check?.reason : undefined;
         if (reason === 'unreachable') reasonKey = 'endpoint_reason_unreachable';
         else if (reason === 'timeout') reasonKey = 'endpoint_reason_timeout';
         else if (reason === 'busy') reasonKey = 'endpoint_reason_busy';
@@ -4350,6 +4350,8 @@
 
       const statusText = unlogged ? `${unlogged}\n${checkLine}` : checkLine;
       setMessage('localEndpointStatus', statusText, 'error');
+      // The line sits at the foot of the form; on a short window it would be cut off.
+      $('localEndpointStatus')?.scrollIntoView?.({block: 'nearest'});
     } finally {
       if (saveBtn) saveBtn.disabled = false;
       if (clearBtn) clearBtn.disabled = false;

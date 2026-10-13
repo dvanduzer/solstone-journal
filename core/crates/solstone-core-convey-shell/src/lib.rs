@@ -128,7 +128,7 @@ mod link_health_cache;
 #[cfg(feature = "host")]
 mod local_network;
 #[cfg(feature = "host")]
-pub(crate) mod loopback_guard;
+mod loopback_guard;
 #[cfg(feature = "host")]
 mod network;
 #[cfg(feature = "host")]
