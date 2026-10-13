@@ -83,6 +83,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cycles', type=int, default=18)
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--expect-unsearchable', action='store_true',
+                        help='Collect transcription/fault evidence while holding the search capability')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     provenance(args)
@@ -116,8 +118,12 @@ def main():
         status = wait_audio(phone, lambda s: s.get('last', {}).get('input', '').endswith(
             '/' + segment + '/' + submitted[segment]) and s['last'].get('indexed'))
         processed.append(status['last'])
-        result = client.http('GET', '/app/search/api/search?q=silver%20lantern&limit=100')
-        assert any('/' + segment + '/' in hit['path'] for hit in hits(result)), result
+        if args.expect_unsearchable:
+            result = client.http('GET', '/app/search/api/search?q=silver%20lantern&limit=100', status=503)
+            assert result['reason_code'] == 'empty_index', result
+        else:
+            result = client.http('GET', '/app/search/api/search?q=silver%20lantern&limit=100')
+            assert any('/' + segment + '/' in hit['path'] for hit in hits(result)), result
         return status
 
     def ping():
@@ -271,10 +277,13 @@ def main():
         with sqlite3.connect(dbpath.as_uri() + '?mode=ro', uri=True) as db:
             assert db.execute('pragma integrity_check').fetchall() == [('ok',)]
             chunks = db.execute('select path,content from chunks where chunks match ?', ('"silver lantern"',)).fetchall()
-            assert {p for p, _ in chunks} == {t['path'] for t in transcripts}, chunks
+            expected = set() if args.expect_unsearchable else {t['path'] for t in transcripts}
+            assert {p for p, _ in chunks} == expected, chunks
         beats = [row for row in phone.rows if row['event'] == 'host.heartbeat']
         assert beats and all(row['value']['state'] == 0 for row in beats)
-        result = {'passed': True, 'started': started, 'finished': time.time(), 'submitted': submitted,
+        result = {'passed': not args.expect_unsearchable, 'transcription_checks_passed': True,
+                  'search_held': args.expect_unsearchable,
+                  'started': started, 'finished': time.time(), 'submitted': submitted,
                   'processed': processed, 'failures': errors, 'authenticated_identity_ms': responsiveness,
                   'transcripts': transcripts, 'npz': npzs,
                   'peak_footprint_bytes': max(row['value']['resources']['footprint_bytes'] for row in beats),
