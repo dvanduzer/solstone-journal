@@ -104,6 +104,10 @@ fn write_sidecar(
     sidecar
 }
 
+// The candidate symlink is Unix-only; the remaining fixture entries run everywhere.
+const FIXTURE_INELIGIBLE: u64 = 7 + cfg!(unix) as u64;
+const FIXTURE_TOTAL: u64 = 12 + FIXTURE_INELIGIBLE;
+
 fn setup_fixture() -> Fixture {
     let temp = tempfile::tempdir().expect("temporary journal");
     let journal = temp.path();
@@ -402,13 +406,13 @@ fn fixture_exercises_all_eight_outcomes_and_flags_are_inert() {
     let writer = AtomicWriter;
     let expected = expected_counts(
         "DRY RUN (no changes written)",
-        20,
+        FIXTURE_TOTAL,
         &[
             ("stamp_empty", 5),
             ("skip_has_record", 1),
             ("skip_chunk_bearing", 1),
             ("skip_marker", 1),
-            ("skip_ineligible", 8),
+            ("skip_ineligible", FIXTURE_INELIGIBLE),
             ("skip_unreadable", 3),
             ("skip_oversize", 1),
             ("write_failed", 0),
@@ -447,13 +451,13 @@ fn commit_stamps_ordered_records_preserves_other_bytes_and_is_idempotent() {
         stdout,
         expected_counts(
             "COMMITTED",
-            20,
+            FIXTURE_TOTAL,
             &[
                 ("stamp_empty", 5),
                 ("skip_has_record", 1),
                 ("skip_chunk_bearing", 1),
                 ("skip_marker", 1),
-                ("skip_ineligible", 8),
+                ("skip_ineligible", FIXTURE_INELIGIBLE),
                 ("skip_unreadable", 3),
                 ("skip_oversize", 1),
                 ("write_failed", 0),
@@ -620,13 +624,13 @@ fn writer_failure_and_re_read_guard_are_independent() {
         stdout,
         expected_counts(
             "COMMITTED",
-            20,
+            FIXTURE_TOTAL,
             &[
                 ("stamp_empty", 0),
                 ("skip_has_record", 1),
                 ("skip_chunk_bearing", 1),
                 ("skip_marker", 1),
-                ("skip_ineligible", 8),
+                ("skip_ineligible", FIXTURE_INELIGIBLE),
                 ("skip_unreadable", 3),
                 ("skip_oversize", 1),
                 ("write_failed", 5),
@@ -637,13 +641,13 @@ fn writer_failure_and_re_read_guard_are_independent() {
         dry.1,
         expected_counts(
             "DRY RUN (no changes written)",
-            20,
+            FIXTURE_TOTAL,
             &[
                 ("stamp_empty", 5),
                 ("skip_has_record", 1),
                 ("skip_chunk_bearing", 1),
                 ("skip_marker", 1),
-                ("skip_ineligible", 8),
+                ("skip_ineligible", FIXTURE_INELIGIBLE),
                 ("skip_unreadable", 3),
                 ("skip_oversize", 1),
                 ("write_failed", 0),

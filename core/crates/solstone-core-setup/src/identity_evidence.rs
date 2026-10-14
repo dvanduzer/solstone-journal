@@ -545,11 +545,20 @@ fn insert_service_guard(values: &mut BTreeMap<String, String>, entry: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solstone_core_installation_identity::{
-        Generation, InstallationId, JournalToken, NamespaceName,
-    };
+    use solstone_core_installation_identity::{Generation, InstallationId, NamespaceName};
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn absolute_test_path(relative: &str) -> PathBuf {
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        relative.split('/').filter(|part| !part.is_empty()).fold(
+            PathBuf::from(root),
+            |mut path, part| {
+                path.push(part);
+                path
+            },
+        )
+    }
 
     fn fields() -> GuardFields {
         GuardFields {
@@ -559,7 +568,10 @@ mod tests {
             .expect("namespace"),
             id: InstallationId::parse("00112233445566778899aabbccddeeff").expect("id"),
             generation: Generation::new(1).expect("generation"),
-            journal_token: JournalToken::from_raw_absolute(b"/journal".to_vec()).expect("journal"),
+            journal_token: solstone_core_installation_identity::journal_token_from_path(
+                &absolute_test_path("journal"),
+            )
+            .expect("journal"),
         }
     }
 
@@ -588,8 +600,10 @@ mod tests {
     fn journal_token_drift_for_one_identity_remains_guarded() {
         let original = fields();
         let changed = GuardFields {
-            journal_token: JournalToken::from_raw_absolute(b"/changed-journal".to_vec())
-                .expect("changed journal"),
+            journal_token: solstone_core_installation_identity::journal_token_from_path(
+                &absolute_test_path("changed-journal"),
+            )
+            .expect("changed journal"),
             ..original.clone()
         };
         let mut solstone = WrapperSlotEvidence {
@@ -644,7 +658,7 @@ mod tests {
             bin.join("journal"),
             crate::wrapper::render_wrapper(
                 WrapperCommand::Journal,
-                Path::new("/journal"),
+                &absolute_test_path("journal"),
                 &old_executable_dir.join("journal"),
                 &guard,
             )
@@ -655,7 +669,7 @@ mod tests {
             bin.join("solstone"),
             crate::wrapper::render_wrapper(
                 WrapperCommand::Solstone,
-                Path::new("/journal"),
+                &absolute_test_path("journal"),
                 &old_executable_dir.join("solstone"),
                 &guard,
             )
@@ -801,8 +815,8 @@ mod tests {
             &path,
             crate::wrapper::render_wrapper(
                 WrapperCommand::Journal,
-                std::path::Path::new("/journal"),
-                std::path::Path::new("/owner-authored/journal"),
+                &absolute_test_path("journal"),
+                &absolute_test_path("owner-authored/journal"),
                 &fields(),
             )
             .unwrap(),
@@ -838,7 +852,7 @@ mod tests {
         for command in [WrapperCommand::Solstone, WrapperCommand::Journal] {
             let published = crate::wrapper::render_wrapper(
                 command,
-                Path::new("/journal"),
+                &absolute_test_path("journal"),
                 &prior.join(command.as_str()),
                 &guard,
             )
@@ -888,7 +902,7 @@ mod tests {
                 bin.join(command.as_str()),
                 crate::wrapper::render_wrapper(
                     command,
-                    Path::new("/journal"),
+                    &absolute_test_path("journal"),
                     &runtime.join(command.as_str()),
                     &guard,
                 )
@@ -949,7 +963,7 @@ mod tests {
             bin.join("journal"),
             crate::wrapper::render_wrapper(
                 WrapperCommand::Journal,
-                Path::new("/journal"),
+                &absolute_test_path("journal"),
                 &runtime.join("journal"),
                 &foreign_guard,
             )
@@ -970,7 +984,7 @@ mod tests {
             bin.join("solstone"),
             crate::wrapper::render_wrapper(
                 WrapperCommand::Solstone,
-                Path::new("/journal"),
+                &absolute_test_path("journal"),
                 &runtime.join("solstone"),
                 &guard,
             )
@@ -981,7 +995,7 @@ mod tests {
             bin.join("journal"),
             crate::wrapper::render_wrapper(
                 WrapperCommand::Journal,
-                Path::new("/journal"),
+                &absolute_test_path("journal"),
                 &runtime.join("journal"),
                 &guard,
             )

@@ -2807,8 +2807,15 @@ mod tests {
                 fs::create_dir_all(&identity_root).expect("create identity root");
                 Some(
                     admit_setup(SetupAdmissionRequest {
-                        owner: OwnerBase::at_home(home.to_path_buf(), PlatformTag::Linux)
-                            .expect("owner base"),
+                        owner: OwnerBase::at_home(
+                            home.to_path_buf(),
+                            if cfg!(windows) {
+                                PlatformTag::Windows
+                            } else {
+                                PlatformTag::Linux
+                            },
+                        )
+                        .expect("owner base"),
                         root_token: root_token_from_path(&identity_root).expect("root token"),
                         journal_token: journal_token_from_path(&resolved.journal_path)
                             .expect("journal token"),

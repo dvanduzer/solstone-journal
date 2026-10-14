@@ -1267,11 +1267,19 @@ mod tests {
                 .expect("generation"),
             platform: solstone_core_installation_identity::PlatformTag::Linux,
             root_token: solstone_core_installation_identity::RootToken::from_raw_absolute(
-                b"/install/clean".to_vec(),
+                if cfg!(windows) {
+                    br"C:\install\clean".to_vec()
+                } else {
+                    b"/install/clean".to_vec()
+                },
             )
             .expect("root"),
             journal_token: solstone_core_installation_identity::JournalToken::from_raw_absolute(
-                b"/journal".to_vec(),
+                if cfg!(windows) {
+                    br"C:\journal".to_vec()
+                } else {
+                    b"/journal".to_vec()
+                },
             )
             .expect("journal"),
         };
