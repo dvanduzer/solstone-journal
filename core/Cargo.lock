@@ -3492,6 +3492,7 @@ dependencies = [
  "solstone-core-body-ingest",
  "solstone-core-body-rebuild",
  "solstone-core-brain",
+ "solstone-core-brain-owner",
  "solstone-core-callosum",
  "solstone-core-chatgpt-auth",
  "solstone-core-check",
@@ -3790,6 +3791,21 @@ dependencies = [
  "serde_json",
  "solstone-core-brain",
  "solstone-core-journal",
+]
+
+[[package]]
+name = "solstone-core-brain-owner"
+version = "2.0.45"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "solstone-core-brain",
+ "solstone-core-chatgpt-auth",
+ "solstone-core-generate",
+ "solstone-core-generate-wire",
+ "solstone-core-local",
+ "solstone-core-spp-ratls",
+ "tempfile",
 ]
 
 [[package]]

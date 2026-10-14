@@ -1205,6 +1205,26 @@ fn brain_refresh_argv_in(dir: &Path) -> Option<Vec<String>> {
 }
 
 fn brain_refresh_argv_for_platform(dir: &Path, windows_package: bool) -> Option<Vec<String>> {
+    brain_refresh_argv_for_platform_kind(
+        dir,
+        windows_package,
+        cfg!(any(target_os = "android", target_os = "ios")),
+    )
+}
+
+fn brain_refresh_argv_for_platform_kind(
+    dir: &Path,
+    windows_package: bool,
+    mobile_package: bool,
+) -> Option<Vec<String>> {
+    if mobile_package {
+        return Some(vec![
+            "solstone".to_owned(),
+            "journal".to_owned(),
+            "brain".to_owned(),
+            "refresh".to_owned(),
+        ]);
+    }
     if windows_package {
         let exe = dir.join("solstone.exe");
         if exe.is_file() {
@@ -2152,8 +2172,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        PollOutcome, brain_refresh_argv_for_platform, brain_refresh_argv_in,
-        classify_portal_call_error, poll_success_body,
+        PollOutcome, brain_refresh_argv_for_platform, brain_refresh_argv_for_platform_kind,
+        brain_refresh_argv_in, classify_portal_call_error, poll_success_body,
     };
 
     const AUDIO_DEFERRAL: &str = "transcription is waiting. nothing is sent until your journal verifies the service. your audio stays on your device and is transcribed later, after the check passes.";
@@ -2608,6 +2628,24 @@ mod tests {
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         assert_eq!(brain_refresh_argv_for_platform(root.path(), true), None);
+    }
+
+    #[test]
+    fn brain_refresh_argv_mobile_package_is_the_canonical_command_and_ignores_siblings() {
+        let root = tempfile::tempdir().expect("dir");
+        let binary = root.path().join("solstone-core-journal");
+        fs::write(&binary, b"sibling-bytes").expect("write sibling");
+        let argv =
+            brain_refresh_argv_for_platform_kind(root.path(), false, true).expect("resolved");
+        assert_eq!(
+            argv,
+            vec![
+                "solstone".to_owned(),
+                "journal".to_owned(),
+                "brain".to_owned(),
+                "refresh".to_owned(),
+            ]
+        );
     }
 
     fn temporary_journal(name: &str) -> PathBuf {

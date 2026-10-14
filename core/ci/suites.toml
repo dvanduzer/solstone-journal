@@ -406,6 +406,17 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
+id = "package::solstone-core-brain-owner"
+package = "solstone-core-brain-owner"
+set = "component"
+areas = ["cognition"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = false
+runtime = "none"
+
+[[package_suites]]
 id = "package::solstone-core-brain-cli"
 package = "solstone-core-brain-cli"
 set = "component"
