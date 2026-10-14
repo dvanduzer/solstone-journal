@@ -745,12 +745,15 @@ mod tests {
         fallbacks.verify();
     }
 
+    // The `_for_platform` resolvers these exercise are not built on Windows.
+    #[cfg(not(windows))]
     struct MockAndroidAuthority {
         restic: Result<PathBuf, AndroidServiceToolsRefusal>,
         rclone: Result<PathBuf, AndroidServiceToolsRefusal>,
         revalidate_err: Option<AndroidServiceToolsRefusal>,
     }
 
+    #[cfg(not(windows))]
     impl AndroidAuthority for MockAndroidAuthority {
         fn resolve_tool(
             &self,
@@ -774,6 +777,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn android_resolution_uninstalled_returns_member_missing() {
         let auth = MockAndroidAuthority {
@@ -808,6 +812,7 @@ mod tests {
         assert_eq!(err_restic.detail(), code::MEMBER_MISSING);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn android_resolution_revalidate_changed_returns_member_changed() {
         let auth = MockAndroidAuthority {
@@ -833,6 +838,7 @@ mod tests {
         assert_eq!(err.detail(), code::MEMBER_CHANGED);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn android_resolution_revalidate_rclone_missing_when_operated() {
         let auth = MockAndroidAuthority {
@@ -860,6 +866,7 @@ mod tests {
         assert_eq!(err.detail(), code::MEMBER_MISSING);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn android_resolution_succeeds_with_admitted_tools() {
         let auth = MockAndroidAuthority {
