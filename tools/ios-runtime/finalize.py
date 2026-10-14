@@ -139,6 +139,30 @@ def regorus_pin() -> dict[str, str]:
     }
 
 
+def validate_build_inputs(record: dict[str, object]) -> None:
+    mobile = record.get("mobile_native_build")
+    if not isinstance(mobile, dict):
+        raise ValueError("appraisal build record has no mobile native build")
+    expected = {
+        "driver_sha256": sha256(ROOT / "scripts/mobile_native_build.py"),
+        "inputs_sha256": sha256(ROOT / "core/distribution/mobile/inputs.json"),
+    }
+    for field, digest in expected.items():
+        if mobile.get(field) != digest:
+            raise ValueError(f"appraisal build record {field} differs from the source tree")
+    patches = mobile.get("patches")
+    if not isinstance(patches, list):
+        raise ValueError("appraisal build record has no patch census")
+    nvattest = [
+        patch
+        for patch in patches
+        if isinstance(patch, dict) and patch.get("component") == "nvattest"
+    ]
+    current_patch = sha256(ROOT / "core/distribution/mobile/nvattest-mobile.patch")
+    if len(nvattest) != 1 or nvattest[0].get("sha256") != current_patch:
+        raise ValueError("appraisal build record nvattest patch differs from the source tree")
+
+
 def build_receipt(
     helper: pathlib.Path,
     bundle: pathlib.Path,
@@ -158,6 +182,8 @@ def build_receipt(
         or record.get("arch") != "arm64"
     ):
         raise ValueError("appraisal build record is incomplete")
+
+    validate_build_inputs(record)
 
     mobile = record["mobile_native_build"]
     pins = mobile["inputs"]
@@ -226,10 +252,18 @@ def main() -> int:
     )
     app = products / "JournalRuntimeDev.app"
     appraisal = app / "Extensions/Appraisal.appex"
+    rims = appraisal / "RIMs"
+    rims.mkdir()
     for source in sorted(args.appraisal_resources.iterdir()):
         if not source.is_file() or source.is_symlink():
             raise ValueError(f"invalid appraisal resource: {source}")
-        shutil.copyfile(source, appraisal / source.name)
+        if source.name == "ca-bundle.pem":
+            destination = appraisal / source.name
+        elif source.suffix in (".xml", ".corim"):
+            destination = rims / source.name
+        else:
+            raise ValueError(f"unexpected appraisal resource: {source}")
+        shutil.copyfile(source, destination)
     shutil.copyfile(
         args.appraisal_build_record, appraisal / "gpu-appraisal-build.json"
     )

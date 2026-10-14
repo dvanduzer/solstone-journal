@@ -116,6 +116,11 @@ impl GpuProfile {
     pub fn status(&self) -> StatusMode {
         self.status
     }
+
+    #[must_use]
+    pub const fn manifests(&self) -> ManifestSet {
+        self.manifests
+    }
 }
 
 // Each admitted production pin and its complete profile. This mapping is

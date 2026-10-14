@@ -11,7 +11,8 @@ use crate::error::GpuAppraisalReason;
 use crate::ios_service_tools::{IosVerifierRefusal, admitted_ios_verifier};
 use crate::nvgpu::appraise::evidence_json;
 use crate::nvgpu::{
-    GpuAppraisal, GpuProfile, NvattestAcceptance, NvattestVerdict, StatusExpectation, StatusMode,
+    GpuAppraisal, GpuProfile, ManifestSet, NvattestAcceptance, NvattestVerdict, StatusExpectation,
+    StatusMode,
 };
 use crate::snp::AppraisalStep;
 use crate::tlv::GpuEnvelope;
@@ -655,6 +656,9 @@ pub fn appraise_ios_gpu(
     proofs: Option<&[u8]>,
     verification_time: SystemTime,
 ) -> Result<GpuAppraisal, GpuAppraisalReason> {
+    if profile.manifests() != ManifestSet::QUALIFIED_595_71_05 {
+        return Err(GpuAppraisalReason::NvattestUnavailable);
+    }
     if profile.status() == StatusMode::OnlineNonce {
         return Err(GpuAppraisalReason::NvattestUnavailable);
     }

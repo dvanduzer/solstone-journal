@@ -684,7 +684,11 @@ pub extern "C" fn journal_ios_verifier_admit() -> bool {
         Err(error) => {
             if let Ok(mut diagnostic) = IOS_VERIFIER_ADMISSION_DIAGNOSTIC.lock() {
                 let mut message = error.to_string();
-                message.truncate(MAX_APPRAISAL_DIAGNOSTIC_BYTES);
+                let mut end = message.len().min(MAX_APPRAISAL_DIAGNOSTIC_BYTES);
+                while !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                message.truncate(end);
                 *diagnostic = Some(message);
             }
             false
@@ -771,7 +775,7 @@ pub extern "C" fn journal_ios_verifier_drain_ready() -> bool {
             true
         }
     } else {
-        true
+        false
     }
 }
 

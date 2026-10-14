@@ -35,8 +35,7 @@ def verdict(observation: Dict[str, Any]) -> bool:
     if not observation.get("exited_after_reply", False):
         return False
 
-    # Check for main thread init requirement if recorded
-    if "main_thread_init" in observation and not observation["main_thread_init"]:
+    if observation.get("main_thread_init") is not True:
         return False
 
     return True
@@ -133,6 +132,15 @@ class TestQualifyGpuAppraisalVerdict(unittest.TestCase):
         }
         self.assertFalse(verdict(obs))
 
+    def test_missing_main_thread_init_refuses(self):
+        obs = {
+            "pid": 1234,
+            "reply": {"returncode": 0, "result_code": 0},
+            "exited_pid": 1234,
+            "exited_after_reply": True,
+        }
+        self.assertFalse(verdict(obs))
+
     def test_cancelled_without_death_after_reply_refuses(self):
         obs = {
             "pid": 2222,
@@ -146,6 +154,7 @@ class TestQualifyGpuAppraisalVerdict(unittest.TestCase):
     def test_cancelled_with_death_after_reply_succeeds(self):
         obs = {
             "pid": 2222,
+            "main_thread_init": True,
             "cancelled": True,
             "reply": {"returncode": 1, "result_code": 1, "result_message": "cancelled"},
             "exited_pid": 2222,
@@ -165,6 +174,7 @@ class TestQualifyGpuAppraisalVerdict(unittest.TestCase):
 
         obs_with_exit = {
             "pid": 3333,
+            "main_thread_init": True,
             "cancelled": True,
             "reply": {"returncode": 124, "result_code": 124, "result_message": "deadline"},
             "exited_pid": 3333,
@@ -178,12 +188,14 @@ class TestQualifyGpuAppraisalVerdict(unittest.TestCase):
     def test_multi_attempt_requires_fresh_pid(self):
         obs1 = {
             "pid": 1001,
+            "main_thread_init": True,
             "reply": {"returncode": 0, "result_code": 0},
             "exited_pid": 1001,
             "exited_after_reply": True,
         }
         obs2 = {
             "pid": 1002,
+            "main_thread_init": True,
             "reply": {"returncode": 0, "result_code": 0},
             "exited_pid": 1002,
             "exited_after_reply": True,
@@ -193,6 +205,7 @@ class TestQualifyGpuAppraisalVerdict(unittest.TestCase):
         # Reusing the same pid fails
         obs2_reuse = {
             "pid": 1001,
+            "main_thread_init": True,
             "reply": {"returncode": 0, "result_code": 0},
             "exited_pid": 1001,
             "exited_after_reply": True,

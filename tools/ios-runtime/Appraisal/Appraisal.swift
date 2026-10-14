@@ -120,6 +120,11 @@ final class AppraisalState: @unchecked Sendable {
 }
 
 struct AppraisalHandler: XPCPeerHandler {
+  private static let appraisalQueue = DispatchQueue(
+    label: "app.solstone.journal.runtime.dev.gpu-appraisal.work",
+    qos: .userInitiated
+  )
+
   func handleIncomingRequest(_ incoming: XPCReceivedMessage) -> (any Encodable)? {
     do {
       let message = try incoming.decode(as: Request.self)
@@ -127,7 +132,9 @@ struct AppraisalHandler: XPCPeerHandler {
       case "hello":
         return hello(message)
       case "appraise":
-        return appraise(message)
+        return incoming.handoffReply(to: Self.appraisalQueue) {
+          incoming.reply(appraise(message))
+        }
       case "cancel":
         return cancel(message)
       default:
@@ -136,6 +143,10 @@ struct AppraisalHandler: XPCPeerHandler {
     } catch {
       return refusal("invalid request", attempt: 0, exitCode: 1)
     }
+  }
+
+  func handleCancellation(error _: XPCRichError) {
+    _exit(125)
   }
 
   private func hello(_ message: Request) -> Reply {
@@ -234,6 +245,7 @@ struct AppraisalHandler: XPCPeerHandler {
       }
       json["bridge_attempt"] = attempt
       json["pid"] = Int(getpid())
+      json["main_thread_init"] = true
       return encodedDictionary(json)
     }
   }

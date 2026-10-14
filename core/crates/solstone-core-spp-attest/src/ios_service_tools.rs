@@ -29,6 +29,7 @@ pub const IOS_HELPER_EXECUTABLE_NAME: &str = "Appraisal";
 pub const IOS_BUNDLE_IDENTIFIER: &str = "app.solstone.journal.runtime.dev.gpu-appraisal";
 pub const IOS_EXTENSION_POINT_HOST: &str = "app.solstone.journal.runtime.dev";
 pub const IOS_EXTENSION_POINT_NAME: &str = "gpu-appraisal";
+const IOS_RIM_DIRECTORY: &str = "RIMs";
 
 const MOBILE_NATIVE_DRIVER: &[u8] = include_bytes!("../../../../scripts/mobile_native_build.py");
 const MOBILE_NATIVE_INPUTS: &[u8] = include_bytes!("../../../distribution/mobile/inputs.json");
@@ -553,7 +554,10 @@ pub fn ios_admission_decision(
         }
     }
     for rim in qualified_rims {
-        let path = format!("{IOS_HELPER_RELATIVE_PATH}/{}", rim.filename());
+        let path = format!(
+            "{IOS_HELPER_RELATIVE_PATH}/{IOS_RIM_DIRECTORY}/{}",
+            rim.filename()
+        );
         if !expected_paths.contains(&path) {
             return Err(IosVerifierRefusal::ReceiptInvalid(format!(
                 "RIM absent from package member receipt: {}",
@@ -609,7 +613,11 @@ pub fn ios_admission_decision(
         } else {
             // Check if it's an expected RIM
             for rim in qualified_rims {
-                if member.relative_path == format!("{IOS_HELPER_RELATIVE_PATH}/{}", rim.filename())
+                if member.relative_path
+                    == format!(
+                        "{IOS_HELPER_RELATIVE_PATH}/{IOS_RIM_DIRECTORY}/{}",
+                        rim.filename()
+                    )
                     && member.sha256 != rim.sha256()
                 {
                     return Err(IosVerifierRefusal::IntegrityFailed(format!(
@@ -840,7 +848,9 @@ fn scan_bundle_members(
                 continue;
             }
             if meta.is_dir() {
-                if relative == Path::new("_CodeSignature") {
+                if relative == Path::new("_CodeSignature")
+                    || relative == Path::new(IOS_RIM_DIRECTORY)
+                {
                     pending.push(path);
                     continue;
                 }
@@ -1053,7 +1063,7 @@ mod tests {
             },
         ];
         package_members.extend(qualified_rims.iter().map(|rim| IosPackagedMemberEntry {
-            path: rim.filename.clone(),
+            path: format!("{IOS_RIM_DIRECTORY}/{}", rim.filename),
             sha256: rim.sha256.clone(),
             size_bytes: 1,
         }));
@@ -1435,5 +1445,51 @@ mod tests {
         assert_eq!(first, ios_macho_content_sha256(&image).unwrap());
         image[8] = 1;
         assert_ne!(first, ios_macho_content_sha256(&image).unwrap());
+    }
+
+    #[test]
+    fn bundle_scanner_descends_only_into_packaged_rim_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let appraisal = temp.path().join(IOS_HELPER_RELATIVE_PATH);
+        let rims = appraisal.join(IOS_RIM_DIRECTORY);
+        std::fs::create_dir_all(&rims).unwrap();
+        std::fs::write(
+            appraisal.join("gpu-appraisal-receipt.json"),
+            serde_json::to_vec(&valid_receipt()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(rims.join("qualified.xml"), b"rim").unwrap();
+
+        let mut extension_attributes = plist::Dictionary::new();
+        extension_attributes.insert(
+            "EXExtensionPointIdentifier".into(),
+            IOS_BUNDLE_IDENTIFIER.into(),
+        );
+        let mut info = plist::Dictionary::new();
+        info.insert("CFBundleIdentifier".into(), IOS_BUNDLE_IDENTIFIER.into());
+        info.insert(
+            "CFBundleExecutable".into(),
+            IOS_HELPER_EXECUTABLE_NAME.into(),
+        );
+        info.insert("CFBundlePackageType".into(), "XPC!".into());
+        info.insert(
+            "EXAppExtensionAttributes".into(),
+            plist::Value::Dictionary(extension_attributes),
+        );
+        plist::to_file_xml(
+            appraisal.join("Info.plist"),
+            &plist::Value::Dictionary(info),
+        )
+        .unwrap();
+
+        let (_, members) = scan_bundle_members(temp.path()).unwrap();
+        assert!(members.iter().any(|member| {
+            member.relative_path
+                == format!("{IOS_HELPER_RELATIVE_PATH}/{IOS_RIM_DIRECTORY}/qualified.xml")
+                && member.is_regular_file
+        }));
+        assert!(!members.iter().any(|member| {
+            member.relative_path == format!("{IOS_HELPER_RELATIVE_PATH}/{IOS_RIM_DIRECTORY}")
+        }));
     }
 }

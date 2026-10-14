@@ -8,7 +8,11 @@ use libc::c_char;
 use libc::c_void;
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(any(target_os = "ios", test))]
+use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString};
+#[cfg(any(target_os = "ios", test))]
+use std::path::Path;
 #[cfg(target_os = "ios")]
 use std::ptr::null_mut;
 
@@ -26,6 +30,23 @@ const NVAT_GPU_CLAIMS_VERSION_V3: u8 = 3;
 const MAX_SDK_JSON_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(target_os = "ios")]
 const MAX_PROOFS_BYTES: usize = 16_384;
+#[cfg(any(target_os = "ios", test))]
+const MAX_RIM_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(any(target_os = "ios", test))]
+const QUALIFIED_RIMS: [(&str, &str); 3] = [
+    (
+        "NV_GPU_DRIVER_GH100_595.71.05.xml",
+        "143005c060a5eb2866f7db046c234d27f87ae386cab20ab40d9daa706be46ea4",
+    ),
+    (
+        "NV_GPU_VBIOS_1010_0210_886_96009F0004.xml",
+        "d5dd2bc3f138713ce9a6bd9ba472cb2833e362316e4528b7f2b5d6890e4315db",
+    ),
+    (
+        "NV_GPU_VBIOS_1010_0210_886_9600880011.xml",
+        "a948d7b1e183a8dbede96a3288a1a14b54ddf4f8d4e8576dc4ccb2798022b183",
+    ),
+];
 
 #[cfg(target_os = "ios")]
 type Handle = *mut c_void;
@@ -135,6 +156,44 @@ fn decode_hex(value: &str, cap: usize) -> Option<Vec<u8>> {
         out.push(((high << 4) | low) as u8);
     }
     Some(out)
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn validate_rim_directory(path: &Path) -> Result<(), ()> {
+    let root = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if root.file_type().is_symlink() || !root.is_dir() {
+        return Err(());
+    }
+    let mut seen = Vec::new();
+    for entry in std::fs::read_dir(path).map_err(|_| ())? {
+        let entry = entry.map_err(|_| ())?;
+        let name = entry.file_name().into_string().map_err(|_| ())?;
+        let expected = QUALIFIED_RIMS
+            .iter()
+            .find(|(filename, _)| *filename == name)
+            .ok_or(())?;
+        if seen.iter().any(|found| found == &name) {
+            return Err(());
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| ())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_RIM_BYTES
+        {
+            return Err(());
+        }
+        let bytes = std::fs::read(entry.path()).map_err(|_| ())?;
+        if bytes.len() as u64 != metadata.len()
+            || format!("{:x}", Sha256::digest(&bytes)) != expected.1
+        {
+            return Err(());
+        }
+        seen.push(name);
+    }
+    if seen.len() != QUALIFIED_RIMS.len() {
+        return Err(());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "ios")]
@@ -309,9 +368,9 @@ fn run_appraisal(request: AppraisalRequestPayload) -> Result<Value, AppraisalFai
         CString::new(evidence).map_err(|_| failure(NVAT_RC_BAD_ARGUMENT, "evidence_cstring"))?;
     let rims = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .filter(|p| p.is_dir())
+        .and_then(|p| p.parent().map(|parent| parent.join("RIMs")))
         .ok_or_else(|| failure(NVAT_RC_BAD_ARGUMENT, "rims_discovery"))?;
+    validate_rim_directory(&rims).map_err(|_| failure(NVAT_RC_BAD_ARGUMENT, "rims_validation"))?;
     let rims_c = CString::new(rims.as_os_str().as_encoded_bytes())
         .map_err(|_| failure(NVAT_RC_BAD_ARGUMENT, "rims_path"))?;
 
@@ -445,6 +504,37 @@ pub unsafe extern "C" fn ios_gpu_appraisal_free(ptr: *mut c_char) {
 mod tests {
     use super::*;
 
+    fn rim_fixture(name: &str) -> &'static [u8] {
+        match name {
+            "NV_GPU_DRIVER_GH100_595.71.05.xml" => include_bytes!(
+                "../../../../core/crates/solstone-core-spp-attest/rims/NV_GPU_DRIVER_GH100_595.71.05.xml"
+            ),
+            "NV_GPU_VBIOS_1010_0210_886_96009F0004.xml" => include_bytes!(
+                "../../../../core/crates/solstone-core-spp-attest/rims/NV_GPU_VBIOS_1010_0210_886_96009F0004.xml"
+            ),
+            "NV_GPU_VBIOS_1010_0210_886_9600880011.xml" => include_bytes!(
+                "../../../../core/crates/solstone-core-spp-attest/rims/NV_GPU_VBIOS_1010_0210_886_9600880011.xml"
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    fn rim_directory() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "solstone-ios-rims-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        for (name, _) in QUALIFIED_RIMS {
+            std::fs::write(path.join(name), rim_fixture(name)).unwrap();
+        }
+        path
+    }
+
     #[test]
     fn hex_decoder_enforces_shape_and_cap() {
         assert_eq!(decode_hex("00ff", 2), Some(vec![0, 255]));
@@ -470,5 +560,22 @@ mod tests {
             serde_json::from_str(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap()).unwrap();
         unsafe { ios_gpu_appraisal_free(ptr) };
         assert_eq!(value["result_code"], NVAT_RC_NOT_INITIALIZED);
+    }
+
+    #[test]
+    fn rim_directory_requires_exact_compiled_set() {
+        let path = rim_directory();
+        assert_eq!(validate_rim_directory(&path), Ok(()));
+        std::fs::write(path.join("extra.xml"), b"extra").unwrap();
+        assert_eq!(validate_rim_directory(&path), Err(()));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rim_directory_rejects_changed_member() {
+        let path = rim_directory();
+        std::fs::write(path.join(QUALIFIED_RIMS[0].0), b"changed").unwrap();
+        assert_eq!(validate_rim_directory(&path), Err(()));
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

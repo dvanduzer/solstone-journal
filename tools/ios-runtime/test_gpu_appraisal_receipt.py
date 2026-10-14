@@ -14,7 +14,14 @@ from build_gpu_appraisal import (
     _record_digest,
     _static_dependencies,
 )
-from finalize import canonical_digest, macho_content_sha256, package_members
+from finalize import (
+    ROOT,
+    canonical_digest,
+    macho_content_sha256,
+    package_members,
+    sha256,
+    validate_build_inputs,
+)
 
 
 class AppraisalBuildTests(unittest.TestCase):
@@ -104,6 +111,42 @@ class AppraisalBuildTests(unittest.TestCase):
             (root / "alias").symlink_to("target")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 package_members(root)
+
+    def test_build_record_inputs_must_match_source_tree(self):
+        record = {
+            "mobile_native_build": {
+                "driver_sha256": sha256(ROOT / "scripts/mobile_native_build.py"),
+                "inputs_sha256": sha256(
+                    ROOT / "core/distribution/mobile/inputs.json"
+                ),
+                "patches": [
+                    {
+                        "component": "nvattest",
+                        "sha256": sha256(
+                            ROOT
+                            / "core/distribution/mobile/nvattest-mobile.patch"
+                        ),
+                    }
+                ],
+            }
+        }
+        validate_build_inputs(record)
+        record["mobile_native_build"]["inputs_sha256"] = "00" * 32
+        with self.assertRaisesRegex(ValueError, "inputs_sha256"):
+            validate_build_inputs(record)
+
+    def test_build_record_requires_one_matching_nvattest_patch(self):
+        record = {
+            "mobile_native_build": {
+                "driver_sha256": sha256(ROOT / "scripts/mobile_native_build.py"),
+                "inputs_sha256": sha256(
+                    ROOT / "core/distribution/mobile/inputs.json"
+                ),
+                "patches": [],
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "nvattest patch"):
+            validate_build_inputs(record)
 
 
 if __name__ == "__main__":
