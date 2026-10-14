@@ -11,10 +11,18 @@ pub struct ToolInputPin {
     pub archive_sha256: &'static str,
 }
 
+/// Identity of the Regorus `build.rs` revision substitution recorded by the
+/// mobile native driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegorusBuildRevisionPin {
+    pub revision: &'static str,
+    pub original_sha256: &'static str,
+    pub patched_sha256: &'static str,
+}
+
 struct MobileInputPins {
-    restic: ToolInputPin,
-    rclone: ToolInputPin,
-    nvattest: ToolInputPin,
+    by_name: Vec<(&'static str, ToolInputPin)>,
+    regorus_build: RegorusBuildRevisionPin,
 }
 
 static PINS: OnceLock<MobileInputPins> = OnceLock::new();
@@ -41,6 +49,36 @@ fn pin_from(inputs: &serde_json::Value, name: &str) -> ToolInputPin {
     leak_pin(revision, archive_sha256)
 }
 
+fn regorus_build_from(sources: &serde_json::Value) -> RegorusBuildRevisionPin {
+    let entries = sources
+        .get("native_sources")
+        .and_then(|value| value.as_array())
+        .expect("native_sources missing from nvattest-windows-sources.json");
+    let entry = entries
+        .iter()
+        .find(|value| {
+            value.get("name").and_then(|name| name.as_str()) == Some("regorus-build-revision")
+        })
+        .expect("regorus-build-revision missing from nvattest-windows-sources.json");
+    let revision = entry
+        .get("revision")
+        .and_then(|value| value.as_str())
+        .expect("regorus-build-revision.revision missing");
+    let original_sha256 = entry
+        .get("original_sha256")
+        .and_then(|value| value.as_str())
+        .expect("regorus-build-revision.original_sha256 missing");
+    let patched_sha256 = entry
+        .get("sha256")
+        .and_then(|value| value.as_str())
+        .expect("regorus-build-revision.sha256 missing");
+    RegorusBuildRevisionPin {
+        revision: Box::leak(revision.to_string().into_boxed_str()),
+        original_sha256: Box::leak(original_sha256.to_string().into_boxed_str()),
+        patched_sha256: Box::leak(patched_sha256.to_string().into_boxed_str()),
+    }
+}
+
 fn get_pins() -> &'static MobileInputPins {
     PINS.get_or_init(|| {
         let text = include_str!("../../../distribution/mobile/inputs.json");
@@ -49,29 +87,62 @@ fn get_pins() -> &'static MobileInputPins {
         let inputs = val
             .get("inputs")
             .expect("inputs key missing from inputs.json");
+        let map = inputs
+            .as_object()
+            .expect("inputs.json inputs must be an object");
+        let mut by_name: Vec<(&'static str, ToolInputPin)> = Vec::with_capacity(map.len());
+        for (name, _) in map {
+            let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+            by_name.push((leaked, pin_from(inputs, name)));
+        }
+        let sources: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../distribution/nvattest-windows-sources.json"
+        ))
+        .expect("nvattest-windows-sources.json must parse as json");
         MobileInputPins {
-            restic: pin_from(inputs, "restic"),
-            rclone: pin_from(inputs, "rclone"),
-            nvattest: pin_from(inputs, "nvattest"),
+            by_name,
+            regorus_build: regorus_build_from(&sources),
         }
     })
 }
 
+fn named_pin(name: &str) -> ToolInputPin {
+    get_pins()
+        .by_name
+        .iter()
+        .find(|(entry, _)| *entry == name)
+        .map(|(_, pin)| *pin)
+        .unwrap_or_else(|| panic!("inputs.{name} missing from inputs.json"))
+}
+
 #[must_use]
 pub fn restic_input_pin() -> ToolInputPin {
-    get_pins().restic
+    named_pin("restic")
 }
 
 #[must_use]
 pub fn rclone_input_pin() -> ToolInputPin {
-    get_pins().rclone
+    named_pin("rclone")
 }
 
 /// Mobile nvattest source-archive pin. `archive_sha256` is the source archive,
 /// not a built `libnvat.so` or `nvattest` binary.
 #[must_use]
 pub fn nvattest_input_pin() -> ToolInputPin {
-    get_pins().nvattest
+    named_pin("nvattest")
+}
+
+/// One compiled `inputs.json` entry. `name` is the driver input key.
+#[must_use]
+pub fn mobile_input_pin(name: &str) -> ToolInputPin {
+    named_pin(name)
+}
+
+/// Compiled Regorus build-revision patch identity. `patched_sha256` is the
+/// `sha256` of the committed `regorus-build-revision` source entry.
+#[must_use]
+pub fn regorus_build_revision_pin() -> RegorusBuildRevisionPin {
+    get_pins().regorus_build
 }
 
 /// Reads `share/ca/ca-bundle.pem` from the repository's pinned linux-aarch64 archive.
@@ -132,5 +203,36 @@ mod tests {
             nvattest_pin.archive_sha256,
             nvattest["sha256"].as_str().unwrap()
         );
+        let openssl = mobile_input_pin("nvattest-openssl");
+        assert_eq!(
+            openssl.revision,
+            val["inputs"]["nvattest-openssl"]["revision"]
+                .as_str()
+                .unwrap()
+        );
+        assert_eq!(
+            openssl.archive_sha256,
+            val["inputs"]["nvattest-openssl"]["sha256"]
+                .as_str()
+                .unwrap()
+        );
+        let sources: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../distribution/nvattest-windows-sources.json"
+        ))
+        .unwrap();
+        let regorus = sources["native_sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "regorus-build-revision")
+            .unwrap();
+        let pin = regorus_build_revision_pin();
+        assert_eq!(pin.revision, regorus["revision"].as_str().unwrap());
+        assert_eq!(
+            pin.original_sha256,
+            regorus["original_sha256"].as_str().unwrap()
+        );
+        assert_eq!(pin.patched_sha256, regorus["sha256"].as_str().unwrap());
+        assert_eq!(pin.revision, mobile_input_pin("nvattest-regorus").revision);
     }
 }

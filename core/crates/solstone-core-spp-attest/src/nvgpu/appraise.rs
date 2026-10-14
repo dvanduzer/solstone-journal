@@ -260,6 +260,9 @@ fn run_nvattest(
     invocation: crate::nvgpu::NvattestCommand,
     timeout: Duration,
 ) -> Result<Output, GpuAppraisalReason> {
+    // A command built from an admitted installation can outlive a replaced
+    // member or a substituted root. Reacquire that authority before spawn.
+    super::binary::authorize_nvattest_spawn(&invocation)?;
     let mut command = Command::new(&invocation.executable);
     command.args(invocation.argv.iter().skip(1));
     #[cfg(windows)]

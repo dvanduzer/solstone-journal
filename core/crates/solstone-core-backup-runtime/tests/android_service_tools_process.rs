@@ -18,13 +18,20 @@ use solstone_core_backup_runtime::resolve::{
 };
 use solstone_core_backup_runtime::runner::ToolRunner;
 use solstone_core_spp_attest::android_service_tools::{
-    ANDROID_CA_BUNDLE_FILENAME, ANDROID_NVAT_FILENAME, ANDROID_NVATTEST_FILENAME,
-    ANDROID_RCLONE_FILENAME, ANDROID_RESTIC_FILENAME, AndroidServiceToolRole,
-    AndroidServiceToolsRefusal, has_admitted_android_service_tools, install_android_service_tools,
-    read_test_ca_bundle_pem, render_android_service_tools_manifest,
-    resolve_admitted_android_service_tool, revalidate_installed_android_service_tools,
+    ANDROID_CA_BUNDLE_FILENAME, ANDROID_NATIVE_RECEIPT_INPUTS, ANDROID_NVAT_FILENAME,
+    ANDROID_NVATTEST_FILENAME, ANDROID_RCLONE_FILENAME, ANDROID_RESTIC_FILENAME,
+    AndroidServiceToolRole, AndroidServiceToolsRefusal, admitted_android_verifier,
+    has_admitted_android_service_tools, install_android_service_tools, read_test_ca_bundle_pem,
+    render_android_service_tools_manifest, resolve_admitted_android_service_tool,
+    revalidate_installed_android_service_tools,
 };
+use solstone_core_spp_attest::error::GpuAppraisalReason;
 use solstone_core_spp_attest::nvgpu::ManifestSet;
+use solstone_core_spp_attest::{
+    NvattestCommand, NvattestInstallation, authorize_nvattest_spawn,
+    build_nvattest_attest_command_with_installation,
+    build_nvattest_offline_attest_command_with_installation,
+};
 use tempfile::tempdir;
 
 struct NoOpRunner;
@@ -98,6 +105,40 @@ fn setup_fixture_roots(native_dir: &Path, resource_dir: &Path) {
     }
 }
 
+fn current_native_inputs() -> serde_json::Value {
+    let mut inputs = serde_json::Map::new();
+    for name in ANDROID_NATIVE_RECEIPT_INPUTS {
+        let pin = solstone_core_distribution::mobile_input_pin(name);
+        let revision = if *name == "nvattest" {
+            solstone_core_distribution::NVATTEST_SDK_REVISION
+        } else {
+            pin.revision
+        };
+        inputs.insert(
+            (*name).to_owned(),
+            serde_json::json!({
+                "revision": revision,
+                "sha256": pin.archive_sha256,
+            }),
+        );
+    }
+    serde_json::Value::Object(inputs)
+}
+
+fn current_native_patches() -> serde_json::Value {
+    let sha = solstone_core_distribution::digest::sha256_hex;
+    let regorus = solstone_core_distribution::regorus_build_revision_pin();
+    serde_json::json!([
+        {"component": "nvattest", "sha256": sha(MOBILE_NVATTEST_PATCH)},
+        {
+            "component": "regorus-build-revision",
+            "revision": regorus.revision,
+            "original_sha256": regorus.original_sha256,
+            "patched_sha256": regorus.patched_sha256,
+        }
+    ])
+}
+
 fn receipt_for_tree(native_dir: &Path, resource_dir: &Path) -> Vec<u8> {
     let sha = solstone_core_distribution::digest::sha256_hex;
     let artifact = |component: &str, bytes: &[u8]| {
@@ -108,9 +149,6 @@ fn receipt_for_tree(native_dir: &Path, resource_dir: &Path) -> Vec<u8> {
             "size_bytes": bytes.len(),
         })
     };
-    let restic_pin = solstone_core_distribution::restic_input_pin();
-    let rclone_pin = solstone_core_distribution::rclone_input_pin();
-    let nvattest_pin = solstone_core_distribution::nvattest_input_pin();
     serde_json::to_vec(&serde_json::json!({
         "platform": "android",
         "complete": true,
@@ -118,15 +156,8 @@ fn receipt_for_tree(native_dir: &Path, resource_dir: &Path) -> Vec<u8> {
         "exit": 0,
         "driver_sha256": sha(MOBILE_NATIVE_DRIVER),
         "inputs_sha256": sha(MOBILE_NATIVE_INPUTS),
-        "inputs": {
-            "restic": {"revision": restic_pin.revision, "sha256": restic_pin.archive_sha256},
-            "rclone": {"revision": rclone_pin.revision, "sha256": rclone_pin.archive_sha256},
-            "nvattest": {
-                "revision": solstone_core_distribution::NVATTEST_SDK_REVISION,
-                "sha256": nvattest_pin.archive_sha256,
-            },
-        },
-        "patches": [{"component": "nvattest", "sha256": sha(MOBILE_NVATTEST_PATCH)}],
+        "inputs": current_native_inputs(),
+        "patches": current_native_patches(),
         "artifacts": [
             artifact("restic-cli", &fs::read(native_dir.join(ANDROID_RESTIC_FILENAME)).unwrap()),
             artifact("rclone-cli", &fs::read(native_dir.join(ANDROID_RCLONE_FILENAME)).unwrap()),
@@ -136,6 +167,159 @@ fn receipt_for_tree(native_dir: &Path, resource_dir: &Path) -> Vec<u8> {
         ],
     }))
     .unwrap()
+}
+
+fn refuse_verifier(installation: &NvattestInstallation, evidence: &Path) {
+    assert_eq!(
+        build_nvattest_attest_command_with_installation(
+            installation,
+            evidence,
+            &[0x11; 32],
+            "remote",
+            None,
+        )
+        .unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+}
+
+fn exercise_verifier_construction(foreign_dir: &Path, resource_dir: &Path) -> NvattestCommand {
+    let admitted = admitted_android_verifier().unwrap();
+    let installation = NvattestInstallation {
+        binary: admitted.binary.clone(),
+        lib_dir: admitted.lib_dir.clone(),
+        ca_bundle: admitted.ca_bundle.clone(),
+    };
+    let evidence = resource_dir.join("evidence.json");
+    fs::write(&evidence, b"{}").unwrap();
+    let command = build_nvattest_attest_command_with_installation(
+        &installation,
+        &evidence,
+        &[0x11; 32],
+        "remote",
+        None,
+    )
+    .unwrap();
+    authorize_nvattest_spawn(&command).unwrap();
+
+    let offline = build_nvattest_offline_attest_command_with_installation(
+        &installation,
+        &evidence,
+        &[0x11; 32],
+        resource_dir,
+        &evidence,
+        1_700_000_000,
+    )
+    .unwrap();
+    assert!(
+        offline
+            .argv
+            .iter()
+            .all(|argument| { argument.as_os_str() != std::ffi::OsStr::new("--ca-bundle") })
+    );
+    authorize_nvattest_spawn(&offline).unwrap();
+
+    let mut forged_binary = installation.clone();
+    forged_binary.binary = foreign_dir.join(ANDROID_NVATTEST_FILENAME);
+    refuse_verifier(&forged_binary, &evidence);
+
+    let mut dotted_binary = installation.clone();
+    dotted_binary.binary = installation
+        .binary
+        .parent()
+        .unwrap()
+        .join(".")
+        .join(ANDROID_NVATTEST_FILENAME);
+    assert_ne!(
+        dotted_binary.binary.as_os_str(),
+        installation.binary.as_os_str()
+    );
+    refuse_verifier(&dotted_binary, &evidence);
+
+    let mut forged_lib = installation.clone();
+    forged_lib.lib_dir = foreign_dir.to_path_buf();
+    refuse_verifier(&forged_lib, &evidence);
+
+    let mut dotted_lib = installation.clone();
+    dotted_lib.lib_dir = installation.lib_dir.join(".");
+    assert_ne!(
+        dotted_lib.lib_dir.as_os_str(),
+        installation.lib_dir.as_os_str()
+    );
+    refuse_verifier(&dotted_lib, &evidence);
+    let mut slashed_lib = installation.clone();
+    slashed_lib.lib_dir = std::path::PathBuf::from(format!("{}/", installation.lib_dir.display()));
+    assert_ne!(
+        slashed_lib.lib_dir.as_os_str(),
+        installation.lib_dir.as_os_str()
+    );
+    refuse_verifier(&slashed_lib, &evidence);
+
+    let mut forged_ca = installation.clone();
+    forged_ca.ca_bundle = foreign_dir.join(ANDROID_CA_BUNDLE_FILENAME);
+    refuse_verifier(&forged_ca, &evidence);
+    assert_eq!(
+        build_nvattest_offline_attest_command_with_installation(
+            &forged_ca,
+            &evidence,
+            &[0x11; 32],
+            resource_dir,
+            &evidence,
+            1_700_000_000,
+        )
+        .unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+
+    let mut dotted_ca = installation.clone();
+    dotted_ca.ca_bundle = installation
+        .ca_bundle
+        .parent()
+        .unwrap()
+        .join(".")
+        .join(ANDROID_CA_BUNDLE_FILENAME);
+    assert_ne!(
+        dotted_ca.ca_bundle.as_os_str(),
+        installation.ca_bundle.as_os_str()
+    );
+    refuse_verifier(&dotted_ca, &evidence);
+
+    let mut bad_exec = command.clone();
+    bad_exec.executable = foreign_dir.join(ANDROID_NVATTEST_FILENAME);
+    assert_eq!(
+        authorize_nvattest_spawn(&bad_exec).unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+    let mut bad_lib = command.clone();
+    bad_lib.lib_dir = foreign_dir.to_path_buf();
+    assert_eq!(
+        authorize_nvattest_spawn(&bad_lib).unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+    let mut bad_ca = command.clone();
+    bad_ca.ca_bundle = foreign_dir.join(ANDROID_CA_BUNDLE_FILENAME);
+    assert_eq!(
+        authorize_nvattest_spawn(&bad_ca).unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+
+    let original = fs::read(&installation.binary).unwrap();
+    fs::write(&installation.binary, b"replaced-nvattest-member").unwrap();
+    refuse_verifier(&installation, &evidence);
+    assert_eq!(
+        authorize_nvattest_spawn(&command).unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+    fs::write(&installation.binary, original).unwrap();
+    build_nvattest_attest_command_with_installation(
+        &installation,
+        &evidence,
+        &[0x11; 32],
+        "remote",
+        None,
+    )
+    .unwrap();
+    command
 }
 
 #[test]
@@ -335,6 +519,8 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     assert_eq!(resolved_op.restic_path, restic_full);
     assert_eq!(resolved_op.rclone_path, Some(rclone_full));
 
+    let verifier_command = exercise_verifier_construction(other_temp.path(), resource_temp.path());
+
     // 6. Tamper check: modifying restic binary on disk triggers member-changed refusal
     fs::write(&restic_full, b"tampered-bytes-after-admission").unwrap();
 
@@ -358,4 +544,37 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     let lookup_err =
         resolve_admitted_android_service_tool(AndroidServiceToolRole::Restic).unwrap_err();
     assert_eq!(lookup_err.code(), "member-changed");
+
+    // A new directory at the admitted path is a different root, even when the
+    // path strings on an already built command still match.
+    let native_path = native_temp.path().to_path_buf();
+    let relocated = native_path.with_file_name(format!(
+        "{}-relocated",
+        native_path.file_name().unwrap().to_string_lossy()
+    ));
+    fs::rename(&native_path, &relocated).unwrap();
+    fs::create_dir(&native_path).unwrap();
+    let root_err = revalidate_installed_android_service_tools().unwrap_err();
+    assert_eq!(root_err.code(), "root-substituted");
+    let substituted = NvattestInstallation {
+        binary: native_path.join(ANDROID_NVATTEST_FILENAME),
+        lib_dir: native_path.clone(),
+        ca_bundle: resource_temp.path().join(ANDROID_CA_BUNDLE_FILENAME),
+    };
+    assert_eq!(
+        build_nvattest_attest_command_with_installation(
+            &substituted,
+            &resource_temp.path().join("evidence.json"),
+            &[0x11; 32],
+            "remote",
+            None,
+        )
+        .unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+    assert_eq!(
+        authorize_nvattest_spawn(&verifier_command).unwrap_err(),
+        GpuAppraisalReason::NvattestIntegrityFailed
+    );
+    let _ = fs::remove_dir_all(&relocated);
 }

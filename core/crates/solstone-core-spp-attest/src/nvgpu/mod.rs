@@ -15,6 +15,7 @@ pub use appraise::{
 };
 pub use binary::{
     NvattestCommand, NvattestInstallation, android_verifier_child_environment,
+    authorize_android_nvattest_installation, authorize_nvattest_spawn,
     build_nvattest_attest_command, build_nvattest_attest_command_with_installation,
     build_nvattest_offline_attest_command, build_nvattest_offline_attest_command_with_installation,
     locate_nvattest,

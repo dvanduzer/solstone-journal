@@ -71,4 +71,3 @@ required-features = ["test-hooks"]
 [[test]]
 name = "android_service_tools_process"
 path = "tests/android_service_tools_process.rs"
-

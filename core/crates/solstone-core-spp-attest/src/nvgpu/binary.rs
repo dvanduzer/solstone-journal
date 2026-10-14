@@ -34,6 +34,13 @@ pub struct NvattestCommand {
     /// Desktop POSIX is exactly `PATH=/usr/bin:/bin`. Android is exactly
     /// `LD_LIBRARY_PATH` set to the admitted absolute `nativeLibraryDir`.
     pub env: BTreeMap<OsString, OsString>,
+    /// Library directory supplied with the installation. Spawn compares this
+    /// path to the revalidated admitted directory and does not read it from
+    /// `LD_LIBRARY_PATH`.
+    pub lib_dir: PathBuf,
+    /// CA bundle supplied with the installation. Spawn compares this path even
+    /// when the offline argv does not contain `--ca-bundle`.
+    pub ca_bundle: PathBuf,
 }
 
 /// Resolves and validates the nvattest payload beneath `nvattest_dir`.
@@ -99,6 +106,7 @@ pub fn build_nvattest_attest_command_with_installation(
     rim_store: &str,
     rim_dir: Option<&Path>,
 ) -> Result<NvattestCommand, GpuAppraisalReason> {
+    bind_android_service_installation(installation)?;
     if owner_nonce.len() != SPDM_NONCE_SIZE {
         return Err(GpuAppraisalReason::GpuAppraisalFailed);
     }
@@ -144,6 +152,8 @@ pub fn build_nvattest_attest_command_with_installation(
         executable: installation.binary.clone(),
         argv,
         env: child_environment(&installation.lib_dir)?,
+        lib_dir: installation.lib_dir.clone(),
+        ca_bundle: installation.ca_bundle.clone(),
     })
 }
 
@@ -181,6 +191,7 @@ pub fn build_nvattest_offline_attest_command_with_installation(
     proof_bundle_file: &Path,
     verification_time_unix: i64,
 ) -> Result<NvattestCommand, GpuAppraisalReason> {
+    bind_android_service_installation(installation)?;
     if owner_nonce.len() != SPDM_NONCE_SIZE || verification_time_unix <= 0 {
         return Err(GpuAppraisalReason::GpuAppraisalFailed);
     }
@@ -217,7 +228,87 @@ pub fn build_nvattest_offline_attest_command_with_installation(
         executable: installation.binary.clone(),
         argv,
         env: child_environment(&installation.lib_dir)?,
+        lib_dir: installation.lib_dir.clone(),
+        ca_bundle: installation.ca_bundle.clone(),
     })
+}
+
+fn android_authority_required() -> bool {
+    if cfg!(target_os = "android") {
+        true
+    } else {
+        crate::android_service_tools::has_admitted_android_service_tools()
+    }
+}
+
+fn map_android_authority(
+    err: crate::android_service_tools::AndroidServiceToolsRefusal,
+) -> GpuAppraisalReason {
+    use crate::android_service_tools::AndroidServiceToolsRefusal::{MemberMissing, RoleMissing};
+    match err {
+        MemberMissing { .. } | RoleMissing { .. } => GpuAppraisalReason::NvattestUnavailable,
+        _ => GpuAppraisalReason::NvattestIntegrityFailed,
+    }
+}
+
+/// Reacquires the process-installed Android verifier and requires `installation`
+/// to name that executable, native-library directory, and CA bundle.
+///
+/// Paths are compared as supplied text. `Path` equality is not used, because
+/// it treats `.`, repeated separators, and a trailing separator as the same
+/// path. A path that only canonicalizes to the admitted path is refused.
+/// Absent admission is
+/// [`GpuAppraisalReason::NvattestUnavailable`]. A mutated admission, a loader
+/// shadow, an unrepresentable load closure, or a path mismatch is
+/// [`GpuAppraisalReason::NvattestIntegrityFailed`].
+pub fn authorize_android_nvattest_installation(
+    installation: &NvattestInstallation,
+) -> Result<(), GpuAppraisalReason> {
+    let admitted =
+        crate::android_service_tools::admitted_android_verifier().map_err(map_android_authority)?;
+    if installation.binary.as_os_str() != admitted.binary.as_os_str()
+        || installation.lib_dir.as_os_str() != admitted.lib_dir.as_os_str()
+        || installation.ca_bundle.as_os_str() != admitted.ca_bundle.as_os_str()
+    {
+        return Err(GpuAppraisalReason::NvattestIntegrityFailed);
+    }
+    Ok(())
+}
+
+fn bind_android_service_installation(
+    installation: &NvattestInstallation,
+) -> Result<(), GpuAppraisalReason> {
+    if android_authority_required() {
+        authorize_android_nvattest_installation(installation)
+    } else {
+        Ok(())
+    }
+}
+
+/// Revalidates a command immediately before spawn.
+///
+/// Desktop and iOS processes with no Android service-tool authority skip this
+/// check. Android always reacquires the admitted installation. A process that
+/// has admitted Android tools reacquires them on every host. On Android the
+/// child environment must still be exactly `LD_LIBRARY_PATH` for the admitted
+/// native-library directory.
+pub fn authorize_nvattest_spawn(invocation: &NvattestCommand) -> Result<(), GpuAppraisalReason> {
+    if !android_authority_required() {
+        return Ok(());
+    }
+    authorize_android_nvattest_installation(&NvattestInstallation {
+        binary: invocation.executable.clone(),
+        lib_dir: invocation.lib_dir.clone(),
+        ca_bundle: invocation.ca_bundle.clone(),
+    })?;
+    #[cfg(target_os = "android")]
+    {
+        let expected = android_verifier_child_environment(&invocation.lib_dir)?;
+        if invocation.env != expected {
+            return Err(GpuAppraisalReason::NvattestIntegrityFailed);
+        }
+    }
+    Ok(())
 }
 
 fn child_input_path(path: &Path) -> Result<OsString, GpuAppraisalReason> {
@@ -518,5 +609,32 @@ mod tests {
             super::android_verifier_child_environment(root.path()),
             Err(GpuAppraisalReason::NvattestIntegrityFailed)
         ));
+    }
+
+    #[test]
+    fn android_spawn_refuses_absent_authority() {
+        let installation = super::NvattestInstallation {
+            binary: PathBuf::from("/data/app/lib/libnvattest.so"),
+            lib_dir: PathBuf::from("/data/app/lib"),
+            ca_bundle: PathBuf::from("/data/app/ca-bundle.pem"),
+        };
+        assert_eq!(
+            super::authorize_android_nvattest_installation(&installation),
+            Err(GpuAppraisalReason::NvattestUnavailable)
+        );
+        let command = super::NvattestCommand {
+            executable: installation.binary.clone(),
+            argv: vec![installation.binary.as_os_str().to_owned()],
+            env: std::collections::BTreeMap::new(),
+            lib_dir: installation.lib_dir.clone(),
+            ca_bundle: installation.ca_bundle,
+        };
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(super::authorize_nvattest_spawn(&command), Ok(()));
+        #[cfg(target_os = "android")]
+        assert_eq!(
+            super::authorize_nvattest_spawn(&command),
+            Err(GpuAppraisalReason::NvattestUnavailable)
+        );
     }
 }

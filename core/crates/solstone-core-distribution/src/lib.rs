@@ -64,7 +64,8 @@ pub mod stage;
 pub mod tar;
 pub mod transparency;
 pub use mobile_inputs::{
-    ToolInputPin, nvattest_input_pin, rclone_input_pin, read_test_ca_bundle_pem, restic_input_pin,
+    RegorusBuildRevisionPin, ToolInputPin, mobile_input_pin, nvattest_input_pin, rclone_input_pin,
+    read_test_ca_bundle_pem, regorus_build_revision_pin, restic_input_pin,
 };
 pub use nvattest_windows::{
     NVATTEST_SDK_REVISION, pinned_ca_bundle_sha256, pinned_regorus_revision,

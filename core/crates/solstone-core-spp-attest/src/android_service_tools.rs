@@ -41,6 +41,26 @@ const MOBILE_NATIVE_INPUTS: &[u8] = include_bytes!("../../../distribution/mobile
 const MOBILE_NVATTEST_PATCH: &[u8] =
     include_bytes!("../../../distribution/mobile/nvattest-mobile.patch");
 
+/// Driver-consumed Android native inputs. Unrelated components such as llama,
+/// Parakeet, PDFium, or `nvattest-zlib` may be absent.
+pub const ANDROID_NATIVE_RECEIPT_INPUTS: &[&str] = &[
+    "restic",
+    "rclone",
+    "go-android",
+    "nvattest",
+    "nvattest-corrosion",
+    "nvattest-regorus",
+    "nvattest-cli11",
+    "nvattest-jwt-cpp",
+    "nvattest-fmt",
+    "nvattest-spdlog",
+    "nvattest-json",
+    "nvattest-openssl",
+    "nvattest-libxml2",
+    "nvattest-xmlsec1",
+    "nvattest-curl",
+];
+
 pub use solstone_core_distribution::read_test_ca_bundle_pem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -566,6 +586,65 @@ fn require_sha(
     }
 }
 
+fn receipt_input_fields(name: &str) -> (&'static str, &'static str) {
+    match name {
+        "restic" => ("restic-revision", "restic-archive"),
+        "rclone" => ("rclone-revision", "rclone-archive"),
+        "nvattest" => ("sdk-revision", "nvattest-archive"),
+        "go-android" => ("go-android", "go-android"),
+        "nvattest-corrosion" => ("nvattest-corrosion", "nvattest-corrosion"),
+        "nvattest-regorus" => ("nvattest-regorus", "nvattest-regorus"),
+        "nvattest-cli11" => ("nvattest-cli11", "nvattest-cli11"),
+        "nvattest-jwt-cpp" => ("nvattest-jwt-cpp", "nvattest-jwt-cpp"),
+        "nvattest-fmt" => ("nvattest-fmt", "nvattest-fmt"),
+        "nvattest-spdlog" => ("nvattest-spdlog", "nvattest-spdlog"),
+        "nvattest-json" => ("nvattest-json", "nvattest-json"),
+        "nvattest-openssl" => ("nvattest-openssl", "nvattest-openssl"),
+        "nvattest-libxml2" => ("nvattest-libxml2", "nvattest-libxml2"),
+        "nvattest-xmlsec1" => ("nvattest-xmlsec1", "nvattest-xmlsec1"),
+        "nvattest-curl" => ("nvattest-curl", "nvattest-curl"),
+        _ => ("inputs", "inputs"),
+    }
+}
+
+fn require_regorus_build_revision(
+    patches: &[serde_json::Value],
+) -> Result<(), AndroidServiceToolsRefusal> {
+    let pin = solstone_core_distribution::regorus_build_revision_pin();
+    let compiled = solstone_core_distribution::mobile_input_pin("nvattest-regorus");
+    if pin.revision != compiled.revision {
+        return Err(pin_mismatch("regorus-build-revision"));
+    }
+    let mut found = 0;
+    let mut matched = false;
+    for entry in patches {
+        if entry.get("component").and_then(|value| value.as_str()) != Some("regorus-build-revision")
+        {
+            continue;
+        }
+        found += 1;
+        let revision = entry
+            .get("revision")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let original = entry
+            .get("original_sha256")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let patched = entry
+            .get("patched_sha256")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        matched = revision == pin.revision
+            && original.eq_ignore_ascii_case(pin.original_sha256)
+            && patched.eq_ignore_ascii_case(pin.patched_sha256);
+    }
+    if found != 1 || !matched {
+        return Err(pin_mismatch("regorus-build-revision"));
+    }
+    Ok(())
+}
+
 fn require_input_pin(
     inputs: &serde_json::Map<String, serde_json::Value>,
     name: &str,
@@ -651,36 +730,30 @@ fn validate_mobile_native_receipt(
     if !patch_ok {
         return Err(pin_mismatch("patch"));
     }
+    require_regorus_build_revision(patches)?;
     let Some(inputs) = obj.get("inputs").and_then(|value| value.as_object()) else {
         return Err(pin_mismatch("inputs"));
     };
-    let restic_pin = solstone_core_distribution::restic_input_pin();
-    let rclone_pin = solstone_core_distribution::rclone_input_pin();
-    let nvattest_pin = solstone_core_distribution::nvattest_input_pin();
-    require_input_pin(
-        inputs,
-        "restic",
-        restic_pin.revision,
-        restic_pin.archive_sha256,
-        "restic-revision",
-        "restic-archive",
-    )?;
-    require_input_pin(
-        inputs,
-        "rclone",
-        rclone_pin.revision,
-        rclone_pin.archive_sha256,
-        "rclone-revision",
-        "rclone-archive",
-    )?;
-    require_input_pin(
-        inputs,
-        "nvattest",
-        solstone_core_distribution::NVATTEST_SDK_REVISION,
-        nvattest_pin.archive_sha256,
-        "sdk-revision",
-        "nvattest-archive",
-    )?;
+    for name in ANDROID_NATIVE_RECEIPT_INPUTS {
+        let (revision_field, archive_field) = receipt_input_fields(name);
+        let pin = solstone_core_distribution::mobile_input_pin(name);
+        let revision = if *name == "nvattest" {
+            if pin.revision != solstone_core_distribution::NVATTEST_SDK_REVISION {
+                return Err(pin_mismatch("sdk-revision"));
+            }
+            solstone_core_distribution::NVATTEST_SDK_REVISION
+        } else {
+            pin.revision
+        };
+        require_input_pin(
+            inputs,
+            name,
+            revision,
+            pin.archive_sha256,
+            revision_field,
+            archive_field,
+        )?;
+    }
     let Some(artifacts) = obj.get("artifacts").and_then(|value| value.as_array()) else {
         return Err(receipt_invalid("artifacts"));
     };
@@ -739,11 +812,12 @@ fn validate_relative_path(path: &str) -> Result<(), AndroidServiceToolsRefusal> 
 /// and one resource root.
 ///
 /// `receipt_bytes` is a mobile-native-build receipt. It must record a passed,
-/// complete Android build whose driver, inputs file, and nvattest patch match
-/// the compiled sources, and whose artifact hashes equal the packaged
+/// complete Android build whose driver, inputs file, nvattest patch, Regorus
+/// build-revision patch, and every driver-consumed native input match the
+/// compiled sources. Its artifact hashes must equal the packaged
 /// `librestic.so`, `librclone.so`, `libnvattest.so`, `libnvat.so`, and
-/// `ca-bundle.pem` bytes. Current SDK, restic, and rclone pin labels are not
-/// applied to any other bytes.
+/// `ca-bundle.pem` bytes. Current pin labels are not applied to any other
+/// bytes. Unrelated components may be absent.
 ///
 /// Do not take the receipt or either root from Intent extras or from
 /// `JournalService` Binder fields `op`, `root`, and `count`.
@@ -1255,8 +1329,10 @@ static INSTALLED_TOOLS: OnceLock<AndroidServiceToolsAdmitted> = OnceLock::new();
 /// Read the manifest, the mobile-native-build receipt, `ca-bundle.pem`, and the
 /// three RIM XML files from the application's own packaged assets or files
 /// directory. That directory is the resource root. The receipt must name the
-/// current driver, inputs, and nvattest patch, and the packaged bytes must equal
-/// its artifact hashes.
+/// current driver, inputs file, nvattest patch, Regorus build-revision patch,
+/// and every driver-consumed native input. The packaged `librestic.so`,
+/// `librclone.so`, `libnvattest.so`, `libnvat.so`, and `ca-bundle.pem` bytes
+/// must equal its artifact hashes.
 ///
 /// The nvattest child environment is cleared and then contains only
 /// `LD_LIBRARY_PATH` set to this revalidated absolute `nativeLibraryDir`.
@@ -1449,15 +1525,48 @@ mod tests {
         })
     }
 
+    fn current_native_inputs() -> serde_json::Value {
+        let mut inputs = serde_json::Map::new();
+        for name in ANDROID_NATIVE_RECEIPT_INPUTS {
+            let pin = solstone_core_distribution::mobile_input_pin(name);
+            let revision = if *name == "nvattest" {
+                solstone_core_distribution::NVATTEST_SDK_REVISION
+            } else {
+                pin.revision
+            };
+            inputs.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "revision": revision,
+                    "sha256": pin.archive_sha256,
+                }),
+            );
+        }
+        serde_json::Value::Object(inputs)
+    }
+
+    fn current_native_patches() -> serde_json::Value {
+        let regorus = solstone_core_distribution::regorus_build_revision_pin();
+        serde_json::json!([
+            {
+                "component": "nvattest",
+                "sha256": super::sha256_hex(super::MOBILE_NVATTEST_PATCH),
+            },
+            {
+                "component": "regorus-build-revision",
+                "revision": regorus.revision,
+                "original_sha256": regorus.original_sha256,
+                "patched_sha256": regorus.patched_sha256,
+            }
+        ])
+    }
+
     fn receipt_for_tree(native_dir: &Path, resource_dir: &Path) -> Vec<u8> {
         let restic = fs::read(native_dir.join(ANDROID_RESTIC_FILENAME)).unwrap();
         let rclone = fs::read(native_dir.join(ANDROID_RCLONE_FILENAME)).unwrap();
         let nvattest = fs::read(native_dir.join(ANDROID_NVATTEST_FILENAME)).unwrap();
         let nvat = fs::read(native_dir.join(ANDROID_NVAT_FILENAME)).unwrap();
         let ca = fs::read(resource_dir.join(ANDROID_CA_BUNDLE_FILENAME)).unwrap();
-        let restic_pin = solstone_core_distribution::restic_input_pin();
-        let rclone_pin = solstone_core_distribution::rclone_input_pin();
-        let nvattest_pin = solstone_core_distribution::nvattest_input_pin();
         serde_json::to_vec(&serde_json::json!({
             "platform": "android",
             "scope": ["restic", "rclone", "nvattest"],
@@ -1466,24 +1575,8 @@ mod tests {
             "exit": 0,
             "driver_sha256": super::sha256_hex(super::MOBILE_NATIVE_DRIVER),
             "inputs_sha256": super::sha256_hex(super::MOBILE_NATIVE_INPUTS),
-            "inputs": {
-                "restic": {
-                    "revision": restic_pin.revision,
-                    "sha256": restic_pin.archive_sha256,
-                },
-                "rclone": {
-                    "revision": rclone_pin.revision,
-                    "sha256": rclone_pin.archive_sha256,
-                },
-                "nvattest": {
-                    "revision": solstone_core_distribution::NVATTEST_SDK_REVISION,
-                    "sha256": nvattest_pin.archive_sha256,
-                },
-            },
-            "patches": [{
-                "component": "nvattest",
-                "sha256": super::sha256_hex(super::MOBILE_NVATTEST_PATCH),
-            }],
+            "inputs": current_native_inputs(),
+            "patches": current_native_patches(),
             "artifacts": [
                 artifact("restic-cli", &restic),
                 artifact("rclone-cli", &rclone),
@@ -1796,6 +1889,168 @@ mod tests {
             }
             _ => panic!("expected PinMismatch"),
         }
+    }
+
+    fn assert_receipt_pin(
+        native: &Path,
+        resource: &Path,
+        manifest: &[u8],
+        receipt: &[u8],
+        field: &str,
+    ) {
+        for err in [
+            render_android_service_tools_manifest(native, resource, receipt).unwrap_err(),
+            admit_android_service_tools(native, resource, manifest, receipt).unwrap_err(),
+        ] {
+            assert_eq!(err.code(), "pin-mismatch");
+            match err {
+                AndroidServiceToolsRefusal::PinMismatch { field: got } => {
+                    assert_eq!(got, field);
+                }
+                _ => panic!("expected PinMismatch"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_receipt_pins_refuse_when_stale_or_missing() {
+        let temp_native = tempdir().unwrap();
+        let temp_resource = tempdir().unwrap();
+        setup_fixture_roots(temp_native.path(), temp_resource.path());
+        let good = receipt_for_tree(temp_native.path(), temp_resource.path());
+        let (manifest, _) = rendered(temp_native.path(), temp_resource.path());
+
+        for name in ANDROID_NATIVE_RECEIPT_INPUTS {
+            let (revision_field, archive_field) = match *name {
+                "restic" => ("restic-revision", "restic-archive"),
+                "rclone" => ("rclone-revision", "rclone-archive"),
+                "nvattest" => ("sdk-revision", "nvattest-archive"),
+                other => (other, other),
+            };
+            assert_eq!(receipt_input_fields(name), (revision_field, archive_field));
+
+            let mut stale_revision: serde_json::Value = serde_json::from_slice(&good).unwrap();
+            stale_revision["inputs"][name]["revision"] = "stale-revision".into();
+            assert_receipt_pin(
+                temp_native.path(),
+                temp_resource.path(),
+                &manifest,
+                &serde_json::to_vec(&stale_revision).unwrap(),
+                revision_field,
+            );
+
+            let mut missing: serde_json::Value = serde_json::from_slice(&good).unwrap();
+            missing["inputs"].as_object_mut().unwrap().remove(*name);
+            assert_receipt_pin(
+                temp_native.path(),
+                temp_resource.path(),
+                &manifest,
+                &serde_json::to_vec(&missing).unwrap(),
+                revision_field,
+            );
+
+            let mut stale_archive: serde_json::Value = serde_json::from_slice(&good).unwrap();
+            stale_archive["inputs"][name]["sha256"] = "0".repeat(64).into();
+            assert_receipt_pin(
+                temp_native.path(),
+                temp_resource.path(),
+                &manifest,
+                &serde_json::to_vec(&stale_archive).unwrap(),
+                archive_field,
+            );
+        }
+
+        let mut patches_only_nvattest: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        patches_only_nvattest["patches"] = serde_json::json!([{
+            "component": "nvattest",
+            "sha256": super::sha256_hex(super::MOBILE_NVATTEST_PATCH),
+        }]);
+        assert_receipt_pin(
+            temp_native.path(),
+            temp_resource.path(),
+            &manifest,
+            &serde_json::to_vec(&patches_only_nvattest).unwrap(),
+            "regorus-build-revision",
+        );
+
+        for (key, value) in [
+            (
+                "revision",
+                serde_json::Value::String("stale-revision".to_owned()),
+            ),
+            ("original_sha256", serde_json::Value::String("0".repeat(64))),
+            ("patched_sha256", serde_json::Value::String("1".repeat(64))),
+        ] {
+            let mut stale: serde_json::Value = serde_json::from_slice(&good).unwrap();
+            for entry in stale["patches"].as_array_mut().unwrap() {
+                if entry["component"] == "regorus-build-revision" {
+                    entry[key] = value.clone();
+                }
+            }
+            assert_receipt_pin(
+                temp_native.path(),
+                temp_resource.path(),
+                &manifest,
+                &serde_json::to_vec(&stale).unwrap(),
+                "regorus-build-revision",
+            );
+        }
+
+        let mut duplicate: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        let regorus_entry = duplicate["patches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["component"] == "regorus-build-revision")
+            .unwrap()
+            .clone();
+        duplicate["patches"]
+            .as_array_mut()
+            .unwrap()
+            .push(regorus_entry);
+        assert_receipt_pin(
+            temp_native.path(),
+            temp_resource.path(),
+            &manifest,
+            &serde_json::to_vec(&duplicate).unwrap(),
+            "regorus-build-revision",
+        );
+
+        let mut unrelated: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        for name in ["llama", "openssl", "nvattest-zlib", "go-ios"] {
+            unrelated["inputs"][name] = serde_json::json!({
+                "revision": "stale-unrelated",
+                "sha256": "2".repeat(64),
+            });
+        }
+        let curl_sha = unrelated["inputs"]["nvattest-curl"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        unrelated["inputs"]["nvattest-curl"]["sha256"] = curl_sha.into();
+        for entry in unrelated["patches"].as_array_mut().unwrap() {
+            if entry["component"] == "regorus-build-revision" {
+                let original = entry["original_sha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_uppercase();
+                entry["original_sha256"] = original.into();
+            }
+        }
+        let unrelated_bytes = serde_json::to_vec(&unrelated).unwrap();
+        render_android_service_tools_manifest(
+            temp_native.path(),
+            temp_resource.path(),
+            &unrelated_bytes,
+        )
+        .unwrap();
+        admit_android_service_tools(
+            temp_native.path(),
+            temp_resource.path(),
+            &manifest,
+            &unrelated_bytes,
+        )
+        .unwrap();
     }
 
     #[test]
