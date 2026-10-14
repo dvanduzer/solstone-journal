@@ -2371,6 +2371,10 @@ impl TaskQueue {
     }
 
     pub fn shutdown(&self) -> TaskQueueShutdownReport {
+        self.shutdown_with_timeout(TASK_QUEUE_SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> TaskQueueShutdownReport {
         let (active_count, snapshot, initial_forced): (usize, Vec<ShutdownSnapshot>, bool) = {
             let mut state = self.inner.state.lock().expect("queue state lock poisoned");
             state.shutdown = true;
@@ -2402,7 +2406,7 @@ impl TaskQueue {
                     process
                         .lock()
                         .expect("managed process lock poisoned")
-                        .terminate_exact(TASK_QUEUE_SHUTDOWN_TIMEOUT),
+                        .terminate_exact(timeout),
                     Err(TerminationError::ParentGraceTimeout)
                 )
             }) {
@@ -2413,7 +2417,7 @@ impl TaskQueue {
         for thread in threads {
             forced |= thread.join().unwrap_or(false);
         }
-        let deadline = Instant::now() + TASK_QUEUE_SHUTDOWN_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let mut state = self.inner.state.lock().expect("queue state lock poisoned");
         while references.iter().any(|reference| {
             state.active.contains_key(reference)
@@ -7262,7 +7266,7 @@ mod tests {
                 },
             );
         }
-        let report = q1.shutdown();
+        let report = q1.shutdown_with_timeout(Duration::from_millis(50));
         assert_eq!(report.active_count, 1);
         assert!(report.forced);
 
