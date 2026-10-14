@@ -273,20 +273,31 @@ pub fn resize_for_vlm(
     image: ImageBuffer<Rgb<u8>, Vec<u8>>,
     max_image_tokens: Option<u64>,
 ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+    match vlm_target_dimensions(image.width(), image.height(), max_image_tokens) {
+        Some((width, height)) => {
+            image::imageops::resize(&image, width, height, FilterType::Lanczos3)
+        }
+        None => image,
+    }
+}
+
+fn vlm_target_dimensions(
+    width: u32,
+    height: u32,
+    max_image_tokens: Option<u64>,
+) -> Option<(u32, u32)> {
     const MAX_DIMENSION: f64 = 1920.0;
-    let width = image.width();
-    let height = image.height();
     let mut scale = (MAX_DIMENSION / f64::from(width.max(height))).min(1.0);
     if let Some(max_image_tokens) = max_image_tokens {
         let max_pixels = max_image_tokens as f64 * 32.0 * 32.0;
         scale = scale.min((max_pixels / (f64::from(width) * f64::from(height))).sqrt());
     }
     if scale >= 1.0 {
-        return image;
+        return None;
     }
     let target_width = (f64::from(width) * scale).floor().max(1.0) as u32;
     let target_height = (f64::from(height) * scale).floor().max(1.0) as u32;
-    image::imageops::resize(&image, target_width, target_height, FilterType::Lanczos3)
+    Some((target_width, target_height))
 }
 
 fn rgb_frame(frame: &ffmpeg::frame::Video) -> Option<RgbFrame> {
@@ -333,28 +344,40 @@ fn decode_failed(mut result: DescribeResult) -> DescribeResult {
 mod image_tests {
     use image::{ImageBuffer, Rgb};
 
-    use super::resize_for_vlm;
+    use super::{resize_for_vlm, vlm_target_dimensions};
+
+    fn pixels(dimensions: Option<(u32, u32)>, original: (u32, u32)) -> u64 {
+        let (width, height) = dimensions.unwrap_or(original);
+        u64::from(width) * u64::from(height)
+    }
 
     #[test]
     fn categorization_images_obey_the_unconditional_pixel_budget() {
-        let image = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(4096, 2160);
-        let resized = resize_for_vlm(image, Some(1024));
-        assert!(u64::from(resized.width()) * u64::from(resized.height()) <= 1024 * 32 * 32);
-        assert!(resized.width() <= 1920 && resized.height() <= 1920);
+        let (width, height) =
+            vlm_target_dimensions(4096, 2160, Some(1024)).expect("large image is resized");
+        assert!(u64::from(width) * u64::from(height) <= 1024 * 32 * 32);
+        assert!(width <= 1920 && height <= 1920);
+
+        let resized = resize_for_vlm(ImageBuffer::<Rgb<u8>, Vec<u8>>::new(64, 32), Some(1));
+        assert_eq!(
+            Some(resized.dimensions()),
+            vlm_target_dimensions(64, 32, Some(1))
+        );
+        assert!(u64::from(resized.width()) * u64::from(resized.height()) <= 32 * 32);
+        let unchanged = resize_for_vlm(ImageBuffer::<Rgb<u8>, Vec<u8>>::new(8, 4), Some(1));
+        assert_eq!(unchanged.dimensions(), (8, 4));
     }
 
     #[test]
     fn extraction_resize_keeps_more_detail_than_categorization() {
-        let large = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(2000, 1200);
-        let categorization = resize_for_vlm(large.clone(), Some(1024));
-        let extraction = resize_for_vlm(large, None);
-        assert!(
-            u64::from(extraction.width()) * u64::from(extraction.height())
-                > u64::from(categorization.width()) * u64::from(categorization.height())
+        let large = (2000, 1200);
+        let categorization = vlm_target_dimensions(large.0, large.1, Some(1024));
+        let extraction = vlm_target_dimensions(large.0, large.1, None);
+        assert!(pixels(extraction, large) > pixels(categorization, large));
+        let small = (800, 600);
+        assert_eq!(
+            vlm_target_dimensions(small.0, small.1, Some(1024)),
+            vlm_target_dimensions(small.0, small.1, None)
         );
-        let small = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(800, 600);
-        let categorization = resize_for_vlm(small.clone(), Some(1024));
-        let extraction = resize_for_vlm(small, None);
-        assert_eq!(categorization.dimensions(), extraction.dimensions());
     }
 }
