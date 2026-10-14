@@ -156,6 +156,7 @@ class AudioQualification(serving.Qualification):
                     assert chunk['time'] == row['start'], (chunk, row)
                 item['retrieved'] = found
                 worker=self.control('status')
+                item.pop("expected_failure", None)
                 item.update(worker=worker, completion_seconds=time.monotonic()-start, rows=rows,
                             heartbeat_seconds=latencies, search_seconds=search_latencies,
                             transcript_sha256=hashlib.sha256(raw).hexdigest())
@@ -168,8 +169,8 @@ class AudioQualification(serving.Qualification):
         started=time.monotonic()
         while time.monotonic()-started<120:
             state=self.control('status')['native']['value']['audio']
-            if state['state']=='failed' and item['reply']['segment'] in state.get('input',''):
-                assert detail in state.get('error',''), state
+            if (state['state']=='failed' and item['reply']['segment'] in state.get('input','')
+                    and detail in state.get('error','')):
                 assert not self.cat(self.input_path(item)+'.jsonl')
                 assert not self.cat(self.input_path(item)+'.npz')
                 item.update(expected_failure=detail, failure=state)
@@ -201,8 +202,10 @@ class AudioQualification(serving.Qualification):
         mark = self.owner('GET', '/init/mark')
         if not mark['locked']: self.owner('POST', '/init/mark/lock', {})
         self.owner('POST', '/init/finalize', {})
+        self.owner('POST', '/app/network/local-network/open', {})
         pair = self.owner('POST', '/app/network/pair-start', {'device_label': self.marker, 'role': ''})
-        self.network('pair', link=pair['pair_link'], label=self.marker)
+        self.network('pair', link=pair['pair_link'], label=self.marker,
+                     carrier=getattr(self.args, 'pair_carrier', 'direct'))
         if self.args.search_probe:
             uri='/app/search/api/search?q='+quote(self.args.search_probe, safe='')
             baseline=self.network(method='GET',uri=uri)
@@ -285,18 +288,17 @@ class AudioQualification(serving.Qualification):
         self.shell('run-as', serving.PACKAGE, 'mv', model, model+'.held')
         self.model_held = True
         self.launch()
+        _, held = self.upload('speech.wav')
+        self.wait_failure(held, 'open Parakeet model')
         failed = self.control('status')
         assert failed['native']['value']['audio']['state'] == 'failed', failed
         assert 'open Parakeet model' in failed['native']['value']['audio']['error'], failed
         self.event('missing_model',status=failed)
-        _, held = self.upload('speech.wav')
         assert not self.cat(self.input_path(held)+'.jsonl')
         self.shell('run-as', serving.PACKAGE, 'sh', '-c', 'printf broken > '+model)
         self.control('audio-resume')
-        time.sleep(2)
+        self.wait_failure(held, 'size differs from pinned model')
         failed = self.control('status')
-        assert failed['native']['value']['audio']['state'] == 'failed', failed
-        assert 'size differs from pinned model' in failed['native']['value']['audio']['error'], failed
         self.event('model_failure', status=failed)
         self.shell('run-as', serving.PACKAGE, 'mv', model+'.held', model)
         self.model_held = False
@@ -311,6 +313,7 @@ class AudioQualification(serving.Qualification):
         self.network(**command, allow_error=True)
         self.denied.append(revoked)
         self.network(method='GET', uri=self.transcript_uri(first), allow_error=True)
+        self.owner('POST', '/app/network/local-network/close', {})
         self.sample('finish')
         self.control('stop')
         self.shell('am', 'force-stop', serving.PACKAGE)
@@ -394,12 +397,13 @@ def main():
     p.add_argument('--adb',default='adb');p.add_argument('--serial',default='RZGL11XCS9D')
     p.add_argument('--package',default='app.solstone.development.journal.audio')
     p.add_argument('--host',required=True);p.add_argument('--port',type=int,default=7657)
+    p.add_argument('--pair-carrier',choices=['direct','relay'],default='direct')
     p.add_argument('--client',required=True);p.add_argument('--apk-sha256',required=True)
     p.add_argument('--fixtures',required=True);p.add_argument('--output',required=True)
     p.add_argument('--repeats',type=int,default=10)
     p.add_argument('--search-probe',help='Existing indexed text to verify during native inference')
     args=p.parse_args()
-    if args.package!='app.solstone.development.journal.audio':p.error('separate audio development application required')
+    if args.package not in {'app.solstone.development.journal.audio', 'app.solstone.development.journal.services'}:p.error('separate audio development application required')
     q=AudioQualification(args)
     try:q.run()
     except BaseException as error:q.event('failed',error=str(error));raise

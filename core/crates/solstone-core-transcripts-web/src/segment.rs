@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 use solstone_core_format::content::{
     Family, RawPerceptFamily, produce_chunks, produce_raw_percept_chunks, talent_projection_map,
 };
+use solstone_core_format::objects::{objects_line, objects_overlay};
 use solstone_core_format::segment::segment_parse;
 use solstone_core_processing_record::vocab;
 use solstone_core_system_health::{DataState, derive_modality_state};
@@ -236,11 +237,19 @@ fn prepare_segment(
                                 {
                                     source_ref["detection_error"] = err.clone();
                                 }
+                                let detections = entry.get("detections");
+                                if let Some(overlay) = detections.and_then(objects_overlay) {
+                                    source_ref["objects"] = overlay;
+                                }
+                                let markdown = match detections.and_then(objects_line) {
+                                    Some(line) => format!("{text}\n\n{line}"),
+                                    None => text.to_owned(),
+                                };
                                 chunks.push(json!({
                                     "type": "image",
                                     "time": time,
                                     "timestamp": timestamp,
-                                    "markdown": text,
+                                    "markdown": markdown,
                                     "source_ref": source_ref,
                                 }));
                             }
@@ -555,7 +564,11 @@ fn screen_chunks(
         });
         let time = wall_time(context.key, offset);
         let participants = participants(source.get("content"));
-        chunks.push(json!({"type":"screen","time":time,"timestamp":day_timestamp(context.zone, context.day, &time, chunk.occurrence_time_ms.map(|value| value.0).unwrap_or(0)),"markdown":chunk.content,"source_ref":{"frame_id":source.get("frame_id"),"filename":name,"raw":source_raw,"media_kind":kind,"monitor":monitor,"offset":source.get("timestamp"),"box_2d":source.get("box_2d"),"analysis":source.get("analysis"),"participants":if participants.is_empty(){Value::Null}else{json!(participants)}},"basic":source.get("analysis").is_none() && source.get("content").is_none_or(|value| value.is_null() || value.as_object().is_some_and(Map::is_empty))}));
+        let mut chunk = json!({"type":"screen","time":time,"timestamp":day_timestamp(context.zone, context.day, &time, chunk.occurrence_time_ms.map(|value| value.0).unwrap_or(0)),"markdown":chunk.content,"source_ref":{"frame_id":source.get("frame_id"),"filename":name,"raw":source_raw,"media_kind":kind,"monitor":monitor,"offset":source.get("timestamp"),"box_2d":source.get("box_2d"),"analysis":source.get("analysis"),"participants":if participants.is_empty(){Value::Null}else{json!(participants)}},"basic":source.get("analysis").is_none() && source.get("content").is_none_or(|value| value.is_null() || value.as_object().is_some_and(Map::is_empty))});
+        if let Some(overlay) = source.get("detections").and_then(objects_overlay) {
+            chunk["source_ref"]["objects"] = overlay;
+        }
+        chunks.push(chunk);
     }
 }
 
@@ -1710,6 +1723,53 @@ mod tests {
             chunk["source_ref"]["detection_error"],
             json!({"reason_code": "rfdetr-unavailable", "detail": "detector did not run"})
         );
+    }
+
+    #[test]
+    fn prepare_segment_carries_qualified_objects_for_frames_and_stills() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let segment_dir = root.join("chronicle/20260101/field/120000_60");
+        std::fs::create_dir_all(&segment_dir).unwrap();
+        std::fs::write(segment_dir.join("photo.jpg"), b"dummy jpeg bytes").unwrap();
+        std::fs::write(
+            segment_dir.join("photo.jsonl"),
+            "{\"_solstone_processing\":{\"handler\":\"depict\",\"schema_version\":1,\"model\":\"mock\",\"device\":\"cpu\",\"state\":\"analyzed\"}}\n{\"start\":\"00:00:05\",\"text\":\"a picnic\",\"detections\":{\"source\":\"still\",\"image\":{\"width\":400,\"height\":300},\"objects\":[{\"class_name\":\"person\",\"score\":0.9,\"bbox\":[10,20,110,220]},{\"class_name\":\"kite\",\"score\":0.9,\"bbox\":[0,0,5,5]}]}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            segment_dir.join("screen.jsonl"),
+            "{\"frame_id\":1,\"timestamp\":2.0,\"analysis\":{\"primary\":\"media\",\"visual_description\":\"a stream\"},\"detections\":{\"source\":\"screen\",\"image\":{\"width\":1920,\"height\":1080},\"objects\":[{\"class_name\":\"person\",\"score\":0.8,\"bbox\":[1,2,3,4]},{\"class_name\":\"laptop\",\"score\":0.9,\"bbox\":[0,0,9,9]}]}}\n{\"frame_id\":2,\"timestamp\":3.0,\"analysis\":{\"primary\":\"code\",\"visual_description\":\"an editor\"}}\n",
+        )
+        .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap();
+        let value = super::prepare_segment(root, "20260101", "field", "120000_60", now).unwrap();
+        let chunks = value["chunks"].as_array().unwrap();
+
+        let still = chunks.iter().find(|c| c["type"] == "image").unwrap();
+        assert_eq!(still["markdown"], "a picnic\n\n**Objects:** person");
+        assert_eq!(
+            still["source_ref"]["objects"],
+            json!({"image":{"width":400.0,"height":300.0},"items":[{"label":"person","score":0.9,"bbox":[10.0,20.0,110.0,220.0]}]})
+        );
+
+        let screens = chunks
+            .iter()
+            .filter(|c| c["type"] == "screen")
+            .collect::<Vec<_>>();
+        assert_eq!(screens.len(), 2);
+        assert!(
+            screens[0]["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("**Objects:** person")
+        );
+        assert_eq!(
+            screens[0]["source_ref"]["objects"]["items"],
+            json!([{"label":"person","score":0.8,"bbox":[1.0,2.0,3.0,4.0]}])
+        );
+        assert!(screens[1]["source_ref"].get("objects").is_none());
     }
 
     #[test]

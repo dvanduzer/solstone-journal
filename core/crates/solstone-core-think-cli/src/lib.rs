@@ -22,6 +22,7 @@ mod dry_run;
 mod flush;
 mod gate;
 mod helpers;
+mod objects;
 mod phase_process;
 mod repair;
 mod retry;

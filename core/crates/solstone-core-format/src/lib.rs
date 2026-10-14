@@ -8,6 +8,7 @@ pub mod chunker;
 pub mod content;
 pub mod json;
 pub mod matcher;
+pub mod objects;
 pub mod paths;
 pub mod segment;
 

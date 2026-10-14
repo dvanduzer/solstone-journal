@@ -12,17 +12,20 @@ import subprocess
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--adb',default='adb');p.add_argument('--serial',required=True)
 p.add_argument('--package',default='app.solstone.development.journal.audio')
-p.add_argument('--parakeet',type=pathlib.Path,required=True)
+p.add_argument('--parakeet',type=pathlib.Path)
+p.add_argument('--voice-only',action='store_true')
 a=p.parse_args()
-if a.package != 'app.solstone.development.journal.audio': p.error('audio development application required')
+if a.package not in {'app.solstone.development.journal.audio', 'app.solstone.development.journal.services'}: p.error('audio development application required')
+if (a.parakeet is None) == (not a.voice_only): p.error('choose --parakeet or --voice-only')
 repo=pathlib.Path(__file__).resolve().parents[2]
 catalog=(repo/'core/crates/solstone-core-assets/src/lib.rs').read_text()
 block=next(b for b in catalog.split('Artifact {') if 'unit: "parakeet-model"' in b)
 field=lambda key:re.search(rf'{key}: "([^"]+)"',block)[1]
-if a.parakeet.name!=field('filename'):p.error('maintained model filename required')
-with a.parakeet.open('rb') as f:
- if hashlib.file_digest(f,'sha256').hexdigest()!=field('sha256'):p.error('model differs from maintained catalog pin')
-models=[a.parakeet,*[repo/'core/models/assets'/name for name in ['silero_vad_v6.onnx','wespeaker-resnet34-256.onnx','pyannote-segmentation-3.0.onnx']]]
+if a.parakeet:
+ if a.parakeet.name!=field('filename'):p.error('maintained model filename required')
+ with a.parakeet.open('rb') as f:
+  if hashlib.file_digest(f,'sha256').hexdigest()!=field('sha256'):p.error('model differs from maintained catalog pin')
+models=([a.parakeet] if a.parakeet else [])+[repo/'core/models/assets'/name for name in ['silero_vad_v6.onnx','wespeaker-resnet34-256.onnx','pyannote-segmentation-3.0.onnx']]
 adb=[a.adb,'-s',a.serial]
 def run(*argv):return subprocess.check_output([*adb,*argv],stderr=subprocess.STDOUT,timeout=300).decode()
 run('shell','am','force-stop',a.package)

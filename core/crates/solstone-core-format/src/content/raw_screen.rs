@@ -201,6 +201,13 @@ fn render_frame(
             lines.push(String::new());
         }
     }
+    if let Some(objects) = frame
+        .get("detections")
+        .and_then(crate::objects::objects_line)
+    {
+        lines.push(objects);
+        lines.push(String::new());
+    }
     if let Some(content) = frame.get("content").and_then(Value::as_object) {
         for (category, value) in content {
             if !json_truthy(Some(value)) {
@@ -760,6 +767,39 @@ mod tests {
                 Some(OccurrenceTimeMs(1_772_614_801_500)),
             ]
         );
+    }
+
+    #[test]
+    fn qualified_detections_render_as_an_objects_line_after_the_description() {
+        let frame = json!({
+            "timestamp": 0.0,
+            "analysis": {"primary": "media", "visual_description": "A town hall stream."},
+            "detections": {
+                "source": "screen",
+                "objects": [
+                    {"class_name": "person", "score": 0.8},
+                    {"class_name": "person", "score": 0.7},
+                    {"class_name": "laptop", "score": 0.9},
+                    {"class_name": "person", "score": 0.2}
+                ]
+            }
+        })
+        .as_object()
+        .expect("frame")
+        .clone();
+        let produced = render("20260304/workstation/090000_300/screen.jsonl", &[frame]);
+        assert_eq!(
+            produced.chunks[0].content,
+            "### 09:00:00\n\n**Category:** media\n\nA town hall stream.\n\n**Objects:** person ×2\n"
+        );
+
+        let mut unqualified = produced.chunks[0].source.clone().expect("source");
+        unqualified["detections"]["objects"] = json!([{"class_name": "tv", "score": 0.9}]);
+        let produced = render(
+            "20260304/workstation/090000_300/screen.jsonl",
+            &[unqualified],
+        );
+        assert!(!produced.chunks[0].content.contains("**Objects:**"));
     }
 
     #[test]
