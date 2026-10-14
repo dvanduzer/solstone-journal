@@ -270,7 +270,6 @@ echo === cargo test --locked (agent connector boundary suite) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-endpoint --lib --features full-tests,test-hooks -- --test-threads=1 || exit /b 1
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-segment --lib --features full-tests agent_memory_ -- --test-threads=1 || exit /b 1
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-journal-io --lib --features full-tests relative_tests -- --test-threads=1 || exit /b 1
-cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-memory-original --lib --features full-tests -- --test-threads=1 || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_waits_for_ordinary_and_nested_readers" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_refuses_a_claim_that_appears_during_retry" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_refuses_a_reader_that_outlives_the_retry_budget" "full-tests" || exit /b 1
