@@ -60,7 +60,7 @@ pub use ratls::{
         AndroidChannelSelection, PayloadSource, ProductionCompositeVerifier,
         android_channel_reason, android_channel_selection_for_state, check_nvattest_readiness,
         establish_production_attested_channel, establish_production_attested_channel_with_clock,
-        verify_composite_with_gpu_appraiser, verify_gpu_after_cpu,
+        ios_nvattest_readiness, verify_composite_with_gpu_appraiser, verify_gpu_after_cpu,
     },
     verify::{
         CompositeVerificationInput, CompositeVerifier, VerifiedCertificateEvidence,

@@ -521,7 +521,7 @@ pub fn write_production_appraisal_staging(
     })
 }
 
-fn evidence_json(
+pub(crate) fn evidence_json(
     envelope: &GpuEnvelope,
     owner_nonce: &[u8; 32],
 ) -> Result<serde_json::Value, GpuAppraisalReason> {

@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         LazyLock, Mutex, Once,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -651,5 +651,255 @@ pub unsafe extern "C" fn journal_runtime(input: *const c_char) -> *mut c_char {
 pub unsafe extern "C" fn journal_runtime_free(p: *mut c_char) {
     if !p.is_null() {
         drop(unsafe { CString::from_raw(p) });
+    }
+}
+
+static CANCEL_GEN: AtomicU64 = AtomicU64::new(0);
+static VERIFIER_TRANSPORT: Mutex<Option<extern "C" fn(*const c_char) -> *mut c_char>> =
+    Mutex::new(None);
+static LAST_STATE_MACHINE: Mutex<
+    Option<solstone_core_spp_attest::ios_appraisal::AppraisalStateMachine>,
+> = Mutex::new(None);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn journal_ios_verifier_admit() -> bool {
+    solstone_core_spp_attest::ios_service_tools::admit_ios_verifier().is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn journal_ios_verifier_register_callback(
+    transport: Option<extern "C" fn(*const c_char) -> *mut c_char>,
+) -> bool {
+    let Some(transport_fn) = transport else {
+        return false;
+    };
+    if solstone_core_spp_attest::ios_appraisal::register_ios_gpu_appraisal_callback(
+        rust_appraisal_bridge,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut guard = match VERIFIER_TRANSPORT.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    *guard = Some(transport_fn);
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn journal_ios_verifier_cancel() {
+    CANCEL_GEN.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut guard) = LAST_STATE_MACHINE.lock()
+        && let Some(ref mut sm) = *guard
+    {
+        let _ = sm.handle_event(solstone_core_spp_attest::ios_appraisal::AppraisalEvent::Cancel);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn journal_ios_verifier_drain_ready() -> bool {
+    if let Ok(guard) = LAST_STATE_MACHINE.lock() {
+        if let Some(ref sm) = *guard {
+            sm.drain_ready()
+        } else {
+            true
+        }
+    } else {
+        true
+    }
+}
+
+fn rust_appraisal_bridge(
+    req: &solstone_core_spp_attest::ios_appraisal::IosGpuAppraisalRequest<'_>,
+) -> Result<
+    solstone_core_spp_attest::ios_appraisal::IosAppraisalReply,
+    solstone_core_spp_attest::error::GpuAppraisalReason,
+> {
+    use solstone_core_spp_attest::error::GpuAppraisalReason;
+    use solstone_core_spp_attest::ios_appraisal::{
+        AppraisalEvent, AppraisalStateMachine, AppraisalTerminalResult, IosAppraisalReply,
+    };
+
+    let generation = CANCEL_GEN.load(Ordering::SeqCst);
+
+    let transport_fn = {
+        let guard = VERIFIER_TRANSPORT
+            .lock()
+            .map_err(|_| GpuAppraisalReason::NvattestUnavailable)?;
+        guard.ok_or(GpuAppraisalReason::NvattestUnavailable)?
+    };
+
+    let mut sm = AppraisalStateMachine::new();
+    let _ = sm.handle_event(AppraisalEvent::Start);
+    if let Ok(mut guard) = LAST_STATE_MACHINE.lock() {
+        *guard = Some(sm);
+    }
+
+    if CANCEL_GEN.load(Ordering::SeqCst) != generation {
+        if let Ok(mut guard) = LAST_STATE_MACHINE.lock()
+            && let Some(ref mut sm) = *guard
+        {
+            let _ = sm.handle_event(AppraisalEvent::Cancel);
+        }
+        return Err(GpuAppraisalReason::GpuAppraisalFailed);
+    }
+
+    let hex_nonce = req
+        .nonce
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let hex_proofs = req
+        .proofs
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let evidence_json_val: Value = serde_json::from_slice(req.evidence_json)
+        .map_err(|_| GpuAppraisalReason::GpuAppraisalFailed)?;
+
+    let request_val = json!({
+        "profile_fingerprint": req.profile_fingerprint,
+        "nonce_hex": hex_nonce,
+        "evidence_json": evidence_json_val,
+        "proofs_hex": hex_proofs,
+        "verification_time_unix": req.verification_time_unix,
+        "budget_ms": req.budget_ms,
+    });
+    let request_str = request_val.to_string();
+    let request_cstr =
+        CString::new(request_str).map_err(|_| GpuAppraisalReason::GpuAppraisalFailed)?;
+
+    // Call Swift transport
+    let response_ptr = transport_fn(request_cstr.as_ptr());
+    if response_ptr.is_null() {
+        if let Ok(mut guard) = LAST_STATE_MACHINE.lock()
+            && let Some(ref mut sm) = *guard
+        {
+            if CANCEL_GEN.load(Ordering::SeqCst) != generation {
+                let _ = sm.handle_event(AppraisalEvent::Cancel);
+            } else {
+                let _ = sm.handle_event(AppraisalEvent::Malformed(
+                    "null response from transport".into(),
+                ));
+            }
+        }
+        return Err(GpuAppraisalReason::GpuAppraisalFailed);
+    }
+
+    let response_str = unsafe {
+        let s = CStr::from_ptr(response_ptr)
+            .to_str()
+            .unwrap_or("{}")
+            .to_string();
+        libc::free(response_ptr as *mut libc::c_void);
+        s
+    };
+
+    let transport_rep: Value = match serde_json::from_str(&response_str) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Ok(mut guard) = LAST_STATE_MACHINE.lock()
+                && let Some(ref mut sm) = *guard
+            {
+                if CANCEL_GEN.load(Ordering::SeqCst) != generation {
+                    let _ = sm.handle_event(AppraisalEvent::Cancel);
+                } else {
+                    let _ = sm.handle_event(AppraisalEvent::Malformed(e.to_string()));
+                }
+            }
+            return Err(GpuAppraisalReason::GpuAppraisalFailed);
+        }
+    };
+
+    let cancelled = CANCEL_GEN.load(Ordering::SeqCst) != generation
+        || transport_rep
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+    let mut guard = LAST_STATE_MACHINE
+        .lock()
+        .map_err(|_| GpuAppraisalReason::GpuAppraisalFailed)?;
+    let sm = guard
+        .as_mut()
+        .ok_or(GpuAppraisalReason::GpuAppraisalFailed)?;
+
+    // Apply events according to transport report:
+    // Launched, then cancel/malformed/disconnect/reply, then Exited
+    if let Some(pid) = transport_rep.get("pid").and_then(Value::as_u64) {
+        let _ = sm.handle_event(AppraisalEvent::Launched { pid: pid as u32 });
+    }
+
+    if cancelled {
+        let _ = sm.handle_event(AppraisalEvent::Cancel);
+    } else if let Some(err_msg) = transport_rep.get("malformed").and_then(Value::as_str) {
+        let _ = sm.handle_event(AppraisalEvent::Malformed(err_msg.to_string()));
+    } else if transport_rep
+        .get("disconnect")
+        .or_else(|| transport_rep.get("disconnected"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let _ = sm.handle_event(AppraisalEvent::Disconnect);
+    } else if let Some(reply_obj) = transport_rep.get("reply") {
+        let returncode = reply_obj
+            .get("returncode")
+            .and_then(Value::as_i64)
+            .unwrap_or(1) as i32;
+        let result_code = reply_obj
+            .get("result_code")
+            .and_then(Value::as_i64)
+            .unwrap_or(1) as i32;
+        let result_message = reply_obj
+            .get("result_message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let claims = reply_obj
+            .get("claims")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let detached_eat = reply_obj
+            .get("detached_eat")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let reply = IosAppraisalReply {
+            returncode,
+            result_code,
+            result_message,
+            claims,
+            detached_eat,
+        };
+        let _ = sm.handle_event(AppraisalEvent::Reply(reply));
+    }
+
+    if let Some(pid) = transport_rep.get("pid").and_then(Value::as_u64)
+        && transport_rep
+            .get("exited")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        let _ = sm.handle_event(AppraisalEvent::Exited { pid: pid as u32 });
+    }
+
+    if CANCEL_GEN.load(Ordering::SeqCst) != generation {
+        let _ = sm.handle_event(AppraisalEvent::Cancel);
+    }
+
+    let term = sm.terminal_result().cloned();
+    drop(guard);
+
+    match term {
+        Some(AppraisalTerminalResult::Accepted(reply)) => Ok(reply),
+        _ => Err(GpuAppraisalReason::GpuAppraisalFailed),
     }
 }

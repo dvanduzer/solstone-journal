@@ -18,10 +18,16 @@ app = products / "JournalRuntimeDev.app"
 sdk = subprocess.check_output(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], text=True).strip()
 xcode_version = subprocess.check_output(["xcodebuild", "-version"], text=True).split()[-1]
 for name, bundle in [("JournalWorker", app / "Extensions/JournalWorker.appex"),
+                     ("Appraisal", app / "Extensions/Appraisal.appex"),
                      ("JournalRuntimeDev", app)]:
     info_path = bundle / "Info.plist"
     info = plistlib.loads(info_path.read_bytes())
-    source = "Host" if name == "JournalRuntimeDev" else "Helper"
+    if name == "JournalRuntimeDev":
+        source = "Host"
+    elif name == "Appraisal":
+        source = "Appraisal"
+    else:
+        source = "Helper"
     inputs = [intermediates / f"{name}.build/Objects-normal/arm64/{source}.swiftconstvalues"]
     assert inputs, f"No compiler metadata for {name}"
     host = name == "JournalRuntimeDev"
