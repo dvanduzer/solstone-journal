@@ -5,19 +5,258 @@
 import argparse
 import ast
 import hashlib
+import io
 import json
 import math
 import pathlib
 import re
 import sqlite3
 import struct
+import subprocess
 import tarfile
 import time
+import uuid
 import wave
 import zipfile
 from urllib.parse import quote
 from provenance import source_manifest
 import qualify_serving as serving
+
+
+SNAPSHOT_ROOTS = ('files/synthetic-serving-journal', 'files/worker-evidence.jsonl')
+
+
+def snapshot_members(raw, expected_files):
+    """Validate the closed archive namespace before any extraction."""
+    if len(raw) % 512:
+        raise ValueError('snapshot archive is not block aligned')
+    expected_files = list(expected_files)
+    if len(set(expected_files)) != len(expected_files):
+        raise ValueError('duplicate source regular-file names')
+    with tarfile.open(fileobj=io.BytesIO(raw)) as bundle:
+        members = bundle.getmembers()
+    names, files = set(), set()
+    for member in members:
+        name = member.name.rstrip('/')
+        parts = name.split('/')
+        if (not name or any(part in ('', '.', '..') for part in parts)
+                or not any(name == root or name.startswith(root + '/')
+                           for root in SNAPSHOT_ROOTS)
+                or (name.startswith(SNAPSHOT_ROOTS[1] + '/'))):
+            raise ValueError(f'unsafe snapshot member: {member.name!r}')
+        if name in names:
+            raise ValueError(f'duplicate snapshot member: {name!r}')
+        if not (member.isfile() or member.isdir()):
+            raise ValueError(f'nonregular snapshot member: {name!r}')
+        names.add(name)
+        if member.isfile():
+            files.add(name)
+    if files != set(expected_files):
+        raise ValueError('snapshot regular-file population differs from stopped source')
+    if SNAPSHOT_ROOTS[1] not in files:
+        raise ValueError('missing regular worker evidence file')
+    return members
+
+
+def snapshot_file_names(raw):
+    if not raw or not raw.endswith(b'\0'):
+        raise ValueError('snapshot source population is empty or unterminated')
+    names = [name.decode() for name in raw[:-1].split(b'\0')]
+    for name in names:
+        if (any(part in ('', '.', '..') for part in name.split('/'))
+                or not (name.startswith(SNAPSHOT_ROOTS[0] + '/') or name == SNAPSHOT_ROOTS[1])):
+            raise ValueError(f'unsafe snapshot source name: {name!r}')
+    if len(set(names)) != len(names):
+        raise ValueError('duplicate source regular-file names')
+    if SNAPSHOT_ROOTS[1] not in names:
+        raise ValueError('missing regular worker evidence file')
+    return names
+
+
+def capture_audio_snapshot(q):
+    """Capture a stopped app's complete regular files, excluding socket entries."""
+    stem = 'cache/audio-snapshot-' + uuid.uuid4().hex
+    archive_name, error_name, list_name = stem + '.tar', stem + '.stderr', stem + '.list'
+    witness = 'audio-snapshot-complete-' + uuid.uuid4().hex
+    receipt = dict(owned_paths=[archive_name, error_name, list_name], passed=False,
+                   completion_witness=witness, remote_settlement='not_started', cleanup='not_attempted')
+    receipt_path = q.out / 'snapshot-capture.json'
+
+    def save():
+        receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+
+    settled = True
+
+    def remote(stage, operation, *args, stdout_file=None, allow_status=False, **kwargs):
+        nonlocal settled
+        receipt['stage'] = stage
+        save()
+        try:
+            result = operation(*args, check=False, **kwargs)
+        except BaseException:
+            settled = False
+            receipt['remote_settlement'] = 'uncertain_after_' + stage
+            raise
+        (q.out / (stdout_file or 'snapshot-' + stage + '.stdout')).write_bytes(result.stdout)
+        (q.out / ('snapshot-' + stage + '.stderr')).write_bytes(result.stderr)
+        if result.returncode and not allow_status:
+            # Even after tar finished, a failed adb/cat/find call is not proof
+            # that this later remote command stopped. Keep owned cache paths.
+            settled = False
+            receipt['remote_settlement'] = 'uncertain_after_' + stage
+            raise RuntimeError(f'snapshot {stage} command failed: {result.returncode}')
+        return result
+
+    save()
+    try:
+        before = remote('source-before', q.shell, 'run-as', serving.PACKAGE, 'find',
+                        *SNAPSHOT_ROOTS, '-type', 'f', '-print0').stdout
+        expected = snapshot_file_names(before)
+        unsupported = remote('source-types-before', q.shell, 'run-as', serving.PACKAGE, 'find',
+                             *SNAPSHOT_ROOTS, '!', '-type', 'f', '!', '-type', 'd',
+                             '!', '-type', 's', '-print0').stdout
+        if unsupported:
+            raise ValueError('unsupported nonregular snapshot source entries')
+        sockets = remote('source-sockets', q.shell, 'run-as', serving.PACKAGE, 'find',
+                         *SNAPSHOT_ROOTS, '-type', 's', '-print0').stdout
+        receipt['omitted_socket_paths'] = [name.decode() for name in sockets.split(b'\0') if name]
+        remote('write-list', q.shell, 'run-as', serving.PACKAGE, 'sh', '-c',
+               'umask 077; cat > "$1"', 'write-list', list_name, data=before)
+        settled = False
+        receipt['remote_settlement'] = 'creation_attempted'
+        result = remote('launch', q.shell, 'run-as', serving.PACKAGE, 'sh', '-c',
+                        'umask 077; tar --null -T "$3" -cf "$1" 2>"$2"; '
+                        'archive_exit=$?; printf "%s:%s\\n" "$4" "$archive_exit"; exit "$archive_exit"',
+                        'snapshot', archive_name, error_name, list_name, witness, allow_status=True)
+        receipt['creation_controller_exit'] = result.returncode
+        completion = re.fullmatch(re.escape(witness.encode()) + rb':([0-9]{1,3})\r?\n', result.stdout)
+        if completion is None or int(completion[1]) > 255:
+            receipt['remote_settlement'] = 'uncertain_without_completion_witness'
+            raise RuntimeError('remote snapshot creation completion is uncertain')
+        settled = True
+        tar_exit = int(completion[1])
+        receipt.update(remote_settlement='creation_completion_witness_received', actual_tar_exit=tar_exit)
+        if result.returncode != tar_exit:
+            settled = False
+            receipt['remote_settlement'] = 'uncertain_after_controller_status_disagreement'
+            raise RuntimeError('snapshot controller status differs from remote completion witness')
+        errors = remote('read-stderr', q.command,
+                        q.adb + ['exec-out', 'run-as', serving.PACKAGE, 'cat', error_name]).stdout
+        (q.out / 'snapshot-tar.stderr').write_bytes(errors)
+        # Retain available archive bytes even when tar itself failed.
+        raw = remote('read-archive', q.command,
+                     q.adb + ['exec-out', 'run-as', serving.PACKAGE, 'cat', archive_name],
+                     stdout_file='files.tar').stdout
+        receipt.update(received_bytes=len(raw), received_sha256=hashlib.sha256(raw).hexdigest())
+        if tar_exit != 0:
+            raise RuntimeError(f'phone snapshot tar exited {tar_exit}')
+        digest = remote('read-digest', q.shell, 'run-as', serving.PACKAGE,
+                        'sha256sum', archive_name).stdout.decode().split()[0]
+        size = int(remote('read-size', q.shell, 'run-as', serving.PACKAGE,
+                          'stat', '-Lc', '%s', archive_name).stdout)
+        receipt.update(phone_sha256=digest, phone_bytes=size, received_bytes=len(raw),
+                       received_sha256=hashlib.sha256(raw).hexdigest())
+        save()
+        if size != len(raw) or receipt['received_sha256'] != digest:
+            raise ValueError('snapshot transport digest or size differs')
+        after = remote('source-after', q.shell, 'run-as', serving.PACKAGE, 'find',
+                       *SNAPSHOT_ROOTS, '-type', 'f', '-print0').stdout
+        if set(snapshot_file_names(after)) != set(expected):
+            raise ValueError('snapshot source population changed during capture')
+        unsupported = remote('source-types-after', q.shell, 'run-as', serving.PACKAGE, 'find',
+                             *SNAPSHOT_ROOTS, '!', '-type', 'f', '!', '-type', 'd',
+                             '!', '-type', 's', '-print0').stdout
+        if unsupported:
+            raise ValueError('unsupported nonregular snapshot source entries')
+        (q.out / 'snapshot-source-files.nul').write_bytes(after)
+        snapshot_members(raw, expected)
+        receipt.update(archive_verified=True, complete_regular_population=True,
+                       population='equal stopped source before/after find -type f -print0 versus all regular tar members')
+    except subprocess.TimeoutExpired as error:
+        settled = False
+        receipt.update(remote_settlement='uncertain_after_timeout', error=str(error))
+        for suffix, stream in (('stdout', error.output), ('stderr', error.stderr)):
+            if stream is not None:
+                (q.out / ('snapshot-timeout.' + suffix)).write_bytes(
+                    stream.encode() if isinstance(stream, str) else stream)
+        raise
+    except BaseException as error:
+        receipt['error'] = str(error)
+        raise
+    finally:
+        save()
+        if settled:
+            receipt['cleanup'] = 'attempted'
+            save()
+            try:
+                result = q.shell('run-as', serving.PACKAGE, 'sh', '-c',
+                                 'rm -f "$1" "$2" "$3" && test ! -e "$1" && test ! -e "$2" && test ! -e "$3"',
+                                 'cleanup', archive_name, error_name, list_name, check=False)
+                receipt.update(cleanup_exit=result.returncode,
+                               cleanup='removed_and_absence_checked' if result.returncode == 0 else 'failed')
+                if result.returncode != 0:
+                    raise RuntimeError('owned snapshot archive cleanup failed')
+            except BaseException as error:
+                receipt.update(cleanup='uncertain' if isinstance(error, subprocess.TimeoutExpired) else 'failed',
+                               cleanup_error=str(error))
+                raise
+            finally:
+                save()
+    receipt['passed'] = True
+    save()
+
+
+def matching_audio_failure(state, relative_input, detail):
+    generation, history = state.get('generation'), state.get('recent_failures')
+    if (type(generation) is not int or generation < 0 or not isinstance(history, list)
+            or len(history) > 64):
+        raise ValueError('audio status lacks generation-bound failure history')
+    matched = None
+    for failure in history:
+        if (not isinstance(failure, dict) or type(failure.get('generation')) is not int
+                or failure['generation'] < 0
+                or not isinstance(failure.get('input'), str) or not isinstance(failure.get('error'), str)):
+            raise ValueError('malformed audio failure history')
+        if (failure['generation'] == generation
+                and failure['input'].endswith('/' + relative_input)
+                and detail in failure['error']):
+            matched = failure
+    return matched
+
+
+def require_absent_audio_artifacts(q, base):
+    for suffix in ('.jsonl', '.npz'):
+        result = q.shell('run-as', serving.PACKAGE, 'sh', '-c',
+                         'if [ -e "$1" ] || [ -L "$1" ]; then printf present; else printf absent; fi',
+                         'artifact', base + suffix)
+        if result.stdout != b'absent':
+            raise ValueError(f'audio artifact exists or absence unproven: {base + suffix}')
+
+
+def verify_snapshot_databases(root):
+    """Check every SQLite file; search exclusion belongs to the mandatory index."""
+    canonical = root / 'indexer/journal.sqlite'
+    if not canonical.is_file():
+        raise ValueError('missing canonical indexer/journal.sqlite')
+    databases = []
+    for path in sorted(root.rglob('*.sqlite')):
+        db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)
+        try:
+            if db.execute('pragma integrity_check').fetchall() != [('ok',)]:
+                raise ValueError(f'SQLite integrity failure: {path}')
+            row = dict(path=str(path.relative_to(root)), integrity='ok')
+            if path == canonical:
+                # Missing query tables is a failure, never an exemption.
+                raw = db.execute("select count(*) from files where path like '%audio.jsonl'").fetchone()[0]
+                matches = db.execute('select count(*) from chunks where chunks match ?',
+                                     ('"quick brown fox"',)).fetchone()[0]
+                if raw != 0 or matches != 0:
+                    raise ValueError(f'raw audio search exclusion failed: files={raw}, matches={matches}')
+                row.update(raw_audio_files=raw, raw_transcript_matches=matches)
+            databases.append(row)
+        finally:
+            db.close()
+    return databases
 
 
 def npy_array(raw):
@@ -167,15 +406,15 @@ class AudioQualification(serving.Qualification):
 
     def wait_failure(self, item, detail):
         started=time.monotonic()
+        relative_input = self.input_path(item) + pathlib.Path(item['fixture']).suffix
         while time.monotonic()-started<120:
             state=self.control('status')['native']['value']['audio']
-            if (state['state']=='failed' and item['reply']['segment'] in state.get('input','')
-                    and detail in state.get('error','')):
-                assert not self.cat(self.input_path(item)+'.jsonl')
-                assert not self.cat(self.input_path(item)+'.npz')
-                item.update(expected_failure=detail, failure=state)
-                self.event('bounded_failure',item=item)
-                return
+            failure = matching_audio_failure(state, relative_input, detail)
+            if failure is not None:
+                require_absent_audio_artifacts(self, self.input_path(item))
+                item.update(expected_failure=detail, failure=failure)
+                self.event('bounded_failure',item=item,observed_status=state)
+                return failure
             time.sleep(1)
         raise TimeoutError(f'bounded failure not observed: {item}')
 
@@ -264,8 +503,7 @@ class AudioQualification(serving.Qualification):
         while self.control('status')['native']['value']['audio']['state']!='cancelled':
             if time.monotonic()>deadline:raise TimeoutError('cancellation did not reach a stage boundary')
             time.sleep(1)
-        assert not self.cat(self.input_path(cancelled)+'.jsonl')
-        assert not self.cat(self.input_path(cancelled)+'.npz')
+        require_absent_audio_artifacts(self, self.input_path(cancelled))
         self.control('audio-resume')
         self.wait_terminal(cancelled)
         # Recovery uses durable originals and normal app startup; no completion command.
@@ -289,16 +527,13 @@ class AudioQualification(serving.Qualification):
         self.model_held = True
         self.launch()
         _, held = self.upload('speech.wav')
-        self.wait_failure(held, 'open Parakeet model')
-        failed = self.control('status')
-        assert failed['native']['value']['audio']['state'] == 'failed', failed
-        assert 'open Parakeet model' in failed['native']['value']['audio']['error'], failed
+        failed = self.wait_failure(held, 'open Parakeet model')
+        assert 'open Parakeet model' in failed['error'], failed
         self.event('missing_model',status=failed)
-        assert not self.cat(self.input_path(held)+'.jsonl')
+        require_absent_audio_artifacts(self, self.input_path(held))
         self.shell('run-as', serving.PACKAGE, 'sh', '-c', 'printf broken > '+model)
         self.control('audio-resume')
-        self.wait_failure(held, 'size differs from pinned model')
-        failed = self.control('status')
+        failed = self.wait_failure(held, 'size differs from pinned model')
         self.event('model_failure', status=failed)
         self.shell('run-as', serving.PACKAGE, 'mv', model+'.held', model)
         self.model_held = False
@@ -315,11 +550,10 @@ class AudioQualification(serving.Qualification):
         self.network(method='GET', uri=self.transcript_uri(first), allow_error=True)
         self.owner('POST', '/app/network/local-network/close', {})
         self.sample('finish')
-        self.control('stop')
+        stopped = self.control('stop')
+        assert stopped['native']['value'] == {'stopped': True}, stopped
         self.shell('am', 'force-stop', serving.PACKAGE)
-        snapshot = self.command(self.adb + ['exec-out', 'run-as', serving.PACKAGE, 'tar', '-cf', '-',
-                                'files/synthetic-serving-journal', 'files/worker-evidence.jsonl']).stdout
-        (self.out/'files.tar').write_bytes(snapshot)
+        capture_audio_snapshot(self)
         self.verify_audio_snapshot()
         (self.out/'population.json').write_text(json.dumps(self.population,indent=2)+'\n')
         self.event('complete', passed=True, capability='local-transcription-and-authenticated-retrieval',
@@ -379,16 +613,7 @@ class AudioQualification(serving.Qualification):
             assert not list((root/'chronicle'/item['day']).glob('*/'+item['requested_segment'])), item
         generated=list(root.glob('chronicle/*/*/*/talents/audio.md'))
         assert not generated, generated
-        databases=[]
-        for path in root.rglob('*.sqlite'):
-            db=sqlite3.connect(f'file:{path}?mode=ro',uri=True)
-            assert db.execute('pragma integrity_check').fetchone()[0]=='ok'
-            raw=db.execute("select count(*) from files where path like '%audio.jsonl'").fetchone()[0]
-            assert raw==0, raw
-            matches=db.execute('select count(*) from chunks where chunks match ?',('"quick brown fox"',)).fetchone()[0]
-            assert matches==0, matches
-            databases.append(dict(path=str(path.relative_to(root)),integrity='ok',raw_audio_files=raw))
-            db.close()
+        databases=verify_snapshot_databases(root)
         (self.out/'independent-verification.json').write_text(json.dumps(dict(inputs=checks,databases=databases),indent=2)+'\n')
 
 

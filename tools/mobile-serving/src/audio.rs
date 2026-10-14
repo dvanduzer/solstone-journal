@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use solstone_core_transcribe::{TranscribeOutcome, discover_audio_files, process_embedded};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -54,10 +54,28 @@ struct State {
     cancel: AtomicBool,
     generation: AtomicU64,
     status: Mutex<Value>,
+    recent_failures: Mutex<VecDeque<Value>>,
     wake: Condvar,
 }
 
 impl State {
+    fn input_failed(&self, generation: u64, input: &Path, error: &str) {
+        // Private qualification/status evidence, bounded and process-local.
+        // A later input can replace the headline without erasing this attempt.
+        let mut failures = self.recent_failures.lock().unwrap();
+        if failures.len() == 64 {
+            failures.pop_front();
+        }
+        failures.push_back(json!({"generation":generation,"input":input,"error":error}));
+    }
+
+    fn snapshot(&self) -> Value {
+        let mut status = self.status.lock().unwrap().clone();
+        status["generation"] = json!(self.generation.load(Ordering::Acquire));
+        status["recent_failures"] = json!(self.recent_failures.lock().unwrap().clone());
+        status
+    }
+
     fn request_cancel(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::Release);
@@ -86,6 +104,7 @@ impl AudioWorker {
             cancel: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             status: Mutex::new(json!({"state":"starting"})),
+            recent_failures: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
         });
         let shared = state.clone();
@@ -113,7 +132,7 @@ impl AudioWorker {
     }
 
     pub fn status(&self) -> Value {
-        self.state.status.lock().unwrap().clone()
+        self.state.snapshot()
     }
     pub fn cancel(&self) {
         self.state.request_cancel();
@@ -189,10 +208,12 @@ fn run(
                 if failures.contains(&input) {
                     continue;
                 }
+                let acceptance_generation = state.generation.load(Ordering::Acquire);
                 match accepted_input(root, &input) {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(error) => {
+                        state.input_failed(acceptance_generation, &input, &error);
                         failures.insert(input.clone());
                         *state.status.lock().unwrap() = json!({"state":"failed","input":input,"error":error,"failed_inputs":failures.len()});
                         continue;
@@ -222,6 +243,7 @@ fn run(
                         // Keep the original and allow subsequent inputs to proceed.
                         // Cancellation/resume or restart retries failed inputs.
                         failures.insert(input.clone());
+                        state.input_failed(generation, &input, &error.to_string());
                         *state.status.lock().unwrap() = json!({"state":"failed","input":input,"error":error.to_string(),"model_load_ms":asr.load_ms.get(),"failed_inputs":failures.len()});
                     }
                 }
@@ -312,6 +334,7 @@ mod tests {
             cancel: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             status: Mutex::new(json!({})),
+            recent_failures: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
         };
         let active = state.generation.load(Ordering::Acquire);
@@ -331,6 +354,57 @@ mod tests {
         worker.resume();
         assert!(state.cancelled(failed_attempt));
         assert!(!state.cancelled(state.generation.load(Ordering::Acquire)));
+    }
+
+    #[test]
+    fn input_failure_survives_headline_replacement_and_resume_identifies_old_attempt() {
+        let worker = AudioWorker {
+            state: Arc::new(State {
+                stop: AtomicBool::new(false),
+                cancel: AtomicBool::new(false),
+                generation: AtomicU64::new(7),
+                status: Mutex::new(json!({"state":"processing"})),
+                recent_failures: Mutex::new(VecDeque::new()),
+                wake: Condvar::new(),
+            }),
+            thread: None,
+        };
+        worker.state.input_failed(
+            7,
+            Path::new("target/audio.wav"),
+            "size differs from pinned model",
+        );
+        worker.state.input_failed(
+            7,
+            Path::new("older/audio.m4a"),
+            "duration exceeds 30 seconds",
+        );
+        *worker.state.status.lock().unwrap() = json!({"state":"failed","input":"older/audio.m4a","error":"duration exceeds 30 seconds"});
+        let snapshot = worker.status();
+        assert_eq!(snapshot["input"], "older/audio.m4a");
+        assert_eq!(snapshot["generation"], 7);
+        assert_eq!(snapshot["recent_failures"][0]["input"], "target/audio.wav");
+        assert_eq!(
+            snapshot["recent_failures"][0]["error"],
+            "size differs from pinned model"
+        );
+        worker.resume();
+        let resumed = worker.status();
+        assert_eq!(resumed["generation"], 8);
+        assert_eq!(resumed["recent_failures"][0]["generation"], 7);
+        for index in 0..70 {
+            worker.state.input_failed(
+                8,
+                Path::new(&format!("input-{index}/audio.wav")),
+                "fixture failure",
+            );
+        }
+        let bounded = worker.status();
+        let history = bounded["recent_failures"].as_array().unwrap();
+        assert_eq!(history.len(), 64);
+        assert_eq!(history[0]["input"], "input-6/audio.wav");
+        assert_eq!(history[63]["input"], "input-69/audio.wav");
+        assert!(history.iter().all(|row| row["generation"] == 8));
     }
 
     #[test]
