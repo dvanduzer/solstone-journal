@@ -319,7 +319,7 @@
     if (pulse.backup?.available !== true || typeof pulse.backup.issue !== 'boolean') return;
     backupObservedAt = Date.now();
     lastBackupIssue = pulse.backup.issue === true
-      ? { text: 'backup credentials or the backup key were refused. check backup in health.',
+      ? { text: "the backup key couldn't open your backup destination. check backup in health.",
           severity: 'amber', href: '/app/health/#backup' } : null;
   }
 

@@ -12,7 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- home now points to health when a backup attempt for your current setup is refused because of its credentials or backup key. changing the setup removes the old warning; ordinary retries stay in backup details.
+- home now points to health when your current backup key can't open the destination. changing the setup removes the old warning; ordinary retries stay in backup details.
 
 - when an older day has daily results that were never made, your journal now makes them after finishing that day's recordings, before moving on to older recordings. before, those results waited until every older recording was finished.
 
