@@ -12,7 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- backups and portable exports now keep your content when its name is also used by the app, such as an entity named cache or a file ending in .key. earlier copies could silently leave that content out; your next backup picks it up automatically.
+- backups and portable exports now keep entities and facets named cache or indexer. portable exports also keep files ending in .key; your next backup picks up previously skipped entities and facets automatically.
 - when an older day has daily results that were never made, your journal now makes them after finishing that day's recordings, before moving on to older recordings. before, those results waited until every older recording was finished.
 
 - new conversations you import from ChatGPT, Claude or Gemini now label your messages as "You" instead of "Human", so your journal can tell them apart from the assistant's replies. Claude messages without a known sender are labeled "Unknown".

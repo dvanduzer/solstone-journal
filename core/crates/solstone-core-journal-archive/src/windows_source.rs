@@ -110,7 +110,7 @@ fn build_inventory(
                     omitted_directories.push(relative_path.to_path_buf());
                     continue;
                 }
-                if deny_member(member.as_str()) {
+                if deny_member(member.as_str(), false) {
                     omitted_directories.push(relative_path.to_path_buf());
                     continue;
                 }
@@ -133,7 +133,7 @@ fn build_inventory(
                 selected.push(observed_entry.clone());
             }
             JournalEntryKind::RegularFile => {
-                if deny_member(member.as_str()) {
+                if deny_member(member.as_str(), true) {
                     continue;
                 }
                 count_file(&components, &mut inventory);
@@ -363,6 +363,13 @@ mod tests {
             "facets/cache/facet.json",
             "facets/indexer/facet.json",
             "imports/item/original.key",
+            "imports/health-dedupe.sqlite-notes/original.key",
+            "imports/health-dedupe.sqlite-wal/original.key",
+            "chronicle/20260101/indexer/120001_60.sqlite/original.key",
+            "imports/item/.removing",
+            "imports/item/notes.removing_original",
+            "imports/health-dedupe.sqlite/original.key",
+            "chronicle/20260102/indexer/indexer.sqlite/original.key",
             "chronicle/20260101/indexer/120000_60/slides.key",
             "chronicle/20260101/source/120000_60/audio.jsonl.lock",
             "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
@@ -370,13 +377,20 @@ mod tests {
         for member in kept {
             write(&root, member, b"owner bytes");
         }
-        for member in [
+        let omitted = [
             "indexer/journal.sqlite",
-            "chronicle/20260101/indexer/day.sqlite",
+            ".removing_root/owner.json",
+            "chronicle/20260101/.removing_flat/owner.json",
+            "chronicle/20260101/source/.removing_qualified/owner.json",
+            "imports/item/deep/.removing_deep/owner.json",
+            "chronicle/20260101/120000_60/.removing_original",
+            "imports/.health-dedupe.sqlite.rebuild-journal",
+            "chronicle/20260101/indexer/indexer.sqlite",
             "health/brain-fingerprint.key",
             "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",
-        ] {
+        ];
+        for member in omitted {
             write(&root, member, b"secret control");
         }
         let source = ArchiveSource::open(&root).unwrap();
@@ -403,13 +417,16 @@ mod tests {
                 b"owner bytes"
             );
         }
-        assert!(
-            !source.inventory().entries().iter().any(|entry| entry
-                .member_name()
-                .as_str()
-                .ends_with("day.sqlite")
-                || entry.member_name().as_str().starts_with("mcp-endpoint/"))
-        );
+        for member in omitted {
+            assert!(
+                !source
+                    .inventory()
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.member_name().as_str() == member),
+                "{member}"
+            );
+        }
     }
 
     #[test]

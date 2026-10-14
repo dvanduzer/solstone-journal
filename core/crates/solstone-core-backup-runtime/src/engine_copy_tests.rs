@@ -7,19 +7,31 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use super::backup_args;
+use super::prepare_backup_args;
 
 #[test]
 #[ignore = "requires a native restic executable; set SOLSTONE_NATIVE_RESTIC and run explicitly"]
 fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
+    assert!(
+        std::env::var_os("PATH").is_some(),
+        "populated expansion control"
+    );
+    assert!(
+        std::env::var_os("SOLSTONE_UNSET_COPY_TEST").is_none(),
+        "unset expansion control"
+    );
     let temp = tempfile::Builder::new()
         .prefix("journal-copy-")
         .tempdir()
         .unwrap();
     #[cfg(unix)]
-    let root = temp.path().join("journal [literal] café * ? ");
+    let root = temp
+        .path()
+        .join("journal [literal] café $PATH ${PATH} $SOLSTONE_UNSET_COPY_TEST * ? ");
     #[cfg(windows)]
-    let root = temp.path().join("journal [literal] café");
+    let root = temp
+        .path()
+        .join("journal [literal] café $PATH ${PATH} $SOLSTONE_UNSET_COPY_TEST");
     fs::create_dir(&root).unwrap();
     let root = fs::canonicalize(&root).unwrap();
     let kept = [
@@ -28,6 +40,11 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
         "facets/cache/facet.json",
         "facets/indexer/facet.json",
         "imports/item/original.key",
+        "imports/health-dedupe.sqlite-notes/original.key",
+        "imports/health-dedupe.sqlite-wal/original.key",
+        "chronicle/20260101/indexer/120001_60.sqlite/original.key",
+        "imports/item/.removing",
+        "imports/item/notes.removing_original",
         "imports/item/cache/owner.sqlite",
         "chronicle/20260101/indexer/120000_60/slides.key",
         "chronicle/20260101/source/120000_60/audio.jsonl.lock",
@@ -38,12 +55,19 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
         "health/pruning-runs/run.jsonl",
         "chronicle/20260101/health/talent-provenance/run.json",
         "config/journal.json",
+        "chronicle/20260102/indexer/indexer.sqlite/original.key",
     ];
     let omitted = [
         "indexer/journal.sqlite",
+        ".removing_root/owner.json",
+        "chronicle/20260101/.removing_flat/owner.json",
+        "chronicle/20260101/source/.removing_qualified/owner.json",
+        "imports/item/deep/.removing_deep/owner.json",
+        "chronicle/20260101/120000_60/.removing_original",
+        "imports/.health-dedupe.sqlite.rebuild-journal",
         "cache/providers/model",
         ".cache/derived",
-        "chronicle/20260101/indexer/day.sqlite-wal",
+        "chronicle/20260101/indexer/indexer.sqlite-wal",
         "imports/health-dedupe.sqlite",
         "health/brain.json",
         "health/brain-fingerprint.key",
@@ -94,7 +118,8 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
     };
     run(&["init".into()]);
     // Seed an older snapshot with the previous basename policy's omissions.
-    let mut previous = backup_args(&root);
+    let previous_prepared = prepare_backup_args(&root).unwrap();
+    let mut previous = previous_prepared.args.clone();
     previous.extend([
         "--exclude".into(),
         "cache".into(),
@@ -122,7 +147,8 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
     };
     let old_snapshot = snapshot_id(run(&previous));
     // No source file changes, force flag, migration or rescan before the next run.
-    let mut current = backup_args(&root);
+    let current_prepared = prepare_backup_args(&root).unwrap();
+    let mut current = current_prepared.args.clone();
     current.push("--json".into());
     let new_snapshot = snapshot_id(run(&current));
     assert_ne!(old_snapshot, new_snapshot);
@@ -136,6 +162,10 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
         "chronicle/20260101/indexer/120000_60/slides.key",
         "chronicle/20260101/source/120000_60/audio.jsonl.lock",
         "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
+        "chronicle/20260102/indexer/indexer.sqlite/original.key",
+        "imports/health-dedupe.sqlite-notes/original.key",
+        "imports/health-dedupe.sqlite-wal/original.key",
+        "chronicle/20260101/indexer/120001_60.sqlite/original.key",
     ];
     for (snapshot, previous) in [(old_snapshot, true), (new_snapshot, false)] {
         let restore = temp.path().join(format!("restored-{snapshot}"));
@@ -165,6 +195,27 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
             assert!(!restored_root.join(name).exists(), "{name}");
         }
     }
+    let owner_directory = "imports/health-dedupe.sqlite/original.key";
+    fs::remove_file(root.join("imports/health-dedupe.sqlite")).unwrap();
+    fs::create_dir(root.join("imports/health-dedupe.sqlite")).unwrap();
+    fs::write(root.join(owner_directory), b"owner directory bytes").unwrap();
+    let prepared = prepare_backup_args(&root).unwrap();
+    let mut args = prepared.args.clone();
+    args.push("--json".into());
+    let snapshot = snapshot_id(run(&args));
+    let restore = temp.path().join("restored-owner-directory");
+    run(&[
+        "restore".into(),
+        snapshot,
+        "--target".into(),
+        crate::restic_filesystem_path(&restore),
+    ]);
+    let tree_root = crate::restic_tree_path(&root);
+    let restored_root = restore.join(Path::new(tree_root.trim_start_matches('/')));
+    assert_eq!(
+        fs::read(restored_root.join(owner_directory)).unwrap(),
+        b"owner directory bytes"
+    );
 }
 
 #[cfg(windows)]

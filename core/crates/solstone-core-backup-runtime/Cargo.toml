@@ -31,6 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tempfile = "3.24.0"
 ureq = { workspace = true, features = ["rustls"] }
 solstone-core-installed-payload.workspace = true
 solstone-core-backup.workspace = true
@@ -52,7 +53,6 @@ rustix = { workspace = true, features = ["process"] }
 solstone-core-distribution.workspace = true
 
 [dev-dependencies]
-tempfile = "3.24.0"
 solstone-core-journal-io = { workspace = true, features = ["test-hooks"] }
 solstone-core-backup-runtime = { path = ".", features = ["test-support"] }
 

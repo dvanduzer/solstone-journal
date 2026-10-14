@@ -1302,6 +1302,12 @@ fn portable_export_and_merge_preserve_colliding_owner_names() {
         }
         for name in [
             "imports/item/original.key",
+            "imports/health-dedupe.sqlite-notes/original.key",
+            "imports/health-dedupe.sqlite-wal/original.key",
+            "imports/health-dedupe.sqlite/original.key",
+            "chronicle/20260101/indexer/120001_60.sqlite/original.key",
+            "imports/item/.removing",
+            "imports/item/notes.removing_original",
             "imports/item/cache/owner.sqlite",
             "chronicle/20260101/indexer/120000_60/slides.key",
             "chronicle/20260101/source/120000_60/audio.jsonl.lock",
@@ -1311,7 +1317,13 @@ fn portable_export_and_merge_preserve_colliding_owner_names() {
         }
         let omitted = [
             "indexer/journal.sqlite",
-            "chronicle/20260101/indexer/day.sqlite",
+            ".removing_root/owner.json",
+            "chronicle/20260101/.removing_flat/owner.json",
+            "chronicle/20260101/source/.removing_qualified/owner.json",
+            "imports/item/deep/.removing_deep/owner.json",
+            "chronicle/20260101/120000_60/.removing_original",
+            "imports/.health-dedupe.sqlite.rebuild-journal",
+            "chronicle/20260101/indexer/indexer.sqlite",
             "health/brain-fingerprint.key",
             "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",

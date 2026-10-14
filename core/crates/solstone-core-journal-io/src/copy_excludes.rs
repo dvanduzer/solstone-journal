@@ -14,12 +14,8 @@ pub const COPY_EXCLUDES: &[&str] = &[
     ".cache",
     "mcp-endpoint",
     "config/chatgpt-sign-in.json*",
-    // Old per-day databases, without pruning a capture source named indexer.
-    "chronicle/*/indexer/*.sqlite*",
-    "imports/health-dedupe.sqlite*",
-    // Segment deletion pivots, in flat and source-qualified day layouts.
-    "chronicle/*/.removing_*",
-    "chronicle/*/*/.removing_*",
+    // Deletion pivots must never be restored, including ambiguous raw names.
+    "**/.removing_*",
     // These namespaces are application-owned, unlike raw segment filenames.
     "health/sync",
     "health/brain.json",
@@ -57,6 +53,31 @@ pub fn copy_excluded(member: &str) -> bool {
     })
 }
 
+/// Exact database filenames in mixed owner/application namespaces.
+pub const LEGACY_DAY_DATABASES: &[&str] = &["indexer.sqlite", "transcripts.sqlite"];
+pub const BODY_DATABASES: &[&str] = &["health-dedupe.sqlite", ".health-dedupe.sqlite.rebuild"];
+pub const SQLITE_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
+
+/// A directory with one of these names is owner content, never a database prune.
+pub fn copy_file_excluded(member: &str) -> bool {
+    let parts: Vec<_> = member.split('/').collect();
+    let (name, databases) = match parts.as_slice() {
+        ["imports", name] => (*name, BODY_DATABASES),
+        ["chronicle", day, "indexer", name]
+            if day.len() == 8 && day.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (*name, LEGACY_DAY_DATABASES)
+        }
+        _ => return false,
+    };
+    databases.iter().any(|database| {
+        SQLITE_SUFFIXES.iter().any(|suffix| {
+            name.strip_prefix(database)
+                .is_some_and(|tail| tail == *suffix)
+        })
+    })
+}
+
 fn prefix_matches(pattern: &[&str], path: &[&str]) -> bool {
     match pattern.split_first() {
         None => true,
@@ -88,14 +109,34 @@ fn component_matches(pattern: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_excluded;
+    use super::{copy_excluded, copy_file_excluded};
+
+    #[test]
+    fn database_files_match_only_exact_operational_slots() {
+        for member in [
+            "imports/health-dedupe.sqlite",
+            "imports/.health-dedupe.sqlite.rebuild-journal",
+            "chronicle/20260101/indexer/indexer.sqlite-wal",
+            "chronicle/20260101/indexer/transcripts.sqlite-shm",
+        ] {
+            assert!(copy_file_excluded(member), "{member}");
+        }
+        for member in [
+            "imports/health-dedupe.sqlite-notes",
+            "imports/health-dedupe.sqlite/original.key",
+            "chronicle/20260101/indexer/120000_60.sqlite",
+            "chronicle/20260101/indexer/indexer.sqlite/original.key",
+            "chronicle/20260101/indexer/indexer.sqlite.lock",
+        ] {
+            assert!(!copy_file_excluded(member), "{member}");
+        }
+    }
 
     #[test]
     fn operational_paths_are_rooted_and_owner_names_survive() {
         for path in [
             "indexer/journal.sqlite-wal",
             "cache/providers/model",
-            "chronicle/20260101/indexer/day.sqlite-shm",
             "health/brain-fingerprint.key",
             "health/callosum.sock",
             "health/locks/backup-activity.lock",
@@ -107,6 +148,9 @@ mod tests {
             "link/ca/.tmp_123_4.tmp",
             "backup/hosted/.tmp_123_4.tmp",
             "chronicle/20260101/source/.removing_120000_60/tombstone.json",
+            ".removing_old/file",
+            "chronicle/20260101/120000_60/.removing_original",
+            "imports/item/deep/.removing_old/file",
         ] {
             assert!(copy_excluded(path), "operational path included: {path}");
         }
@@ -115,6 +159,12 @@ mod tests {
             "facets/indexer/facet.json",
             "imports/item/source.key",
             "imports/item/cache/a.sqlite",
+            "imports/health-dedupe.sqlite/original.key",
+            "imports/health-dedupe.sqlite-notes/original.key",
+            "chronicle/20260101/indexer/120000_60.sqlite/original.key",
+            "chronicle/20260101/indexer/indexer.sqlite/original.key",
+            "imports/item/.removing",
+            "imports/item/notes.removing_original",
             "chronicle/20260101/indexer/120000_60/original.key",
             "chronicle/20260101/source/120000_60/brain.json",
             "chronicle/20260101/source/120000_60/audio.jsonl.lock",
