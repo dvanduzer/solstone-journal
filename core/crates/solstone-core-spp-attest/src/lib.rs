@@ -3,6 +3,7 @@
 
 //! Pure parsers and verifiers for SPP attestation evidence.
 
+pub mod android_service_tools;
 pub mod binding;
 pub mod error;
 pub mod nvgpu;

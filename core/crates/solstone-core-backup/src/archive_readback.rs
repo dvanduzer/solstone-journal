@@ -84,8 +84,7 @@ use solstone_core_journal_io::media::RootActivityCarrier;
 
 #[cfg(unix)]
 pub(crate) const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
-#[cfg(any(unix, windows))]
-const SUPPORTED_RESTIC_VERSION: &str = "0.19.0";
+pub const SUPPORTED_RESTIC_VERSION: &str = "0.19.0";
 #[cfg(any(unix, windows))]
 const MAX_QUERY_BYTES: usize = 1024 * 1024;
 

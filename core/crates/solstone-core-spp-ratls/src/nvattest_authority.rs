@@ -22,7 +22,7 @@ pub fn confidential_verifier_on_this_platform() -> bool {
     verifier_on_platform(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-fn verifier_on_platform(os: &str, arch: &str) -> bool {
+pub(crate) fn verifier_on_platform(os: &str, arch: &str) -> bool {
     nvattest_platform_key(os, arch).is_some() && !owner_use_held(os)
 }
 
@@ -77,6 +77,7 @@ mod tests {
             assert!(super::verifier_on_platform(os, arch), "{os}-{arch}");
         }
         assert!(!super::verifier_on_platform("macos", "x86_64"));
+        assert!(!super::verifier_on_platform("android", "aarch64"));
     }
 
     #[test]

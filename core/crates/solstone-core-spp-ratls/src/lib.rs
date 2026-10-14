@@ -55,7 +55,8 @@ pub use ratls::{
         establish_attested_channel_with_clock, send_admission_probe, send_json_request,
     },
     production_verifier::{
-        PayloadSource, ProductionCompositeVerifier, check_nvattest_readiness,
+        PayloadSource, ProductionCompositeVerifier, android_channel_reason,
+        android_channel_reason_for_state, check_nvattest_readiness,
         establish_production_attested_channel, establish_production_attested_channel_with_clock,
         verify_composite_with_gpu_appraiser, verify_gpu_after_cpu,
     },

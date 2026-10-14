@@ -3,9 +3,9 @@
 
 use std::path::PathBuf;
 
-use solstone_core_installed_payload::{
-    InstalledPackage, InstalledPayloadRefusal, code, guidance, locate_installed_package,
-};
+#[cfg(not(target_os = "android"))]
+use solstone_core_installed_payload::locate_installed_package;
+use solstone_core_installed_payload::{InstalledPackage, InstalledPayloadRefusal, code, guidance};
 
 use crate::state::{AttestationFailure, AttestationFailureKind};
 
@@ -201,27 +201,40 @@ pub fn resolve_installed_nvattest(
     })
 }
 
-pub fn resolve_nvattest_from_current_exe() -> Result<NvattestPaths, NvattestRefusal> {
-    let current_exe = std::env::current_exe().map_err(|_| NvattestRefusal {
+#[must_use]
+pub fn refusal_for_android_location() -> NvattestRefusal {
+    NvattestRefusal {
         failure: AttestationFailure {
             kind: AttestationFailureKind::Unreachable,
             reason_code: "nvattest_unavailable",
         },
         detail: code::UNSUPPORTED_LOCATION,
         guidance: guidance::UNSUPPORTED_LOCATION,
-    })?;
-    let root = locate_installed_package(
-        &current_exe,
-        solstone_core_installed_payload::host_executable_platform(),
-    )
-    .map_err(|refusal| refusal_for_installed_payload(&refusal))?;
-    let package = InstalledPackage::admit(
-        &root,
-        solstone_core_installed_payload::COMPILED_VERSION,
-        solstone_core_installed_payload::compiled_target(),
-    )
-    .map_err(|refusal| refusal_for_installed_payload(&refusal))?;
-    resolve_installed_nvattest(&package)
+    }
+}
+
+pub fn resolve_nvattest_from_current_exe() -> Result<NvattestPaths, NvattestRefusal> {
+    #[cfg(target_os = "android")]
+    {
+        return Err(refusal_for_android_location());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let current_exe = std::env::current_exe().map_err(|_| refusal_for_android_location())?;
+        let root = locate_installed_package(
+            &current_exe,
+            solstone_core_installed_payload::host_executable_platform(),
+        )
+        .map_err(|refusal| refusal_for_installed_payload(&refusal))?;
+        let package = InstalledPackage::admit(
+            &root,
+            solstone_core_installed_payload::COMPILED_VERSION,
+            solstone_core_installed_payload::compiled_target(),
+        )
+        .map_err(|refusal| refusal_for_installed_payload(&refusal))?;
+        resolve_installed_nvattest(&package)
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +250,15 @@ mod tests {
             targets: None,
             io: None,
         }
+    }
+
+    #[test]
+    fn android_location_refusal_matches_unsupported_location() {
+        let refusal = refusal_for_android_location();
+        assert_eq!(refusal.detail, code::UNSUPPORTED_LOCATION);
+        assert_eq!(refusal.guidance, guidance::UNSUPPORTED_LOCATION);
+        assert_eq!(refusal.failure.reason_code, "nvattest_unavailable");
+        assert_eq!(refusal.failure.kind, AttestationFailureKind::Unreachable);
     }
 
     #[test]

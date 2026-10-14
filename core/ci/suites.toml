@@ -2283,6 +2283,19 @@ required_features = ["test-hooks"]
 runtime = "none"
 
 [[suites]]
+id = "solstone-core-backup-runtime::android_service_tools_process"
+package = "solstone-core-backup-runtime"
+target = "android_service_tools_process"
+set = "component"
+areas = ["backup"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
 id = "solstone-core-offload::backup_native"
 package = "solstone-core-offload"
 target = "backup_native"

@@ -35,6 +35,23 @@ pub struct PackagedRim {
     xml: &'static [u8],
 }
 
+impl PackagedRim {
+    #[must_use]
+    pub const fn filename(&self) -> &'static str {
+        self.filename
+    }
+
+    #[must_use]
+    pub const fn sha256(&self) -> &'static str {
+        self.sha256
+    }
+
+    #[must_use]
+    pub const fn xml(&self) -> &'static [u8] {
+        self.xml
+    }
+}
+
 /// A finite, digest-pinned set of NVIDIA reference manifests.
 #[derive(Debug, Clone, Copy)]
 pub struct ManifestSet(&'static [PackagedRim]);
@@ -60,6 +77,11 @@ const QUALIFIED_595_71_05: &[PackagedRim] = &[
 impl ManifestSet {
     /// Driver 595.71.05 with both qualified H100 VBIOS variants.
     pub const QUALIFIED_595_71_05: Self = Self(QUALIFIED_595_71_05);
+
+    #[must_use]
+    pub const fn entries(&self) -> &'static [PackagedRim] {
+        self.0
+    }
 }
 
 /// One admitted image's complete GPU profile: its manifests and status mode.

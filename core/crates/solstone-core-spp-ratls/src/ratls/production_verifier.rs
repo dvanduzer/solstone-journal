@@ -8,24 +8,25 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(not(target_os = "android"))]
 use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(not(target_os = "android"))]
+use solstone_core_spp_attest::production_policy;
 use solstone_core_spp_attest::{
     CpuBundle, GpuAppraiser, NvattestGpuAppraiser, appraise_cpu_leg,
     error::{CpuLegError, GpuAppraisalReason, PcrFingerprintError, SnpVerifyError},
     locate_nvattest,
     nvgpu::{GpuProfiles, GpuStatusInput},
-    production_policy,
     snp::CpuAppraisal,
     tlv::decode_gpu_envelope,
 };
 
+#[cfg(not(target_os = "android"))]
+use crate::ratls::channel::establish_attested_channel_with_clock;
 use crate::{
     CompositeVerdict, CompositeVerificationError, NvattestEnsureStatus, RatlsChannelError,
     ratls::{
-        channel::{
-            AdmissionClock, AttestedChannel, RatlsEndpoint, SystemAdmissionClock,
-            establish_attested_channel_with_clock,
-        },
+        channel::{AdmissionClock, AttestedChannel, RatlsEndpoint, SystemAdmissionClock},
         verify::{CompositeVerificationInput, CompositeVerifier},
     },
 };
@@ -226,6 +227,35 @@ pub fn check_nvattest_readiness(nvattest_dir: &Path) -> NvattestEnsureStatus {
     }
 }
 
+#[must_use]
+pub fn android_channel_reason() -> &'static str {
+    if solstone_core_spp_attest::android_service_tools::get_admitted_android_service_tools()
+        .is_none()
+    {
+        return "nvattest_unavailable";
+    }
+    if solstone_core_spp_attest::android_service_tools::revalidate_installed_android_service_tools()
+        .is_err()
+    {
+        return "nvattest_integrity_failed";
+    }
+    "nvattest_load_unrepresentable"
+}
+
+#[must_use]
+pub fn android_channel_reason_for_state(
+    tools_installed: bool,
+    revalidate_ok: bool,
+) -> &'static str {
+    if !tools_installed {
+        "nvattest_unavailable"
+    } else if !revalidate_ok {
+        "nvattest_integrity_failed"
+    } else {
+        "nvattest_load_unrepresentable"
+    }
+}
+
 /// Establishes one production-policy RA-TLS channel with a fresh owner nonce.
 pub fn establish_production_attested_channel(
     endpoint: &RatlsEndpoint,
@@ -285,38 +315,50 @@ pub fn establish_production_attested_channel_with_clock(
     epoch: u64,
     clock: &dyn AdmissionClock,
 ) -> Result<AttestedChannel, RatlsChannelError> {
-    let current_exe = std::env::current_exe().map_err(|_| RatlsChannelError {
-        reason_code: "nvattest_unavailable",
-    })?;
-    let root = solstone_core_installed_payload::locate_installed_package(
-        &current_exe,
-        solstone_core_installed_payload::host_executable_platform(),
-    )
-    .map_err(|refusal| {
-        let mapped = crate::installed::refusal_for_installed_payload(&refusal);
-        RatlsChannelError {
-            reason_code: mapped.failure.reason_code,
-        }
-    })?;
-    let package = solstone_core_installed_payload::InstalledPackage::admit(
-        &root,
-        solstone_core_installed_payload::COMPILED_VERSION,
-        solstone_core_installed_payload::compiled_target(),
-    )
-    .map_err(|refusal| {
-        let mapped = crate::installed::refusal_for_installed_payload(&refusal);
-        RatlsChannelError {
-            reason_code: mapped.failure.reason_code,
-        }
-    })?;
+    #[cfg(target_os = "android")]
+    {
+        let _ = (_nvattest_dir, socket_timeout, epoch, clock, endpoint);
+        crate::ratls::channel::refuse_held_platform(std::env::consts::OS)?;
+        return Err(RatlsChannelError {
+            reason_code: android_channel_reason(),
+        });
+    }
 
-    establish_production_attested_channel_in_package_with_clock(
-        endpoint,
-        &package,
-        socket_timeout,
-        epoch,
-        clock,
-    )
+    #[cfg(not(target_os = "android"))]
+    {
+        let current_exe = std::env::current_exe().map_err(|_| RatlsChannelError {
+            reason_code: "nvattest_unavailable",
+        })?;
+        let root = solstone_core_installed_payload::locate_installed_package(
+            &current_exe,
+            solstone_core_installed_payload::host_executable_platform(),
+        )
+        .map_err(|refusal| {
+            let mapped = crate::installed::refusal_for_installed_payload(&refusal);
+            RatlsChannelError {
+                reason_code: mapped.failure.reason_code,
+            }
+        })?;
+        let package = solstone_core_installed_payload::InstalledPackage::admit(
+            &root,
+            solstone_core_installed_payload::COMPILED_VERSION,
+            solstone_core_installed_payload::compiled_target(),
+        )
+        .map_err(|refusal| {
+            let mapped = crate::installed::refusal_for_installed_payload(&refusal);
+            RatlsChannelError {
+                reason_code: mapped.failure.reason_code,
+            }
+        })?;
+
+        establish_production_attested_channel_in_package_with_clock(
+            endpoint,
+            &package,
+            socket_timeout,
+            epoch,
+            clock,
+        )
+    }
 }
 
 #[cfg(not(windows))]
@@ -336,7 +378,7 @@ pub fn establish_production_attested_channel_in_package(
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "android")))]
 /// [`establish_production_attested_channel_in_package`], admitted on the caller's clock.
 pub fn establish_production_attested_channel_in_package_with_clock(
     endpoint: &RatlsEndpoint,
@@ -367,6 +409,20 @@ pub fn establish_production_attested_channel_in_package_with_clock(
         epoch,
         clock,
     )
+}
+
+#[cfg(all(not(windows), target_os = "android"))]
+pub fn establish_production_attested_channel_in_package_with_clock(
+    _endpoint: &RatlsEndpoint,
+    _package: &solstone_core_installed_payload::InstalledPackage,
+    _socket_timeout: Duration,
+    _epoch: u64,
+    _clock: &dyn AdmissionClock,
+) -> Result<AttestedChannel, RatlsChannelError> {
+    crate::ratls::channel::refuse_held_platform(std::env::consts::OS)?;
+    Err(RatlsChannelError {
+        reason_code: android_channel_reason(),
+    })
 }
 
 fn cpu_error(error: CpuLegError) -> CompositeVerificationError {
@@ -420,7 +476,10 @@ mod tests {
         GpuProfile, GpuProfiles, GpuStatusInput, ManifestSet, StatusMode,
     };
 
-    use super::{check_nvattest_readiness, verify_composite_with_gpu_appraiser};
+    use super::{
+        android_channel_reason_for_state, check_nvattest_readiness,
+        verify_composite_with_gpu_appraiser,
+    };
 
     const FIXTURE_PIN: &str = "b162f46105c80d3e45028e37cc649404c9d65297ad1cda8f953208582060b0e3";
 
@@ -914,6 +973,31 @@ mod tests {
         assert_eq!(
             classify_nvattest_prerequisite(NvattestEnsureStatus::AlreadyInstalled),
             None
+        );
+    }
+
+    #[test]
+    fn android_channel_refusal_order_matches_specification() {
+        // a. uninstalled -> "nvattest_unavailable"
+        assert_eq!(
+            android_channel_reason_for_state(false, true),
+            "nvattest_unavailable"
+        );
+        assert_eq!(
+            android_channel_reason_for_state(false, false),
+            "nvattest_unavailable"
+        );
+
+        // b. revalidation fails -> "nvattest_integrity_failed"
+        assert_eq!(
+            android_channel_reason_for_state(true, false),
+            "nvattest_integrity_failed"
+        );
+
+        // c. admitted and valid -> "nvattest_load_unrepresentable"
+        assert_eq!(
+            android_channel_reason_for_state(true, true),
+            "nvattest_load_unrepresentable"
         );
     }
 }

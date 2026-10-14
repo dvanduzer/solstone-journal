@@ -26,6 +26,7 @@ mod parent_watch;
 mod state;
 pub mod teardown_configuration;
 
+pub use archive_readback::SUPPORTED_RESTIC_VERSION;
 pub use defaults::backup_defaults;
 pub use destination::assemble_backend_env;
 pub use hosted::{delete_hosted_binding, load_hosted_binding, save_hosted_binding};

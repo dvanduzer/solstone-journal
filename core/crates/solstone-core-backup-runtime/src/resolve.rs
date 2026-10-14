@@ -11,6 +11,11 @@ use crate::engine::run_backup_tool_resolution_started_hook;
 use crate::engine::{AdmittedBackupMode, AdmittedCapability, ClosedToolError};
 use crate::runner::ToolRunner;
 
+use solstone_core_spp_attest::android_service_tools::{
+    ANDROID_RCLONE_MEMBER, AndroidServiceToolRole, AndroidServiceToolsRefusal,
+    get_admitted_android_service_tool, revalidate_installed_android_service_tools,
+};
+
 const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
 const RCLONE_MEMBER: &str = "lib/solstone-rclone/rclone";
 
@@ -19,6 +24,129 @@ const RCLONE_MEMBER: &str = "lib/solstone-rclone/rclone";
 pub struct ResolvedTools {
     pub restic_path: PathBuf,
     pub rclone_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPlatform {
+    Desktop,
+    AndroidAarch64,
+}
+
+#[must_use]
+pub fn host_tool_platform() -> ToolPlatform {
+    #[cfg(target_os = "android")]
+    {
+        ToolPlatform::AndroidAarch64
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        ToolPlatform::Desktop
+    }
+}
+
+pub trait AndroidAuthority: Send + Sync {
+    fn get_tool(&self, role: AndroidServiceToolRole) -> Option<PathBuf>;
+    fn revalidate(&self) -> Result<(), AndroidServiceToolsRefusal>;
+}
+
+pub struct LiveAndroidAuthority;
+
+impl AndroidAuthority for LiveAndroidAuthority {
+    fn get_tool(&self, role: AndroidServiceToolRole) -> Option<PathBuf> {
+        get_admitted_android_service_tool(role)
+    }
+
+    fn revalidate(&self) -> Result<(), AndroidServiceToolsRefusal> {
+        revalidate_installed_android_service_tools()
+    }
+}
+
+fn map_android_refusal(
+    refusal: &AndroidServiceToolsRefusal,
+    needs_rclone: bool,
+) -> ClosedToolError {
+    match refusal {
+        AndroidServiceToolsRefusal::MemberMissing { path } => {
+            if needs_rclone && path == ANDROID_RCLONE_MEMBER {
+                ClosedToolError::RcloneUnavailable {
+                    detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
+                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
+                        .to_owned(),
+                }
+            } else {
+                ClosedToolError::ResticUnavailable {
+                    detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
+                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
+                        .to_owned(),
+                }
+            }
+        }
+        AndroidServiceToolsRefusal::MemberChanged { path } => {
+            if needs_rclone && path == ANDROID_RCLONE_MEMBER {
+                ClosedToolError::RcloneUnavailable {
+                    detail: solstone_core_installed_payload::code::MEMBER_CHANGED.to_owned(),
+                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
+                        .to_owned(),
+                }
+            } else {
+                ClosedToolError::ResticUnavailable {
+                    detail: solstone_core_installed_payload::code::MEMBER_CHANGED.to_owned(),
+                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
+                        .to_owned(),
+                }
+            }
+        }
+        other => ClosedToolError::ResticUnavailable {
+            detail: other.to_string(),
+            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.to_owned(),
+        },
+    }
+}
+
+fn resolve_android_tools(
+    authority: &dyn AndroidAuthority,
+    needs_rclone: bool,
+) -> Result<ResolvedTools, ClosedToolError> {
+    if let Err(refusal) = authority.revalidate() {
+        return Err(map_android_refusal(&refusal, needs_rclone));
+    }
+    let restic_path = authority
+        .get_tool(AndroidServiceToolRole::Restic)
+        .ok_or_else(|| ClosedToolError::ResticUnavailable {
+            detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
+            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.to_owned(),
+        })?;
+    let rclone_path = if needs_rclone {
+        Some(
+            authority
+                .get_tool(AndroidServiceToolRole::Rclone)
+                .ok_or_else(|| ClosedToolError::RcloneUnavailable {
+                    detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
+                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
+                        .to_owned(),
+                })?,
+        )
+    } else {
+        None
+    };
+    Ok(ResolvedTools {
+        restic_path,
+        rclone_path,
+    })
+}
+
+fn resolve_android_restic_member(
+    authority: &dyn AndroidAuthority,
+) -> Result<PathBuf, ClosedToolError> {
+    if let Err(refusal) = authority.revalidate() {
+        return Err(map_android_refusal(&refusal, false));
+    }
+    authority
+        .get_tool(AndroidServiceToolRole::Restic)
+        .ok_or_else(|| ClosedToolError::ResticUnavailable {
+            detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
+            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.to_owned(),
+        })
 }
 
 #[cfg(not(windows))]
@@ -57,159 +185,219 @@ fn admit_package(
 /// Resolve the pinned tools required by an already-admitted backup capability.
 pub fn resolve_tools(
     capability: &AdmittedCapability,
+    runner: &dyn ToolRunner,
+    executable: &Path,
+) -> Result<ResolvedTools, ClosedToolError> {
+    #[cfg(not(windows))]
+    {
+        resolve_tools_for_platform(
+            capability,
+            runner,
+            executable,
+            host_tool_platform(),
+            &LiveAndroidAuthority,
+        )
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = (runner, executable);
+        resolve_tools_windows(capability)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn resolve_tools_for_platform(
+    capability: &AdmittedCapability,
     _runner: &dyn ToolRunner,
     executable: &Path,
+    platform: ToolPlatform,
+    android_authority: &dyn AndroidAuthority,
 ) -> Result<ResolvedTools, ClosedToolError> {
     #[cfg(any(test, feature = "test-hooks"))]
     run_backup_tool_resolution_started_hook(&capability.resolved_journal);
 
     let needs_rclone = matches!(capability.mode, AdmittedBackupMode::Operated { .. });
 
-    #[cfg(not(windows))]
-    {
-        let package = admit_package(executable, needs_rclone)?;
-        let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
-            ClosedToolError::ResticUnavailable {
-                detail: refusal.code.to_owned(),
-                guidance: refusal.guidance.to_owned(),
-            }
-        })?;
-        let rclone_path = if needs_rclone {
-            Some(package.member(RCLONE_MEMBER).map_err(|refusal| {
-                ClosedToolError::RcloneUnavailable {
+    match platform {
+        ToolPlatform::Desktop => {
+            let package = admit_package(executable, needs_rclone)?;
+            let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
+                ClosedToolError::ResticUnavailable {
                     detail: refusal.code.to_owned(),
                     guidance: refusal.guidance.to_owned(),
                 }
-            })?)
-        } else {
-            None
-        };
-        Ok(ResolvedTools {
-            restic_path,
-            rclone_path,
-        })
-    }
-
-    #[cfg(windows)]
-    {
-        let _ = executable;
-        // Windows has no resolver reason code; detail and guidance both hold the verification error string.
-        let restic_path = crate::windows_tool::verify_package_and_get_tool(
-            solstone_core_installed_payload::windows_payload::WINDOWS_RESTIC_WORKER,
-        )
-        .map_err(|err| {
-            let msg = err.to_string();
-            ClosedToolError::ResticUnavailable {
-                detail: msg.clone(),
-                guidance: msg,
-            }
-        })?;
-        let rclone_path = if needs_rclone {
-            Some(
-                crate::windows_tool::verify_package_and_get_tool(
-                    solstone_core_installed_payload::windows_payload::WINDOWS_RCLONE_WORKER,
-                )
-                .map_err(|err| {
-                    let msg = err.to_string();
+            })?;
+            let rclone_path = if needs_rclone {
+                Some(package.member(RCLONE_MEMBER).map_err(|refusal| {
                     ClosedToolError::RcloneUnavailable {
-                        detail: msg.clone(),
-                        guidance: msg,
+                        detail: refusal.code.to_owned(),
+                        guidance: refusal.guidance.to_owned(),
                     }
-                })?,
-            )
-        } else {
-            None
-        };
-        Ok(ResolvedTools {
-            restic_path,
-            rclone_path,
-        })
+                })?)
+            } else {
+                None
+            };
+            Ok(ResolvedTools {
+                restic_path,
+                rclone_path,
+            })
+        }
+        ToolPlatform::AndroidAarch64 => {
+            let _ = executable;
+            resolve_android_tools(android_authority, needs_rclone)
+        }
     }
+}
+
+#[cfg(windows)]
+fn resolve_tools_windows(
+    capability: &AdmittedCapability,
+) -> Result<ResolvedTools, ClosedToolError> {
+    let needs_rclone = matches!(capability.mode, AdmittedBackupMode::Operated { .. });
+    let restic_path = crate::windows_tool::verify_package_and_get_tool(
+        solstone_core_installed_payload::windows_payload::WINDOWS_RESTIC_WORKER,
+    )
+    .map_err(|err| {
+        let msg = err.to_string();
+        ClosedToolError::ResticUnavailable {
+            detail: msg.clone(),
+            guidance: msg,
+        }
+    })?;
+    let rclone_path = if needs_rclone {
+        Some(
+            crate::windows_tool::verify_package_and_get_tool(
+                solstone_core_installed_payload::windows_payload::WINDOWS_RCLONE_WORKER,
+            )
+            .map_err(|err| {
+                let msg = err.to_string();
+                ClosedToolError::RcloneUnavailable {
+                    detail: msg.clone(),
+                    guidance: msg,
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+    Ok(ResolvedTools {
+        restic_path,
+        rclone_path,
+    })
 }
 
 /// Resolve the pinned restic binary, and rclone when this journal needs an
 /// operated append-only session.
 pub fn resolve_operational_tools(
-    _runner: &dyn ToolRunner,
+    runner: &dyn ToolRunner,
     journal: &Path,
     append_only: bool,
     executable: &Path,
 ) -> Result<ResolvedTools, ClosedToolError> {
-    let needs_rclone = append_only && journal_is_operated(journal);
-
     #[cfg(not(windows))]
     {
-        let package = admit_package(executable, needs_rclone)?;
-        let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
-            ClosedToolError::ResticUnavailable {
-                detail: refusal.code.to_owned(),
-                guidance: refusal.guidance.to_owned(),
-            }
-        })?;
-        let rclone_path = if needs_rclone {
-            Some(package.member(RCLONE_MEMBER).map_err(|refusal| {
-                ClosedToolError::RcloneUnavailable {
-                    detail: refusal.code.to_owned(),
-                    guidance: refusal.guidance.to_owned(),
-                }
-            })?)
-        } else {
-            None
-        };
-        Ok(ResolvedTools {
-            restic_path,
-            rclone_path,
-        })
+        resolve_operational_tools_for_platform(
+            runner,
+            journal,
+            append_only,
+            executable,
+            host_tool_platform(),
+            &LiveAndroidAuthority,
+        )
     }
 
     #[cfg(windows)]
     {
-        let _ = executable;
-        // Windows has no resolver reason code; detail and guidance both hold the verification error string.
-        let restic_path = crate::windows_tool::verify_package_and_get_tool(
-            solstone_core_installed_payload::windows_payload::WINDOWS_RESTIC_WORKER,
-        )
-        .map_err(|err| {
-            let msg = err.to_string();
-            ClosedToolError::ResticUnavailable {
-                detail: msg.clone(),
-                guidance: msg,
-            }
-        })?;
-        let rclone_path = if needs_rclone {
-            Some(
-                crate::windows_tool::verify_package_and_get_tool(
-                    solstone_core_installed_payload::windows_payload::WINDOWS_RCLONE_WORKER,
-                )
-                .map_err(|err| {
-                    let msg = err.to_string();
-                    ClosedToolError::RcloneUnavailable {
-                        detail: msg.clone(),
-                        guidance: msg,
-                    }
-                })?,
-            )
-        } else {
-            None
-        };
-        Ok(ResolvedTools {
-            restic_path,
-            rclone_path,
-        })
+        let _ = (runner, executable);
+        resolve_operational_tools_windows(journal, append_only)
     }
+}
+
+#[cfg(not(windows))]
+pub fn resolve_operational_tools_for_platform(
+    _runner: &dyn ToolRunner,
+    journal: &Path,
+    append_only: bool,
+    executable: &Path,
+    platform: ToolPlatform,
+    android_authority: &dyn AndroidAuthority,
+) -> Result<ResolvedTools, ClosedToolError> {
+    let needs_rclone = append_only && journal_is_operated(journal);
+    match platform {
+        ToolPlatform::Desktop => {
+            let package = admit_package(executable, needs_rclone)?;
+            let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
+                ClosedToolError::ResticUnavailable {
+                    detail: refusal.code.to_owned(),
+                    guidance: refusal.guidance.to_owned(),
+                }
+            })?;
+            let rclone_path = if needs_rclone {
+                Some(package.member(RCLONE_MEMBER).map_err(|refusal| {
+                    ClosedToolError::RcloneUnavailable {
+                        detail: refusal.code.to_owned(),
+                        guidance: refusal.guidance.to_owned(),
+                    }
+                })?)
+            } else {
+                None
+            };
+            Ok(ResolvedTools {
+                restic_path,
+                rclone_path,
+            })
+        }
+        ToolPlatform::AndroidAarch64 => {
+            let _ = executable;
+            resolve_android_tools(android_authority, needs_rclone)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resolve_operational_tools_windows(
+    journal: &Path,
+    append_only: bool,
+) -> Result<ResolvedTools, ClosedToolError> {
+    let needs_rclone = append_only && journal_is_operated(journal);
+    let restic_path = crate::windows_tool::verify_package_and_get_tool(
+        solstone_core_installed_payload::windows_payload::WINDOWS_RESTIC_WORKER,
+    )
+    .map_err(|err| {
+        let msg = err.to_string();
+        ClosedToolError::ResticUnavailable {
+            detail: msg.clone(),
+            guidance: msg,
+        }
+    })?;
+    let rclone_path = if needs_rclone {
+        Some(
+            crate::windows_tool::verify_package_and_get_tool(
+                solstone_core_installed_payload::windows_payload::WINDOWS_RCLONE_WORKER,
+            )
+            .map_err(|err| {
+                let msg = err.to_string();
+                ClosedToolError::RcloneUnavailable {
+                    detail: msg.clone(),
+                    guidance: msg,
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+    Ok(ResolvedTools {
+        restic_path,
+        rclone_path,
+    })
 }
 
 /// Resolve the pinned restic binary only.
 pub fn resolve_restic_member(executable: &Path) -> Result<PathBuf, ClosedToolError> {
     #[cfg(not(windows))]
     {
-        let package = admit_package(executable, false)?;
-        package
-            .member(RESTIC_MEMBER)
-            .map_err(|refusal| ClosedToolError::ResticUnavailable {
-                detail: refusal.code.to_owned(),
-                guidance: refusal.guidance.to_owned(),
-            })
+        resolve_restic_member_for_platform(executable, host_tool_platform(), &LiveAndroidAuthority)
     }
 
     #[cfg(windows)]
@@ -225,6 +413,29 @@ pub fn resolve_restic_member(executable: &Path) -> Result<PathBuf, ClosedToolErr
                 guidance: msg,
             }
         })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn resolve_restic_member_for_platform(
+    executable: &Path,
+    platform: ToolPlatform,
+    android_authority: &dyn AndroidAuthority,
+) -> Result<PathBuf, ClosedToolError> {
+    match platform {
+        ToolPlatform::Desktop => {
+            let package = admit_package(executable, false)?;
+            package
+                .member(RESTIC_MEMBER)
+                .map_err(|refusal| ClosedToolError::ResticUnavailable {
+                    detail: refusal.code.to_owned(),
+                    guidance: refusal.guidance.to_owned(),
+                })
+        }
+        ToolPlatform::AndroidAarch64 => {
+            let _ = executable;
+            resolve_android_restic_member(android_authority)
+        }
     }
 }
 
@@ -245,6 +456,7 @@ mod tests {
         COMPILED_VERSION, INSTALLED_PAYLOAD_MANIFEST, PRODUCT, code, compiled_target, guidance,
         render_installed_payload,
     };
+    use solstone_core_spp_attest::android_service_tools::ANDROID_RESTIC_MEMBER;
     use std::fs;
 
     struct NoOpRunner;
@@ -559,5 +771,139 @@ mod tests {
         );
 
         fallbacks.verify();
+    }
+
+    struct MockAndroidAuthority {
+        restic: Option<PathBuf>,
+        rclone: Option<PathBuf>,
+        revalidate_err: Option<AndroidServiceToolsRefusal>,
+    }
+
+    impl AndroidAuthority for MockAndroidAuthority {
+        fn get_tool(&self, role: AndroidServiceToolRole) -> Option<PathBuf> {
+            match role {
+                AndroidServiceToolRole::Restic => self.restic.clone(),
+                AndroidServiceToolRole::Rclone => self.rclone.clone(),
+            }
+        }
+
+        fn revalidate(&self) -> Result<(), AndroidServiceToolsRefusal> {
+            if let Some(ref err) = self.revalidate_err {
+                Err(err.clone())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn android_resolution_uninstalled_returns_member_missing() {
+        let auth = MockAndroidAuthority {
+            restic: None,
+            rclone: None,
+            revalidate_err: None,
+        };
+        let journal = configured_journal();
+        let capability = prepare(journal.path(), &FixedClock).unwrap();
+        let dummy_exe = Path::new("/system/bin/app_process64");
+
+        let err = resolve_tools_for_platform(
+            &capability,
+            &NoOpRunner,
+            dummy_exe,
+            ToolPlatform::AndroidAarch64,
+            &auth,
+        )
+        .unwrap_err();
+        assert_eq!(err.detail(), code::MEMBER_MISSING);
+        assert_eq!(err.guidance(), guidance::PACKAGE_MISMATCH);
+
+        let err_restic =
+            resolve_restic_member_for_platform(dummy_exe, ToolPlatform::AndroidAarch64, &auth)
+                .unwrap_err();
+        assert_eq!(err_restic.detail(), code::MEMBER_MISSING);
+    }
+
+    #[test]
+    fn android_resolution_revalidate_changed_returns_member_changed() {
+        let auth = MockAndroidAuthority {
+            restic: Some(PathBuf::from("/data/app/restic")),
+            rclone: Some(PathBuf::from("/data/app/rclone")),
+            revalidate_err: Some(AndroidServiceToolsRefusal::MemberChanged {
+                path: ANDROID_RESTIC_MEMBER.to_owned(),
+            }),
+        };
+        let journal = configured_journal();
+        let capability = prepare(journal.path(), &FixedClock).unwrap();
+        let dummy_exe = Path::new("/system/bin/app_process64");
+
+        let err = resolve_tools_for_platform(
+            &capability,
+            &NoOpRunner,
+            dummy_exe,
+            ToolPlatform::AndroidAarch64,
+            &auth,
+        )
+        .unwrap_err();
+        assert_eq!(err.detail(), code::MEMBER_CHANGED);
+    }
+
+    #[test]
+    fn android_resolution_revalidate_rclone_missing_when_operated() {
+        let auth = MockAndroidAuthority {
+            restic: Some(PathBuf::from("/data/app/restic")),
+            rclone: None,
+            revalidate_err: Some(AndroidServiceToolsRefusal::MemberMissing {
+                path: ANDROID_RCLONE_MEMBER.to_owned(),
+            }),
+        };
+        let journal = configured_journal();
+        solstone_core_backup::set_mode(journal.path(), "operated").unwrap();
+        let dummy_exe = Path::new("/system/bin/app_process64");
+
+        let err = resolve_operational_tools_for_platform(
+            &NoOpRunner,
+            journal.path(),
+            true,
+            dummy_exe,
+            ToolPlatform::AndroidAarch64,
+            &auth,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "rclone_unavailable");
+        assert_eq!(err.detail(), code::MEMBER_MISSING);
+    }
+
+    #[test]
+    fn android_resolution_succeeds_with_admitted_tools() {
+        let auth = MockAndroidAuthority {
+            restic: Some(PathBuf::from("/data/app/lib/solstone-restic/restic")),
+            rclone: Some(PathBuf::from("/data/app/lib/solstone-rclone/rclone")),
+            revalidate_err: None,
+        };
+        let journal = configured_journal();
+        let capability = prepare(journal.path(), &FixedClock).unwrap();
+        let dummy_exe = Path::new("/system/bin/app_process64");
+
+        let tools = resolve_tools_for_platform(
+            &capability,
+            &NoOpRunner,
+            dummy_exe,
+            ToolPlatform::AndroidAarch64,
+            &auth,
+        )
+        .unwrap();
+        assert_eq!(
+            tools.restic_path,
+            PathBuf::from("/data/app/lib/solstone-restic/restic")
+        );
+
+        let restic =
+            resolve_restic_member_for_platform(dummy_exe, ToolPlatform::AndroidAarch64, &auth)
+                .unwrap();
+        assert_eq!(
+            restic,
+            PathBuf::from("/data/app/lib/solstone-restic/restic")
+        );
     }
 }

@@ -606,7 +606,7 @@ fn validate_listed_paths(files: &[ParsedFile]) -> Result<(), InstalledPayloadRef
     Ok(())
 }
 
-fn validate_relative(path: &str) -> Result<(), InstalledPayloadRefusal> {
+pub fn validate_relative(path: &str) -> Result<(), InstalledPayloadRefusal> {
     if path.is_empty()
         || path.starts_with('/')
         || path.starts_with('\\')
@@ -740,7 +740,7 @@ fn resolve_directory(
     Ok(Some(current))
 }
 
-fn resolve_member(root: &Path, relative: &str) -> Result<PathBuf, InstalledPayloadRefusal> {
+pub fn resolve_member(root: &Path, relative: &str) -> Result<PathBuf, InstalledPayloadRefusal> {
     validate_relative(relative)?;
     let mut current = root.to_path_buf();
     let parts = relative.split('/').collect::<Vec<_>>();
@@ -805,7 +805,7 @@ fn read_manifest_bytes(root: &Path) -> Result<Vec<u8>, InstalledPayloadRefusal> 
     }
 }
 
-fn read_member(path: &Path, relative: &str) -> Result<Vec<u8>, InstalledPayloadRefusal> {
+pub fn read_member(path: &Path, relative: &str) -> Result<Vec<u8>, InstalledPayloadRefusal> {
     let mut file = fs::File::open(path).map_err(|error| map_read_error(relative, error))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -821,11 +821,11 @@ fn map_read_error(relative: &str, error: io::Error) -> InstalledPayloadRefusal {
     }
 }
 
-fn digest_matches(bytes: &[u8], expected_len: u64, expected_sha: &str) -> bool {
+pub fn digest_matches(bytes: &[u8], expected_len: u64, expected_sha: &str) -> bool {
     bytes.len() as u64 == expected_len && sha256_hex(bytes).eq_ignore_ascii_case(expected_sha)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 

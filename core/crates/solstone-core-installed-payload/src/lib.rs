@@ -22,9 +22,10 @@ pub use posix::{
     COMPILED_VERSION, CurrentInstalledMember, ExecutablePlatform, INSTALLED_PAYLOAD_MANIFEST,
     INSTALLED_PAYLOAD_SCHEMA, INSTALLED_PAYLOAD_SIGNATURE, InstalledPackage,
     InstalledPayloadRefusal, PRODUCT, TARGET_LINUX_AARCH64, TARGET_LINUX_X86_64,
-    TARGET_MACOS_ARM64, bin_parent_root, canonical_target, host_executable_platform,
-    locate_installed_package, package_root_from_executable_path, render_installed_payload,
-    resolve_current_member, verify_installed_package,
+    TARGET_MACOS_ARM64, bin_parent_root, canonical_target, digest_matches,
+    host_executable_platform, locate_installed_package, package_root_from_executable_path,
+    read_member, render_installed_payload, resolve_current_member, resolve_member, sha256_hex,
+    validate_relative, verify_installed_package,
 };
 
 pub use windows_payload::WINDOWS_PAYLOAD_TARGET as TARGET_WINDOWS_X86_64;
@@ -91,7 +92,8 @@ pub fn compiled_target() -> &'static str {
     "ios-arm64-unshipped"
 }
 
-/// Android has compile/link support but no admitted installed package.
+/// Android has compile/link support but no admitted desktop installed package
+/// (app-owned service tools use `solstone.android-service-tools.v1`).
 /// Keep this id outside canonical_target until a mobile delivery is defined.
 #[cfg(all(target_os = "android", target_arch = "aarch64"))]
 #[must_use]

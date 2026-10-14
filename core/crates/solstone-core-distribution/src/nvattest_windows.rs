@@ -280,6 +280,21 @@ const BUILD_TOOLS: &[DownloadSourcePin] = &[
 
 pub const NVATTEST_SDK_REVISION: &str = "69a71c859ec02b6e5f10616b8b8a873c230941c9";
 
+#[must_use]
+pub fn pinned_ca_bundle_sha256() -> &'static str {
+    production_pins().ca_bundle.sha256
+}
+
+#[must_use]
+pub fn pinned_regorus_revision() -> &'static str {
+    for pin in NATIVE_SOURCES {
+        if let NativeSourcePin::BuildRevision(build) = pin {
+            return build.revision;
+        }
+    }
+    unreachable!("NATIVE_SOURCES must contain a BuildRevision pin for regorus")
+}
+
 pub(crate) const fn production_pins() -> Pins {
     Pins {
         sdk_repo: "https://github.com/solpbc/attestation-sdk",

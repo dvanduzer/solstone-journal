@@ -62,6 +62,7 @@ pub mod sign;
 pub mod stage;
 pub mod tar;
 pub mod transparency;
+pub use nvattest_windows::{pinned_ca_bundle_sha256, pinned_regorus_revision};
 pub use solstone_core_installed_payload::windows_payload;
 pub mod windows_pe_closure;
 pub mod windows_publish;

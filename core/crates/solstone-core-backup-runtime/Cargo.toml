@@ -39,6 +39,7 @@ solstone-core-indexer-store.workspace = true
 solstone-core-journal-io.workspace = true
 solstone-core-journal-config-write.workspace = true
 solstone-core-system.workspace = true
+solstone-core-spp-attest.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
@@ -63,3 +64,10 @@ nix = { workspace = true, features = ["fs", "signal"] }
 name = "backup_runtime_process"
 path = "tests/backup_runtime_process.rs"
 required-features = ["test-hooks"]
+
+# OnceLock process-global storage in spp-attest means tests mutating the
+# admitted Android service tools cannot run concurrently with other test threads.
+[[test]]
+name = "android_service_tools_process"
+path = "tests/android_service_tools_process.rs"
+
