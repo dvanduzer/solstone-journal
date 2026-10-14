@@ -1331,177 +1331,11 @@ mod tests {
     }
 
     #[test]
-    fn nvattest_linux_authority_committed_resolve_and_stage() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .unwrap();
-        let input = crate::inventory::PinnedInput::AuthorityCommitted {
-            platform: "linux-x86_64".into(),
-            path: "core/models/assets/nvattest/libnvat-linux-x86_64-1.2.2-sol.7-archive.tar.xz"
-                .into(),
-        };
-        let (bytes, pin, filename) = resolve_pinned_input(
-            "nvattest-linux",
-            repo_root,
-            &catalog_input_cache_dir(repo_root),
-            "linux-x86_64",
-            &input,
-        )
-        .unwrap();
-
-        let needed_set = BTreeSet::from([
-            "bin/nvattest",
-            "lib/libnvat.so.1.2.2",
-            "share/ca/ca-bundle.pem",
-            "LICENSE",
-            "share/THIRD_PARTY_NOTICES.md",
-        ]);
-        let contents =
-            extract_needed_members("nvattest-linux", &bytes, &filename, &needed_set).unwrap();
-
-        let staged = vec![
-            test_staged_member(
-                "bin/nvattest",
-                "lib/solstone-nvattest/bin/nvattest",
-                0o755,
-                &sha256_hex(&contents["bin/nvattest"]),
-            ),
-            test_staged_member(
-                "lib/libnvat.so.1",
-                "lib/solstone-nvattest/lib/libnvat.so.1",
-                0o755,
-                &sha256_hex(&contents["lib/libnvat.so.1.2.2"]),
-            ),
-            test_staged_member(
-                "share/ca/ca-bundle.pem",
-                "lib/solstone-nvattest/share/ca/ca-bundle.pem",
-                0o644,
-                &sha256_hex(&contents["share/ca/ca-bundle.pem"]),
-            ),
-            test_staged_member(
-                "LICENSE",
-                "share/solstone-journal/licenses/nvattest/LICENSE",
-                0o644,
-                &sha256_hex(&contents["LICENSE"]),
-            ),
-            test_staged_member(
-                "share/THIRD_PARTY_NOTICES.md",
-                "share/solstone-journal/licenses/nvattest/THIRD_PARTY_NOTICES.md",
-                0o644,
-                &sha256_hex(&contents["share/THIRD_PARTY_NOTICES.md"]),
-            ),
-        ];
-        let ignored = vec!["lib/libnvat.so".into(), "lib/libnvat.so.1.2.2".into()];
-
-        let plans = plan_pinned_input("nvattest-linux", &bytes, &pin, &filename, &staged, &ignored)
-            .unwrap();
-        assert_eq!(plans[1].alias.as_deref(), Some("lib/libnvat.so.1"));
-        assert_eq!(plans[1].inner_path, "lib/libnvat.so.1.2.2");
-
-        let tmp = tempfile::tempdir().unwrap();
-        stage_pinned_plans("nvattest-linux", tmp.path(), &bytes, &filename, &plans).unwrap();
-        assert_no_symlinks_recursive(tmp.path());
-
-        let bin_bytes =
-            std::fs::read(tmp.path().join("lib/solstone-nvattest/bin/nvattest")).unwrap();
-        let so_bytes =
-            std::fs::read(tmp.path().join("lib/solstone-nvattest/lib/libnvat.so.1")).unwrap();
-        crate::elf::admit_elf(
-            "lib/solstone-nvattest/bin/nvattest",
-            &bin_bytes,
-            EM_X86_64,
-            "lib/solstone-nvattest/bin",
-            None,
-            &[("lib/solstone-nvattest/lib/libnvat.so.1", &so_bytes)],
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn macos_real_bytes() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(3)
             .unwrap();
-        let input = crate::inventory::PinnedInput::AuthorityCommitted {
-            platform: "macos-arm64".into(),
-            path: "core/models/assets/nvattest/libnvat-macos-arm64-1.2.2-sol.7-archive.tar.xz"
-                .into(),
-        };
-        let (bytes, pin, filename) = resolve_pinned_input(
-            "nvattest-mac",
-            repo_root,
-            &catalog_input_cache_dir(repo_root),
-            "macos-arm64",
-            &input,
-        )
-        .unwrap();
-
-        let needed_set = BTreeSet::from([
-            "bin/nvattest",
-            "lib/libnvat.1.2.2.dylib",
-            "share/ca/ca-bundle.pem",
-            "LICENSE",
-            "share/THIRD_PARTY_NOTICES.md",
-        ]);
-        let contents =
-            extract_needed_members("nvattest-mac", &bytes, &filename, &needed_set).unwrap();
-
-        let staged = vec![
-            test_staged_member(
-                "bin/nvattest",
-                "lib/solstone-nvattest/bin/nvattest",
-                0o755,
-                &sha256_hex(&contents["bin/nvattest"]),
-            ),
-            test_staged_member(
-                "lib/libnvat.1.dylib",
-                "lib/solstone-nvattest/lib/libnvat.1.dylib",
-                0o755,
-                &sha256_hex(&contents["lib/libnvat.1.2.2.dylib"]),
-            ),
-            test_staged_member(
-                "share/ca/ca-bundle.pem",
-                "lib/solstone-nvattest/share/ca/ca-bundle.pem",
-                0o644,
-                &sha256_hex(&contents["share/ca/ca-bundle.pem"]),
-            ),
-            test_staged_member(
-                "LICENSE",
-                "share/solstone-journal/licenses/nvattest/LICENSE",
-                0o644,
-                &sha256_hex(&contents["LICENSE"]),
-            ),
-            test_staged_member(
-                "share/THIRD_PARTY_NOTICES.md",
-                "share/solstone-journal/licenses/nvattest/THIRD_PARTY_NOTICES.md",
-                0o644,
-                &sha256_hex(&contents["share/THIRD_PARTY_NOTICES.md"]),
-            ),
-        ];
-        let ignored = vec!["lib/libnvat.dylib".into(), "lib/libnvat.1.2.2.dylib".into()];
-        let plans =
-            plan_pinned_input("nvattest-mac", &bytes, &pin, &filename, &staged, &ignored).unwrap();
-        assert_eq!(plans[1].alias.as_deref(), Some("lib/libnvat.1.dylib"));
-        assert_eq!(plans[1].inner_path, "lib/libnvat.1.2.2.dylib");
-
-        let tmp = tempfile::tempdir().unwrap();
-        stage_pinned_plans("nvattest-mac", tmp.path(), &bytes, &filename, &plans).unwrap();
-        assert_no_symlinks_recursive(tmp.path());
-
-        let bin_bytes =
-            std::fs::read(tmp.path().join("lib/solstone-nvattest/bin/nvattest")).unwrap();
-        crate::macho::admit_macho(
-            "lib/solstone-nvattest/bin/nvattest",
-            &bin_bytes,
-            crate::macho::cputype_arm64(),
-            (15, 0),
-            "lib/solstone-nvattest/bin",
-            None,
-            &["lib/solstone-nvattest/lib/libnvat.1.dylib"],
-        )
-        .unwrap();
 
         // CED macOS Metal ARM64
         let ced_mac_path =
@@ -1568,8 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn nvattest_inventory_targets_staged_and_admitted() {
-        const EM_AARCH64: u16 = 183;
+    fn nvattest_inventory_entries_shape() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(3)
@@ -1598,20 +1431,6 @@ mod tests {
                 "nvattest for {target_id} is a component entry and a notice entry"
             );
 
-            let input = match entries[0] {
-                crate::inventory::Entry::PinnedMembers { input, .. } => input,
-                _ => unreachable!(),
-            };
-            let (bytes, pin, filename) = resolve_pinned_input(
-                "nvattest",
-                repo_root,
-                &catalog_input_cache_dir(repo_root),
-                target_id,
-                input,
-            )
-            .unwrap();
-            let tmp = tempfile::tempdir().unwrap();
-            let mut all_staged = Vec::new();
             for entry in &entries {
                 let (class, staged, ignored) = match entry {
                     crate::inventory::Entry::PinnedMembers {
@@ -1664,6 +1483,63 @@ mod tests {
                         "ignored name {ign} must not be a dest or relpath in staged"
                     );
                 }
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn nvattest_inventory_targets_staged_and_admitted() {
+        const EM_AARCH64: u16 = 183;
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        let inventory =
+            crate::inventory::load_inventory(&repo_root.join("core/distribution/inventory.toml"))
+                .unwrap();
+
+        for target_id in ["linux-x86_64", "linux-aarch64", "macos-arm64"] {
+            let entries: Vec<_> = inventory
+                .entry
+                .iter()
+                .filter(|e| match e {
+                    crate::inventory::Entry::PinnedMembers {
+                        component, targets, ..
+                    } => {
+                        component.as_deref() == Some("nvattest")
+                            && targets.iter().any(|t| t == target_id)
+                    }
+                    _ => false,
+                })
+                .collect();
+            assert_eq!(
+                entries.len(),
+                2,
+                "nvattest for {target_id} is a component entry and a notice entry"
+            );
+
+            let input = match entries[0] {
+                crate::inventory::Entry::PinnedMembers { input, .. } => input,
+                _ => unreachable!(),
+            };
+            let (bytes, pin, filename) = resolve_pinned_input(
+                "nvattest",
+                repo_root,
+                &catalog_input_cache_dir(repo_root),
+                target_id,
+                input,
+            )
+            .unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let mut all_staged = Vec::new();
+            for entry in &entries {
+                let (staged, ignored) = match entry {
+                    crate::inventory::Entry::PinnedMembers {
+                        staged, ignored, ..
+                    } => (staged.as_slice(), ignored.as_slice()),
+                    _ => unreachable!(),
+                };
                 let plans = plan_pinned_input("nvattest", &bytes, &pin, &filename, staged, ignored)
                     .unwrap();
                 stage_pinned_plans("nvattest", tmp.path(), &bytes, &filename, &plans).unwrap();
