@@ -17,13 +17,14 @@ use solstone_core_backup_runtime::resolve::{
     resolve_restic_member_for_platform, resolve_tools_for_platform,
 };
 use solstone_core_backup_runtime::runner::ToolRunner;
-use solstone_core_installed_payload::sha256_hex;
 use solstone_core_spp_attest::android_service_tools::{
-    ANDROID_RCLONE_MEMBER, ANDROID_RESTIC_MEMBER, AndroidServiceToolFile, AndroidServiceToolRole,
-    AndroidServiceToolsRefusal, admit_android_service_tools, get_admitted_android_service_tool,
-    get_admitted_android_service_tools, install_admitted_android_service_tools,
-    render_android_service_tools_manifest, revalidate_installed_android_service_tools,
+    ANDROID_CA_BUNDLE_FILENAME, ANDROID_NVAT_FILENAME, ANDROID_NVATTEST_FILENAME,
+    ANDROID_RCLONE_FILENAME, ANDROID_RESTIC_FILENAME, AndroidServiceToolRole,
+    AndroidServiceToolsRefusal, has_admitted_android_service_tools, install_android_service_tools,
+    read_test_ca_bundle_pem, render_android_service_tools_manifest,
+    resolve_admitted_android_service_tool, revalidate_installed_android_service_tools,
 };
+use solstone_core_spp_attest::nvgpu::ManifestSet;
 use tempfile::tempdir;
 
 struct NoOpRunner;
@@ -64,6 +65,79 @@ fn configured_journal() -> tempfile::TempDir {
     dir
 }
 
+const MOBILE_NATIVE_DRIVER: &[u8] = include_bytes!("../../../../scripts/mobile_native_build.py");
+const MOBILE_NATIVE_INPUTS: &[u8] = include_bytes!("../../../distribution/mobile/inputs.json");
+const MOBILE_NVATTEST_PATCH: &[u8] =
+    include_bytes!("../../../distribution/mobile/nvattest-mobile.patch");
+
+fn setup_fixture_roots(native_dir: &Path, resource_dir: &Path) {
+    let restic_bytes = b"\x7fELFdummy-restic-pie";
+    let rclone_bytes = b"\x7fELFdummy-rclone-pie";
+    let nvattest_bytes = solstone_core_distribution::elf::fixture_shared_needed(
+        solstone_core_distribution::elf::machine_aarch64(),
+        &["libnvat.so", "libm.so", "libdl.so", "libc.so"],
+        None,
+        None,
+    );
+    let nvat_bytes = solstone_core_distribution::elf::fixture_shared_needed(
+        solstone_core_distribution::elf::machine_aarch64(),
+        &["libz.so", "liblog.so", "libdl.so", "libm.so", "libc.so"],
+        Some(ANDROID_NVAT_FILENAME),
+        None,
+    );
+    fs::write(native_dir.join(ANDROID_RESTIC_FILENAME), restic_bytes).unwrap();
+    fs::write(native_dir.join(ANDROID_RCLONE_FILENAME), rclone_bytes).unwrap();
+    fs::write(native_dir.join(ANDROID_NVATTEST_FILENAME), nvattest_bytes).unwrap();
+    fs::write(native_dir.join(ANDROID_NVAT_FILENAME), nvat_bytes).unwrap();
+
+    let ca_bytes = read_test_ca_bundle_pem().unwrap();
+    fs::write(resource_dir.join(ANDROID_CA_BUNDLE_FILENAME), ca_bytes).unwrap();
+
+    for rim in ManifestSet::QUALIFIED_595_71_05.entries() {
+        fs::write(resource_dir.join(rim.filename()), rim.xml()).unwrap();
+    }
+}
+
+fn receipt_for_tree(native_dir: &Path, resource_dir: &Path) -> Vec<u8> {
+    let sha = solstone_core_distribution::digest::sha256_hex;
+    let artifact = |component: &str, bytes: &[u8]| {
+        serde_json::json!({
+            "component": component,
+            "path": component,
+            "sha256": sha(bytes),
+            "size_bytes": bytes.len(),
+        })
+    };
+    let restic_pin = solstone_core_distribution::restic_input_pin();
+    let rclone_pin = solstone_core_distribution::rclone_input_pin();
+    let nvattest_pin = solstone_core_distribution::nvattest_input_pin();
+    serde_json::to_vec(&serde_json::json!({
+        "platform": "android",
+        "complete": true,
+        "status": "passed",
+        "exit": 0,
+        "driver_sha256": sha(MOBILE_NATIVE_DRIVER),
+        "inputs_sha256": sha(MOBILE_NATIVE_INPUTS),
+        "inputs": {
+            "restic": {"revision": restic_pin.revision, "sha256": restic_pin.archive_sha256},
+            "rclone": {"revision": rclone_pin.revision, "sha256": rclone_pin.archive_sha256},
+            "nvattest": {
+                "revision": solstone_core_distribution::NVATTEST_SDK_REVISION,
+                "sha256": nvattest_pin.archive_sha256,
+            },
+        },
+        "patches": [{"component": "nvattest", "sha256": sha(MOBILE_NVATTEST_PATCH)}],
+        "artifacts": [
+            artifact("restic-cli", &fs::read(native_dir.join(ANDROID_RESTIC_FILENAME)).unwrap()),
+            artifact("rclone-cli", &fs::read(native_dir.join(ANDROID_RCLONE_FILENAME)).unwrap()),
+            artifact("nvattest-cli", &fs::read(native_dir.join(ANDROID_NVATTEST_FILENAME)).unwrap()),
+            artifact("nvattest-library", &fs::read(native_dir.join(ANDROID_NVAT_FILENAME)).unwrap()),
+            artifact("nvattest-ca-bundle", &fs::read(resource_dir.join(ANDROID_CA_BUNDLE_FILENAME)).unwrap()),
+        ],
+    }))
+    .unwrap()
+}
+
 #[test]
 #[allow(unsafe_code)]
 fn android_service_tools_process_lifecycle_and_env_isolation() {
@@ -72,9 +146,9 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     let capability = prepare(journal.path(), &FixedClock).unwrap();
 
     // 1. Pre-installation state:
-    assert!(get_admitted_android_service_tools().is_none());
-    assert!(get_admitted_android_service_tool(AndroidServiceToolRole::Restic).is_none());
-    assert!(get_admitted_android_service_tool(AndroidServiceToolRole::Rclone).is_none());
+    assert!(!has_admitted_android_service_tools());
+    assert!(resolve_admitted_android_service_tool(AndroidServiceToolRole::Restic).is_err());
+    assert!(resolve_admitted_android_service_tool(AndroidServiceToolRole::Rclone).is_err());
     assert!(revalidate_installed_android_service_tools().is_err());
 
     let err = resolve_tools_for_platform(
@@ -95,75 +169,103 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     .unwrap_err();
     assert_eq!(err_restic.detail(), "member-missing");
 
-    // 2. Prepare valid tools in a temporary directory
-    let temp = tempdir().unwrap();
-    let root = temp.path();
-
-    let restic_rel = ANDROID_RESTIC_MEMBER;
-    let rclone_rel = ANDROID_RCLONE_MEMBER;
-
-    let restic_full = root.join(restic_rel);
-    let rclone_full = root.join(rclone_rel);
-
-    fs::create_dir_all(restic_full.parent().unwrap()).unwrap();
-    fs::create_dir_all(rclone_full.parent().unwrap()).unwrap();
-
-    let restic_bytes = b"\x7fELFfake-android-restic-pie";
-    let rclone_bytes = b"\x7fELFfake-android-rclone-pie";
-
-    fs::write(&restic_full, restic_bytes).unwrap();
-    fs::write(&rclone_full, rclone_bytes).unwrap();
-
-    let files = vec![
-        AndroidServiceToolFile {
-            path: rclone_rel.to_owned(),
-            bytes: rclone_bytes.len() as u64,
-            sha256: sha256_hex(rclone_bytes),
-            role: Some(AndroidServiceToolRole::Rclone),
-            version: Some("1.73.1".to_owned()),
-        },
-        AndroidServiceToolFile {
-            path: restic_rel.to_owned(),
-            bytes: restic_bytes.len() as u64,
-            sha256: sha256_hex(restic_bytes),
-            role: Some(AndroidServiceToolRole::Restic),
-            version: Some(solstone_core_backup::SUPPORTED_RESTIC_VERSION.to_owned()),
-        },
-    ];
-
-    let manifest_bytes = render_android_service_tools_manifest(&files).unwrap();
-    let admitted = admit_android_service_tools(root, &manifest_bytes).unwrap();
-
-    // 3. Install into OnceLock
-    install_admitted_android_service_tools(admitted.clone()).unwrap();
-
-    // Attempt second install: must fail
-    let second_err = install_admitted_android_service_tools(admitted).unwrap_err();
-    assert!(matches!(
-        second_err,
-        AndroidServiceToolsRefusal::ManifestInvalid { .. }
-    ));
-
-    // 4. Post-installation queries:
-    assert!(get_admitted_android_service_tools().is_some());
-    assert_eq!(
-        get_admitted_android_service_tool(AndroidServiceToolRole::Restic).unwrap(),
-        restic_full
-    );
-    assert_eq!(
-        get_admitted_android_service_tool(AndroidServiceToolRole::Rclone).unwrap(),
-        rclone_full
-    );
-    assert!(revalidate_installed_android_service_tools().is_ok());
-
-    // 5. Environmental isolation: modifying environment must not alter resolution
+    let home = tempdir().unwrap();
     unsafe {
+        std::env::set_var("HOME", home.path());
         std::env::set_var("PATH", "/injected/bin:/usr/bin");
         std::env::set_var("LD_LIBRARY_PATH", "/injected/lib");
         std::env::set_var("SOLSTONE_RESTIC_BUNDLE", "/injected/bundle");
         std::env::set_var("SOLSTONE_RCLONE_BUNDLE", "/injected/bundle");
     }
 
+    // 2. Prepare valid fixture roots
+    let native_temp = tempdir().unwrap();
+    let resource_temp = tempdir().unwrap();
+    setup_fixture_roots(native_temp.path(), resource_temp.path());
+
+    let restic_full = native_temp.path().join(ANDROID_RESTIC_FILENAME);
+    let rclone_full = native_temp.path().join(ANDROID_RCLONE_FILENAME);
+
+    let receipt = receipt_for_tree(native_temp.path(), resource_temp.path());
+    let manifest_bytes =
+        render_android_service_tools_manifest(native_temp.path(), resource_temp.path(), &receipt)
+            .unwrap();
+
+    let mut stamped = serde_json::from_slice::<serde_json::Value>(&receipt).unwrap();
+    for artifact in stamped["artifacts"].as_array_mut().unwrap() {
+        if artifact["component"] == "restic-cli" {
+            artifact["sha256"] = serde_json::Value::String("0".repeat(64));
+        }
+    }
+    let stamp_err = install_android_service_tools(
+        native_temp.path(),
+        resource_temp.path(),
+        &manifest_bytes,
+        &serde_json::to_vec(&stamped).unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(stamp_err.code(), "pin-mismatch");
+    assert!(!has_admitted_android_service_tools());
+
+    // 3. Install into OnceLock
+    install_android_service_tools(
+        native_temp.path(),
+        resource_temp.path(),
+        &manifest_bytes,
+        &receipt,
+    )
+    .unwrap();
+
+    // Idempotent reinstall: identical roots and manifest bytes must succeed
+    install_android_service_tools(
+        native_temp.path(),
+        resource_temp.path(),
+        &manifest_bytes,
+        &receipt,
+    )
+    .unwrap();
+
+    // A receipt that does not match the packaged bytes fails admission and does
+    // not replace the authority.
+    let stamp_after = install_android_service_tools(
+        native_temp.path(),
+        resource_temp.path(),
+        &manifest_bytes,
+        &serde_json::to_vec(&stamped).unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(stamp_after.code(), "pin-mismatch");
+
+    // Rejection on difference: different root or manifest bytes returns AlreadyInstalled
+    let other_temp = tempdir().unwrap();
+    setup_fixture_roots(other_temp.path(), resource_temp.path());
+    let other_receipt = receipt_for_tree(other_temp.path(), resource_temp.path());
+    let diff_err = install_android_service_tools(
+        other_temp.path(),
+        resource_temp.path(),
+        &manifest_bytes,
+        &other_receipt,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        diff_err,
+        AndroidServiceToolsRefusal::AlreadyInstalled
+    ));
+    assert_eq!(diff_err.code(), "already-installed");
+
+    // 4. Post-installation queries:
+    assert!(has_admitted_android_service_tools());
+    assert_eq!(
+        resolve_admitted_android_service_tool(AndroidServiceToolRole::Restic).unwrap(),
+        restic_full
+    );
+    assert_eq!(
+        resolve_admitted_android_service_tool(AndroidServiceToolRole::Rclone).unwrap(),
+        rclone_full
+    );
+    assert!(revalidate_installed_android_service_tools().is_ok());
+
+    // 5. Environmental isolation: planted environment must not alter resolution
     let resolved = resolve_tools_for_platform(
         &capability,
         &NoOpRunner,
@@ -183,8 +285,44 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     .unwrap();
     assert_eq!(resolved_restic, restic_full);
 
+    let non_operated = resolve_operational_tools_for_platform(
+        &NoOpRunner,
+        journal.path(),
+        true,
+        dummy_exe,
+        ToolPlatform::AndroidAarch64,
+        &LiveAndroidAuthority,
+    )
+    .unwrap();
+    assert_eq!(non_operated.restic_path, restic_full);
+    assert_eq!(non_operated.rclone_path, None);
+
     // Operated mode needs rclone:
+    solstone_core_backup::save_hosted_binding(
+        journal.path(),
+        &solstone_core_backup::HostedBinding {
+            broker_endpoint: "https://backup.example".into(),
+            account_id: "account".into(),
+            instance_id: "instance".into(),
+            bucket: "bucket".into(),
+            prefix: "prefix".into(),
+            broker_token: "token".into(),
+        },
+    )
+    .unwrap();
     solstone_core_backup::set_mode(journal.path(), "operated").unwrap();
+    let operated = prepare(journal.path(), &FixedClock).unwrap();
+    let resolved_operated = resolve_tools_for_platform(
+        &operated,
+        &NoOpRunner,
+        dummy_exe,
+        ToolPlatform::AndroidAarch64,
+        &LiveAndroidAuthority,
+    )
+    .unwrap();
+    assert_eq!(resolved_operated.restic_path, restic_full);
+    assert_eq!(resolved_operated.rclone_path, Some(rclone_full.clone()));
+
     let resolved_op = resolve_operational_tools_for_platform(
         &NoOpRunner,
         journal.path(),
@@ -201,12 +339,11 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     fs::write(&restic_full, b"tampered-bytes-after-admission").unwrap();
 
     let reval_err = revalidate_installed_android_service_tools().unwrap_err();
-    assert_eq!(
+    assert!(matches!(
         reval_err,
-        AndroidServiceToolsRefusal::MemberChanged {
-            path: restic_rel.to_owned(),
-        }
-    );
+        AndroidServiceToolsRefusal::MemberChanged { .. }
+    ));
+    assert_eq!(reval_err.code(), "member-changed");
 
     let tampered_res = resolve_tools_for_platform(
         &capability,
@@ -217,4 +354,8 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     )
     .unwrap_err();
     assert_eq!(tampered_res.detail(), "member-changed");
+
+    let lookup_err =
+        resolve_admitted_android_service_tool(AndroidServiceToolRole::Restic).unwrap_err();
+    assert_eq!(lookup_err.code(), "member-changed");
 }

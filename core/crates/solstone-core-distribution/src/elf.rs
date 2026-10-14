@@ -836,11 +836,23 @@ pub fn fixture_gnu_dynamic(
     runpath: Option<&str>,
     glibc: (u32, u32),
 ) -> Vec<u8> {
-    build_gnu(machine, Some(interp), needed, runpath, Some(glibc))
+    build_gnu(machine, Some(interp), needed, runpath, Some(glibc), None)
 }
 
 pub fn fixture_static_musl(machine: u16) -> Vec<u8> {
-    build_gnu(machine, None, &[], None, None)
+    build_gnu(machine, None, &[], None, None, None)
+}
+
+/// ELF64 shared object whose dynamic section names `needed`, an optional
+/// SONAME, and an optional `DT_RUNPATH`. Used to admit a measured Android
+/// load closure without a device.
+pub fn fixture_shared_needed(
+    machine: u16,
+    needed: &[&str],
+    soname: Option<&str>,
+    runpath: Option<&str>,
+) -> Vec<u8> {
+    build_gnu(machine, None, needed, runpath, None, soname)
 }
 
 fn build_gnu(
@@ -849,6 +861,7 @@ fn build_gnu(
     needed: &[&str],
     runpath: Option<&str>,
     glibc: Option<(u32, u32)>,
+    soname: Option<&str>,
 ) -> Vec<u8> {
     let mut dynstr = vec![0_u8];
     let mut needed_off = Vec::new();
@@ -866,6 +879,12 @@ fn build_gnu(
         dynstr.push(0);
     }
     let runpath_off = runpath.map(|value| {
+        let off = dynstr.len() as u64;
+        dynstr.extend_from_slice(value.as_bytes());
+        dynstr.push(0);
+        off
+    });
+    let soname_off = soname.map(|value| {
         let off = dynstr.len() as u64;
         dynstr.extend_from_slice(value.as_bytes());
         dynstr.push(0);
@@ -905,6 +924,7 @@ fn build_gnu(
     let num_dyn_entries = 2
         + needed_off.len()
         + usize::from(runpath_off.is_some())
+        + usize::from(soname_off.is_some())
         + if glibc.is_some() { 2 } else { 0 };
     let dyn_size = num_dyn_entries * 16;
     let dynstr_off = dyn_off + dyn_size;
@@ -920,6 +940,9 @@ fn build_gnu(
     }
     if let Some(off) = runpath_off {
         push_dyn(&mut dynamic, DT_RUNPATH, off);
+    }
+    if let Some(off) = soname_off {
+        push_dyn(&mut dynamic, DT_SONAME, off);
     }
     if glibc.is_some() {
         push_dyn(&mut dynamic, DT_VERNEED, ver_off as u64);

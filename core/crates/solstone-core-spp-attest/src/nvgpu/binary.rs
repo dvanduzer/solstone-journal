@@ -30,8 +30,9 @@ pub struct NvattestCommand {
     pub executable: PathBuf,
     /// Includes `executable` as argv[0], matching Python's subprocess argv.
     pub argv: Vec<OsString>,
-    /// Environment variables. On POSIX, the child process does not inherit
-    /// the parent environment; its environment is exactly `PATH=/usr/bin:/bin`.
+    /// Environment variables. The child does not inherit the parent environment.
+    /// Desktop POSIX is exactly `PATH=/usr/bin:/bin`. Android is exactly
+    /// `LD_LIBRARY_PATH` set to the admitted absolute `nativeLibraryDir`.
     pub env: BTreeMap<OsString, OsString>,
 }
 
@@ -236,7 +237,11 @@ fn child_environment(lib_dir: &Path) -> Result<BTreeMap<OsString, OsString>, Gpu
         let _ = lib_dir;
         super::windows::environment(std::env::vars_os())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    {
+        android_verifier_child_environment(lib_dir)
+    }
+    #[cfg(all(not(windows), not(target_os = "android")))]
     {
         let _ = lib_dir;
         Ok(BTreeMap::from([(
@@ -244,6 +249,25 @@ fn child_environment(lib_dir: &Path) -> Result<BTreeMap<OsString, OsString>, Gpu
             OsString::from("/usr/bin:/bin"),
         )]))
     }
+}
+
+/// Cleared nvattest child environment for an admitted Android native-library directory.
+///
+/// The map contains only `LD_LIBRARY_PATH`. The directory must be absolute, must
+/// not contain a path separator, and must not contain an app-local copy of
+/// `libc.so`, `libm.so`, `libdl.so`, `liblog.so`, or `libz.so`.
+pub fn android_verifier_child_environment(
+    native_library_dir: &Path,
+) -> Result<BTreeMap<OsString, OsString>, GpuAppraisalReason> {
+    crate::android_service_tools::validate_android_loader_directory(native_library_dir)
+        .map_err(|_| GpuAppraisalReason::NvattestIntegrityFailed)?;
+    let text = native_library_dir
+        .to_str()
+        .ok_or(GpuAppraisalReason::NvattestIntegrityFailed)?;
+    Ok(BTreeMap::from([(
+        OsString::from("LD_LIBRARY_PATH"),
+        OsString::from(text),
+    )]))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -461,5 +485,38 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn android_child_environment_is_only_the_native_library_dir() {
+        let root = TempDir::new();
+        let env = super::android_verifier_child_environment(root.path()).expect("loader path");
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            env.get(OsStr::new("LD_LIBRARY_PATH")),
+            Some(&OsString::from(root.path().to_str().expect("utf-8 path")))
+        );
+        assert!(!env.contains_key(OsStr::new("PATH")));
+
+        assert!(matches!(
+            super::android_verifier_child_environment(Path::new("native")),
+            Err(GpuAppraisalReason::NvattestIntegrityFailed)
+        ));
+        assert!(matches!(
+            super::android_verifier_child_environment(Path::new("/data/app/lib:extra")),
+            Err(GpuAppraisalReason::NvattestIntegrityFailed)
+        ));
+
+        fs::write(root.path().join("libc.so"), b"shadow").expect("shadow");
+        assert!(matches!(
+            super::android_verifier_child_environment(root.path()),
+            Err(GpuAppraisalReason::NvattestIntegrityFailed)
+        ));
+        fs::remove_file(root.path().join("libc.so")).expect("remove shadow");
+        fs::write(root.path().join("libz.so"), b"shadow").expect("libz shadow");
+        assert!(matches!(
+            super::android_verifier_child_environment(root.path()),
+            Err(GpuAppraisalReason::NvattestIntegrityFailed)
+        ));
     }
 }

@@ -12,8 +12,8 @@ use crate::engine::{AdmittedBackupMode, AdmittedCapability, ClosedToolError};
 use crate::runner::ToolRunner;
 
 use solstone_core_spp_attest::android_service_tools::{
-    ANDROID_RCLONE_MEMBER, AndroidServiceToolRole, AndroidServiceToolsRefusal,
-    get_admitted_android_service_tool, revalidate_installed_android_service_tools,
+    AndroidServiceToolRole, AndroidServiceToolsRefusal, resolve_admitted_android_service_tool,
+    revalidate_installed_android_service_tools,
 };
 
 const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
@@ -45,15 +45,21 @@ pub fn host_tool_platform() -> ToolPlatform {
 }
 
 pub trait AndroidAuthority: Send + Sync {
-    fn get_tool(&self, role: AndroidServiceToolRole) -> Option<PathBuf>;
+    fn resolve_tool(
+        &self,
+        role: AndroidServiceToolRole,
+    ) -> Result<PathBuf, AndroidServiceToolsRefusal>;
     fn revalidate(&self) -> Result<(), AndroidServiceToolsRefusal>;
 }
 
 pub struct LiveAndroidAuthority;
 
 impl AndroidAuthority for LiveAndroidAuthority {
-    fn get_tool(&self, role: AndroidServiceToolRole) -> Option<PathBuf> {
-        get_admitted_android_service_tool(role)
+    fn resolve_tool(
+        &self,
+        role: AndroidServiceToolRole,
+    ) -> Result<PathBuf, AndroidServiceToolsRefusal> {
+        resolve_admitted_android_service_tool(role)
     }
 
     fn revalidate(&self) -> Result<(), AndroidServiceToolsRefusal> {
@@ -65,41 +71,18 @@ fn map_android_refusal(
     refusal: &AndroidServiceToolsRefusal,
     needs_rclone: bool,
 ) -> ClosedToolError {
-    match refusal {
-        AndroidServiceToolsRefusal::MemberMissing { path } => {
-            if needs_rclone && path == ANDROID_RCLONE_MEMBER {
-                ClosedToolError::RcloneUnavailable {
-                    detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
-                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
-                        .to_owned(),
-                }
-            } else {
-                ClosedToolError::ResticUnavailable {
-                    detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
-                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
-                        .to_owned(),
-                }
-            }
-        }
-        AndroidServiceToolsRefusal::MemberChanged { path } => {
-            if needs_rclone && path == ANDROID_RCLONE_MEMBER {
-                ClosedToolError::RcloneUnavailable {
-                    detail: solstone_core_installed_payload::code::MEMBER_CHANGED.to_owned(),
-                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
-                        .to_owned(),
-                }
-            } else {
-                ClosedToolError::ResticUnavailable {
-                    detail: solstone_core_installed_payload::code::MEMBER_CHANGED.to_owned(),
-                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
-                        .to_owned(),
-                }
-            }
-        }
-        other => ClosedToolError::ResticUnavailable {
-            detail: other.to_string(),
-            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.to_owned(),
-        },
+    let is_rclone = refusal.role() == Some(AndroidServiceToolRole::Rclone);
+    let detail = refusal.code().to_owned();
+    let guidance =
+        if refusal.code() == solstone_core_installed_payload::code::RESTART_TO_FINISH_UPDATE {
+            solstone_core_installed_payload::guidance::RESTART_UPDATE.to_owned()
+        } else {
+            solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.to_owned()
+        };
+    if needs_rclone && is_rclone {
+        ClosedToolError::RcloneUnavailable { detail, guidance }
+    } else {
+        ClosedToolError::ResticUnavailable { detail, guidance }
     }
 }
 
@@ -111,20 +94,13 @@ fn resolve_android_tools(
         return Err(map_android_refusal(&refusal, needs_rclone));
     }
     let restic_path = authority
-        .get_tool(AndroidServiceToolRole::Restic)
-        .ok_or_else(|| ClosedToolError::ResticUnavailable {
-            detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
-            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.to_owned(),
-        })?;
+        .resolve_tool(AndroidServiceToolRole::Restic)
+        .map_err(|refusal| map_android_refusal(&refusal, needs_rclone))?;
     let rclone_path = if needs_rclone {
         Some(
             authority
-                .get_tool(AndroidServiceToolRole::Rclone)
-                .ok_or_else(|| ClosedToolError::RcloneUnavailable {
-                    detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
-                    guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH
-                        .to_owned(),
-                })?,
+                .resolve_tool(AndroidServiceToolRole::Rclone)
+                .map_err(|refusal| map_android_refusal(&refusal, needs_rclone))?,
         )
     } else {
         None
@@ -142,11 +118,8 @@ fn resolve_android_restic_member(
         return Err(map_android_refusal(&refusal, false));
     }
     authority
-        .get_tool(AndroidServiceToolRole::Restic)
-        .ok_or_else(|| ClosedToolError::ResticUnavailable {
-            detail: solstone_core_installed_payload::code::MEMBER_MISSING.to_owned(),
-            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.to_owned(),
-        })
+        .resolve_tool(AndroidServiceToolRole::Restic)
+        .map_err(|refusal| map_android_refusal(&refusal, false))
 }
 
 #[cfg(not(windows))]
@@ -456,7 +429,6 @@ mod tests {
         COMPILED_VERSION, INSTALLED_PAYLOAD_MANIFEST, PRODUCT, code, compiled_target, guidance,
         render_installed_payload,
     };
-    use solstone_core_spp_attest::android_service_tools::ANDROID_RESTIC_MEMBER;
     use std::fs;
 
     struct NoOpRunner;
@@ -774,16 +746,22 @@ mod tests {
     }
 
     struct MockAndroidAuthority {
-        restic: Option<PathBuf>,
-        rclone: Option<PathBuf>,
+        restic: Result<PathBuf, AndroidServiceToolsRefusal>,
+        rclone: Result<PathBuf, AndroidServiceToolsRefusal>,
         revalidate_err: Option<AndroidServiceToolsRefusal>,
     }
 
     impl AndroidAuthority for MockAndroidAuthority {
-        fn get_tool(&self, role: AndroidServiceToolRole) -> Option<PathBuf> {
+        fn resolve_tool(
+            &self,
+            role: AndroidServiceToolRole,
+        ) -> Result<PathBuf, AndroidServiceToolsRefusal> {
             match role {
                 AndroidServiceToolRole::Restic => self.restic.clone(),
                 AndroidServiceToolRole::Rclone => self.rclone.clone(),
+                AndroidServiceToolRole::Nvattest | AndroidServiceToolRole::Nvat => {
+                    Err(AndroidServiceToolsRefusal::RoleMissing { role })
+                }
             }
         }
 
@@ -799,8 +777,14 @@ mod tests {
     #[test]
     fn android_resolution_uninstalled_returns_member_missing() {
         let auth = MockAndroidAuthority {
-            restic: None,
-            rclone: None,
+            restic: Err(AndroidServiceToolsRefusal::MemberMissing {
+                path: "librestic.so".to_owned(),
+                role: Some(AndroidServiceToolRole::Restic),
+            }),
+            rclone: Err(AndroidServiceToolsRefusal::MemberMissing {
+                path: "librclone.so".to_owned(),
+                role: Some(AndroidServiceToolRole::Rclone),
+            }),
             revalidate_err: None,
         };
         let journal = configured_journal();
@@ -827,10 +811,11 @@ mod tests {
     #[test]
     fn android_resolution_revalidate_changed_returns_member_changed() {
         let auth = MockAndroidAuthority {
-            restic: Some(PathBuf::from("/data/app/restic")),
-            rclone: Some(PathBuf::from("/data/app/rclone")),
+            restic: Ok(PathBuf::from("/data/app/librestic.so")),
+            rclone: Ok(PathBuf::from("/data/app/librclone.so")),
             revalidate_err: Some(AndroidServiceToolsRefusal::MemberChanged {
-                path: ANDROID_RESTIC_MEMBER.to_owned(),
+                path: "librestic.so".to_owned(),
+                role: Some(AndroidServiceToolRole::Restic),
             }),
         };
         let journal = configured_journal();
@@ -851,11 +836,12 @@ mod tests {
     #[test]
     fn android_resolution_revalidate_rclone_missing_when_operated() {
         let auth = MockAndroidAuthority {
-            restic: Some(PathBuf::from("/data/app/restic")),
-            rclone: None,
-            revalidate_err: Some(AndroidServiceToolsRefusal::MemberMissing {
-                path: ANDROID_RCLONE_MEMBER.to_owned(),
+            restic: Ok(PathBuf::from("/data/app/librestic.so")),
+            rclone: Err(AndroidServiceToolsRefusal::MemberMissing {
+                path: "librclone.so".to_owned(),
+                role: Some(AndroidServiceToolRole::Rclone),
             }),
+            revalidate_err: None,
         };
         let journal = configured_journal();
         solstone_core_backup::set_mode(journal.path(), "operated").unwrap();
@@ -877,8 +863,8 @@ mod tests {
     #[test]
     fn android_resolution_succeeds_with_admitted_tools() {
         let auth = MockAndroidAuthority {
-            restic: Some(PathBuf::from("/data/app/lib/solstone-restic/restic")),
-            rclone: Some(PathBuf::from("/data/app/lib/solstone-rclone/rclone")),
+            restic: Ok(PathBuf::from("/data/app/lib/arm64/librestic.so")),
+            rclone: Ok(PathBuf::from("/data/app/lib/arm64/librclone.so")),
             revalidate_err: None,
         };
         let journal = configured_journal();
@@ -895,15 +881,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             tools.restic_path,
-            PathBuf::from("/data/app/lib/solstone-restic/restic")
+            PathBuf::from("/data/app/lib/arm64/librestic.so")
         );
 
         let restic =
             resolve_restic_member_for_platform(dummy_exe, ToolPlatform::AndroidAarch64, &auth)
                 .unwrap();
-        assert_eq!(
-            restic,
-            PathBuf::from("/data/app/lib/solstone-restic/restic")
-        );
+        assert_eq!(restic, PathBuf::from("/data/app/lib/arm64/librestic.so"));
     }
 }

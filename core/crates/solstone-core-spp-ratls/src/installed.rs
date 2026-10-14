@@ -203,20 +203,86 @@ pub fn resolve_installed_nvattest(
 
 #[must_use]
 pub fn refusal_for_android_location() -> NvattestRefusal {
+    android_nvattest_refusal(false)
+}
+
+#[must_use]
+pub fn android_nvattest_refusal(admitted_and_valid: bool) -> NvattestRefusal {
+    if admitted_and_valid {
+        NvattestRefusal {
+            failure: AttestationFailure {
+                kind: AttestationFailureKind::Unreachable,
+                reason_code: "nvattest_load_unrepresentable",
+            },
+            detail: "load-unrepresentable",
+            guidance: guidance::UNSUPPORTED_LOCATION,
+        }
+    } else {
+        NvattestRefusal {
+            failure: AttestationFailure {
+                kind: AttestationFailureKind::Unreachable,
+                reason_code: "nvattest_unavailable",
+            },
+            detail: code::UNSUPPORTED_LOCATION,
+            guidance: guidance::UNSUPPORTED_LOCATION,
+        }
+    }
+}
+
+fn android_integrity_refusal() -> NvattestRefusal {
     NvattestRefusal {
         failure: AttestationFailure {
             kind: AttestationFailureKind::Unreachable,
-            reason_code: "nvattest_unavailable",
+            reason_code: "nvattest_integrity_failed",
         },
-        detail: code::UNSUPPORTED_LOCATION,
+        detail: "nvattest_integrity_failed",
         guidance: guidance::UNSUPPORTED_LOCATION,
+    }
+}
+
+/// Host-tested Android nvattest resolution. `SelectAdmittedInstallation` is the
+/// admitted `libnvattest.so` / `libnvat.so` closure, not a desktop package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AndroidNvattestDecision {
+    SelectAdmittedInstallation,
+    Refuse(NvattestRefusal),
+}
+
+#[must_use]
+pub fn android_nvattest_decision(
+    installed: bool,
+    revalidate_ok: bool,
+    closure_ok: bool,
+    loader_ok: bool,
+) -> AndroidNvattestDecision {
+    if !installed {
+        AndroidNvattestDecision::Refuse(android_nvattest_refusal(false))
+    } else if !revalidate_ok || !loader_ok {
+        AndroidNvattestDecision::Refuse(android_integrity_refusal())
+    } else if !closure_ok {
+        AndroidNvattestDecision::Refuse(android_nvattest_refusal(true))
+    } else {
+        AndroidNvattestDecision::SelectAdmittedInstallation
     }
 }
 
 pub fn resolve_nvattest_from_current_exe() -> Result<NvattestPaths, NvattestRefusal> {
     #[cfg(target_os = "android")]
     {
-        return Err(refusal_for_android_location());
+        if !solstone_core_spp_attest::android_service_tools::has_admitted_android_service_tools() {
+            return Err(android_nvattest_refusal(false));
+        }
+        return match solstone_core_spp_attest::android_service_tools::admitted_android_verifier() {
+            Ok(paths) => Ok(NvattestPaths {
+                binary: paths.binary,
+                ca_bundle: paths.ca_bundle,
+                library: paths.library,
+            }),
+            Err(
+                solstone_core_spp_attest::android_service_tools::AndroidServiceToolsRefusal::LoadUnrepresentable { .. },
+            ) => Err(android_nvattest_refusal(true)),
+            Err(_) => Err(android_integrity_refusal()),
+        };
     }
 
     #[cfg(not(target_os = "android"))]
@@ -259,6 +325,48 @@ mod tests {
         assert_eq!(refusal.guidance, guidance::UNSUPPORTED_LOCATION);
         assert_eq!(refusal.failure.reason_code, "nvattest_unavailable");
         assert_eq!(refusal.failure.kind, AttestationFailureKind::Unreachable);
+    }
+
+    #[test]
+    fn android_nvattest_refusal_returns_expected_reasons() {
+        let valid = android_nvattest_refusal(true);
+        assert_eq!(valid.failure.reason_code, "nvattest_load_unrepresentable");
+        assert_eq!(valid.detail, "load-unrepresentable");
+
+        let invalid = android_nvattest_refusal(false);
+        assert_eq!(invalid.failure.reason_code, "nvattest_unavailable");
+        assert_eq!(invalid.detail, code::UNSUPPORTED_LOCATION);
+        assert_eq!(invalid.guidance, guidance::UNSUPPORTED_LOCATION);
+        assert_eq!(invalid.failure.kind, AttestationFailureKind::Unreachable);
+    }
+
+    #[test]
+    fn android_nvattest_decision_selects_admitted_installation() {
+        assert!(matches!(
+            android_nvattest_decision(false, true, true, true),
+            AndroidNvattestDecision::Refuse(refusal)
+                if refusal.failure.reason_code == "nvattest_unavailable"
+        ));
+        assert!(matches!(
+            android_nvattest_decision(true, false, true, true),
+            AndroidNvattestDecision::Refuse(refusal)
+                if refusal.failure.reason_code == "nvattest_integrity_failed"
+        ));
+        assert!(matches!(
+            android_nvattest_decision(true, true, true, false),
+            AndroidNvattestDecision::Refuse(refusal)
+                if refusal.failure.reason_code == "nvattest_integrity_failed"
+        ));
+        assert!(matches!(
+            android_nvattest_decision(true, true, false, true),
+            AndroidNvattestDecision::Refuse(refusal)
+                if refusal.failure.reason_code == "nvattest_load_unrepresentable"
+                    && refusal.detail == "load-unrepresentable"
+        ));
+        assert_eq!(
+            android_nvattest_decision(true, true, true, true),
+            AndroidNvattestDecision::SelectAdmittedInstallation
+        );
     }
 
     #[test]

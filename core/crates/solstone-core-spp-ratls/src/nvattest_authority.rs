@@ -19,7 +19,28 @@ pub(crate) fn owner_use_held(os: &str) -> bool {
 /// verifier target and its owners are not held back. Every other answer about
 /// the hardware check comes from running it.
 pub fn confidential_verifier_on_this_platform() -> bool {
-    verifier_on_platform(std::env::consts::OS, std::env::consts::ARCH)
+    let android_tools_admitted = if std::env::consts::OS == "android" {
+        solstone_core_spp_attest::android_service_tools::admitted_android_verifier().is_ok()
+    } else {
+        false
+    };
+    confidential_verifier_offered(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        android_tools_admitted,
+    )
+}
+
+/// Pure determination of whether confidential processing is offered.
+///
+/// On Android, `android_tools_admitted` means the app authority is admitted and
+/// its nvattest load closure is valid. Desktop targets ignore that flag.
+pub fn confidential_verifier_offered(os: &str, arch: &str, android_tools_admitted: bool) -> bool {
+    if os == "android" {
+        android_tools_admitted
+    } else {
+        verifier_on_platform(os, arch)
+    }
 }
 
 pub(crate) fn verifier_on_platform(os: &str, arch: &str) -> bool {
@@ -78,6 +99,31 @@ mod tests {
         }
         assert!(!super::verifier_on_platform("macos", "x86_64"));
         assert!(!super::verifier_on_platform("android", "aarch64"));
+    }
+
+    #[test]
+    fn confidential_verifier_offered_pure_function() {
+        assert!(super::confidential_verifier_offered(
+            "android", "aarch64", true
+        ));
+        assert!(!super::confidential_verifier_offered(
+            "android", "aarch64", false
+        ));
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
+            assert!(
+                super::confidential_verifier_offered(os, arch, false),
+                "{os}-{arch}"
+            );
+            assert!(
+                super::confidential_verifier_offered(os, arch, true),
+                "{os}-{arch}"
+            );
+        }
     }
 
     #[test]

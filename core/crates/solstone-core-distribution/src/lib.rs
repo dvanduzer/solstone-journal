@@ -36,6 +36,7 @@ mod llama_windows_config;
 pub mod llama_windows_source;
 pub mod macho;
 pub mod manifest_verify;
+pub mod mobile_inputs;
 pub mod nvattest_windows;
 pub mod nvattest_windows_source;
 pub mod onnx_runtime;
@@ -62,7 +63,12 @@ pub mod sign;
 pub mod stage;
 pub mod tar;
 pub mod transparency;
-pub use nvattest_windows::{pinned_ca_bundle_sha256, pinned_regorus_revision};
+pub use mobile_inputs::{
+    ToolInputPin, nvattest_input_pin, rclone_input_pin, read_test_ca_bundle_pem, restic_input_pin,
+};
+pub use nvattest_windows::{
+    NVATTEST_SDK_REVISION, pinned_ca_bundle_sha256, pinned_regorus_revision,
+};
 pub use solstone_core_installed_payload::windows_payload;
 pub mod windows_pe_closure;
 pub mod windows_publish;

@@ -19,7 +19,7 @@ pub use error::{
 };
 pub use nvgpu::{
     GpuAppraiser, NVATTEST_TIMEOUT, NvattestCommand, NvattestGpuAppraiser, NvattestInstallation,
-    appraise_gpu_leg, build_nvattest_attest_command,
+    android_verifier_child_environment, appraise_gpu_leg, build_nvattest_attest_command,
     build_nvattest_attest_command_with_installation, build_nvattest_offline_attest_command,
     build_nvattest_offline_attest_command_with_installation, locate_nvattest,
 };

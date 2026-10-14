@@ -8,9 +8,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[cfg(not(target_os = "android"))]
 use ring::rand::{SecureRandom, SystemRandom};
-#[cfg(not(target_os = "android"))]
 use solstone_core_spp_attest::production_policy;
 use solstone_core_spp_attest::{
     CpuBundle, GpuAppraiser, NvattestGpuAppraiser, appraise_cpu_leg,
@@ -21,7 +19,6 @@ use solstone_core_spp_attest::{
     tlv::decode_gpu_envelope,
 };
 
-#[cfg(not(target_os = "android"))]
 use crate::ratls::channel::establish_attested_channel_with_clock;
 use crate::{
     CompositeVerdict, CompositeVerificationError, NvattestEnsureStatus, RatlsChannelError,
@@ -36,6 +33,7 @@ pub enum PayloadSource {
     Directory(PathBuf),
     #[cfg(not(windows))]
     Package(solstone_core_installed_payload::InstalledPackage),
+    Installation(solstone_core_spp_attest::NvattestInstallation),
 }
 
 /// Production verifier backed by the locally provisioned nvattest payload.
@@ -73,6 +71,20 @@ impl ProductionCompositeVerifier {
             profiles,
         }
     }
+
+    pub fn from_installation(installation: solstone_core_spp_attest::NvattestInstallation) -> Self {
+        Self::from_installation_with_profiles(installation, GpuProfiles::production())
+    }
+
+    pub fn from_installation_with_profiles(
+        installation: solstone_core_spp_attest::NvattestInstallation,
+        profiles: GpuProfiles,
+    ) -> Self {
+        Self {
+            source: PayloadSource::Installation(installation),
+            profiles,
+        }
+    }
 }
 
 impl CompositeVerifier for ProductionCompositeVerifier {
@@ -92,24 +104,6 @@ impl CompositeVerifier for ProductionCompositeVerifier {
             ),
             #[cfg(not(windows))]
             PayloadSource::Package(package) => {
-                let cpu = appraise_cpu_leg(
-                    bundle,
-                    input.envelope_tlv,
-                    input.channel_binding,
-                    input.binding_domain,
-                    input.policy,
-                    input.quote_verifier,
-                )
-                .map_err(cpu_error)?;
-
-                let profile = self.profiles.select(&cpu.pcr_sha256).map_err(gpu_error)?;
-                let envelope = decode_gpu_envelope(input.envelope_tlv)
-                    .map_err(|_| composite_error("cpu_verification_failed"))?;
-                let owner_nonce: &[u8; 32] = input
-                    .owner_nonce
-                    .try_into()
-                    .map_err(|_| composite_error("gpu_appraisal_failed"))?;
-
                 let paths = crate::installed::resolve_installed_nvattest(package)
                     .map_err(|refusal| composite_error(refusal.failure.reason_code))?;
                 let lib_dir = paths
@@ -121,27 +115,56 @@ impl CompositeVerifier for ProductionCompositeVerifier {
                     lib_dir: lib_dir.to_path_buf(),
                     ca_bundle: paths.ca_bundle,
                 };
-                let now = SystemTime::now();
-                let status = GpuStatusInput {
-                    profile,
-                    proofs: input.status_proofs,
-                    verification_time: now,
-                };
-                let gpu = NvattestGpuAppraiser
-                    .appraise_installation(&envelope, owner_nonce, &installation, &status)
-                    .map_err(gpu_error)?;
-
-                Ok(CompositeVerdict {
-                    verified: true,
-                    legs: ["cpu", "gpu"],
-                    substrate: format!("AMD SEV-SNP + NVIDIA {}", gpu.hwmodel),
-                    checked_at: now,
-                    cpu,
-                    gpu,
-                })
+                verify_with_installation(bundle, input, &self.profiles, &installation)
+            }
+            PayloadSource::Installation(installation) => {
+                verify_with_installation(bundle, input, &self.profiles, installation)
             }
         }
     }
+}
+
+fn verify_with_installation(
+    bundle: CpuBundle<'_>,
+    input: CompositeVerificationInput<'_>,
+    profiles: &GpuProfiles,
+    installation: &solstone_core_spp_attest::NvattestInstallation,
+) -> Result<CompositeVerdict, CompositeVerificationError> {
+    let cpu = appraise_cpu_leg(
+        bundle,
+        input.envelope_tlv,
+        input.channel_binding,
+        input.binding_domain,
+        input.policy,
+        input.quote_verifier,
+    )
+    .map_err(cpu_error)?;
+
+    let profile = profiles.select(&cpu.pcr_sha256).map_err(gpu_error)?;
+    let envelope = decode_gpu_envelope(input.envelope_tlv)
+        .map_err(|_| composite_error("cpu_verification_failed"))?;
+    let owner_nonce: &[u8; 32] = input
+        .owner_nonce
+        .try_into()
+        .map_err(|_| composite_error("gpu_appraisal_failed"))?;
+    let now = SystemTime::now();
+    let status = GpuStatusInput {
+        profile,
+        proofs: input.status_proofs,
+        verification_time: now,
+    };
+    let gpu = NvattestGpuAppraiser
+        .appraise_installation(&envelope, owner_nonce, installation, &status)
+        .map_err(gpu_error)?;
+
+    Ok(CompositeVerdict {
+        verified: true,
+        legs: ["cpu", "gpu"],
+        substrate: format!("AMD SEV-SNP + NVIDIA {}", gpu.hwmodel),
+        checked_at: now,
+        cpu,
+        gpu,
+    })
 }
 
 /// Verifies both attestation legs with an injectable GPU appraiser.
@@ -227,32 +250,55 @@ pub fn check_nvattest_readiness(nvattest_dir: &Path) -> NvattestEnsureStatus {
     }
 }
 
+/// Refusal reason for the current Android verifier admission.
+///
+/// A valid admission is not a refusal. Callers that reach this function after
+/// `admitted_android_verifier` succeeds fail closed with `nvattest_unavailable`
+/// rather than treating that success as `nvattest_load_unrepresentable`.
 #[must_use]
 pub fn android_channel_reason() -> &'static str {
-    if solstone_core_spp_attest::android_service_tools::get_admitted_android_service_tools()
-        .is_none()
-    {
+    use solstone_core_spp_attest::android_service_tools::{
+        AndroidServiceToolsRefusal, admitted_android_verifier, has_admitted_android_service_tools,
+    };
+    if !has_admitted_android_service_tools() {
         return "nvattest_unavailable";
     }
-    if solstone_core_spp_attest::android_service_tools::revalidate_installed_android_service_tools()
-        .is_err()
-    {
-        return "nvattest_integrity_failed";
+    match admitted_android_verifier() {
+        Ok(_) => "nvattest_unavailable",
+        Err(AndroidServiceToolsRefusal::LoadUnrepresentable { .. }) => {
+            "nvattest_load_unrepresentable"
+        }
+        Err(_) => "nvattest_integrity_failed",
     }
-    "nvattest_load_unrepresentable"
+}
+
+/// Host-tested Android channel choice. `AppraiseInstallation` selects the
+/// admitted `libnvattest.so` / `libnvat.so` closure. It is not a desktop package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AndroidChannelSelection {
+    AppraiseInstallation,
+    Refuse(&'static str),
 }
 
 #[must_use]
-pub fn android_channel_reason_for_state(
-    tools_installed: bool,
+pub fn android_channel_selection_for_state(
+    installed: bool,
     revalidate_ok: bool,
-) -> &'static str {
-    if !tools_installed {
-        "nvattest_unavailable"
-    } else if !revalidate_ok {
-        "nvattest_integrity_failed"
-    } else {
-        "nvattest_load_unrepresentable"
+    closure_ok: bool,
+    loader_ok: bool,
+) -> AndroidChannelSelection {
+    match crate::installed::android_nvattest_decision(
+        installed,
+        revalidate_ok,
+        closure_ok,
+        loader_ok,
+    ) {
+        crate::installed::AndroidNvattestDecision::SelectAdmittedInstallation => {
+            AndroidChannelSelection::AppraiseInstallation
+        }
+        crate::installed::AndroidNvattestDecision::Refuse(refusal) => {
+            AndroidChannelSelection::Refuse(refusal.failure.reason_code)
+        }
     }
 }
 
@@ -317,11 +363,38 @@ pub fn establish_production_attested_channel_with_clock(
 ) -> Result<AttestedChannel, RatlsChannelError> {
     #[cfg(target_os = "android")]
     {
-        let _ = (_nvattest_dir, socket_timeout, epoch, clock, endpoint);
+        let _ = _nvattest_dir;
         crate::ratls::channel::refuse_held_platform(std::env::consts::OS)?;
-        return Err(RatlsChannelError {
-            reason_code: android_channel_reason(),
-        });
+        let admitted = solstone_core_spp_attest::android_service_tools::admitted_android_verifier()
+            .map_err(|_| RatlsChannelError {
+                reason_code: android_channel_reason(),
+            })?;
+        let mut owner_nonce = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut owner_nonce)
+            .map_err(|_| RatlsChannelError {
+                reason_code: "nonce_generation_failed",
+            })?;
+        let policy = production_policy();
+        let installation = solstone_core_spp_attest::NvattestInstallation {
+            binary: admitted.binary,
+            lib_dir: admitted.lib_dir,
+            ca_bundle: admitted.ca_bundle,
+        };
+        let verifier = ProductionCompositeVerifier::from_installation(installation);
+        return establish_attested_channel_with_clock(
+            endpoint,
+            &owner_nonce,
+            Path::new(""),
+            SystemTime::now(),
+            None,
+            Some(&policy),
+            None,
+            &verifier,
+            socket_timeout,
+            epoch,
+            clock,
+        );
     }
 
     #[cfg(not(target_os = "android"))]
@@ -421,7 +494,7 @@ pub fn establish_production_attested_channel_in_package_with_clock(
 ) -> Result<AttestedChannel, RatlsChannelError> {
     crate::ratls::channel::refuse_held_platform(std::env::consts::OS)?;
     Err(RatlsChannelError {
-        reason_code: android_channel_reason(),
+        reason_code: "nvattest_unavailable",
     })
 }
 
@@ -477,7 +550,7 @@ mod tests {
     };
 
     use super::{
-        android_channel_reason_for_state, check_nvattest_readiness,
+        AndroidChannelSelection, android_channel_selection_for_state, check_nvattest_readiness,
         verify_composite_with_gpu_appraiser,
     };
 
@@ -977,27 +1050,30 @@ mod tests {
     }
 
     #[test]
-    fn android_channel_refusal_order_matches_specification() {
-        // a. uninstalled -> "nvattest_unavailable"
+    fn android_channel_selection_matches_admission_state() {
         assert_eq!(
-            android_channel_reason_for_state(false, true),
-            "nvattest_unavailable"
+            android_channel_selection_for_state(false, true, true, true),
+            AndroidChannelSelection::Refuse("nvattest_unavailable")
         );
         assert_eq!(
-            android_channel_reason_for_state(false, false),
-            "nvattest_unavailable"
+            android_channel_selection_for_state(false, false, false, false),
+            AndroidChannelSelection::Refuse("nvattest_unavailable")
         );
-
-        // b. revalidation fails -> "nvattest_integrity_failed"
         assert_eq!(
-            android_channel_reason_for_state(true, false),
-            "nvattest_integrity_failed"
+            android_channel_selection_for_state(true, false, true, true),
+            AndroidChannelSelection::Refuse("nvattest_integrity_failed")
         );
-
-        // c. admitted and valid -> "nvattest_load_unrepresentable"
         assert_eq!(
-            android_channel_reason_for_state(true, true),
-            "nvattest_load_unrepresentable"
+            android_channel_selection_for_state(true, true, true, false),
+            AndroidChannelSelection::Refuse("nvattest_integrity_failed")
+        );
+        assert_eq!(
+            android_channel_selection_for_state(true, true, false, true),
+            AndroidChannelSelection::Refuse("nvattest_load_unrepresentable")
+        );
+        assert_eq!(
+            android_channel_selection_for_state(true, true, true, true),
+            AndroidChannelSelection::AppraiseInstallation
         );
     }
 }

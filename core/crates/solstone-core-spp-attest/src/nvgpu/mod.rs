@@ -14,9 +14,10 @@ pub use appraise::{
     GpuAppraiser, GpuStatusInput, NVATTEST_TIMEOUT, NvattestGpuAppraiser, appraise_gpu_leg,
 };
 pub use binary::{
-    NvattestCommand, NvattestInstallation, build_nvattest_attest_command,
-    build_nvattest_attest_command_with_installation, build_nvattest_offline_attest_command,
-    build_nvattest_offline_attest_command_with_installation, locate_nvattest,
+    NvattestCommand, NvattestInstallation, android_verifier_child_environment,
+    build_nvattest_attest_command, build_nvattest_attest_command_with_installation,
+    build_nvattest_offline_attest_command, build_nvattest_offline_attest_command_with_installation,
+    locate_nvattest,
 };
 pub use claims::{
     GpuAppraisal, GpuStatusAuthorization, NvattestAcceptance, NvattestRejection, NvattestVerdict,

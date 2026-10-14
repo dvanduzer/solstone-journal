@@ -31,13 +31,15 @@ pub use fresh::{
     FreshAttestedChannelWith, establish_fresh_production_channel, perform_fresh_reattest_with,
 };
 pub use installed::{
-    NvattestPaths, NvattestRefusal, refusal_for_installed_payload, resolve_installed_nvattest,
-    resolve_nvattest_from_current_exe,
+    NvattestPaths, NvattestRefusal, android_nvattest_refusal, refusal_for_installed_payload,
+    resolve_installed_nvattest, resolve_nvattest_from_current_exe,
 };
 pub use nvattest::{
     NvattestEnsureStatus, classify_channel_failure, classify_nvattest_prerequisite,
 };
-pub use nvattest_authority::confidential_verifier_on_this_platform;
+pub use nvattest_authority::{
+    confidential_verifier_offered, confidential_verifier_on_this_platform,
+};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use ratls::channel::establish_local_test_channel_with_clock;
@@ -55,8 +57,8 @@ pub use ratls::{
         establish_attested_channel_with_clock, send_admission_probe, send_json_request,
     },
     production_verifier::{
-        PayloadSource, ProductionCompositeVerifier, android_channel_reason,
-        android_channel_reason_for_state, check_nvattest_readiness,
+        AndroidChannelSelection, PayloadSource, ProductionCompositeVerifier,
+        android_channel_reason, android_channel_selection_for_state, check_nvattest_readiness,
         establish_production_attested_channel, establish_production_attested_channel_with_clock,
         verify_composite_with_gpu_appraiser, verify_gpu_after_cpu,
     },
