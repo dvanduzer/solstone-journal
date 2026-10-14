@@ -16,7 +16,9 @@ use std::sync::mpsc;
 // CortexStore: claim + journal path those cases need
 // Work: construct the spawn request those cases pass in
 // RunningUse: shared LaunchAuthority from CortexState::running for RunningUsesGuard / immediate-stop
-pub use crate::process::{spawn_one, stop_group_with_grace};
+pub use crate::process::spawn_one;
+#[cfg(unix)]
+pub use crate::process::stop_group_with_grace;
 pub use crate::state::{CortexState, RunningUse, Work};
 pub use crate::storage::CortexStore;
 

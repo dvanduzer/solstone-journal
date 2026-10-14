@@ -160,7 +160,8 @@ fn retry_owned(deps: &BackupWebDeps, deadline: Instant) -> Response {
         .into_response()
 }
 
-#[cfg(test)]
+// The native driver runs this with full-tests, which its operation helpers need.
+#[cfg(all(test, feature = "full-tests"))]
 #[path = "cleanup_native_tests.rs"]
 mod native_tests;
 

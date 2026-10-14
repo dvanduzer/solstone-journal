@@ -382,6 +382,7 @@ fn duration_ms(value: Option<&Value>) -> i64 {
 mod tests {
     use std::fs;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
@@ -622,6 +623,8 @@ mod tests {
         assert_eq!(report["runs"]["daily"]["count"], 0);
     }
 
+    // An unreadable directory is a Unix permission mode; Windows has no 0o000.
+    #[cfg(unix)]
     #[test]
     fn no_health_directory_completion_failure_degrades_to_unknown_scan_failed() {
         let temporary = temporary();

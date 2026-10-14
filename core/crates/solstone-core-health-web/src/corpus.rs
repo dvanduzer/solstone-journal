@@ -766,7 +766,10 @@ async fn ac10_and_ac11_log_reads_are_whole_and_safely_classified() {
     let outside = tempfile::tempdir().unwrap();
     let outside_file = outside.path().join("outside.log");
     std::fs::write(&outside_file, "outside").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside_file, health.join("escape.log")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside_file, health.join("escape.log")).unwrap();
     let (status, body) = get(root.path(), "chronicle/20240101/health/escape.log").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["reason_code"], "invalid_path");

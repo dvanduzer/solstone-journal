@@ -101,6 +101,14 @@ call "%JOURNAL_WIN_CI_FFMPEG_ENV%" || ( echo ERROR: staged FFmpeg build toolchai
 del /q "%JOURNAL_WIN_CI_FFMPEG_ENV%" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\win-ci-ffmpeg-tools.ps1 -Mode assert -RepositoryRoot "%CD%" -ToolsRoot "%JOURNAL_WIN_CI_FFMPEG_TOOLS_ROOT%" || ( echo ERROR: staged FFmpeg build toolchain did not verify in this run's environment & exit /b 1 )
 
+:: Check every workspace library and binary test target for this target before
+:: running anything, and keep going, so a test that does not compile on Windows
+:: is reported here, every one at once, rather than wherever a later leg first
+:: builds it. The excluded packages are the ONNX-linked ones make ci excludes.
+call :phase compile
+echo === cargo check --locked --keep-going (every library and binary test target) ===
+cargo check --manifest-path core\Cargo.toml --locked --workspace --exclude solstone-core-speakers-analyze --exclude solstone-core-speakers-onnx --exclude solstone-core-vad-analyze --lib --bins --profile test --keep-going || exit /b 1
+
 echo === native restic owner-filename round trip ===
 call :run_exact_library "solstone-core-backup-runtime" "engine::copy_tests::real_restic_preserves_owner_names_and_excludes_operational_secrets" "full-tests" "ignored" || exit /b 1
 echo === cargo test --locked (portable archive owner filenames) ===
@@ -270,7 +278,6 @@ echo === cargo test --locked (agent connector boundary suite) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-endpoint --lib --features full-tests,test-hooks -- --test-threads=1 || exit /b 1
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-segment --lib --features full-tests agent_memory_ -- --test-threads=1 || exit /b 1
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-journal-io --lib --features full-tests relative_tests -- --test-threads=1 || exit /b 1
-cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-memory-original --lib --features full-tests -- --test-threads=1 || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_waits_for_ordinary_and_nested_readers" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_refuses_a_claim_that_appears_during_retry" "full-tests" || exit /b 1
 call :run_exact_library "solstone-core-retention" "door::tests::segment_delete_refuses_a_reader_that_outlives_the_retry_budget" "full-tests" || exit /b 1

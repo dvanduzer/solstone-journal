@@ -431,6 +431,60 @@ pub fn plan_windows(
         });
     }
 
+    // A package suite that lists windows runs its library tests here, with the
+    // features and serial threads its Linux and macOS run uses. Binary targets
+    // stay out: the evidence row counts the last result line, which a binary
+    // with no tests would report as zero.
+    for package_suite in &registry.package_suites {
+        if !package_suite.platforms.iter().any(|p| p == "windows") {
+            continue;
+        }
+        let timeout_seconds = registry
+            .timeouts
+            .get(&package_suite.timeout)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "suite {}: timeout class {:?} not found in registry",
+                    package_suite.id, package_suite.timeout
+                )
+            })?;
+        let mut argv = vec![
+            "cargo".to_owned(),
+            "test".to_owned(),
+            "--manifest-path".to_owned(),
+            "core/Cargo.toml".to_owned(),
+            "--locked".to_owned(),
+            "-p".to_owned(),
+            package_suite.package.clone(),
+            "--lib".to_owned(),
+        ];
+        if !package_suite.features.is_empty() {
+            argv.push("--features".to_owned());
+            argv.push(package_suite.features.join(","));
+        }
+        argv.push("--".to_owned());
+        argv.push("--test-threads=1".to_owned());
+        items.push(WindowsPlanItem {
+            id: package_suite.id.clone(),
+            package: package_suite.package.clone(),
+            target: "lib".to_owned(),
+            required_features: package_suite.features.clone(),
+            timeout_seconds,
+            serial_group: package_suite.serial_group.clone(),
+            default_full: package_suite.default_full,
+            status: PlanStatus::Ready,
+            commands: vec![WindowsPlannedCommand {
+                is_receipt: false,
+                test_name: None,
+                argv,
+                expected_markers: vec![],
+                expected_marker_patterns: vec![],
+            }],
+            policy: None,
+        });
+    }
+
     if items.is_empty() {
         return Err("windows selection matched zero suites".to_owned());
     }
@@ -1216,7 +1270,7 @@ pub fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ci::load_registry;
+    use crate::ci::{PackageSuite, load_registry};
 
     fn test_fixture_registry() -> Registry {
         Registry {
@@ -1282,6 +1336,56 @@ mod tests {
         assert_eq!(item.required_features, vec!["test-hooks"]);
     }
 
+    fn package_suite(package: &str, platforms: &[&str], features: &[&str]) -> PackageSuite {
+        PackageSuite {
+            id: format!("package::{package}"),
+            package: package.to_owned(),
+            set: "component".to_owned(),
+            areas: vec!["test".to_owned()],
+            platforms: platforms.iter().map(|p| (*p).to_owned()).collect(),
+            prerequisites: vec!["cargo-cache".to_owned()],
+            timeout: "standard".to_owned(),
+            serial_group: None,
+            default_full: false,
+            runtime: "none".to_owned(),
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn package_suite_listing_windows_runs_its_library_tests() {
+        let mut registry = test_fixture_registry();
+        registry.package_suites = vec![
+            package_suite("pkg-w", &["linux", "windows"], &["full-tests"]),
+            package_suite("pkg-l", &["linux"], &[]),
+        ];
+        let plan = plan_windows(&registry, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        let ids: Vec<_> = plan.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["pkg-a::test_win", "package::pkg-w"]);
+        let item = &plan.items[1];
+        assert_eq!(item.status, PlanStatus::Ready);
+        assert_eq!(item.required_features, vec!["full-tests"]);
+        assert_eq!(item.timeout_seconds, 600);
+        assert_eq!(item.commands.len(), 1);
+        assert_eq!(
+            item.commands[0].argv,
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                "core/Cargo.toml",
+                "--locked",
+                "-p",
+                "pkg-w",
+                "--lib",
+                "--features",
+                "full-tests",
+                "--",
+                "--test-threads=1",
+            ]
+        );
+    }
+
     #[test]
     fn real_suites_toml_loads_and_selects_expected_windows_suites() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1300,6 +1404,17 @@ mod tests {
                     plan_ids.contains(suite.id.as_str()),
                     "suite {} is default_full with windows platform but missing from plan",
                     suite.id
+                );
+            }
+        }
+
+        // A package suite that lists windows is a Windows run, not a label.
+        for package_suite in &registry.package_suites {
+            if package_suite.platforms.iter().any(|p| p == "windows") {
+                assert!(
+                    plan_ids.contains(package_suite.id.as_str()),
+                    "package suite {} lists windows but is missing from plan",
+                    package_suite.id
                 );
             }
         }
