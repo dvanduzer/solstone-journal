@@ -690,7 +690,7 @@ pub struct BoundParentLock {
 
 #[cfg(unix)]
 impl BoundParentLock {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn duplicate_descriptor(
         &self,
         name: &OsStr,
