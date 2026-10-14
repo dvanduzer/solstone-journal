@@ -1,0 +1,168 @@
+running 148 tests
+test android_service_tools::tests::appraisal_staging_requires_installed_authority ... ok
+test android_service_tools::tests::closure_refuses_unexpected_needed_missing_soname_and_loader_path ... ok
+test android_service_tools::tests::duplicate_path_refuses ... ok
+test android_service_tools::tests::duplicate_role_refuses ... ok
+test android_service_tools::tests::file_replaced_with_symlink_or_truncated_after_admit ... ok
+test android_service_tools::tests::header_refusals_check_codes ... ok
+test android_service_tools::tests::loader_directory_rejects_separators_and_os_shadows ... ok
+test android_service_tools::tests::member_missing_and_changed_refusals ... ok
+test android_service_tools::tests::native_receipt_pins_refuse_when_stale_or_missing ... ok
+test android_service_tools::tests::omitted_identity_refuses_manifest_invalid ... ok
+test android_service_tools::tests::path_traversal_and_absolute_paths_refuse_unsafe_path ... ok
+test android_service_tools::tests::pin_mismatches_refuse_with_field_id ... ok
+test android_service_tools::tests::producer_and_admit_roundtrip_valid_tree ... ok
+test android_service_tools::tests::receipt_stamp_and_structure_refuse ... ok
+test android_service_tools::tests::role_on_resource_and_unexpected_seventh_resource_refuse_manifest_invalid ... ok
+test android_service_tools::tests::role_validation_and_unknown_role ... ok
+test android_service_tools::tests::symlink_file_at_admit_refuses_unsafe_path ... ok
+test android_service_tools::tests::symlink_root_at_admit_refuses_unsafe_path ... ok
+test binding::tests::binding_accepts_matching_owner_and_spdm_nonce ... ok
+test binding::tests::binding_hash_matches_fixture_vector ... ok
+test binding::tests::binding_rejects_foreign_field_one_nonce ... ok
+test binding::tests::binding_rejects_spdm_nonce_splice ... ok
+test binding::tests::binding_rejects_wrong_owner_nonce ... ok
+test ios_appraisal::tests::callback_registry_enforces_rules ... ok
+test ios_appraisal::tests::classify_result_code_504_maps_to_gpu_nonce_mismatch ... ok
+test ios_appraisal::tests::state_machine_cancel_and_deadline_lock_terminal_across_reply_and_exit ... ok
+test ios_appraisal::tests::state_machine_cancel_before_launch_retains_pending_activation ... ok
+test ios_appraisal::tests::state_machine_exit_before_reply_fails ... ok
+test ios_appraisal::tests::state_machine_normal_flow_accepts_reply_after_exit ... ok
+test ios_appraisal::tests::state_machine_pid_mismatch_fails_and_does_not_drain ... ok
+test ios_appraisal::tests::state_machine_refuses_start_when_process_is_owned_and_not_exited ... ok
+test ios_appraisal::tests::validate_request_bounds_enforced ... ok
+test ios_service_tools::tests::bundle_scanner_descends_only_into_packaged_rim_directory ... FAILED
+test ios_service_tools::tests::macho_content_digest_excludes_only_signature_blob ... ok
+test ios_service_tools::tests::pure_decision_accepts_valid_receipt_and_bundle ... ok
+test ios_service_tools::tests::pure_decision_refuses_extra_or_missing_member ... ok
+test ios_service_tools::tests::pure_decision_refuses_failed_receipt ... ok
+test ios_service_tools::tests::pure_decision_refuses_helper_hash_mismatch ... ok
+test ios_service_tools::tests::pure_decision_refuses_non_ios_macho_platform ... ok
+test ios_service_tools::tests::pure_decision_refuses_non_system_dependency ... ok
+test ios_service_tools::tests::pure_decision_refuses_on_disk_ca_or_rim_hash_mismatch ... ok
+test ios_service_tools::tests::pure_decision_refuses_pin_mismatch ... ok
+test ios_service_tools::tests::pure_decision_refuses_regorus_patch_hash_mismatch ... ok
+test ios_service_tools::tests::pure_decision_refuses_self_declared_extra_member ... ok
+test ios_service_tools::tests::pure_decision_refuses_substituted_identity ... ok
+test ios_service_tools::tests::pure_decision_refuses_symlink_or_non_regular_file ... ok
+test ios_service_tools::tests::pure_decision_refuses_wrong_platform_or_arch ... ok
+test nvgpu::claims::tests::every_status_leg_needs_a_truthful_signed_age_claim ... ok
+test nvgpu::claims::tests::gpu_claims_overall_eat_is_veto_only ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_claims_not_a_list ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_claims_version_mismatch ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_debug_enabled ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_driver_rim_signature_false ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_empty_stdout ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_garbage_stdout ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_measres_failure ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_missing_claim_key ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_ocsp_bad ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_result_code_as_bool_false ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_secboot_false ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_secboot_int ... ok
+test nvgpu::claims::tests::gpu_claims_rejects_secboot_string ... ok
+test nvgpu::claims::tests::gpu_neg_a_classifies_nonce_mismatch ... ok
+test nvgpu::claims::tests::gpu_neg_b_classifies_nonce_mismatch ... ok
+test nvgpu::claims::tests::gpu_neg_c_classifies_nonce_mismatch ... ok
+test nvgpu::claims::tests::gpu_positive_stdout_classifies_accepted ... ok
+test nvgpu::claims::tests::legacy_and_offline_results_cannot_cross_modes ... ok
+test nvgpu::claims::tests::offline_claims_authorize_until_the_earliest_leg_deadline ... ok
+test nvgpu::rims::tests::embedded_collateral_stages_without_an_installed_resource_directory ... ok
+test nvgpu::rims::tests::every_admitted_cpu_profile_has_integrity_checked_collateral ... ok
+test nvgpu::rims::tests::test_profiles_can_map_several_pins_to_different_modes ... ok
+test nvgpu::rims::tests::unknown_duplicate_profile_and_tampered_collateral_fail_closed ... ok
+test nvgpu::staging::tests::base_with_trailing_separator_stages_its_child ... ok
+test nvgpu::staging::tests::base_without_trailing_separator_stages_its_child ... ok
+test nvgpu::staging::tests::names_that_are_not_one_plain_component_are_refused ... ok
+test nvgpu::staging::tests::process_temporary_directory_stages_its_child ... ok
+test nvgpu::staging::tests::trailing_separator_does_not_change_the_staged_path ... ok
+test nvgpu::windows::tests::child_environment_discards_ambient_configuration_case_insensitively ... ok
+test nvgpu::windows::tests::child_paths_refuse_network_paths_and_count_utf16_units ... ok
+test nvgpu::windows::tests::package_root_climbs_out_of_the_private_verifier_folder ... ok
+test pcr_appraisal::tests::application_expectations_constructor_validates_key_set ... ok
+test pcr_appraisal::tests::appraisal_reports_multiple_failures_in_order ... ok
+test pcr_appraisal::tests::appraisal_reports_register_absent ... ok
+test pcr_appraisal::tests::appraisal_reports_single_register_mismatch_table_driven ... ok
+test pcr_appraisal::tests::appraisal_succeeds_on_good_map_and_ignores_platform_pcrs ... ok
+test pcr_appraisal::tests::parse_quote_pcrs_parses_fixture_correctly ... ok
+test pcr_appraisal::tests::parse_quote_pcrs_parses_synthetic_fourteen_register_blob ... ok
+test pcr_appraisal::tests::parse_quote_pcrs_rejects_raw_buffer_as_structure_error ... ok
+test pcr_appraisal::tests::parse_quote_pcrs_rejects_wrong_selection ... ok
+test pins::tests::each_appraised_register_wrong_alone_is_refused_with_its_own_reason ... ok
+test pins::tests::production_admits_the_published_build_in_both_firmware_states ... ok
+test pins::tests::production_policy_constructs_independent_pin_sets ... ok
+test pins::tests::production_policy_pins_exactly_the_azure_firmware_signer ... ok
+test pins::tests::production_policy_pins_the_production_fingerprint ... ok
+test pins::tests::production_refuses_a_quote_without_the_published_register_set ... ok
+test snp::tests::amd_chain_and_report_signature_accept_fixture ... ok
+test snp::tests::amd_chain_rejects_broken_root_pairing ... ok
+test snp::tests::amd_chain_rejects_foreign_root_set_selection ... ok
+test snp::tests::amd_report_signature_rejects_flipped_bit ... ok
+test snp::tests::an_empty_id_key_pin_set_refuses_every_report ... ok
+test snp::tests::appraise_cpu_evidence_matches_captured_fixture ... ok
+test snp::tests::appraise_cpu_evidence_records_standalone_report_difference ... ok
+test snp::tests::appraise_cpu_evidence_rejects_foreign_ak_public_key ... ok
+test snp::tests::appraise_cpu_evidence_rejects_tlv_splice_before_any_step ... ok
+test snp::tests::check_policy_rejects_debug_enabled_report ... ok
+test snp::tests::check_policy_rejects_unsupported_report_version ... ok
+test snp::tests::default_pcr_policy_records_without_rejecting ... ok
+test snp::tests::default_policy_leaves_the_id_key_unchecked ... ok
+test snp::tests::embedded_roots_match_python_source ... ok
+test snp::tests::hcla_parses_fixture_runtime_json ... ok
+test snp::tests::hcla_report_matches_standalone_report ... ok
+test snp::tests::id_key_digest_lies_inside_the_amd_signed_report_bytes ... ok
+test snp::tests::pinned_id_key_admits_a_real_report_from_each_accepted_azure_state ... ok
+test snp::tests::pinned_id_key_refuses_a_foreign_digest ... ok
+test snp::tests::pinned_id_key_refuses_a_zero_digest ... ok
+test snp::tests::pinned_pcr_policy_compares_case_insensitively ... ok
+test snp::tests::pinned_pcr_policy_reports_a_distinct_mismatch ... ok
+test snp::tests::pinned_pcr_policy_supports_dual_pin_sets ... ok
+test snp::tests::production_policy_admits_qualified_sealed_quotes_and_rejects_mutations ... ok
+test snp::tests::snp_report_fixture_parses ... ok
+test snp::tests::snp_report_parse_rejects_truncated_input ... ok
+test snp::tests::unknown_pcr_policy_mode_rejects ... ok
+test tlv::tests::tlv_decodes_fixture_positive ... ok
+test tlv::tests::tlv_rejects_bad_spdm_header ... ok
+test tlv::tests::tlv_rejects_duplicate_field_id ... ok
+test tlv::tests::tlv_rejects_field_count_mismatch ... ok
+test tlv::tests::tlv_rejects_length_overrun ... ok
+test tlv::tests::tlv_rejects_out_of_order_field_id ... ok
+test tlv::tests::tlv_rejects_short_nonce_field ... ok
+test tlv::tests::tlv_rejects_short_spdm_header ... ok
+test tlv::tests::tlv_rejects_trailing_bytes ... ok
+test tlv::tests::tlv_rejects_unknown_field_id ... ok
+test tlv::tests::tlv_rejects_wrong_magic ... ok
+test tpm_quote::tests::tpm_quote_accepts_fixture_positive ... ok
+test tpm_quote::tests::tpm_quote_rejects_empty_pcr_file_selection ... ok
+test tpm_quote::tests::tpm_quote_rejects_empty_quote_pcr_selection ... ok
+test tpm_quote::tests::tpm_quote_rejects_flipped_signature_byte ... ok
+test tpm_quote::tests::tpm_quote_rejects_mutated_pcr_value ... ok
+test tpm_quote::tests::tpm_quote_rejects_oversize_pcr_digest ... ok
+test tpm_quote::tests::tpm_quote_rejects_pcr_selection_mismatch ... ok
+test tpm_quote::tests::tpm_quote_rejects_trailing_pcr_bytes ... ok
+test tpm_quote::tests::tpm_quote_rejects_trailing_quote_msg_bytes ... ok
+test tpm_quote::tests::tpm_quote_rejects_truncated_quote_msg ... ok
+test tpm_quote::tests::tpm_quote_rejects_unsupported_hash_algorithm ... ok
+test tpm_quote::tests::tpm_quote_rejects_unsupported_signature_algorithm ... ok
+test tpm_quote::tests::tpm_quote_rejects_wrong_binding ... ok
+test tpm_quote::tests::tpm_quote_rejects_zero_pcr_file_bitmap ... ok
+test tpm_quote::tests::tpm_quote_rejects_zero_quote_pcr_bitmap ... ok
+
+failures:
+
+---- ios_service_tools::tests::bundle_scanner_descends_only_into_packaged_rim_directory stdout ----
+
+thread 'ios_service_tools::tests::bundle_scanner_descends_only_into_packaged_rim_directory' (3344) panicked at crates\solstone-core-spp-attest\src\ios_service_tools.rs:1529:9:
+assertion failed: members.iter().any(|member|
+        {
+            member.relative_path ==
+                    format!("{IOS_HELPER_RELATIVE_PATH}/{IOS_RIM_DIRECTORY}/qualified.xml")
+                && member.is_regular_file
+        })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ios_service_tools::tests::bundle_scanner_descends_only_into_packaged_rim_directory
+
+test result: FAILED. 147 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.30s

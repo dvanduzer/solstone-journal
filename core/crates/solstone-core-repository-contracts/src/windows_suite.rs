@@ -280,10 +280,19 @@ pub fn package_test_artifacts(
 ) -> Result<BTreeMap<String, PathBuf>, String> {
     let mut artifacts = BTreeMap::new();
     let mut finished = false;
-    for line in output
-        .lines()
-        .filter(|line| line.trim_start().starts_with('{'))
-    {
+    let harness_start = Regex::new(r"^running \d+ tests?$").unwrap();
+    for line in output.lines() {
+        // Cargo's JSON protocol ends before the first library harness starts.
+        // Test failure bodies can themselves contain arbitrary, multi-line JSON.
+        if harness_start.is_match(line) {
+            if !finished {
+                return Err("library harness started before Cargo finished".to_owned());
+            }
+            break;
+        }
+        if !line.trim_start().starts_with('{') {
+            continue;
+        }
         let value: serde_json::Value = serde_json::from_str(line)
             .map_err(|error| format!("invalid Cargo artifact message: {error}"))?;
         if value["reason"] == "build-finished" {
@@ -1649,6 +1658,23 @@ mod tests {
         let artifacts = package_test_artifacts(&missing, &names, &batch).unwrap();
         assert!(!artifacts.contains_key("solstone-core-about"));
         assert!(artifacts.contains_key("solstone-core-memory-original"));
+    }
+
+    #[test]
+    fn cargo_artifacts_end_before_test_output_that_contains_rust_assertion_blocks() {
+        let names =
+            cargo_package_names(include_str!("fixtures/windows-package/metadata.json")).unwrap();
+        let output = include_str!("fixtures/windows-package/artifacts.jsonl");
+        // Captured native Windows assertion output contains a Rust block beginning with `{`.
+        let with_test_output = format!(
+            "{output}\n{}",
+            include_str!("fixtures/windows-package/windows-failure.stdout")
+        );
+        let batch = captured_package_batch();
+        assert_eq!(
+            package_test_artifacts(&with_test_output, &names, &batch).unwrap(),
+            package_test_artifacts(output, &names, &batch).unwrap()
+        );
     }
 
     #[test]
