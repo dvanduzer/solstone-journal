@@ -6,6 +6,7 @@
 use crate::priority::PriorityIntent;
 use crate::work_policy::{ThinkingLane, WorkPolicy};
 use solstone_core_journal_config::work_priority::{WORK_PRIORITY_ENV, WorkPriority};
+use solstone_core_local::admission::confidential_background_open;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
@@ -857,11 +858,15 @@ struct QueueState {
     timeout_marked: BTreeSet<String>,
     stopped_ticks: BTreeMap<String, u8>,
     termination_attempts: TerminationAttemptRegistry,
+    /// When the last older analysis task left; the owner's rest counts from it.
+    background_finished_at: Option<Instant>,
 }
 
 struct RunningSlot {
     reference: String,
     command: Vec<String>,
+    /// Older analysis: it counts against the confidential lane's one task.
+    background: bool,
 }
 
 #[derive(Clone)]
@@ -1286,6 +1291,7 @@ impl TaskQueue {
                     timeout_marked: BTreeSet::new(),
                     stopped_ticks: BTreeMap::new(),
                     termination_attempts: TerminationAttemptRegistry::default(),
+                    background_finished_at: None,
                 }),
                 #[cfg(test)]
                 work_policy_override: Mutex::new(None),
@@ -1314,10 +1320,8 @@ impl TaskQueue {
     }
 
     pub fn submit(&self, request: ExecutionRequest) -> SubmitOutcome {
-        let today = selection_day(&self.inner.options.journal_root);
-        let spending = read_work_policy(&self.inner);
+        let selection = Selection::read(&self.inner);
         let submission = normalize_request(request, self.inner.options.cap_resolver.as_ref());
-        let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
         let partition = submission.partition.clone();
         let (outcome, dispatch, event) = {
             let mut state = self.inner.state.lock().expect("queue state lock poisoned");
@@ -1329,7 +1333,7 @@ impl TaskQueue {
             } else {
                 let reference = submission.reference.clone();
                 let outcome = enqueue_locked(&mut state, submission);
-                let dispatch = take_ready(&mut state, allowed, today, spending);
+                let dispatch = take_ready(&mut state, selection);
                 let outcome = if dispatch.iter().any(|d| d.references.contains(&reference)) {
                     SubmitOutcome::Dispatched
                 } else {
@@ -1354,9 +1358,7 @@ impl TaskQueue {
     /// coalesced into the same command retains its own priority and authority.
     /// Reservation, execution and safety holds are outside this operation.
     pub fn replace_discovered(&self, candidates: Vec<DiscoveredTask>) {
-        let today = selection_day(&self.inner.options.journal_root);
-        let spending = read_work_policy(&self.inner);
-        let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
+        let selection = Selection::read(&self.inner);
         let (dispatches, events) = {
             let mut state = self.inner.state.lock().expect("queue state");
             if state.shutdown {
@@ -1418,7 +1420,7 @@ impl TaskQueue {
                     break;
                 }
             }
-            let dispatches = take_ready(&mut state, allowed, today, spending);
+            let dispatches = take_ready(&mut state, selection);
             changed.extend(
                 dispatches
                     .iter()
@@ -1457,9 +1459,7 @@ impl TaskQueue {
     }
 
     pub fn set_ready(&self) {
-        let today = selection_day(&self.inner.options.journal_root);
-        let spending = read_work_policy(&self.inner);
-        let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
+        let selection = Selection::read(&self.inner);
         let (dispatches, events) = {
             let mut state = self.inner.state.lock().expect("queue state lock poisoned");
             if state.ready {
@@ -1475,7 +1475,7 @@ impl TaskQueue {
                 changed.insert(submission.partition.clone());
                 enqueue_locked(&mut state, submission);
             }
-            let dispatches = take_ready(&mut state, allowed, today, spending);
+            let dispatches = take_ready(&mut state, selection);
             let events: Vec<_> = changed
                 .iter()
                 .map(|partition| queue_changed_event(&state, partition))
@@ -1493,12 +1493,10 @@ impl TaskQueue {
     /// Resume work held by the owner's processing window without disturbing
     /// shutdown or the queue's independent process-tree safety holds.
     pub fn resume_processing(&self) {
-        let today = selection_day(&self.inner.options.journal_root);
-        let spending = read_work_policy(&self.inner);
-        let allowed = crate::processing::processing_allowed(&self.inner.options.journal_root);
+        let selection = Selection::read(&self.inner);
         let dispatches = {
             let mut state = self.inner.state.lock().expect("queue state");
-            take_ready(&mut state, allowed, today, spending)
+            take_ready(&mut state, selection)
         };
         for dispatch in dispatches {
             start_dispatch(Arc::clone(&self.inner), dispatch);
@@ -1506,8 +1504,6 @@ impl TaskQueue {
     }
 
     pub fn enforce_deadlines(&self, now: Instant) {
-        let today = selection_day(&self.inner.options.journal_root);
-        let spending = read_work_policy(&self.inner);
         let (has_held, has_queue_hold) = {
             let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
             (!state.held.is_empty(), state.queue_hold.is_some())
@@ -1754,6 +1750,7 @@ impl TaskQueue {
                                 && std::fs::remove_file(&probe_path).is_ok();
 
                             if probe_ok {
+                                let selection = Selection::read(&self.inner);
                                 let dispatches = {
                                     let mut state =
                                         self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1792,14 +1789,7 @@ impl TaskQueue {
                                         }
                                     }
                                     state.queue_hold = None;
-                                    take_ready(
-                                        &mut state,
-                                        crate::processing::processing_allowed(
-                                            &self.inner.options.journal_root,
-                                        ),
-                                        today,
-                                        spending,
-                                    )
+                                    take_ready(&mut state, selection)
                                 };
                                 for dispatch in dispatches {
                                     start_dispatch(Arc::clone(&self.inner), dispatch);
@@ -2753,7 +2743,33 @@ fn read_work_policy(inner: &QueueInner) -> WorkPolicy {
     WorkPolicy::read(&inner.options.journal_root).unwrap_or(WorkPolicy {
         lane: ThinkingLane::Unavailable,
         history_confirmed: false,
+        confidential_history_rest: Duration::ZERO,
     })
+}
+
+/// What selection reads outside the state lock, so the lock never waits on I/O.
+#[derive(Clone, Copy)]
+struct Selection {
+    allowed: bool,
+    today: chrono::NaiveDate,
+    spending: WorkPolicy,
+    /// No older confidential call holds or awaits the shared slot, and no
+    /// failed one asked for a pause.
+    background_slot_open: bool,
+}
+
+impl Selection {
+    fn read(inner: &QueueInner) -> Self {
+        let journal = &inner.options.journal_root;
+        let spending = read_work_policy(inner);
+        Self {
+            allowed: crate::processing::processing_allowed(journal),
+            today: selection_day(journal),
+            spending,
+            background_slot_open: spending.lane != ThinkingLane::Confidential
+                || confidential_background_open(journal),
+        }
+    }
 }
 
 fn selection_day(journal: &Path) -> chrono::NaiveDate {
@@ -2840,17 +2856,30 @@ fn enqueue_locked(state: &mut QueueState, submission: Submission) -> SubmitOutco
 // One selector for every wakeup. Held lanes are not candidates. A busy lane's
 // highest waiting analysis is a barrier: lower work cannot reserve other lanes
 // ahead of it. Independent maintenance remains runnable during that wait.
-fn take_ready(
-    state: &mut QueueState,
-    allowed: bool,
-    today: chrono::NaiveDate,
-    spending: WorkPolicy,
-) -> Vec<Dispatch> {
+//
+// Older confidential work (bands 4-6) shares one engine call at a time per
+// journal. One such task runs at a time, and only while no other call holds or
+// awaits that slot, no failed call asked for a pause, and the owner's rest has
+// passed. Until then older entries are not candidates, so neither they nor a
+// waiting call can hold a lane, or be a barrier, that newer work needs.
+fn take_ready(state: &mut QueueState, selection: Selection) -> Vec<Dispatch> {
+    let Selection {
+        allowed,
+        today,
+        spending,
+        background_slot_open,
+    } = selection;
     let mut dispatches = Vec::new();
     if !state.ready || state.shutdown || state.queue_hold.is_some() {
         return dispatches;
     }
     loop {
+        let background_waits = spending.lane == ThinkingLane::Confidential
+            && (!background_slot_open
+                || state.running.values().any(|slot| slot.background)
+                || state
+                    .background_finished_at
+                    .is_some_and(|at| at.elapsed() < spending.confidential_history_rest));
         let analysis = allowed
             .then(|| {
                 state
@@ -2858,21 +2887,13 @@ fn take_ready(
                     .iter()
                     .filter(|(partition, _)| !state.held.contains_key(*partition))
                     .flat_map(|(partition, queue)| {
-                        queue
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, entry)| {
-                                is_analysis_command(&entry.command)
-                                    && spending
-                                        .permits(entry.priority.resolve(&entry.command, today).band)
-                            })
-                            .map(move |(index, entry)| {
-                                (
-                                    partition.clone(),
-                                    index,
-                                    entry.priority.resolve(&entry.command, today),
-                                )
-                            })
+                        queue.iter().enumerate().filter_map(move |(index, entry)| {
+                            let priority = entry.priority.resolve(&entry.command, today);
+                            (is_analysis_command(&entry.command)
+                                && spending.permits(priority.band)
+                                && !(background_waits && priority.band.is_background()))
+                            .then(|| (partition.clone(), index, priority))
+                        })
                     })
                     .min_by_key(|(_, _, priority)| priority.sort_key())
             })
@@ -2913,16 +2934,19 @@ fn take_ready(
             daily_catchup_provenance: entry.daily_catchup_provenance,
             priority: entry.priority,
         };
+        let priority = submission.priority.resolve(&submission.command, today);
         state.running.insert(
             partition,
             RunningSlot {
                 reference: submission.reference.clone(),
                 command: submission.command.clone(),
+                background: is_analysis_command(&submission.command)
+                    && priority.band.is_background(),
             },
         );
         dispatches.push(Dispatch {
             sources: entry.sources,
-            priority: submission.priority.resolve(&submission.command, today),
+            priority,
             submission,
             references: entry.references,
             daily_catchup_admission: None,
@@ -3994,9 +4018,7 @@ fn holds_any(state: &QueueState, references: &[String]) -> bool {
 }
 
 fn finish_worker(inner: &QueueInner, partition: &Partition, reference: &str) -> Vec<Dispatch> {
-    let today = selection_day(&inner.options.journal_root);
-    let spending = read_work_policy(inner);
-    let allowed = crate::processing::processing_allowed(&inner.options.journal_root);
+    let selection = Selection::read(inner);
     let (dispatches, events) = {
         let mut state = inner.state.lock().expect("queue state lock poisoned");
         if state.held.contains_key(partition)
@@ -4008,8 +4030,14 @@ fn finish_worker(inner: &QueueInner, partition: &Partition, reference: &str) -> 
         {
             return Vec::new();
         }
-        state.running.remove(partition);
-        let dispatches = take_ready(&mut state, allowed, today, spending);
+        if state
+            .running
+            .remove(partition)
+            .is_some_and(|slot| slot.background)
+        {
+            state.background_finished_at = Some(Instant::now());
+        }
+        let dispatches = take_ready(&mut state, selection);
         let mut changed = BTreeSet::from([partition.clone()]);
         changed.extend(dispatches.iter().map(|d| d.submission.partition.clone()));
         let events = changed
@@ -4684,6 +4712,16 @@ mod tests {
         WorkPolicy {
             lane: ThinkingLane::Bundled,
             history_confirmed: false,
+            confidential_history_rest: Duration::ZERO,
+        }
+    }
+
+    fn selection(today: chrono::NaiveDate, spending: WorkPolicy) -> Selection {
+        Selection {
+            allowed: true,
+            today,
+            spending,
+            background_slot_open: true,
         }
     }
 
@@ -4707,9 +4745,7 @@ mod tests {
             state.ready = true;
             take_ready(
                 &mut state,
-                true,
-                selection_day(root.path()),
-                local_spending(),
+                selection(selection_day(root.path()), local_spending()),
             )
             .pop()
             .unwrap()
@@ -5065,9 +5101,7 @@ mod tests {
             state.ready = true;
             let reserved = take_ready(
                 &mut state,
-                true,
-                selection_day(Path::new("")),
-                local_spending(),
+                selection(selection_day(Path::new("")), local_spending()),
             );
             assert_eq!(reserved.len(), 1);
         }
@@ -5133,9 +5167,7 @@ mod tests {
         while !state.queues.is_empty() {
             let dispatches = take_ready(
                 &mut state,
-                true,
-                selection_day(Path::new("")),
-                local_spending(),
+                selection(selection_day(Path::new("")), local_spending()),
             );
             assert!(!dispatches.is_empty());
             for dispatch in dispatches {
@@ -5177,9 +5209,7 @@ mod tests {
             state.ready = true;
             take_ready(
                 &mut state,
-                true,
-                selection_day(Path::new("")),
-                local_spending(),
+                selection(selection_day(Path::new("")), local_spending()),
             )
         };
         assert_eq!(
@@ -5239,7 +5269,7 @@ mod tests {
                 enqueue_locked(&mut state, submission);
             }
             state.ready = true;
-            take_ready(&mut state, true, date(11), local_spending())
+            take_ready(&mut state, selection(date(11), local_spending()))
                 .pop()
                 .unwrap()
         };
@@ -5276,12 +5306,12 @@ mod tests {
             queue.inner.options.cap_resolver.as_ref(),
         );
         enqueue_locked(&mut state, newer);
-        let first = take_ready(&mut state, true, date(19), local_spending());
+        let first = take_ready(&mut state, selection(date(19), local_spending()));
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].submission.reference, "today");
         assert_eq!(first[0].priority.to_string(), "1:20261019120000");
         state.running.clear();
-        let second = take_ready(&mut state, true, date(19), local_spending());
+        let second = take_ready(&mut state, selection(date(19), local_spending()));
         assert_eq!(second[0].priority.to_string(), "2:20261011120000");
         assert_eq!(second[0].references, ["derived"]);
     }
@@ -5317,9 +5347,7 @@ mod tests {
         );
         let selected = take_ready(
             &mut state,
-            true,
-            selection_day(Path::new("")),
-            local_spending(),
+            selection(selection_day(Path::new("")), local_spending()),
         );
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].submission.reference, "old-day");
@@ -5328,6 +5356,157 @@ mod tests {
             state.queues[&Partition::new("segment")][0].references,
             ["held-live"]
         );
+    }
+
+    fn confidential_spending(rest: Duration) -> WorkPolicy {
+        WorkPolicy {
+            lane: ThinkingLane::Confidential,
+            history_confirmed: false,
+            confidential_history_rest: rest,
+        }
+    }
+
+    /// Selects with the confidential lane and the background slot as given.
+    fn select_confidential(state: &mut QueueState, rest: Duration, slot_open: bool) -> Vec<String> {
+        take_ready(
+            state,
+            Selection {
+                allowed: true,
+                today: selection_day(Path::new("")),
+                spending: confidential_spending(rest),
+                background_slot_open: slot_open,
+            },
+        )
+        .into_iter()
+        .map(|dispatch| dispatch.submission.reference)
+        .collect()
+    }
+
+    fn ready_state(queue: &TaskQueue) -> std::sync::MutexGuard<'_, QueueState> {
+        let mut state = queue.inner.state.lock().unwrap();
+        state.ready = true;
+        state
+    }
+
+    /// Each reference is its own work, daily included: unlike `ranked_request`,
+    /// the reference stays in the command so same-day daily work does not merge.
+    fn enqueue_ranked(queue: &TaskQueue, state: &mut QueueState, work: &[(&str, &str, &str)]) {
+        for &(reference, mode, priority) in work {
+            let mut command = vec!["journal", "think", "--day", "20260101"];
+            command.extend([mode, reference].into_iter().filter(|arg| !arg.is_empty()));
+            let ExecutionRequest::Bus(mut request) = command_request(&command, reference, None)
+            else {
+                unreachable!()
+            };
+            request.priority = Some(priority.parse().unwrap());
+            let request = ExecutionRequest::Bus(request);
+            enqueue_locked(
+                state,
+                normalize_request(request, queue.inner.options.cap_resolver.as_ref()),
+            );
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn older_confidential_work_runs_one_task_and_holds_no_lane_newer_work_needs() {
+        let queue = queue(false, 10, VecDeque::new());
+        let mut state = ready_state(&queue);
+        let older = [
+            ("import", "--activity", "4:1"),
+            ("history", "--segment", "5:1"),
+            ("remake", "", "6:1"),
+        ];
+        enqueue_ranked(&queue, &mut state, &older);
+        // Another call holds or awaits the slot: no older task starts at all.
+        assert!(select_confidential(&mut state, Duration::ZERO, false).is_empty());
+        let newer = [
+            ("now", "--segment", "1:2"),
+            ("waiting", "--activity", "2:2"),
+            ("recent", "", "3:2"),
+        ];
+        enqueue_ranked(&queue, &mut state, &newer);
+        assert_eq!(
+            select_confidential(&mut state, Duration::ZERO, false),
+            ["now", "waiting", "recent"],
+            "newer work submitted after older work waits runs in every lane, in band order"
+        );
+        state.running.clear();
+        // Once the slot opens, older work resumes without a new request, one
+        // task at a time and highest band first; newer work still runs beside it.
+        for (expected, lane) in [
+            ("import", "activity"),
+            ("history", "segment"),
+            ("remake", "daily"),
+        ] {
+            assert_eq!(
+                select_confidential(&mut state, Duration::ZERO, true),
+                [expected]
+            );
+            assert!(select_confidential(&mut state, Duration::ZERO, true).is_empty());
+            let now = format!("now-{lane}");
+            enqueue_ranked(&queue, &mut state, &[(&now, "--settle", "1:3")]);
+            assert_eq!(select_confidential(&mut state, Duration::ZERO, true), [now]);
+            state.running.remove(&Partition::new("flush"));
+            state.running.remove(&Partition::new(lane));
+        }
+        assert!(state.queues.is_empty());
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn the_owners_rest_runs_between_older_tasks_and_a_change_applies_at_once() {
+        let queue = queue(false, 10, VecDeque::new());
+        let mut state = ready_state(&queue);
+        state.background_finished_at = Some(Instant::now());
+        enqueue_ranked(
+            &queue,
+            &mut state,
+            &[
+                ("history", "--segment", "5:1"),
+                ("now", "--activity", "1:2"),
+                ("recent", "", "3:2"),
+            ],
+        );
+        let rest = Duration::from_secs(60);
+        assert_eq!(
+            select_confidential(&mut state, rest, true),
+            ["now", "recent"],
+            "newer work never rests"
+        );
+        assert!(select_confidential(&mut state, rest, true).is_empty());
+        assert_eq!(
+            select_confidential(&mut state, Duration::ZERO, true),
+            ["history"],
+            "a change to zero applies at once"
+        );
+        state.running.remove(&Partition::new("segment"));
+        state.background_finished_at = Instant::now().checked_sub(rest + Duration::from_secs(1));
+        enqueue_ranked(&queue, &mut state, &[("remake", "--segment", "6:1")]);
+        assert_eq!(select_confidential(&mut state, rest, true), ["remake"]);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn an_owner_request_promotes_waiting_older_work_once() {
+        let queue = queue(false, 10, VecDeque::new());
+        let mut state = ready_state(&queue);
+        enqueue_ranked(&queue, &mut state, &[("history", "--segment", "5:1")]);
+        assert!(select_confidential(&mut state, Duration::ZERO, false).is_empty());
+        enqueue_ranked(&queue, &mut state, &[("history", "--segment", "1:2")]);
+        let dispatched = take_ready(
+            &mut state,
+            Selection {
+                allowed: true,
+                today: selection_day(Path::new("")),
+                spending: confidential_spending(Duration::ZERO),
+                background_slot_open: false,
+            },
+        );
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].references, ["history"]);
+        assert_eq!(dispatched[0].priority.to_string(), "1:2");
+        assert!(state.queues.is_empty());
     }
 
     #[cfg(all(test, feature = "full-tests"))]
@@ -5581,6 +5760,7 @@ mod tests {
                 RunningSlot {
                     reference: "running".to_owned(),
                     command: Vec::new(),
+                    background: false,
                 },
             );
         queue.submit(request("one"));
@@ -6206,6 +6386,7 @@ mod tests {
                 RunningSlot {
                     reference: "already-running-indexer".to_owned(),
                     command: Vec::new(),
+                    background: false,
                 },
             );
 
@@ -7062,6 +7243,7 @@ mod tests {
             RunningSlot {
                 reference: "primary".to_owned(),
                 command: Vec::new(),
+                background: false,
             },
         );
         assert_eq!(queue.submit(request("follower")), SubmitOutcome::Queued);

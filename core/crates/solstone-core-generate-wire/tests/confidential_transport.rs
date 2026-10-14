@@ -306,30 +306,28 @@ fn older_confidential_calls_share_a_process_safe_slot_while_foreground_bypasses_
         },
     );
     assert!(matches!(result, ConfidentialResult::Generated(_)));
-    // The cooldown survives the first worker returning, across every older band.
+    // Rest is not the call's: once a call finishes, the next older call runs.
     for band in 4..=6 {
         let result = confidential_background_call(
             &root,
             format!("{band}:0").parse().unwrap(),
-            Duration::from_millis(1),
-            |_| panic!("cooldown must survive the completed call"),
+            Duration::from_secs(5),
+            |_| paced_success(),
         );
-        assert!(matches!(result, ConfidentialResult::Failed(_)));
+        assert!(matches!(result, ConfidentialResult::Generated(_)));
     }
+    assert!(solstone_core_local::admission::confidential_background_open(&root));
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn older_confidential_failure_leaves_a_shared_backoff() {
+fn an_older_confidential_failure_pauses_older_work_without_holding_its_caller() {
     use solstone_core_generate_wire::{
         ConfidentialResult, test_support::confidential_background_call,
     };
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use solstone_core_local::admission::confidential_background_open;
+    use std::time::Duration;
     let root = journal("pacing-failure");
-    let before = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
     let result = confidential_background_call(
         &root,
         "6:0".parse().unwrap(),
@@ -340,17 +338,14 @@ fn older_confidential_failure_leaves_a_shared_backoff() {
         result,
         ConfidentialResult::AttestationFailed("gateway_unreachable")
     ));
-    let next: u64 = serde_json::from_slice(
-        &std::fs::read(root.join("health/confidential-background/next-call.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(next >= before + 60_000);
+    assert!(!confidential_background_open(&root));
+    // The task queue honours the pause; a call it already admitted is not held.
     let result = confidential_background_call(
         &root,
         "4:0".parse().unwrap(),
-        Duration::from_millis(1),
-        |_| panic!("failed engine must get a shared pause"),
+        Duration::from_secs(1),
+        |_| paced_success(),
     );
-    assert!(matches!(result, ConfidentialResult::Failed(_)));
+    assert!(matches!(result, ConfidentialResult::Generated(_)));
     std::fs::remove_dir_all(root).unwrap();
 }
