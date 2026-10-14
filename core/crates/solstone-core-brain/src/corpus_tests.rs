@@ -694,6 +694,7 @@ fn inspection_outcomes_are_real_filesystem_conditions() {
     fs::write(journal.path.join("health"), b"not a directory").expect("blocking health file");
     let unavailable = inspect_brain_state(&journal.path, bundled_config(), fixture_now());
     assert_eq!(unavailable.status, InspectionStatus::Unavailable);
+    assert!(unavailable.error.is_some());
     assert_eq!(
         unavailable.projection.reason_code.as_deref(),
         Some("brain_record_unavailable")

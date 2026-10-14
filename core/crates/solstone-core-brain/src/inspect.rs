@@ -144,16 +144,27 @@ pub fn inspect_brain_state_with_clock(
 ) -> BrainInspection {
     // Sample after the read: a concurrent renewal may be newer than the time
     // at which a caller started its health-check battery.
-    let bytes = fs::read(brain_state_path(journal_path));
+    let state_path = brain_state_path(journal_path);
+    let bytes = fs::read(&state_path);
     let now = clock();
     let (record, raw, status, record_reason, error) = match bytes {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            None,
-            None,
-            InspectionStatus::Unavailable,
-            Some("brain_record_missing"),
-            None,
-        ),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && state_path
+                    .parent()
+                    .is_some_and(|parent| match fs::metadata(parent) {
+                        Ok(metadata) => metadata.is_dir(),
+                        Err(parent_error) => parent_error.kind() == std::io::ErrorKind::NotFound,
+                    }) =>
+        {
+            (
+                None,
+                None,
+                InspectionStatus::Unavailable,
+                Some("brain_record_missing"),
+                None,
+            )
+        }
         Err(error) => (
             None,
             None,
