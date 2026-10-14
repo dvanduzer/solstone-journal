@@ -1627,7 +1627,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             manifest_a["files_created"],
-            serde_json::json!([seg_a_dir.join("image_transcript.md").display().to_string()])
+            serde_json::json!([seg_a_dir
+                .join("image_transcript.md")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()])
         );
 
         let seg_b_dir = journal
@@ -1639,7 +1644,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             manifest_b["files_created"],
-            serde_json::json!([seg_b_dir.join("image_transcript.md").display().to_string()])
+            serde_json::json!([seg_b_dir
+                .join("image_transcript.md")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()])
         );
 
         assert_eq!(*pub_a.touched_days.borrow(), vec!["20260615"]);
@@ -2053,7 +2063,7 @@ mod tests {
         let img_jpeg = source_dir.path().join("photo.jpeg");
         write_test_jpeg(&img_jpg, [55, 66, 77], time);
         fs::copy(&img_jpg, &img_jpeg).unwrap();
-        File::open(&img_jpeg)
+        crate::shared::open_to_set_times(&img_jpeg)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(time.into()))
             .unwrap();

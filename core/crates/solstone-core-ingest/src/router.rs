@@ -3435,6 +3435,9 @@ mod tests {
         let dir = root();
         let root = dir.path().to_path_buf();
         let socket = root.join("health/callosum.sock");
+        #[cfg(windows)]
+        let _namespace =
+            solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
         let server = CallosumSocketServer::bind(&socket).await.unwrap();
         let mut peer = CallosumSocketConnection::new(&socket, Map::new());
         peer.start();
@@ -3510,6 +3513,9 @@ mod tests {
         let dir = root();
         let root = dir.path().to_path_buf();
         let socket = root.join("health/callosum.sock");
+        #[cfg(windows)]
+        let _namespace =
+            solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
         let server = CallosumSocketServer::bind(&socket).await.unwrap();
         let mut peer = CallosumSocketConnection::new(&socket, Map::new());
         peer.start();
@@ -3662,6 +3668,9 @@ mod tests {
             let dir = root();
             let root = dir.path();
             let socket = root.join("health/callosum.sock");
+            #[cfg(windows)]
+            let _namespace =
+                solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
             let server = CallosumSocketServer::bind(&socket).await.unwrap();
             let mut peer = CallosumSocketConnection::new(&socket, Map::new());
             peer.start();
@@ -3808,6 +3817,9 @@ mod tests {
             .unwrap();
             assert_eq!(reserved.stream, "device_browser");
             let socket = root.join("health/callosum.sock");
+            #[cfg(windows)]
+            let _namespace =
+                solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
             let server = CallosumSocketServer::bind(&socket).await.unwrap();
             let mut peer = CallosumSocketConnection::new(&socket, Map::new());
             peer.start();
@@ -3870,6 +3882,9 @@ mod tests {
             // Subscriber is client 1, observing's one-shot is 2, and the new
             // confirmed browser index sender is 3. Withhold only that echo.
             hooks.block_client(3);
+            #[cfg(windows)]
+            let _namespace =
+                solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
             let server = CallosumSocketServer::bind_with_test_hooks(&socket, hooks.clone())
                 .await
                 .unwrap();
@@ -3934,6 +3949,9 @@ mod tests {
             let dir = root();
             let root = dir.path();
             let socket = root.join("health/callosum.sock");
+            #[cfg(windows)]
+            let _namespace =
+                solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
             let server = CallosumSocketServer::bind(&socket).await.unwrap();
             let mut peer = CallosumSocketConnection::new(&socket, Map::new());
             peer.start();

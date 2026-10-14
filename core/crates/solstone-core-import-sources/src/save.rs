@@ -356,7 +356,12 @@ mod tests {
     #[test]
     fn direct_rendered_file_publication_preserves_owner_deleted_segments() {
         let root = tempfile::tempdir().unwrap();
-        let segment = root.path().join("chronicle/20260101/import.ics/120000_0");
+        let segment = root
+            .path()
+            .join("chronicle")
+            .join("20260101")
+            .join("import.ics")
+            .join("120000_0");
         let output = segment.join("calendar.md");
         super::write_segment_private(&output, b"first").unwrap();
         super::write_segment_private(&output, b"second").unwrap();

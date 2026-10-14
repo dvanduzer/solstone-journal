@@ -137,9 +137,19 @@ async fn corpus_replays_all_cases() {
                 case["path"]
             );
             if let Some(expected_json) = case.get("json") {
+                #[allow(unused_mut)]
+                let mut expected_json = expected_json.clone();
+                #[cfg(windows)]
+                if matches!(
+                    case["path"].as_str(),
+                    Some("/app/backup/status" | "/app/backup/offload/status")
+                ) && response.status == 200
+                {
+                    expected_json["cleanup_admission"] = json!("ready");
+                }
                 assert_eq!(
                     serde_json::from_slice::<Value>(&response.body).expect("json body"),
-                    *expected_json,
+                    expected_json,
                     "{phase} {}",
                     case["path"]
                 );
@@ -230,7 +240,12 @@ async fn status_shape_preserves_backup_phase_discrimination() {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_object().expect("object").len(), 18);
+        assert_eq!(
+            body.as_object().expect("object").len(),
+            18 + usize::from(cfg!(windows))
+        );
+        #[cfg(windows)]
+        assert_eq!(body["cleanup_admission"], "ready");
         assert!(
             body["last_backup_current_setup"].is_null(),
             "historical fixtures have no setup provenance"
@@ -253,7 +268,12 @@ async fn offload_status_uses_injected_geometry_and_has_exact_shape() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(body.as_object().expect("object").len(), 13);
+    assert_eq!(
+        body.as_object().expect("object").len(),
+        13 + usize::from(cfg!(windows))
+    );
+    #[cfg(windows)]
+    assert_eq!(body["cleanup_admission"], "ready");
     assert_eq!(
         body["device"],
         json!({"free_bytes":crate::test_support::DEVICE_FREE_BYTES,"total_bytes":crate::test_support::DEVICE_TOTAL_BYTES})
@@ -1540,6 +1560,8 @@ fn rotate_outputs() -> Vec<ToolOutput> {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn engine_routes_return_running_while_restic_is_held() {
     struct Case {
@@ -1663,6 +1685,8 @@ async fn engine_route_missing_package_reports_terminal_before_hold_start() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn held_fixture_failure_releases_and_settles_before_dropping_roots() {
     for (hosted_poll, approved) in [(false, false), (true, false), (true, true)] {
@@ -1768,6 +1792,8 @@ async fn held_fixture_failure_releases_and_settles_before_dropping_roots() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn enable_init_failure_leaves_disabled_and_errors() {
     let root = crate::test_support::root("healthy");
@@ -1783,6 +1809,8 @@ async fn enable_init_failure_leaves_disabled_and_errors() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn restore_success_records_snapshots_then_restore() {
     let root = crate::test_support::root("healthy");
@@ -1832,6 +1860,8 @@ async fn restore_success_records_snapshots_then_restore() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn restore_empty_snapshots_records_journal_snapshot_not_found() {
     let root = crate::test_support::root("healthy");
@@ -1850,6 +1880,8 @@ async fn restore_empty_snapshots_records_journal_snapshot_not_found() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn restore_adapter_records_invalid_key_once_after_tool_resolution() {
     let root = crate::test_support::root("healthy");
@@ -1868,6 +1900,8 @@ async fn restore_adapter_records_invalid_key_once_after_tool_resolution() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn restore_worker_panic_is_restore_failed_and_records_once() {
     let root = crate::test_support::root("healthy");
@@ -1892,6 +1926,8 @@ async fn restore_worker_panic_is_restore_failed_and_records_once() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn restore_check_failure_is_degraded() {
     let root = crate::test_support::root("healthy");
@@ -1908,6 +1944,8 @@ async fn restore_check_failure_is_degraded() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn rotate_does_not_echo_recovery_key() {
     let root = crate::test_support::root("healthy");
@@ -1939,6 +1977,8 @@ async fn hold_until_rotate_done(deps: crate::BackupWebDeps, runner: Arc<ScriptRu
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn second_engine_post_is_backup_busy() {
     let root = crate::test_support::root("healthy");
@@ -1969,6 +2009,8 @@ async fn second_engine_post_is_backup_busy() {
     .await;
 }
 
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn destination_returns_distinct_reason_codes_from_cat_config() {
     let destination = json!({"repository":"s3:bucket","backend":"s3","credentials":{"access_key_id":"key","secret_access_key":"secret"}});
@@ -2234,6 +2276,8 @@ async fn enable_hosted_verifies_refusals_and_busy_behavior() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn handoff_binding_enables_operated_mode() {
     let root = crate::test_support::root("healthy");
@@ -2287,6 +2331,8 @@ async fn handoff_binding_enables_operated_mode() {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_enable_hides_persisted_binding_until_done_while_credentials_are_held() {
     let root = crate::test_support::root("healthy");
@@ -2447,6 +2493,8 @@ async fn handoff_needs_subscription_is_terminal_without_binding() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn bound_restore_hosted_maps_broker_402_to_entitlement_error() {
     let root = crate::test_support::hosted_bound_root();
@@ -2770,6 +2818,8 @@ mod held_restore_tests {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn enable_records_resolved_restic_program_not_path_decoy() {
     let root = crate::test_support::root("healthy");
@@ -2827,6 +2877,8 @@ async fn enable_success_response_shape_has_operation_without_secrets() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn bound_restore_hosted_returns_running_then_done_while_held() {
     let root = crate::test_support::hosted_bound_root();
@@ -2875,6 +2927,8 @@ async fn bound_restore_hosted_returns_running_then_done_while_held() {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn expired_hosted_wait_clears_busy_on_status_and_begin() {
     let root = crate::test_support::root("healthy");
@@ -3694,6 +3748,8 @@ async fn malformed_refused_handoff_with_wrong_nonce_leaves_live_restore_unchange
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn restore_handoff_needs_subscription_can_retry_with_a_new_generation() {
     let root = crate::test_support::root("fresh");
@@ -3773,6 +3829,8 @@ async fn restore_handoff_needs_subscription_can_retry_with_a_new_generation() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn bound_and_byo_restore_bypass_hosted_handoff_transport() {
     let bound_root = crate::test_support::hosted_bound_root();
@@ -4175,6 +4233,8 @@ async fn hosted_poll_gets_handoff_backup_nonce_without_instance() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_configured_portal_base_preflight_blocks_or_allows_transport() {
     struct Case {
@@ -4453,6 +4513,8 @@ async fn hosted_poll_configured_portal_base_preflight_blocks_or_allows_transport
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_approved_enables_operated_mode() {
     let root = crate::test_support::root("healthy");
@@ -4576,6 +4638,8 @@ async fn hosted_poll_subscribe_url_and_secrets_stay_off_status() {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_response_classes_retry_or_fail() {
     struct Case {
@@ -4841,6 +4905,8 @@ async fn hosted_poll_needs_subscription_rejects_non_https_subscribe_url() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_restore_uses_slot_recovery_key() {
     let root = crate::test_support::root("fresh");
@@ -4916,6 +4982,8 @@ async fn hosted_poll_restore_uses_slot_recovery_key() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_restore_failure_records_without_publishing_destination_or_recovery_state() {
     let root = crate::test_support::root("fresh");
@@ -5001,6 +5069,8 @@ async fn hosted_poll_stale_generation_cannot_persist_binding() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_second_local_handoff_after_poll_approval_is_rejected() {
     let root = crate::test_support::root("healthy");
@@ -5116,6 +5186,8 @@ async fn hosted_poll_get_timeout_is_bounded_by_remaining_ttl() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_broker_unreachable_matches_local_handoff_broker_unreachable_contract() {
     async fn run(
@@ -5197,6 +5269,8 @@ async fn hosted_poll_broker_unreachable_matches_local_handoff_broker_unreachable
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_broker_error_matches_local_handoff_broker_error_contract() {
     async fn run(
@@ -5844,6 +5918,8 @@ async fn hosted_poll_binding_write_failure_matches_local_handoff_contract() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_repository_init_failure_matches_local_handoff_contract() {
     async fn run(
@@ -5929,6 +6005,8 @@ async fn hosted_poll_repository_init_failure_matches_local_handoff_contract() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_poll_restore_failure_matches_local_handoff_contract() {
     async fn run(
@@ -6046,6 +6124,8 @@ async fn hosted_poll_restore_failure_matches_local_handoff_contract() {
 }
 
 #[cfg(feature = "full-tests")]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn handoff_restore_composition_nonce_one_use_and_command_order() {
     let root = crate::test_support::root("fresh");
@@ -6104,6 +6184,8 @@ async fn handoff_restore_composition_nonce_one_use_and_command_order() {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[tokio::test]
 async fn hosted_secrets_and_binding_mode_are_never_exposed() {
     struct Scenario {

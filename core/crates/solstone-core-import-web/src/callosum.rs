@@ -15,7 +15,7 @@ pub(crate) enum BusError {
 }
 
 fn socket(root: &Path) -> std::path::PathBuf {
-    root.join("health/callosum.sock")
+    root.join("health").join("callosum.sock")
 }
 
 fn send(root: &Path, value: Value) -> Result<(), BusError> {
@@ -139,6 +139,10 @@ mod tests {
     #[tokio::test]
     async fn a_watch_hears_the_end_of_the_task_it_requested_even_an_immediate_one() {
         let root = tempfile::TempDir::new().unwrap();
+        #[cfg(windows)]
+        let _namespace = solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(
+            socket(root.path()),
+        );
         let server = CallosumSocketServer::bind(socket(root.path()))
             .await
             .unwrap();

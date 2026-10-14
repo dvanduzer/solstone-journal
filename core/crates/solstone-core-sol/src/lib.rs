@@ -686,17 +686,60 @@ impl ShutdownSignal for RealShutdownSignal {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+struct RealShutdownSignal {
+    runtime: tokio::runtime::Runtime,
+    signals: std::sync::Mutex<(
+        tokio::signal::windows::CtrlC,
+        tokio::signal::windows::CtrlBreak,
+    )>,
+}
+
+#[cfg(windows)]
+impl RealShutdownSignal {
+    fn install() -> io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let signals = {
+            let _entered = runtime.enter();
+            (
+                tokio::signal::windows::ctrl_c()?,
+                tokio::signal::windows::ctrl_break()?,
+            )
+        };
+        Ok(Self {
+            runtime,
+            signals: std::sync::Mutex::new(signals),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl ShutdownSignal for RealShutdownSignal {
+    fn wait(&self) {
+        let mut signals = self.signals.lock().expect("resident signal lock poisoned");
+        let (ctrl_c, ctrl_break) = &mut *signals;
+        self.runtime.block_on(async {
+            tokio::select! {
+                _ = ctrl_c.recv() => {},
+                _ = ctrl_break.recv() => {},
+            }
+        });
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 struct RealShutdownSignal;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl RealShutdownSignal {
     fn install() -> Result<Self, &'static str> {
         Err("shutdown signals are unavailable on this platform")
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl ShutdownSignal for RealShutdownSignal {
     fn wait(&self) {}
 }

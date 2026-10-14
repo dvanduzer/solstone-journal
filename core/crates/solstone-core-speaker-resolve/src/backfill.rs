@@ -881,8 +881,10 @@ mod tests {
         let final_journal_files = collect_all_files(temp.path());
         // Only speakers/backfill-operations.jsonl (and lock files) was added
         for p in final_journal_files.keys() {
-            let s = p.to_string_lossy();
-            if s.contains("speakers/backfill-operations.jsonl") || s.contains("health/locks") {
+            if p.ends_with(Path::new("speakers").join("backfill-operations.jsonl"))
+                || p.ends_with(Path::new("speakers").join("backfill-operations.jsonl.lock"))
+                || p.starts_with(temp.path().join("health").join("locks"))
+            {
                 continue;
             }
             assert!(

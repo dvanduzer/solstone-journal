@@ -4359,10 +4359,9 @@ mod tests {
         fs::write(&jsonl_path, transcript.as_bytes()).unwrap();
 
         if let Some(mtime) = mtime {
-            let f_j = fs::File::open(&jsonl_path).unwrap();
-            f_j.set_modified(mtime).unwrap();
-            let f_n = fs::File::open(&npz_path).unwrap();
-            f_n.set_modified(mtime).unwrap();
+            let mtime = filetime::FileTime::from_system_time(mtime);
+            filetime::set_file_mtime(&jsonl_path, mtime).unwrap();
+            filetime::set_file_mtime(&npz_path, mtime).unwrap();
         }
     }
 
@@ -4934,8 +4933,11 @@ mod tests {
         let j_path = journal.join("chronicle/20260102/mic/090000_60/audio.jsonl");
         let _guard = set_second_stat_hook(move |pos| {
             if pos.day == "20260102" {
-                let f = fs::File::open(&j_path).unwrap();
-                f.set_modified(std::time::SystemTime::now()).unwrap();
+                filetime::set_file_mtime(
+                    &j_path,
+                    filetime::FileTime::from_system_time(std::time::SystemTime::now()),
+                )
+                .unwrap();
             }
         });
 
@@ -4974,8 +4976,8 @@ mod tests {
         );
         let corrupt_npz = journal.join("chronicle/20260102/mic/090000_60/audio.npz");
         fs::write(&corrupt_npz, b"corrupted").unwrap();
-        let f = fs::File::open(&corrupt_npz).unwrap();
-        f.set_modified(old_time).unwrap();
+        filetime::set_file_mtime(&corrupt_npz, filetime::FileTime::from_system_time(old_time))
+            .unwrap();
 
         // 2: npz missing embeddings.npy
         write_mock_segment(
@@ -5046,8 +5048,7 @@ mod tests {
         let transcript = "{\"speaker_evidence\": \"none\"}\n";
         let j_path = journal.join("chronicle/20260102/mic/090000_60/audio.jsonl");
         fs::write(&j_path, transcript.as_bytes()).unwrap();
-        let f = fs::File::open(&j_path).unwrap();
-        f.set_modified(old_time).unwrap();
+        filetime::set_file_mtime(&j_path, filetime::FileTime::from_system_time(old_time)).unwrap();
 
         let res = backfill_speaker_pool(&journal);
         let SpeakerPoolCatchUp::Done(report) = res else {
@@ -5539,8 +5540,7 @@ mod tests {
         let transcript = "{\"speaker_evidence\": \"none\"}\n";
         let j_path = journal.join("chronicle/20260102/mic/092000_60/audio.jsonl");
         fs::write(&j_path, transcript.as_bytes()).unwrap();
-        let f = fs::File::open(&j_path).unwrap();
-        f.set_modified(old_time).unwrap();
+        filetime::set_file_mtime(&j_path, filetime::FileTime::from_system_time(old_time)).unwrap();
         // 4: gone (not written)
 
         let cand = CandidateProfile {
@@ -5706,8 +5706,8 @@ mod tests {
         );
         let corrupt_npz = journal.join("chronicle/20260102/mic/090000_60/audio.npz");
         fs::write(&corrupt_npz, b"corrupted").unwrap();
-        let f = fs::File::open(&corrupt_npz).unwrap();
-        f.set_modified(old_time).unwrap();
+        filetime::set_file_mtime(&corrupt_npz, filetime::FileTime::from_system_time(old_time))
+            .unwrap();
 
         let t0 = Utc::now() - chrono::Duration::minutes(15);
         let state = json!({
@@ -5972,8 +5972,7 @@ mod tests {
         let transcript = "{\"speaker_evidence\": \"none\"}\n";
         let j_path = journal.join("chronicle/20260102/mic/092000_60/audio.jsonl");
         fs::write(&j_path, transcript.as_bytes()).unwrap();
-        let f = fs::File::open(&j_path).unwrap();
-        f.set_modified(old_time).unwrap();
+        filetime::set_file_mtime(&j_path, filetime::FileTime::from_system_time(old_time)).unwrap();
 
         // 2: feed 1 (091000_60 is 2nd in descending walk order)
         write_mock_segment(
@@ -6063,8 +6062,7 @@ mod tests {
         let transcript = "{\"speaker_evidence\": \"none\"}\n";
         let j_path = journal.join("chronicle/20260102/mic/092000_60/audio.jsonl");
         fs::write(&j_path, transcript.as_bytes()).unwrap();
-        let f = fs::File::open(&j_path).unwrap();
-        f.set_modified(old_time).unwrap();
+        filetime::set_file_mtime(&j_path, filetime::FileTime::from_system_time(old_time)).unwrap();
         // Feed 2 (091000_60 is 3rd in descending walk order - times out)
         write_mock_segment(
             &journal,

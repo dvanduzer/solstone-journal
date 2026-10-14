@@ -38,16 +38,43 @@ fn move_merge_publishes_complete_observations_without_truncating_an_open_reader(
         "{\"id\":1,\"content\":\"added\",\"observed_at\":2000}\n",
     )
     .unwrap();
-    let mut old_reader = fs::File::open(&destination).unwrap();
+    #[allow(unused_mut)]
+    let mut old_reader = Some(fs::File::open(&destination).unwrap());
 
-    move_facet_entity(temporary.path(), "subject", "from", "to", true).unwrap();
+    let result = move_facet_entity(temporary.path(), "subject", "from", "to", true);
+    #[cfg(windows)]
+    let result = match result {
+        // MoveFileEx refuses replacement of an open destination. It must leave
+        // both the old reader and named bytes intact, and work once it closes.
+        Err(crate::FacetEntityWriteError::LinkFolders(
+            solstone_core_entity::facet_links::LinkFolderError::Write(
+                solstone_core_journal_io::AtomicWriteError::Io { source: error, .. },
+            ),
+        )) if error.raw_os_error() == Some(5) => {
+            let mut contents = String::new();
+            old_reader
+                .as_mut()
+                .unwrap()
+                .read_to_string(&mut contents)
+                .unwrap();
+            assert_eq!(contents, original);
+            assert_eq!(fs::read_to_string(&destination).unwrap(), original);
+            assert!(source.is_file());
+            drop(old_reader.take());
+            move_facet_entity(temporary.path(), "subject", "from", "to", true)
+        }
+        result => result,
+    };
+    result.unwrap();
 
-    let mut old_contents = String::new();
-    old_reader.read_to_string(&mut old_contents).unwrap();
-    assert_eq!(
-        old_contents, original,
-        "publication must not truncate the previous inode"
-    );
+    if let Some(mut old_reader) = old_reader {
+        let mut old_contents = String::new();
+        old_reader.read_to_string(&mut old_contents).unwrap();
+        assert_eq!(
+            old_contents, original,
+            "publication must not truncate the previous inode"
+        );
+    }
     let page = read_live_observations(
         temporary.path(),
         "to",

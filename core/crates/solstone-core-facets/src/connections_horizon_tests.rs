@@ -304,6 +304,8 @@ fn second_call_returns_cached_horizon() {
     assert_eq!(first, second);
 }
 
+// Cache fingerprints require Unix inode metadata; Windows performs a live scan.
+#[cfg(unix)]
 #[test]
 fn matching_cache_with_wrong_horizon_is_consulted() {
     let temporary = journal_with_facet();
@@ -386,6 +388,8 @@ fn later_day_file_is_outside_fingerprint_set() {
     assert_eq!(second.expect("still cached").day, "20260115");
 }
 
+// Cache fingerprints require Unix inode metadata; Windows performs a live scan.
+#[cfg(unix)]
 #[test]
 fn backdated_mtime_same_size_still_invalidates() {
     let temporary = journal_with_facet();
@@ -433,6 +437,8 @@ fn cache_hit_does_not_open_fingerprinted_files() {
     assert_eq!(second.expect("hit").day, "20260301");
 }
 
+// Cache fingerprints require Unix inode metadata; Windows performs a live scan.
+#[cfg(unix)]
 #[test]
 fn cache_miss_on_missing_truncated_stale_schema() {
     let temporary = journal_with_facet();
@@ -560,6 +566,8 @@ fn hit_promotes_n0_to_some_when_earlier_chronicle_appears() {
     assert_eq!(horizon.earlier_days, 1);
 }
 
+// Cache fingerprints require Unix inode metadata; Windows performs a live scan.
+#[cfg(unix)]
 #[test]
 fn absent_horizon_is_cached_and_not_rescanned() {
     let temporary = journal_with_facet();
@@ -577,7 +585,8 @@ fn cache_file_is_not_listed_as_a_facet() {
     let root = temporary.path();
     write_chronicle(root, "20260101");
     write_detected(root, "work", "20260301", QUALIFYING);
-    refresh_connections_horizon(root).unwrap();
+    // The listing contract applies even on hosts that do not write this cache.
+    fs::write(root.join(CACHE_REL), b"{}").unwrap();
     let directories = list_facet_directories(root).unwrap();
     assert!(
         directories
@@ -599,6 +608,8 @@ fn read_horizon_does_not_create_or_refresh_the_derived_cache() {
     );
     assert!(!root.join(CACHE_REL).exists());
     refresh_connections_horizon(root).unwrap();
+    #[cfg(not(unix))]
+    fs::write(root.join(CACHE_REL), b"{}").unwrap();
     let before = fs::read(root.join(CACHE_REL)).unwrap();
     write_detected(root, "work", "20260215", QUALIFYING);
     assert_eq!(

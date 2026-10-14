@@ -619,12 +619,15 @@ mod tests {
 
         // Assert PinnedMembers file
         let staged_weights = &plan["lib/solstone_journal_models/ced/weights.bin"];
-        assert_eq!(staged_weights.record.mode, 0o644);
+        assert_eq!(
+            staged_weights.record.mode,
+            crate::stage::recorded_mode(0o644)
+        );
         assert_eq!(staged_weights.bytes.as_ref(), weights_content);
 
         // Assert LicenceTree file
         let staged_lic = &plan["share/licenses/ced/deps/mod@1.2.3/LICENSE"];
-        assert_eq!(staged_lic.record.mode, 0o644);
+        assert_eq!(staged_lic.record.mode, crate::stage::recorded_mode(0o644));
         assert_eq!(staged_lic.bytes.as_ref(), license_content);
 
         // Assert PinnedNative targeting Windows is refused

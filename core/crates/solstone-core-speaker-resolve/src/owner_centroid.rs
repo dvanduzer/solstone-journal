@@ -423,13 +423,26 @@ pub fn remove_owner_centroid(
         .map_err(write_admission_failure)?;
     let path = owner_centroid_file(journal_root, principal_entity_id)?;
     let _lock = hold_lock(&path, LockOptions::default())?;
-    let relative = path.strip_prefix(journal_root).map_err(|_| {
+    // Entity paths are resolved canonically; compare against the same root
+    // spelling before converting back to the logical removal coordinate.
+    let canonical_root = std::fs::canonicalize(journal_root)
+        .map_err(|error| OwnerCentroidWriteError::Invalid(error.to_string()))?;
+    let invalid_relative = || {
         OwnerCentroidWriteError::Invalid(format!(
             "owner centroid {} is outside the journal",
             path.display()
         ))
-    })?;
-    let removed = solstone_core_journal_io::remove_file(journal_root, &relative.to_string_lossy())
+    };
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .map_err(|_| invalid_relative())?;
+    let coordinate = relative
+        .iter()
+        .map(|part| part.to_str())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(invalid_relative)?
+        .join("/");
+    let removed = solstone_core_journal_io::remove_file(&canonical_root, &coordinate)
         .map_err(|error| OwnerCentroidWriteError::Invalid(error.to_string()))?;
     Ok(matches!(
         removed,

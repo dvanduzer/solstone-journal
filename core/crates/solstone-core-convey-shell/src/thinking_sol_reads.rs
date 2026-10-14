@@ -790,7 +790,19 @@ fn output_file(request: &Value, journal: &Path) -> Result<Option<String>, String
     // Keep the named in-journal path; the fetch route resolves symlinks and
     // enforces containment before reading any bytes.
     path.strip_prefix(journal)
-        .map(|path| Some(path.display().to_string()))
+        .or_else(|error| match journal.canonicalize() {
+            // Stored explicit outputs may already carry Windows' canonical
+            // verbatim prefix, while the caller retains its original root.
+            Ok(canonical) => path.strip_prefix(canonical),
+            Err(_) => Err(error),
+        })
+        .map(|path| {
+            // This value is a logical fetch coordinate, not a native path.
+            path.iter()
+                .map(|part| part.to_str())
+                .collect::<Option<Vec<_>>>()
+                .map(|parts| parts.join("/"))
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -871,9 +883,30 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn saved_output_coordinates_can_be_fetched() {
+        let root = tempfile::tempdir().expect("journal");
+        let day = root.path().join("chronicle").join("20260101");
+        let output = day.join("talents").join("demo.md");
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, "saved output").unwrap();
+        for request in [
+            json!({"output": "md", "output_path": output}),
+            json!({"output": "md", "output_path": output.canonicalize().unwrap()}),
+            json!({"output": "md", "day": "20260101", "name": "demo"}),
+        ] {
+            let coordinate = output_file(&request, root.path()).unwrap().unwrap();
+            assert_eq!(coordinate, "chronicle/20260101/talents/demo.md");
+            assert_eq!(
+                resolve_journal_path(root.path(), &coordinate).unwrap(),
+                output
+            );
+        }
+    }
+
     #[tokio::test]
     async fn preview_composes_distinct_sections_without_journal_write() {
-        let root = tempfile::TempDir::new_in("/var/tmp").expect("journal root");
+        let root = tempfile::TempDir::new().expect("journal root");
         fs::create_dir_all(root.path().join("talent")).expect("talent root");
         fs::create_dir_all(root.path().join("apps")).expect("apps root");
         fs::create_dir_all(root.path().join("think/templates")).expect("template root");
@@ -952,7 +985,7 @@ mod tests {
 
     #[test]
     fn share_layout_resolves_and_fails_when_anchor_removed() {
-        let root = tempfile::TempDir::new_in("/var/tmp").expect("share layout root");
+        let root = tempfile::TempDir::new().expect("share layout root");
         let bin = root.path().join("bin");
         let share = root.path().join("share");
         fs::create_dir_all(&bin).unwrap();
@@ -974,7 +1007,7 @@ mod tests {
 
     #[test]
     fn read_run_candidate_use_id_classifies_match_mismatch_missing_and_unparseable() {
-        let root = tempfile::TempDir::new_in("/var/tmp").expect("root");
+        let root = tempfile::TempDir::new().expect("root");
         let path = root.path().join("run.jsonl");
         fs::write(&path, r#"{"event":"request","use_id":"hit"}"#).expect("match");
         assert!(matches!(
@@ -1015,7 +1048,7 @@ mod tests {
 
     #[test]
     fn a_run_started_without_a_day_reads_the_day_it_started() {
-        let root = tempfile::TempDir::new_in("/var/tmp").expect("root");
+        let root = tempfile::TempDir::new().expect("root");
         let directory = root.path().join("talents/demo");
         fs::create_dir_all(&directory).expect("talent directory");
         let use_id = "1767268800000";

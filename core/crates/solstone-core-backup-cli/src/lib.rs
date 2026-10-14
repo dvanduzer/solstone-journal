@@ -3824,6 +3824,8 @@ mod resolution_tests {
         assert!(programs.iter().all(|program| program != "restic"));
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn ac1_backup_run_uses_pinned_restic_not_decoy() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -3838,6 +3840,8 @@ mod resolution_tests {
         assert_resolved_restic(&runner.programs.borrow(), &expected, &decoy);
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn ac3_backup_run_persists_restic_unavailable() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3892,6 +3896,8 @@ mod resolution_tests {
         assert!(runner.programs.borrow().is_empty());
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn backup_run_success_twin_byo_and_operated() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -3940,6 +3946,8 @@ mod resolution_tests {
         assert!(broker.calls.get() > 0);
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn backup_run_pins_admitted_byo_mode_despite_config_flip_to_operated_during_resolution() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -3954,6 +3962,8 @@ mod resolution_tests {
         assert!(rclone_program(&runner.argvs.borrow()).is_none());
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn backup_run_pins_admitted_operated_mode_despite_config_flip_to_byo_during_resolution() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -4671,6 +4681,8 @@ mod resolution_tests {
     }
 
     // The operated run passes the verified rclone member path.
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn ac4_operated_run_passes_absolute_rclone_program() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -4718,6 +4730,8 @@ mod resolution_tests {
         );
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn ac6_operated_run_persists_rclone_unavailable() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -4779,6 +4793,8 @@ mod resolution_tests {
         );
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn ac7_byo_operational_verbs_resolve_restic_without_rclone() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -4827,6 +4843,8 @@ mod resolution_tests {
         assert!(tools.rclone_path.is_none());
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn ac8_operated_prune_does_not_resolve_rclone() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -4898,6 +4916,8 @@ mod resolution_tests {
         );
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn ac10_operated_run_resolves_rclone_member() {
         let package_dir = tempfile::tempdir().unwrap();
@@ -4962,6 +4982,8 @@ mod resolution_tests {
         assert!(runner.programs.borrow().is_empty());
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn annotate_last_backup_restart_and_absent_detail() {
         use solstone_core_installed_payload::{
@@ -5190,6 +5212,8 @@ mod resolution_tests {
         }
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn fallback_negative_ignores_markers_and_env() {
         let _lock = CURRENT_DIRECTORY.lock().unwrap();
@@ -5218,6 +5242,8 @@ mod resolution_tests {
         fallbacks.verify();
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn altered_member_refuses_backup_run() {
         use solstone_core_installed_payload::{code, guidance};
@@ -5270,6 +5296,8 @@ mod resolution_tests {
         );
     }
 
+    // This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+    #[cfg(unix)]
     #[test]
     fn scheduled_restart_status_annotation() {
         use solstone_core_installed_payload::{

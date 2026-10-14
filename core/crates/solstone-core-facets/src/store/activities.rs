@@ -305,7 +305,12 @@ mod tests {
     #[test]
     fn semantic_edits_preserve_damaged_definitions_and_report_physical_line() {
         let root = declared_root();
-        let path = root.path().join("facets/work/activities/activities.jsonl");
+        let path = root
+            .path()
+            .join("facets")
+            .join("work")
+            .join("activities")
+            .join("activities.jsonl");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         for bad in ["{sensitive-sentinel", "\"sensitive-sentinel\""] {
             let original =
@@ -338,7 +343,12 @@ mod tests {
     #[test]
     fn semantic_edits_refuse_unreadable_and_invalid_utf8_input() {
         let root = declared_root();
-        let path = root.path().join("facets/work/activities/activities.jsonl");
+        let path = root
+            .path()
+            .join("facets")
+            .join("work")
+            .join("activities")
+            .join("activities.jsonl");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(add_activity(root.path(), "work", serde_json::json!({"id":"new"})).is_err());
@@ -352,7 +362,12 @@ mod tests {
     #[test]
     fn healthy_definitions_keep_first_use_and_semantic_edit_behavior() {
         let root = declared_root();
-        let path = root.path().join("facets/work/activities/activities.jsonl");
+        let path = root
+            .path()
+            .join("facets")
+            .join("work")
+            .join("activities")
+            .join("activities.jsonl");
         let first = serde_json::json!({"id":"first","custom":true,"extra":{"preserve":1}});
         add_activity(root.path(), "work", first.clone()).unwrap();
         add_activity(root.path(), "work", first.clone()).unwrap();
@@ -380,7 +395,12 @@ mod tests {
     #[test]
     fn icon_conversion_preserves_damaged_input_in_both_modes() {
         let root = declared_root();
-        let path = root.path().join("facets/work/activities/activities.jsonl");
+        let path = root
+            .path()
+            .join("facets")
+            .join("work")
+            .join("activities")
+            .join("activities.jsonl");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let eligible = "{\"id\":\"x\",\"custom\":true,\"icon\":\"🎯\"}\n";
         for bad in ["{broken", "42"] {

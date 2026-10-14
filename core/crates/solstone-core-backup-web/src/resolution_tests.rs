@@ -247,6 +247,8 @@ fn plant_fallbacks(pkg_root: &Path) -> PlantedFallbacks {
     }
 }
 
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[test]
 fn fallback_negative_ignores_markers_and_env() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -276,6 +278,8 @@ fn fallback_negative_ignores_markers_and_env() {
     fallbacks.verify();
 }
 
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[test]
 fn altered_member_refuses() {
     let pkg = tempfile::tempdir().unwrap();
@@ -298,6 +302,8 @@ fn altered_member_refuses() {
     assert!(runner.0.lock().unwrap().is_empty());
 }
 
+// This fixture admits a Unix bin/lib payload; Windows requires verified native workers.
+#[cfg(unix)]
 #[test]
 fn web_constant_pairing() {
     let runner = Arc::new(NoSpawnRunner(std::sync::Mutex::new(vec![])));

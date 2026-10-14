@@ -182,6 +182,21 @@ pub(crate) fn discovery(
 
 #[cfg(test)]
 mod tests {
+    fn run_discovery(args: &[String], root: &std::path::Path) -> crate::CliOutcome {
+        #[cfg(windows)]
+        {
+            // These no-helper cases need no launch grants. An unexpected helper
+            // launch still refuses with this empty context.
+            crate::CliOutcome::Rendered(crate::run_cli_with_discovery_generation(
+                args,
+                root,
+                &solstone_core_system::process::ChildLaunchContext::default(),
+            ))
+        }
+        #[cfg(not(windows))]
+        crate::run_cli(args, root)
+    }
+
     #[test]
     fn registered_discovery_preserves_cache_until_owner_voice_is_available() {
         let root = tempfile::tempdir().unwrap();
@@ -189,7 +204,7 @@ mod tests {
         let cache = root.path().join("awareness/discovery_clusters.json");
         std::fs::write(&cache, "prior cache").unwrap();
         let mut args = vec!["run".to_owned(), "speakers:discover-voices".to_owned()];
-        let result = crate::run_cli(&args, root.path());
+        let result = run_discovery(&args, root.path());
         assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["status"],
@@ -201,7 +216,7 @@ mod tests {
             r#"{"id":"owner","name":"Owner","type":"Person","is_principal":true}"#,
         )
         .unwrap();
-        let result = crate::run_cli(&args, root.path());
+        let result = run_discovery(&args, root.path());
         assert_eq!(result.output().2, 0, "{}", result.output().1);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(result.output().0).unwrap()["reason_code"],
@@ -209,7 +224,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&cache).unwrap(), b"prior cache");
         args.push("--commit".to_owned());
-        assert_eq!(crate::run_cli(&args, root.path()).output().2, 2);
+        assert_eq!(run_discovery(&args, root.path()).output().2, 2);
         assert_eq!(std::fs::read(&cache).unwrap(), b"prior cache");
     }
 
@@ -242,7 +257,7 @@ mod tests {
         ] {
             std::fs::write(root.path().join("awareness").join(name), "prior cache").unwrap();
         }
-        let result = crate::run_cli(
+        let result = run_discovery(
             &["run".to_owned(), "speakers:discover-voices".to_owned()],
             root.path(),
         );
@@ -373,7 +388,13 @@ mod tests {
                 if path.is_dir() {
                     walk(root, &path, files);
                 } else {
-                    let key = path.strip_prefix(root).unwrap().display().to_string();
+                    let key = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .iter()
+                        .map(|part| part.to_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join("/");
                     files.insert(key, std::fs::read(&path).unwrap());
                 }
             }

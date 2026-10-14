@@ -2488,7 +2488,17 @@ mod claim_tests {
             match mutation {
                 "deleted" => fs::write(directory.join("tombstone.json"), b"{}").unwrap(),
                 "replaced" => {
-                    fs::rename(&directory, journal.path().join("previous")).unwrap();
+                    let renamed = fs::rename(&directory, journal.path().join("previous"));
+                    #[cfg(windows)]
+                    if let Err(error) = &renamed {
+                        // Windows holds the admitted directory against replacement.
+                        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+                        assert!(directory.is_dir());
+                        claims.revalidate().unwrap();
+                        assert!(!destination.exists());
+                        continue;
+                    }
+                    renamed.unwrap();
                     fs::create_dir(&directory).unwrap();
                 }
                 _ => (),

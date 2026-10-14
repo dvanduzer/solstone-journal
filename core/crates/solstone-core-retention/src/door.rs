@@ -1509,7 +1509,13 @@ pub fn receipt_manifest(journal: &Path, target: &Target, holding: &Path) -> Opti
         }
     }
     let rel_tombstone = rel_holding.join(TOMBSTONE_NAME);
-    let path = contained_path(journal, rel_tombstone.to_str()?).ok()?;
+    // Admission consumes a logical journal coordinate, not native separators.
+    let coordinate = rel_tombstone
+        .iter()
+        .map(|part| part.to_str())
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    let path = contained_path(journal, &coordinate).ok()?;
     let bytes = std::fs::read(&path).ok()?;
     let parsed: ReceiptManifestOnly = serde_json::from_slice(&bytes).ok()?;
 

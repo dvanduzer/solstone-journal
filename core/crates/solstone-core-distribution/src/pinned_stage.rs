@@ -1814,15 +1814,16 @@ mod tests {
                     .find(|r| r.dest == "lib/solstone-nvattest/bin/nvattest")
                     .expect("rpm bin");
 
-                assert_eq!(tar_bin.mode, 0o755);
-                assert_eq!(deb_bin.mode, 0o755);
-                assert_eq!(rpm_bin.mode, 0o755);
+                assert_eq!(tar_bin.mode, crate::stage::recorded_mode(0o755));
+                assert_eq!(deb_bin.mode, crate::stage::recorded_mode(0o755));
+                assert_eq!(rpm_bin.mode, crate::stage::recorded_mode(0o755));
             }
         }
     }
 
     #[cfg(all(test, feature = "full-tests"))]
-    #[cfg(target_arch = "x86_64")]
+    // Executes the staged Linux x86_64 ELF, not a cross-host parser fixture.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn nvattest_version_staged_runs_exit_0() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))

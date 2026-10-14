@@ -239,11 +239,14 @@ pub fn promote(request: &PromoteRequest) -> Result<PathBuf, PromoteError> {
                         .strip_prefix(base)
                         .map_err(|e| PromoteError::new(e.to_string()))?;
                     let rel_str = rel
-                        .to_str()
-                        .ok_or_else(|| PromoteError::new("non-utf8 path"))?;
+                        .iter()
+                        .map(|part| part.to_str())
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| PromoteError::new("non-utf8 path"))?
+                        .join("/");
                     let bytes = fs::read(&path).map_err(|e| PromoteError::new(e.to_string()))?;
                     let digest = crate::digest::sha256_hex(&bytes);
-                    map.insert(rel_str.to_string(), digest);
+                    map.insert(rel_str, digest);
                 }
             }
             Ok(())

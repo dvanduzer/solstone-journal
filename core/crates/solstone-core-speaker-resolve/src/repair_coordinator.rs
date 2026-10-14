@@ -487,7 +487,13 @@ fn run_attempt(
             }
         };
 
-        let expected_dir = journal_root.join("entities").join(&removal.entity_dir);
+        // The entity store returns a canonical path (including the Windows
+        // verbatim prefix); keep the inventory comparison in that spelling.
+        let expected_dir = journal_root
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .join("entities")
+            .join(&removal.entity_dir);
         if memory_dir != expected_dir {
             let _ = append_repair_event(
                 journal_root,

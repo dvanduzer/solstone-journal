@@ -1340,8 +1340,10 @@ mod tests {
                     .path()
                     .strip_prefix(root)
                     .unwrap()
-                    .display()
-                    .to_string();
+                    .iter()
+                    .map(|part| part.to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                     values.insert(format!("{relative}/"));
                     visit(root, &entry.path(), values);
@@ -1672,7 +1674,9 @@ mod tests {
             requests[0].config["output_path"],
             journal
                 .path()
-                .join("reflections/weekly/20260802.md")
+                .join("reflections")
+                .join("weekly")
+                .join("20260802.md")
                 .display()
                 .to_string()
         );
@@ -1721,7 +1725,9 @@ mod tests {
                 last.config["output_path"],
                 journal
                     .path()
-                    .join(format!("reflections/weekly/{expected_start}.md"))
+                    .join("reflections")
+                    .join("weekly")
+                    .join(format!("{expected_start}.md"))
                     .display()
                     .to_string()
             );
@@ -2409,10 +2415,14 @@ mod tests {
         );
         assert_eq!(requests[2].config["output"], "json");
         assert!(
-            requests[0].config["output_path"]
-                .as_str()
-                .unwrap()
-                .ends_with("facets/work/activities/20260813/reading_1/one.md")
+            Path::new(requests[0].config["output_path"].as_str().unwrap()).ends_with(
+                Path::new("facets")
+                    .join("work")
+                    .join("activities")
+                    .join("20260813")
+                    .join("reading_1")
+                    .join("one.md")
+            )
         );
         assert_eq!(
             recorder

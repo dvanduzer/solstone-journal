@@ -982,10 +982,9 @@ mod tests {
             .unwrap();
 
             // Set modified times older than 10 minutes settle window
-            let jsonl_file = fs::File::open(&jsonl_path).unwrap();
-            jsonl_file.set_modified(old_mtime).unwrap();
-            let npz_file = fs::File::open(&npz_path).unwrap();
-            npz_file.set_modified(old_mtime).unwrap();
+            let old_mtime = filetime::FileTime::from_system_time(old_mtime);
+            filetime::set_file_mtime(&jsonl_path, old_mtime).unwrap();
+            filetime::set_file_mtime(&npz_path, old_mtime).unwrap();
         }
 
         // Run production backfill_speaker_pool

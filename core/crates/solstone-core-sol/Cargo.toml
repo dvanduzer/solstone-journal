@@ -29,6 +29,7 @@ nix = { workspace = true, features = ["signal"] }
 solstone-core-sol-link = { workspace = true, features = ["client"] }
 
 [target.'cfg(windows)'.dependencies]
+tokio = { workspace = true, features = ["rt", "signal", "macros"] }
 velopack.workspace = true
 
 [dev-dependencies]

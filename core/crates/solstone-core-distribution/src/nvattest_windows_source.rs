@@ -718,8 +718,11 @@ mod tests {
         let documents =
             assemble_and_admit(&fixture.pins, &record_inputs(&written, &files, repo())).unwrap();
         let evidence = written.root.path().join("out-evidence.json");
-        // The receipt's parent does not exist, so its publication fails.
-        let receipt = written.root.path().join("missing-dir/out-receipt.json");
+        // A regular file obstructs the parent on every host; Windows publication
+        // may create a missing parent and report its durability separately.
+        let parent = written.root.path().join("obstructed-parent");
+        fs::write(&parent, b"obstruction").unwrap();
+        let receipt = parent.join("out-receipt.json");
         let error = publish_documents(&documents, &evidence, &receipt).unwrap_err();
         assert!(
             error.message.contains("published evidence removed"),

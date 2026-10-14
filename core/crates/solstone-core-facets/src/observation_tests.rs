@@ -185,6 +185,8 @@ fn entity_id_match_wins_when_it_equals_another_relationship_dir() {
     );
 }
 
+// The refusal fixture removes Unix directory permissions with chmod.
+#[cfg(unix)]
 #[test]
 fn resolve_error_does_not_create_a_query_named_directory() {
     let temporary = TempDir::new();

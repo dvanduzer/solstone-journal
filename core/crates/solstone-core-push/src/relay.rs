@@ -162,6 +162,26 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    fn read_small_post(stream: &mut std::net::TcpStream) {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            assert!(headers.len() < 8192, "fixture request headers too large");
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+        assert!(headers.contains("\r\ncontent-length: 4\r\n"));
+        let mut body = [0; 4];
+        stream.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"data");
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn ureq_relay_timeout_behavior() {
         let listener = bind_local().unwrap();
@@ -274,7 +294,7 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn post_bytes_status_404_and_410_returned_as_statuses() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::thread;
 
         for status in [404, 410] {
@@ -283,8 +303,8 @@ mod tests {
 
             let handle = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf).unwrap();
+                // Consume the body before closing, avoiding a TCP reset on Windows.
+                read_small_post(&mut stream);
                 let response = format!("HTTP/1.1 {status} Error\r\nContent-Length: 0\r\n\r\n");
                 stream.write_all(response.as_bytes()).unwrap();
             });
@@ -300,7 +320,7 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn post_bytes_301_with_location_returns_301_without_redirect() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::thread;
 
         let listener_target = bind_local().unwrap();
@@ -312,8 +332,7 @@ mod tests {
 
         let handle1 = thread::spawn(move || {
             let (mut stream, _) = listener1.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf).unwrap();
+            read_small_post(&mut stream);
             let resp = format!(
                 "HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:{target_port}/target\r\nContent-Length: 0\r\n\r\n"
             );

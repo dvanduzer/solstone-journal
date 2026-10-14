@@ -323,12 +323,22 @@ targets = ["linux-x86_64", "linux-aarch64", "macos-arm64", "windows-x86_64"]
         fs::write(dist_dir.join("payload.txt"), "").expect("write payload");
         let inventory_path = dist_dir.join("inventory.toml");
         fs::write(&inventory_path, inventory_toml).expect("write inventory");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            repo.join("core/distribution/licenses"),
-            dist_dir.join("licenses"),
-        )
-        .expect("symlink licenses");
+        fn copy_licenses(source: &Path, destination: &Path) {
+            fs::create_dir_all(destination).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_licenses(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        copy_licenses(
+            &repo.join("core/distribution/licenses"),
+            &dist_dir.join("licenses"),
+        );
         let inventory = crate::inventory::load_inventory(&inventory_path).expect("load inventory");
 
         for target_id in [
