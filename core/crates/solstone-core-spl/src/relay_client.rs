@@ -1403,7 +1403,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn replacement_generation_keeps_old_ack_but_stays_connecting_until_its_pong()
     -> Result<(), String> {
         let connector = FakeConnector::new();
@@ -1453,7 +1453,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn tunnel_offers_coalesce_across_listener_generations() -> Result<(), String> {
         let connector = FakeConnector::new();
         let mut first_listen = connector.push_socket();
@@ -1580,7 +1580,7 @@ mod tests {
     // Falsified by dropping the tunnel as soon as its write half closes: the relay is still
     // sending the dialer's upload, the socket is aborted, and the refusal written just before
     // can be lost on the way to the dialer.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_finished_tunnel_reads_on_until_the_relay_closes() -> Result<(), String> {
         let connector = FakeConnector::new();
         let mut listen = connector.push_socket();
