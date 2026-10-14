@@ -12,13 +12,94 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
-static SERVING: std::sync::Mutex<Option<journal_mobile_serving::MobileServing>> =
-    std::sync::Mutex::new(None);
+struct ServingInstance {
+    handle: journal_mobile_serving::MobileServing,
+    root: std::sync::Arc<jio::JournalRoot>,
+}
+
+static SERVING: std::sync::Mutex<Option<ServingInstance>> = std::sync::Mutex::new(None);
+static GENERATE: std::sync::LazyLock<solstone_core_generate_wire::EndpointRuntime> =
+    std::sync::LazyLock::new(solstone_core_generate_wire::EndpointRuntime::default);
+static THINKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serving(root: &Path, command: &str) -> Result<Value, String> {
     let command: Value = serde_json::from_str(command).map_err(|e| e.to_string())?;
+    let operation = command["op"].as_str().ok_or("serving op required")?;
+    // Stop drains the bounded provider operation before retiring its journal.
+    // Keep owner status and network controls independent of this wait.
+    let _thinking = if matches!(operation, "generate" | "talent" | "stop") {
+        Some(THINKING.lock().map_err(|_| "thinking lock poisoned")?)
+    } else {
+        None
+    };
+    if matches!(operation, "generate" | "talent") {
+        // Thinking runs independently of serving controls and never retains the
+        // serving mutex across a provider call.
+        let binding = {
+            let server = SERVING.lock().map_err(|_| "serving lock poisoned")?;
+            let current = server.as_ref().ok_or("server stopped")?;
+            current
+                .root
+                .revalidate_canonical_binding()
+                .map_err(|e| e.to_string())?;
+            if fs::canonicalize(root).map_err(|e| e.to_string())? != current.root.canonical_path() {
+                return Err("thinking journal does not match the serving journal".into());
+            }
+            std::sync::Arc::clone(&current.root)
+        };
+        let root = binding.canonical_path();
+        let raw = command["payload"]
+            .as_str()
+            .ok_or("thinking request required")?;
+        let generate = |request: &solstone_core_generate::GenerateRequest| -> Result<
+            solstone_core_generate::GenerateResponse,
+            solstone_core_generate::ClientError,
+        > {
+            binding
+                .revalidate_canonical_binding()
+                .map_err(|e| solstone_core_generate::ClientError::Decode(e.to_string()))?;
+            let response = solstone_core_generate_wire::respond(request, &GENERATE, root, |_| None)
+                .map_err(solstone_core_generate::ClientError::Decode)?;
+            binding
+                .revalidate_canonical_binding()
+                .map_err(|e| solstone_core_generate::ClientError::Decode(e.to_string()))?;
+            Ok(response)
+        };
+        if operation == "generate" {
+            let request = solstone_core_generate_wire::parse_one_shot_request(raw)?;
+            let response = generate(&request).map_err(|e| e.to_string())?;
+            return serde_json::from_str(&solstone_core_generate::encode_one_shot_response(
+                &response,
+            )?)
+            .map_err(|e| e.to_string());
+        }
+        let request = serde_json::from_str::<serde_json::Map<String, Value>>(raw)
+            .map_err(|e| e.to_string())?;
+        let payload = root
+            .parent()
+            .ok_or("app directory missing")?
+            .join("journal-payload");
+        let paths = solstone_core_talent_runtime::prepare::RuntimePaths {
+            talent_root: payload.join("solstone/talent"),
+            apps_root: payload.join("solstone/apps"),
+            templates_dir: payload.join("solstone/think/templates"),
+        };
+        let context = solstone_core_talent_runtime::ExecutionContext {
+            journal: root.to_owned(),
+        };
+        let mut events = Vec::new();
+        let outcome = solstone_core_talent_runtime::execute_request(
+            request,
+            &paths,
+            &context,
+            &generate,
+            &mut events,
+        );
+        return Ok(json!({"outcome":format!("{outcome:?}"),
+            "events":String::from_utf8(events).map_err(|e|e.to_string())?}));
+    }
     let mut server = SERVING.lock().map_err(|_| "serving lock poisoned")?;
-    match command["op"].as_str().ok_or("serving op required")? {
+    match operation {
         "start" => {
             if server.is_some() {
                 return Err("server already started".into());
@@ -33,44 +114,81 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                 .as_str()
                 .ok_or("ONNX runtime library required")?;
             ort::init_from(library).map_err(|e| e.to_string())?.commit();
-            *server = Some(journal_mobile_serving::MobileServing::start_with_payload(
+            let binding =
+                std::sync::Arc::new(jio::JournalRoot::open(root).map_err(|e| e.to_string())?);
+            let handle = journal_mobile_serving::MobileServing::start_with_payload(
                 root.to_path_buf(),
                 address,
                 root.parent()
                     .ok_or("app directory missing")?
                     .join("journal-payload"),
-            )?);
-            Ok(server.as_ref().unwrap().status())
+            )?;
+            *server = Some(ServingInstance {
+                handle,
+                root: binding,
+            });
+            Ok(server.as_ref().unwrap().handle.status())
         }
         "stop" => {
             *server = None;
+            GENERATE.drain_idle_pool();
             Ok(json!({"stopped":true}))
         }
-        "status" => Ok(server.as_ref().ok_or("server stopped")?.status()),
-        "index" => server.as_ref().ok_or("server stopped")?.index(),
+        "status" => Ok(server.as_ref().ok_or("server stopped")?.handle.status()),
+        "index" => server.as_ref().ok_or("server stopped")?.handle.index(),
+        "service-tools" => {
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+            let restic = solstone_core_backup_runtime::resolve::resolve_restic_member(&executable)
+                .map(|p| p.display().to_string())
+                .map_err(|e| e.to_string());
+            let nvattest = solstone_core_spp_ratls::resolve_nvattest_from_current_exe()
+                .map(|p| p.binary.display().to_string())
+                .map_err(|e| format!("{}:{}", e.failure.reason_code, e.detail));
+            Ok(
+                json!({"executable":executable,"restic":format!("{restic:?}"),
+                "nvattest":format!("{nvattest:?}"),
+                "confidential_offered":solstone_core_spp_ratls::confidential_verifier_on_this_platform()}),
+            )
+        }
         "audio-enable" => {
             let files = root.parent().ok_or("app files missing")?;
-            server.as_mut().ok_or("server stopped")?.enable_audio(
-                files.join("audio-models"),
-                files.join("audio-models/tdt-0.6b-v3-q8_0.gguf"),
-                files.join("audio-scratch"),
-            )?;
-            Ok(server.as_ref().unwrap().status())
+            server
+                .as_mut()
+                .ok_or("server stopped")?
+                .handle
+                .enable_audio(
+                    files.join("audio-models"),
+                    files.join("audio-models/tdt-0.6b-v3-q8_0.gguf"),
+                    files.join("audio-scratch"),
+                )?;
+            Ok(server.as_ref().unwrap().handle.status())
         }
         "audio-cancel" => {
-            server.as_ref().ok_or("server stopped")?.cancel_audio()?;
+            server
+                .as_ref()
+                .ok_or("server stopped")?
+                .handle
+                .cancel_audio()?;
             Ok(json!({"cancel_requested":true}))
         }
         "audio-resume" => {
-            server.as_ref().ok_or("server stopped")?.resume_audio()?;
+            server
+                .as_ref()
+                .ok_or("server stopped")?
+                .handle
+                .resume_audio()?;
             Ok(json!({"resumed":true}))
         }
         "owner" => {
-            let response = server.as_ref().ok_or("server stopped")?.request_owner(
-                command["method"].as_str().ok_or("method required")?,
-                command["uri"].as_str().ok_or("uri required")?,
-                command["body"].as_str().unwrap_or(""),
-            )?;
+            let response = server
+                .as_ref()
+                .ok_or("server stopped")?
+                .handle
+                .request_owner(
+                    command["method"].as_str().ok_or("method required")?,
+                    command["uri"].as_str().ok_or("uri required")?,
+                    command["body"].as_str().unwrap_or(""),
+                )?;
             Ok(json!({"status":response.status,"body":response.body}))
         }
         _ => Err("unknown serving operation".into()),
