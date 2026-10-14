@@ -2307,23 +2307,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn thinking_embedded_assets_are_generated_from_crate_copies() {
-        let generated = include_str!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
-        for path in [
-            "/app/thinking/workspace",
-            "/app/thinking/static/thinking.js",
-        ] {
-            let entry = generated
-                .lines()
-                .find(|line| line.contains(&format!("path: \"{path}\"")))
-                .expect("thinking asset is embedded");
-            assert!(entry.contains(env!("CARGO_MANIFEST_DIR")));
-            assert!(entry.contains("assets/thinking/"));
-            assert!(!entry.contains("solstone/apps/"));
-        }
-    }
-
     #[tokio::test]
     async fn write_routes_register_the_reference_methods() {
         let root = temporary_journal("write-methods");

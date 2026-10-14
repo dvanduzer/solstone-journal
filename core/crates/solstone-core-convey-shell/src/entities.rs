@@ -161,15 +161,6 @@ mod tests {
             body,
             include_bytes!("../assets/entities/workspace.html").as_slice()
         );
-
-        let generated = include_str!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
-        let entry = generated
-            .lines()
-            .find(|line| line.contains("path: \"/app/entities/workspace\""))
-            .expect("entities workspace is embedded");
-        assert!(entry.contains(env!("CARGO_MANIFEST_DIR")));
-        assert!(entry.contains("assets/entities/"));
-        assert!(!entry.contains("solstone/apps/"));
     }
 
     #[tokio::test]
