@@ -4,6 +4,7 @@
 """Qualify direct authenticated phone serving with synthetic activity records."""
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import queue
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -30,6 +32,7 @@ class Phone:
 
     def launch(self, extra_args=()):
         self.events = queue.Queue()
+        launch_rows = []
         process = subprocess.Popen([
             'xcrun', 'devicectl', 'device', 'process', 'launch', '--device', self.args.device,
             '--console', '--terminate-existing', BUNDLE, '--serve', '--suite', self.args.suite,
@@ -47,12 +50,52 @@ class Phone:
                 except ValueError:
                     continue
                 self.rows.append(row)
+                launch_rows.append(row)
                 events.put(row)
             events.put(None)
         threading.Thread(target=capture, daemon=True).start()
-        started = self.wait(lambda r: r['event'] == 'serve.start')
+        try:
+            started = self.wait(lambda r: r['event'] == 'serve.start')
+        except queue.Empty:
+            starts = [r for r in launch_rows if r.get('event') == 'host.start'
+                      and r.get('value', {}).get('journal') == self.args.suite]
+            assert len(starts) == 1, 'missing unique fresh launch identity'
+            start = starts[0]
+            with self.device_file('evidence.jsonl') as downloaded:
+                matches = []
+                launch_matches = 0
+                with downloaded.open('rb') as stream:
+                    while line := stream.readline(8 * 1024 * 1024 + 1):
+                        assert len(line) <= 8 * 1024 * 1024, 'evidence row exceeds bound'
+                        if not line.endswith(b'\n'):
+                            break  # The live writer may be appending the final row.
+                        row = json.loads(line)
+                        if row == start:
+                            launch_matches += 1
+                        if (launch_matches == 1 and row.get('event') == 'serve.start'
+                                and row.get('host_pid') == start['host_pid']
+                                and row.get('uptime', -1) >= start['uptime']):
+                            matches.append(row)
+                assert launch_matches == 1, 'missing unique matching durable launch record'
+                assert len(matches) == 1, 'missing unique startup receipt for fresh process'
+                started = matches[0]
+            self.log.write(json.dumps({'qualification_receipt': 'app-evidence',
+                                       'event': started['event'], 'host_pid': started['host_pid']}) + '\n')
+            self.log.flush()
         native(started['value']['reply'])
         return started
+
+    @contextmanager
+    def device_file(self, name):
+        assert name in ('evidence.jsonl', 'owner-reply.json')
+        with tempfile.TemporaryDirectory(prefix='receipt-', dir=self.args.output) as temporary:
+            downloaded = Path(temporary) / name
+            subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', self.args.device,
+                            '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
+                            '--source', 'Documents/' + name, '--destination', str(downloaded)],
+                           check=True, stdout=subprocess.DEVNULL)
+            assert downloaded.stat().st_size <= 128 * 1024 * 1024, 'device receipt exceeds bound'
+            yield downloaded
 
     def wait(self, predicate, seconds=160):
         deadline = time.monotonic() + seconds
@@ -79,7 +122,15 @@ class Phone:
                            check=True, stdout=subprocess.DEVNULL)
         finally:
             command.unlink(missing_ok=True)
-        reply = self.wait(lambda r: r['event'] == 'owner.reply' and r['value'].get('id') == identifier)['value']
+        try:
+            reply = self.wait(lambda r: r['event'] == 'owner.reply' and r['value'].get('id') == identifier)['value']
+        except queue.Empty:
+            with self.device_file('owner-reply.json') as downloaded:
+                assert downloaded.stat().st_size <= 32 * 1024 * 1024, 'owner reply exceeds bound'
+                reply = json.loads(downloaded.read_bytes())
+            assert reply.get('id') == identifier, 'receipt does not match the submitted command'
+            self.log.write(json.dumps({'qualification_receipt': 'app-owner-reply', 'id': identifier}) + '\n')
+            self.log.flush()
         assert reply['ok'], reply
         return reply['reply']
 

@@ -44,3 +44,4 @@ check:
 	cargo clippy --locked --manifest-path appraisal-helper/Cargo.toml --all-targets --no-deps -- -D warnings
 	cargo test --locked --manifest-path appraisal-helper/Cargo.toml
 	python3 test_gpu_appraisal_receipt.py
+	python3 test_serving_receipts.py
