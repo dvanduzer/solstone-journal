@@ -646,6 +646,14 @@ pub(crate) fn run_restic_with_stdin(
     if let Some(size) = max_repack_size {
         argv.extend(["--max-repack-size".into(), size.into()]);
     }
+    // Android app children have no desktop home/cache environment. Restic init
+    // works without a cache, but key and backup operations otherwise fail while
+    // opening one. Keep app execution explicit without inventing an ambient home
+    // or writing an unadmitted cache outside the app's retained authorities.
+    #[cfg(target_os = "android")]
+    if !argv.iter().any(|arg| arg == "--no-cache") {
+        argv.push("--no-cache".into());
+    }
     guard_argv(&argv, &secrets)?;
     let output = runner
         .run(&ToolRequest {
