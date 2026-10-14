@@ -2306,6 +2306,9 @@ mod tests {
         assert_eq!(err.code(), "unsafe-path");
     }
 
+    // Root identity is the directory's device and inode, which only Unix
+    // hosts have; Android, the one place these tools are admitted, is one.
+    #[cfg(unix)]
     #[test]
     fn substituted_native_root_refuses_root_substituted() {
         let parent = tempdir().unwrap();
@@ -2340,6 +2343,9 @@ mod tests {
         assert_eq!(err_reval.code(), "root-substituted");
     }
 
+    // Root identity is the directory's device and inode, which only Unix
+    // hosts have; Android, the one place these tools are admitted, is one.
+    #[cfg(unix)]
     #[test]
     fn substituted_resource_root_refuses_root_substituted() {
         let native_dir = tempdir().unwrap();
@@ -2634,7 +2640,6 @@ mod tests {
 
     #[test]
     fn loader_directory_rejects_separators_and_os_shadows() {
-        let dir = tempdir().unwrap();
         assert_eq!(
             validate_android_loader_directory(Path::new("relative"))
                 .unwrap_err()
@@ -2653,17 +2658,33 @@ mod tests {
                 .code(),
             "unsafe-path"
         );
-        assert!(validate_android_loader_directory(dir.path()).is_ok());
-        fs::write(dir.path().join("libc.so"), b"shadow").unwrap();
-        let err = validate_android_loader_directory(dir.path()).unwrap_err();
+        let dir = tempdir().unwrap();
+        // A drive-letter path carries the loader's `:` separator, so no Windows
+        // directory can be a loader directory.
+        #[cfg(windows)]
+        assert_eq!(
+            validate_android_loader_directory(dir.path())
+                .unwrap_err()
+                .code(),
+            "unsafe-path"
+        );
+        #[cfg(unix)]
+        assert_loader_directory_refuses_os_shadows(dir.path());
+    }
+
+    #[cfg(unix)]
+    fn assert_loader_directory_refuses_os_shadows(dir: &Path) {
+        assert!(validate_android_loader_directory(dir).is_ok());
+        fs::write(dir.join("libc.so"), b"shadow").unwrap();
+        let err = validate_android_loader_directory(dir).unwrap_err();
         assert_eq!(err.code(), "library-shadow");
         assert!(matches!(
             err,
             AndroidServiceToolsRefusal::LibraryShadow { name: "libc.so" }
         ));
-        fs::remove_file(dir.path().join("libc.so")).unwrap();
-        fs::write(dir.path().join("libz.so"), b"shadow").unwrap();
-        let err = validate_android_loader_directory(dir.path()).unwrap_err();
+        fs::remove_file(dir.join("libc.so")).unwrap();
+        fs::write(dir.join("libz.so"), b"shadow").unwrap();
+        let err = validate_android_loader_directory(dir).unwrap_err();
         assert_eq!(err.code(), "library-shadow");
         assert!(matches!(
             err,
