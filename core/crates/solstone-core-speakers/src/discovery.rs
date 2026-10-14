@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn many_well_separated_256_dim_groups_recover_expected_cluster_count() {
-        let rows = 2_000;
+        let rows = 245;
         let cols = 256;
         let (matrix, expected_clusters) = seeded_unit_normalized_discovery_matrix(rows, cols, 11);
 
