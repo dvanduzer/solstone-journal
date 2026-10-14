@@ -10,19 +10,22 @@ publish = false
 [features]
 full-tests = []
 audio-native = ["audio", "journal-mobile-audio/native"]
-audio = ["dep:journal-mobile-audio", "dep:solstone-core-transcribe", "dep:solstone-core-callosum", "dep:sha2"]
+audio = ["dep:journal-mobile-audio", "dep:solstone-core-transcribe", "dep:sha2"]
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false }
 serde_json = "1"
+log = "0.4"
+solstone-core-spl = { path = "../../core/crates/solstone-core-spl" }
+solstone-core-mcp-endpoint = { path = "../../core/crates/solstone-core-mcp-endpoint" }
 solstone-core-convey-shell = { path = "../../core/crates/solstone-core-convey-shell" }
 solstone-core-indexer-store = { path = "../../core/crates/solstone-core-indexer-store" }
 solstone-core-journal-io = { path = "../../core/crates/solstone-core-journal-io" }
 solstone-core-journal-config-write = { path = "../../core/crates/solstone-core-journal-config-write" }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 journal-mobile-audio = { path = "../mobile-audio", optional = true, default-features = false }
 solstone-core-transcribe = { path = "../../core/crates/solstone-core-transcribe", features = ["embedded"], optional = true }
-solstone-core-callosum = { path = "../../core/crates/solstone-core-callosum", optional = true }
+solstone-core-callosum = { path = "../../core/crates/solstone-core-callosum" }
 sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
