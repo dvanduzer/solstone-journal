@@ -12,10 +12,13 @@ From this directory:
 
 ```sh
 python3 build_native.py
-python3 build_apk.py --root "$PWD" --sdk "$ANDROID_HOME" --java "$JAVA_HOME"
-python3 run_device.py full --install
+python3 build_apk.py --root "$PWD" --sdk "$ANDROID_HOME" --java "$JAVA_HOME" \
+  --debug-keystore /absolute/path/to/retained-debug-keystore.p12
+python3 run_device.py full --install --signer-sha256 EXPECTED_SIGNER_SHA256
 python3 run_device.py mixed
 ```
+
+Pass the same retained debug keystore across checkouts; the builder does not create one. Read its signer SHA-256 from `build/artifact-manifest.json`. The installer checks APK bytes, package identity, signer and existing UID before a single streamed install. A signer conflict refuses installation without uninstalling or retrying.
 
 `run_device.py` targets the development handset recorded in its source. Pass `--serial SERIAL` or set `ANDROID_SERIAL` for another bench. It verifies the installed APK hash, wakes the screen and dismisses an unsecured keyguard. It leaves security settings unchanged. The app keeps the screen awake while its activity is visible.
 
@@ -35,7 +38,7 @@ python3 verify_evidence.py --files files.tar \
   --mixed evidence/mixed-<run>/events.txt --output verification.json
 ```
 
-`evidence/` contains actual command exits, app events, APK hashes and device snapshots. `build/` contains the APK, member hashes and debug key. These and native build outputs are excluded from Git.
+`evidence/` contains actual command exits, app events, APK hashes and device snapshots. `build/` contains the APK and member hashes. Keep the signing key outside the checkout. These and native build outputs are excluded from Git.
 
 ## Storage and limits
 

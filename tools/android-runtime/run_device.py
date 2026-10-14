@@ -3,7 +3,7 @@
 # Copyright (c) 2026 sol pbc
 """Bench lock must already be held. Launch the app; wait for its completion event."""
 import argparse,hashlib,json,os,pathlib,subprocess,threading,time
-p=argparse.ArgumentParser();p.add_argument('scenario');p.add_argument('--install',action='store_true');p.add_argument('--package',default='app.solstone.development.journal');p.add_argument('--serial',default=os.environ.get('ANDROID_SERIAL','RZGL11XCS9D'));a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('scenario');p.add_argument('--install',action='store_true');p.add_argument('--signer-sha256');p.add_argument('--package',default='app.solstone.development.journal');p.add_argument('--serial',default=os.environ.get('ANDROID_SERIAL','RZGL11XCS9D'));a=p.parse_args()
 if a.package not in ('app.solstone.development.journal','app.solstone.development.journal.audio'):p.error('development application required')
 run_id=str(time.time_ns())
 root=pathlib.Path(__file__).resolve().parent
@@ -19,7 +19,10 @@ def run(name,args,binary=False):
  return r.stdout
 run('device',['shell','getprop','ro.build.fingerprint'])
 run('capture-before',['shell','dumpsys','package','app.solstone.observer.phone'])
-if a.install:run('install',['install','-r',str(root/'build/journal-process-runtime.apk')])
+if a.install:
+ if not a.signer_sha256:p.error('--signer-sha256 is required with --install')
+ apk=root/'build/journal-process-runtime.apk'
+ subprocess.run([os.sys.executable,str(root/'install_apk.py'),'--apk',str(apk),'--apk-sha256',hashlib.sha256(apk.read_bytes()).hexdigest(),'--signer-sha256',a.signer_sha256,'--application-id',pkg,'--sdk',os.environ['ANDROID_HOME'],'--adb',adb[0],'--serial',a.serial,'--receipt',str(out/'install.json')],check=True,stdin=subprocess.DEVNULL)
 path=run('package-path',['shell','pm','path',pkg]).decode().strip().removeprefix('package:')
 installed=run('installed-apk',['exec-out','cat',path],True)
 expected=hashlib.sha256((root/'build/journal-process-runtime.apk').read_bytes()).hexdigest()
