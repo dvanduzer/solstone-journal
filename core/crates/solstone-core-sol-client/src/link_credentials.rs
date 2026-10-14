@@ -13,6 +13,11 @@ use crate::seam::LinkJournalMetadata;
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
+pub type FileObjectIdentity = solstone_core_journal_io::WindowsFileIdentity;
+#[cfg(not(windows))]
+pub type FileObjectIdentity = (u64, u64);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingIdentity {
     pub cert_sha256: String,
@@ -123,7 +128,7 @@ impl std::fmt::Display for StoreMutationError {
 #[derive(Clone, PartialEq, Eq)]
 pub struct StoreVersion {
     identity: PairingIdentity,
-    bundle_dev_ino: (u64, u64),
+    bundle_dev_ino: FileObjectIdentity,
     access_generation: Option<u64>,
     access_digest: Option<String>,
 }
@@ -138,7 +143,10 @@ impl std::fmt::Debug for StoreVersion {
 pub struct StoreCommit {
     pub record: RelayAccessRecord,
     pub version: StoreVersion,
-    /// False means rename succeeded, but directory durability is uncertain.
+    /// False means publication happened, but the platform's persistence checks failed.
+    /// On Unix these flush directory entries. On Windows they confirm directory
+    /// presence after the file flush and rename, without claiming power-loss persistence
+    /// of directory entries (the journal filesystem contract).
     pub durable: bool,
 }
 
@@ -210,13 +218,8 @@ impl LinkCredentialStore {
 
     pub fn acquire_lock(&self) -> Result<SidecarLockGuard, StoreMutationError> {
         let file = self.open_lock_file()?;
-        #[cfg(unix)]
-        {
-            use rustix::fs::{FlockOperation, flock};
-            flock(&file, FlockOperation::LockExclusive).map_err(|err| {
-                StoreMutationError::LockFailed(format!("cannot flock lock file: {err}"))
-            })?;
-        }
+        file.lock()
+            .map_err(|err| StoreMutationError::LockFailed(err.to_string()))?;
         Ok(SidecarLockGuard { _file: file })
     }
 
@@ -228,25 +231,18 @@ impl LinkCredentialStore {
             return Err(StoreMutationError::Retired);
         }
         let file = self.open_lock_file()?;
-        #[cfg(unix)]
-        {
-            use rustix::fs::{FlockOperation, flock};
-            loop {
-                if !may_publish() {
-                    return Err(StoreMutationError::Retired);
+        loop {
+            if !may_publish() {
+                return Err(StoreMutationError::Retired);
+            }
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    // The caller supplies its deadline/retirement fence.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                    Ok(()) => break,
-                    Err(rustix::io::Errno::WOULDBLOCK) => {
-                        // Never park the mutation owner indefinitely behind another
-                        // process. The caller supplies its deadline/retirement fence.
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(err) => {
-                        return Err(StoreMutationError::LockFailed(format!(
-                            "cannot flock lock file: {err}"
-                        )));
-                    }
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(StoreMutationError::LockFailed(err.to_string()));
                 }
             }
         }
@@ -357,8 +353,8 @@ impl LinkCredentialStore {
         if &identity != expected_identity {
             return Err(StoreMutationError::IdentityMismatch);
         }
-        let bundle_dev_ino =
-            get_file_dev_ino(&self.bundle_dir).map_err(|_| StoreMutationError::BundleNotFound)?;
+        let bundle_dev_ino = file_object_identity(&self.bundle_dir)
+            .map_err(|_| StoreMutationError::BundleNotFound)?;
         let bytes = match fs::read(self.bundle_dir.join("relay_access.json")) {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -393,8 +389,8 @@ impl LinkCredentialStore {
         let identity = self
             .compute_identity()
             .map_err(|_| StoreMutationError::BundleNotFound)?;
-        let dev_ino =
-            get_file_dev_ino(&self.bundle_dir).map_err(|_| StoreMutationError::BundleNotFound)?;
+        let dev_ino = file_object_identity(&self.bundle_dir)
+            .map_err(|_| StoreMutationError::BundleNotFound)?;
         if identity != version.identity || dev_ino != version.bundle_dev_ino {
             return Err(StoreMutationError::IdentityMismatch);
         }
@@ -795,15 +791,12 @@ impl LinkCredentialStore {
     fn sync_directories(&self) -> bool {
         // Rename changes entries in both directories. Attempt both even if the
         // first sync fails; the result reports visible but uncertain publication.
-        let bundle_synced = !self.take_write_fault(2)
-            && File::open(&self.bundle_dir)
-                .and_then(|file| file.sync_all())
-                .is_ok();
+        let bundle_synced = !self.take_write_fault(2) && sync_directory(&self.bundle_dir).is_ok();
         let parent_synced = !self.take_write_fault(3)
             && self
                 .bundle_dir
                 .parent()
-                .is_some_and(|parent| File::open(parent).and_then(|file| file.sync_all()).is_ok());
+                .is_some_and(|parent| sync_directory(parent).is_ok());
         bundle_synced && parent_synced
     }
 }
@@ -821,17 +814,62 @@ pub fn pem_cert_der(pem: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(body).ok()
 }
 
-pub fn get_file_dev_ino(path: &Path) -> Result<(u64, u64), String> {
+/// Preserve the complete platform-native identity, including Windows' 128-bit file ID.
+pub fn file_object_identity(path: &Path) -> Result<FileObjectIdentity, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(path).map_err(|err| format!("failed to stat {path:?}: {err}"))?;
         Ok((meta.dev(), meta.ino()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let file =
+            open_windows_object(path).map_err(|err| format!("failed to open {path:?}: {err}"))?;
+        solstone_core_journal_io::windows_file_identity(&file)
+            .map_err(|err| format!("failed to identify {path:?}: {err}"))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
-        Ok((0, 0))
+        Err("native object identity is unsupported".to_owned())
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_object(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(
+            "can't use this location for connection settings",
+        ));
+    }
+    Ok(file)
+}
+
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        // Windows has no directory-entry flush in the journal filesystem contract.
+        // Confirm the no-follow directory still exists; staged files were flushed.
+        if open_windows_object(path)?.metadata()?.is_dir() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "connection settings path must be a folder",
+            ))
+        }
     }
 }
 
@@ -1021,6 +1059,12 @@ mod tests {
 
         let guard1 = store1.acquire_lock().expect("store1 acquires lock");
         assert!(store1.lock_path().exists());
+        let contender = store2.open_lock_file().unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(contender);
 
         // store2 in another thread attempting non-blocking or dropping guard1
         drop(guard1);
@@ -1411,7 +1455,7 @@ mod tests {
                 .unwrap();
             assert!(!commit.durable);
             assert_eq!(store.capture_version(&identity).unwrap(), commit.version);
-            let before = get_file_dev_ino(&path).unwrap();
+            let before = file_object_identity(&path).unwrap();
             let bytes = fs::read(&path).unwrap();
             let repaired = store
                 .reconcile_if_current(&commit.version, || true)
@@ -1419,7 +1463,7 @@ mod tests {
             assert!(repaired.durable);
             assert_eq!(repaired.version, commit.version);
             assert_eq!(
-                get_file_dev_ino(&path).unwrap(),
+                file_object_identity(&path).unwrap(),
                 before,
                 "reconcile must not rewrite"
             );

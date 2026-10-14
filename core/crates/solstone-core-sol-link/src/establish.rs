@@ -471,6 +471,8 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(fs::read(bundle.join("state.json")).unwrap(), before);
         assert!(bundle.join("cert.pem").is_file());
+        // POSIX mode bits are not the Windows private-file permission model.
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(bundle.join("private.pem"))
                 .unwrap()

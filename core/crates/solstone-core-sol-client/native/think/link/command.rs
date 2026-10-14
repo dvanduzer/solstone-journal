@@ -1433,7 +1433,7 @@ where
     for (name, content) in files {
         write_file(&staging.path.join(name), content)?;
     }
-    File::open(&staging.path)?.sync_all()?;
+    crate::link_credentials::sync_directory(&staging.path)?;
     publish_staging_dir(&staging.path, bundle_dir)?;
     staging.disarm();
     if let Ok(directory) = File::open(parent) {

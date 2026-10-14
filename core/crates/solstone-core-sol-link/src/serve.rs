@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use solstone_core_ingest_contract::CONNECTION_BODY_LIMIT;
 use solstone_core_sol_client::link_credentials::{
     LinkCredentialStore, PairingIdentity, StoreLoadOutcome, StoreMutationError, StoreVersion,
-    get_file_dev_ino, parse_relay_origin, same_relay_origin,
+    file_object_identity, parse_relay_origin, same_relay_origin,
 };
 use solstone_core_sol_client::resident::ShutdownSignal;
 use solstone_core_sol_client::seam::{
@@ -932,7 +932,7 @@ pub struct StatusTracker {
     operation_epoch: std::sync::atomic::AtomicU64,
     retired: AtomicBool,
     expected_identity: Option<PairingIdentity>,
-    expected_dev_ino: Option<(u64, u64)>,
+    expected_dev_ino: Option<solstone_core_sol_client::link_credentials::FileObjectIdentity>,
     instance_id: String,
     ca_fp_prefix_hex: String,
     paired_at: String,
@@ -991,7 +991,7 @@ impl StatusTracker {
             if bundle_dir.as_os_str().is_empty() {
                 (None, None, None)
             } else {
-                let dev_ino = get_file_dev_ino(&bundle_dir).ok();
+                let dev_ino = file_object_identity(&bundle_dir).ok();
                 let store = LinkCredentialStore::new(bundle_dir.clone(), "");
                 let id = store.compute_identity().ok();
                 let metadata_path = bundle_dir.join("journal_metadata.json");
@@ -1089,7 +1089,7 @@ impl StatusTracker {
             return true;
         }
         if let Some(expected_dev_ino) = self.expected_dev_ino
-            && get_file_dev_ino(&self.bundle_dir).ok() != Some(expected_dev_ino)
+            && file_object_identity(&self.bundle_dir).ok() != Some(expected_dev_ino)
         {
             return false;
         }

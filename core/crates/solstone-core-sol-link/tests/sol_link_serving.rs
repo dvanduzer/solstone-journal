@@ -2093,7 +2093,7 @@ fn access_http_completion_cannot_overwrite_successor_or_publish_after_shutdown()
 #[cfg(feature = "access-test-hooks")]
 #[test]
 fn ready_requires_durability_and_uncertain_commit_reconciles_without_rewrite() {
-    use solstone_core_sol_client::link_credentials::{StoreWriteFault, get_file_dev_ino};
+    use solstone_core_sol_client::link_credentials::{StoreWriteFault, file_object_identity};
     for fault in [
         StoreWriteFault::BeforeRename,
         StoreWriteFault::BundleSync,
@@ -2130,13 +2130,13 @@ fn ready_requires_durability_and_uncertain_commit_reconciles_without_rewrite() {
         } else {
             assert_ne!(record.device_token.as_deref(), Some("old"));
             assert!(manager.persistence_uncertain_for_test());
-            let inode = get_file_dev_ino(&path.join("relay_access.json")).unwrap();
+            let inode = file_object_identity(&path.join("relay_access.json")).unwrap();
             access_exchange_with(&scheduler, 503, json!({}), || {});
             assert_eq!(manager.incarnation(), 1);
             assert!(manager.get().0.is_some());
             assert!(!manager.persistence_uncertain_for_test());
             assert_eq!(
-                get_file_dev_ino(&path.join("relay_access.json")).unwrap(),
+                file_object_identity(&path.join("relay_access.json")).unwrap(),
                 inode
             );
         }

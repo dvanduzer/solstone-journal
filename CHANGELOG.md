@@ -12,6 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- on windows, `solstone link join` can finish pairing and save connection settings.
 - on windows, you can preview an import again.
 - with confidential processing, older recordings and days waiting their turn no longer hold up new recordings and recent days. your journal works on one older item at a time, and newer work starts ahead of older work still waiting.
 - stopping or restarting your journal no longer waits several extra seconds when a background job left a helper program running. that time now goes to letting your journal's other programs stop cleanly.

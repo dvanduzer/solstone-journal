@@ -5455,8 +5455,10 @@ dependencies = [
  "serde",
  "serde_json",
  "solstone-core-format",
+ "solstone-core-journal-io",
  "spl-core",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
