@@ -35,16 +35,20 @@ pub fn resolve_journal_path(journal: &Path, rel: &str) -> Result<PathBuf, Journa
     let rel = normalize_rel(rel);
     validate_rel(&rel)?;
     let first = rel.split('/').next().unwrap_or("");
-    if is_date_key(first) {
-        Ok(journal.join(CHRONICLE_DIR).join(rel))
+    let mut resolved = if is_date_key(first) {
+        journal.join(CHRONICLE_DIR)
     } else {
-        Ok(journal.join(rel))
+        journal.to_path_buf()
+    };
+    for part in rel.split('/') {
+        resolved.push(part);
     }
+    Ok(resolved)
 }
 
 /// Drop trailing slashes, repeated separators, and `.` the way pathlib parts do.
 fn normalize_rel(rel: &str) -> String {
-    if rel.contains('\\') || Path::new(rel).is_absolute() {
+    if rel.contains('\\') || rel.starts_with('/') || Path::new(rel).has_root() {
         return rel.to_owned();
     }
     let parts: Vec<&str> = rel
@@ -69,16 +73,21 @@ fn validate_rel(rel: &str) -> Result<(), JournalPathError> {
     if rel.is_empty() {
         return Err(JournalPathError::Empty);
     }
-    if Path::new(rel).is_absolute() {
+    if rel.starts_with('/') || Path::new(rel).has_root() {
         return Err(JournalPathError::Absolute);
     }
     if rel.contains('\\') {
         return Err(JournalPathError::Backslash);
     }
-    if rel
-        .split('/')
-        .any(|part| part.is_empty() || part == "." || part == "..")
-    {
+    if rel.split('/').any(|part| {
+        part.is_empty()
+            || part == "."
+            || part == ".."
+            || !matches!(
+                Path::new(part).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+    }) {
         return Err(JournalPathError::InvalidComponent);
     }
     Ok(())
@@ -128,6 +137,31 @@ mod tests {
             resolve_journal_path(journal, "20240101/").unwrap(),
             PathBuf::from("/tmp/journal/chronicle/20240101")
         );
+    }
+
+    #[test]
+    fn resolved_paths_use_native_separators_without_changing_the_journal() {
+        let journal = Path::new(if cfg!(windows) {
+            r"C:\journal"
+        } else {
+            "/journal"
+        });
+        let expected = journal
+            .join("chronicle")
+            .join("20240101")
+            .join("talents")
+            .join("flow.md");
+        let actual = resolve_journal_path(journal, "20240101/talents/flow.md").unwrap();
+        assert_eq!(actual.as_os_str(), expected.as_os_str());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_components_never_replace_the_journal_root() {
+        let journal = Path::new(r"C:\journal");
+        for rel in ["D:escape", "chronicle/D:escape", "D:/escape"] {
+            assert!(resolve_journal_path(journal, rel).is_err(), "{rel}");
+        }
     }
 
     #[test]

@@ -295,33 +295,37 @@ pub fn resolve_journal_path(journal: &Path, rel: &str) -> Result<PathBuf, PathEr
     if normalized.trim().is_empty() {
         return Err(invalid(rel, "journal path must not be empty"));
     }
-    if Path::new(&normalized).is_absolute() {
+    if normalized.starts_with('/') || Path::new(&normalized).has_root() {
         return Err(invalid(rel, "journal path must be relative"));
     }
     if normalized.contains('\\') {
         return Err(invalid(rel, "journal path must use forward slashes"));
     }
-    if normalized
-        .split('/')
-        .any(|part| part.is_empty() || matches!(part, "." | ".."))
-    {
+    if normalized.split('/').any(|part| {
+        part.is_empty()
+            || matches!(part, "." | "..")
+            || !matches!(
+                Path::new(part).components().collect::<Vec<_>>().as_slice(),
+                [Component::Normal(_)]
+            )
+    }) {
         return Err(invalid(rel, "journal path contains invalid component"));
     }
-    let relative = Path::new(&normalized);
-    let mut components = relative.components();
-    let resolved = match components
-        .next()
-        .and_then(|component| component.as_os_str().to_str())
-    {
-        Some(day) if is_day_key(day) => journal.join(CHRONICLE_DIR).join(relative),
-        _ => journal.join(relative),
+    let first = normalized.split('/').next().unwrap_or("");
+    let mut resolved = if is_day_key(first) {
+        journal.join(CHRONICLE_DIR)
+    } else {
+        journal.to_path_buf()
     };
+    for part in normalized.split('/') {
+        resolved.push(part);
+    }
     Ok(resolved)
 }
 
 /// Drop trailing slashes, repeated separators, and `.` the way pathlib parts do.
 fn normalize_rel(rel: &str) -> String {
-    if rel.contains('\\') || Path::new(rel).is_absolute() {
+    if rel.contains('\\') || rel.starts_with('/') || Path::new(rel).has_root() {
         return rel.to_owned();
     }
     let parts: Vec<&str> = rel
@@ -1378,5 +1382,38 @@ mod tests {
         assert!(identity_names.contains(&"093000_300_a"));
         assert!(identity_names.contains(&"093000_300_b"));
         assert!(check_unique_record_keys(&identities).is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_relative_tests {
+    use super::*;
+
+    #[test]
+    fn logical_paths_become_native_paths_without_replacing_the_root() {
+        let root = Path::new(if cfg!(windows) {
+            r"C:\journal"
+        } else {
+            "/journal"
+        });
+        let expected = root
+            .join("chronicle")
+            .join("20260101")
+            .join("photos")
+            .join("image.jpg");
+        let resolved = resolve_journal_path(root, "20260101/photos/image.jpg").unwrap();
+        assert_eq!(resolved.as_os_str(), expected.as_os_str());
+        for rel in [
+            "/escape",
+            "//escape",
+            "chronicle/../escape",
+            r"chronicle\escape",
+        ] {
+            assert!(resolve_journal_path(root, rel).is_err(), "{rel}");
+        }
+        #[cfg(windows)]
+        for rel in ["D:escape", "chronicle/D:escape", "D:/escape"] {
+            assert!(resolve_journal_path(root, rel).is_err(), "{rel}");
+        }
     }
 }

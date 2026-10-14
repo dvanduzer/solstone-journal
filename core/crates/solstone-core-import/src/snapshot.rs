@@ -75,6 +75,18 @@ pub struct Snapshot {
     temporary: Option<tempfile::TempDir>,
 }
 
+// Metadata carries logical slash paths; native separators are not wire syntax.
+fn portable_relative(path: &Path) -> Result<PathBuf, String> {
+    let parts = path
+        .components()
+        .map(|part| match part {
+            std::path::Component::Normal(name) => name.to_str().ok_or("invalid snapshot path"),
+            _ => Err("invalid snapshot path"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PathBuf::from(parts.join("/")))
+}
+
 impl Snapshot {
     pub fn persist(mut self) {
         if let Some(temporary) = self.temporary.take() {
@@ -137,10 +149,11 @@ pub fn create(journal: &Path, import_id: &str, source: &Path) -> Result<Snapshot
     if before != after || before != fingerprint(&destination).map_err(|error| error.to_string())? {
         return Err("the source changed while preparing its preview; try again".to_owned());
     }
-    let relative = destination
-        .strip_prefix(&parent)
-        .map_err(|error| error.to_string())?
-        .to_path_buf();
+    let relative = portable_relative(
+        destination
+            .strip_prefix(&parent)
+            .map_err(|error| error.to_string())?,
+    )?;
     Ok(Snapshot {
         relative,
         digest: before,
@@ -200,8 +213,13 @@ pub fn verify_preview(
     setting: Option<&str>,
     source_hint: Option<&str>,
 ) -> Result<(), String> {
+    let lexical_imports = journal.join("imports");
+    let canonical_imports = lexical_imports
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
     let relative = source
-        .strip_prefix(journal.join("imports"))
+        .strip_prefix(&lexical_imports)
+        .or_else(|_| source.strip_prefix(&canonical_imports))
         .map_err(|error| error.to_string())?;
     let id = relative
         .components()
@@ -240,8 +258,9 @@ pub fn verify_preview(
         || relative
             .strip_prefix(id)
             .ok()
-            .and_then(|path| path.to_str())
-            != record["relative"].as_str()
+            .and_then(|path| portable_relative(path).ok())
+            .as_deref()
+            != record["relative"].as_str().map(Path::new)
     {
         return Err(
             "the source or settings changed after preview; preview again before importing"
@@ -269,7 +288,12 @@ pub fn discard_download(journal: &Path, import_id: &str) -> Result<(), String> {
         .and_then(serde_json::Value::as_str)
     {
         let path = Path::new(path);
-        if let Ok(relative) = path.strip_prefix(&parent) {
+        let lexical_parent = journal.join("imports").join(import_id);
+        if let Ok(relative) = path
+            .strip_prefix(&parent)
+            .or_else(|_| path.strip_prefix(&lexical_parent))
+        {
+            let relative = portable_relative(relative)?;
             let safe = solstone_core_journal_io::contained_path(
                 &parent,
                 relative.to_str().ok_or("invalid download path")?,
@@ -319,6 +343,7 @@ mod tests {
         let (root, source) = fixture();
         let prepared = create(root.path(), ID, &source).unwrap();
         let (relative, digest) = (prepared.relative.clone(), prepared.digest.clone());
+        assert!(!relative.as_os_str().to_str().unwrap().contains('\\'));
         prepared.persist();
         let snapshot = root.path().join("imports").join(ID).join(&relative);
         assert_eq!(
