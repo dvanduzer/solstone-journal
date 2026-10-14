@@ -924,48 +924,74 @@ pub fn read_raw_input_fingerprint(journal: &Path, day: &str) -> Result<String, C
     let day_dir = journal.join("chronicle").join(day);
     let mut entries = Vec::new();
     for segment in iter_segments(journal, PathOrDay::Day(day))? {
-        for entry in read_dir(segment.path())? {
-            let entry = entry.map_err(|source| CatchupError::Io {
-                path: segment.path().to_path_buf(),
-                source,
-            })?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                return Err(CatchupError::State(format!(
-                    "non-UTF-8 input name under {}",
-                    segment.path().display()
-                )));
-            };
-            let marker = if is_raw_hashed(&name) && !is_processing_projection(&path) {
-                sha256_file(&path)?
-            } else if is_sized_media(&path) {
-                format!("size:{}", metadata(&path)?.len())
-            } else {
-                continue;
-            };
-            let relative = path
-                .strip_prefix(&day_dir)
-                .map_err(|_| {
-                    CatchupError::State(format!("segment path escaped day: {}", path.display()))
-                })?
-                .to_str()
-                .ok_or_else(|| {
-                    CatchupError::State(format!(
-                        "non-UTF-8 relative path under {}",
-                        day_dir.display()
-                    ))
-                })?
-                .replace('\\', "/");
-            entries.push((relative, marker));
-        }
+        push_raw_input_entries(&day_dir, segment.path(), &mut entries)?;
     }
+    Ok(sorted_input_digest(entries))
+}
+
+/// The same raw-input fingerprint, for one segment directory under its day.
+pub fn read_segment_input_fingerprint(
+    journal: &Path,
+    day: &str,
+    segment_dir: &Path,
+) -> Result<String, CatchupError> {
+    let mut entries = Vec::new();
+    push_raw_input_entries(
+        &journal.join("chronicle").join(day),
+        segment_dir,
+        &mut entries,
+    )?;
+    Ok(sorted_input_digest(entries))
+}
+
+fn push_raw_input_entries(
+    day_dir: &Path,
+    segment_dir: &Path,
+    entries: &mut Vec<(String, String)>,
+) -> Result<(), CatchupError> {
+    for entry in read_dir(segment_dir)? {
+        let entry = entry.map_err(|source| CatchupError::Io {
+            path: segment_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(CatchupError::State(format!(
+                "non-UTF-8 input name under {}",
+                segment_dir.display()
+            )));
+        };
+        let marker = if is_raw_hashed(&name) && !is_processing_projection(&path) {
+            sha256_file(&path)?
+        } else if is_sized_media(&path) {
+            format!("size:{}", metadata(&path)?.len())
+        } else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(day_dir)
+            .map_err(|_| {
+                CatchupError::State(format!("segment path escaped day: {}", path.display()))
+            })?
+            .to_str()
+            .ok_or_else(|| {
+                CatchupError::State(format!(
+                    "non-UTF-8 relative path under {}",
+                    day_dir.display()
+                ))
+            })?
+            .replace('\\', "/");
+        entries.push((relative, marker));
+    }
+    Ok(())
+}
+
+fn sorted_input_digest(mut entries: Vec<(String, String)>) -> String {
     entries.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(hex_digest(Sha256::digest(
-        compact_ascii_entries(&entries).as_bytes(),
-    )))
+    hex_digest(Sha256::digest(compact_ascii_entries(&entries).as_bytes()))
 }
 
 pub fn eligible_or_fail_open(journal: &Path, day: &str, now: SystemTime) -> bool {

@@ -23,6 +23,7 @@ solstone-core-indexer-query = { path = "../../../core/crates/solstone-core-index
 solstone-core-generate = { path = "../../../core/crates/solstone-core-generate" }
 solstone-core-generate-wire = { path = "../../../core/crates/solstone-core-generate-wire" }
 solstone-core-talent-runtime = { path = "../../../core/crates/solstone-core-talent-runtime" }
+solstone-core-spp-attest = { path = "../../../core/crates/solstone-core-spp-attest" }
 
 [patch.crates-io]
 ffmpeg-sys-next = { path = "../../../core/vendor/ffmpeg-sys-next" }

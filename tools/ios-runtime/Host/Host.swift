@@ -1,12 +1,622 @@
-import ExtensionFoundation
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
+import ExtensionFoundation
 import SwiftUI
 import UIKit
 import XPC
 
 extension AppExtensionPoint {
   @Definition static var journal: AppExtensionPoint { Name("journal") }
+  @Definition static var gpuAppraisal: AppExtensionPoint { Name("gpu-appraisal") }
+}
+
+struct AppraisalWireRequest: Codable, Sendable {
+  var op: String
+  var payload: String = ""
+  var bridgeAttempt: UInt64
+
+  enum CodingKeys: String, CodingKey {
+    case op
+    case payload
+    case bridgeAttempt = "bridge_attempt"
+  }
+}
+
+private struct HostAttemptRecord: Codable {
+  let schema: String
+  let bootSeconds: Int64
+  let bootMicroseconds: Int32
+  let bridgeAttempt: UInt64
+  let hostPid: Int32
+  let helperPid: Int32?
+  let deadlineUptimeMs: UInt64
+  let phase: String
+
+  enum CodingKeys: String, CodingKey {
+    case schema
+    case bootSeconds = "boot_seconds"
+    case bootMicroseconds = "boot_microseconds"
+    case bridgeAttempt = "bridge_attempt"
+    case hostPid = "host_pid"
+    case helperPid = "helper_pid"
+    case deadlineUptimeMs = "deadline_uptime_ms"
+    case phase
+  }
+}
+
+final class AppraisalHostBridge: @unchecked Sendable {
+  static let shared = AppraisalHostBridge()
+  private let appGroup = "group.app.solstone.journal.runtime.dev"
+  private let recordName = "gpu-appraisal-attempt.json"
+  let lock = NSLock()
+  private var currentSession: XPCSession?
+  private var activePid: pid_t?
+  private var activeAttempt: UInt64?
+  private var ownershipUnknown = false
+  private var isCancelled = false
+
+  private func bootIdentity() -> (Int64, Int32)? {
+    var boot = timeval()
+    var size = MemoryLayout<timeval>.size
+    guard sysctlbyname("kern.boottime", &boot, &size, nil, 0) == 0 else { return nil }
+    return (Int64(boot.tv_sec), Int32(boot.tv_usec))
+  }
+
+  private func recordURL() -> URL? {
+    FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)?
+      .appendingPathComponent(recordName, isDirectory: false)
+  }
+
+  private func readRecord(_ url: URL) -> HostAttemptRecord? {
+    guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+          data.count <= 4_096
+    else {
+      return nil
+    }
+    return try? JSONDecoder().decode(HostAttemptRecord.self, from: data)
+  }
+
+  private func recordPredatesCurrentBoot(_ url: URL, bootSeconds: Int64) -> Bool {
+    var info = stat()
+    let status: Int32 = url.withUnsafeFileSystemRepresentation { path in
+      guard let path else { return Int32(-1) }
+      return stat(path, &info)
+    }
+    return status == 0 && Int64(info.st_mtimespec.tv_sec) < bootSeconds
+  }
+
+  private func writeRecord(_ record: HostAttemptRecord, to url: URL) -> Bool {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(record),
+          data.count <= 4_096
+    else {
+      return false
+    }
+    do {
+      try data.write(to: url, options: [.atomic])
+      let fileDescriptor = open(url.path, O_RDONLY | O_CLOEXEC)
+      guard fileDescriptor >= 0 else { return false }
+      let fileSynced = fsync(fileDescriptor) == 0
+      close(fileDescriptor)
+      let directoryDescriptor = open(url.deletingLastPathComponent().path, O_RDONLY | O_CLOEXEC)
+      guard directoryDescriptor >= 0 else { return false }
+      let directorySynced = fsync(directoryDescriptor) == 0
+      close(directoryDescriptor)
+      return fileSynced && directorySynced
+    } catch {
+      return false
+    }
+  }
+
+  private func makeRecord(
+    attempt: UInt64, deadlineMs: UInt64, helperPid: pid_t?, phase: String
+  ) -> HostAttemptRecord? {
+    guard let boot = bootIdentity(), attempt > 0 else { return nil }
+    return HostAttemptRecord(
+      schema: "gpu-appraisal-attempt-v1",
+      bootSeconds: boot.0,
+      bootMicroseconds: boot.1,
+      bridgeAttempt: attempt,
+      hostPid: Int32(getpid()),
+      helperPid: helperPid,
+      deadlineUptimeMs: deadlineMs,
+      phase: phase)
+  }
+
+  private func reserve(attempt: UInt64, deadlineMs: UInt64) -> Bool {
+    guard let url = recordURL(), let boot = bootIdentity() else { return false }
+    if FileManager.default.fileExists(atPath: url.path) {
+      if let prior = readRecord(url) {
+        guard prior.schema == "gpu-appraisal-attempt-v1" else { return false }
+        if prior.bootSeconds == boot.0 && prior.bootMicroseconds == boot.1 {
+          guard prior.phase == "retired" else { return false }
+        }
+      } else if !recordPredatesCurrentBoot(url, bootSeconds: boot.0) {
+        return false
+      }
+    }
+    guard let record = makeRecord(
+      attempt: attempt, deadlineMs: deadlineMs, helperPid: nil, phase: "reserved")
+    else {
+      return false
+    }
+    return writeRecord(record, to: url)
+  }
+
+  private func updateRecord(
+    attempt: UInt64, deadlineMs: UInt64, helperPid: pid_t?, phase: String
+  ) -> Bool {
+    guard let url = recordURL(),
+          let current = readRecord(url),
+          let boot = bootIdentity(),
+          current.schema == "gpu-appraisal-attempt-v1",
+          current.bootSeconds == boot.0,
+          current.bootMicroseconds == boot.1,
+          current.bridgeAttempt == attempt,
+          current.hostPid == Int32(getpid()),
+          let next = makeRecord(
+            attempt: attempt, deadlineMs: deadlineMs, helperPid: helperPid, phase: phase)
+    else {
+      return false
+    }
+    return writeRecord(next, to: url)
+  }
+
+  func cancel() {
+    journal_ios_verifier_cancel()
+    lock.lock()
+    isCancelled = true
+    let session = currentSession
+    let pid = activePid
+    let attempt = activeAttempt
+    lock.unlock()
+
+    if let session, let attempt {
+      let request = AppraisalWireRequest(op: "cancel", bridgeAttempt: attempt)
+      try? session.send(request) { (_: Result<Reply, Error>) in }
+    }
+    if let pid, pid > 0 {
+      kill(pid, SIGKILL)
+    }
+  }
+
+  func clearCancellationIfDrained() {
+    lock.lock()
+    if activePid == nil && !ownershipUnknown {
+      isCancelled = false
+      activeAttempt = nil
+    }
+    lock.unlock()
+  }
+
+  private func isPidDead(_ pid: pid_t) -> Bool {
+    guard pid > 0 else { return false }
+    return kill(pid, 0) == -1 && errno == ESRCH
+  }
+
+  private func waitForDeath(pid: pid_t, deadline: Double) async -> Bool {
+    guard pid > 0 else { return false }
+    while ProcessInfo.processInfo.systemUptime < deadline {
+      if isPidDead(pid) { return true }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    kill(pid, SIGKILL)
+    let killDeadline = ProcessInfo.processInfo.systemUptime + 2.0
+    while ProcessInfo.processInfo.systemUptime < killDeadline {
+      if isPidDead(pid) { return true }
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    return isPidDead(pid)
+  }
+
+  private func json(_ value: [String: Any]) -> String {
+    guard JSONSerialization.isValidJSONObject(value),
+          let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+    else {
+      return "{}"
+    }
+    return String(data: data, encoding: .utf8) ?? "{}"
+  }
+
+  private func logTransportResult(_ value: String) {
+    guard let data = value.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else {
+      print("event=ios_verifier_transport malformed_summary=true")
+      return
+    }
+    var summary: [String: Any] = [:]
+    for key in ["bridge_attempt", "pid", "exited", "cancelled", "malformed"] {
+      if let item = object[key] { summary[key] = item }
+    }
+    if let reply = object["reply"] as? [String: Any] {
+      for key in ["bridge_attempt", "pid", "returncode", "result_code", "result_message", "main_thread_init"] {
+        if let item = reply[key] { summary["reply_\(key)"] = item }
+      }
+      summary["reply_claims_count"] = (reply["claims"] as? [Any])?.count ?? -1
+      summary["reply_detached_eat_count"] = (reply["detached_eat"] as? [Any])?.count ?? -1
+    }
+    print("event=ios_verifier_transport summary=\(json(summary))")
+  }
+
+  private func send(
+    _ request: AppraisalWireRequest, through session: XPCSession, timeout: Double
+  ) async throws -> Reply {
+    try await withCheckedThrowingContinuation { continuation in
+      let pending = PendingReply(continuation)
+      let timer = DispatchWorkItem {
+        if pending.finish(.failure(NSError(domain: "appraisal-timeout", code: 151))) {
+          session.cancel(reason: "appraisal timeout")
+        }
+      }
+      pending.watchdog = timer
+      DispatchQueue.global().asyncAfter(deadline: .now() + max(0.001, timeout), execute: timer)
+      do {
+        try session.send(request) { (result: Result<Reply, Error>) in pending.finish(result) }
+      } catch {
+        pending.finish(.failure(error))
+      }
+    }
+  }
+
+  private func finishKnownProcess(
+    attempt: UInt64, pid: pid_t, deadlineMs: UInt64, deadline: Double
+  ) async -> Bool {
+    let dead = await waitForDeath(pid: pid, deadline: deadline)
+    lock.lock()
+    if dead {
+      activePid = nil
+      currentSession = nil
+    } else {
+      ownershipUnknown = true
+    }
+    lock.unlock()
+    if dead {
+      let recorded = updateRecord(
+        attempt: attempt, deadlineMs: deadlineMs, helperPid: pid, phase: "retired")
+      if recorded {
+        lock.lock()
+        activeAttempt = nil
+        lock.unlock()
+      }
+      return recorded
+    }
+    return false
+  }
+
+  func transport(_ cRequestStr: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
+    guard let cRequestStr else {
+      return strdup(json([
+        "bridge_attempt": 0,
+        "malformed": "null request pointer",
+        "exited": false,
+        "cancelled": false,
+      ]))
+    }
+    let requestString = String(cString: cRequestStr)
+    guard requestString.utf8.count <= 1_114_112,
+          let data = requestString.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let attemptNumber = object["bridge_attempt"] as? NSNumber,
+          let budgetNumber = object["budget_ms"] as? NSNumber
+    else {
+      return strdup(json([
+        "bridge_attempt": 0,
+        "malformed": "invalid bounded appraisal request",
+        "exited": false,
+        "cancelled": false,
+      ]))
+    }
+    let attempt = attemptNumber.uint64Value
+    let budgetMs = min(budgetNumber.uint64Value, 60_000)
+    guard attempt > 0, budgetMs > 0 else {
+      return strdup(json([
+        "bridge_attempt": attempt,
+        "malformed": "invalid appraisal attempt or budget",
+        "retired_without_launch": true,
+        "cancelled": false,
+      ]))
+    }
+
+    let start = ProcessInfo.processInfo.systemUptime
+    let deadline = start + Double(budgetMs) / 1_000.0
+    let deadlineMs = UInt64(deadline * 1_000)
+
+    lock.lock()
+    if ownershipUnknown || activePid != nil || activeAttempt != nil {
+      lock.unlock()
+      return strdup(json([
+        "bridge_attempt": attempt,
+        "malformed": "previous helper ownership has not retired",
+        "exited": false,
+        "cancelled": false,
+      ]))
+    }
+    if isCancelled {
+      lock.unlock()
+      return strdup(json([
+        "bridge_attempt": attempt,
+        "malformed": "appraisal cancelled before reservation",
+        "retired_without_launch": true,
+        "cancelled": true,
+      ]))
+    }
+    activeAttempt = attempt
+    lock.unlock()
+
+    guard reserve(attempt: attempt, deadlineMs: deadlineMs) else {
+      lock.lock()
+      ownershipUnknown = true
+      lock.unlock()
+      return strdup(json([
+        "bridge_attempt": attempt,
+        "malformed": "appraisal ownership record refused",
+        "exited": false,
+        "cancelled": false,
+      ]))
+    }
+
+    let result = AppraisalResultBox()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+      do {
+        let monitor = try await AppExtensionPoint.Monitor(appExtensionPoint: .gpuAppraisal)
+        let matches = monitor.identities.filter {
+          $0.bundleIdentifier == "app.solstone.journal.runtime.dev.gpu-appraisal"
+        }
+        guard matches.count == 1, let identity = matches.first else {
+          guard self.updateRecord(
+            attempt: attempt, deadlineMs: deadlineMs, helperPid: nil, phase: "retired")
+          else {
+            self.lock.lock()
+            self.ownershipUnknown = true
+            self.lock.unlock()
+            throw NSError(domain: "appraisal-record", code: 1)
+          }
+          self.lock.lock()
+          self.activeAttempt = nil
+          let cancelled = self.isCancelled
+          self.lock.unlock()
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "malformed": "extension discovery failed",
+            "retired_without_launch": true,
+            "cancelled": cancelled,
+          ]))
+          semaphore.signal()
+          return
+        }
+
+        self.lock.lock()
+        let cancelledBeforeLaunch = self.isCancelled
+        self.lock.unlock()
+        if cancelledBeforeLaunch {
+          guard self.updateRecord(
+            attempt: attempt, deadlineMs: deadlineMs, helperPid: nil, phase: "retired")
+          else {
+            throw NSError(domain: "appraisal-record", code: 2)
+          }
+          self.lock.lock()
+          self.activeAttempt = nil
+          self.lock.unlock()
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "malformed": "appraisal cancelled before launch",
+            "retired_without_launch": true,
+            "cancelled": true,
+          ]))
+          semaphore.signal()
+          return
+        }
+
+        let process = try await AppExtensionProcess(
+          configuration: .init(appExtensionIdentity: identity))
+        let session = try process.makeXPCSession()
+        try session.activate()
+
+        self.lock.lock()
+        self.currentSession = session
+        self.lock.unlock()
+
+        let helloTimeout = max(0.001, deadline - ProcessInfo.processInfo.systemUptime)
+        let hello = try await self.send(
+          AppraisalWireRequest(op: "hello", bridgeAttempt: attempt),
+          through: session,
+          timeout: helloTimeout)
+        guard let helloObject =
+          (try? JSONSerialization.jsonObject(with: Data(hello.json.utf8))) as? [String: Any],
+          (helloObject["bridge_attempt"] as? NSNumber)?.uint64Value == attempt,
+          (helloObject["hello"] as? Bool) == true,
+          let pidNumber = helloObject["pid"] as? NSNumber,
+          pidNumber.int64Value > 0,
+          pidNumber.int64Value <= Int64(Int32.max)
+        else {
+          self.lock.lock()
+          self.ownershipUnknown = true
+          self.lock.unlock()
+          throw NSError(domain: "appraisal-hello", code: 1)
+        }
+        let pid = pid_t(pidNumber.int32Value)
+        let aliveProbe = kill(pid, 0)
+        let aliveProbeErrno = aliveProbe == -1 ? errno : 0
+        print("event=ios_verifier_alive attempt=\(attempt) pid=\(pid) kill_zero_result=\(aliveProbe) errno=\(aliveProbeErrno)")
+        self.lock.lock()
+        self.activePid = pid
+        let cancelledAfterHello = self.isCancelled
+        self.lock.unlock()
+
+        guard self.updateRecord(
+          attempt: attempt, deadlineMs: deadlineMs, helperPid: pid, phase: "launched")
+        else {
+          kill(pid, SIGKILL)
+          _ = await self.finishKnownProcess(
+            attempt: attempt, pid: pid, deadlineMs: deadlineMs,
+            deadline: ProcessInfo.processInfo.systemUptime + 2.0)
+          throw NSError(domain: "appraisal-record", code: 3)
+        }
+
+        if cancelledAfterHello {
+          kill(pid, SIGKILL)
+          let dead = await self.finishKnownProcess(
+            attempt: attempt, pid: pid, deadlineMs: deadlineMs,
+            deadline: ProcessInfo.processInfo.systemUptime + 2.0)
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "pid": Int(pid),
+            "cancelled": true,
+            "exited": dead,
+          ]))
+          semaphore.signal()
+          return
+        }
+
+        let replyTimeout = max(0.001, deadline - ProcessInfo.processInfo.systemUptime)
+        let reply = try await self.send(
+          AppraisalWireRequest(
+            op: "appraise", payload: requestString, bridgeAttempt: attempt),
+          through: session,
+          timeout: replyTimeout)
+        let replyObject =
+          (try? JSONSerialization.jsonObject(with: Data(reply.json.utf8))) as? [String: Any]
+        guard let replyObject,
+              (replyObject["bridge_attempt"] as? NSNumber)?.uint64Value == attempt,
+              (replyObject["pid"] as? NSNumber)?.int32Value == pid
+        else {
+          kill(pid, SIGKILL)
+          let dead = await self.finishKnownProcess(
+            attempt: attempt, pid: pid, deadlineMs: deadlineMs,
+            deadline: ProcessInfo.processInfo.systemUptime + 2.0)
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "pid": Int(pid),
+            "malformed": "helper reply identity mismatch",
+            "cancelled": false,
+            "exited": dead,
+          ]))
+          semaphore.signal()
+          return
+        }
+
+        let dead = await self.finishKnownProcess(
+          attempt: attempt, pid: pid, deadlineMs: deadlineMs, deadline: deadline)
+        self.lock.lock()
+        let cancelled = self.isCancelled
+        self.lock.unlock()
+        let deadlineExpired = ProcessInfo.processInfo.systemUptime >= deadline
+        if deadlineExpired {
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "pid": Int(pid),
+            "malformed": "appraisal deadline expired",
+            "deadline": true,
+            "exited": dead,
+            "cancelled": cancelled,
+          ]))
+        } else {
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "pid": Int(pid),
+            "reply": replyObject,
+            "exited": dead,
+            "cancelled": cancelled,
+          ]))
+        }
+      } catch {
+        self.lock.lock()
+        let pid = self.activePid
+        let cancelled = self.isCancelled
+        self.lock.unlock()
+        let deadlineExpired = ProcessInfo.processInfo.systemUptime >= deadline
+        if let pid {
+          kill(pid, SIGKILL)
+          let dead = await self.finishKnownProcess(
+            attempt: attempt, pid: pid, deadlineMs: deadlineMs,
+            deadline: ProcessInfo.processInfo.systemUptime + 2.0)
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "pid": Int(pid),
+            "malformed": deadlineExpired ? "appraisal deadline expired" : cancelled ? "appraisal cancelled" : "helper communication failure",
+            "deadline": deadlineExpired,
+            "cancelled": cancelled,
+            "exited": dead,
+          ]))
+        } else {
+          self.lock.lock()
+          self.ownershipUnknown = true
+          self.lock.unlock()
+          result.finish(self.json([
+            "bridge_attempt": attempt,
+            "malformed": deadlineExpired ? "appraisal deadline expired before PID proof" : cancelled ? "appraisal cancelled before PID proof" : "helper ownership unknown",
+            "deadline": deadlineExpired,
+            "cancelled": cancelled,
+            "exited": false,
+          ]))
+        }
+      }
+      semaphore.signal()
+    }
+
+    if semaphore.wait(timeout: .now() + Double(budgetMs) / 1_000.0 + 3.0) == .timedOut {
+      lock.lock()
+      ownershipUnknown = true
+      let pid = activePid
+      lock.unlock()
+      if let pid { kill(pid, SIGKILL) }
+      var report: [String: Any] = [
+        "bridge_attempt": attempt,
+        "malformed": "host transport deadline expired without retirement proof",
+        "deadline": true,
+        "cancelled": false,
+        "exited": false,
+      ]
+      if let pid { report["pid"] = Int(pid) }
+      return strdup(json(report))
+    }
+    let response = result.value() ?? json([
+      "bridge_attempt": attempt,
+      "malformed": "host transport returned no result",
+      "cancelled": false,
+      "exited": false,
+    ])
+    logTransportResult(response)
+    return strdup(response)
+  }
+}
+
+final class AppraisalResultBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var result: String?
+
+  func finish(_ value: String) {
+    lock.lock()
+    if result == nil { result = value }
+    lock.unlock()
+  }
+
+  func value() -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return result
+  }
+}
+
+
+let appraisalTransportCallback: journal_ios_transport_fn = { cRequestStr in
+  AppraisalHostBridge.shared.transport(cRequestStr)
+}
+
+func cancelAndDrain() async {
+  AppraisalHostBridge.shared.cancel()
+  let deadline = ProcessInfo.processInfo.systemUptime + 3.0
+  while !journal_ios_verifier_drain_ready()
+    && ProcessInfo.processInfo.systemUptime < deadline
+  {
+    try? await Task.sleep(for: .milliseconds(50))
+  }
+  if journal_ios_verifier_drain_ready() {
+    AppraisalHostBridge.shared.clearCancellationIfDrained()
+  }
 }
 final class PendingReply: @unchecked Sendable {
   let lock = NSLock()
@@ -63,9 +673,10 @@ final class PendingReply: @unchecked Sendable {
       }
       let handle = try FileHandle(forWritingTo: file)
       try handle.seekToEnd()
-      try handle.write(contentsOf: data + Data([10]))
+      let line = data + Data([10])
+      try handle.write(contentsOf: line)
       try handle.close()
-      print(String(data: data, encoding: .utf8)!)
+      try FileHandle.standardOutput.write(contentsOf: line)
       status = event
     } catch {
       status = "evidence error: \(error)"
@@ -123,6 +734,9 @@ final class PendingReply: @unchecked Sendable {
     return try await call(s, request, label)
   }
   func servingCall(_ request: Request, _ label: String) async throws -> [String: Any] {
+    if request.op == "serve-stop" {
+      await cancelAndDrain()
+    }
     let start = ProcessInfo.processInfo.systemUptime
     let reply: Reply = await withCheckedContinuation { continuation in
       Engine.queue.async { continuation.resume(returning: Engine.execute(request)) }
@@ -285,6 +899,26 @@ final class PendingReply: @unchecked Sendable {
         "resources": resources(),
       ])
     do {
+      let verifierAdmitted = journal_ios_verifier_admit()
+      let admissionDiagnosticPointer = journal_ios_verifier_admission_diagnostic()
+      let admissionDiagnostic = admissionDiagnosticPointer.map { String(cString: $0) } ?? "unavailable"
+      journal_runtime_free(admissionDiagnosticPointer)
+      let verifierCallbackRegistered =
+        verifierAdmitted
+        && journal_ios_verifier_register_callback(appraisalTransportCallback)
+      log(
+        "verifier.admission",
+        [
+          "admitted": verifierAdmitted,
+          "callback_registered": verifierCallbackRegistered,
+          "diagnostic": admissionDiagnostic,
+        ])
+      if scenario == "verifier-admission" {
+        guard verifierAdmitted && verifierCallbackRegistered else {
+          throw NSError(domain: "verifier-admission-refused", code: 1)
+        }
+        return
+      }
       try Data("host-owned authority control".utf8).write(
         to: output.appendingPathComponent("host.txt"))
       try await reopen()
@@ -397,6 +1031,7 @@ final class PendingReply: @unchecked Sendable {
   }
 }
 @main struct RuntimeDev: App {
+  @Environment(\.scenePhase) var scenePhase
   @StateObject var runner = Runner()
   var body: some Scene {
     WindowGroup {
@@ -413,7 +1048,16 @@ final class PendingReply: @unchecked Sendable {
           Button("search") { runner.command("query") }
         }
         ScrollView { Text(runner.result).font(.caption) }
-      }.padding().task { await runner.start() }
+      }
+      .padding()
+      .task { await runner.start() }
+      .onChange(of: scenePhase) { newPhase in
+        if newPhase != .active {
+          Task {
+            await cancelAndDrain()
+          }
+        }
+      }
     }
   }
 }

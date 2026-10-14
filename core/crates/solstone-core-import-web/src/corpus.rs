@@ -543,7 +543,10 @@ pub(crate) mod tests {
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("private.md"), "OUTSIDE_SENTINEL").unwrap();
         fs::remove_file(&transcript).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path().join("private.md"), &transcript).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(outside.path().join("private.md"), &transcript).unwrap();
         let (status, body) = json_request(root.path(), "GET", &uri).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["reason_code"], "import_content_failed");

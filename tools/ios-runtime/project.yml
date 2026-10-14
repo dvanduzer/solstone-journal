@@ -41,6 +41,8 @@ targets:
     - sdk: ExtensionFoundation.framework
     - target: JournalWorker
       embed: true
+    - target: Appraisal
+      embed: true
   JournalWorker:
     type: extensionkit-extension
     platform: iOS
@@ -58,6 +60,21 @@ targets:
         EX_ENABLE_EXTENSION_POINT_GENERATION: true
         APPLICATION_EXTENSION_API_ONLY: true
         SKIP_INSTALL: true
+  Appraisal:
+    type: extensionkit-extension
+    platform: iOS
+    sources:
+    - Appraisal
+    dependencies:
+    - sdk: ExtensionFoundation.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.solstone.journal.runtime.dev.gpu-appraisal
+        EX_ENABLE_EXTENSION_POINT_GENERATION: true
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+        LD_RUNPATH_SEARCH_PATHS: ''
+        OTHER_LDFLAGS: $(APPRAISAL_LIB) $(NVAT_LIB) -lc++ -lz -liconv -framework Foundation -framework Security -framework SystemConfiguration -framework CoreFoundation
 schemes:
   JournalRuntimeDev:
     build:

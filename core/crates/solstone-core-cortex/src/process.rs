@@ -371,6 +371,7 @@ pub(crate) fn cancel_worker(state: CortexState, receiver: mpsc::Receiver<(String
 mod tests {
     use chrono::TimeZone;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
 
@@ -380,6 +381,8 @@ mod tests {
     use crate::storage::CortexStore;
     use tempfile::tempdir;
 
+    // The stubs are executable shell scripts, which only Unix hosts run.
+    #[cfg(unix)]
     fn write_sibling_stub(executable_dir: &Path) {
         let native = executable_dir.join("solstone-core");
         fs::write(&native, "#!/bin/sh\n").expect("native stub");
@@ -434,6 +437,7 @@ mod tests {
         assert_eq!(present.fields["day"], "other-day");
     }
 
+    #[cfg(unix)]
     #[test]
     fn deliberate_spawn_emits_exactly_one_native_sibling_command() {
         let directory = tempdir().unwrap();
@@ -475,6 +479,7 @@ mod tests {
         assert!(command.current_dir.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn renewal_cycle_never_reaches_injected_interpreters_but_deliberate_spawn_does() {
         let directory = tempdir().unwrap();

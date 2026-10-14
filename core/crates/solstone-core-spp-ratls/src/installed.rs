@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use solstone_core_installed_payload::locate_installed_package;
 use solstone_core_installed_payload::{InstalledPackage, InstalledPayloadRefusal, code, guidance};
 
@@ -240,6 +240,31 @@ fn android_integrity_refusal() -> NvattestRefusal {
     }
 }
 
+pub fn refusal_for_ios(
+    refusal: &solstone_core_spp_attest::ios_service_tools::IosVerifierRefusal,
+) -> NvattestRefusal {
+    let reason_code =
+        solstone_core_spp_attest::ios_service_tools::ios_verifier_refusal_reason(refusal);
+    let (kind, detail, guidance) = if reason_code == "nvattest_integrity_failed" {
+        (
+            AttestationFailureKind::Failed,
+            "nvattest_integrity_failed",
+            guidance::UNSUPPORTED_LOCATION,
+        )
+    } else {
+        (
+            AttestationFailureKind::Unreachable,
+            code::UNSUPPORTED_LOCATION,
+            guidance::UNSUPPORTED_LOCATION,
+        )
+    };
+    NvattestRefusal {
+        failure: AttestationFailure { kind, reason_code },
+        detail,
+        guidance,
+    }
+}
+
 /// Host-tested Android nvattest resolution. `SelectAdmittedInstallation` is the
 /// admitted `libnvattest.so` / `libnvat.so` closure, not a desktop package.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +310,19 @@ pub fn resolve_nvattest_from_current_exe() -> Result<NvattestPaths, NvattestRefu
         };
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    {
+        return match solstone_core_spp_attest::ios_service_tools::admitted_ios_verifier() {
+            Ok(_) => Ok(NvattestPaths {
+                binary: PathBuf::new(),
+                ca_bundle: PathBuf::new(),
+                library: PathBuf::new(),
+            }),
+            Err(refusal) => Err(refusal_for_ios(&refusal)),
+        };
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let current_exe = std::env::current_exe().map_err(|_| refusal_for_android_location())?;
         let root = locate_installed_package(
@@ -583,5 +620,23 @@ mod tests {
         assert_eq!(mapped.failure.reason_code, "nvattest_unavailable");
         assert_eq!(mapped.failure.kind, AttestationFailureKind::Unreachable);
         assert_eq!(mapped.guidance, guidance::RESTART_UPDATE);
+    }
+
+    #[test]
+    fn test_refusal_for_ios_mappings() {
+        use solstone_core_spp_attest::ios_service_tools::IosVerifierRefusal;
+
+        let unavail = IosVerifierRefusal::Unavailable("not found".into());
+        let res_unavail = refusal_for_ios(&unavail);
+        assert_eq!(res_unavail.failure.reason_code, "nvattest_unavailable");
+        assert_eq!(
+            res_unavail.failure.kind,
+            AttestationFailureKind::Unreachable
+        );
+
+        let integ = IosVerifierRefusal::IntegrityFailed("bad sha".into());
+        let res_integ = refusal_for_ios(&integ);
+        assert_eq!(res_integ.failure.reason_code, "nvattest_integrity_failed");
+        assert_eq!(res_integ.failure.kind, AttestationFailureKind::Failed);
     }
 }

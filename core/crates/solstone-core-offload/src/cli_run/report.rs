@@ -439,6 +439,7 @@ impl OwnedOffloadCliRun {
                 "deadline_unavailable" | "clock_unavailable" => {
                     "the operation clock could not be confirmed."
                 }
+                "preparation_refused" => "offload did not start.",
                 _ => {
                     "offload did not finish. keep its recovery files and review the recorded effects before retrying."
                 }

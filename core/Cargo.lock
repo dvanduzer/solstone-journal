@@ -5620,6 +5620,7 @@ version = "2.0.46"
 dependencies = [
  "base64 0.22.1",
  "minisign",
+ "plist",
  "ring",
  "serde",
  "serde_json",

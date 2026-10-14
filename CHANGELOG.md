@@ -14,6 +14,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - with confidential processing, older recordings and days waiting their turn no longer hold up new recordings and recent days. your journal works on one older item at a time, and newer work starts ahead of older work still waiting.
 - stopping or restarting your journal no longer waits several extra seconds when a background job left a helper program running. that time now goes to letting your journal's other programs stop cleanly.
+- media offload runs again on a large journal. a check it runs first mistook your journal's ordinary activity for unfinished work, so offload stopped before it began. nothing was removed, and your media stayed on this computer.
+- when one step of thinking about a recording failed the same way every time, your journal kept running it over and over. once a step has kept failing like that for a couple of hours, your journal now stops repeating it and lists it in health's set-aside work, where you can try again. it also tries once more on its own when the recording changes or an update fixes that failure. that recording's day stays open until the step finishes, so nothing from it is skipped.
+- health counted some set-aside work, like a story your journal couldn't use, as work still left, so it kept saying your journal was still catching up on older days. everything in the set-aside list now counts as set aside.
 
 ## [2.0.46] - 2026-10-14
 

@@ -223,6 +223,15 @@ fn write_host_makefile(root: &Path, system: &str, arch: &str) {
     fs::create_dir_all(root.join("core")).expect("create fixture core directory");
     fs::write(root.join("core/Cargo.toml"), "[workspace]\nmembers = []\n")
         .expect("write fixture Cargo manifest");
+    // The format check walks crate directories; give it one so the traversal
+    // reaches Cargo instead of matching nothing.
+    let fixture_crate = root.join("core/crates/fixture");
+    fs::create_dir_all(&fixture_crate).expect("create fixture crate directory");
+    fs::write(
+        fixture_crate.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )
+    .expect("write fixture crate manifest");
 }
 
 fn replace_makefile_once(root: &Path, old: &str, new: &str) {

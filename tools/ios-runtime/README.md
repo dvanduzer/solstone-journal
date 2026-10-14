@@ -79,3 +79,20 @@ python3 tools/ios-runtime/qualify_audio.py --device <id> --host <phone-wifi-ip> 
 The [audio qualification](qualify_audio.py) generates synthetic speech on the mac and uploads it through the production protocol-v3 device-ingest route over paired SPL. The phone discovers inputs with accepted custody receipts, decodes and transcribes them locally, and writes normal transcript and speaker outputs. The paired client reads the transcript through the existing segment API. The verifier compares raw-file hashes, persisted and retrieved transcript content, custody records and exported embedding sidecars. Raw transcripts stay out of search; searchable summaries require Generate integration. It records native stage timing, foreground resource counters, thermal state and request latency during processing. Use a fresh suite and output directory; `--smoke` runs only the first speech case.
 
 The embedded processing pass accepts at most 16 MiB of encoded input and 30 seconds of decoded mono audio at 16 kHz. Over-limit or failed input keeps its original file. These processing limits do not change the ingest format contract. Restarting the process retries failed inputs. Model failure leaves the authenticated listener available. Cancellation takes effect at native stage boundaries; an active inference call may finish before cancellation is observed. The default build and serving startup leave audio processing disabled.
+
+## Confidential GPU appraisal
+
+The development app uses a separately signed helper for local GPU appraisal. Each request starts a fresh helper, initializes the pinned SDK on its main thread, and uses the profile's pinned CA and RIM resources. The host accepts a result only after confirming that helper's death. Connection cancellation and the helper's independent watchdog terminate native work; the maximum request budget remains 60 seconds. Admission covers the helper, linked native libraries and signed resources before the app registers its transport callback. The production CPU, GPU, nonce and signed-status checks still govern confidential Generate requests.
+
+The opt-in [lifecycle qualifier](qualify_gpu_lifecycle.py) builds a separate diagnostic clone from an explicitly selected clean commit. Its observation code records entry and return at the native callable boundary through a shared memory record. It runs genuine appraisals, invalid proof/nonce/evidence controls, cancellation during an active native call, a 500 ms deadline during an active native call, and successful calls after both interruptions. Each case requires a distinct helper PID and verified death. This diagnostic does not identify which SDK instruction was executing, and its binary differs from the production build.
+
+Use a retained genuine appraisal request containing the profile fingerprint, nonce, GPU evidence, proofs and verification time. Run the qualifier from the committed source tree on the paired mac with the signing keychain unlocked:
+
+```sh
+python3 tools/ios-runtime/qualify_gpu_lifecycle.py \
+  --commit <exact-commit> --fixture <appraisal-request.json> \
+  --work /var/tmp/gpu-lifecycle-source --build /var/tmp/gpu-lifecycle-build \
+  --device <device-identifier> --output /var/tmp/gpu-lifecycle-evidence
+```
+
+All three output directories must be absent. The tool retains the selected source inputs, app hashes, build and install logs, physical console and final result. Restore the production development app after this diagnostic, then run the normal authenticated service checks separately.

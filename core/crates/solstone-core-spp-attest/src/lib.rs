@@ -6,6 +6,8 @@
 pub mod android_service_tools;
 pub mod binding;
 pub mod error;
+pub mod ios_appraisal;
+pub mod ios_service_tools;
 pub mod nvgpu;
 pub mod pcr_appraisal;
 pub mod pins;

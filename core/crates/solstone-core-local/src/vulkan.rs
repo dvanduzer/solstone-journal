@@ -474,14 +474,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn memoized_probe_uses_test_sibling_helper() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempfile::tempdir().expect("temporary helper directory");
-        let helper = directory.path().join(HELPER);
-        fs::write(&helper, "#!/bin/sh\nprintf '[]\\n'\n").expect("write helper");
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))
-            .expect("make helper executable");
+        crate::test_support::write_executable(
+            &directory.path().join(HELPER),
+            b"#!/bin/sh\nprintf '[]\\n'\n",
+        );
         let _guard = reset_detect_cache(Some(directory.path().to_path_buf()));
         assert!(gpu_probe_ok());
         assert!(detect_gpus().is_empty());

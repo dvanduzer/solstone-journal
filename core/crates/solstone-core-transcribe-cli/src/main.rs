@@ -24,7 +24,14 @@ fn main() -> ExitCode {
                 .unwrap_or_default()
         );
     };
-    match run_cli(env::args().skip(1), &journal, &mut on_day) {
+    match run_cli(
+        env::args().skip(1),
+        &journal,
+        &mut on_day,
+        // A standalone run is not launched through an admitted Windows task.
+        #[cfg(windows)]
+        None,
+    ) {
         Ok(result) => {
             if let Some(summary) = result.summary {
                 println!("{summary}");

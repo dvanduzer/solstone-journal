@@ -1784,10 +1784,10 @@ mod tests {
     use super::inprocess_producer_request;
     use chrono_tz::Tz;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::{
-        cell::RefCell, ffi::OsString, fs, os::unix::fs::PermissionsExt, rc::Rc, time::Duration,
-    };
+    use std::{cell::RefCell, ffi::OsString, fs, rc::Rc, time::Duration};
 
     use axum::{
         body::{Body, to_bytes},
@@ -2415,6 +2415,8 @@ mod tests {
         );
     }
 
+    // Owner-only directory modes are Unix permission bits.
+    #[cfg(unix)]
     #[test]
     fn criterion_28_relocation_repairs_import_chain_privacy() {
         let root = TempDir::new().unwrap();

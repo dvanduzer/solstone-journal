@@ -9,11 +9,12 @@ use std::{
 };
 
 use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(not(target_os = "ios"))]
+use solstone_core_spp_attest::locate_nvattest;
 use solstone_core_spp_attest::production_policy;
 use solstone_core_spp_attest::{
     CpuBundle, GpuAppraiser, NvattestGpuAppraiser, appraise_cpu_leg,
     error::{CpuLegError, GpuAppraisalReason, PcrFingerprintError, SnpVerifyError},
-    locate_nvattest,
     nvgpu::{GpuProfiles, GpuStatusInput},
     snp::CpuAppraisal,
     tlv::decode_gpu_envelope,
@@ -34,6 +35,8 @@ pub enum PayloadSource {
     #[cfg(not(windows))]
     Package(solstone_core_installed_payload::InstalledPackage),
     Installation(solstone_core_spp_attest::NvattestInstallation),
+    #[cfg(target_os = "ios")]
+    IosAdmitted,
 }
 
 /// Production verifier backed by the locally provisioned nvattest payload.
@@ -43,6 +46,13 @@ pub struct ProductionCompositeVerifier {
 }
 
 impl ProductionCompositeVerifier {
+    #[cfg(target_os = "ios")]
+    pub fn ios_admitted() -> Self {
+        Self {
+            source: PayloadSource::IosAdmitted,
+            profiles: GpuProfiles::production(),
+        }
+    }
     pub fn new(nvattest_dir: PathBuf) -> Self {
         Self::with_profiles(nvattest_dir, GpuProfiles::production())
     }
@@ -120,8 +130,54 @@ impl CompositeVerifier for ProductionCompositeVerifier {
             PayloadSource::Installation(installation) => {
                 verify_with_installation(bundle, input, &self.profiles, installation)
             }
+            #[cfg(target_os = "ios")]
+            PayloadSource::IosAdmitted => verify_ios_gpu(bundle, input, &self.profiles),
         }
     }
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) fn verify_ios_gpu(
+    bundle: CpuBundle<'_>,
+    input: CompositeVerificationInput<'_>,
+    profiles: &GpuProfiles,
+) -> Result<CompositeVerdict, CompositeVerificationError> {
+    let cpu = appraise_cpu_leg(
+        bundle,
+        input.envelope_tlv,
+        input.channel_binding,
+        input.binding_domain,
+        input.policy,
+        input.quote_verifier,
+    )
+    .map_err(cpu_error)?;
+
+    let profile = profiles.select(&cpu.pcr_sha256).map_err(gpu_error)?;
+    let envelope = decode_gpu_envelope(input.envelope_tlv)
+        .map_err(|_| composite_error("cpu_verification_failed"))?;
+    let owner_nonce: &[u8; 32] = input
+        .owner_nonce
+        .try_into()
+        .map_err(|_| composite_error("gpu_appraisal_failed"))?;
+    let now = SystemTime::now();
+
+    let gpu = solstone_core_spp_attest::ios_appraisal::appraise_ios_gpu(
+        &envelope,
+        owner_nonce,
+        profile,
+        input.status_proofs,
+        now,
+    )
+    .map_err(gpu_error)?;
+
+    Ok(CompositeVerdict {
+        verified: true,
+        legs: ["cpu", "gpu"],
+        substrate: format!("AMD SEV-SNP + NVIDIA {}", gpu.hwmodel),
+        checked_at: now,
+        cpu,
+        gpu,
+    })
 }
 
 fn verify_with_installation(
@@ -234,8 +290,36 @@ pub fn verify_gpu_after_cpu(
     })
 }
 
+/// Readiness status for the admitted iOS GPU verifier.
+pub fn ios_nvattest_readiness(
+    admission: Result<
+        solstone_core_spp_attest::ios_service_tools::AdmittedIosVerifier,
+        solstone_core_spp_attest::ios_service_tools::IosVerifierRefusal,
+    >,
+) -> NvattestEnsureStatus {
+    match admission {
+        Ok(_) => NvattestEnsureStatus::AlreadyInstalled,
+        Err(refusal) => {
+            let reason =
+                solstone_core_spp_attest::ios_service_tools::ios_verifier_refusal_reason(&refusal);
+            if reason == "nvattest_integrity_failed" {
+                NvattestEnsureStatus::IntegrityFailed
+            } else {
+                NvattestEnsureStatus::Unavailable
+            }
+        }
+    }
+}
+
 /// Checks whether the local nvattest payload is ready for an attestation attempt.
 pub fn check_nvattest_readiness(nvattest_dir: &Path) -> NvattestEnsureStatus {
+    #[cfg(target_os = "ios")]
+    {
+        let _ = nvattest_dir;
+        ios_nvattest_readiness(solstone_core_spp_attest::ios_service_tools::admitted_ios_verifier())
+    }
+
+    #[cfg(not(target_os = "ios"))]
     match locate_nvattest(nvattest_dir) {
         Ok(_) => NvattestEnsureStatus::AlreadyInstalled,
         Err(GpuAppraisalReason::NvattestUnavailable) => NvattestEnsureStatus::Unavailable,
@@ -397,7 +481,47 @@ pub fn establish_production_attested_channel_with_clock(
         );
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    {
+        let _ = _nvattest_dir;
+        crate::ratls::channel::refuse_held_platform(std::env::consts::OS)?;
+        let _admitted = solstone_core_spp_attest::ios_service_tools::admitted_ios_verifier()
+            .map_err(|refusal| {
+                let reason_code =
+                    solstone_core_spp_attest::ios_service_tools::ios_verifier_refusal_reason(
+                        &refusal,
+                    );
+                RatlsChannelError { reason_code }
+            })?;
+        if solstone_core_spp_attest::ios_appraisal::get_ios_gpu_appraisal_callback().is_none() {
+            return Err(RatlsChannelError {
+                reason_code: "nvattest_unavailable",
+            });
+        }
+        let mut owner_nonce = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut owner_nonce)
+            .map_err(|_| RatlsChannelError {
+                reason_code: "nonce_generation_failed",
+            })?;
+        let policy = production_policy();
+        let verifier = ProductionCompositeVerifier::ios_admitted();
+        return establish_attested_channel_with_clock(
+            endpoint,
+            &owner_nonce,
+            Path::new(""),
+            SystemTime::now(),
+            None,
+            Some(&policy),
+            None,
+            &verifier,
+            socket_timeout,
+            epoch,
+            clock,
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let current_exe = std::env::current_exe().map_err(|_| RatlsChannelError {
             reason_code: "nvattest_unavailable",

@@ -24,20 +24,35 @@ pub fn confidential_verifier_on_this_platform() -> bool {
     } else {
         false
     };
+    let ios_verifier_admitted = if std::env::consts::OS == "ios" {
+        solstone_core_spp_attest::ios_service_tools::admitted_ios_verifier().is_ok()
+    } else {
+        false
+    };
     confidential_verifier_offered(
         std::env::consts::OS,
         std::env::consts::ARCH,
         android_tools_admitted,
+        ios_verifier_admitted,
     )
 }
 
 /// Pure determination of whether confidential processing is offered.
 ///
 /// On Android, `android_tools_admitted` means the app authority is admitted and
-/// its nvattest load closure is valid. Desktop targets ignore that flag.
-pub fn confidential_verifier_offered(os: &str, arch: &str, android_tools_admitted: bool) -> bool {
+/// its nvattest load closure is valid. On iOS, `ios_verifier_admitted` means the
+/// companion appraisal helper authority is admitted and architecture is aarch64.
+/// Desktop targets ignore those flags.
+pub fn confidential_verifier_offered(
+    os: &str,
+    arch: &str,
+    android_tools_admitted: bool,
+    ios_verifier_admitted: bool,
+) -> bool {
     if os == "android" {
         android_tools_admitted
+    } else if os == "ios" {
+        ios_verifier_admitted && arch == "aarch64"
     } else {
         verifier_on_platform(os, arch)
     }
@@ -104,11 +119,26 @@ mod tests {
     #[test]
     fn confidential_verifier_offered_pure_function() {
         assert!(super::confidential_verifier_offered(
-            "android", "aarch64", true
+            "android", "aarch64", true, false
         ));
         assert!(!super::confidential_verifier_offered(
-            "android", "aarch64", false
+            "android", "aarch64", false, false
         ));
+        // iOS offering matrix
+        assert!(super::confidential_verifier_offered(
+            "ios", "aarch64", false, true
+        ));
+        assert!(!super::confidential_verifier_offered(
+            "ios", "aarch64", false, false
+        ));
+        assert!(!super::confidential_verifier_offered(
+            "ios", "x86_64", false, true
+        ));
+        // Android flag true does not offer iOS
+        assert!(!super::confidential_verifier_offered(
+            "ios", "aarch64", true, false
+        ));
+
         for (os, arch) in [
             ("linux", "x86_64"),
             ("linux", "aarch64"),
@@ -116,11 +146,15 @@ mod tests {
             ("windows", "x86_64"),
         ] {
             assert!(
-                super::confidential_verifier_offered(os, arch, false),
+                super::confidential_verifier_offered(os, arch, false, false),
                 "{os}-{arch}"
             );
             assert!(
-                super::confidential_verifier_offered(os, arch, true),
+                super::confidential_verifier_offered(os, arch, true, false),
+                "{os}-{arch}"
+            );
+            assert!(
+                super::confidential_verifier_offered(os, arch, false, true),
                 "{os}-{arch}"
             );
         }

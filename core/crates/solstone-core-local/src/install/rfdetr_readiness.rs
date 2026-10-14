@@ -366,15 +366,10 @@ mod tests {
             size: model_bytes.len() as u64,
         };
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        std::fs::write(&binary, binary_bytes).unwrap();
+        crate::test_support::write_executable(&binary, binary_bytes);
         let model_path = model_path(journal.path());
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         std::fs::write(&model_path, model_bytes).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         let sidecar = journal
             .path()
             .join("cache/providers/rfdetr/.rfdetr-install.json");

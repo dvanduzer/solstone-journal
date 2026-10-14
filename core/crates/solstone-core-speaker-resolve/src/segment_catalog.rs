@@ -327,7 +327,9 @@ pub fn lookup_segment(
     }
 }
 
-#[cfg(test)]
+// These tests build journals under /var/tmp and use Unix permission modes and
+// symlinks.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

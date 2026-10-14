@@ -1,4 +1,5 @@
 *.xcodeproj/
 Resources/
 native/target/
+appraisal-helper/target/
 __pycache__/
