@@ -2,13 +2,14 @@ version = 1
 target = "x86_64-pc-windows-msvc"
 
 [baseline]
-# Re-derived on 2026-10-11 with:
+# Re-derived on 2026-10-14 with:
 # cargo metadata --manifest-path core/Cargo.toml --locked --no-deps --format-version 1
 # Count workspace_members joined to packages, then packages with any target
-# whose kind includes `lib`. solstone-core-location and solstone-core-map-web
-# add two members and two libraries to the previous 134/127 baseline.
-workspace_packages = 136
-library_packages = 129
+# whose kind includes `lib`. solstone-core-linked-share and
+# solstone-core-brain-owner add two members and two libraries to the previous
+# 136/129 baseline.
+workspace_packages = 138
+library_packages = 131
 
 [[exclusions]]
 package = "ring"
