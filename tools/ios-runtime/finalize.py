@@ -89,6 +89,17 @@ def package_members(bundle: pathlib.Path) -> list[dict[str, object]]:
     return members
 
 
+def prepare_rim_directory(rims: pathlib.Path, allowed_names: set[str]) -> None:
+    if rims.is_symlink():
+        raise ValueError("appraisal RIM directory is a symlink")
+    rims.mkdir(exist_ok=True)
+    for member in rims.iterdir():
+        if member.is_symlink() or not member.is_file():
+            raise ValueError(f"appraisal RIM directory contains non-file: {member.name}")
+        if member.name not in allowed_names:
+            raise ValueError(f"appraisal RIM directory contains unexpected member: {member.name}")
+
+
 def needed_libraries(helper: pathlib.Path) -> list[str]:
     output = subprocess.check_output(["otool", "-L", helper], text=True)
     result = []
@@ -253,7 +264,11 @@ def main() -> int:
     app = products / "JournalRuntimeDev.app"
     appraisal = app / "Extensions/Appraisal.appex"
     rims = appraisal / "RIMs"
-    rims.mkdir()
+    prepare_rim_directory(
+        rims,
+        {source.name for source in args.appraisal_resources.iterdir()
+         if source.suffix in (".xml", ".corim")},
+    )
     for source in sorted(args.appraisal_resources.iterdir()):
         if not source.is_file() or source.is_symlink():
             raise ValueError(f"invalid appraisal resource: {source}")

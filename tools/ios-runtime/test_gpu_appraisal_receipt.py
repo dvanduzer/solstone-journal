@@ -19,12 +19,45 @@ from finalize import (
     canonical_digest,
     macho_content_sha256,
     package_members,
+    prepare_rim_directory,
     sha256,
     validate_build_inputs,
 )
 
 
 class AppraisalBuildTests(unittest.TestCase):
+    def test_rim_directory_reuse_preserves_existing_members(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rims = pathlib.Path(temp) / "RIMs"
+            prepare_rim_directory(rims, {"driver.xml"})
+            member = rims / "driver.xml"
+            member.write_bytes(b"existing")
+            prepare_rim_directory(rims, {"driver.xml"})
+            self.assertEqual(member.read_bytes(), b"existing")
+
+    def test_rim_directory_reuse_refuses_symlinks_and_directories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            target = root / "outside"
+            target.mkdir()
+            rims = root / "RIMs"
+            rims.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                prepare_rim_directory(rims, {"driver.xml"})
+            rims.unlink()
+            rims.mkdir()
+            (rims / "driver.xml").symlink_to(target / "outside.xml")
+            with self.assertRaisesRegex(ValueError, "non-file"):
+                prepare_rim_directory(rims, {"driver.xml"})
+            (rims / "driver.xml").unlink()
+            (rims / "unexpected").mkdir()
+            with self.assertRaisesRegex(ValueError, "non-file"):
+                prepare_rim_directory(rims, {"driver.xml"})
+            (rims / "unexpected").rmdir()
+            (rims / "unexpected.xml").write_bytes(b"unknown")
+            with self.assertRaisesRegex(ValueError, "unexpected member"):
+                prepare_rim_directory(rims, {"driver.xml"})
+
     def test_static_reconfigure_preserves_exact_driver_command(self):
         build = SimpleNamespace(
             summary={
