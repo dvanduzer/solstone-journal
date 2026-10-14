@@ -769,6 +769,7 @@ fn main() -> ExitCode {
         Ok(Command::Reprocess(args)) => run_reprocess(args),
         Ok(Command::JournalStats(args)) => run_journal_stats(args),
         Ok(Command::Talent(args)) => run_talent(args),
+        Ok(Command::Share(args)) => run_share(args),
         Ok(Command::Backfill(args)) => run_backfill(args),
         Ok(Command::BackfillFacetIds { commit }) => run_backfill_facet_ids(commit),
         Ok(Command::BackfillFacetIdsHelp) => {
@@ -1628,6 +1629,43 @@ fn run_talent(args: Vec<OsString>) -> ExitCode {
     print!("{}", run.stdout);
     eprint!("{}", run.stderr);
     ExitCode::from(run.exit_code as u8)
+}
+
+/// `journal share`: read-only matching and packaging. Talents run in process
+/// through the installed talent tree and the sibling generate client.
+fn run_share(args: Vec<OsString>) -> ExitCode {
+    let run = if !solstone_core_linked_share::reads_journal(&args) {
+        solstone_core_linked_share::run_cli(&args, Path::new(""), &|_: &str, _: &str| {
+            Err("help and usage read nothing".to_owned())
+        })
+    } else {
+        let journal = match resolve_process_journal_path() {
+            Ok(journal) => journal.path,
+            Err(error) => {
+                eprint_journal_path_error(error);
+                return ExitCode::from(EXIT_TEMPFAIL);
+            }
+        };
+        let paths = match solstone_core_talent_runtime::runtime_paths_from_current_executable() {
+            Ok(paths) => paths,
+            Err(error) => {
+                eprintln!("share failed: {error}");
+                return ExitCode::from(EXIT_TEMPFAIL);
+            }
+        };
+        let generate = match solstone_core_generate::OneShotClient::sibling() {
+            Ok(generate) => generate,
+            Err(error) => {
+                eprintln!("share failed: {error}");
+                return ExitCode::from(EXIT_TEMPFAIL);
+            }
+        };
+        let talents = solstone_core_linked_share::RuntimeTalents::new(&journal, paths, &generate);
+        solstone_core_linked_share::run_cli(&args, &journal, &talents)
+    };
+    print!("{}", run.stdout);
+    eprint!("{}", run.stderr);
+    ExitCode::from(u8::try_from(run.exit_code).unwrap_or(1))
 }
 
 fn run_backfill(args: Vec<OsString>) -> ExitCode {

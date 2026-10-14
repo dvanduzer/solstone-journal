@@ -6,9 +6,9 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 use solstone_core_journal_io::JournalRoot;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use {
     solstone_core_journal_io::{
         activity::ActivityLease, activity_obligations::observe_obligations,
@@ -53,15 +53,15 @@ pub fn with_forced_admission_failure<T>(f: impl FnOnce() -> T) -> T {
 pub struct AdmittedDestination {
     #[cfg(windows)]
     root: JournalRoot,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     root: Arc<JournalRoot>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     activity: Arc<ActivityLease>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     child_lock: OwnedFd,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     callback_path: PathBuf,
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     path: PathBuf,
 }
 
@@ -80,7 +80,7 @@ impl AdmittedDestination {
                 .map_err(|_| DestinationAdmissionError::Failed)?;
             Ok(Self { root })
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let absolute =
                 std::path::absolute(path).map_err(|_| DestinationAdmissionError::Failed)?;
@@ -108,7 +108,7 @@ impl AdmittedDestination {
             admitted.revalidate_for_target()?;
             Ok(admitted)
         }
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         {
             Ok(Self {
                 path: path.to_path_buf(),
@@ -135,7 +135,7 @@ impl AdmittedDestination {
                 .map_err(|_| DestinationAdmissionError::Failed)?;
             Ok(self.root.canonical_path())
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.activity
                 .revalidate()
@@ -150,7 +150,7 @@ impl AdmittedDestination {
                 .map_err(|_| DestinationAdmissionError::Failed)?;
             Ok(self.root.canonical_path())
         }
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         {
             Ok(&self.path)
         }
@@ -161,7 +161,7 @@ impl AdmittedDestination {
     }
 
     pub(crate) fn callback_target(&self) -> &Path {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             &self.callback_path
         }
@@ -169,7 +169,7 @@ impl AdmittedDestination {
         {
             self.root.canonical_path()
         }
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         {
             &self.path
         }
@@ -179,7 +179,7 @@ impl AdmittedDestination {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn child_lock(&self) -> BorrowedFd<'_> {
         self.child_lock.as_fd()
     }
@@ -188,7 +188,7 @@ impl AdmittedDestination {
 pub fn admit_restore_destination(
     path: &Path,
 ) -> Result<AdmittedDestination, DestinationAdmissionError> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let absolute = std::path::absolute(path).map_err(|_| DestinationAdmissionError::Failed)?;
         let mut existing = absolute.as_path();
@@ -265,6 +265,6 @@ pub fn admit_restore_destination(
         }
         Ok(admitted)
     }
-    #[cfg(all(not(windows), not(target_os = "linux")))]
+    #[cfg(all(not(windows), not(any(target_os = "linux", target_os = "android"))))]
     AdmittedDestination::admit(path)
 }

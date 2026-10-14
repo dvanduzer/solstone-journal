@@ -3519,6 +3519,7 @@ dependencies = [
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "solstone-core-journal-stats-cli",
+ "solstone-core-linked-share",
  "solstone-core-local",
  "solstone-core-maintenance",
  "solstone-core-mcp-endpoint",
@@ -4824,6 +4825,25 @@ dependencies = [
  "solstone-core-talent-config",
  "tempfile",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "solstone-core-linked-share"
+version = "2.0.44"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "solstone-core-entity",
+ "solstone-core-facets",
+ "solstone-core-format",
+ "solstone-core-generate",
+ "solstone-core-journal-config",
+ "solstone-core-processing-record",
+ "solstone-core-system-health",
+ "solstone-core-talent-runtime",
+ "solstone-core-transcripts",
+ "tempfile",
 ]
 
 [[package]]

@@ -1568,6 +1568,17 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
+id = "package::solstone-core-linked-share"
+package = "solstone-core-linked-share"
+set = "component"
+areas = ["talents"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = false
+runtime = "none"
+
+[[package_suites]]
 id = "package::solstone-core-talent-cli"
 package = "solstone-core-talent-cli"
 set = "component"

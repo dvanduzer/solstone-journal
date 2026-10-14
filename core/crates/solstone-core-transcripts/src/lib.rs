@@ -1042,7 +1042,7 @@ pub fn owner_voice_lines(dir: &Path, voices: &VoiceNames) -> Vec<String> {
 
 /// The audio file the segment's labels refer to: the embedded source, else
 /// the only audio transcript. Ambiguous segments name no one.
-fn labelled_audio_source(dir: &Path) -> Option<String> {
+pub fn labelled_audio_source(dir: &Path) -> Option<String> {
     let mut embedded = Vec::new();
     let mut transcripts = Vec::new();
     for entry in fs::read_dir(dir).ok()?.flatten() {

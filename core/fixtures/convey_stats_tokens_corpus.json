@@ -314,6 +314,12 @@
             "response.body.generators.event.path",
             "response.body.generators.facet_newsletter.mtime",
             "response.body.generators.facet_newsletter.path",
+            "response.body.generators.linked_presence.mtime",
+            "response.body.generators.linked_presence.path",
+            "response.body.generators.linked_share.mtime",
+            "response.body.generators.linked_share.path",
+            "response.body.generators.linked_share_activity.mtime",
+            "response.body.generators.linked_share_activity.path",
             "response.body.generators.morning_briefing.mtime",
             "response.body.generators.morning_briefing.path",
             "response.body.generators.participation.mtime",
@@ -547,6 +553,60 @@
                   "schedule": "daily",
                   "source": "system",
                   "title": "facet newsletter generator",
+                  "type": "generate"
+                },
+                "linked_presence": {
+                  "color": "#6c757d",
+                  "description": "Decides whether a named person is taking part in a few lines of conversation or is only being talked about.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 64,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_presence.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked presence",
+                  "type": "generate"
+                },
+                "linked_share": {
+                  "color": "#6c757d",
+                  "description": "Lists the points of one part of an activity the owner is sharing with a linked person, each citing the lines it comes from.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 2048,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share",
+                  "type": "generate"
+                },
+                "linked_share_activity": {
+                  "color": "#6c757d",
+                  "description": "Writes one paragraph summarizing the points of an activity the owner is sharing with a linked person.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 1024,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share_activity.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share activity summary",
                   "type": "generate"
                 },
                 "morning_briefing": {
@@ -1042,6 +1102,12 @@
             "response.body.generators.event.path",
             "response.body.generators.facet_newsletter.mtime",
             "response.body.generators.facet_newsletter.path",
+            "response.body.generators.linked_presence.mtime",
+            "response.body.generators.linked_presence.path",
+            "response.body.generators.linked_share.mtime",
+            "response.body.generators.linked_share.path",
+            "response.body.generators.linked_share_activity.mtime",
+            "response.body.generators.linked_share_activity.path",
             "response.body.generators.morning_briefing.mtime",
             "response.body.generators.morning_briefing.path",
             "response.body.generators.participation.mtime",
@@ -1276,6 +1342,60 @@
                   "schedule": "daily",
                   "source": "system",
                   "title": "facet newsletter generator",
+                  "type": "generate"
+                },
+                "linked_presence": {
+                  "color": "#6c757d",
+                  "description": "Decides whether a named person is taking part in a few lines of conversation or is only being talked about.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 64,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_presence.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked presence",
+                  "type": "generate"
+                },
+                "linked_share": {
+                  "color": "#6c757d",
+                  "description": "Lists the points of one part of an activity the owner is sharing with a linked person, each citing the lines it comes from.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 2048,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share",
+                  "type": "generate"
+                },
+                "linked_share_activity": {
+                  "color": "#6c757d",
+                  "description": "Writes one paragraph summarizing the points of an activity the owner is sharing with a linked person.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 1024,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share_activity.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share activity summary",
                   "type": "generate"
                 },
                 "morning_briefing": {
@@ -1872,6 +1992,12 @@
             "response.body.generators.event.path",
             "response.body.generators.facet_newsletter.mtime",
             "response.body.generators.facet_newsletter.path",
+            "response.body.generators.linked_presence.mtime",
+            "response.body.generators.linked_presence.path",
+            "response.body.generators.linked_share.mtime",
+            "response.body.generators.linked_share.path",
+            "response.body.generators.linked_share_activity.mtime",
+            "response.body.generators.linked_share_activity.path",
             "response.body.generators.morning_briefing.mtime",
             "response.body.generators.morning_briefing.path",
             "response.body.generators.participation.mtime",
@@ -2106,6 +2232,60 @@
                   "schedule": "daily",
                   "source": "system",
                   "title": "facet newsletter generator",
+                  "type": "generate"
+                },
+                "linked_presence": {
+                  "color": "#6c757d",
+                  "description": "Decides whether a named person is taking part in a few lines of conversation or is only being talked about.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 64,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_presence.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked presence",
+                  "type": "generate"
+                },
+                "linked_share": {
+                  "color": "#6c757d",
+                  "description": "Lists the points of one part of an activity the owner is sharing with a linked person, each citing the lines it comes from.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 2048,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share",
+                  "type": "generate"
+                },
+                "linked_share_activity": {
+                  "color": "#6c757d",
+                  "description": "Writes one paragraph summarizing the points of an activity the owner is sharing with a linked person.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 1024,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share_activity.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share activity summary",
                   "type": "generate"
                 },
                 "morning_briefing": {
@@ -2703,6 +2883,12 @@
             "response.body.generators.event.path",
             "response.body.generators.facet_newsletter.mtime",
             "response.body.generators.facet_newsletter.path",
+            "response.body.generators.linked_presence.mtime",
+            "response.body.generators.linked_presence.path",
+            "response.body.generators.linked_share.mtime",
+            "response.body.generators.linked_share.path",
+            "response.body.generators.linked_share_activity.mtime",
+            "response.body.generators.linked_share_activity.path",
             "response.body.generators.morning_briefing.mtime",
             "response.body.generators.morning_briefing.path",
             "response.body.generators.participation.mtime",
@@ -2936,6 +3122,60 @@
                   "schedule": "daily",
                   "source": "system",
                   "title": "facet newsletter generator",
+                  "type": "generate"
+                },
+                "linked_presence": {
+                  "color": "#6c757d",
+                  "description": "Decides whether a named person is taking part in a few lines of conversation or is only being talked about.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 64,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_presence.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked presence",
+                  "type": "generate"
+                },
+                "linked_share": {
+                  "color": "#6c757d",
+                  "description": "Lists the points of one part of an activity the owner is sharing with a linked person, each citing the lines it comes from.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 2048,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share",
+                  "type": "generate"
+                },
+                "linked_share_activity": {
+                  "color": "#6c757d",
+                  "description": "Writes one paragraph summarizing the points of an activity the owner is sharing with a linked person.",
+                  "load": {
+                    "transcripts": false,
+                    "percepts": false,
+                    "talents": false
+                  },
+                  "max_output_tokens": 1024,
+                  "mtime": "<TALENT_MTIME>",
+                  "output": "json",
+                  "path": "<TALENT_PATH>",
+                  "schema": "linked_share_activity.schema.json",
+                  "source": "system",
+                  "temperature": 0,
+                  "title": "Linked share activity summary",
                   "type": "generate"
                 },
                 "morning_briefing": {

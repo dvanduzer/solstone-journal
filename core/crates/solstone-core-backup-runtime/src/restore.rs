@@ -212,11 +212,11 @@ fn restic(
         None,
         Some(Duration::from_secs(timeout)),
         &{
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             {
                 [admitted.child_lock()]
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             {
                 []
             }
@@ -319,7 +319,7 @@ pub fn restore_journal(
         if retaining_runner.cleanup_pending() {
             return unrecorded_outcome(draft);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let mut draft = draft;
             if admitted.revalidate_for_target().is_err() {
@@ -341,7 +341,7 @@ pub fn restore_journal(
             }
             outcome
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             if admitted.revalidate_for_target().is_err() {
                 return unrecorded_outcome(error_draft(
@@ -443,7 +443,7 @@ pub fn restore_journal(
                 "--target".into(),
                 target_path.display().to_string(),
             ];
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let args = {
                 let mut args = args;
                 args.extend(["--exclude".to_owned(), "backup-activity.lock".to_owned()]);
@@ -467,7 +467,7 @@ pub fn restore_journal(
             .unwrap_or(RESTORE_REASON_RESTORE_FAILED);
         return finish(journal, services.clock, recorder, error_draft(reason));
     }
-    let selected_regular_files = if cfg!(target_os = "linux") {
+    let selected_regular_files = if cfg!(any(target_os = "linux", target_os = "android")) {
         None
     } else {
         snapshot.regular_files
@@ -523,7 +523,7 @@ pub fn restore_journal(
         )
     };
     let admission_failed = || {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             finish(
                 journal,
@@ -537,7 +537,7 @@ pub fn restore_journal(
                 ),
             )
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED))
         }
@@ -645,7 +645,7 @@ pub fn restore_journal(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     mod cooperation;
 
     use super::*;
@@ -879,7 +879,7 @@ mod tests {
     }
 
     fn selected_file_count(files: u64) -> Option<u64> {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
             None
         } else {
             Some(files)

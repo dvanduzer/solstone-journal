@@ -227,7 +227,7 @@ impl ActivityLease {
 
     /// Share the held lock with a joined child; this does not grant settlement.
     /// Retain this lease until the child stops: its drop explicitly unlocks the shared lock.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn duplicate_descriptor_for_child(
         &self,
     ) -> Result<std::os::fd::OwnedFd, ActivityAdmissionError> {

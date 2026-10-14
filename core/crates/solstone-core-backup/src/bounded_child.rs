@@ -396,9 +396,14 @@ fn inherit_in_child(command: &mut Command, descriptors: &[BorrowedFd<'_>]) -> io
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn prepare_dns_child(command: &mut Command) {
     let expected_parent = std::process::id() as nix::libc::pid_t;
+    #[cfg(target_os = "linux")]
+    let close_range_cloexec = nix::libc::CLOSE_RANGE_CLOEXEC;
+    // Android's libc crate exposes the syscall but not this Linux UAPI flag.
+    #[cfg(target_os = "android")]
+    let close_range_cloexec: nix::libc::c_uint = 1 << 2;
     // SAFETY: this child-local hook allocates nothing. Only direct Linux OS
     // calls run between fork and exec; no parent descriptor flags are changed.
     #[allow(unsafe_code)]
@@ -410,7 +415,7 @@ fn prepare_dns_child(command: &mut Command) {
                 nix::libc::SYS_close_range,
                 nix::libc::c_long::from(3_u8),
                 nix::libc::c_long::from(nix::libc::c_uint::MAX),
-                nix::libc::c_long::from(nix::libc::CLOSE_RANGE_CLOEXEC),
+                nix::libc::c_long::from(close_range_cloexec),
             ) != 0
             {
                 return Err(io::Error::last_os_error());
@@ -683,7 +688,15 @@ fn execute_tracked(
             inherit_in_child(&mut command, &request.pass_fds)?;
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    {
+        // Ordinary backup/restore receives the same descriptor sweep and
+        // parent-death protection as Linux. Creator admission remains closed
+        // above until Android's media settlement contract is qualified.
+        prepare_dns_child(&mut command);
+        inherit_in_child(&mut command, &request.pass_fds)?;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     inherit_in_child(&mut command, &request.pass_fds)?;
     if stop_requested(cancellation) {
         return Err(cancelled());

@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["role"],
+  "properties": {
+    "role": {"type": "string", "enum": ["with", "about", "unclear"]}
+  }
+}

@@ -140,6 +140,11 @@ pub(crate) const NATIVE_PROCESS_SPECS: &[NativeProcessSpec] = &[
         preset_argv: &["talent"],
     },
     NativeProcessSpec {
+        token: "share",
+        binary: "solstone-core",
+        preset_argv: &["share"],
+    },
+    NativeProcessSpec {
         token: "service",
         binary: "solstone-core",
         preset_argv: SERVICE,
@@ -451,6 +456,12 @@ pub(crate) const PROCESS_SPECS: &[ProcessSpec] = &[
     ProcessSpec {
         token: "talent",
         module: "solstone.think.talent_cli",
+        preset_argv: EMPTY,
+        kind: ProcessKind::Service,
+    },
+    ProcessSpec {
+        token: "share",
+        module: "solstone.think.share_cli",
         preset_argv: EMPTY,
         kind: ProcessKind::Service,
     },
