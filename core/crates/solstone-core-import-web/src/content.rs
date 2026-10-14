@@ -164,7 +164,12 @@ fn derive_content_items(
             }
             let preview = messages
                 .iter()
-                .find(|item| item.get("speaker").and_then(Value::as_str) == Some("Human"))
+                .find(|item| {
+                    matches!(
+                        item.get("speaker").and_then(Value::as_str),
+                        Some("You" | "Human")
+                    )
+                })
                 .and_then(|item| item.get("text").and_then(Value::as_str))
                 .unwrap_or("")
                 .chars()
@@ -616,6 +621,44 @@ fn read_item_content(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn rebuilt_conversation_previews_use_the_owner_message() {
+        for owner_label in ["You", "Human"] {
+            let temp = tempdir().unwrap();
+            let root = temp.path();
+            let timestamp = "20260101_120000";
+            let import_dir = root.join("imports").join(timestamp);
+            fs::create_dir_all(&import_dir).unwrap();
+            let file_path = root
+                .join("chronicle/20260101/import.chatgpt/120000_300/conversation_transcript.jsonl");
+            fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            let transcript = [
+                json!({"imported": {"id": timestamp}}),
+                json!({"start": "00:00:00", "speaker": "Assistant", "text": "assistant reply"}),
+                json!({"start": "00:01:00", "speaker": "Unknown", "text": "unassigned message"}),
+                json!({"start": "00:02:00", "speaker": owner_label, "text": "owner request"}),
+            ]
+            .map(|row| row.to_string())
+            .join("\n");
+            fs::write(&file_path, transcript).unwrap();
+            fs::write(
+                import_dir.join("imported.json"),
+                json!({
+                    "source_type": "chatgpt",
+                    "all_created_files": [file_path.to_str().unwrap()]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let items = derive_content_items(root, timestamp).unwrap().unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["preview"], "owner request");
+            assert_eq!(items[0]["title"], "owner request");
+            assert_eq!(items[0]["meta"]["message_count"], 3);
+        }
+    }
 
     #[test]
     fn test_derive_content_items_fails_on_missing_created_file() {

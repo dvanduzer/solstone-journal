@@ -3050,7 +3050,8 @@ function renderContentDetail(data) {
       return `<div class="import-content-markdown">${window.AppServices.renderMarkdown(part.content)}</div>`;
     }
     const speaker = part.speaker || 'Unknown';
-    const cls = speaker === 'Human' ? 'human' : 'assistant';
+    const cls = speaker === 'You' || speaker === 'Human' ? 'human'
+      : speaker === 'Assistant' ? 'assistant' : '';
     return `<div class="import-content-message"><span class="import-content-speaker ${cls}">${escapeContentHtml(speaker)}:</span> ${escapeContentHtml(part.text || '')}</div>`;
   }).join('');
 }

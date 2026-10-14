@@ -65,6 +65,7 @@ solstone-core-system.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+solstone-core-format.workspace = true
 solstone-core-indexer-store.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
