@@ -10,8 +10,18 @@ use axum::{
 use serde_json::{Value, json};
 use solstone_core_convey_shell::{EmbeddedConveyHandle, bind_embedded_device_door_with_routes};
 use solstone_core_journal_io::JournalRoot;
-use std::{net::SocketAddrV4, path::PathBuf, sync::Mutex, time::Duration};
-use tokio::{sync::watch, task::JoinHandle};
+use std::{
+    net::SocketAddrV4,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    sync::{oneshot, watch},
+    task::JoinHandle,
+};
+
+mod brain;
 
 #[cfg(feature = "audio")]
 mod audio;
@@ -29,7 +39,7 @@ pub struct MobileServing {
     bus: solstone_core_callosum::CallosumSocketServer,
     handle: EmbeddedConveyHandle,
     runtime: tokio::runtime::Runtime,
-    root: JournalRoot,
+    root: Arc<JournalRoot>,
     services: Mutex<Option<AppServices>>,
 }
 
@@ -59,7 +69,7 @@ impl MobileServing {
         if address.ip().is_unspecified() || address.ip().is_multicast() || address.port() == 0 {
             return Err("an explicit interface address and nonzero port are required".into());
         }
-        let root = JournalRoot::open(&root).map_err(|e| e.to_string())?;
+        let root = Arc::new(JournalRoot::open(&root).map_err(|e| e.to_string())?);
         root.revalidate_canonical_binding()
             .map_err(|e| e.to_string())?;
         solstone_core_journal_config_write::persist_direct_door_port(
@@ -91,6 +101,23 @@ impl MobileServing {
             })
             .map_err(|e| e.to_string())?;
         let (shutdown, mut stop) = watch::channel(false);
+        let (ready, registered) = oneshot::channel();
+        let brain_task = runtime.spawn(brain::run(Arc::clone(&root), stop.clone(), ready));
+        let brain_ready = runtime.block_on(async {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), registered).await,
+                Ok(Ok(()))
+            )
+        });
+        if !brain_ready {
+            let _ = shutdown.send(true);
+            runtime.block_on(async {
+                let _ = brain_task.await;
+                handle.shutdown_and_wait().await;
+                bus.stop().await;
+            });
+            return Err("embedded Brain consumer did not register".into());
+        }
         let mcp_root = root.canonical_path().to_path_buf();
         let mut mcp_stop = stop.clone();
         let mcp_task = runtime.spawn(async move {
@@ -148,7 +175,7 @@ impl MobileServing {
             root,
             services: Mutex::new(Some(AppServices {
                 shutdown,
-                tasks: vec![relay_task, mcp_task],
+                tasks: vec![brain_task, relay_task, mcp_task],
             })),
         })
     }

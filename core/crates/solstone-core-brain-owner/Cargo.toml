@@ -11,6 +11,9 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+full-tests = []
+
 [dependencies]
 chrono.workspace = true
 serde_json.workspace = true

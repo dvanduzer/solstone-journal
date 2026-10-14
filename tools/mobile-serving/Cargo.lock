@@ -1791,8 +1791,11 @@ dependencies = [
  "log",
  "serde_json",
  "sha2",
+ "solstone-core-brain-owner",
  "solstone-core-callosum",
  "solstone-core-convey-shell",
+ "solstone-core-cortex",
+ "solstone-core-generate-wire",
  "solstone-core-indexer-store",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
@@ -3364,6 +3367,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-brain-owner"
+version = "2.0.45"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "solstone-core-brain",
+ "solstone-core-chatgpt-auth",
+ "solstone-core-generate",
+ "solstone-core-generate-wire",
+ "solstone-core-local",
+ "solstone-core-spp-ratls",
+]
+
+[[package]]
 name = "solstone-core-callosum"
 version = "2.0.45"
 dependencies = [
@@ -3510,6 +3527,30 @@ dependencies = [
  "tower",
  "ureq",
  "zip",
+]
+
+[[package]]
+name = "solstone-core-cortex"
+version = "2.0.45"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "log",
+ "nix",
+ "serde_json",
+ "solstone-core-brain",
+ "solstone-core-callosum",
+ "solstone-core-generate-wire",
+ "solstone-core-journal",
+ "solstone-core-journal-cli",
+ "solstone-core-journal-config",
+ "solstone-core-journal-io",
+ "solstone-core-spp-ratls",
+ "solstone-core-system",
+ "solstone-core-talent-cli",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

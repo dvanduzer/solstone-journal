@@ -3,12 +3,14 @@
 
 //! Native Cortex service lifecycle and Callosum adapter.
 
+mod embedded_renewal;
 mod process;
 mod renewal;
 mod service;
 mod state;
 mod storage;
 
+pub use embedded_renewal::EmbeddedSppRenewal;
 pub use service::{
     CortexOptions, CortexServiceError, ShutdownMode, run_native_service,
     run_native_service_with_hosted_parent, run_until,

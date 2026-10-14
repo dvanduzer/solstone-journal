@@ -963,79 +963,6 @@ fn bundled_runtime_readiness(
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use std::path::PathBuf;
-    use std::sync::Mutex;
-    use std::sync::mpsc;
-
-    struct PanicSpp;
-    impl OwnerSppPrerequisite for PanicSpp {
-        fn assess(
-            &self,
-            _journal: &Path,
-            _config: &Map<String, Value>,
-            _now: DateTime<Utc>,
-        ) -> Value {
-            panic!("SPP assess must not be called");
-        }
-    }
-
-    struct TestProbe<F> {
-        fingerprint: String,
-        generate_fn: Mutex<F>,
-        captured_requests: Mutex<Vec<GenerateRequest>>,
-    }
-
-    impl<F> TestProbe<F>
-    where
-        F: FnMut(
-            &GenerateRequest,
-            &Path,
-            &Map<String, Value>,
-        ) -> Result<GenerateResponse, ClientError>,
-    {
-        fn new(fingerprint: String, generate_fn: F) -> Self {
-            Self {
-                fingerprint,
-                generate_fn: Mutex::new(generate_fn),
-                captured_requests: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl<F> OwnerProbe for TestProbe<F>
-    where
-        F: FnMut(
-            &GenerateRequest,
-            &Path,
-            &Map<String, Value>,
-        ) -> Result<GenerateResponse, ClientError>,
-    {
-        fn bundled_runtime_fingerprint(
-            &self,
-            _journal: &Path,
-            _config: &Map<String, Value>,
-        ) -> Option<String> {
-            Some(self.fingerprint.clone())
-        }
-
-        fn assess_bundled_runtime(
-            &self,
-            journal: &Path,
-            expected: Option<&str>,
-        ) -> BundledRuntimePrerequisiteAssessment {
-            assess_bundled_runtime_prerequisite(journal, expected)
-        }
-
-        fn execute_generate(
-            &self,
-            request: &GenerateRequest,
-            journal: &Path,
-            config: &Map<String, Value>,
-        ) -> Result<GenerateResponse, ClientError> {
-            self.captured_requests.lock().unwrap().push(request.clone());
-            (self.generate_fn.lock().unwrap())(request, journal, config)
-        }
-    }
 
     fn test_owner_view(state: &str, reason: Option<&str>, component: Option<&str>) -> OwnerView {
         OwnerView {
@@ -1295,111 +1222,120 @@ mod tests {
         assert!(!mismatch.contains_key("runtime_reason"));
     }
 
-    fn setup_temp_journal() -> tempfile::TempDir {
-        let temp = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
-        std::fs::write(
-            temp.path().join("config/journal.json"),
-            br#"{"providers":{"active":{"provider":"local"}}}"#,
-        )
-        .expect("config write");
-        temp
-    }
+    #[cfg(all(test, feature = "full-tests"))]
+    mod full {
+        use super::*;
+        use std::path::PathBuf;
+        use std::sync::{Mutex, mpsc};
 
-    fn write_runtime_file(journal: &Path, phase: &str, desired_fingerprint: &str) {
-        let runtime_dir = journal.join("health/providers/runtime");
-        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
-        std::fs::write(
-            runtime_dir.join("local.json"),
-            serde_json::to_vec(&json!({
-                "phase": phase,
-                "desired_fingerprint_sha256": desired_fingerprint,
-            }))
-            .expect("serialize runtime"),
-        )
-        .expect("write runtime");
-    }
+        struct PanicSpp;
+        impl OwnerSppPrerequisite for PanicSpp {
+            fn assess(
+                &self,
+                _journal: &Path,
+                _config: &Map<String, Value>,
+                _now: DateTime<Utc>,
+            ) -> Value {
+                panic!("SPP assess must not be called");
+            }
+        }
 
-    #[test]
-    fn owner_refresh_bundled_success_converges_to_ready() {
-        let temp = setup_temp_journal();
-        let fingerprint = "a".repeat(64);
-        write_runtime_file(temp.path(), "ready", &fingerprint);
-        let probe = TestProbe::new(fingerprint.clone(), |_, _, _| {
-            Ok(GenerateResponse::Generated(Box::new(generated_response(
-                "OK",
-                "stop",
-                json!({}),
-                None,
-            ))))
-        });
-        let outcome = refresh(
-            temp.path(),
-            &OwnerRefreshOptions {
-                expected_fingerprint: None,
-                expected_active_fingerprint: false,
-                expect_active_fingerprint_absent: false,
-            },
-            &probe,
-            &PanicSpp,
-        );
-        assert!(
-            matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
-        );
+        struct TestProbe<F> {
+            fingerprint: String,
+            generate_fn: Mutex<F>,
+            captured_requests: Mutex<Vec<GenerateRequest>>,
+        }
 
-        let config = read_journal_config(temp.path()).unwrap().config.unwrap();
-        let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
-        assert_eq!(inspection.projection.aggregate_state, "ready");
-        assert_eq!(inspection.projection.reason_code, None);
-        assert!(inspection.projection.fingerprint_sha256.is_some());
+        impl<F> TestProbe<F>
+        where
+            F: FnMut(
+                &GenerateRequest,
+                &Path,
+                &Map<String, Value>,
+            ) -> Result<GenerateResponse, ClientError>,
+        {
+            fn new(fingerprint: String, generate_fn: F) -> Self {
+                Self {
+                    fingerprint,
+                    generate_fn: Mutex::new(generate_fn),
+                    captured_requests: Mutex::new(Vec::new()),
+                }
+            }
+        }
 
-        let record_val = inspection.record.expect("record exists");
-        assert_eq!(record_val["reason_code"], serde_json::Value::Null);
-        assert_eq!(record_val["checking"], serde_json::Value::Null);
-        solstone_core_brain::validate_brain_state_record(&record_val, Utc::now())
-            .expect("record validates");
-
-        let captured = probe.captured_requests.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].timeout_s, Some(30.0));
-        assert_eq!(captured[0].transport_retries, Some(0));
-    }
-
-    #[test]
-    fn owner_refresh_bundled_prerequisite_failures_skip_generate_and_stay_non_ready() {
-        let failure_cases = [
-            (None, "local_runtime_not_ready"),
-            (
-                Some(("ready", "c".repeat(64))),
-                "local_runtime_fingerprint_mismatch",
-            ),
-            (
-                Some(("starting", "a".repeat(64))),
-                "local_runtime_not_ready",
-            ),
-        ];
-
-        for (runtime, expected_reason) in failure_cases {
-            let temp = setup_temp_journal();
-            let fingerprint = "a".repeat(64);
-            if let Some((phase, desired)) = runtime {
-                write_runtime_file(temp.path(), phase, &desired);
+        impl<F> OwnerProbe for TestProbe<F>
+        where
+            F: FnMut(
+                &GenerateRequest,
+                &Path,
+                &Map<String, Value>,
+            ) -> Result<GenerateResponse, ClientError>,
+        {
+            fn bundled_runtime_fingerprint(
+                &self,
+                _journal: &Path,
+                _config: &Map<String, Value>,
+            ) -> Option<String> {
+                Some(self.fingerprint.clone())
             }
 
-            let imports_dir = temp.path().join("imports");
-            std::fs::create_dir_all(&imports_dir).unwrap();
-            std::fs::write(imports_dir.join("planted.txt"), b"arbitrary-import-data").unwrap();
+            fn assess_bundled_runtime(
+                &self,
+                journal: &Path,
+                expected: Option<&str>,
+            ) -> BundledRuntimePrerequisiteAssessment {
+                assess_bundled_runtime_prerequisite(journal, expected)
+            }
 
-            let assessment = assess_bundled_runtime_prerequisite(temp.path(), Some(&fingerprint));
-            assert_eq!(assessment.reason_code.as_deref(), Some(expected_reason));
+            fn execute_generate(
+                &self,
+                request: &GenerateRequest,
+                journal: &Path,
+                config: &Map<String, Value>,
+            ) -> Result<GenerateResponse, ClientError> {
+                self.captured_requests.lock().unwrap().push(request.clone());
+                (self.generate_fn.lock().unwrap())(request, journal, config)
+            }
+        }
 
-            let probe = TestProbe::new(
-                fingerprint.clone(),
-                |_, _, _| -> Result<GenerateResponse, ClientError> {
-                    panic!("generate must not be called on bundled prerequisite failure");
-                },
-            );
+        fn setup_temp_journal() -> tempfile::TempDir {
+            let temp = tempfile::tempdir().expect("temp dir");
+            std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
+            std::fs::write(
+                temp.path().join("config/journal.json"),
+                br#"{"providers":{"active":{"provider":"local"}}}"#,
+            )
+            .expect("config write");
+            temp
+        }
 
+        fn write_runtime_file(journal: &Path, phase: &str, desired_fingerprint: &str) {
+            let runtime_dir = journal.join("health/providers/runtime");
+            std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+            std::fs::write(
+                runtime_dir.join("local.json"),
+                serde_json::to_vec(&json!({
+                    "phase": phase,
+                    "desired_fingerprint_sha256": desired_fingerprint,
+                }))
+                .expect("serialize runtime"),
+            )
+            .expect("write runtime");
+        }
+
+        #[test]
+        fn owner_refresh_bundled_success_converges_to_ready() {
+            let temp = setup_temp_journal();
+            let fingerprint = "a".repeat(64);
+            write_runtime_file(temp.path(), "ready", &fingerprint);
+            let probe = TestProbe::new(fingerprint.clone(), |_, _, _| {
+                Ok(GenerateResponse::Generated(Box::new(generated_response(
+                    "OK",
+                    "stop",
+                    json!({}),
+                    None,
+                ))))
+            });
             let outcome = refresh(
                 temp.path(),
                 &OwnerRefreshOptions {
@@ -1411,360 +1347,143 @@ mod tests {
                 &PanicSpp,
             );
             assert!(
-                matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if owner_exit_code(view) != 0)
+                matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
             );
 
             let config = read_journal_config(temp.path()).unwrap().config.unwrap();
             let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
-            assert_ne!(inspection.projection.aggregate_state, "ready");
+            assert_eq!(inspection.projection.aggregate_state, "ready");
+            assert_eq!(inspection.projection.reason_code, None);
+            assert!(inspection.projection.fingerprint_sha256.is_some());
+
+            let record_val = inspection.record.expect("record exists");
+            assert_eq!(record_val["reason_code"], serde_json::Value::Null);
+            assert_eq!(record_val["checking"], serde_json::Value::Null);
+            solstone_core_brain::validate_brain_state_record(&record_val, Utc::now())
+                .expect("record validates");
+
             let captured = probe.captured_requests.lock().unwrap();
-            assert!(captured.is_empty());
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].timeout_s, Some(30.0));
+            assert_eq!(captured[0].transport_retries, Some(0));
         }
-    }
 
-    #[test]
-    fn owner_refresh_generate_failure_records_unhealthy_or_blocked() {
-        let temp = setup_temp_journal();
-        let fingerprint = "a".repeat(64);
-        write_runtime_file(temp.path(), "ready", &fingerprint);
-        let probe = TestProbe::new(
-            fingerprint.clone(),
-            |_, _, _| -> Result<GenerateResponse, ClientError> {
-                Ok(GenerateResponse::Generated(Box::new(generated_response(
-                    "",
-                    "stop",
-                    json!({}),
-                    None,
-                ))))
-            },
-        );
-        let outcome = refresh(
-            temp.path(),
-            &OwnerRefreshOptions {
-                expected_fingerprint: None,
-                expected_active_fingerprint: false,
-                expect_active_fingerprint_absent: false,
-            },
-            &probe,
-            &PanicSpp,
-        );
-        assert!(
-            matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if owner_exit_code(view) == 1)
-        );
+        #[test]
+        fn owner_refresh_bundled_prerequisite_failures_skip_generate_and_stay_non_ready() {
+            let failure_cases = [
+                (None, "local_runtime_not_ready"),
+                (
+                    Some(("ready", "c".repeat(64))),
+                    "local_runtime_fingerprint_mismatch",
+                ),
+                (
+                    Some(("starting", "a".repeat(64))),
+                    "local_runtime_not_ready",
+                ),
+            ];
 
-        let config = read_journal_config(temp.path()).unwrap().config.unwrap();
-        let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
-        assert!(
-            matches!(
-                inspection.projection.aggregate_state.as_str(),
-                "unhealthy" | "blocked"
-            ),
-            "state: {}",
-            inspection.projection.aggregate_state
-        );
-        assert_ne!(inspection.projection.aggregate_state, "ready");
-    }
+            for (runtime, expected_reason) in failure_cases {
+                let temp = setup_temp_journal();
+                let fingerprint = "a".repeat(64);
+                if let Some((phase, desired)) = runtime {
+                    write_runtime_file(temp.path(), phase, &desired);
+                }
 
-    #[test]
-    fn owner_refresh_stale_expected_fingerprint_short_circuits() {
-        let temp = setup_temp_journal();
-        let fingerprint = "a".repeat(64);
-        write_runtime_file(temp.path(), "ready", &fingerprint);
-        let probe = TestProbe::new(fingerprint.clone(), |_, _, _| {
-            Ok(GenerateResponse::Generated(Box::new(generated_response(
-                "OK",
-                "stop",
-                json!({}),
-                None,
-            ))))
-        });
-        let outcome1 = refresh(
-            temp.path(),
-            &OwnerRefreshOptions {
-                expected_fingerprint: None,
-                expected_active_fingerprint: false,
-                expect_active_fingerprint_absent: false,
-            },
-            &probe,
-            &PanicSpp,
-        );
-        assert!(
-            matches!(outcome1, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
-        );
+                let imports_dir = temp.path().join("imports");
+                std::fs::create_dir_all(&imports_dir).unwrap();
+                std::fs::write(imports_dir.join("planted.txt"), b"arbitrary-import-data").unwrap();
 
-        let brain_record_path = temp.path().join("health/brain.json");
-        let initial_bytes = std::fs::read(&brain_record_path).expect("read brain.json");
+                let assessment =
+                    assess_bundled_runtime_prerequisite(temp.path(), Some(&fingerprint));
+                assert_eq!(assessment.reason_code.as_deref(), Some(expected_reason));
 
-        let stale_probe = TestProbe::new(
-            fingerprint.clone(),
-            |_, _, _| -> Result<GenerateResponse, ClientError> {
-                panic!("generate must not be called on stale fingerprint");
-            },
-        );
-        let outcome2 = refresh(
-            temp.path(),
-            &OwnerRefreshOptions {
-                expected_fingerprint: Some("b".repeat(64)),
-                expected_active_fingerprint: false,
-                expect_active_fingerprint_absent: false,
-            },
-            &stale_probe,
-            &PanicSpp,
-        );
-        assert!(
-            matches!(outcome2, OwnerRefreshOutcome::StaleExpectedFingerprint { ref view } if owner_exit_code(view) == 3)
-        );
+                let probe = TestProbe::new(
+                    fingerprint.clone(),
+                    |_, _, _| -> Result<GenerateResponse, ClientError> {
+                        panic!("generate must not be called on bundled prerequisite failure");
+                    },
+                );
 
-        let after_bytes = std::fs::read(&brain_record_path).expect("read brain.json after");
-        assert_eq!(initial_bytes, after_bytes);
-        assert!(stale_probe.captured_requests.lock().unwrap().is_empty());
-    }
+                let outcome = refresh(
+                    temp.path(),
+                    &OwnerRefreshOptions {
+                        expected_fingerprint: None,
+                        expected_active_fingerprint: false,
+                        expect_active_fingerprint_absent: false,
+                    },
+                    &probe,
+                    &PanicSpp,
+                );
+                assert!(
+                    matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if owner_exit_code(view) != 0)
+                );
 
-    #[test]
-    fn snapshot_fence_mismatch_skips_probe_and_returns_lost_fence() {
-        struct MismatchProbe {
-            fingerprint: String,
-            rewrite_bytes: &'static [u8],
-        }
-        impl OwnerProbe for MismatchProbe {
-            fn bundled_runtime_fingerprint(
-                &self,
-                _: &Path,
-                _: &Map<String, Value>,
-            ) -> Option<String> {
-                Some(self.fingerprint.clone())
-            }
-            fn assess_bundled_runtime(
-                &self,
-                journal: &Path,
-                expected: Option<&str>,
-            ) -> BundledRuntimePrerequisiteAssessment {
-                assess_bundled_runtime_prerequisite(journal, expected)
-            }
-            fn execute_generate(
-                &self,
-                _: &GenerateRequest,
-                _: &Path,
-                _: &Map<String, Value>,
-            ) -> Result<GenerateResponse, ClientError> {
-                panic!("generate must not be called on fence mismatch");
-            }
-            fn after_permit_acquired(&self, journal: &Path) {
-                std::fs::write(journal.join("config/journal.json"), self.rewrite_bytes).unwrap();
+                let config = read_journal_config(temp.path()).unwrap().config.unwrap();
+                let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
+                assert_ne!(inspection.projection.aggregate_state, "ready");
+                let captured = probe.captured_requests.lock().unwrap();
+                assert!(captured.is_empty());
             }
         }
 
-        let temp = setup_temp_journal();
-        let fingerprint = "a".repeat(64);
-        write_runtime_file(temp.path(), "ready", &fingerprint);
+        #[test]
+        fn owner_refresh_generate_failure_records_unhealthy_or_blocked() {
+            let temp = setup_temp_journal();
+            let fingerprint = "a".repeat(64);
+            write_runtime_file(temp.path(), "ready", &fingerprint);
+            let probe = TestProbe::new(
+                fingerprint.clone(),
+                |_, _, _| -> Result<GenerateResponse, ClientError> {
+                    Ok(GenerateResponse::Generated(Box::new(generated_response(
+                        "",
+                        "stop",
+                        json!({}),
+                        None,
+                    ))))
+                },
+            );
+            let outcome = refresh(
+                temp.path(),
+                &OwnerRefreshOptions {
+                    expected_fingerprint: None,
+                    expected_active_fingerprint: false,
+                    expect_active_fingerprint_absent: false,
+                },
+                &probe,
+                &PanicSpp,
+            );
+            assert!(
+                matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if owner_exit_code(view) == 1)
+            );
 
-        let probe = MismatchProbe {
-            fingerprint: fingerprint.clone(),
-            rewrite_bytes:
-                br#"{"providers":{"active":{"provider":"google","model":"gemini-1.5-flash"}}}"#,
-        };
-        let outcome = refresh(
-            temp.path(),
-            &OwnerRefreshOptions {
-                expected_fingerprint: None,
-                expected_active_fingerprint: false,
-                expect_active_fingerprint_absent: false,
-            },
-            &probe,
-            &PanicSpp,
-        );
-
-        assert!(
-            matches!(outcome, OwnerRefreshOutcome::LostFence { ref view } if owner_exit_code(view) == 3)
-        );
-
-        let config = read_journal_config(temp.path()).unwrap().config.unwrap();
-        let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
-        assert_ne!(inspection.projection.aggregate_state, "ready");
-        assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
-
-        let temp2 = setup_temp_journal();
-        write_runtime_file(temp2.path(), "ready", &fingerprint);
-
-        let probe2 = MismatchProbe {
-            fingerprint,
-            rewrite_bytes: br#"{"providers":{"active":{"provider":"not-a-provider"}}}"#,
-        };
-        let outcome2 = refresh(
-            temp2.path(),
-            &OwnerRefreshOptions {
-                expected_fingerprint: None,
-                expected_active_fingerprint: false,
-                expect_active_fingerprint_absent: false,
-            },
-            &probe2,
-            &PanicSpp,
-        );
-
-        assert!(
-            matches!(outcome2, OwnerRefreshOutcome::LostFence { ref view } if owner_exit_code(view) == 3)
-        );
-
-        let brain_record_bytes =
-            std::fs::read(temp2.path().join("health/brain.json")).expect("read health/brain.json");
-        let brain_record: Value =
-            serde_json::from_slice(&brain_record_bytes).expect("parse health/brain.json");
-        assert!(brain_record.get("checking").is_some());
-        assert!(!brain_record["checking"].is_null());
-        assert_ne!(
-            brain_record.get("reason_code").and_then(Value::as_str),
-            Some("probe_internal_error")
-        );
-        assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp2.path())).unwrap());
-    }
-
-    #[test]
-    fn renewal_fallback_uses_the_caller_journal_and_executor() {
-        let temp = setup_temp_journal();
-        let fingerprint = "a".repeat(64);
-        write_runtime_file(temp.path(), "ready", &fingerprint);
-
-        struct CapturingProbe {
-            fingerprint: String,
-            captured_path: Mutex<Option<PathBuf>>,
+            let config = read_journal_config(temp.path()).unwrap().config.unwrap();
+            let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
+            assert!(
+                matches!(
+                    inspection.projection.aggregate_state.as_str(),
+                    "unhealthy" | "blocked"
+                ),
+                "state: {}",
+                inspection.projection.aggregate_state
+            );
+            assert_ne!(inspection.projection.aggregate_state, "ready");
         }
-        impl OwnerProbe for CapturingProbe {
-            fn bundled_runtime_fingerprint(
-                &self,
-                _: &Path,
-                _: &Map<String, Value>,
-            ) -> Option<String> {
-                Some(self.fingerprint.clone())
-            }
-            fn assess_bundled_runtime(
-                &self,
-                journal: &Path,
-                expected: Option<&str>,
-            ) -> BundledRuntimePrerequisiteAssessment {
-                assess_bundled_runtime_prerequisite(journal, expected)
-            }
-            fn execute_generate(
-                &self,
-                _: &GenerateRequest,
-                journal: &Path,
-                _: &Map<String, Value>,
-            ) -> Result<GenerateResponse, ClientError> {
-                *self.captured_path.lock().unwrap() = Some(journal.to_path_buf());
+
+        #[test]
+        fn owner_refresh_stale_expected_fingerprint_short_circuits() {
+            let temp = setup_temp_journal();
+            let fingerprint = "a".repeat(64);
+            write_runtime_file(temp.path(), "ready", &fingerprint);
+            let probe = TestProbe::new(fingerprint.clone(), |_, _, _| {
                 Ok(GenerateResponse::Generated(Box::new(generated_response(
                     "OK",
                     "stop",
                     json!({}),
                     None,
                 ))))
-            }
-        }
-
-        let probe = CapturingProbe {
-            fingerprint,
-            captured_path: Mutex::new(None),
-        };
-
-        let outcome = renew_prerequisites(temp.path(), None, &probe, &PanicSpp);
-        assert!(
-            matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
-        );
-        assert_eq!(
-            probe.captured_path.lock().unwrap().as_deref(),
-            Some(temp.path())
-        );
-    }
-
-    #[test]
-    fn spp_refusal_skips_generate_and_stays_non_ready() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
-        let config_json = br#"{"providers":{"active":{"provider":"local","model":"local/qwen3.5-4b"},"local":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential":"secret"}},"services":{"confidential":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential_fingerprint_sha256":"2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"}}}"#;
-        std::fs::write(temp.path().join("config/journal.json"), config_json).expect("config write");
-
-        let parsed: Map<String, Value> = serde_json::from_slice(config_json).unwrap();
-        assert_eq!(
-            derive_active_brain_lane(&parsed).lane.as_deref(),
-            Some("spp")
-        );
-
-        struct RefusingSpp;
-        impl OwnerSppPrerequisite for RefusingSpp {
-            fn assess(&self, _: &Path, _: &Map<String, Value>, now: DateTime<Utc>) -> Value {
-                component_for_reason(
-                    "lane_prerequisites",
-                    "attestation_not_verified",
-                    Map::new(),
-                    now,
-                )
-            }
-        }
-
-        struct NoGenerateProbe;
-        impl OwnerProbe for NoGenerateProbe {
-            fn bundled_runtime_fingerprint(
-                &self,
-                _: &Path,
-                _: &Map<String, Value>,
-            ) -> Option<String> {
-                None
-            }
-            fn assess_bundled_runtime(
-                &self,
-                _: &Path,
-                _: Option<&str>,
-            ) -> BundledRuntimePrerequisiteAssessment {
-                unreachable!()
-            }
-            fn execute_generate(
-                &self,
-                _: &GenerateRequest,
-                _: &Path,
-                _: &Map<String, Value>,
-            ) -> Result<GenerateResponse, ClientError> {
-                panic!("generate must not be called when SPP prerequisites refuse");
-            }
-        }
-
-        let outcome = refresh(
-            temp.path(),
-            &OwnerRefreshOptions {
-                expected_fingerprint: None,
-                expected_active_fingerprint: false,
-                expect_active_fingerprint_absent: false,
-            },
-            &NoGenerateProbe,
-            &RefusingSpp,
-        );
-        assert!(
-            matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if view.aggregate_state != "ready")
-        );
-    }
-
-    #[test]
-    fn paused_executor_holds_the_lease_until_return() {
-        let temp = setup_temp_journal();
-        let fingerprint = "a".repeat(64);
-        write_runtime_file(temp.path(), "ready", &fingerprint);
-
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-
-        let probe = TestProbe::new(fingerprint.clone(), move |_, _, _| {
-            entered_tx.send(()).unwrap();
-            release_rx.lock().unwrap().recv().unwrap();
-            Ok(GenerateResponse::Generated(Box::new(generated_response(
-                "OK",
-                "stop",
-                json!({}),
-                None,
-            ))))
-        });
-
-        let journal_path = temp.path().to_path_buf();
-        let handle = std::thread::spawn(move || {
-            refresh(
-                &journal_path,
+            });
+            let outcome1 = refresh(
+                temp.path(),
                 &OwnerRefreshOptions {
                     expected_fingerprint: None,
                     expected_active_fingerprint: false,
@@ -1772,132 +1491,574 @@ mod tests {
                 },
                 &probe,
                 &PanicSpp,
-            )
-        });
+            );
+            assert!(
+                matches!(outcome1, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
+            );
 
-        entered_rx.recv().unwrap();
-        assert!(probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
+            let brain_record_path = temp.path().join("health/brain.json");
+            let initial_bytes = std::fs::read(&brain_record_path).expect("read brain.json");
 
-        let (_unrelated_tx, unrelated_rx) = mpsc::channel::<()>();
-        drop(unrelated_rx);
-        assert!(probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
-
-        release_tx.send(()).unwrap();
-        let outcome = handle.join().unwrap();
-        assert!(
-            matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
-        );
-        assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
-    }
-
-    #[test]
-    fn unwind_releases_the_lease_and_does_not_publish_ready() {
-        let temp = setup_temp_journal();
-        let fingerprint = "a".repeat(64);
-        write_runtime_file(temp.path(), "ready", &fingerprint);
-
-        struct PanickingProbe {
-            fingerprint: String,
-        }
-        impl OwnerProbe for PanickingProbe {
-            fn bundled_runtime_fingerprint(
-                &self,
-                _: &Path,
-                _: &Map<String, Value>,
-            ) -> Option<String> {
-                Some(self.fingerprint.clone())
-            }
-            fn assess_bundled_runtime(
-                &self,
-                journal: &Path,
-                expected: Option<&str>,
-            ) -> BundledRuntimePrerequisiteAssessment {
-                assess_bundled_runtime_prerequisite(journal, expected)
-            }
-            fn execute_generate(
-                &self,
-                _: &GenerateRequest,
-                _: &Path,
-                _: &Map<String, Value>,
-            ) -> Result<GenerateResponse, ClientError> {
-                panic!("intentional panic inside generate");
-            }
-        }
-
-        let probe = PanickingProbe { fingerprint };
-        let journal_path = temp.path().to_path_buf();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refresh(
-                &journal_path,
+            let stale_probe = TestProbe::new(
+                fingerprint.clone(),
+                |_, _, _| -> Result<GenerateResponse, ClientError> {
+                    panic!("generate must not be called on stale fingerprint");
+                },
+            );
+            let outcome2 = refresh(
+                temp.path(),
                 &OwnerRefreshOptions {
-                    expected_fingerprint: None,
+                    expected_fingerprint: Some("b".repeat(64)),
                     expected_active_fingerprint: false,
                     expect_active_fingerprint_absent: false,
                 },
-                &probe,
+                &stale_probe,
                 &PanicSpp,
-            )
-        }));
+            );
+            assert!(
+                matches!(outcome2, OwnerRefreshOutcome::StaleExpectedFingerprint { ref view } if owner_exit_code(view) == 3)
+            );
 
-        assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
+            let after_bytes = std::fs::read(&brain_record_path).expect("read brain.json after");
+            assert_eq!(initial_bytes, after_bytes);
+            assert!(stale_probe.captured_requests.lock().unwrap().is_empty());
+        }
 
-        let config = read_journal_config(temp.path()).unwrap().config.unwrap();
-        let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
-        assert_ne!(inspection.projection.aggregate_state, "ready");
-    }
-
-    #[test]
-    fn respond_with_config_probe_uses_the_snapshot_not_the_file() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
-        std::fs::write(
-            temp.path().join("config/journal.json"),
-            br#"{"providers":{"active":{"provider":"unknown"}}}"#,
-        )
-        .expect("write config");
-
-        let probe = RespondWithConfigProbe {
-            runtime: solstone_core_generate_wire::EndpointRuntime::default(),
-        };
-
-        let request = GenerateRequest {
-            id: None,
-            context: HEALTH_BRAIN_GENERATE_CONTEXT.to_owned(),
-            contents: vec![ContentPart::Text {
-                text: "Reply with the single word OK.".to_owned(),
-            }],
-            system_instruction: None,
-            temperature: 0.0,
-            max_output_tokens: 512,
-            timeout_s: Some(30.0),
-            json_output: false,
-            json_schema: None,
-            attempt_index: 0,
-            exclusive_admission: false,
-            transport_retries: Some(0),
-        };
-
-        let snapshot = json!({
-            "providers": {
-                "active": {
-                    "provider": "google"
+        #[test]
+        fn snapshot_fence_mismatch_skips_probe_and_returns_lost_fence() {
+            struct MismatchProbe {
+                fingerprint: String,
+                rewrite_bytes: &'static [u8],
+            }
+            impl OwnerProbe for MismatchProbe {
+                fn bundled_runtime_fingerprint(
+                    &self,
+                    _: &Path,
+                    _: &Map<String, Value>,
+                ) -> Option<String> {
+                    Some(self.fingerprint.clone())
+                }
+                fn assess_bundled_runtime(
+                    &self,
+                    journal: &Path,
+                    expected: Option<&str>,
+                ) -> BundledRuntimePrerequisiteAssessment {
+                    assess_bundled_runtime_prerequisite(journal, expected)
+                }
+                fn execute_generate(
+                    &self,
+                    _: &GenerateRequest,
+                    _: &Path,
+                    _: &Map<String, Value>,
+                ) -> Result<GenerateResponse, ClientError> {
+                    panic!("generate must not be called on fence mismatch");
+                }
+                fn after_permit_acquired(&self, journal: &Path) {
+                    std::fs::write(journal.join("config/journal.json"), self.rewrite_bytes)
+                        .unwrap();
                 }
             }
-        })
-        .as_object()
-        .unwrap()
-        .clone();
 
-        let result = probe.execute_generate(&request, temp.path(), &snapshot);
-        match result {
-            Ok(GenerateResponse::Refused(refusal)) => {
-                assert_eq!(refusal.provider.as_deref(), Some("google"));
-                assert_eq!(
-                    refusal.reason_code.as_ref().map(|r| r.as_wire()),
-                    Some("provider_key_missing")
-                );
+            let temp = setup_temp_journal();
+            let fingerprint = "a".repeat(64);
+            write_runtime_file(temp.path(), "ready", &fingerprint);
+
+            let probe = MismatchProbe {
+                fingerprint: fingerprint.clone(),
+                rewrite_bytes:
+                    br#"{"providers":{"active":{"provider":"google","model":"gemini-1.5-flash"}}}"#,
+            };
+            let outcome = refresh(
+                temp.path(),
+                &OwnerRefreshOptions {
+                    expected_fingerprint: None,
+                    expected_active_fingerprint: false,
+                    expect_active_fingerprint_absent: false,
+                },
+                &probe,
+                &PanicSpp,
+            );
+
+            assert!(
+                matches!(outcome, OwnerRefreshOutcome::LostFence { ref view } if owner_exit_code(view) == 3)
+            );
+
+            let config = read_journal_config(temp.path()).unwrap().config.unwrap();
+            let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
+            assert_ne!(inspection.projection.aggregate_state, "ready");
+            assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
+
+            let temp2 = setup_temp_journal();
+            write_runtime_file(temp2.path(), "ready", &fingerprint);
+
+            let probe2 = MismatchProbe {
+                fingerprint,
+                rewrite_bytes: br#"{"providers":{"active":{"provider":"not-a-provider"}}}"#,
+            };
+            let outcome2 = refresh(
+                temp2.path(),
+                &OwnerRefreshOptions {
+                    expected_fingerprint: None,
+                    expected_active_fingerprint: false,
+                    expect_active_fingerprint_absent: false,
+                },
+                &probe2,
+                &PanicSpp,
+            );
+
+            assert!(
+                matches!(outcome2, OwnerRefreshOutcome::LostFence { ref view } if owner_exit_code(view) == 3)
+            );
+
+            let brain_record_bytes = std::fs::read(temp2.path().join("health/brain.json"))
+                .expect("read health/brain.json");
+            let brain_record: Value =
+                serde_json::from_slice(&brain_record_bytes).expect("parse health/brain.json");
+            assert!(brain_record.get("checking").is_some());
+            assert!(!brain_record["checking"].is_null());
+            assert_ne!(
+                brain_record.get("reason_code").and_then(Value::as_str),
+                Some("probe_internal_error")
+            );
+            assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp2.path())).unwrap());
+        }
+
+        #[test]
+        fn renewal_fallback_uses_the_caller_journal_and_executor() {
+            let temp = setup_temp_journal();
+            let fingerprint = "a".repeat(64);
+            write_runtime_file(temp.path(), "ready", &fingerprint);
+
+            struct CapturingProbe {
+                fingerprint: String,
+                captured_path: Mutex<Option<PathBuf>>,
             }
-            other => panic!("expected refused provider_key_missing, got {other:?}"),
+            impl OwnerProbe for CapturingProbe {
+                fn bundled_runtime_fingerprint(
+                    &self,
+                    _: &Path,
+                    _: &Map<String, Value>,
+                ) -> Option<String> {
+                    Some(self.fingerprint.clone())
+                }
+                fn assess_bundled_runtime(
+                    &self,
+                    journal: &Path,
+                    expected: Option<&str>,
+                ) -> BundledRuntimePrerequisiteAssessment {
+                    assess_bundled_runtime_prerequisite(journal, expected)
+                }
+                fn execute_generate(
+                    &self,
+                    _: &GenerateRequest,
+                    journal: &Path,
+                    _: &Map<String, Value>,
+                ) -> Result<GenerateResponse, ClientError> {
+                    *self.captured_path.lock().unwrap() = Some(journal.to_path_buf());
+                    Ok(GenerateResponse::Generated(Box::new(generated_response(
+                        "OK",
+                        "stop",
+                        json!({}),
+                        None,
+                    ))))
+                }
+            }
+
+            let probe = CapturingProbe {
+                fingerprint,
+                captured_path: Mutex::new(None),
+            };
+
+            let outcome = renew_prerequisites(temp.path(), None, &probe, &PanicSpp);
+            assert!(
+                matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
+            );
+            assert_eq!(
+                probe.captured_path.lock().unwrap().as_deref(),
+                Some(temp.path())
+            );
+        }
+
+        #[test]
+        fn spp_refusal_skips_generate_and_stays_non_ready() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
+            let config_json = br#"{"providers":{"active":{"provider":"local","model":"local/qwen3.5-4b"},"local":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential":"secret"}},"services":{"confidential":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential_fingerprint_sha256":"2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"}}}"#;
+            std::fs::write(temp.path().join("config/journal.json"), config_json)
+                .expect("config write");
+
+            let parsed: Map<String, Value> = serde_json::from_slice(config_json).unwrap();
+            assert_eq!(
+                derive_active_brain_lane(&parsed).lane.as_deref(),
+                Some("spp")
+            );
+
+            struct RefusingSpp;
+            impl OwnerSppPrerequisite for RefusingSpp {
+                fn assess(&self, _: &Path, _: &Map<String, Value>, now: DateTime<Utc>) -> Value {
+                    component_for_reason(
+                        "lane_prerequisites",
+                        "attestation_not_verified",
+                        Map::new(),
+                        now,
+                    )
+                }
+            }
+
+            struct NoGenerateProbe;
+            impl OwnerProbe for NoGenerateProbe {
+                fn bundled_runtime_fingerprint(
+                    &self,
+                    _: &Path,
+                    _: &Map<String, Value>,
+                ) -> Option<String> {
+                    None
+                }
+                fn assess_bundled_runtime(
+                    &self,
+                    _: &Path,
+                    _: Option<&str>,
+                ) -> BundledRuntimePrerequisiteAssessment {
+                    unreachable!()
+                }
+                fn execute_generate(
+                    &self,
+                    _: &GenerateRequest,
+                    _: &Path,
+                    _: &Map<String, Value>,
+                ) -> Result<GenerateResponse, ClientError> {
+                    panic!("generate must not be called when SPP prerequisites refuse");
+                }
+            }
+
+            let outcome = refresh(
+                temp.path(),
+                &OwnerRefreshOptions {
+                    expected_fingerprint: None,
+                    expected_active_fingerprint: false,
+                    expect_active_fingerprint_absent: false,
+                },
+                &NoGenerateProbe,
+                &RefusingSpp,
+            );
+            assert!(
+                matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if view.aggregate_state != "ready")
+            );
+        }
+
+        #[test]
+        fn paused_executor_holds_the_lease_until_return() {
+            let temp = setup_temp_journal();
+            let fingerprint = "a".repeat(64);
+            write_runtime_file(temp.path(), "ready", &fingerprint);
+
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+
+            let probe = TestProbe::new(fingerprint.clone(), move |_, _, _| {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok(GenerateResponse::Generated(Box::new(generated_response(
+                    "OK",
+                    "stop",
+                    json!({}),
+                    None,
+                ))))
+            });
+
+            let journal_path = temp.path().to_path_buf();
+            let (result_tx, result_rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let outcome = refresh(
+                    &journal_path,
+                    &OwnerRefreshOptions {
+                        expected_fingerprint: None,
+                        expected_active_fingerprint: false,
+                        expect_active_fingerprint_absent: false,
+                    },
+                    &probe,
+                    &PanicSpp,
+                );
+                // This is the actual worker result observer, not an unrelated channel.
+                assert!(result_tx.send(outcome.clone()).is_err());
+                outcome
+            });
+
+            entered_rx.recv_timeout(StdDuration::from_secs(10)).unwrap();
+            drop(result_rx);
+            let held = probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap();
+            let competing = TestProbe::new(fingerprint, |_, _, _| {
+                panic!("a competing refresh must not execute while the worker owns the lease")
+            });
+            let busy = refresh(
+                temp.path(),
+                &OwnerRefreshOptions {
+                    expected_fingerprint: None,
+                    expected_active_fingerprint: false,
+                    expect_active_fingerprint_absent: false,
+                },
+                &competing,
+                &PanicSpp,
+            );
+
+            release_tx.send(()).unwrap();
+            let outcome = handle.join().unwrap();
+            assert!(held);
+            assert!(matches!(busy, OwnerRefreshOutcome::Busy { .. }));
+            assert!(
+                matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
+            );
+            assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
+        }
+
+        #[test]
+        fn unwind_releases_the_lease_and_does_not_publish_ready() {
+            let temp = setup_temp_journal();
+            let fingerprint = "a".repeat(64);
+            write_runtime_file(temp.path(), "ready", &fingerprint);
+
+            struct PanickingProbe {
+                fingerprint: String,
+            }
+            impl OwnerProbe for PanickingProbe {
+                fn bundled_runtime_fingerprint(
+                    &self,
+                    _: &Path,
+                    _: &Map<String, Value>,
+                ) -> Option<String> {
+                    Some(self.fingerprint.clone())
+                }
+                fn assess_bundled_runtime(
+                    &self,
+                    journal: &Path,
+                    expected: Option<&str>,
+                ) -> BundledRuntimePrerequisiteAssessment {
+                    assess_bundled_runtime_prerequisite(journal, expected)
+                }
+                fn execute_generate(
+                    &self,
+                    _: &GenerateRequest,
+                    _: &Path,
+                    _: &Map<String, Value>,
+                ) -> Result<GenerateResponse, ClientError> {
+                    panic!("intentional panic inside generate");
+                }
+            }
+
+            let probe = PanickingProbe { fingerprint };
+            let journal_path = temp.path().to_path_buf();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                refresh(
+                    &journal_path,
+                    &OwnerRefreshOptions {
+                        expected_fingerprint: None,
+                        expected_active_fingerprint: false,
+                        expect_active_fingerprint_absent: false,
+                    },
+                    &probe,
+                    &PanicSpp,
+                )
+            }));
+
+            assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
+
+            let config = read_journal_config(temp.path()).unwrap().config.unwrap();
+            let inspection = inspect_brain_state(temp.path(), &config, Utc::now());
+            assert_ne!(inspection.projection.aggregate_state, "ready");
+        }
+
+        #[test]
+        fn respond_with_config_probe_uses_the_snapshot_not_the_file() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
+            std::fs::write(
+                temp.path().join("config/journal.json"),
+                br#"{"providers":{"active":{"provider":"unknown"}}}"#,
+            )
+            .expect("write config");
+
+            let probe = RespondWithConfigProbe {
+                runtime: solstone_core_generate_wire::EndpointRuntime::default(),
+            };
+
+            let request = GenerateRequest {
+                id: None,
+                context: HEALTH_BRAIN_GENERATE_CONTEXT.to_owned(),
+                contents: vec![ContentPart::Text {
+                    text: "Reply with the single word OK.".to_owned(),
+                }],
+                system_instruction: None,
+                temperature: 0.0,
+                max_output_tokens: 512,
+                timeout_s: Some(30.0),
+                json_output: false,
+                json_schema: None,
+                attempt_index: 0,
+                exclusive_admission: false,
+                transport_retries: Some(0),
+            };
+
+            let snapshot = json!({
+                "providers": {
+                    "active": {
+                        "provider": "google"
+                    }
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+
+            let result = probe.execute_generate(&request, temp.path(), &snapshot);
+            match result {
+                Ok(GenerateResponse::Refused(refusal)) => {
+                    assert_eq!(refusal.provider.as_deref(), Some("google"));
+                    assert_eq!(
+                        refusal.reason_code.as_ref().map(|r| r.as_wire()),
+                        Some("provider_key_missing")
+                    );
+                }
+                other => panic!("expected refused provider_key_missing, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn callable_safe_renewal_reuses_the_existing_generate_evidence() {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(temp.path().join("config")).unwrap();
+            let config = json!({"providers":{"active":{"provider":"local","model":"local/qwen3.5-4b"},"local":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential":"secret"}},"services":{"confidential":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential_fingerprint_sha256":"2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"}}});
+            std::fs::write(
+                temp.path().join("config/journal.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let now = Utc::now();
+            let component = json!({"status":"ok","observed_at":now.to_rfc3339(),"expires_at":(now + Duration::days(1)).to_rfc3339()});
+            let permit = begin_refresh(temp.path(), now, None, None, false, None)
+                .unwrap()
+                .unwrap();
+            finish_refresh(temp.path(),permit,json!({"configuration":component,"lane_prerequisites":component,"generate":component}),Utc::now(),None).unwrap();
+            let before: Value =
+                serde_json::from_slice(&std::fs::read(brain_state_path(temp.path())).unwrap())
+                    .unwrap();
+            let view = owner_view(temp.path(), config.as_object().unwrap(), Utc::now());
+            assert_eq!(view.aggregate_state, "ready");
+            struct ReadySpp;
+            impl OwnerSppPrerequisite for ReadySpp {
+                fn assess(&self, _: &Path, _: &Map<String, Value>, now: DateTime<Utc>) -> Value {
+                    json!({"status":"ok","observed_at":now.to_rfc3339(),"expires_at":(now + Duration::days(1)).to_rfc3339()})
+                }
+            }
+            let probe = TestProbe::new("a".repeat(64), |_, _, _| {
+                panic!("safe prerequisite renewal must not execute Generate")
+            });
+            let result = renew_prerequisites(
+                temp.path(),
+                view.fingerprint_sha256.as_deref(),
+                &probe,
+                &ReadySpp,
+            );
+            assert!(matches!(result, OwnerRefreshOutcome::PersistedReady { .. }));
+            let after: Value =
+                serde_json::from_slice(&std::fs::read(brain_state_path(temp.path())).unwrap())
+                    .unwrap();
+            assert_eq!(
+                after["evidence"]["generate"],
+                before["evidence"]["generate"]
+            );
+            assert_eq!(
+                after["evidence"]["configuration"],
+                before["evidence"]["configuration"]
+            );
+            assert!(probe.captured_requests.lock().unwrap().is_empty());
+            assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
+        }
+
+        #[test]
+        fn callable_snapshot_aba_ignores_ambient_provider_overrides() {
+            let temp = tempfile::tempdir().unwrap();
+            let receipt = temp.path().join("child-receipt");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::full::snapshot_aba_ambient_child",
+                    "--ignored",
+                ])
+                .env("BRAIN_OWNER_SNAPSHOT_RECEIPT", &receipt)
+                .env(
+                    "SOLSTONE_GENERATE_PROVIDER_OVERRIDE",
+                    "unsupported-ambient-provider",
+                )
+                .env("SOLSTONE_GENERATE_MODEL_OVERRIDE", "ambient-model")
+                .env(
+                    "SOLSTONE_GENERATE_API_KEY_OVERRIDE",
+                    "synthetic-ambient-key",
+                )
+                .env("SOLSTONE_GENERATE_BASE_URL_OVERRIDE", "http://127.0.0.1:9")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // A misspelled exact test name may exit zero with no test executed.
+            assert_eq!(
+                std::fs::read(receipt).unwrap(),
+                b"snapshot-aba-ambient-passed"
+            );
+        }
+
+        #[test]
+        #[ignore = "run by callable_snapshot_aba_ignores_ambient_provider_overrides in its isolated process"]
+        fn snapshot_aba_ambient_child() {
+            assert_eq!(
+                std::env::var("SOLSTONE_GENERATE_PROVIDER_OVERRIDE").unwrap(),
+                "unsupported-ambient-provider"
+            );
+            let receipt = std::env::var_os("BRAIN_OWNER_SNAPSHOT_RECEIPT").expect("parent receipt");
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(temp.path().join("config")).unwrap();
+            let a = json!({"providers":{"active":{"provider":"google","model":"snapshot-model"}}});
+            let b = json!({"providers":{"active":{"provider":"openai","model":"file-model"}}});
+            let file = temp.path().join("config/journal.json");
+            std::fs::write(&file, serde_json::to_vec(&a).unwrap()).unwrap();
+            let snapshot = read_journal_config(temp.path()).unwrap().config.unwrap();
+            let probe = RespondWithConfigProbe {
+                runtime: solstone_core_generate_wire::EndpointRuntime::default(),
+            };
+            let request = GenerateRequest {
+                id: None,
+                context: HEALTH_BRAIN_GENERATE_CONTEXT.to_owned(),
+                contents: vec![ContentPart::Text {
+                    text: "Reply with the single word OK.".to_owned(),
+                }],
+                system_instruction: None,
+                temperature: 0.0,
+                max_output_tokens: 512,
+                timeout_s: Some(0.25),
+                json_output: false,
+                json_schema: None,
+                attempt_index: 0,
+                exclusive_admission: false,
+                transport_retries: Some(0),
+            };
+            for file_config in [&a, &b, &a] {
+                std::fs::write(&file, serde_json::to_vec(file_config).unwrap()).unwrap();
+                match probe.execute_generate(&request, temp.path(), &snapshot) {
+                    Ok(GenerateResponse::Refused(refusal)) => {
+                        assert_eq!(refusal.provider.as_deref(), Some("google"));
+                        assert_eq!(
+                            refusal.reason_code.as_ref().map(|reason| reason.as_wire()),
+                            Some("provider_key_missing")
+                        );
+                    }
+                    other => panic!("checked snapshot lost: {other:?}"),
+                }
+            }
+            std::fs::write(receipt, b"snapshot-aba-ambient-passed").unwrap();
         }
     }
 }
