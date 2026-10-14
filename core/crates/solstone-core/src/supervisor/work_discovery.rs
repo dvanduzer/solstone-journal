@@ -20,7 +20,7 @@ use solstone_core_system::{
     queue::{DISCOVERED_ADMISSION, DiscoveredTask, TaskQueue},
     request::{BusTaskRequest, DailyCatchupProvenance, TaskArgv},
     work_intent::{self, IntentState, OwnerIntent},
-    work_inventory::{WorkHold, WorkInventory},
+    work_inventory::{HistoryProgress, HistorySample, WorkHold, WorkInventory},
     work_policy::WorkPolicy,
     work_retry::{self, Unit},
 };
@@ -289,6 +289,17 @@ struct DayWork {
     candidates: Vec<DiscoveredTask>,
     completed_segments: BTreeSet<Coordinate>,
     daily_current: bool,
+    history: HistoryDay,
+}
+
+#[derive(Default)]
+struct HistoryDay {
+    owed: u64,
+    segments_owed: u64,
+    daily_units_owed: u64,
+    set_aside: u64,
+    segments_set_aside: u64,
+    daily_units_set_aside: u64,
 }
 
 fn priority(
@@ -424,6 +435,7 @@ fn raw_retries(
     imports: &[ImportThinking],
     policy: WorkPolicy,
     capped: &BTreeSet<solstone_core_system_health::TerminalUnit>,
+    permanently_held: &mut bool,
     report: &mut WorkInventory,
 ) -> Result<Vec<DiscoveredTask>, String> {
     let directory = match segment.stream_layout {
@@ -508,6 +520,7 @@ fn raw_retries(
             reason: record.reason.clone(),
         });
         let Some(grant) = grant else {
+            *permanently_held |= permanently_set_aside(&record.reason);
             continue;
         };
         if !policy.permits(p.band) {
@@ -548,6 +561,7 @@ fn daily_retries(
     imports: &[ImportThinking],
     policy: WorkPolicy,
     ready: bool,
+    permanently_held: &mut BTreeSet<String>,
     report: &mut WorkInventory,
 ) -> Result<Vec<DiscoveredTask>, String> {
     let today = chrono::Utc::now()
@@ -592,6 +606,9 @@ fn daily_retries(
             reason: record.reason.clone(),
         });
         let Some(grant) = grant else {
+            if permanently_set_aside(&record.reason) {
+                permanently_held.insert(id);
+            }
             continue;
         };
         if !ready {
@@ -633,6 +650,7 @@ fn talent_retries(
     intent: Option<&OwnerIntent>,
     imports: &[ImportThinking],
     policy: WorkPolicy,
+    permanently_held_activities: &mut u64,
     report: &mut WorkInventory,
 ) -> Result<Vec<DiscoveredTask>, String> {
     let (records, errors) = work_retry::list(journal);
@@ -691,6 +709,10 @@ fn talent_retries(
             report.band(p.band).activities_owed += 1;
         }
         let Some(grant) = grant else {
+            if matches!(record.unit, Unit::Activity { .. }) && permanently_set_aside(&record.reason)
+            {
+                *permanently_held_activities += 1;
+            }
             continue;
         };
         if !policy.permits(p.band) {
@@ -739,8 +761,10 @@ fn inspect_day(
         candidates: Vec::new(),
         completed_segments: BTreeSet::new(),
         daily_current: false,
+        history: HistoryDay::default(),
     };
     if let Some(intent) = intent.filter(|intent| intent.from_scratch) {
+        work.history.owed = 1;
         if intent.state == IntentState::Queued {
             let p = priority(day, None, today, Some(WorkBand::Waiting));
             report.band(p.band).owner_requests += 1;
@@ -799,6 +823,7 @@ fn inspect_day(
         if super::tick::is_mcp_audit_segment(Some(&segment.stream)) {
             continue;
         }
+        let mut permanently_held = false;
         work.candidates.extend(raw_retries(
             journal,
             day,
@@ -807,6 +832,7 @@ fn inspect_day(
             imports,
             policy,
             &capped.value,
+            &mut permanently_held,
             report,
         )?);
         let coordinate = Coordinate {
@@ -829,6 +855,12 @@ fn inspect_day(
             continue;
         }
         prerequisites_ready = false;
+        if permanently_held {
+            work.history.set_aside += 1;
+            work.history.segments_set_aside += u64::from(p.band == WorkBand::Completing);
+        } else {
+            work.history.owed += 1;
+        }
         if readiness == SegmentReadiness::Owed {
             segments_thought = false;
         }
@@ -842,6 +874,7 @@ fn inspect_day(
         .or_else(|| imported.then_some(WorkBand::Import));
     let coverage = daily_coverage::read_daily_coverage(journal, day)?;
     let p = daily_priority(priority(day, None, today, explicit), &coverage);
+    let mut permanently_held_daily = BTreeSet::new();
     work.candidates.extend(daily_retries(
         journal,
         day,
@@ -850,8 +883,33 @@ fn inspect_day(
         imports,
         policy,
         prerequisites_ready && !closing,
+        &mut permanently_held_daily,
         report,
     )?);
+    // A daily output waiting solely on permanently held recordings is also
+    // set aside for the range. Ordinary prerequisites remain work owed.
+    let permanently_blocked =
+        !segments_thought && work.history.owed == 0 && work.history.set_aside > 0;
+    for covered in &coverage.units {
+        let unit = Unit::Daily {
+            day: day.into(),
+            talent: covered.identity.name.clone(),
+            facet: covered.identity.facet.clone(),
+        };
+        let id = unit.id()?;
+        let hold = report
+            .holds
+            .iter()
+            .find(|hold| hold.retry_unit.as_ref() == Some(&id));
+        if covered.state.is_owed() || hold.is_some() {
+            if permanently_blocked || permanently_held_daily.contains(&id) {
+                work.history.set_aside += 1;
+                work.history.daily_units_set_aside += u64::from(p.band >= WorkBand::Completing);
+            } else {
+                work.history.owed += 1;
+            }
+        }
+    }
     let closes_day = day < today.format("%Y%m%d").to_string().as_str()
         && queue_daily(
             journal,
@@ -1111,6 +1169,88 @@ fn admit(
     Ok(current)
 }
 
+fn permanently_set_aside(reason: &str) -> bool {
+    matches!(
+        reason,
+        "corrupt_input" | "analysis_failed" | "no_audio_stream"
+    )
+}
+
+/// All historical days after the newest owed day are caught up. Today and
+/// yesterday are outside this range; unreadable days and permanent holds are
+/// counted separately. This folds only evidence already read by the pass.
+fn history_progress(
+    report: &WorkInventory,
+    days: &BTreeMap<String, (HistoryDay, bool)>,
+    today: chrono::NaiveDate,
+    previous: Option<&HistorySample>,
+) -> HistoryProgress {
+    let through = today - chrono::Duration::days(2);
+    let through_day = through.format("%Y%m%d").to_string();
+    let historical = days
+        .iter()
+        .filter(|(day, _)| *day <= &through_day)
+        .collect::<Vec<_>>();
+    let newest_owed = historical
+        .iter()
+        .rev()
+        .find(|(_, (work, unreadable))| !unreadable && work.owed > 0)
+        .map(|(day, _)| day.as_str());
+    let caught_up_since = match newest_owed {
+        Some(day) if day == through_day => None,
+        Some(day) => chrono::NaiveDate::parse_from_str(day, "%Y%m%d")
+            .ok()
+            .and_then(|day| day.succ_opt())
+            .map(|day| day.format("%Y%m%d").to_string()),
+        None => historical.first().map(|(day, _)| (*day).clone()),
+    };
+    let readable = days
+        .values()
+        .filter(|(_, unreadable)| !unreadable)
+        .map(|(work, _)| work)
+        .collect::<Vec<_>>();
+    let segments_set_aside = readable.iter().map(|work| work.segments_set_aside).sum();
+    let daily_units_set_aside = readable.iter().map(|work| work.daily_units_set_aside).sum();
+    let segments_owed = readable
+        .iter()
+        .map(|work| work.segments_owed)
+        .sum::<u64>()
+        .saturating_sub(segments_set_aside);
+    let daily_units_owed = readable
+        .iter()
+        .map(|work| work.daily_units_owed)
+        .sum::<u64>()
+        .saturating_sub(daily_units_set_aside);
+    let mut unreadable = report.unreadable.clone();
+    unreadable.sort();
+    unreadable.dedup();
+    let sample = (report.days_inspected == report.days_total).then(|| HistorySample {
+        local_day: today.format("%Y%m%d").to_string(),
+        journal_version: env!("CARGO_PKG_VERSION").into(),
+        as_of_ms: report.as_of_ms,
+        owed: segments_owed + daily_units_owed,
+        set_aside: segments_set_aside + daily_units_set_aside,
+        unreadable,
+    });
+    let net_per_hour = sample
+        .as_ref()
+        .zip(previous)
+        .and_then(|(current, previous)| current.net_per_hour(previous));
+    HistoryProgress {
+        caught_up_since,
+        through_day,
+        segments_owed,
+        daily_units_owed,
+        set_aside_units: historical.iter().map(|(_, (work, _))| work.set_aside).sum(),
+        unreadable_days: historical
+            .iter()
+            .filter(|(_, (_, unreadable))| *unreadable)
+            .count(),
+        sample,
+        net_per_hour,
+    }
+}
+
 /// Fold the per-day snapshots into the published totals. Built only when it
 /// is about to be published: the holds grow with the journal.
 fn aggregate(
@@ -1153,6 +1293,17 @@ fn reconcile_pass(
     automatic: bool,
 ) -> Result<Backlog, String> {
     let pass_started = Instant::now();
+    // One small reporting snapshot, before this pass publishes its progress.
+    // No day or segment is read again to obtain the rate baseline.
+    let previous = match solstone_core_system::work_inventory::read(journal) {
+        Ok(inventory) => inventory
+            .and_then(|inventory| inventory.history)
+            .and_then(|history| history.sample),
+        Err(error) => {
+            log::warn!("previous history progress unreadable: {error}");
+            None
+        }
+    };
     let policy = WorkPolicy::read(journal)?;
     let mut days = solstone_core_journal_io::day_dirs(journal)
         .map_err(|error| error.to_string())?
@@ -1167,6 +1318,7 @@ fn reconcile_pass(
     let (held_records, retry_errors) = work_retry::list(journal);
     let now = chrono::Utc::now();
     let today = daily_coverage::local_day(journal, now);
+    let pass_day = today.clone();
     solstone_core_system::daily_coverage::activate_daily_inputs(journal, now)?;
     let maintenance =
         solstone_core_journal_io::DailyUnitIdentity::new(&today, "daily_schedule", None);
@@ -1203,6 +1355,7 @@ fn reconcile_pass(
     let mut last_publish = Instant::now();
     let mut candidates = Vec::new();
     let mut day_reports = BTreeMap::<String, WorkInventory>::new();
+    let mut history_days = BTreeMap::new();
     let import_errors = report.unreadable.clone();
     let mut inspected = BTreeSet::new();
     let mut observed_intents = BTreeMap::new();
@@ -1257,6 +1410,7 @@ fn reconcile_pass(
         ) {
             day_report.unreadable.push(format!("{day}: {error}"));
         }
+        let mut history_day = HistoryDay::default();
         match inspect_day(
             journal,
             &day,
@@ -1267,6 +1421,7 @@ fn reconcile_pass(
             &mut day_report,
         ) {
             Ok(work) => {
+                history_day = work.history;
                 fulfilled_segments.extend(work.completed_segments);
                 if work.daily_current {
                     fulfilled_days.insert(day.clone());
@@ -1275,6 +1430,7 @@ fn reconcile_pass(
             }
             Err(error) => day_report.unreadable.push(format!("{day}: {error}")),
         }
+        let mut permanent_activities = 0;
         if !intents.get(&day).is_some_and(|intent| intent.from_scratch) {
             match talent_retries(
                 journal,
@@ -1282,6 +1438,7 @@ fn reconcile_pass(
                 intents.get(&day),
                 &imports.imports,
                 policy,
+                &mut permanent_activities,
                 &mut day_report,
             ) {
                 Ok(work) => retain_best(&mut candidates, work),
@@ -1349,6 +1506,21 @@ fn reconcile_pass(
             };
             retain_best(&mut candidates, vec![candidate]);
         }
+        history_day.owed += day_report
+            .bands
+            .iter()
+            .map(|band| band.activities_owed)
+            .sum::<u64>();
+        history_day.segments_owed = day_report.bands[4].segments_owed;
+        history_day.daily_units_owed =
+            day_report.bands[4].daily_units_owed + day_report.bands[5].daily_units_owed;
+        // Only holds without renewed permission are permanent exceptions.
+        history_day.owed = history_day.owed.saturating_sub(permanent_activities);
+        history_day.set_aside += permanent_activities;
+        history_days.insert(
+            day.clone(),
+            (history_day, !day_report.unreadable.is_empty()),
+        );
         inspected.insert(day.clone());
         day_reports.insert(day, day_report);
         if stopped.load(Ordering::Acquire) {
@@ -1441,6 +1613,17 @@ fn reconcile_pass(
     report.as_of_ms = chrono::Utc::now().timestamp_millis();
     report.next_pass_ms =
         automatic.then(|| report.as_of_ms + rest_after(pass_started.elapsed()).as_millis() as i64);
+    let ended = chrono::Utc::now();
+    if import_errors.is_empty() && daily_coverage::local_day(journal, ended) == pass_day {
+        let today = chrono::NaiveDate::parse_from_str(&pass_day, "%Y%m%d")
+            .map_err(|error| error.to_string())?;
+        report.history = Some(history_progress(
+            &report,
+            &history_days,
+            today,
+            previous.as_ref(),
+        ));
+    }
     report.publish(journal)?;
     Ok(Backlog { admitted, ranked })
 }
@@ -1487,6 +1670,140 @@ mod tests {
             "{\"text\":\"A meeting about a garden.\"}\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn history_range_keeps_prerequisites_but_excepts_young_and_unreadable_days() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let mut days = BTreeMap::from([
+            (
+                "20260901".into(),
+                (
+                    HistoryDay {
+                        owed: 10,
+                        set_aside: 0,
+                        ..HistoryDay::default()
+                    },
+                    false,
+                ),
+            ),
+            (
+                "20260902".into(),
+                (
+                    HistoryDay {
+                        owed: 0,
+                        set_aside: 5,
+                        ..HistoryDay::default()
+                    },
+                    false,
+                ),
+            ),
+            (
+                "20261009".into(),
+                (
+                    HistoryDay {
+                        owed: 0,
+                        set_aside: 0,
+                        ..HistoryDay::default()
+                    },
+                    false,
+                ),
+            ),
+            (
+                "20261010".into(),
+                (
+                    HistoryDay {
+                        owed: 9,
+                        set_aside: 0,
+                        ..HistoryDay::default()
+                    },
+                    true,
+                ),
+            ),
+            (
+                "20261011".into(),
+                (
+                    HistoryDay {
+                        owed: 0,
+                        set_aside: 0,
+                        ..HistoryDay::default()
+                    },
+                    false,
+                ),
+            ),
+            (
+                "20261012".into(),
+                (
+                    HistoryDay {
+                        owed: 30,
+                        set_aside: 0,
+                        ..HistoryDay::default()
+                    },
+                    false,
+                ),
+            ),
+            (
+                "20261013".into(),
+                (
+                    HistoryDay {
+                        owed: 40,
+                        set_aside: 0,
+                        ..HistoryDay::default()
+                    },
+                    false,
+                ),
+            ),
+        ]);
+        let mut report = WorkInventory {
+            complete: true,
+            ..WorkInventory::default()
+        };
+        report.bands[3].segments_owed = 100;
+        report.bands[4].segments_owed = 20;
+        report.bands[5].segments_owed = 200;
+        report.bands[4].daily_units_owed = 3;
+        report.bands[5].daily_units_owed = 4;
+        days.get_mut("20260901").unwrap().0.segments_owed = 20;
+        days.get_mut("20260901").unwrap().0.daily_units_owed = 7;
+        days.get_mut("20261010").unwrap().0.segments_owed = 100;
+        days.get_mut("20261010").unwrap().0.daily_units_owed = 100;
+        let progress = history_progress(&report, &days, today, None);
+        assert_eq!(progress.caught_up_since.as_deref(), Some("20260902"));
+        assert_eq!(progress.through_day, "20261011");
+        assert_eq!(progress.set_aside_units, 5);
+        assert_eq!(progress.unreadable_days, 1);
+        assert_eq!(progress.segments_owed, 20);
+        assert_eq!(progress.daily_units_owed, 7);
+        assert!(progress.net_per_hour.is_none());
+        // A real prerequisite on a readable day moves the range forward.
+        days.get_mut("20261009").unwrap().0.owed = 1;
+        assert_eq!(
+            history_progress(&report, &days, today, None)
+                .caught_up_since
+                .as_deref(),
+            Some("20261010")
+        );
+        days.get_mut("20261011").unwrap().0.owed = 1;
+        assert!(
+            history_progress(&report, &days, today, None)
+                .caught_up_since
+                .is_none()
+        );
+        // A full pass with stable unreadable exceptions is comparable even
+        // though the inventory's stronger complete flag remains false.
+        report.complete = false;
+        report.unreadable.push("20261010: unreadable".into());
+        assert!(
+            history_progress(&report, &days, today, None)
+                .sample
+                .is_some()
+        );
+        report.days_total = 1;
+        assert!(
+            history_progress(&report, &days, today, progress.sample.as_ref())
+                .sample
+                .is_none()
+        );
     }
 
     #[test]
@@ -1591,6 +1908,68 @@ mod tests {
         assert!(!queue.contains_reference(&format!("supervisor-work-{today}-daily")));
     }
 
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn history_excepts_only_permanently_held_input_and_its_blocked_outputs() {
+        let root = fixture("local");
+        let day = "19990101";
+        let directory = root
+            .path()
+            .join("chronicle")
+            .join(day)
+            .join("notes/120000_60");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("audio.wav"), "failed source").unwrap();
+        std::fs::write(
+            directory.join("audio.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "raw":"audio.wav", "_solstone_processing": {
+                        "schema":"solstone.processing.v1", "handler":"transcribe",
+                        "state":"failed", "reason_code":"analysis_failed", "attempts":3
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let queue = queue(root.path());
+        let policy = WorkPolicy::read(root.path()).unwrap();
+        let mut report = WorkInventory::default();
+        let work = inspect_day(root.path(), day, &queue, None, &[], policy, &mut report).unwrap();
+        assert_eq!(work.history.owed, 0);
+        assert_eq!(work.history.segments_set_aside, 1);
+        assert!(work.history.daily_units_set_aside > 0);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let mut history_day = work.history;
+        history_day.segments_owed = report.bands[4].segments_owed;
+        history_day.daily_units_owed =
+            report.bands[4].daily_units_owed + report.bands[5].daily_units_owed;
+        let history = history_progress(
+            &report,
+            &BTreeMap::from([(day.into(), (history_day, false))]),
+            today,
+            None,
+        );
+        assert_eq!(history.segments_owed, 0);
+        assert_eq!(history.daily_units_owed, 0);
+        assert!(history.set_aside_units > 1);
+        // Another, ordinary prerequisite on the same day still pins the range.
+        segment(root.path(), day, "120100_60");
+        let mut report = WorkInventory::default();
+        let work = inspect_day(root.path(), day, &queue, None, &[], policy, &mut report).unwrap();
+        assert!(work.history.owed > 1);
+        assert_eq!(work.history.segments_set_aside, 1);
+        assert_eq!(work.history.daily_units_set_aside, 0);
+        // Fresh input permits a retry. It is real work again, not an exception.
+        std::fs::write(directory.join("audio.wav"), "changed source for retry").unwrap();
+        let mut report = WorkInventory::default();
+        let work = inspect_day(root.path(), day, &queue, None, &[], policy, &mut report).unwrap();
+        assert_eq!(work.history.segments_set_aside, 0);
+        assert_eq!(work.history.set_aside, 0);
+        assert!(work.history.owed > 0);
+    }
+
     #[test]
     fn native_readmissions_keep_today_owner_and_background_priority_and_spend() {
         use solstone_core_system::work_policy::ThinkingLane;
@@ -1644,6 +2023,7 @@ mod tests {
                 &[],
                 local,
                 &BTreeSet::new(),
+                &mut false,
                 &mut report,
             )
             .unwrap();
@@ -1661,6 +2041,7 @@ mod tests {
                         &[],
                         own_keys,
                         &BTreeSet::new(),
+                        &mut false,
                         &mut report
                     )
                     .unwrap()
@@ -1676,6 +2057,7 @@ mod tests {
                     &[],
                     confidential,
                     &BTreeSet::new(),
+                    &mut false,
                     &mut report,
                 )
                 .unwrap();
@@ -1691,6 +2073,7 @@ mod tests {
                     &[],
                     own_keys,
                     &BTreeSet::new(),
+                    &mut false,
                     &mut WorkInventory::default(),
                 )
                 .unwrap();
