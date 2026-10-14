@@ -148,7 +148,16 @@ pub fn regorus_build_revision_pin() -> RegorusBuildRevisionPin {
 /// Reads `share/ca/ca-bundle.pem` from the repository's pinned linux-aarch64 archive.
 ///
 /// Used for test fixtures to verify against the true compiled pin without embedding 7MB.
+/// The archive is decompressed once per process.
 pub fn read_test_ca_bundle_pem() -> Result<Vec<u8>, std::io::Error> {
+    static CA_BUNDLE: OnceLock<Result<Vec<u8>, (std::io::ErrorKind, String)>> = OnceLock::new();
+    CA_BUNDLE
+        .get_or_init(|| read_ca_bundle_pem_uncached().map_err(|e| (e.kind(), e.to_string())))
+        .clone()
+        .map_err(|(kind, message)| std::io::Error::new(kind, message))
+}
+
+fn read_ca_bundle_pem_uncached() -> Result<Vec<u8>, std::io::Error> {
     let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let archive_path = repo_root
         .join("core/models/assets/nvattest/libnvat-linux-aarch64-1.2.2-sol.7-archive.tar.xz");
