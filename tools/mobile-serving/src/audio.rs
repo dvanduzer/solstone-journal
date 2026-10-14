@@ -123,6 +123,9 @@ impl AudioWorker {
         self.cancel();
     }
     pub fn resume(&self) {
+        // A repaired input/model must retry even when failure did not cancel
+        // the worker. Advancing also preserves cancellation of old inferences.
+        self.state.generation.fetch_add(1, Ordering::AcqRel);
         self.state.cancel.store(false, Ordering::Release);
         self.state.wake.notify_all();
     }
@@ -314,8 +317,19 @@ mod tests {
         let active = state.generation.load(Ordering::Acquire);
         assert!(!state.cancelled(active));
         state.request_cancel();
-        state.cancel.store(false, Ordering::Release); // resume before inference returns
+        let worker = AudioWorker {
+            state: Arc::new(state),
+            thread: None,
+        };
+        worker.resume(); // resume before inference returns
+        let state = &worker.state;
         assert!(state.cancelled(active));
+        assert!(!state.cancelled(state.generation.load(Ordering::Acquire)));
+        // Per-input failures leave cancel false. Resume must still retire that
+        // attempt, causing the scan's failure cache to clear before retry.
+        let failed_attempt = state.generation.load(Ordering::Acquire);
+        worker.resume();
+        assert!(state.cancelled(failed_attempt));
         assert!(!state.cancelled(state.generation.load(Ordering::Acquire)));
     }
 
