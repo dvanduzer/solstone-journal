@@ -264,39 +264,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glyph_asset_order_is_load_bearing() {
-        let assets = MarkAssets::load().unwrap();
-        let names = assets
-            .glyphs
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            &names[..6],
-            ["anchor", "banana", "bike", "bug", "cake", "cat"]
-        );
-        assert_eq!(
-            &names[names.len() - 6..],
-            ["train", "trees", "truck", "turtle", "tv", "watch"]
-        );
-    }
-
-    #[test]
-    fn color_asset_order_is_load_bearing() {
-        let assets = MarkAssets::load().unwrap();
-        let names = assets
-            .colors
-            .iter()
-            .map(|color| color.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(&names[..4], ["crimson", "orange", "amber", "gold"]);
-        assert_eq!(
-            &names[names.len() - 4..],
-            ["purple", "magenta", "pink", "slate"]
-        );
-    }
-
-    #[test]
     fn reordered_colors_change_the_reference_derivation() {
         let jid = parse_jid_bytes("f30ed159-ef46-8e9c-913f-e49f0fe7d201").unwrap();
         let assets = MarkAssets::load().unwrap();

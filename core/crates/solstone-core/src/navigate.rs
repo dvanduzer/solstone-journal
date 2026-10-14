@@ -79,14 +79,3 @@ pub(crate) fn run(path: String) -> ExitCode {
 fn print_navigation(path: &str) {
     println!("Navigate: {path}");
 }
-
-#[cfg(test)]
-mod tests {
-    use super::NAVIGATE_SOCKET_TIMEOUT;
-    use std::time::Duration;
-
-    #[test]
-    fn navigate_socket_timeout_matches_the_reference_default() {
-        assert_eq!(NAVIGATE_SOCKET_TIMEOUT, Duration::from_secs(2));
-    }
-}

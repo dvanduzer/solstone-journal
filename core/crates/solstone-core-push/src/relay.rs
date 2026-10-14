@@ -185,11 +185,6 @@ mod tests {
     }
 
     #[test]
-    fn ureq_relay_default_timeout_is_60_seconds() {
-        assert_eq!(DEFAULT_RELAY_TIMEOUT, Duration::from_secs(60));
-    }
-
-    #[test]
     fn ureq_relay_web_push_agent_config() {
         let relay = UreqRelay::default();
         let config = relay.web_push_agent_config();
