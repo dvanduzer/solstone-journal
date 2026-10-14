@@ -1704,21 +1704,29 @@ mod retained_clear_tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
-    fn retained_clear_windows_refuses_before_lock_or_mutation() {
+    fn retained_clear_preserves_other_settings_and_refuses_stale_source() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("config")).unwrap();
-        let path = root.path().join("config/journal.json");
-        let original = br#"{"backup":{"enabled":true}}"#;
+        let path = root.path().join("config").join("journal.json");
+        let original = br#"{"backup":{"enabled":true},"other":{"keep":7}}"#;
         std::fs::write(&path, original).unwrap();
         let admitted = Arc::new(JournalRoot::open(root.path()).unwrap());
+        let read = read_journal_config(root.path()).unwrap();
+        let sha = read.sha256.unwrap();
         let expected = get_backup_config(root.path()).unwrap();
         assert!(matches!(
-            clear_backup_config_at_root(&admitted, "unneeded", &expected),
-            Err(BoundConfigRefusal::Unsupported)
+            clear_backup_config_at_root(&admitted, &sha, &expected).unwrap(),
+            BoundConfigOutcome::Published(_)
         ));
-        assert_eq!(std::fs::read(path).unwrap(), original);
-        assert!(!root.path().join("config/journal.json.lock").exists());
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["other"]["keep"], 7);
+        assert_eq!(saved["backup"]["enabled"], false);
+        let current = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            clear_backup_config_at_root(&admitted, &sha, &expected),
+            Err(BoundConfigRefusal::Conflict)
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), current);
     }
 }

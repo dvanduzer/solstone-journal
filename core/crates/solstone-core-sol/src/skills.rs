@@ -1347,6 +1347,8 @@ mod tests {
         output
     }
 
+    // The captured POSIX oracle creates symlinks and records Unix path spellings.
+    #[cfg(unix)]
     #[test]
     fn skills_parity_vectors_match_native() {
         let text = fs::read_to_string(fixture_root()).expect("read skills parity vectors");
@@ -1625,7 +1627,10 @@ mod tests {
         );
         assert!(user.stdout.find("claude").unwrap() < user.stdout.find("codex").unwrap());
         assert!(user.stdout.find("codex").unwrap() < user.stdout.find("gemini").unwrap());
+        // Project skill links are POSIX symlinks; Windows user copies are covered above.
+        #[cfg(unix)]
         let project = temp.path().join("project");
+        #[cfg(unix)]
         let output = run_with_context(
             parse_command(&[
                 OsString::from("install"),
@@ -1637,6 +1642,7 @@ mod tests {
             .expect("parse project install"),
             &context,
         );
+        #[cfg(unix)]
         assert!(output.stdout.find("journal").unwrap() < output.stdout.find(" solstone ").unwrap());
     }
 
@@ -1810,6 +1816,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // The overlap is constructed through a POSIX symlink into the journal.
+    #[cfg(unix)]
     #[test]
     fn journal_overlap_through_install_user() {
         let temp = unique_temp("overlap");

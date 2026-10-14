@@ -652,7 +652,7 @@ mod tests {
         }
         fs::create_dir_all(context.journal.join("config")).unwrap();
         fs::write(
-            context.journal.join("config/journal.json"),
+            context.journal.join("config").join("journal.json"),
             r#"{"providers":{"active":{"provider":"test","model":"test-model"}}}"#,
         )
         .unwrap();
@@ -693,7 +693,9 @@ mod tests {
         // These tests recreate "work" to prove the fences against a replaced facet;
         // the store never reuses a name, so the retired record is dropped as a hand edit would.
         let _ = std::fs::remove_file(
-            std::path::Path::new(&context.journal).join("facets/retired.json"),
+            std::path::Path::new(&context.journal)
+                .join("facets")
+                .join("retired.json"),
         );
         solstone_core_facets::create_facet(
             &context.journal,
@@ -728,7 +730,7 @@ mod tests {
         let journal = root.path().join("journal");
         std::fs::create_dir_all(journal.join("config")).unwrap();
         std::fs::write(
-            journal.join("config/journal.json"),
+            journal.join("config").join("journal.json"),
             r#"{"providers":{"active":{"provider":"none"}}}"#,
         )
         .unwrap();
@@ -772,7 +774,7 @@ mod tests {
             fs::create_dir_all(directory).unwrap();
         }
         fs::write(
-            journal.join("config/journal.json"),
+            journal.join("config").join("journal.json"),
             r#"{"providers":{"active":{"provider":"none"}}}"#,
         )
         .unwrap();
@@ -812,7 +814,8 @@ mod tests {
         let expected_output = journal
             .join("chronicle")
             .join(day)
-            .join("talents/probe.json");
+            .join("talents")
+            .join("probe.json");
         let result = prepare(
             json!({"name":"probe","day":day})
                 .as_object()
@@ -848,7 +851,7 @@ mod tests {
             fs::create_dir_all(directory).expect("fixture directory");
         }
         fs::write(
-            journal.join("config/journal.json"),
+            journal.join("config").join("journal.json"),
             r#"{"identity":{"preferred":"Soleil"},"providers":{"active":{"provider":"none"}}}"#,
         )
         .expect("journal config");
@@ -862,8 +865,13 @@ mod tests {
             "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"output\":\"json\"\n}\n$segment_preamble",
         )
         .expect("talent");
-        let expected_output =
-            journal.join("chronicle/20260101/import.obsidian/090000_60/talents/screen.json");
+        let expected_output = journal
+            .join("chronicle")
+            .join("20260101")
+            .join("import.obsidian")
+            .join("090000_60")
+            .join("talents")
+            .join("screen.json");
         let prepared = prepare(
             json!({
                 "name":"screen",
@@ -906,19 +914,27 @@ mod tests {
             apps_root.clone(),
             templates_dir.clone(),
             journal.join("config"),
-            journal.join("facets/work"),
-            journal.join("chronicle/20260101/090000_60/talents"),
-            journal.join("chronicle/20260101/090200_120/talents"),
+            journal.join("facets").join("work"),
+            journal
+                .join("chronicle")
+                .join("20260101")
+                .join("090000_60")
+                .join("talents"),
+            journal
+                .join("chronicle")
+                .join("20260101")
+                .join("090200_120")
+                .join("talents"),
         ] {
             fs::create_dir_all(directory).expect("fixture directory");
         }
         fs::write(
-            journal.join("config/journal.json"),
+            journal.join("config").join("journal.json"),
             r#"{"identity":{"preferred":"Soleil"},"providers":{"active":{"provider":"none"}}}"#,
         )
         .expect("journal config");
         fs::write(
-            journal.join("facets/work/facet.json"),
+            journal.join("facets").join("work").join("facet.json"),
             r#"{"name":"work","description":"Work"}"#,
         )
         .expect("facet");
@@ -975,12 +991,12 @@ mod tests {
     fn activity_context_shows_each_segments_facet_classification() {
         let instruction = render_activity_instruction(|journal| {
             fs::write(
-                journal.join("chronicle/20260101/090000_60/talents/facets.json"),
+                journal.join("chronicle").join("20260101").join("090000_60").join("talents").join("facets.json"),
                 r#"[{"facet":"personal","activity":"Replied to a family message.","level":"low"},{"facet":"work","activity":"Debugged retry handling.","level":"high"}]"#,
             )
             .expect("first facets");
             fs::write(
-                journal.join("chronicle/20260101/090200_120/talents/facets.json"),
+                journal.join("chronicle").join("20260101").join("090200_120").join("talents").join("facets.json"),
                 r#"[{"facet":"work","activity":"Verified the provider request.","level":"medium"}]"#,
             )
             .expect("second facets");
@@ -1011,7 +1027,7 @@ mod tests {
             // Segments are classified, but only into other facets.
             |journal: &Path| {
                 fs::write(
-                    journal.join("chronicle/20260101/090000_60/talents/facets.json"),
+                    journal.join("chronicle").join("20260101").join("090000_60").join("talents").join("facets.json"),
                     r#"[{"facet":"personal","activity":"Replied to a family message.","level":"high"}]"#,
                 )
                 .expect("facets");
@@ -1040,12 +1056,12 @@ mod tests {
             templates_dir.clone(),
             journal.join("config"),
             journal.join("streams"),
-            journal.join("chronicle/20260101/090000_60"),
+            journal.join("chronicle").join("20260101").join("090000_60"),
         ] {
             fs::create_dir_all(directory).expect("fixture directory");
         }
         fs::write(
-            journal.join("config/journal.json"),
+            journal.join("config").join("journal.json"),
             r#"{"identity":{"preferred":"Soleil"},"providers":{"active":{"provider":"none"}}}"#,
         )
         .expect("journal config");
@@ -1058,7 +1074,7 @@ mod tests {
         // Write streams/label_browser.json where top-level source is not browser, top-level kind is not browser,
         // and allocation.source is "browser"
         fs::write(
-            journal.join("streams/label_browser.json"),
+            journal.join("streams").join("label_browser.json"),
             r#"{"source":"screen","kind":"observed","allocation":{"source":"browser"}}"#,
         )
         .expect("stream record");
@@ -1099,7 +1115,7 @@ mod tests {
         assert_eq!(screen_instruction, ordinary_instruction);
 
         fs::write(
-            journal.join("streams/renamed_feed.json"),
+            journal.join("streams").join("renamed_feed.json"),
             r#"{"source":"browser","kind":"browser","allocation":{"source":"screen"}}"#,
         )
         .expect("browser stream record");

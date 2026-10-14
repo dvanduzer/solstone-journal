@@ -1591,7 +1591,7 @@ mod tests {
 
         let resolved = resolve_project_root_from_executable(&bin.join("sol"))
             .expect("installed project root should resolve");
-        assert_eq!(resolved, site_packages);
+        assert_eq!(resolved, site_packages.canonicalize().unwrap());
     }
 
     #[test]

@@ -846,8 +846,16 @@ fn scan_bundle_members(
             let relative = path.strip_prefix(&appraisal_dir).map_err(|e| {
                 IosVerifierRefusal::IntegrityFailed(format!("appraisal member escaped bundle: {e}"))
             })?;
-            let relative_path =
-                format!("{IOS_HELPER_RELATIVE_PATH}/{}", relative.to_string_lossy());
+            // Manifest coordinates use slash separators on every host. Preserve
+            // component text so a Unix backslash filename is not reinterpreted.
+            let relative_path = format!(
+                "{IOS_HELPER_RELATIVE_PATH}/{}",
+                relative
+                    .iter()
+                    .map(|part| part.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            );
             let is_symlink = meta.file_type().is_symlink();
             if is_symlink {
                 members.push(IosBundleMember {

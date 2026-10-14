@@ -1016,6 +1016,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_19_index_failure_warns_once_and_worker_finishes() {
         let root = tempfile::tempdir().unwrap();

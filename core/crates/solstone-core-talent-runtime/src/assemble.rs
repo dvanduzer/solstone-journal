@@ -373,6 +373,8 @@ mod tests {
     use super::*;
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn activity_preview_contents_match_the_real_execute_provider_request() {
         let root = tempfile::tempdir().expect("root");

@@ -1531,6 +1531,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn held_floor_permission_reaches_the_real_model_once() {
         use solstone_core_system::work_retry::{self, Unit};
@@ -1597,6 +1599,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn held_activity_permission_reaches_the_real_writer_once() {
         use solstone_core_system::work_retry::{self, Unit};
@@ -1795,6 +1799,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn pulse_execution_emits_the_request_received_by_generate_after_start() {
         let (root, paths, context) = fixture(
@@ -1837,6 +1843,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_23_injected_one_shot_path_reaches_the_client() {
         let root = tempfile::tempdir().unwrap();
@@ -1861,6 +1869,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn sibling_client_uses_the_generate_one_shot_boundary() {
         let root = tempfile::Builder::new()
@@ -1913,6 +1923,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_1_ndjson_start_then_finish_writes_derived_output() {
         let (root, paths, context) = fixture(
@@ -1949,6 +1961,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn disabled_talent_skips_and_enabled_talent_runs() {
         let (root, paths, context) = fixture(
@@ -2004,6 +2018,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_7_schema_validation_blocks_story_commit_end_to_end() {
         let (root, paths, context) = fixture(
@@ -2072,6 +2088,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_2_line_loop_skips_blank_reports_one_error_and_continues() {
         let (root, paths, context) = fixture(
@@ -2115,6 +2133,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_10_unported_hook_and_ported_transcript_loading() {
         let (root, paths, context) = fixture(
@@ -2283,6 +2303,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_8_framework_failure_is_terminal_and_typed() {
         let (root, paths, context) = fixture(
@@ -2324,6 +2346,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_1_and_2_and_4_generate_refusal_preserves_structured_facts() {
         let live_detail = "the configured provider could not produce a usable response";
@@ -2864,6 +2888,8 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     // AC2: direct path schema fail then success -> Finished after exactly 2 calls, text from attempt 2
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn generate_and_write_retries_schema_validation_failure_to_success() {
         let (root, paths, context) = fixture(
@@ -2930,6 +2956,8 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     // AC3: direct path double schema fail -> SchemaValidationFailed after exactly 2 calls
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn generate_and_write_exhausts_schema_validation_retries() {
         let (root, paths, context) = fixture(
@@ -2991,6 +3019,8 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     // AC4: incomplete_json_length retry to success and double incomplete_json_length exhaustion
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn generate_and_write_retries_incomplete_json_length_and_exhausts() {
         // Success on attempt 2
@@ -3108,6 +3138,8 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     // AC4a: attempt 1 incomplete_json_length, attempt 2 provider_response_invalid -> terminal carries attempt 2
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn generate_and_write_mixed_failure_preserves_latest_refusal_details() {
         let (root, paths, context) = fixture(
@@ -3173,6 +3205,8 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     // AC4b: first-attempt success executes exactly 1 call
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn generate_and_write_first_attempt_success_invokes_client_once() {
         let (root, paths, context) = fixture(
@@ -3219,6 +3253,8 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     // AC4c: pulse execution with retry emits generate_input exactly once
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn pulse_execution_emits_generate_input_exactly_once_across_retries() {
         let (root, paths, context) = fixture(
@@ -3272,6 +3308,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn pulse_schema_exhaustion_returns_schema_validation_failed_without_writing() {
         let (root, paths, context) = fixture(
@@ -3321,6 +3359,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn pulse_ignores_forged_unavailable_selection_and_input_budget() {
         let run_pulse = |extra: Option<Map<String, Value>>| -> (RuntimeOutcome, Vec<u8>, Value) {
@@ -3406,6 +3446,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn generate_attempt_evidence_records_ordinal_status_cause_and_retry() {
         let (root, paths, context) = fixture(
@@ -3576,6 +3618,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn screen_length_retry_changes_only_instruction() {
         let root = tempfile::tempdir().unwrap();
@@ -3639,6 +3683,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn exhausted_compact_screen_retry_preserves_the_published_output() {
         let root = tempfile::tempdir().unwrap();
@@ -3761,6 +3807,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn briefing_saves_model_attention_without_reading_historical_tracking_lists() {
         let (root, paths, context) = fixture(
@@ -4068,6 +4116,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn published_output_changed_body_indexes_and_is_searchable() {
         let (root, paths, context) = fixture(
@@ -4116,6 +4166,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn published_output_unchanged_body_and_provenance_skips_indexing() {
         let (root, paths, context) = fixture(
@@ -4159,6 +4211,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn published_output_provenance_only_change_indexes_and_marks_changed() {
         use chrono::TimeZone;
@@ -4262,6 +4316,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn published_output_same_second_replaces_and_is_searchable() {
         let (root, paths, context) = fixture(
@@ -4339,6 +4395,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn published_output_index_failure_warns_and_preserves_output_and_finishes() {
         let (root, paths, context) = fixture(

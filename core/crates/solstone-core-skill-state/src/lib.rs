@@ -276,6 +276,8 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // This fixture creates POSIX symlinks; Windows user-skill copies are tested separately.
+    #[cfg(unix)]
     #[test]
     fn classifies_expected_foreign_and_stale_links() {
         let root = std::env::temp_dir().join(format!("skill-state-{}", std::process::id()));
@@ -314,8 +316,15 @@ mod tests {
             &root.join("solstone/talent/journal"),
             &root.join("scratch/skills-oracle/casework/p/deep/.claude/skills"),
         );
-        assert!(target.starts_with("../../.."), "{target}");
-        assert!(target.ends_with("solstone/talent/journal"), "{target}");
+        let path = Path::new(&target);
+        assert!(
+            path.starts_with(Path::new("..").join("..").join("..")),
+            "{target}"
+        );
+        assert!(
+            path.ends_with(Path::new("solstone").join("talent").join("journal")),
+            "{target}"
+        );
     }
 }
 

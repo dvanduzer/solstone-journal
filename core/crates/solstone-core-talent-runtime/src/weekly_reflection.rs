@@ -2492,6 +2492,8 @@ Weekly prompt
             assert!(doc["memories"].as_array().unwrap().is_empty());
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_schema_invalid_twice() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2554,6 +2556,8 @@ Weekly prompt
             assert_eq!(doc["memories"].as_array().unwrap().len(), 1);
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_refusal_context_budget_exceeded() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2607,6 +2611,8 @@ Weekly prompt
             assert_eq!(doc["selection"]["status"], "fallback");
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_refusal_incomplete_json_length_twice() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2669,6 +2675,8 @@ Weekly prompt
             assert_eq!(doc["selection"]["status"], "fallback");
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_transport_error() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2714,6 +2722,8 @@ Weekly prompt
             assert_eq!(doc["selection"]["model"], "google/gemini");
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_clipped_budget_two_candidates() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2768,6 +2778,8 @@ Weekly prompt
             assert_eq!(doc["memories"][0]["text"], "Alpha memory.");
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_valid_unclipped_selection_non_first() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2822,6 +2834,8 @@ Weekly prompt
             assert_eq!(doc["memories"][0]["text"], "Beta memory.");
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_parse_failure_null_schema_validation() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2946,6 +2960,8 @@ Weekly prompt
             assert!(res.is_err());
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_template_variables_preserved_in_request() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -2981,6 +2997,8 @@ Weekly prompt
             assert!(req_content.contains("Memory with $name and $$ dollars."));
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_weekly_reflection_ignores_forged_request_keys() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -3097,6 +3115,8 @@ Weekly prompt
             assert_eq!(doc["days"].as_array().unwrap().len(), 7);
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_weekly_reflection_candidate_id_mapping() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");
@@ -3158,6 +3178,8 @@ Weekly prompt
             assert_eq!(day_entry["memory_id"], "m-20260308-2");
         }
 
+        // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+        #[cfg(unix)]
         #[test]
         fn test_full_weekly_reflection_placeholder_only_slot() {
             let _guard = pin_stage_now("2026-03-15T18:00:00Z");

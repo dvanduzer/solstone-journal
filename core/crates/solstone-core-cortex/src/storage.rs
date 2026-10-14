@@ -571,7 +571,13 @@ fn summarize_output_file(
         .strip_prefix(day_dir)
         .or_else(|_| output_path.strip_prefix(journal_root))
         .ok()
-        .map(|path| path.display().to_string())
+        // Day-index fields are logical links, not native filesystem spellings.
+        .and_then(|path| {
+            path.iter()
+                .map(|part| part.to_str())
+                .collect::<Option<Vec<_>>>()
+        })
+        .map(|parts| parts.join("/"))
 }
 
 fn derived_output_path(day_dir: &Path, request: &Map<String, Value>) -> Option<PathBuf> {

@@ -676,6 +676,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn criterion_7_story_validation_precedes_on_disk_mutation() {
         let root = tempfile::tempdir().unwrap();
@@ -779,6 +781,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn a_story_from_a_clipped_request_says_its_input_was_partial() {
         let root = tempfile::tempdir().unwrap();
@@ -855,6 +859,8 @@ mod tests {
     }
 
     #[cfg(all(test, feature = "full-tests"))]
+    // Executes a POSIX /bin/sh one-shot fixture, not a Windows executable.
+    #[cfg(unix)]
     #[test]
     fn a_story_request_budget_with_a_null_response_budget_does_not_set_partial_input() {
         let root = tempfile::tempdir().unwrap();
