@@ -12,7 +12,7 @@ on windows, this version brings every change in [2.0.45](https://solstone.app/re
 
 ### Fixed
 
-- on mac, confidential processing works again. in 2.0.45, your journal couldn't check the service before sending it anything, so it sent nothing and kept that work for later. it catches up after you update, with nothing for you to redo.
+- on mac, confidential processing works again. in 2.0.45, health said processing needed attention and that your journal's install didn't match. your install was fine: your journal couldn't check the service, so it sent nothing and kept that work for later. it catches up after you update, with nothing for you to redo.
 
 ## [2.0.45] - 2026-10-14
 
