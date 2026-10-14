@@ -33,7 +33,7 @@ pub(crate) fn sources_from_config(config: &Map<String, Value>) -> Sources {
 
 /// The owner and every other admitted person, as transcript lines name them
 /// by voice. `None` without a single admitted principal.
-pub(crate) fn voice_names(journal: &Path) -> Option<VoiceNames> {
+pub fn voice_names(journal: &Path) -> Option<VoiceNames> {
     let principal = crate::JournalOwner::load(journal).ok()?.id?;
     let owner_voice_confirmed = matches!(
         solstone_core_speaker_resolve::owner_centroid::load_owner_centroid(journal, &principal),

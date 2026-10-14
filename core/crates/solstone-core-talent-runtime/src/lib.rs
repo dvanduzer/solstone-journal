@@ -46,6 +46,7 @@ pub mod writers;
 mod test_support;
 
 use contract::{CommitDisposition, GateDecision, PrePostState, resolve_hook};
+pub use transcript::voice_names;
 
 /// Config key honored only by the speaker_attribution pre-step.
 /// Not a general per-stage dry-run flag.
@@ -378,7 +379,8 @@ fn configure_generate_client(client: OneShotClient) -> OneShotClient {
     client.with_prefix_arguments(["generate".into()])
 }
 
-fn runtime_paths_from_current_executable() -> Result<prepare::RuntimePaths, String> {
+/// The installed talent, app and template roots beside the running executable.
+pub fn runtime_paths_from_current_executable() -> Result<prepare::RuntimePaths, String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not resolve worker executable: {error}"))?;
     let executable_dir = executable

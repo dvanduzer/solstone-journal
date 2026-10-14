@@ -35,6 +35,7 @@ pub const USAGE: &str = concat!(
     "  solstone-core backup [args...]\n",
     "  solstone-core journal-stats [args...]\n",
     "  solstone-core talent [args...]\n",
+    "  solstone-core share [args...]\n",
     "  solstone-core reprocess [args...]\n",
     "  solstone-core backfill-processing-records [args...]\n"
 );
@@ -715,6 +716,7 @@ pub enum Command {
     Reprocess(Vec<OsString>),
     JournalStats(Vec<OsString>),
     Talent(Vec<OsString>),
+    Share(Vec<OsString>),
     Backfill(Vec<OsString>),
     BackfillFacetIds { commit: bool },
     BackfillFacetIdsHelp,
@@ -1589,6 +1591,7 @@ pub fn evaluate_args(args: &[OsString]) -> Result<Command, UsageError> {
         [command, rest @ ..] if command == OsStr::new("talent") => {
             Ok(Command::Talent(rest.to_vec()))
         }
+        [command, rest @ ..] if command == OsStr::new("share") => Ok(Command::Share(rest.to_vec())),
         [command, rest @ ..] if command == OsStr::new("backfill-processing-records") => {
             Ok(Command::Backfill(rest.to_vec()))
         }
@@ -7909,6 +7912,7 @@ mod tests {
             "segment",
             "backup",
             "journal-stats",
+            "share",
             "reprocess",
             "backfill-processing-records",
         ] {
@@ -7920,6 +7924,14 @@ mod tests {
         assert!(USAGE.contains("solstone journal convey"));
         assert!(USAGE.contains("solstone journal schedule"));
         assert!(USAGE.starts_with("Usage:\n"));
+    }
+
+    #[test]
+    fn share_passes_its_arguments_through() {
+        assert_eq!(
+            evaluate_args(&args(&["share", "match", "--person", "jane_doe"])),
+            Ok(Command::Share(args(&["match", "--person", "jane_doe"])))
+        );
     }
 
     #[test]

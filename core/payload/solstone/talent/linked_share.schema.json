@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["points"],
+  "properties": {
+    "points": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ids", "point"],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {"type": "string"}
+          },
+          "point": {"type": "string", "maxLength": 600}
+        }
+      }
+    }
+  }
+}

@@ -490,7 +490,7 @@ not the codebase. See [APPS.md](APPS.md).
 | Think (processing) | `import`, `think`, `planner`, `indexer`, `supervisor`, `schedule`, `maintenance`, `top`, `health`, `status`, `notify`, `heartbeat` |
 | Service | `service` (+ aliases `up`, `down`, `start`), `navigate`, `identity`, `settings`, `install-provider`, `thinking set-lane`, `thinking chatgpt {sign-in,sign-out,status,models}` |
 | Observe (capture) | `transcribe`, `describe`, `sense` |
-| Talent (AI agents) | `agents`, `cortex`, `talent`, `call`, `engage`, `providers` |
+| Talent (AI agents) | `agents`, `cortex`, `talent`, `share {match,package}` (read-only linked-share preview), `call`, `engage`, `providers` |
 | Convey (web UI) | `convey` |
 | Schedule (read-only) | `schedule` |
 | Specialized | `config`, `mcp` ([endpoint](#journal-mcp-endpoint)), `skills`, `streams`, `journal-stats`, `reprocess`, `formatter` |
