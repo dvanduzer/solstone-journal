@@ -594,14 +594,30 @@ mod tests {
         let shared = ProductionCallosum::new(path).unwrap();
         let mut receive = ProductionReceive::new(Arc::clone(&shared));
         receive.start().unwrap();
-        assert!(matches!(
-            receive.next().unwrap(),
-            Some(CallosumReceiveEvent::Continuity {
-                generation: 0,
-                epoch: 0,
-                phase: solstone_core_callosum::CallosumConnectionPhase::Connecting { attempt: 1 },
-            })
-        ));
+        let event = receive.next().unwrap();
+        let Some(CallosumReceiveEvent::Continuity {
+            generation: 0,
+            epoch: 0,
+            phase,
+        }) = &event
+        else {
+            panic!("expected never-connected continuity, got {event:?}");
+        };
+        // The background connect may already have replaced the initial latch
+        // with its failed attempt before this nonblocking read.
+        assert!(
+            match phase {
+                solstone_core_callosum::CallosumConnectionPhase::Connecting { attempt } => {
+                    *attempt >= 1
+                }
+                solstone_core_callosum::CallosumConnectionPhase::Unavailable {
+                    latest_attempt,
+                    failures_since_success,
+                } => *latest_attempt >= 1 && latest_attempt == failures_since_success,
+                _ => false,
+            },
+            "unexpected never-connected phase: {phase:?}"
+        );
         receive.stop().unwrap();
     }
 
