@@ -301,6 +301,8 @@ fn project_sources(files: BTreeMap<String, PathBuf>) -> Result<SourceProjection,
         {
             resolution = ContentResolution::Indexed(Family::Markdown);
         }
+        let path_selected_protected_video =
+            resolution == ContentResolution::Indexed(Family::ProtectedVideo);
         // A written shape is an input contract: malformed/unreadable sidecars cannot mean empty evidence.
         let sidecar = path.with_file_name(content::SHAPE_SIDECAR_BASENAME);
         match fs::read_to_string(&sidecar) {
@@ -308,7 +310,7 @@ fn project_sources(files: BTreeMap<String, PathBuf>) -> Result<SourceProjection,
                 let shape: Value = serde_json::from_str(&text)
                     .map_err(|e| format!("{}: {e}", sidecar.display()))?;
                 let shape = shape.as_object().ok_or("shape sidecar is not an object")?;
-                if let Some(value) = shape.get(filename) {
+                if !path_selected_protected_video && let Some(value) = shape.get(filename) {
                     resolution = value
                         .as_str()
                         .and_then(content::parse_shape_name)
@@ -324,7 +326,22 @@ fn project_sources(files: BTreeMap<String, PathBuf>) -> Result<SourceProjection,
         ) {
             continue;
         }
-        let mut text = strict_text(&path)?;
+        let mut text = if resolution == ContentResolution::Indexed(Family::ProtectedVideo) {
+            let raw = fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            raw.lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty()
+                        && serde_json::from_str::<Value>(trimmed)
+                            .ok()
+                            .is_some_and(|v| v.is_object())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            strict_text(&path)?
+        };
         if resolution == ContentResolution::Indexed(Family::Activity) {
             text = text
                 .lines()
@@ -1895,6 +1912,91 @@ mod tests {
         let rev_changed = revision(&root, "schedule", None);
         assert_ne!(rev_before, rev_changed);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protected_video_captures_sources_and_tolerates_corrupt_lines() {
+        let root = root("protected-video-daily");
+        let note_rel = "chronicle/20260910/desk/120000_60/120000_60_protected_video.jsonl";
+        let row_a = r#"{"t":"protected_video","ts":1792027800000,"end_ts":1792030500000,"service":"Netflix","app":"Comet","title":"Netflix"}"#;
+        let row_b = r#"{"t":"protected_video","ts":1000,"end_ts":91000,"service":"Apple TV"}"#;
+        write(&root, note_rel, &format!("{row_a}\n{row_b}\n"));
+
+        let sources = capture_day_sources(&root, "20260910").expect("capture day sources");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0].path,
+            "20260910/desk/120000_60/120000_60_protected_video.jsonl"
+        );
+        assert_eq!(sources[0].occurrence_time_ms, Some(1792027800000));
+        assert_eq!(sources[0].agent, "protected_video");
+        assert_eq!(sources[1].occurrence_time_ms, Some(1000));
+        assert_eq!(sources[1].agent, "protected_video");
+
+        // Same day, add a valid activity and add corrupt lines to note file
+        write(
+            &root,
+            "facets/work/activities/20260910.jsonl",
+            r#"{"source":"user","title":"QuarterlySentinelToken"}"#,
+        );
+        write(&root, note_rel, &format!("{row_a}\n{{\n42\n{row_b}\n"));
+        let sources_mixed =
+            capture_day_sources(&root, "20260910").expect("capture with mixed note");
+        assert!(
+            sources_mixed
+                .iter()
+                .any(|c| c.text.contains("QuarterlySentinelToken"))
+        );
+        assert!(sources_mixed.iter().any(|c| c.text.contains("Netflix")));
+        assert!(sources_mixed.iter().any(|c| c.text.contains("Apple TV")));
+
+        // Sibling shape.json with Browser
+        write(
+            &root,
+            "chronicle/20260910/desk/120000_60/shape.json",
+            r#"{"120000_60_protected_video.jsonl":"Browser"}"#,
+        );
+        let sources_sidecar = capture_day_sources(&root, "20260910").expect("capture with sidecar");
+        let note_chunks = sources_sidecar
+            .iter()
+            .filter(|c| c.path.ends_with("_protected_video.jsonl"))
+            .collect::<Vec<_>>();
+        assert_eq!(note_chunks.len(), 2);
+        assert_eq!(note_chunks[0].agent, "protected_video");
+        assert!(note_chunks[0].text.contains("Netflix"));
+
+        // Sibling shape.json with NotAShape
+        write(
+            &root,
+            "chronicle/20260910/desk/120000_60/shape.json",
+            r#"{"120000_60_protected_video.jsonl":"NotAShape"}"#,
+        );
+        let sources_not_a_shape =
+            capture_day_sources(&root, "20260910").expect("capture with unparseable shape");
+        assert!(
+            sources_not_a_shape
+                .iter()
+                .any(|c| c.agent == "protected_video")
+        );
+
+        // Malformed sidecar JSON on this file must still return Err
+        write(
+            &root,
+            "chronicle/20260910/desk/120000_60/shape.json",
+            "{not json",
+        );
+        assert!(capture_day_sources(&root, "20260910").is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protected_video_activity_malformed_json_still_errors_without_panic() {
+        let root = root("protected-video-activity-malformed");
+        write(&root, "facets/work/activities/20260910.jsonl", "{not json");
+        let result = capture_day_sources(&root, "20260910");
+        assert!(result.is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solstone_core_transcribe::{TranscribeOutcome, discover_audio_files, process_embedded};
 use std::{
+    cell::{Cell, RefCell},
     collections::HashSet,
     fs::File,
     io::Read,
@@ -18,6 +19,35 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+// Keep local inference available without loading its model when the owner has
+// chosen confidential transcription. The model is verified before local use.
+struct LocalAsr<'a> {
+    model: &'a Path,
+    scratch: &'a Path,
+    loaded: RefCell<Option<journal_mobile_audio::Parakeet>>,
+    load_ms: Cell<Option<f64>>,
+}
+
+impl solstone_core_transcribe::EmbeddedAsr for LocalAsr<'_> {
+    fn transcribe(&self, samples: &[f32]) -> Result<Value, String> {
+        let mut loaded = self.loaded.borrow_mut();
+        if loaded.is_none() {
+            let started = Instant::now();
+            *loaded = Some(journal_mobile_audio::Parakeet::new(
+                self.model,
+                self.scratch,
+            )?);
+            self.load_ms
+                .set(Some(started.elapsed().as_secs_f64() * 1000.));
+        }
+        loaded.as_ref().unwrap().transcribe(samples)
+    }
+
+    fn model_info(&self) -> solstone_core_transcribe::EmbeddedModelInfo {
+        journal_mobile_audio::Parakeet::pinned_model_info()
+    }
+}
 
 struct State {
     stop: AtomicBool,
@@ -116,9 +146,14 @@ fn run(
 ) -> Result<(), String> {
     let authority = solstone_core_journal_io::JournalRoot::open(root).map_err(|e| e.to_string())?;
     let started = Instant::now();
-    let asr = journal_mobile_audio::Parakeet::new(model, scratch)?;
-    let load_ms = started.elapsed().as_secs_f64() * 1000.;
-    *state.status.lock().unwrap() = json!({"state":"ready","model_load_ms":load_ms});
+    let asr = LocalAsr {
+        model,
+        scratch,
+        loaded: RefCell::new(None),
+        load_ms: Cell::new(None),
+    };
+    let worker_start_ms = started.elapsed().as_secs_f64() * 1000.;
+    *state.status.lock().unwrap() = json!({"state":"ready","worker_start_ms":worker_start_ms,"model_load_ms":asr.load_ms.get()});
     let mut failures = HashSet::new();
     let mut retry_generation = state.generation.load(Ordering::Acquire);
     while !state.stop.load(Ordering::Acquire) {
@@ -163,7 +198,7 @@ fn run(
                 let generation = state.generation.load(Ordering::Acquire);
                 let start = Instant::now();
                 let prior = state.status.lock().unwrap().clone();
-                *state.status.lock().unwrap() = json!({"state":"processing","input":input,"previous":prior.get("last"),"model_load_ms":load_ms});
+                *state.status.lock().unwrap() = json!({"state":"processing","input":input,"previous":prior.get("last"),"model_load_ms":asr.load_ms.get()});
                 let result = process_embedded(&input, root, models, scratch, &asr, &|| {
                     state.cancelled(generation)
                 });
@@ -178,13 +213,13 @@ fn run(
                     Ok(result) => {
                         let last = json!({"input":input,"outcome":format!("{:?}",result.outcome),"transcript":result.transcript_path,"processing_ms":start.elapsed().as_secs_f64()*1000.,"failed_inputs":failures.len()});
                         *state.status.lock().unwrap() =
-                            json!({"state":"ready","model_load_ms":load_ms,"last":last});
+                            json!({"state":"ready","model_load_ms":asr.load_ms.get(),"last":last});
                     }
                     Err(error) => {
                         // Keep the original and allow subsequent inputs to proceed.
                         // Cancellation/resume or restart retries failed inputs.
                         failures.insert(input.clone());
-                        *state.status.lock().unwrap() = json!({"state":"failed","input":input,"error":error.to_string(),"model_load_ms":load_ms,"failed_inputs":failures.len()});
+                        *state.status.lock().unwrap() = json!({"state":"failed","input":input,"error":error.to_string(),"model_load_ms":asr.load_ms.get(),"failed_inputs":failures.len()});
                     }
                 }
             }
