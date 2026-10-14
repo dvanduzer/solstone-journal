@@ -902,7 +902,11 @@ mod tests {
             RelocationEnd {
                 day: day.to_owned(),
                 segment: segment.to_owned(),
-                path: self.path().join(&disk_rel),
+                path: disk_rel
+                    .split('/')
+                    .fold(self.path().to_path_buf(), |path, component| {
+                        path.join(component)
+                    }),
                 disk_rel,
                 parent_rel,
             }
@@ -1192,7 +1196,13 @@ mod tests {
             );
             assert!(!root.join("chronicle").join(day).join(key).exists());
         }
-        assert!(!root.join("chronicle/20260305/120000_60").exists());
+        assert!(
+            !root
+                .join("chronicle")
+                .join("20260305")
+                .join("120000_60")
+                .exists()
+        );
     }
 
     #[test]
@@ -1213,11 +1223,17 @@ mod tests {
         assert_eq!(report.verified, None);
         for key in ["090000_60", "100000_60", "110000_60"] {
             assert!(
-                root.join("chronicle/20260304").join(key).is_dir(),
+                root.join("chronicle").join("20260304").join(key).is_dir(),
                 "{key} was disturbed by a refused run"
             );
         }
-        assert!(!root.join("chronicle/20260304/work").exists());
+        assert!(
+            !root
+                .join("chronicle")
+                .join("20260304")
+                .join("work")
+                .exists()
+        );
     }
 
     #[test]
@@ -1230,7 +1246,12 @@ mod tests {
 
         assert_eq!(report.missing_markers, 1);
         assert_eq!(report.moved, 0);
-        assert!(root.join("chronicle/20260304/090000_60").is_dir());
+        assert!(
+            root.join("chronicle")
+                .join("20260304")
+                .join("090000_60")
+                .is_dir()
+        );
         assert!(!root.join("escaped").exists());
     }
 
@@ -1247,15 +1268,36 @@ mod tests {
         assert_eq!(report.moved, 1);
         assert_eq!(report.removed, 1);
         assert_eq!(report.verified, None, "nothing to verify on a plan");
-        assert!(root.join("chronicle/20260304/090000_60").is_dir());
-        assert!(root.join("chronicle/20260304/100000_60").is_dir());
-        assert!(!root.join("chronicle/20260304/work").exists());
+        assert!(
+            root.join("chronicle")
+                .join("20260304")
+                .join("090000_60")
+                .is_dir()
+        );
+        assert!(
+            root.join("chronicle")
+                .join("20260304")
+                .join("100000_60")
+                .is_dir()
+        );
+        assert!(
+            !root
+                .join("chronicle")
+                .join("20260304")
+                .join("work")
+                .exists()
+        );
     }
 
     #[test]
     fn an_already_nested_journal_reports_no_work_and_an_empty_one_reports_nothing() {
         let fixture = Fixture::new();
-        let nested = fixture.path().join("chronicle/20260304/work/090000_60");
+        let nested = fixture
+            .path()
+            .join("chronicle")
+            .join("20260304")
+            .join("work")
+            .join("090000_60");
         fs::create_dir_all(&nested).expect("nested segment");
         fs::write(nested.join("audio.jsonl"), "{}\n").expect("content written");
 
@@ -1274,16 +1316,16 @@ mod tests {
     fn segment_and_daily_agent_outputs_move_into_the_agents_layout() {
         let fixture = Fixture::new();
         let root = fixture.path();
-        fs::create_dir_all(root.join("facets/work")).expect("facet directory");
-        fs::create_dir_all(root.join("facets/home")).expect("facet directory");
-        let segment = root.join("chronicle/20260304/090000_60");
+        fs::create_dir_all(root.join("facets").join("work")).expect("facet directory");
+        fs::create_dir_all(root.join("facets").join("home")).expect("facet directory");
+        let segment = root.join("chronicle").join("20260304").join("090000_60");
         fs::create_dir_all(&segment).expect("segment directory");
         fs::write(segment.join("summary.md"), "body").expect("markdown written");
         fs::write(segment.join("facets.json"), "{}").expect("known json written");
         fs::write(segment.join("activity_state_work.json"), "{\"a\":1}").expect("faceted written");
         fs::write(segment.join("activity_state_absent.json"), "{}").expect("unknown facet");
         fs::write(segment.join("ingest.json"), "{}").expect("unrelated json");
-        let day_agents = root.join("chronicle/20260304/agents");
+        let day_agents = root.join("chronicle").join("20260304").join("agents");
         fs::create_dir_all(&day_agents).expect("day agents directory");
         fs::write(day_agents.join("digest_work.md"), "digest").expect("faceted markdown");
         fs::write(day_agents.join("notes_home.json"), "{}").expect("faceted json");
@@ -1299,13 +1341,18 @@ mod tests {
         );
         assert_eq!(report.errors, 0);
         assert_eq!(
-            fs::read_to_string(segment.join("agents/summary.md")).expect("moved markdown"),
+            fs::read_to_string(segment.join("agents").join("summary.md")).expect("moved markdown"),
             "body"
         );
-        assert!(segment.join("agents/facets.json").is_file());
+        assert!(segment.join("agents").join("facets.json").is_file());
         assert_eq!(
-            fs::read_to_string(segment.join("agents/work/activity_state.json"))
-                .expect("faceted state"),
+            fs::read_to_string(
+                segment
+                    .join("agents")
+                    .join("work")
+                    .join("activity_state.json")
+            )
+            .expect("faceted state"),
             "{\"a\":1}"
         );
         assert!(!segment.join("summary.md").exists());
@@ -1315,10 +1362,10 @@ mod tests {
         );
         assert!(segment.join("ingest.json").is_file());
         assert_eq!(
-            fs::read_to_string(day_agents.join("work/digest.md")).expect("daily markdown"),
+            fs::read_to_string(day_agents.join("work").join("digest.md")).expect("daily markdown"),
             "digest"
         );
-        assert!(day_agents.join("home/notes.json").is_file());
+        assert!(day_agents.join("home").join("notes.json").is_file());
         assert!(day_agents.join("orphan.md").is_file());
     }
 
@@ -1326,12 +1373,13 @@ mod tests {
     fn an_identical_destination_retires_the_source_and_a_differing_one_keeps_both() {
         let fixture = Fixture::new();
         let root = fixture.path();
-        let segment = root.join("chronicle/20260304/090000_60");
+        let segment = root.join("chronicle").join("20260304").join("090000_60");
         fs::create_dir_all(segment.join("agents")).expect("agents directory");
         fs::write(segment.join("same.md"), "shared").expect("source written");
-        fs::write(segment.join("agents/same.md"), "shared").expect("identical destination");
+        fs::write(segment.join("agents").join("same.md"), "shared").expect("identical destination");
         fs::write(segment.join("differs.md"), "source").expect("source written");
-        fs::write(segment.join("agents/differs.md"), "destination").expect("other destination");
+        fs::write(segment.join("agents").join("differs.md"), "destination")
+            .expect("other destination");
 
         let report = migrate_agent_layout(root, false).expect("migration runs");
 
@@ -1347,7 +1395,8 @@ mod tests {
             "source"
         );
         assert_eq!(
-            fs::read_to_string(segment.join("agents/differs.md")).expect("destination retained"),
+            fs::read_to_string(segment.join("agents").join("differs.md"))
+                .expect("destination retained"),
             "destination",
             "a differing destination is never overwritten"
         );
@@ -1357,11 +1406,11 @@ mod tests {
     fn an_agent_layout_dry_run_counts_the_same_work_and_writes_nothing() {
         let fixture = Fixture::new();
         let root = fixture.path();
-        let segment = root.join("chronicle/20260304/090000_60");
+        let segment = root.join("chronicle").join("20260304").join("090000_60");
         fs::create_dir_all(segment.join("agents")).expect("agents directory");
         fs::write(segment.join("summary.md"), "body").expect("source written");
         fs::write(segment.join("same.md"), "shared").expect("source written");
-        fs::write(segment.join("agents/same.md"), "shared").expect("identical destination");
+        fs::write(segment.join("agents").join("same.md"), "shared").expect("identical destination");
 
         let report = migrate_agent_layout(root, true).expect("migration plans");
 
@@ -1369,16 +1418,16 @@ mod tests {
         assert_eq!(report.cleaned, 1);
         assert!(segment.join("summary.md").is_file());
         assert!(segment.join("same.md").is_file(), "no source was retired");
-        assert!(!segment.join("agents/summary.md").exists());
+        assert!(!segment.join("agents").join("summary.md").exists());
     }
 
     #[test]
     fn the_longest_facet_name_claims_a_daily_file_whose_stem_ends_in_both() {
         let fixture = Fixture::new();
         let root = fixture.path();
-        fs::create_dir_all(root.join("facets/travel")).expect("facet directory");
-        fs::create_dir_all(root.join("facets/work_travel")).expect("facet directory");
-        let day_agents = root.join("chronicle/20260304/agents");
+        fs::create_dir_all(root.join("facets").join("travel")).expect("facet directory");
+        fs::create_dir_all(root.join("facets").join("work_travel")).expect("facet directory");
+        let day_agents = root.join("chronicle").join("20260304").join("agents");
         fs::create_dir_all(&day_agents).expect("day agents directory");
         fs::write(day_agents.join("notes_work_travel.md"), "notes").expect("faceted markdown");
 
@@ -1386,16 +1435,20 @@ mod tests {
 
         assert_eq!(report.moved, 1);
         assert!(
-            day_agents.join("work_travel/notes.md").is_file(),
+            day_agents.join("work_travel").join("notes.md").is_file(),
             "the longer facet name wins the suffix"
         );
-        assert!(!day_agents.join("travel/notes_work.md").exists());
+        assert!(!day_agents.join("travel").join("notes_work.md").exists());
     }
 
     #[test]
     fn key_search_returns_the_candidate_when_free_and_claims_nothing_either_way() {
         let fixture = Fixture::new();
-        let parent = fixture.path().join("chronicle/20260305/work");
+        let parent = fixture
+            .path()
+            .join("chronicle")
+            .join("20260305")
+            .join("work");
         fs::create_dir_all(&parent).expect("parent directory");
 
         assert_eq!(

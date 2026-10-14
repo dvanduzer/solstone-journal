@@ -399,7 +399,7 @@ mod tests {
     use super::{PipelineReport, summarize_pipeline_day};
 
     fn temporary() -> TempDir {
-        TempDir::new_in("/var/tmp").unwrap()
+        TempDir::new().unwrap()
     }
 
     fn now() -> chrono::DateTime<Utc> {

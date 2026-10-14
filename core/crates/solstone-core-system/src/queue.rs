@@ -6804,6 +6804,8 @@ mod tests {
         }
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn poll_error_with_live_root_holds_partition() {
         let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6853,6 +6855,8 @@ mod tests {
         assert_eq!(snap.recent_tasks[0].reference, "poll-err-clean");
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn ordinary_exit_with_live_group_member_holds_partition() {
         let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6897,6 +6901,8 @@ mod tests {
         assert_eq!(snap2.recent_tasks[0].reference, "group-task");
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn each_unproven_observation_holds_and_its_changed_observation_releases() {
         // 1. RootLive -> Gone
@@ -7005,6 +7011,8 @@ mod tests {
         }
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn recovery_signals_only_bound_identities() {
         let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7729,6 +7737,8 @@ mod tests {
         assert_eq!(queue.submit(request("t-next")), SubmitOutcome::Queued);
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn restart_hold_signals_only_recorded_bound_identities() {
         let journal = tempfile::tempdir().expect("journal");
@@ -7808,6 +7818,8 @@ mod tests {
         assert_eq!(signals[0].1, SignalKind::Terminate);
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn unreadable_record_holds_across_two_restarts() {
         let journal = tempfile::tempdir().expect("journal");
@@ -7933,6 +7945,8 @@ mod tests {
         assert!(!rec_path.exists());
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn held_persist_and_recovery_release_do_not_resurrect_a_record() {
         let journal = tempfile::tempdir().expect("journal");
@@ -8014,6 +8028,8 @@ mod tests {
         }
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn newly_listable_directory_is_loaded_before_clearing() {
         let journal = tempfile::tempdir().expect("journal");
@@ -8173,6 +8189,8 @@ mod tests {
         assert!(snap.queue_hold.is_none());
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn two_records_for_one_partition_hold_until_both_are_proven() {
         let journal = tempfile::tempdir().expect("journal");
@@ -8456,6 +8474,8 @@ mod tests {
         assert!(!rec_path.exists());
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn termination_bound_identities_survive_a_restart() {
         let journal = tempfile::tempdir().expect("journal");
@@ -8563,6 +8583,8 @@ mod tests {
         assert!(snap.held.is_empty());
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn handle_less_live_root_is_snapshotted_before_it_is_signalled() {
         let journal = tempfile::tempdir().expect("journal");
@@ -8648,6 +8670,8 @@ mod tests {
         assert_eq!(signals[1].1, SignalKind::Terminate);
     }
 
+    // Unix PID/group recovery fixture; Windows proves liveness through supervisor/jobs.
+    #[cfg(unix)]
     #[test]
     fn intent_without_root_holds_until_reboot() {
         let journal = tempfile::tempdir().expect("journal");

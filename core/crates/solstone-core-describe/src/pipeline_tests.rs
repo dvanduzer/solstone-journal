@@ -1355,7 +1355,11 @@ fn owner_retry_reaches_describe_writer_and_keeps_retained_partial_rows() {
     let mut run = TestRun::new("owner-retry");
     run.video = run
         .journal
-        .join("chronicle/20260101/desktop/120000_300/screen.webm");
+        .join("chronicle")
+        .join("20260101")
+        .join("desktop")
+        .join("120000_300")
+        .join("screen.webm");
     fs::create_dir_all(run.video.parent().unwrap()).unwrap();
     fs::write(&run.video, "synthetic video bytes").unwrap();
     let factory = ScriptedFactory::new(default_response);

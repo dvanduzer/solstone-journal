@@ -445,7 +445,12 @@ mod tests {
     }
     fn fixture() -> (TempDir, PathBuf, PathBuf) {
         let root = TempDir::new();
-        let segment = root.path().join("chronicle/20260101/work/120000_60");
+        let segment = root
+            .path()
+            .join("chronicle")
+            .join("20260101")
+            .join("work")
+            .join("120000_60");
         fs::create_dir_all(&segment).unwrap();
         let raw = segment.join("audio.wav");
         fs::write(&raw, b"before").unwrap();
@@ -553,7 +558,11 @@ mod tests {
         fs::rename(&chronicle, root.path().join("old-chronicle")).unwrap();
         fs::create_dir_all(segment.parent().unwrap()).unwrap();
         fs::rename(
-            root.path().join("old-chronicle/20260101/work/120000_60"),
+            root.path()
+                .join("old-chronicle")
+                .join("20260101")
+                .join("work")
+                .join("120000_60"),
             &segment,
         )
         .unwrap();
@@ -597,7 +606,11 @@ mod tests {
         );
         assert!(
             commit
-                .require_outputs(&claims, &segment, [segment.join("nested/wrong.jsonl")])
+                .require_outputs(
+                    &claims,
+                    &segment,
+                    [segment.join("nested").join("wrong.jsonl")]
+                )
                 .is_err()
         );
         assert!(commit.require_outputs(&claims, &segment, []).is_err());
@@ -720,7 +733,15 @@ mod tests {
                 _ => {
                     fs::rename(root.path().join("chronicle"), root.path().join("old")).unwrap();
                     fs::create_dir_all(segment.parent().unwrap()).unwrap();
-                    fs::rename(root.path().join("old/20260101/work/120000_60"), &segment).unwrap();
+                    fs::rename(
+                        root.path()
+                            .join("old")
+                            .join("20260101")
+                            .join("work")
+                            .join("120000_60"),
+                        &segment,
+                    )
+                    .unwrap();
                 }
             }
             assert!(commit.revalidate().is_err());
@@ -733,7 +754,7 @@ mod tests {
     #[test]
     fn empty_discovery_and_same_retained_ancestry_restoration_stay_valid() {
         let root = TempDir::new();
-        let segment = root.path().join("parent/segment");
+        let segment = root.path().join("parent").join("segment");
         fs::create_dir_all(&segment).unwrap();
         let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
         let commit = claims.commit(&segment).unwrap();

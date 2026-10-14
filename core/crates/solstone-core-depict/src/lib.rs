@@ -1061,7 +1061,10 @@ mod tests {
         fs::write(&model_file, model_bytes).unwrap();
         let sidecar = root
             .path()
-            .join("cache/providers/rfdetr/.rfdetr-install.json");
+            .join("cache")
+            .join("providers")
+            .join("rfdetr")
+            .join(".rfdetr-install.json");
         fs::write(
             sidecar,
             json!({
@@ -1614,7 +1617,12 @@ mod tests {
         use solstone_core_system::work_retry::{self, raw};
         let _env = lock_depict_env();
         let root = tempfile::tempdir().unwrap();
-        let segment = root.path().join("chronicle/20260101/photos/123456_300");
+        let segment = root
+            .path()
+            .join("chronicle")
+            .join("20260101")
+            .join("photos")
+            .join("123456_300");
         fs::create_dir_all(&segment).unwrap();
         let image = segment.join("photo.png");
         ImageBuffer::<Rgb<u8>, _>::from_pixel(4, 4, Rgb([255, 0, 0]))

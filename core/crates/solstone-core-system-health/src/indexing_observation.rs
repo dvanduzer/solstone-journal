@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(end, now.timestamp_millis());
 
         // Chronicle day with health log
-        let health_dir = dir.path().join("chronicle/20261005/health");
+        let health_dir = dir.path().join("chronicle").join("20261005").join("health");
         fs::create_dir_all(&health_dir).unwrap();
         let log_path = health_dir.join("think.test.jsonl");
 
@@ -687,7 +687,7 @@ mod tests {
         let dir = tempdir().unwrap();
         setup_utc_journal(dir.path());
         let now = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
-        let health_dir = dir.path().join("chronicle/20261005/health");
+        let health_dir = dir.path().join("chronicle").join("20261005").join("health");
         fs::create_dir_all(&health_dir).unwrap();
 
         let base_ts = now.timestamp_millis() - 50_000;
@@ -760,11 +760,16 @@ mod tests {
         let dir = tempdir().unwrap();
         setup_utc_journal(dir.path());
         let now = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
-        let health_dir = dir.path().join("chronicle/20261005/health");
+        let health_dir = dir.path().join("chronicle").join("20261005").join("health");
         fs::create_dir_all(&health_dir).unwrap();
 
         let base_ts = now.timestamp_millis() - 50_000;
-        let abs = dir.path().join("chronicle/20261005/talents/flow.md");
+        let abs = dir
+            .path()
+            .join("chronicle")
+            .join("20261005")
+            .join("talents")
+            .join("flow.md");
         let row1 = serde_json::json!({"event":"index.attempt","ts":base_ts,"path":"chronicle/20261005/talents/flow.md","outcome":"failed"});
         let row2 = serde_json::json!({"event":"index.attempt","ts":base_ts + 1000,"path":"20261005/talents/flow.md","outcome":"failed"});
         let row3 = serde_json::json!({"event":"index.attempt","ts":base_ts + 2000,"path":abs.to_str().unwrap(),"outcome":"indexed"});
@@ -861,7 +866,7 @@ mod tests {
         let dir = tempdir().unwrap();
         setup_utc_journal(dir.path());
         let now = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
-        let health_dir = dir.path().join("chronicle/20261005/health");
+        let health_dir = dir.path().join("chronicle").join("20261005").join("health");
         fs::create_dir_all(&health_dir).unwrap();
 
         let readable = health_dir.join("think.a.jsonl");

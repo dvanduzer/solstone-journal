@@ -1032,7 +1032,11 @@ mod tests {
     use super::*;
 
     fn segment(root: &Path) -> PathBuf {
-        let path = root.join("chronicle/20260812/capture/120000_1");
+        let path = root
+            .join("chronicle")
+            .join("20260812")
+            .join("capture")
+            .join("120000_1");
         fs::create_dir_all(&path).expect("segment");
         path
     }
@@ -1046,7 +1050,7 @@ mod tests {
 
         let all = delete_outputs(
             temp.path(),
-            &temp.path().join("chronicle/20260812"),
+            &temp.path().join("chronicle").join("20260812"),
             ReprocessKind::All,
             None,
             None,
@@ -1059,7 +1063,7 @@ mod tests {
         );
         let screen = delete_outputs(
             temp.path(),
-            &temp.path().join("chronicle/20260812"),
+            &temp.path().join("chronicle").join("20260812"),
             ReprocessKind::Screen,
             None,
             None,
@@ -1075,7 +1079,7 @@ mod tests {
         let path = segment(temp.path());
         let output = path.join("orphan_screen.jsonl");
         fs::write(&output, "{}\n").expect("sidecar");
-        let day = temp.path().join("chronicle/20260812");
+        let day = temp.path().join("chronicle").join("20260812");
 
         assert!(
             delete_outputs(temp.path(), &day, ReprocessKind::All, None, None, true)
@@ -1112,7 +1116,7 @@ mod tests {
                 done_tx
                     .send(delete_outputs(
                         &journal,
-                        &journal.join("chronicle/20260812"),
+                        &journal.join("chronicle").join("20260812"),
                         ReprocessKind::Audio,
                         None,
                         None,
@@ -1155,7 +1159,7 @@ mod tests {
         let output = path.join("meeting.jsonl");
         fs::write(&output, "{}\n").expect("sidecar");
         fs::write(path.join("meeting.mp4"), "video").expect("source");
-        let day = temp.path().join("chronicle/20260812");
+        let day = temp.path().join("chronicle").join("20260812");
 
         assert_eq!(
             delete_outputs(temp.path(), &day, ReprocessKind::All, None, None, true)
@@ -1227,12 +1231,18 @@ mod tests {
         let path = segment(temp.path());
         let output = path.join("orphan_screen.jsonl");
         fs::write(&output, "{}\n").expect("sidecar");
-        fs::create_dir_all(temp.path().join("chronicle/20260812/health/stream.updated"))
-            .expect("block stream marker");
+        fs::create_dir_all(
+            temp.path()
+                .join("chronicle")
+                .join("20260812")
+                .join("health")
+                .join("stream.updated"),
+        )
+        .expect("block stream marker");
 
         let result = delete_outputs(
             temp.path(),
-            &temp.path().join("chronicle/20260812"),
+            &temp.path().join("chronicle").join("20260812"),
             ReprocessKind::Screen,
             None,
             None,
@@ -1258,10 +1268,15 @@ mod tests {
         let first = segment(temp.path());
         fs::write(first.join("audio.flac"), "audio").expect("audio");
         fs::write(first.join("screen.webm"), "video").expect("video");
-        let second = temp.path().join("chronicle/20260812/other/120001_1");
+        let second = temp
+            .path()
+            .join("chronicle")
+            .join("20260812")
+            .join("other")
+            .join("120001_1");
         fs::create_dir_all(&second).expect("second segment");
         fs::write(second.join("other.flac"), "audio").expect("other audio");
-        let day = temp.path().join("chronicle/20260812");
+        let day = temp.path().join("chronicle").join("20260812");
 
         let audio = scan_unprocessed(
             temp.path(),
@@ -1290,7 +1305,7 @@ mod tests {
             "{\"_solstone_processing\":{\"state\":\"failed\",\"handler\":\"describe\",\"attempts\":2}}\n",
         )
         .expect("retryable sidecar");
-        let day = temp.path().join("chronicle/20260812");
+        let day = temp.path().join("chronicle").join("20260812");
         assert_eq!(
             scan_unprocessed(temp.path(), &day, None, None, None)
                 .expect("retry scan")
@@ -1314,7 +1329,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("journal");
         let path = segment(temp.path());
         fs::write(path.join("audio.flac"), "audio").expect("audio");
-        let day = temp.path().join("chronicle/20260812");
+        let day = temp.path().join("chronicle").join("20260812");
 
         // AC4: attempts=1 -> included in scan
         fs::write(
@@ -1354,7 +1369,7 @@ mod tests {
     fn image_reprocess_scans_bare_stills_and_never_deletes_sidecars() {
         let temp = tempfile::tempdir().expect("journal");
         let path = segment(temp.path());
-        let day = temp.path().join("chronicle/20260812");
+        let day = temp.path().join("chronicle").join("20260812");
 
         // Two bare stills -> work length 2, both depict
         fs::write(path.join("camera-1.jpg"), b"img1").expect("img1");
@@ -1423,11 +1438,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("journal");
         let import_dir = temp
             .path()
-            .join("chronicle/20260812/import.camera/120000_1");
+            .join("chronicle")
+            .join("20260812")
+            .join("import.camera")
+            .join("120000_1");
         fs::create_dir_all(&import_dir).expect("import segment");
         fs::write(import_dir.join("photo.jpg"), b"imported").expect("photo");
 
-        let day = temp.path().join("chronicle/20260812");
+        let day = temp.path().join("chronicle").join("20260812");
         let work = scan_unprocessed(temp.path(), &day, None, None, Some(ReprocessKind::Image))
             .expect("scan");
         assert!(work.is_empty());
@@ -1436,9 +1454,9 @@ mod tests {
     #[test]
     fn depict_reentry_distinguishes_unfiltered_image_only_and_import_streams() {
         let temp = tempfile::tempdir().expect("journal");
-        let day = temp.path().join("chronicle/20260812");
-        let capture = day.join("capture/120000_1");
-        let imported = day.join("import.image/120000_1");
+        let day = temp.path().join("chronicle").join("20260812");
+        let capture = day.join("capture").join("120000_1");
+        let imported = day.join("import.image").join("120000_1");
         fs::create_dir_all(&capture).expect("capture");
         fs::create_dir_all(&imported).expect("import");
         let sidecar = |reason: &str, attempts: i64| {
@@ -1535,7 +1553,7 @@ mod tests {
         fs::write(path.join("photo.png"), b"image").expect("image");
         let work = scan_unprocessed(
             temp.path(),
-            &temp.path().join("chronicle/20260812"),
+            &temp.path().join("chronicle").join("20260812"),
             None,
             None,
             None,
