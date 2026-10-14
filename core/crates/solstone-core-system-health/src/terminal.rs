@@ -181,6 +181,56 @@ pub fn read_capped_segment_talents<S: HealthLogSource>(
     source: &S,
     day: &str,
 ) -> Result<FoldRead<BTreeSet<TerminalUnit>>, HealthError> {
+    let failures = read_segment_talent_failures(source, day)?;
+    Ok(FoldRead {
+        value: failures.value.capped,
+        malformed_line_count: failures.malformed_line_count,
+    })
+}
+
+/// A segment talent that keeps failing on the same work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatedFailure {
+    /// The reason its latest counted failure gave.
+    pub reason_code: String,
+    pub latest_ts: i64,
+}
+
+/// What one read of a day's logs says about segment talents that keep failing.
+#[derive(Debug, Clone, Default)]
+pub struct SegmentTalentFailures {
+    /// The floor cap: any failure but a confidential-access or attestation
+    /// outage counts.
+    pub capped: BTreeSet<TerminalUnit>,
+    /// Talents to set aside. Only a failure about the request itself counts,
+    /// so an outage or a dropped connection never sets a recording's work aside.
+    pub repeated: BTreeMap<TerminalUnit, RepeatedFailure>,
+}
+
+/// Request-specific failures beyond the deterministic set: the answer ran out
+/// of room or could not be used.
+const UNUSABLE_ANSWER_REASON_CODES: &[&str] = &[
+    "context_budget_exceeded",
+    "context_fitted_overflow",
+    "context_preserved_overflow",
+    "incomplete_json_length",
+    "incomplete_text_length",
+    "provider_response_invalid",
+    "schema_validation_failed",
+    "thinking_consumed_budget",
+];
+
+/// A failure the same request would meet again. Anything else, including an
+/// unknown cause, may be the lane or the moment, and keeps its turn.
+fn about_the_request(reason: &str) -> bool {
+    (is_deterministic(reason) || UNUSABLE_ANSWER_REASON_CODES.contains(&reason))
+        && !solstone_core_generate::is_blocking_reason(reason)
+}
+
+pub fn read_segment_talent_failures<S: HealthLogSource>(
+    source: &S,
+    day: &str,
+) -> Result<FoldRead<SegmentTalentFailures>, HealthError> {
     let scanned = read_day_records(source, day)?;
     let grouped = group_observed_terminals(
         scanned
@@ -189,41 +239,62 @@ pub fn read_capped_segment_talents<S: HealthLogSource>(
             .map(|record| (day.to_owned(), record)),
         None,
     );
-    let capped = grouped
-        .into_iter()
-        .filter(|(unit, terminals)| unit.mode == "segment" && trailing_failures_capped(terminals))
-        .map(|(unit, _)| unit)
-        .collect();
+    let mut failures = SegmentTalentFailures::default();
+    for (unit, terminals) in grouped {
+        if unit.mode != "segment" {
+            continue;
+        }
+        let repeated =
+            trailing_failures_repeated(&terminals, |code| !code.is_some_and(about_the_request));
+        if trailing_failures_repeated(&terminals, |code| {
+            code.is_some_and(|code| {
+                code == "confidential_access_ended"
+                    || solstone_core_generate::is_attestation_family_reason(code)
+            })
+        })
+        .is_some()
+        {
+            failures.capped.insert(unit.clone());
+        }
+        if let Some(repeated) = repeated {
+            failures.repeated.insert(unit, repeated);
+        }
+    }
     Ok(FoldRead {
-        value: capped,
+        value: failures,
         malformed_line_count: scanned.malformed_line_count,
     })
 }
 
-fn trailing_failures_capped(terminals: &[ObservedTerminal]) -> bool {
+/// At least `CAP` trailing failures spanning `MIN_SPAN_MS`, not counting the
+/// excluded reasons, which neither count nor end the run.
+fn trailing_failures_repeated(
+    terminals: &[ObservedTerminal],
+    excluded: impl Fn(Option<&str>) -> bool,
+) -> Option<RepeatedFailure> {
     let mut count = 0;
-    let mut latest_counted_ts = None;
+    let mut latest = None;
     let mut oldest_counted_ts = None;
     for terminal in terminals.iter().rev() {
         if terminal.event != TerminalEvent::Fail {
             break;
         }
-        if terminal.reason_code.as_deref().is_some_and(|code| {
-            code == "confidential_access_ended"
-                || solstone_core_generate::is_attestation_family_reason(code)
-        }) {
+        if excluded(terminal.reason_code.as_deref()) {
             continue;
         }
         count += 1;
-        if latest_counted_ts.is_none() {
-            latest_counted_ts = Some(terminal.ts);
-        }
+        latest.get_or_insert(terminal);
         oldest_counted_ts = Some(terminal.ts);
     }
-    count >= CAP
-        && latest_counted_ts
-            .zip(oldest_counted_ts)
-            .is_some_and(|(latest, oldest)| latest - oldest >= MIN_SPAN_MS)
+    let latest = latest?;
+    (count >= CAP && oldest_counted_ts.is_some_and(|oldest| latest.ts - oldest >= MIN_SPAN_MS))
+        .then(|| RepeatedFailure {
+            reason_code: latest
+                .reason_code
+                .clone()
+                .unwrap_or_else(|| "talent_failed".to_owned()),
+            latest_ts: latest.ts,
+        })
 }
 
 pub fn read_completed_units<S: HealthLogSource>(

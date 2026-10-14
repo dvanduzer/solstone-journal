@@ -355,6 +355,10 @@ fn think(
         complete(log, context, segment, stream, ModeResult::default());
         return Ok(ModeResult::default());
     }
+    if !refresh && held_aside(context, &segment_dir, segment, stream, "sense")? {
+        log_skip(log, context, "sense", segment, "set_aside", stream);
+        return Ok(ModeResult::default());
+    }
     let runtime = runtime()?;
     let sense_use = match dispatch_agent(
         context,
@@ -687,8 +691,9 @@ fn thinking_is_current(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// A held floor talent reuses the verified Sense output. No Sense rerun,
-/// activity replay, successful sibling or whole-day work is hidden here.
+/// A held talent reuses the verified Sense output. No Sense rerun, activity
+/// replay, successful sibling or whole-day work is hidden here. A held Sense
+/// is the segment's first step, so retrying it thinks the segment again.
 pub(crate) fn retry_talent(
     context: &ThinkContext,
     log: &mut RunLogWriter,
@@ -697,7 +702,39 @@ pub(crate) fn retry_talent(
     talent: &str,
 ) -> Result<ModeResult, String> {
     if !SEGMENT_FLOOR_TALENTS.contains(&talent) {
-        return Err("not a retryable floor talent".into());
+        // Finished elsewhere, or no longer selected: nothing is left to
+        // retry, so the hold is released rather than retried every pass.
+        let progress = read_segment_progress(
+            &FilesystemHealthLogSource::new(&context.journal),
+            &context.day,
+        )
+        .map_err(|error| error.to_string())?;
+        if progress.malformed_line_count != 0 {
+            return Err("segment progress contains unreadable records".into());
+        }
+        let pending = solstone_core_system_health::segment_pending_talents(
+            lookup_segment_progress(&progress.value, stream, segment),
+        );
+        if !pending.contains(talent) {
+            if let Some((unit, _)) = &context.retry {
+                solstone_core_system::work_retry::reconcile_accepted(&context.journal, unit)?;
+            }
+            return Ok(ModeResult::default());
+        }
+    }
+    if talent == "sense" {
+        return run_with(
+            context,
+            log,
+            segment,
+            false,
+            Some(stream),
+            1,
+            Some(crate::dispatch::DEFAULT_THINK_TIMEOUT),
+            false,
+            &[],
+            CurrentSegment::Skip,
+        );
     }
     let configs = load_talent_configs(
         &context.talent_root,
@@ -712,7 +749,7 @@ pub(crate) fn retry_talent(
     let config = configs
         .iter()
         .find(|c| c.key == talent)
-        .ok_or("floor talent is no longer enabled")?;
+        .ok_or("held talent is no longer enabled")?;
     let runtime = crate::dispatch::runtime()?;
     let item = match dispatch_agent(
         context,
@@ -726,8 +763,8 @@ pub(crate) fn retry_talent(
         log,
     ) {
         Ok(AgentDispatch::Pending(item)) => item,
-        Ok(AgentDispatch::Skipped) => return Err("floor talent could not be retried".into()),
-        Err(_) => return Err("floor talent could not be dispatched".into()),
+        Ok(AgentDispatch::Skipped) => return Err("held talent could not be retried".into()),
+        Err(_) => return Err("held talent could not be dispatched".into()),
     };
     let result = drain_with_deadline_observed(
         context,
@@ -848,7 +885,60 @@ fn select_agents<'a>(
             stream,
         );
     }
+    if !refresh {
+        let mut kept = Vec::with_capacity(selected.len());
+        for config in selected {
+            let gating = !SEGMENT_FLOOR_TALENTS.contains(&config.key.as_str())
+                && !SEGMENT_NONGATING_TALENTS.contains(&config.key.as_str());
+            if gating && held_aside(context, segment_dir, segment, stream, &config.key)? {
+                log_skip(log, context, &config.key, segment, "set_aside", stream);
+            } else {
+                kept.push(config);
+            }
+        }
+        selected = kept;
+    }
     Ok(selected)
+}
+
+/// The retry identity of one talent of this segment.
+fn segment_talent_unit(
+    context: &ThinkContext,
+    segment_dir: &std::path::Path,
+    segment: &str,
+    stream: Option<&str>,
+    talent: &str,
+) -> solstone_core_system::work_retry::Unit {
+    solstone_core_system::work_retry::Unit::Segment {
+        day: context.day.clone(),
+        stream: stream.unwrap_or(DEFAULT_STREAM).into(),
+        segment: segment.into(),
+        talent: talent.into(),
+        direct: segment_dir.parent() == Some(context.day_dir.as_path()),
+    }
+}
+
+/// A talent set aside after failing again and again on the same input waits
+/// for its own retry: an ordinary run neither repeats nor abandons it.
+fn held_aside(
+    context: &ThinkContext,
+    segment_dir: &std::path::Path,
+    segment: &str,
+    stream: Option<&str>,
+    talent: &str,
+) -> Result<bool, String> {
+    let unit = segment_talent_unit(context, segment_dir, segment, stream, talent);
+    if context
+        .retry
+        .as_ref()
+        .is_some_and(|(selected, _)| selected == &unit)
+    {
+        return Ok(false);
+    }
+    Ok(
+        solstone_core_system::work_retry::read(&context.journal, &unit.id()?)?
+            .is_some_and(|record| record.held),
+    )
 }
 
 fn has_audio_embeddings(segment_dir: &std::path::Path) -> bool {
@@ -985,10 +1075,9 @@ fn floor_retry_attempt(
     refresh: bool,
 ) -> Result<Option<solstone_core_system::work_retry::Attempt>, String> {
     use solstone_core_system::{work_intent, work_retry};
-    if let Some((selected, attempt)) = &context.retry {
-        if selected != unit {
-            return Err("floor retry scope changed".into());
-        }
+    if let Some((selected, attempt)) = &context.retry
+        && selected == unit
+    {
         return Ok(Some(attempt.clone()));
     }
     if refresh
@@ -1043,18 +1132,24 @@ fn dispatch_agent(
         );
         return Ok(AgentDispatch::Skipped);
     }
-    let retry_unit = if SEGMENT_FLOOR_TALENTS.contains(&config.key.as_str()) {
+    // A held talent's own retry carries its permission to the writer.
+    let retry_target = context.retry.as_ref().is_some_and(|(selected, _)| {
+        matches!(
+            selected,
+            solstone_core_system::work_retry::Unit::Segment { segment: held, talent, .. }
+                if held == segment && talent == &config.key
+        )
+    });
+    let retry_unit = if SEGMENT_FLOOR_TALENTS.contains(&config.key.as_str()) || retry_target {
         let directory = find_segment_dir(&context.journal, &context.day, segment, stream)
             .ok_or(DispatchFailure::Unavailable)?;
-        Some(solstone_core_system::work_retry::Unit::Segment {
-            day: context.day.clone(),
-            stream: stream
-                .unwrap_or(solstone_core_journal_io::DEFAULT_STREAM)
-                .into(),
-            segment: segment.into(),
-            talent: config.key.clone(),
-            direct: directory.parent() == Some(context.day_dir.as_path()),
-        })
+        Some(segment_talent_unit(
+            context,
+            &directory,
+            segment,
+            stream,
+            &config.key,
+        ))
     } else {
         None
     };
@@ -2654,6 +2749,25 @@ fn log_use_terminal(
     // known here — `failure_cause` reads the same use log the daily path consults — so
     // record it under the same `reason_code` key rather than leaving the state to stand
     // in for a reason it does not carry.
+    if matches!(outcome, DrainOutcome::Finish)
+        && !SEGMENT_FLOOR_TALENTS.contains(&item.name.as_str())
+        && let Some(directory) = find_segment_dir(&context.journal, &context.day, segment, stream)
+    {
+        // A held talent that finished, by its retry or after its input
+        // changed, is no longer set aside. Floor talents settle in the writer.
+        let unit = segment_talent_unit(context, &directory, segment, stream, &item.name);
+        if let Ok(id) = unit.id()
+            && solstone_core_system::work_retry::read(&context.journal, &id)
+                .is_ok_and(|record| record.is_some_and(|record| record.held))
+            && let Err(error) =
+                solstone_core_system::work_retry::reconcile_accepted(&context.journal, &unit)
+        {
+            log::warn!(
+                "could not release held {} for {segment}: {error}",
+                item.name
+            );
+        }
+    }
     if let Some(reason_code) = carried_cause {
         fields.insert("reason_code".to_owned(), Value::String(reason_code));
         // Same gap as daily mode's log_daily_failure: reason_code alone drops whatever
@@ -3625,4 +3739,54 @@ fn from_scratch_floor_retry_consumes_one_durable_owner_cause() {
         );
         work_intent::finish_from_scratch(root.path(), day, &intent.id, false).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_held_talent_runs_only_in_its_own_retry() {
+    use solstone_core_system::work_retry;
+    let root = tempfile::tempdir().unwrap();
+    let day = "20260101";
+    let (segment, stream) = ("120000_300", Some("notes"));
+    let directory = root
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("notes")
+        .join(segment);
+    std::fs::create_dir_all(directory.join("talents")).unwrap();
+    std::fs::write(directory.join("talents/sense.json"), b"{}").unwrap();
+    let mut context = ThinkContext::new(
+        root.path(),
+        day.into(),
+        root.path().join("chronicle").join(day),
+        1,
+    )
+    .unwrap();
+    let screen = segment_talent_unit(&context, &directory, segment, stream, "screen");
+    assert!(!held_aside(&context, &directory, segment, stream, "screen").unwrap());
+    let input = work_retry::input::current(root.path(), &screen).unwrap();
+    work_retry::observe_held(root.path(), &screen, "provider_request_rejected", &input).unwrap();
+    // An ordinary run leaves it waiting, even once a cause to retry exists.
+    assert!(held_aside(&context, &directory, segment, stream, "screen").unwrap());
+    work_retry::request(root.path(), &screen).unwrap();
+    assert!(held_aside(&context, &directory, segment, stream, "screen").unwrap());
+    let attempt = work_retry::read(root.path(), &screen.id().unwrap())
+        .unwrap()
+        .unwrap()
+        .permission(&input, work_retry::DECLARED_FIXES)
+        .unwrap();
+    context.retry = Some((screen.clone(), attempt.clone()));
+    assert!(!held_aside(&context, &directory, segment, stream, "screen").unwrap());
+    assert_eq!(
+        floor_retry_attempt(&context, &screen, false).unwrap(),
+        Some(attempt)
+    );
+    // Its siblings dispatch as usual inside that retry.
+    let documents = segment_talent_unit(&context, &directory, segment, stream, "documents");
+    assert!(
+        floor_retry_attempt(&context, &documents, false)
+            .unwrap()
+            .is_none()
+    );
 }

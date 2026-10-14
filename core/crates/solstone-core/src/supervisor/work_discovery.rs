@@ -520,7 +520,7 @@ fn raw_retries(
             reason: record.reason.clone(),
         });
         let Some(grant) = grant else {
-            *permanently_held |= permanently_set_aside(&record.reason);
+            *permanently_held = true;
             continue;
         };
         if !policy.permits(p.band) {
@@ -606,9 +606,7 @@ fn daily_retries(
             reason: record.reason.clone(),
         });
         let Some(grant) = grant else {
-            if permanently_set_aside(&record.reason) {
-                permanently_held.insert(id);
-            }
+            permanently_held.insert(id);
             continue;
         };
         if !ready {
@@ -709,8 +707,7 @@ fn talent_retries(
             report.band(p.band).activities_owed += 1;
         }
         let Some(grant) = grant else {
-            if matches!(record.unit, Unit::Activity { .. }) && permanently_set_aside(&record.reason)
-            {
+            if matches!(record.unit, Unit::Activity { .. }) {
                 *permanently_held_activities += 1;
             }
             continue;
@@ -806,12 +803,12 @@ fn inspect_day(
         return Err("segment progress contains unreadable records".into());
     }
     // One read of the day's logs; never one per segment.
-    let capped = solstone_core_system_health::read_capped_segment_talents(
+    let failures = solstone_core_system_health::read_segment_talent_failures(
         &solstone_core_system_health::FilesystemHealthLogSource::new(journal),
         day,
     )
     .map_err(|error| error.to_string())?;
-    if capped.malformed_line_count != 0 {
+    if failures.malformed_line_count != 0 {
         return Err("floor failure evidence is unreadable".into());
     }
     // Ready also needs every segment's saved outputs published; thought does
@@ -831,7 +828,7 @@ fn inspect_day(
             intent,
             imports,
             policy,
-            &capped.value,
+            &failures.value.capped,
             &mut permanently_held,
             report,
         )?);
@@ -855,7 +852,18 @@ fn inspect_day(
             continue;
         }
         prerequisites_ready = false;
-        if permanently_held {
+        let thinking_held = if readiness == SegmentReadiness::Owed {
+            held_thinking(
+                journal,
+                day,
+                segment,
+                &progress.value,
+                &failures.value.repeated,
+            )?
+        } else {
+            None
+        };
+        if permanently_held || thinking_held == Some(HeldThinking::SetAside) {
             work.history.set_aside += 1;
             work.history.segments_set_aside += u64::from(p.band == WorkBand::Completing);
         } else {
@@ -863,6 +871,11 @@ fn inspect_day(
         }
         if readiness == SegmentReadiness::Owed {
             segments_thought = false;
+        }
+        // Held thinking is retried one talent at a time, by its own cause.
+        // Repairing the segment again would only repeat its failures.
+        if thinking_held.is_some() {
+            continue;
         }
         owed_segments.push((segment, p, readiness));
     }
@@ -886,8 +899,9 @@ fn inspect_day(
         &mut permanently_held_daily,
         report,
     )?);
-    // A daily output waiting solely on permanently held recordings is also
-    // set aside for the range. Ordinary prerequisites remain work owed.
+    // A daily output waiting solely on set-aside recordings, or on their
+    // set-aside thinking, is also set aside for the range. Ordinary
+    // prerequisites remain work owed.
     let permanently_blocked =
         !segments_thought && work.history.owed == 0 && work.history.set_aside > 0;
     for covered in &coverage.units {
@@ -1169,11 +1183,126 @@ fn admit(
     Ok(current)
 }
 
-fn permanently_set_aside(reason: &str) -> bool {
-    matches!(
-        reason,
-        "corrupt_input" | "analysis_failed" | "no_audio_stream"
-    )
+/// Where a segment's unfinished thinking stands when every talent it still
+/// waits on is held after failing again and again on the same input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldThinking {
+    /// Nothing will retry it until its input changes, the owner asks, or a
+    /// release fixes the reason.
+    SetAside,
+    /// One of its holds has a cause to retry, which talent retries run.
+    Retrying,
+}
+
+/// Hold each talent this segment still waits on that keeps failing on its
+/// current input, then say whether all of its waiting thinking is held.
+/// `None` is ordinary work: something it waits on is not held, its input is
+/// newer than its last Sense read, or the evidence cannot be read.
+fn held_thinking(
+    journal: &Path,
+    day: &str,
+    segment: &solstone_core_system_health::DaySegment,
+    progress: &BTreeMap<
+        solstone_core_system_health::SegmentIdentity,
+        solstone_core_system_health::SegmentProgress,
+    >,
+    repeated: &BTreeMap<
+        solstone_core_system_health::TerminalUnit,
+        solstone_core_system_health::RepeatedFailure,
+    >,
+) -> Result<Option<HeldThinking>, String> {
+    if !solstone_core_system_health::segment_fully_sensed(&segment.data_state) {
+        return Ok(None);
+    }
+    let thought = solstone_core_system_health::lookup_segment_progress(
+        progress,
+        &segment.stream,
+        &segment.key,
+    );
+    let pending = solstone_core_system_health::segment_pending_talents(thought);
+    if pending.is_empty()
+        || pending.iter().any(|name| {
+            name == "facet_routing"
+                || solstone_core_system_health::SEGMENT_FLOOR_TALENTS.contains(&name.as_str())
+        })
+    {
+        return Ok(None);
+    }
+    let direct = matches!(
+        segment.stream_layout,
+        solstone_core_journal_io::SegmentLayout::Direct
+    );
+    // Only a segment with a failure pattern or a hold reads its files: an
+    // ordinary backlog costs one lookup per waiting talent.
+    let mut held_talents = Vec::new();
+    for name in &pending {
+        let unit = Unit::Segment {
+            day: day.into(),
+            stream: segment.stream.clone(),
+            segment: segment.key.clone(),
+            talent: name.clone(),
+            direct,
+        };
+        let id = unit.id()?;
+        let failing = repeated.get(&solstone_core_system_health::TerminalUnit {
+            day: day.into(),
+            mode: "segment".into(),
+            name: name.clone(),
+            facet: None,
+            stream: Some(segment.stream.clone()),
+            segment: Some(segment.key.clone()),
+            activity: None,
+        });
+        let is_held = work_retry::read(journal, &id)?.is_some_and(|record| record.held);
+        if failing.is_none() && !is_held {
+            return Ok(None);
+        }
+        held_talents.push((unit, id, failing, is_held));
+    }
+    let directory = if direct {
+        journal.join("chronicle").join(day).join(&segment.key)
+    } else {
+        journal
+            .join("chronicle")
+            .join(day)
+            .join(&segment.stream)
+            .join(&segment.key)
+    };
+    let newest = solstone_core_system_health::newest_segment_input_ms(&directory)
+        .map_err(|error| error.to_string())?;
+    let read_current = thought
+        .and_then(|progress| progress.sense_input_ms)
+        .is_some_and(|read| newest.is_none_or(|newest| newest < read));
+    // Input newer than the last Sense read is ordinary work: Sense reads it first.
+    if !pending.contains("sense") && !read_current {
+        return Ok(None);
+    }
+    let mut held = HeldThinking::SetAside;
+    for (unit, id, failing, is_held) in held_talents {
+        let Ok(input) = work_retry::input::current(journal, &unit) else {
+            return Ok(None);
+        };
+        // Failures on input older than what the segment holds now say
+        // nothing about it.
+        if let Some(failure) =
+            failing.filter(|failure| newest.is_none_or(|newest| failure.latest_ts > newest))
+            && !is_held
+        {
+            work_retry::observe_held(journal, &unit, &failure.reason_code, &input)?;
+        }
+        match work_retry::read(journal, &id)?.filter(|record| record.held) {
+            None => return Ok(None),
+            Some(record)
+                if record
+                    .permission(&input, work_retry::DECLARED_FIXES)
+                    .is_some() =>
+            {
+                held = HeldThinking::Retrying;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(Some(held))
 }
 
 /// All historical days after the newest owed day are caught up. Today and
@@ -2859,5 +2988,215 @@ mod tests {
                 assert!(!owed.contains(day), "{day} present in {owed:?}");
             }
         }
+    }
+
+    /// One old segment, sensed, whose `talent` then failed `failures` times an
+    /// hour apart with `reason`. Returns the segment directory.
+    fn failing_talent(
+        root: &Path,
+        talent: &str,
+        failures: i64,
+        reason: &str,
+        sensed: bool,
+    ) -> PathBuf {
+        use solstone_core_journal_io::{
+            JournalRoot,
+            operational_log::{OplogFormat, create_oplog_at},
+        };
+        use std::io::Write;
+        let (day, key) = ("19990101", "120000_60");
+        segment(root, day, key);
+        let directory = root.join("chronicle").join(day).join("notes").join(key);
+        std::fs::write(
+            directory.join("audio.jsonl"),
+            "{\"start\":\"00:00:01\",\"text\":\"A meeting about a garden.\"}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(directory.join("talents")).unwrap();
+        std::fs::write(
+            directory.join("talents/sense.json"),
+            "{\"density\":\"active\"}",
+        )
+        .unwrap();
+        let mut log = create_oplog_at(
+            JournalRoot::open(root).unwrap(),
+            "think",
+            "segment",
+            OplogFormat::Jsonl,
+            chrono::NaiveDate::parse_from_str(day, "%Y%m%d")
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+                .fixed_offset(),
+        )
+        .unwrap();
+        let after_input = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        if sensed {
+            writeln!(log, "{}", serde_json::json!({"event":"sense.complete","ts":after_input,"mode":"segment","stream":"notes","segment":key,"density":"active"})).unwrap();
+            writeln!(log, "{}", serde_json::json!({"event":"talent.dispatch","ts":after_input,"mode":"segment","stream":"notes","segment":key,"name":"documents","use_id":"use-documents"})).unwrap();
+            writeln!(log, "{}", serde_json::json!({"event":"talent.complete","ts":after_input,"mode":"segment","stream":"notes","segment":key,"name":"documents","use_id":"use-documents"})).unwrap();
+        }
+        for attempt in 0..failures {
+            let ts = after_input + 1 + attempt * 3_600_000;
+            let use_id = format!("use-{attempt}");
+            writeln!(log, "{}", serde_json::json!({"event":"talent.dispatch","ts":ts,"mode":"segment","stream":"notes","segment":key,"name":talent,"use_id":use_id})).unwrap();
+            writeln!(log, "{}", serde_json::json!({"event":"talent.fail","ts":ts + 1,"mode":"segment","stream":"notes","segment":key,"name":talent,"use_id":use_id,"reason_code":reason})).unwrap();
+        }
+        directory
+    }
+
+    fn held_unit(talent: &str) -> Unit {
+        Unit::Segment {
+            day: "19990101".into(),
+            stream: "notes".into(),
+            segment: "120000_60".into(),
+            talent: talent.into(),
+            direct: false,
+        }
+    }
+
+    /// A talent that fails on every attempt is set aside rather than repaired
+    /// on every pass, its day's outputs wait with it, and it comes back for
+    /// changed input or an owner's ask, one retry per cause.
+    #[test]
+    fn a_talent_that_keeps_failing_is_set_aside_until_a_cause_to_retry() {
+        let root = fixture("local");
+        let directory =
+            failing_talent(root.path(), "screen", 30, "provider_request_rejected", true);
+        let queue = queue(root.path());
+        let repair = "supervisor-work-19990101-notes-120000_60";
+        let unit = held_unit("screen");
+        let id = unit.id().unwrap();
+        let retry = format!("supervisor-retry-talent-19990101-{id}");
+        for _ in 0..2 {
+            reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+            assert!(!queue.contains_reference(repair));
+            assert!(!queue.contains_reference(&retry));
+            assert!(!queue.contains_reference("supervisor-work-19990101-daily"));
+            let record = work_retry::read(root.path(), &id).unwrap().unwrap();
+            assert!(record.held);
+            assert_eq!(record.reason, "provider_request_rejected");
+            let report = solstone_core_system::work_inventory::read(root.path())
+                .unwrap()
+                .unwrap();
+            assert!(
+                report
+                    .holds
+                    .iter()
+                    .any(|hold| hold.retry_unit.as_deref() == Some(&id))
+            );
+            assert_eq!(
+                report
+                    .bands
+                    .iter()
+                    .map(|band| band.segments_owed)
+                    .sum::<u64>(),
+                0
+            );
+        }
+        let policy = WorkPolicy::read(root.path()).unwrap();
+        let mut report = WorkInventory::default();
+        let work = inspect_day(
+            root.path(),
+            "19990101",
+            &queue,
+            None,
+            &[],
+            policy,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(work.history.owed, 0);
+        assert_eq!(work.history.segments_set_aside, 1);
+        assert!(work.history.daily_units_set_aside > 0);
+
+        // Its input changes: one retry, still no repeat of the whole segment.
+        std::fs::write(
+            directory.join("talents/sense.json"),
+            "{\"density\":\"busy\"}",
+        )
+        .unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference(&retry));
+        assert!(!queue.contains_reference(repair));
+
+        // That retry spent its cause; it failed again, so it waits again.
+        let input = work_retry::input::current(root.path(), &unit).unwrap();
+        let attempt = work_retry::read(root.path(), &id)
+            .unwrap()
+            .unwrap()
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .unwrap();
+        work_retry::consume(root.path(), &unit, &attempt, &attempt.reason, &input, &[]).unwrap();
+        work_retry::finish(
+            root.path(),
+            &unit,
+            &attempt,
+            Some("provider_request_rejected"),
+        )
+        .unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(!queue.contains_reference(&retry));
+        assert!(!queue.contains_reference(repair));
+
+        // The owner asks again from Health: one more retry.
+        work_retry::request(root.path(), &unit).unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference(&retry));
+        assert!(!queue.contains_reference(repair));
+    }
+
+    /// Sense that never succeeds is held against the recording itself.
+    #[test]
+    fn a_sense_that_keeps_failing_is_held_against_the_recording() {
+        let root = fixture("local");
+        let directory = failing_talent(root.path(), "sense", 8, "context_window_exceeded", false);
+        std::fs::remove_dir_all(directory.join("talents")).unwrap();
+        let queue = queue(root.path());
+        let unit = held_unit("sense");
+        let id = unit.id().unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(work_retry::read(root.path(), &id).unwrap().unwrap().held);
+        assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+        std::fs::write(
+            directory.join("audio.jsonl"),
+            "{\"start\":\"00:00:01\",\"text\":\"A longer meeting about the garden.\"}\n",
+        )
+        .unwrap();
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference(&format!("supervisor-retry-talent-19990101-{id}")));
+    }
+
+    /// An outage or a lost connection says nothing about the recording: its
+    /// work keeps its turn.
+    #[test]
+    fn failures_while_the_lane_is_down_never_set_work_aside() {
+        for reason in [
+            "local_endpoint_unreachable",
+            "network_unreachable",
+            "wait failed: Dispatch(Closed)",
+        ] {
+            let root = fixture("local");
+            failing_talent(root.path(), "screen", 30, reason, true);
+            let queue = queue(root.path());
+            reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+            assert!(queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+            assert!(
+                work_retry::read(root.path(), &held_unit("screen").id().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    /// A few recent failures are ordinary work, not yet a pattern.
+    #[test]
+    fn failures_short_of_the_cap_keep_repairing() {
+        let root = fixture("local");
+        failing_talent(root.path(), "screen", 4, "provider_request_rejected", true);
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
     }
 }

@@ -45,7 +45,7 @@ pub use catchup_state::{
 pub use change_detection::{detect_segment_change, resolve_predecessor};
 pub use completion::{
     blocked_segment_details, blocked_segment_keys, classify_segment_completion,
-    lookup_segment_progress, segment_fully_sensed, segment_fully_thought,
+    lookup_segment_progress, segment_fully_sensed, segment_fully_thought, segment_pending_talents,
     segment_requires_processing, segment_thinking_is_current,
 };
 pub use data_state::derive_modality_state;
@@ -102,8 +102,9 @@ pub use sync_copy::{
     describe_sync_rescan, format_admission_waiting_copy, format_sync_scan_failure_copy,
 };
 pub use terminal::{
-    is_floor_talent_capped, read_capped_segment_talents, read_completed_since,
-    read_completed_units, read_daily_deterministic_failures, read_terminal_states,
+    RepeatedFailure, SegmentTalentFailures, is_floor_talent_capped, read_capped_segment_talents,
+    read_completed_since, read_completed_units, read_daily_deterministic_failures,
+    read_segment_talent_failures, read_terminal_states,
 };
 pub use types::{
     BacklogDay, BacklogError, BacklogUnit, BacklogView, BackoffSummary, CappedDailySummary,
