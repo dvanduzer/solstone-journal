@@ -673,9 +673,10 @@ final class PendingReply: @unchecked Sendable {
       }
       let handle = try FileHandle(forWritingTo: file)
       try handle.seekToEnd()
-      try handle.write(contentsOf: data + Data([10]))
+      let line = data + Data([10])
+      try handle.write(contentsOf: line)
       try handle.close()
-      print(String(data: data, encoding: .utf8)!)
+      try FileHandle.standardOutput.write(contentsOf: line)
       status = event
     } catch {
       status = "evidence error: \(error)"
