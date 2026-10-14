@@ -6,6 +6,7 @@ import argparse,hashlib,json,os,pathlib,shutil,subprocess,sys,time
 from provenance import source_manifest
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--clippy',action='store_true')
+parser.add_argument('--release',action='store_true')
 args=parser.parse_args()
 root=pathlib.Path(__file__).resolve().parent
 repo=root.parents[1]
@@ -32,12 +33,14 @@ def run(name,argv):
  steps.append(row);(out/'native-build.json').write_text(json.dumps({'source':subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),'environment':{k:v for k,v in env.items() if k.startswith(('CARGO_','CC_','CXX_','AR_','CFLAGS_','CXXFLAGS_','PARAKEET_','SOLSTONE_FFMPEG_','JOURNAL_ONNX_'))},'steps':steps},indent=2))
  print(json.dumps(row),flush=True)
  if p.returncode:print(log.read_text(errors='replace')[-12000:]);sys.exit(p.returncode)
-run('cargo-build',['cargo','build','--locked','--offline','--manifest-path',root/'native/Cargo.toml','--target','aarch64-linux-android'])
+profile_args=['--release'] if args.release else []
+run('cargo-build',['cargo','build','--locked','--offline','--manifest-path',root/'native/Cargo.toml','--target','aarch64-linux-android',*profile_args])
 lib=root/'lib/arm64-v8a';lib.mkdir(parents=True,exist_ok=True)
 onnx=pathlib.Path(env['JOURNAL_ONNX_LIBRARY'])
 shutil.copy2(onnx,lib/'libonnxruntime.so')
 (out/'audio-native-inputs.json').write_text(json.dumps({str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in [onnx,*cxx_inputs,pathlib.Path(env['SOLSTONE_FFMPEG_SOURCE_ARCHIVE']),*sorted(pathlib.Path(env['PARAKEET_LIB_DIR']).rglob('*.a'))]},indent=2)+'\n')
-shutil.copy2(root/'target/aarch64-linux-android/debug/libandroid_journal_runtime.so',lib/'libandroid_journal_runtime.so')
+profile='release' if args.release else 'debug'
+shutil.copy2(root/'target/aarch64-linux-android'/profile/'libandroid_journal_runtime.so',lib/'libandroid_journal_runtime.so')
 run('jni-build',[bins/'aarch64-linux-android31-clang','-shared','-fPIC','-Wl,-z,max-page-size=16384','-Wl,-z,common-page-size=16384',root/'bridge.c','-L'+str(lib),'-landroid_journal_runtime','-o',lib/'libjournalbridge.so'])
 
-if args.clippy:run('cargo-clippy',['cargo','clippy','--locked','--offline','--manifest-path',root/'native/Cargo.toml','--target','aarch64-linux-android','--all-targets','--','-D','warnings'])
+if args.clippy:run('cargo-clippy',['cargo','clippy','--locked','--offline','--manifest-path',root/'native/Cargo.toml','--target','aarch64-linux-android','--all-targets',*profile_args,'--','-D','warnings'])

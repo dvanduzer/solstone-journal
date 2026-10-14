@@ -14,6 +14,7 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Development owner controls. Journal requests arrive only at the SPL door. */
 public class ServingActivity extends Activity {
@@ -22,6 +23,9 @@ public class ServingActivity extends Activity {
     FileObserver commands;
     int sequence;
     boolean bound;
+    volatile long readyConnection;
+    final AtomicLong connectionGeneration = new AtomicLong();
+    volatile boolean destroyed;
     String root;
     final Handler ui = new Handler(Looper.getMainLooper());
     final ExecutorService control = Executors.newSingleThreadExecutor();
@@ -40,22 +44,35 @@ public class ServingActivity extends Activity {
     });
     final ServiceConnection connection = new ServiceConnection() {
         public void onServiceConnected(ComponentName name, IBinder binder) {
-            worker = new Messenger(binder);
+            if (destroyed) return;
+            final long generation = connectionGeneration.incrementAndGet();
+            final Messenger target = new Messenger(binder);
+            worker = target;
+            readyConnection = 0;
             control.execute(()->{
-                try { show(call(MainActivity.obj("op", "start", "address", wifiAddress()+":7657", "onnx_library", getApplicationInfo().nativeLibraryDir+"/libonnxruntime.so"))); }
+                if (!currentConnection(generation, target)) return;
+                try { show(call(target, MainActivity.obj("op", "start", "address", wifiAddress()+":7657", "onnx_library", getApplicationInfo().nativeLibraryDir+"/libonnxruntime.so"))); }
                 catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
-                try { show(call(MainActivity.obj("op", "audio-enable"))); }
+                if (!currentConnection(generation, target)) return;
+                try { show(call(target, MainActivity.obj("op", "audio-enable"))); }
                 catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
+                if (!currentConnection(generation, target)) return;
+                readyConnection = generation;
                 consumeCommand();
             });
         }
         public void onServiceDisconnected(ComponentName name) {
+            connectionGeneration.incrementAndGet();
+            readyConnection = 0;
             worker = null;
             for (CompletableFuture<JSONObject> future: pending.values()) future.completeExceptionally(new EOFException("worker lost"));
             pending.clear();
             show(MainActivity.obj("error", "worker disconnected"));
         }
     };
+    boolean currentConnection(long generation, Messenger target) {
+        return !destroyed && connectionGeneration.get() == generation && worker == target;
+    }
     String wifiAddress() throws Exception {
         ConnectivityManager cm = (ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
         for (Network network: cm.getAllNetworks()) {
@@ -70,7 +87,9 @@ public class ServingActivity extends Activity {
         throw new IOException("private Wi-Fi IPv4 unavailable");
     }
     JSONObject call(JSONObject command) throws Exception {
-        Messenger target = worker;
+        return call(worker, command);
+    }
+    JSONObject call(Messenger target, JSONObject command) throws Exception {
         if (target == null) throw new IOException("worker unavailable");
         int id = ++sequence;
         CompletableFuture<JSONObject> result = new CompletableFuture<>(); pending.put(id, result);
@@ -95,6 +114,11 @@ public class ServingActivity extends Activity {
     // Debug USB automation writes this file through run-as, which has the app UID.
     // Intent extras and external IPC never carry owner requests.
     void consumeCommand() {
+        // Keep an early USB command until Binder startup has completed.
+        final long generation = connectionGeneration.get();
+        final Messenger target = worker;
+        if (readyConnection == 0 || readyConnection != generation
+                || !currentConnection(generation, target) || target == null) return;
         File command = new File(getFilesDir(), "serving-command.json");
         if (!command.isFile()) return;
         String id = "unread";
@@ -102,8 +126,9 @@ public class ServingActivity extends Activity {
         try {
             JSONObject input = new JSONObject(new String(Files.readAllBytes(command.toPath()), StandardCharsets.UTF_8));
             id = input.getString("id");
+            if (readyConnection != generation || !currentConnection(generation, target)) return;
             if (!command.delete()) throw new IOException("command retirement failed");
-            row = call(input);
+            row = call(target, input);
         } catch(Exception e) { row = MainActivity.obj("error", e.toString()); }
         try {
             row.put("id", id); row.put("host_pid", android.os.Process.myPid());
@@ -139,6 +164,7 @@ public class ServingActivity extends Activity {
         } catch(IOException e) { show(MainActivity.obj("error", e.toString())); }
     }
     protected void onDestroy() {
+        destroyed = true; connectionGeneration.incrementAndGet(); readyConnection = 0;
         commands.stopWatching(); if(bound) unbindService(connection); control.shutdownNow(); super.onDestroy();
     }
 }

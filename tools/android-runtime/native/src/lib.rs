@@ -145,7 +145,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                 .map(|p| p.binary.display().to_string())
                 .map_err(|e| format!("{}:{}", e.failure.reason_code, e.detail));
             Ok(
-                json!({"executable":executable,"restic":format!("{restic:?}"),
+                json!({"executable":executable,"temporary_directory":std::env::temp_dir(),"restic":format!("{restic:?}"),
                 "nvattest":format!("{nvattest:?}"),
                 "confidential_offered":solstone_core_spp_ratls::confidential_verifier_on_this_platform()}),
             )
@@ -632,6 +632,59 @@ fn run(root: &Path, op: &str, count: usize) -> Result<Value, Box<dyn std::error:
     }
 }
 
+/// Startup-only app metadata and signed APK service assets. No owner command
+/// or environment setting reaches this function.
+///
+/// # Safety
+/// Directory pointers must be live NUL-terminated strings. Asset pointers must
+/// remain readable for their stated lengths. Release the result with `journal_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn journal_admit_service_tools(
+    native: *const c_char,
+    resources: *const c_char,
+    manifest: *const u8,
+    manifest_len: usize,
+    receipt: *const u8,
+    receipt_len: usize,
+) -> *mut c_char {
+    let output = std::panic::catch_unwind(|| -> Result<Value, String> {
+        const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
+        if native.is_null()
+            || resources.is_null()
+            || manifest.is_null()
+            || receipt.is_null()
+            || manifest_len == 0
+            || receipt_len == 0
+            || manifest_len > MAX_ASSET_BYTES
+            || receipt_len > MAX_ASSET_BYTES
+        {
+            return Err("app metadata and bounded service assets required".into());
+        }
+        let native = unsafe { CStr::from_ptr(native) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let resources = unsafe { CStr::from_ptr(resources) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let manifest = unsafe { std::slice::from_raw_parts(manifest, manifest_len) };
+        let receipt = unsafe { std::slice::from_raw_parts(receipt, receipt_len) };
+        solstone_core_spp_attest::android_service_tools::install_android_service_tools(
+            Path::new(native),
+            Path::new(resources),
+            manifest,
+            receipt,
+        )
+        .map_err(|e| format!("{}:{e}", e.code()))?;
+        Ok(json!({"installed":true}))
+    });
+    let value = match output {
+        Ok(Ok(value)) => json!({"ok":true,"value":value}),
+        Ok(Err(error)) => json!({"ok":false,"error":error}),
+        Err(_) => json!({"ok":false,"error":"native service-tool admission panicked"}),
+    };
+    CString::new(value.to_string()).unwrap().into_raw()
+}
+
 /// # Safety
 /// `root` and `op` must point to live NUL-terminated strings for this call.
 /// Release the returned owned string exactly once with `journal_free`.
@@ -661,7 +714,7 @@ pub unsafe extern "C" fn journal_run(
 }
 
 /// # Safety
-/// `value` must be null or an unreleased pointer returned by `journal_run`.
+/// `value` must be null or an unreleased pointer returned by a journal FFI call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn journal_free(value: *mut c_char) {
     if !value.is_null() {

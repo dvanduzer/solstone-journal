@@ -15,9 +15,17 @@ public class JournalService extends Service {
     final ExecutorService thinking=execution.thinking;
     final ThinkingAdmission thinkingAdmission = execution.admission;
     boolean destroyed;
+    String serviceToolAdmission;
     Messenger incoming;
     public void onCreate() {
         super.onCreate();
+        long admissionStarted = SystemClock.elapsedRealtime();
+        evidence("service_tools_admission_started", "");
+        try { serviceToolAdmission = ServiceToolAssets.install(this); }
+        catch (Exception error) {
+            serviceToolAdmission = "{\"ok\":false,\"packaged\":true,\"error\":" + JSONObject.quote(error.toString()) + "}";
+        }
+        evidence("service_tools_admission_finished", Long.toString(SystemClock.elapsedRealtime() - admissionStarted));
         incoming=new Messenger(new Handler(Looper.getMainLooper()) {
             public void handleMessage(Message m) {
                 final String op=m.getData().getString("op");
@@ -35,6 +43,7 @@ public class JournalService extends Service {
                     catch (JSONException e) { /* Native boundary returns the parse refusal. */ }
                 }
                 final boolean isThinking = operation.equals("generate") || operation.equals("talent");
+                final boolean isToolStatus = operation.equals("service-tools");
                 final boolean isStop = operation.equals("stop"), isStart = operation.equals("start");
                 final long generation = thinkingAdmission.generation();
                 if (isStop) thinkingAdmission.stop();
@@ -53,6 +62,11 @@ public class JournalService extends Service {
                                 result="{\"ok\":false,\"error\":\"server stopped\"}";
                             } else {
                                 result=Native.run(root,op,count);
+                            }
+                            if (isToolStatus) {
+                                JSONObject diagnostic = new JSONObject(result);
+                                diagnostic.put("startup", new JSONObject(serviceToolAdmission));
+                                result = diagnostic.toString();
                             }
                             if (isStart && new JSONObject(result).optBoolean("ok")) {
                                 thinkingAdmission.opened(generation);

@@ -19,6 +19,7 @@ solstone-core-generate = { path = "../../../core/crates/solstone-core-generate" 
 solstone-core-generate-wire = { path = "../../../core/crates/solstone-core-generate-wire" }
 solstone-core-talent-runtime = { path = "../../../core/crates/solstone-core-talent-runtime" }
 solstone-core-spp-ratls = { path = "../../../core/crates/solstone-core-spp-ratls" }
+solstone-core-spp-attest = { path = "../../../core/crates/solstone-core-spp-attest" }
 solstone-core-backup-runtime = { path = "../../../core/crates/solstone-core-backup-runtime" }
 chrono = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
