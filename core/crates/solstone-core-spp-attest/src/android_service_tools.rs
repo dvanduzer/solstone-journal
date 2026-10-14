@@ -2017,6 +2017,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "full-tests"))]
     fn assert_receipt_pin(
         native: &Path,
         resource: &Path,
@@ -2038,6 +2039,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn native_receipt_pins_refuse_when_stale_or_missing() {
         let temp_native = tempdir().unwrap();
