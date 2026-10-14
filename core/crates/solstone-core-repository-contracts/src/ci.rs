@@ -813,7 +813,7 @@ pub fn scan_routine_boundaries(repo: &Path) -> Result<BTreeSet<String>, String> 
             continue;
         }
         let classified_package = classified_packages.contains(package);
-        let contexts = module_contexts(&member_root, classified_package)?;
+        let (contexts, mut parsed) = module_contexts(&member_root, classified_package)?;
         let mut files = rust_files(&member_root.join("src"))?;
         for file in contexts.keys() {
             if !files.contains(file) {
@@ -830,7 +830,16 @@ pub fn scan_routine_boundaries(repo: &Path) -> Result<BTreeSet<String>, String> 
                 .map_err(|error| format!("strip {}: {error}", file.display()))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            let syntax = parse_rust_file(&file)?;
+            let syntax = match parsed.remove(&file) {
+                Some(syntax) => syntax,
+                None => {
+                    let text = read_rust_file(&file)?;
+                    if !may_reach_boundary(&text) {
+                        continue;
+                    }
+                    parse_rust_text(&file, &text)?
+                }
+            };
             if classified_package && has_exact_classified_full_tests_cfg(&syntax.attrs) {
                 continue;
             }
@@ -865,20 +874,103 @@ struct ModuleContext {
     exempt: bool,
 }
 
-fn parse_rust_file(file: &Path) -> Result<syn::File, String> {
-    let text = fs::read_to_string(file)
-        .map_err(|error| format!("read Rust source {}: {error}", file.display()))?;
-    syn::parse_file(&text).map_err(|error| format!("parse Rust source {}: {error}", file.display()))
+fn read_rust_file(file: &Path) -> Result<String, String> {
+    fs::read_to_string(file)
+        .map_err(|error| format!("read Rust source {}: {error}", file.display()))
 }
 
-fn module_contexts(
-    member_root: &Path,
-    classified_package: bool,
-) -> Result<BTreeMap<PathBuf, ModuleContext>, String> {
+fn parse_rust_text(file: &Path, text: &str) -> Result<syn::File, String> {
+    syn::parse_file(text).map_err(|error| format!("parse Rust source {}: {error}", file.display()))
+}
+
+/// Whether `text` may declare an out-of-line module (`mod name;`): the word
+/// `mod`, then a name, then `;`, with only whitespace and comments between.
+/// A file without one has no child module files, so it needn't be parsed to
+/// walk the module tree. Anything that could be a name is taken as one.
+pub(crate) fn may_declare_file_module(text: &str) -> bool {
+    let continues_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(found) = text[from..].find("mod") {
+        let start = from + found;
+        from = start + "mod".len();
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(continues_word)
+        {
+            continue;
+        }
+        let rest = &text[from..];
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '/') {
+            continue;
+        }
+        let rest = skip_trivia(rest);
+        let name = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, ';' | '{' | '/'))
+            .unwrap_or(rest.len());
+        if name > 0 && skip_trivia(&rest[name..]).starts_with(';') {
+            return true;
+        }
+    }
+    false
+}
+
+/// `text` past leading whitespace and comments.
+fn skip_trivia(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        if let Some(line) = text.strip_prefix("//") {
+            text = line.find('\n').map_or("", |end| &line[end..]);
+        } else if let Some(mut block) = text.strip_prefix("/*") {
+            let mut depth = 1;
+            while depth > 0 {
+                let open = block.find("/*");
+                let Some(close) = block.find("*/") else {
+                    return "";
+                };
+                match open {
+                    Some(open) if open < close => {
+                        depth += 1;
+                        block = &block[open + 2..];
+                    }
+                    _ => {
+                        depth -= 1;
+                        block = &block[close + 2..];
+                    }
+                }
+            }
+            text = block;
+        } else {
+            return text;
+        }
+    }
+}
+
+/// Whether `text` holds a name some boundary call below is recognised by. A
+/// file without one has no findings, so it needn't be parsed.
+fn may_reach_boundary(text: &str) -> bool {
+    text.contains("Command")
+        || NETWORK_CONSTRUCTORS
+            .iter()
+            .any(|[owner, _]| text.contains(owner))
+        || NATIVE_CALL_SEGMENTS
+            .iter()
+            .any(|segment| text.contains(segment))
+}
+
+/// Each file's context, and the syntax of the files that had to be parsed to
+/// find their child modules.
+type ModuleTree = (
+    BTreeMap<PathBuf, ModuleContext>,
+    BTreeMap<PathBuf, syn::File>,
+);
+
+fn module_contexts(member_root: &Path, classified_package: bool) -> Result<ModuleTree, String> {
     let src = member_root.join("src");
     let mut roots = vec![src.join("lib.rs"), src.join("main.rs")];
     roots.extend(rust_files(&src.join("bin"))?);
     let mut contexts = BTreeMap::new();
+    let mut parsed = BTreeMap::new();
     let mut pending = roots
         .into_iter()
         .filter(|root| root.is_file())
@@ -889,7 +981,11 @@ fn module_contexts(
             continue;
         }
         contexts.insert(file.clone(), context);
-        let syntax = parse_rust_file(&file)?;
+        let text = read_rust_file(&file)?;
+        if !may_declare_file_module(&text) {
+            continue;
+        }
+        let syntax = parse_rust_text(&file, &text)?;
         let directory = file.parent().unwrap_or(member_root).to_path_buf();
         let owner = directory_owner
             || file
@@ -926,8 +1022,9 @@ fn module_contexts(
                 pending.push((target, child, target_owner));
             }
         }
+        parsed.insert(file, syntax);
     }
-    Ok(contexts)
+    Ok((contexts, parsed))
 }
 
 fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
@@ -1168,11 +1265,30 @@ fn static_string(expression: &syn::Expr) -> Option<String> {
     }
 }
 
+const NATIVE_CALL_SEGMENTS: &[&str] = &[
+    "ffmpeg",
+    "ffmpeg_next",
+    "libloading",
+    "pdfium",
+    "onnx",
+    "vulkan",
+    "maturin",
+];
+
+const NETWORK_CONSTRUCTORS: &[[&str; 2]] = &[
+    ["TcpListener", "bind"],
+    ["TcpStream", "connect"],
+    ["TcpStream", "connect_timeout"],
+    ["UdpSocket", "connect"],
+    ["UdpSocket", "bind"],
+    ["UnixListener", "bind"],
+    ["UnixStream", "connect"],
+    ["UnixDatagram", "bind"],
+    ["Socket", "new"],
+];
+
 fn is_native_call_segment(segment: &str) -> bool {
-    matches!(
-        segment,
-        "ffmpeg" | "ffmpeg_next" | "libloading" | "pdfium" | "onnx" | "vulkan" | "maturin"
-    )
+    NATIVE_CALL_SEGMENTS.contains(&segment)
 }
 
 fn is_native_executable(program: &str) -> bool {
@@ -1183,19 +1299,9 @@ fn is_native_executable(program: &str) -> bool {
 }
 
 fn is_network_constructor(segments: &[String]) -> bool {
-    [
-        ["TcpListener", "bind"],
-        ["TcpStream", "connect"],
-        ["TcpStream", "connect_timeout"],
-        ["UdpSocket", "connect"],
-        ["UdpSocket", "bind"],
-        ["UnixListener", "bind"],
-        ["UnixStream", "connect"],
-        ["UnixDatagram", "bind"],
-        ["Socket", "new"],
-    ]
-    .iter()
-    .any(|suffix| path_ends_with(segments, suffix))
+    NETWORK_CONSTRUCTORS
+        .iter()
+        .any(|suffix| path_ends_with(segments, suffix))
 }
 
 fn is_process_constructor(
@@ -1779,6 +1885,27 @@ features = ["full-tests"]
             BTreeSet::new(),
             "a full-tests feature cfg is not a test cfg"
         );
+    }
+
+    #[test]
+    fn text_filters_keep_every_file_that_could_declare_a_module_or_reach_a_boundary() {
+        for declares in [
+            "mod a;",
+            "pub(crate) mod a ;",
+            "#[cfg(test)]\n#[path = \"x.rs\"]\nmod r#loop;",
+            "mod /* { } */ b // c {\n;",
+            "mod\tc/* /* nested */ */;",
+            "mod inner { mod deep; }",
+        ] {
+            assert!(may_declare_file_module(declares), "{declares}");
+        }
+        for not_declares in ["mod tests { }", "model;", "a_mod b;", "fn mod_x();", ""] {
+            assert!(!may_declare_file_module(not_declares), "{not_declares}");
+        }
+        for reaches in ["Command", "UdpSocket", "libloading", "onnx"] {
+            assert!(may_reach_boundary(reaches), "{reaches}");
+        }
+        assert!(!may_reach_boundary("fn pure() { let _ = 2 + 2; }"));
     }
 
     #[test]
