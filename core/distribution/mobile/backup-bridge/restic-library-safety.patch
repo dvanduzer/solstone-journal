@@ -1,0 +1,65 @@
+--- a/internal/data/snapshot.go
++++ b/internal/data/snapshot.go
+@@ -87,6 +87,10 @@
+ 		return nil, fmt.Errorf("failed to load snapshot %v: %w", id.Str(), err)
+ 	}
+ 
++	if sn.Tree == nil || sn.Tree.IsNull() {
++		return nil, fmt.Errorf("snapshot %v has no root tree", id.Str())
++	}
++
+ 	return sn, nil
+ }
+ 
+--- a/internal/checker/checker.go
++++ b/internal/checker/checker.go
+@@ -200,7 +200,7 @@
+ 	for item := range tree {
+ 		if item.Error != nil {
+ 			errs = append(errs, &Error{TreeID: id, Err: errors.Errorf("failed to decode tree %v: %w", id, item.Error)})
+-			break
++			continue
+ 		}
+ 		node := item.Node
+ 		switch node.Type {
+
+--- a/internal/repository/index/index.go
++++ b/internal/repository/index/index.go
+@@ -519,6 +519,11 @@
+ 		packID := idx.addToPacks(p.ID)
+ 
+ 		for _, blob := range p.Blobs {
++			const maxMobilePackBytes = 64 * 1024 * 1024
++			if blob.Offset > maxMobilePackBytes || blob.Length > maxMobilePackBytes ||
++				blob.UncompressedLength > maxMobilePackBytes || blob.Offset > maxMobilePackBytes-blob.Length {
++				return nil, errors.New("index offset or length exceeds mobile pack bounds")
++			}
+ 			idx.store(packID, restic.Blob{
+ 				BlobHandle: restic.BlobHandle{
+ 					Type: blob.Type,
+--- a/internal/repository/repository.go
++++ b/internal/repository/repository.go
+@@ -196,6 +196,9 @@
+ 		return nil, err
+ 	}
+ 
++	if len(buf) < crypto.Extension {
++		return nil, errors.New("truncated encrypted repository metadata")
++	}
+ 	nonce, ciphertext := buf[:r.key.NonceSize()], buf[r.key.NonceSize():]
+ 	plaintext, err := r.key.Open(ciphertext[:0], nonce, ciphertext, nil)
+ 	if err != nil {
+@@ -357,9 +360,8 @@
+ 		opts := []zstd.DOption{
+-			// Use all available cores.
+-			zstd.WithDecoderConcurrency(0),
+-			// Limit the maximum decompressed memory. Set to a very high,
+-			// conservative value.
+-			zstd.WithDecoderMaxMemory(16 * 1024 * 1024 * 1024),
++			// Keep mobile metadata decode memory independent of host core count.
++			zstd.WithDecoderConcurrency(1),
++			// Bound decompressed frames for the mobile callable library.
++			zstd.WithDecoderMaxMemory(8 * 1024 * 1024),
+ 		}
+ 
+ 		dec, err := zstd.NewReader(nil, opts...)
