@@ -7,11 +7,13 @@ pub mod appraise;
 pub mod binary;
 pub mod claims;
 mod rims;
+mod staging;
 #[cfg(any(windows, test))]
 mod windows;
 
 pub use appraise::{
-    GpuAppraiser, GpuStatusInput, NVATTEST_TIMEOUT, NvattestGpuAppraiser, appraise_gpu_leg,
+    GpuAppraiser, GpuStatusInput, NVATTEST_TIMEOUT, NvattestGpuAppraiser,
+    ProductionAppraisalStaging, appraise_gpu_leg, write_production_appraisal_staging,
 };
 pub use binary::{
     NvattestCommand, NvattestInstallation, android_verifier_child_environment,

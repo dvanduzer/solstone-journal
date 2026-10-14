@@ -18,15 +18,19 @@ use solstone_core_backup_runtime::resolve::{
 };
 use solstone_core_backup_runtime::runner::ToolRunner;
 use solstone_core_spp_attest::android_service_tools::{
-    ANDROID_CA_BUNDLE_FILENAME, ANDROID_NATIVE_RECEIPT_INPUTS, ANDROID_NVAT_FILENAME,
-    ANDROID_NVATTEST_FILENAME, ANDROID_RCLONE_FILENAME, ANDROID_RESTIC_FILENAME,
-    AndroidServiceToolRole, AndroidServiceToolsRefusal, admitted_android_verifier,
+    ANDROID_APPRAISAL_STAGING_DIR, ANDROID_CA_BUNDLE_FILENAME, ANDROID_NATIVE_RECEIPT_INPUTS,
+    ANDROID_NVAT_FILENAME, ANDROID_NVATTEST_FILENAME, ANDROID_RCLONE_FILENAME,
+    ANDROID_RESTIC_FILENAME, AndroidServiceToolRole, AndroidServiceToolsRefusal,
+    admitted_android_verifier, create_android_appraisal_staging,
     has_admitted_android_service_tools, install_android_service_tools, read_test_ca_bundle_pem,
     render_android_service_tools_manifest, resolve_admitted_android_service_tool,
     revalidate_installed_android_service_tools,
 };
 use solstone_core_spp_attest::error::GpuAppraisalReason;
-use solstone_core_spp_attest::nvgpu::ManifestSet;
+use solstone_core_spp_attest::nvgpu::{
+    GpuProfile, ManifestSet, StatusMode, write_production_appraisal_staging,
+};
+use solstone_core_spp_attest::tlv::{GpuEnvelope, GpuField};
 use solstone_core_spp_attest::{
     NvattestCommand, NvattestInstallation, authorize_nvattest_spawn,
     build_nvattest_attest_command_with_installation,
@@ -167,6 +171,175 @@ fn receipt_for_tree(native_dir: &Path, resource_dir: &Path) -> Vec<u8> {
         ],
     }))
     .unwrap()
+}
+
+fn appraisal_envelope() -> GpuEnvelope {
+    GpuEnvelope {
+        fields: vec![
+            GpuField {
+                field_id: 2,
+                value: b"evidence-bytes".to_vec(),
+            },
+            GpuField {
+                field_id: 3,
+                value: b"certificate-bytes".to_vec(),
+            },
+            GpuField {
+                field_id: 7,
+                value: b"gh100".to_vec(),
+            },
+        ],
+        nonce: [0x11; 32],
+        spdm_nonce: [0x22; 32],
+        raw: Vec::new(),
+    }
+}
+
+fn appraisal_profile() -> GpuProfile {
+    GpuProfile::new(
+        "84edaf3d0205a8280068ab485bf45edfc81f371ab7a7dcccaef8538728ccd8a3",
+        ManifestSet::QUALIFIED_595_71_05,
+        StatusMode::OfflineSignedAge,
+    )
+}
+
+fn write_staging(
+    proof: &[u8],
+) -> Result<solstone_core_spp_attest::nvgpu::ProductionAppraisalStaging, GpuAppraisalReason> {
+    write_production_appraisal_staging(
+        &appraisal_envelope(),
+        &[0x11; 32],
+        &appraisal_profile(),
+        proof,
+    )
+}
+
+#[cfg(unix)]
+fn permission_bits(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn assert_desktop_staging_skips_resource(resource_root: &Path) {
+    let marker = resource_root.join(ANDROID_APPRAISAL_STAGING_DIR);
+    assert!(!marker.exists());
+    let proof = b"desktop-proof";
+    let staged = write_staging(proof).unwrap();
+    let temp = std::env::temp_dir();
+    assert_eq!(
+        staged.rim_dir().parent().unwrap().as_os_str(),
+        temp.as_os_str()
+    );
+    assert_eq!(
+        staged.evidence().parent().unwrap().as_os_str(),
+        temp.as_os_str()
+    );
+    assert_eq!(
+        staged.proof().parent().unwrap().as_os_str(),
+        temp.as_os_str()
+    );
+    assert_eq!(fs::read(staged.proof()).unwrap(), proof);
+    assert!(!marker.exists());
+}
+
+fn exercise_private_appraisal_staging(resource_root: &Path) {
+    let staging = create_android_appraisal_staging().unwrap();
+    assert_eq!(
+        staging.as_os_str(),
+        resource_root
+            .join(ANDROID_APPRAISAL_STAGING_DIR)
+            .as_os_str()
+    );
+    assert_eq!(
+        staging.parent().unwrap().as_os_str(),
+        resource_root.as_os_str()
+    );
+    #[cfg(unix)]
+    assert_eq!(permission_bits(&staging), 0o700);
+
+    let proof = b"offline-proof";
+    let staged = write_staging(proof).unwrap();
+    assert_eq!(
+        staged.rim_dir().parent().unwrap().as_os_str(),
+        staging.as_os_str()
+    );
+    assert_eq!(
+        staged.evidence().parent().unwrap().as_os_str(),
+        staging.as_os_str()
+    );
+    assert_eq!(
+        staged.proof().parent().unwrap().as_os_str(),
+        staging.as_os_str()
+    );
+    assert!(
+        staged
+            .rim_dir()
+            .join(ManifestSet::QUALIFIED_595_71_05.entries()[0].filename())
+            .is_file()
+    );
+    assert_eq!(fs::read(staged.proof()).unwrap(), proof);
+    let evidence = fs::read(staged.evidence()).unwrap();
+    assert!(evidence.windows(64).any(|window| window == [b'1'; 64]));
+    #[cfg(unix)]
+    {
+        assert_eq!(permission_bits(staged.rim_dir()), 0o700);
+        assert_eq!(permission_bits(staged.evidence()), 0o600);
+        assert_eq!(permission_bits(staged.proof()), 0o600);
+    }
+    let rim = staged.rim_dir().to_path_buf();
+    let evidence_path = staged.evidence().to_path_buf();
+    let proof_path = staged.proof().to_path_buf();
+    drop(staged);
+    assert!(!rim.exists());
+    assert!(!evidence_path.exists());
+    assert!(!proof_path.exists());
+    assert!(staging.is_dir());
+    assert!(fs::read_dir(&staging).unwrap().next().is_none());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::symlink_metadata(&staging).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&staging, perms).unwrap();
+        assert_eq!(
+            create_android_appraisal_staging().unwrap_err().code(),
+            "unsafe-path"
+        );
+        assert_staging_integrity_failed(proof);
+        assert!(fs::read_dir(&staging).unwrap().next().is_none());
+
+        fs::remove_dir(&staging).unwrap();
+        let foreign = tempdir().unwrap();
+        std::os::unix::fs::symlink(foreign.path(), &staging).unwrap();
+        assert_eq!(
+            create_android_appraisal_staging().unwrap_err().code(),
+            "unsafe-path"
+        );
+        assert_staging_integrity_failed(proof);
+        assert!(fs::read_dir(foreign.path()).unwrap().next().is_none());
+        fs::remove_file(&staging).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        fs::remove_dir_all(&staging).unwrap();
+    }
+    assert!(!resource_root.join(ANDROID_APPRAISAL_STAGING_DIR).exists());
+}
+
+fn assert_staging_integrity_failed(proof: &[u8]) {
+    match write_staging(proof) {
+        Err(GpuAppraisalReason::NvattestIntegrityFailed) => {}
+        Err(other) => panic!("staging refusal {other:?}"),
+        Ok(staged) => {
+            panic!("staging wrote {}", staged.rim_dir().display())
+        }
+    }
+}
+
+fn refuse_changed_appraisal_staging(code: &str) {
+    assert_eq!(create_android_appraisal_staging().unwrap_err().code(), code);
+    assert_staging_integrity_failed(b"must-not-land");
 }
 
 fn refuse_verifier(installation: &NvattestInstallation, evidence: &Path) {
@@ -331,6 +504,10 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
 
     // 1. Pre-installation state:
     assert!(!has_admitted_android_service_tools());
+    assert_eq!(
+        create_android_appraisal_staging().unwrap_err().code(),
+        "member-missing"
+    );
     assert!(resolve_admitted_android_service_tool(AndroidServiceToolRole::Restic).is_err());
     assert!(resolve_admitted_android_service_tool(AndroidServiceToolRole::Rclone).is_err());
     assert!(revalidate_installed_android_service_tools().is_err());
@@ -366,6 +543,7 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     let native_temp = tempdir().unwrap();
     let resource_temp = tempdir().unwrap();
     setup_fixture_roots(native_temp.path(), resource_temp.path());
+    assert_desktop_staging_skips_resource(resource_temp.path());
 
     let restic_full = native_temp.path().join(ANDROID_RESTIC_FILENAME);
     let rclone_full = native_temp.path().join(ANDROID_RCLONE_FILENAME);
@@ -520,6 +698,7 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     assert_eq!(resolved_op.rclone_path, Some(rclone_full));
 
     let verifier_command = exercise_verifier_construction(other_temp.path(), resource_temp.path());
+    exercise_private_appraisal_staging(resource_temp.path());
 
     // 6. Tamper check: modifying restic binary on disk triggers member-changed refusal
     fs::write(&restic_full, b"tampered-bytes-after-admission").unwrap();
@@ -544,6 +723,13 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     let lookup_err =
         resolve_admitted_android_service_tool(AndroidServiceToolRole::Restic).unwrap_err();
     assert_eq!(lookup_err.code(), "member-changed");
+    refuse_changed_appraisal_staging("member-changed");
+    assert!(
+        !resource_temp
+            .path()
+            .join(ANDROID_APPRAISAL_STAGING_DIR)
+            .exists()
+    );
 
     // A new directory at the admitted path is a different root, even when the
     // path strings on an already built command still match.
@@ -556,6 +742,13 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
     fs::create_dir(&native_path).unwrap();
     let root_err = revalidate_installed_android_service_tools().unwrap_err();
     assert_eq!(root_err.code(), "root-substituted");
+    refuse_changed_appraisal_staging("root-substituted");
+    assert!(
+        !resource_temp
+            .path()
+            .join(ANDROID_APPRAISAL_STAGING_DIR)
+            .exists()
+    );
     let substituted = NvattestInstallation {
         binary: native_path.join(ANDROID_NVATTEST_FILENAME),
         lib_dir: native_path.clone(),

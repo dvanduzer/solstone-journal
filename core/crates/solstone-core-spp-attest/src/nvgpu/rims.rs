@@ -185,11 +185,15 @@ impl TempRimDir {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| GpuAppraisalReason::NvattestIntegrityFailed)?
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "solstone-nvattest-rims-{}-{timestamp}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
+        let staging = super::staging::appraisal_staging()?;
+        let path = super::staging::staging_child(
+            &staging.directory,
+            &format!(
+                "solstone-nvattest-rims-{}-{timestamp}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ),
+        )?;
         let builder = fs::DirBuilder::new();
         #[cfg(unix)]
         let builder = {

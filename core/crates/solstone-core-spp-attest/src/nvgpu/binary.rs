@@ -233,7 +233,7 @@ pub fn build_nvattest_offline_attest_command_with_installation(
     })
 }
 
-fn android_authority_required() -> bool {
+pub(crate) fn android_authority_required() -> bool {
     if cfg!(target_os = "android") {
         true
     } else {
@@ -241,7 +241,7 @@ fn android_authority_required() -> bool {
     }
 }
 
-fn map_android_authority(
+pub(crate) fn map_android_authority(
     err: crate::android_service_tools::AndroidServiceToolsRefusal,
 ) -> GpuAppraisalReason {
     use crate::android_service_tools::AndroidServiceToolsRefusal::{MemberMissing, RoleMissing};

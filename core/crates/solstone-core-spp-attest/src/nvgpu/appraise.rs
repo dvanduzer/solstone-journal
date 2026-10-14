@@ -379,15 +379,19 @@ struct TempFile {
 
 impl TempFile {
     fn write(label: &str, extension: &str, bytes: &[u8]) -> Result<Self, GpuAppraisalReason> {
+        let staging = super::staging::appraisal_staging()?;
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| GpuAppraisalReason::GpuAppraisalFailed)?
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "solstone-nvattest-{label}-{}-{timestamp}-{sequence}.{extension}",
-            std::process::id()
-        ));
+        let path = super::staging::staging_child(
+            &staging.directory,
+            &format!(
+                "solstone-nvattest-{label}-{}-{timestamp}-{sequence}.{extension}",
+                std::process::id()
+            ),
+        )?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -423,19 +427,31 @@ struct TempEvidenceFile {
 impl TempEvidenceFile {
     fn write(envelope: &GpuEnvelope, owner_nonce: &[u8; 32]) -> Result<Self, GpuAppraisalReason> {
         let evidence = evidence_json(envelope, owner_nonce)?;
-        let mut path = std::env::temp_dir();
+        let staging = super::staging::appraisal_staging()?;
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| GpuAppraisalReason::GpuAppraisalFailed)?
             .as_nanos();
-        path.push(format!(
-            "solstone-nvattest-{}-{timestamp}-{sequence}.json",
-            std::process::id()
-        ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let path = super::staging::staging_child(
+            &staging.directory,
+            &format!(
+                "solstone-nvattest-{}-{timestamp}-{sequence}.json",
+                std::process::id()
+            ),
+        )?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if staging.private_files {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = staging.private_files;
+        }
+        let mut file = options
             .open(&path)
             .map_err(|_| GpuAppraisalReason::GpuAppraisalFailed)?;
         let evidence_file = Self { path };
@@ -454,6 +470,55 @@ impl Drop for TempEvidenceFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Production RIM directory, evidence file, and offline proof file.
+///
+/// Dropping this value removes those three paths. It does not remove the
+/// staging directory they were created in, and it does not spawn nvattest.
+pub struct ProductionAppraisalStaging {
+    rims: super::rims::TempRimDir,
+    evidence: TempEvidenceFile,
+    proof: TempFile,
+}
+
+impl ProductionAppraisalStaging {
+    #[must_use]
+    pub fn rim_dir(&self) -> &Path {
+        self.rims.path()
+    }
+
+    #[must_use]
+    pub fn evidence(&self) -> &Path {
+        self.evidence.path()
+    }
+
+    #[must_use]
+    pub fn proof(&self) -> &Path {
+        self.proof.path()
+    }
+}
+
+/// Writes the three production appraisal inputs and removes them on drop.
+///
+/// The writers are the ones installation appraisal uses for the RIM directory,
+/// the evidence file, and the offline proof file. Android, and any process
+/// that has admitted Android service tools, stages them under the admitted
+/// resource root. This does not spawn nvattest.
+pub fn write_production_appraisal_staging(
+    envelope: &GpuEnvelope,
+    owner_nonce: &[u8; 32],
+    profile: &GpuProfile,
+    proofs: &[u8],
+) -> Result<ProductionAppraisalStaging, GpuAppraisalReason> {
+    let rims = super::rims::TempRimDir::write(profile)?;
+    let evidence = TempEvidenceFile::write(envelope, owner_nonce)?;
+    let proof = TempFile::write("proofs", "der", proofs)?;
+    Ok(ProductionAppraisalStaging {
+        rims,
+        evidence,
+        proof,
+    })
 }
 
 fn evidence_json(
@@ -508,8 +573,15 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     use std::{os::unix::fs::PermissionsExt, time::Duration};
 
-    use super::{GpuAppraisalReason, GpuAppraiser, GpuStatusInput, NvattestGpuAppraiser};
-    use crate::{test_support::fixture_bytes, tlv::decode_gpu_envelope};
+    use super::{
+        GpuAppraisalReason, GpuAppraiser, GpuStatusInput, NvattestGpuAppraiser,
+        write_production_appraisal_staging,
+    };
+    use crate::nvgpu::{GpuProfile, ManifestSet, StatusMode};
+    use crate::{
+        test_support::fixture_bytes,
+        tlv::{GpuEnvelope, GpuField, decode_gpu_envelope},
+    };
 
     static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -540,6 +612,65 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn staging_envelope() -> GpuEnvelope {
+        GpuEnvelope {
+            fields: vec![
+                GpuField {
+                    field_id: 2,
+                    value: b"evidence-bytes".to_vec(),
+                },
+                GpuField {
+                    field_id: 3,
+                    value: b"certificate-bytes".to_vec(),
+                },
+                GpuField {
+                    field_id: 7,
+                    value: b"gh100".to_vec(),
+                },
+            ],
+            nonce: [0x11; 32],
+            spdm_nonce: [0x22; 32],
+            raw: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn production_staging_without_android_authority_uses_process_temp() {
+        let proof = b"desktop-proof";
+        let staged = write_production_appraisal_staging(
+            &staging_envelope(),
+            &[0x11; 32],
+            &GpuProfile::new(
+                "84edaf3d0205a8280068ab485bf45edfc81f371ab7a7dcccaef8538728ccd8a3",
+                ManifestSet::QUALIFIED_595_71_05,
+                StatusMode::OfflineSignedAge,
+            ),
+            proof,
+        )
+        .expect("desktop staging");
+        let temp = std::env::temp_dir();
+        assert_eq!(
+            staged.rim_dir().parent().unwrap().as_os_str(),
+            temp.as_os_str()
+        );
+        assert_eq!(
+            staged.evidence().parent().unwrap().as_os_str(),
+            temp.as_os_str()
+        );
+        assert_eq!(
+            staged.proof().parent().unwrap().as_os_str(),
+            temp.as_os_str()
+        );
+        assert_eq!(fs::read(staged.proof()).unwrap(), proof);
+        let rim = staged.rim_dir().to_path_buf();
+        let evidence = staged.evidence().to_path_buf();
+        let proof_path = staged.proof().to_path_buf();
+        drop(staged);
+        assert!(!rim.exists());
+        assert!(!evidence.exists());
+        assert!(!proof_path.exists());
     }
 
     fn owner_nonce() -> [u8; 32] {

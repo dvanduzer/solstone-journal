@@ -9,7 +9,9 @@
 //! and admitted through `solstone.android-service-tools.v1`.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -28,6 +30,33 @@ pub const ANDROID_RCLONE_FILENAME: &str = "librclone.so";
 pub const ANDROID_NVATTEST_FILENAME: &str = "libnvattest.so";
 pub const ANDROID_NVAT_FILENAME: &str = "libnvat.so";
 pub const ANDROID_CA_BUNDLE_FILENAME: &str = "ca-bundle.pem";
+
+/// Single path component of the private appraisal directory under the admitted
+/// resource root. [`create_android_appraisal_staging`] joins and checks it.
+pub const ANDROID_APPRAISAL_STAGING_DIR: &str = "appraisal-staging";
+
+const fn staging_component_is_single(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || is_dot_component(bytes) {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'/' || byte == b'\\' || byte == 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const fn is_dot_component(bytes: &[u8]) -> bool {
+    (bytes.len() == 1 && bytes[0] == b'.')
+        || (bytes.len() == 2 && bytes[0] == b'.' && bytes[1] == b'.')
+}
+
+const _: () = assert!(staging_component_is_single(ANDROID_APPRAISAL_STAGING_DIR));
 
 const ANDROID_SERVICE_TOOL_FILE_COUNT: usize = 8;
 
@@ -1337,6 +1366,11 @@ static INSTALLED_TOOLS: OnceLock<AndroidServiceToolsAdmitted> = OnceLock::new();
 /// The nvattest child environment is cleared and then contains only
 /// `LD_LIBRARY_PATH` set to this revalidated absolute `nativeLibraryDir`.
 ///
+/// Appraisal inputs are staged in a private directory under this admitted
+/// resource root. [`create_android_appraisal_staging`] revalidates the
+/// installed authority and returns that directory. It is not taken from
+/// Android `Intent` extras or from `JournalService` Binder fields.
+///
 /// Call this function once during application startup, before backup or
 /// confidential work. An identical later call is a no-op and returns `Ok(())`.
 /// A different later call returns [`AndroidServiceToolsRefusal::AlreadyInstalled`]
@@ -1472,6 +1506,91 @@ pub fn admitted_android_verifier() -> Result<AndroidVerifierPaths, AndroidServic
     })
 }
 
+/// Private appraisal staging directory under the admitted resource root.
+///
+/// The directory is `<resource root>/appraisal-staging`. First-party startup
+/// supplies that resource root to [`install_android_service_tools`]. This
+/// function revalidates the installed authority before creating or returning
+/// the directory. On Unix the directory is mode `0700`. A symlink, a
+/// non-directory, or a directory with group or other permissions is refused.
+///
+/// The path is not taken from Android `Intent` extras or from `JournalService`
+/// Binder fields `op`, `root`, and `count`.
+pub fn create_android_appraisal_staging() -> Result<PathBuf, AndroidServiceToolsRefusal> {
+    let Some(tools) = INSTALLED_TOOLS.get() else {
+        return Err(AndroidServiceToolsRefusal::MemberMissing {
+            path: "android service tools not installed in process".to_owned(),
+            role: None,
+        });
+    };
+    tools.revalidate()?;
+    let staging = tools.resource_root.join(ANDROID_APPRAISAL_STAGING_DIR);
+    if staging.file_name() != Some(OsStr::new(ANDROID_APPRAISAL_STAGING_DIR))
+        || staging.parent().map(Path::as_os_str) != Some(tools.resource_root.as_os_str())
+    {
+        return Err(AndroidServiceToolsRefusal::UnsafePath {
+            path: staging.display().to_string(),
+        });
+    }
+    ensure_private_staging_dir(&staging)?;
+    Ok(staging)
+}
+
+fn ensure_private_staging_dir(path: &Path) -> Result<(), AndroidServiceToolsRefusal> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => validate_private_staging(&meta, path),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(_) => {
+                    return Err(AndroidServiceToolsRefusal::UnsafePath {
+                        path: path.display().to_string(),
+                    });
+                }
+            }
+            let meta =
+                fs::symlink_metadata(path).map_err(|_| AndroidServiceToolsRefusal::UnsafePath {
+                    path: path.display().to_string(),
+                })?;
+            validate_private_staging(&meta, path)
+        }
+        Err(_) => Err(AndroidServiceToolsRefusal::UnsafePath {
+            path: path.display().to_string(),
+        }),
+    }
+}
+
+fn validate_private_staging(
+    meta: &fs::Metadata,
+    path: &Path,
+) -> Result<(), AndroidServiceToolsRefusal> {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(AndroidServiceToolsRefusal::UnsafePath {
+            path: path.display().to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(AndroidServiceToolsRefusal::UnsafePath {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1593,6 +1712,13 @@ mod tests {
         let manifest =
             render_android_service_tools_manifest(native_dir, resource_dir, &receipt).unwrap();
         (manifest, receipt)
+    }
+
+    #[test]
+    fn appraisal_staging_requires_installed_authority() {
+        let err = create_android_appraisal_staging().unwrap_err();
+        assert_eq!(err.code(), "member-missing");
+        assert!(err.role().is_none());
     }
 
     #[test]
