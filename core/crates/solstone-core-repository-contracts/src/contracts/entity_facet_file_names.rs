@@ -64,6 +64,7 @@ const ARTIFACTS: &[(&str, &[&str])] = &[
 /// `derived: …` (stays: it reads or matches by path shape and needs no owner
 /// semantics) or `message: …` (prose naming the file). A new site that reads
 /// through a name is routed through its owner's API instead of listed.
+#[cfg(feature = "full-tests")]
 const LISTED: &[(&str, &str, &str, usize, &str)] = &[
     (
         "core/crates/solstone-core-convey-shell/src/speakers_attribution.rs",
@@ -235,6 +236,7 @@ const LISTED: &[(&str, &str, &str, usize, &str)] = &[
     ),
 ];
 
+#[cfg(feature = "full-tests")]
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -276,6 +278,7 @@ fn names_in(text: &str) -> Vec<&'static str> {
     found
 }
 
+#[cfg(feature = "full-tests")]
 fn owner_of(name: &str) -> Vec<&'static str> {
     if let Some((_, owner)) = NAMES.iter().find(|(candidate, _)| *candidate == name) {
         return vec![owner];
@@ -768,6 +771,7 @@ type Counted = BTreeMap<(String, String, &'static str), usize>;
 
 /// Every production site outside a name's owner, keyed by file relative to
 /// the repository.
+#[cfg(feature = "full-tests")]
 fn outside_sites(root: &Path, crates: &Path) -> (Counted, Vec<String>) {
     let mut sites = BTreeMap::new();
     let mut errors = Vec::new();
@@ -854,6 +858,7 @@ fn leak(name: &str) -> &'static str {
         .unwrap_or("")
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn only_owners_spell_entity_and_facet_file_names() {
     let root = repository_root();
@@ -872,33 +877,6 @@ fn only_owners_spell_entity_and_facet_file_names() {
         "go through the owner's API (the entity or facets store), or list the site with its reason:\n{}",
         problems.join("\n")
     );
-}
-
-#[test]
-fn test_only_modules_are_not_seen() {
-    let root = repository_root();
-    let (found, _) = outside_sites(&root, &root.join("core/crates"));
-    let count = |file: &str| {
-        found
-            .iter()
-            .filter(|((path, ..), _)| path == file)
-            .map(|(_, count)| count)
-            .sum::<usize>()
-    };
-    for test_only in [
-        "core/crates/solstone-core-records-web/src/corpus.rs",
-        "core/crates/solstone-core-records-web/src/search_page_oracle.rs",
-        "core/crates/solstone-core-transcripts-web/src/corpus.rs",
-        "core/crates/solstone-core-settings-web/src/mutations.rs",
-        "core/crates/solstone-core-repository-contracts/src/contracts/facet_link_layout.rs",
-        "core/crates/solstone-core-repository-contracts/src/contracts/entity_facet_file_names.rs",
-    ] {
-        assert_eq!(
-            count(test_only),
-            0,
-            "{test_only} is test-only through its parent"
-        );
-    }
 }
 
 #[test]

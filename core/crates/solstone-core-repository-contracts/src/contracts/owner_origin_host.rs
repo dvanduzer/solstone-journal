@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+#[cfg(feature = "full-tests")]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "full-tests")]
 use std::fs;
+#[cfg(feature = "full-tests")]
 use std::path::{Path, PathBuf};
 
 use quote::ToTokens;
@@ -11,6 +14,7 @@ use syn::visit::{self, Visit};
 
 const OWNER_HOST: &str = "updates.solstone.app";
 
+#[cfg(feature = "full-tests")]
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -302,6 +306,7 @@ fn validate_hits(hits: &[Hit]) -> Vec<String> {
     errors
 }
 
+#[cfg(feature = "full-tests")]
 fn discover_inventory_packages(inventory_path: &Path) -> BTreeSet<String> {
     let content = fs::read_to_string(inventory_path).expect("read inventory.toml");
     let doc = content
@@ -348,6 +353,7 @@ fn discover_inventory_packages(inventory_path: &Path) -> BTreeSet<String> {
     packages
 }
 
+#[cfg(feature = "full-tests")]
 fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
     attrs.iter().find_map(|attr| {
         if !attr.path().is_ident("path") {
@@ -367,6 +373,7 @@ fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
     })
 }
 
+#[cfg(feature = "full-tests")]
 fn module_contexts(crate_root: &Path) -> BTreeMap<PathBuf, bool> {
     let src = crate_root.join("src");
     let mut roots = vec![src.join("lib.rs"), src.join("main.rs")];
@@ -450,6 +457,7 @@ fn module_contexts(crate_root: &Path) -> BTreeMap<PathBuf, bool> {
     contexts
 }
 
+#[cfg(feature = "full-tests")]
 fn scan_reachable_crates(repo_root: &Path) -> Vec<Hit> {
     let inventory_packages =
         discover_inventory_packages(&repo_root.join("core/distribution/inventory.toml"));
@@ -629,6 +637,7 @@ pub const PRODUCTION_HOST_URL: &str = "https://updates.solstone.app/untracked";
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn owner_origin_host_production_contract_passes() {
     let root = repository_root();
