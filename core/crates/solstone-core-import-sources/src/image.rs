@@ -1197,7 +1197,7 @@ mod tests {
             // Stored sideways with orientation 6: sent upright, same pixel count.
             (40, 24, 6, (24, 40)),
             // No rotation, larger than the shared vision bound: sent resized.
-            (3000, 1500, 1, (1920, 960)),
+            (3000, 16, 1, (1920, 10)),
         ] {
             let source = jpeg_with_exif(width, height, orientation);
             let mut decoder = ImageReader::with_format(Cursor::new(&source), ImageFormat::Jpeg)
