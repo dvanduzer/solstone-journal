@@ -671,6 +671,9 @@ fn walk_crate(
                 continue;
             }
         };
+        if !crate::ci::may_declare_file_module(&source) && !may_hold_a_site(&source) {
+            continue;
+        }
         let parsed = match syn::parse_file(&source) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -708,6 +711,17 @@ fn walk_crate(
             }
         }
     }
+}
+
+/// Whether a file's text could hold a site or a `cfg_attr` the visitor
+/// refuses: each is spelled plainly in source, short of escapes in a literal.
+fn may_hold_a_site(source: &str) -> bool {
+    NAMES.iter().any(|(name, _)| source.contains(name))
+        || source.contains(&format!("{}\"", PREFIX.0))
+        || ARTIFACTS
+            .iter()
+            .any(|(id, _)| source.contains(id.split("::").next().unwrap_or(id)))
+        || source.contains("cfg_attr")
 }
 
 /// A crate's production roots: its library and binaries, from `Cargo.toml`

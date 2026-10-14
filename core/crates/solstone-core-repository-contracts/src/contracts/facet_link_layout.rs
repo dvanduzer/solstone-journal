@@ -236,6 +236,10 @@ fn only_the_link_folder_owner_spells_a_path_into_a_link_folder() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source");
+        // Every path the visitor reports spells `facets` in a literal.
+        if !source.contains("facets") {
+            continue;
+        }
         let file = match syn::parse_file(&source) {
             Ok(file) => file,
             Err(error) => {

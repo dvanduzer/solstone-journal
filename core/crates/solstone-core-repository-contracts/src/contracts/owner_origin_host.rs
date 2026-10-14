@@ -233,7 +233,7 @@ impl<'ast> Visit<'ast> for TestSpanCollector {
 }
 
 fn scan_source(relative_path: &str, content: &str) -> Vec<Hit> {
-    if relative_path.contains("tests") {
+    if relative_path.contains("tests") || !content.contains(OWNER_HOST) {
         return Vec::new();
     }
     let syntax = match syn::parse_file(content) {
@@ -409,6 +409,9 @@ fn module_contexts(crate_root: &Path) -> BTreeMap<PathBuf, bool> {
             Ok(c) => c,
             Err(_) => continue,
         };
+        if !crate::ci::may_declare_file_module(&content) {
+            continue;
+        }
         let syntax = match syn::parse_file(&content) {
             Ok(s) => s,
             Err(_) => continue,
@@ -570,10 +573,6 @@ fn scan_reachable_crates(repo_root: &Path) -> Vec<Hit> {
         collect_rs_files(&src_dir, &mut files);
 
         for file in files {
-            let file_str = file.to_string_lossy();
-            if file_str.contains("tests") {
-                continue;
-            }
             if contexts.get(&file) == Some(&true) {
                 // reached only via test mod
                 continue;
