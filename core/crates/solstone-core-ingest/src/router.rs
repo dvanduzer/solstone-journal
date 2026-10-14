@@ -1428,8 +1428,12 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, Once, mpsc};
+    #[cfg(feature = "full-tests")]
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, Once};
+    #[cfg(feature = "full-tests")]
     use std::thread;
+    #[cfg(feature = "full-tests")]
     use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
@@ -1908,6 +1912,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "full-tests")]
     #[test]
     fn source_writes_serialize_before_the_second_stream_bind() {
         for source in ["location", "audio", ""] {
