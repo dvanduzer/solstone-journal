@@ -68,6 +68,48 @@ pub fn segment_fully_thought(progress: Option<&SegmentProgress>) -> ThoughtVerdi
     ThoughtVerdict::Complete
 }
 
+/// Every step a segment's thinking still waits on, where
+/// `segment_fully_thought` names only the first. Empty exactly when that
+/// verdict is complete.
+pub fn segment_pending_talents(progress: Option<&SegmentProgress>) -> BTreeSet<String> {
+    let Some(progress) = progress.filter(|progress| progress.sensed) else {
+        return BTreeSet::from(["sense".to_owned()]);
+    };
+    let mut pending = BTreeSet::new();
+    if progress.dispatched.contains("facet_routing")
+        && !progress.completed.contains("facet_routing")
+    {
+        pending.insert("facet_routing".to_owned());
+    }
+    if progress.density.as_deref() == Some("idle")
+        || progress.change_class.as_deref() == Some("redundant")
+    {
+        return pending;
+    }
+    for name in SEGMENT_FLOOR_TALENTS {
+        if !progress.completed.contains(*name)
+            && !progress.unconfigured.contains(*name)
+            && !progress.capped_by_skip.contains(*name)
+        {
+            pending.insert((*name).to_owned());
+        }
+    }
+    for name in &progress.dispatched {
+        if SEGMENT_NONGATING_TALENTS.contains(&name.as_str())
+            || SEGMENT_SUPERSEDED_TALENTS
+                .iter()
+                .find(|(legacy, _)| *legacy == name)
+                .is_some_and(|(_, replacement)| progress.completed.contains(*replacement))
+        {
+            continue;
+        }
+        if !progress.completed.contains(name) && !progress.capped_by_skip.contains(name) {
+            pending.insert(name.clone());
+        }
+    }
+    pending
+}
+
 /// Whether a segment's thinking already covers the input it holds now.
 ///
 /// True only when the segment is fully thought and none of its input is newer
@@ -264,6 +306,42 @@ mod tests {
 
     fn refs(lines: &[String]) -> Vec<&str> {
         lines.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn pending_talents_name_every_step_the_verdict_waits_on() {
+        use super::{segment_fully_thought, segment_pending_talents};
+        use crate::ThoughtVerdict;
+        assert_eq!(segment_pending_talents(None), ["sense".to_owned()].into());
+        let thought = thought_at(100);
+        let mut screen_and_speakers = thought.clone();
+        for (name, ts) in [("screen", 200), ("speaker_attribution", 210)] {
+            screen_and_speakers.push(event(
+                "talent.dispatch",
+                ts,
+                &format!(r#","name":"{name}","use_id":"{name}""#),
+            ));
+            screen_and_speakers.push(event(
+                "talent.fail",
+                ts + 1,
+                &format!(r#","name":"{name}","use_id":"{name}","reason_code":"no_output""#),
+            ));
+        }
+        for (lines, pending) in [
+            (thought.clone(), vec![]),
+            (screen_and_speakers, vec!["screen", "speaker_attribution"]),
+        ] {
+            let progress = progress_after(&refs(&lines));
+            let names = segment_pending_talents(progress.as_ref());
+            assert_eq!(
+                names.iter().map(String::as_str).collect::<Vec<_>>(),
+                pending
+            );
+            assert_eq!(
+                names.is_empty(),
+                segment_fully_thought(progress.as_ref()) == ThoughtVerdict::Complete
+            );
+        }
     }
 
     #[test]

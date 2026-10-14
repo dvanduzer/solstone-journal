@@ -50,6 +50,17 @@ pub fn is_attestation_family_reason(code: &str) -> bool {
     code.starts_with("attestation_") && known_reason_code(code)
 }
 
+/// True when the contract marks `code` as blocking: the lane itself cannot
+/// serve (an endpoint down, a missing key or model), so the failure says
+/// nothing about the request that met it.
+pub fn is_blocking_reason(code: &str) -> bool {
+    contract()["reason_codes"]
+        .as_array()
+        .expect("generate contract reason codes are an array")
+        .iter()
+        .any(|entry| entry["code"].as_str() == Some(code) && entry["blocking"] == true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

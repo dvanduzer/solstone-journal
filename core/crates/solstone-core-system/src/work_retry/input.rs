@@ -8,6 +8,15 @@ use std::{collections::BTreeMap, path::Path};
 pub fn current(journal: &Path, unit: &Unit) -> Result<String, String> {
     unit.validate()?;
     match unit {
+        // Sense reads the recording itself, and may never have written its output.
+        Unit::Segment { day, talent, .. } if talent == "sense" => {
+            crate::catchup::read_segment_input_fingerprint(
+                journal,
+                day,
+                &unit.segment_directory(journal)?,
+            )
+            .map_err(|e| e.to_string())
+        }
         Unit::Segment { .. } => {
             let path = unit.segment_directory(journal)?.join("talents/sense.json");
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
