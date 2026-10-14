@@ -9,8 +9,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-[lints]
-workspace = true
+# SQLite's descriptor-bound VFS is the only private FFI boundary.
+[lints.rust]
+unsafe_code = "deny"
+
+[features]
+full-tests = []
 
 [dependencies]
 rusqlite.workspace = true

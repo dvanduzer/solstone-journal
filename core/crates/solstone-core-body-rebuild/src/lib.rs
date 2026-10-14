@@ -14,7 +14,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, params};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use rusqlite::OpenFlags;
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use solstone_core_body_source::{
     BodyEnvelope, BodyMonth, BodyRawRetention, BodyString, BodyValue, BundleClass,
@@ -33,6 +35,10 @@ use solstone_core_journal_io::sync_dir;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
+mod descriptor_checkpoint;
 
 const IMPORTS_DIR: &str = "imports";
 const DATABASE_REL: &str = "imports/health-dedupe.sqlite";
@@ -922,24 +928,31 @@ fn checkpoint_existing_database(path: &Path) -> Result<(), BodyRebuildError> {
             "existing_database",
         ));
     }
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|_| error(BodyRebuildErrorKind::Publication, "checkpoint_database"))?;
-    let journal_mode: String = connection
-        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-        .map_err(|_| error(BodyRebuildErrorKind::Publication, "checkpoint_database"))?;
-    if !journal_mode.eq_ignore_ascii_case("delete") {
-        return Err(error(
-            BodyRebuildErrorKind::Publication,
-            "checkpoint_database",
-        ));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        descriptor_checkpoint::checkpoint(path)
     }
-    connection
-        .close()
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
         .map_err(|_| error(BodyRebuildErrorKind::Publication, "checkpoint_database"))?;
-    Ok(())
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .map_err(|_| error(BodyRebuildErrorKind::Publication, "checkpoint_database"))?;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(error(
+                BodyRebuildErrorKind::Publication,
+                "checkpoint_database",
+            ));
+        }
+        connection
+            .close()
+            .map_err(|_| error(BodyRebuildErrorKind::Publication, "checkpoint_database"))?;
+        Ok(())
+    }
 }
 
 fn build_database(path: &Path, state: &BodyDedupeState) -> Result<(), BodyRebuildError> {
