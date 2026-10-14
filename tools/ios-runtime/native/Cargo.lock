@@ -104,9 +104,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arbitrary"
-version = "1.5.0"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 dependencies = [
  "derive_arbitrary",
 ]
@@ -779,19 +779,19 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.8"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "derive_arbitrary"
-version = "1.5.0"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -838,9 +838,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.19.0"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "elliptic-curve"
@@ -1338,9 +1338,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
-version = "0.5.3"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
+checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hickory-proto"
@@ -1791,8 +1791,11 @@ dependencies = [
  "log",
  "serde_json",
  "sha2",
+ "solstone-core-brain-owner",
  "solstone-core-callosum",
  "solstone-core-convey-shell",
+ "solstone-core-cortex",
+ "solstone-core-generate-wire",
  "solstone-core-indexer-store",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
@@ -1804,9 +1807,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.106"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7883d941dae510fb2d978fc3fe018c71c9e2892fd38854de3e8b92c2e5ad9cc5"
+checksum = "ce57d20d1ea864ce2ac172ab472d409214f4fd359f0b2a2775abdf522e2af99e"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -1909,9 +1912,9 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.25"
+version = "0.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
+checksum = "8d8f1ea3f21fd3405dcaf6c9b5c1630af9afc422d9073ea39c5f6d6c772e08ed"
 dependencies = [
  "libc",
 ]
@@ -3191,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-about"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "libc",
  "log",
@@ -3205,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-artifact-download"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "sha2",
  "solstone-core-assets",
@@ -3215,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-assets"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -3224,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-auth-flow"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "getrandom 0.3.4",
  "sha2",
@@ -3232,7 +3235,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-backup"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
@@ -3249,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-backup-runtime"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -3280,7 +3283,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-backup-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3306,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-ingest"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3327,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-rebuild"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "nix",
  "rusqlite",
@@ -3340,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-source"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "ryu",
  "sha2",
@@ -3348,14 +3351,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-store"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "solstone-core-body-source",
 ]
 
 [[package]]
 name = "solstone-core-brain"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -3373,8 +3376,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-brain-owner"
+version = "2.0.46"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "solstone-core-brain",
+ "solstone-core-chatgpt-auth",
+ "solstone-core-generate",
+ "solstone-core-generate-wire",
+ "solstone-core-local",
+ "solstone-core-spp-ratls",
+]
+
+[[package]]
 name = "solstone-core-callosum"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
@@ -3394,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-chatgpt-auth"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -3408,7 +3425,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-check"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "log",
  "nix",
@@ -3422,11 +3439,11 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-cli-boundary"
-version = "2.0.45"
+version = "2.0.46"
 
 [[package]]
 name = "solstone-core-convey-body"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3442,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-convey-http"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "hyper",
@@ -3455,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-convey-shell"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3522,8 +3539,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-cortex"
+version = "2.0.46"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "log",
+ "nix",
+ "serde_json",
+ "solstone-core-brain",
+ "solstone-core-callosum",
+ "solstone-core-generate-wire",
+ "solstone-core-journal",
+ "solstone-core-journal-cli",
+ "solstone-core-journal-config",
+ "solstone-core-journal-io",
+ "solstone-core-spp-ratls",
+ "solstone-core-system",
+ "solstone-core-talent-cli",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "solstone-core-depict"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3544,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-describe-categories"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -3552,7 +3593,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-distribution"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "bzip2-rs",
  "flate2",
@@ -3577,7 +3618,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entities"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3600,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entity"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "caseless",
  "chrono",
@@ -3621,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entity-matching"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "caseless",
  "md5",
@@ -3632,7 +3673,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-facets"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "caseless",
  "chrono",
@@ -3648,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-facets-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3669,14 +3710,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ffmpeg-build-support"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "solstone-core-format"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "glob",
@@ -3690,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-generate"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "log",
  "serde",
@@ -3699,7 +3740,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-generate-wire"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3723,14 +3764,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-handoff-nonce"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "getrandom 0.3.4",
 ]
 
 [[package]]
 name = "solstone-core-health-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3755,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-home"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3780,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-home-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3800,7 +3841,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-import"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3824,7 +3865,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-import-sources"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3856,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-import-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -3883,7 +3924,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3902,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer-query"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3918,7 +3959,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer-store"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "log",
  "rusqlite",
@@ -3933,7 +3974,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ingest"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "log",
@@ -3952,7 +3993,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ingest-contract"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "jsonschema",
  "serde_json",
@@ -3961,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ingest-resolve"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "serde",
@@ -3974,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-installation-identity"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "getrandom 0.3.4",
  "nix",
@@ -3984,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-installed-payload"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "minisign",
  "serde",
@@ -3995,14 +4036,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "toml_edit",
 ]
 
 [[package]]
 name = "solstone-core-journal-archive"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "nix",
  "solstone-core-journal-io",
@@ -4011,7 +4052,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-cli"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "serde_json",
@@ -4035,7 +4076,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-config"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4050,7 +4091,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-config-write"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde_json",
  "solstone-core-journal-config",
@@ -4059,7 +4100,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-io"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4075,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-stats-cli"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "serde",
@@ -4092,7 +4133,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-local"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "flate2",
@@ -4118,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-location"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4138,7 +4179,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-map-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -4150,7 +4191,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-mcp-audit"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "serde",
@@ -4160,7 +4201,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-mcp-endpoint"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4211,7 +4252,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-memory-original"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -4222,11 +4263,11 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-npy"
-version = "2.0.45"
+version = "2.0.46"
 
 [[package]]
 name = "solstone-core-nvattest-authority"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -4234,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-observe-audio"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
@@ -4243,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-offload"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4264,7 +4305,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-processing-record"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -4272,7 +4313,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-profile-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -4288,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-push"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4312,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-records-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -4332,7 +4373,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-reprocess-cli"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4348,7 +4389,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-retention"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4366,7 +4407,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-retention-client"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -4375,7 +4416,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-segment"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "caseless",
  "serde",
@@ -4388,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sense"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "serde",
@@ -4407,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-service-unit"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "plist",
  "quick-xml 0.41.0",
@@ -4417,7 +4458,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-serving"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "serde",
@@ -4430,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-settings-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -4455,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sol-client"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4469,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sol-link"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "argon2",
  "axum",
@@ -4505,7 +4546,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sound-tags"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "log",
  "serde_json",
@@ -4517,7 +4558,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speaker-id"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -4529,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speaker-resolve"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4559,14 +4600,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speakers"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "hdbscan",
 ]
 
 [[package]]
 name = "solstone-core-speakers-analyze"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "env_logger",
  "log",
@@ -4578,7 +4619,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speakers-onnx"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "ort",
  "solstone-core-local",
@@ -4588,7 +4629,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spl"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4611,9 +4652,10 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spp-attest"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "base64 0.22.1",
+ "plist",
  "ring",
  "serde",
  "serde_json",
@@ -4627,7 +4669,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spp-ratls"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "nix",
  "ring",
@@ -4642,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-stats-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -4659,7 +4701,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-support-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "nix",
@@ -4669,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-system"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4703,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-system-health"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "log",
@@ -4726,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-talent-cli"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "jsonschema",
@@ -4741,14 +4783,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-talent-config"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "solstone-core-talent-runtime"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "caseless",
  "chrono",
@@ -4786,7 +4828,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-thinking"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4812,14 +4854,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-thinking-copy"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "solstone-core-transcribe"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4852,7 +4894,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-transcripts"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "chrono",
  "log",
@@ -4865,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-transcripts-web"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "axum",
  "chrono",
@@ -4897,7 +4939,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-vad-analyze"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "ort",
  "serde_json",
@@ -4907,7 +4949,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-win-dll-load"
-version = "2.0.45"
+version = "2.0.46"
 dependencies = [
  "libloading 0.8.9",
  "windows-sys 0.61.2",
@@ -5591,9 +5633,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.129"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bb54f33acc68fd454578d9820b0bde1a1a3d17aa17bb7b6595806d02886d409"
+checksum = "aecb87a33d3b0c5e3b7aa46336eaf486cffafbd281b195e4c8b80d50df2351bf"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -5604,9 +5646,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.129"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e29d0c35b16e224a7eeb5cd2d25e3e1968fbd65604117b44d3b789d00ee8535"
+checksum = "a690d511e3c1a8b3a55e33511e3c2c00c78415cd23650f32b808627f5696b9ed"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -5614,9 +5656,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.129"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f501a8bc3719dba86ef8ae4728879c08001bea749eb1333ac5b91e040e2a6b7"
+checksum = "411e4887f0071ef2d2164a9d5fdf2d20efbef78fccd3a78b0c10a1dc5295e48a"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -5627,18 +5669,18 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.129"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
+checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
 ]
 
 [[package]]
 name = "web-sys"
-version = "0.3.106"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88261b9deccee56594c11a3460c462c41f58d148598fe70ad77070126a68aba4"
+checksum = "9fbddc4a036f00ec4f18c83445bd3115cb306a91da554919a099d9222fe4a7f8"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

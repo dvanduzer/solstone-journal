@@ -2,23 +2,32 @@
 # Copyright (c) 2026 sol pbc
 SHELL := /bin/bash
 BUILD_ROOT ?= /var/tmp/journal-ios-runtime-build
+CACHE_DIR ?= /var/tmp/journal-mobile-cache
+JOBS ?= 6
 DEVICE ?=
 DESTINATION ?= generic/platform=iOS
 RUST_LIB := $(BUILD_ROOT)/rust/aarch64-apple-ios/debug/libsolstone_ios_runtime.a
 APPRAISAL_LIB := $(BUILD_ROOT)/appraisal-rust/aarch64-apple-ios/debug/libsolstone_ios_appraisal_helper.a
+APPRAISAL_NATIVE_WORK := $(BUILD_ROOT)/appraisal-native-work
+APPRAISAL_NATIVE_DIR := $(BUILD_ROOT)/appraisal-native
+APPRAISAL_RESOURCES := $(BUILD_ROOT)/appraisal-resources
+APPRAISAL_BUILD_RECORD := $(BUILD_ROOT)/appraisal-native-build.json
+NVAT_LIB := $(APPRAISAL_NATIVE_DIR)/libnvat-all.a
 APP := $(BUILD_ROOT)/derived/Build/Products/Debug-iphoneos/JournalRuntimeDev.app
-.PHONY: build rust appraisal-rust payload project finalize install run check
+.PHONY: build rust appraisal-rust appraisal-native payload project finalize install run check
 rust:
-	cargo build --locked --manifest-path native/Cargo.toml $(if $(AUDIO_MODELS_DIR),--features audio,) --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/rust
+	IPHONEOS_DEPLOYMENT_TARGET=26.0 cargo build --locked --manifest-path native/Cargo.toml $(if $(AUDIO_MODELS_DIR),--features audio,) --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/rust
 appraisal-rust:
-	cargo build --locked --manifest-path appraisal-helper/Cargo.toml --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/appraisal-rust
+	IPHONEOS_DEPLOYMENT_TARGET=26.0 cargo build --locked --manifest-path appraisal-helper/Cargo.toml --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/appraisal-rust
+appraisal-native:
+	python3 build_gpu_appraisal.py --work-dir $(APPRAISAL_NATIVE_WORK) --cache-dir $(CACHE_DIR) --output-lib $(NVAT_LIB) --resource-dir $(APPRAISAL_RESOURCES) --build-record $(APPRAISAL_BUILD_RECORD) --jobs $(JOBS)
 payload:
 	AUDIO_MODELS_DIR='$(AUDIO_MODELS_DIR)' python3 package_payload.py
 project: payload
 	xcodegen generate
-build: rust appraisal-rust project
-	xcodebuild -project JournalRuntimeDev.xcodeproj -scheme JournalRuntimeDev -configuration Debug -destination '$(DESTINATION)' -derivedDataPath $(BUILD_ROOT)/derived -allowProvisioningUpdates RUST_LIB=$(RUST_LIB) APPRAISAL_LIB=$(APPRAISAL_LIB) build
-	python3 finalize.py $(BUILD_ROOT)
+build: rust appraisal-rust appraisal-native project
+	xcodebuild -project JournalRuntimeDev.xcodeproj -scheme JournalRuntimeDev -configuration Debug -destination '$(DESTINATION)' -derivedDataPath $(BUILD_ROOT)/derived -allowProvisioningUpdates RUST_LIB=$(RUST_LIB) APPRAISAL_LIB=$(APPRAISAL_LIB) NVAT_LIB=$(NVAT_LIB) build
+	python3 finalize.py $(BUILD_ROOT) --nvattest-lib $(NVAT_LIB) --appraisal-build-record $(APPRAISAL_BUILD_RECORD) --appraisal-resources $(APPRAISAL_RESOURCES)
 install: build
 	@test -n "$(DEVICE)" || (echo "Set DEVICE to a connected device identifier"; exit 2)
 	xcrun devicectl device install app --device $(DEVICE) $(APP)
@@ -28,5 +37,10 @@ run:
 check:
 	cargo fmt --manifest-path native/Cargo.toml -- --check
 	cargo clippy --locked --manifest-path native/Cargo.toml --all-targets --no-deps -- -D warnings
+	cargo test --locked --manifest-path native/Cargo.toml
+	cargo test --locked --manifest-path ../../core/Cargo.toml -p solstone-core-spp-attest --features test-hooks ios_appraisal::tests
+	cargo test --locked --manifest-path ../../core/Cargo.toml -p solstone-core-spp-attest --features test-hooks ios_service_tools::tests
 	cargo fmt --manifest-path appraisal-helper/Cargo.toml -- --check
 	cargo clippy --locked --manifest-path appraisal-helper/Cargo.toml --all-targets --no-deps -- -D warnings
+	cargo test --locked --manifest-path appraisal-helper/Cargo.toml
+	python3 test_gpu_appraisal_receipt.py

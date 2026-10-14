@@ -73,7 +73,8 @@ targets:
         EX_ENABLE_EXTENSION_POINT_GENERATION: true
         APPLICATION_EXTENSION_API_ONLY: true
         SKIP_INSTALL: true
-        OTHER_LDFLAGS: $(APPRAISAL_LIB) -lc++ -lz -liconv -framework Foundation -framework Security
+        LD_RUNPATH_SEARCH_PATHS: ''
+        OTHER_LDFLAGS: $(APPRAISAL_LIB) $(NVAT_LIB) -lc++ -lz -liconv -framework Foundation -framework Security -framework SystemConfiguration -framework CoreFoundation
 schemes:
   JournalRuntimeDev:
     build:

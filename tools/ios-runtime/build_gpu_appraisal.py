@@ -2,28 +2,28 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (c) 2026 sol pbc
 
-"""Build and receipt generator for the iOS confidential GPU appraisal helper.
+"""Build the pinned iOS nvattest static closure and emit its build record."""
 
-Constructs the static libnvat library and Appraisal.appex companion for iOS,
-records receipt metadata with cryptographic pins, and verifies link symbols.
-Boundary: compile, link, packaging, and signing identity; not a device run.
-"""
-
+import argparse
+import hashlib
 import json
-import os
 import pathlib
 import re
+import shlex
+import shutil
+import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any
 
-# Import Build, acquire, sha256, INPUTS, ROOT from scripts/mobile_native_build.py
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from mobile_native_build import Build, acquire, sha256, INPUTS, ROOT, tree_digest
+from mobile_native_build import Build, sha256
 
-NVAT_PRODUCTION_SYMBOLS = [
+
+NVAT_PRODUCTION_SYMBOLS = (
     "nvat_str_length",
     "nvat_str_get_data",
     "nvat_str_free",
@@ -49,153 +49,206 @@ NVAT_PRODUCTION_SYMBOLS = [
     "nvat_verify_gpu_evidence",
     "nvat_claims_collection_serialize_json",
     "nvat_claims_collection_free",
-]
-
-LINK_PROBE_BOUNDARY = (
-    "compile, link, packaging, and signing identity; not a device run"
 )
 
 
-def load_regorus_build_revision() -> Dict[str, str]:
-    sources_path = ROOT / "core/distribution/nvattest-windows-sources.json"
-    sources_data = json.loads(sources_path.read_text(encoding="utf-8"))
-    for item in sources_data.get("native_sources", []):
-        if item.get("name") == "regorus-build-revision":
-            return {
-                "revision": item.get("revision", ""),
-                "original_sha256": item.get("original_sha256", ""),
-                "sha256": item.get("sha256", ""),
-            }
-    raise ValueError("regorus-build-revision not found in nvattest-windows-sources.json")
+def _configure_argv(build: Build) -> list[str]:
+    matches = [
+        step["argv"]
+        for step in build.summary["steps"]
+        if step.get("name") == "nvattest-configure"
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one nvattest configure command, got {len(matches)}")
+    argv = [arg for arg in matches[0] if not arg.startswith("-DBUILD_SHARED_LIBS=")]
+    return [*argv, "-DBUILD_SHARED_LIBS=OFF", "-DCMAKE_SKIP_INSTALL_RULES=ON"]
 
 
-def load_production_pcr_pins() -> List[str]:
-    pins_rs = ROOT / "core/crates/solstone-core-spp-attest/src/pins.rs"
-    content = pins_rs.read_text(encoding="utf-8")
-    m = re.search(
-        r"pub const PRODUCTION_PCR_SHA256_PINS:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
-        content,
-        re.DOTALL,
+def _static_dependencies(link_command: str, build_dir: pathlib.Path) -> list[pathlib.Path]:
+    dependencies: list[pathlib.Path] = []
+    for token in shlex.split(link_command):
+        if not token.endswith(".a"):
+            continue
+        path = pathlib.Path(token)
+        if not path.is_absolute():
+            path = build_dir / path
+        path = path.resolve()
+        if path not in dependencies:
+            dependencies.append(path)
+    if not dependencies:
+        raise ValueError("nvattest dynamic link command supplied no static dependencies")
+    return dependencies
+
+
+def _record_digest(record: dict[str, Any]) -> str:
+    canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _read_required_symbols(build: Build, aggregate: pathlib.Path) -> str:
+    """Read Darwin's partial table while rejecting any unexpected nm failure."""
+    argv = ["nm", "-gU", aggregate]
+    started = time.time()
+    result = subprocess.run(
+        list(map(str, argv)),
+        cwd=REPO_ROOT,
+        env=build.env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
     )
-    if not m:
-        raise ValueError("PRODUCTION_PCR_SHA256_PINS not found in pins.rs")
-    pins = re.findall(r'"([0-9a-fA-F]{64})"', m.group(1))
-    if not pins:
-        raise ValueError("No PCR pins parsed from pins.rs")
-    return pins
-
-
-def format_receipt(
-    steps: List[Dict[str, Any]],
-    platform: str,
-    arch: str,
-    driver_sha256: str,
-    inputs_sha256: str,
-    patch_sha256: str,
-    nvattest_revision: str,
-    regorus_revision: str,
-    regorus_original_sha256: str,
-    regorus_patched_sha256: str,
-    ca_bundle_sha256: str,
-    pcr_sha256_pins: List[str],
-    rims: List[Dict[str, str]],
-    needed: List[str],
-    helper_sha256: Optional[str] = None,
-    is_partial: bool = False,
-) -> Dict[str, Any]:
-    all_steps_ok = len(steps) > 0 and all(s.get("exit", 1) == 0 for s in steps)
-    passed = all_steps_ok and not is_partial and helper_sha256 is not None
-    exit_code = 0 if passed else 1
-    status = "passed" if passed else "failed"
-
-    return {
-        "status": status,
-        "complete": passed,
-        "exit": exit_code,
-        "platform": platform,
-        "arch": arch,
-        "driver_sha256": driver_sha256,
-        "inputs_sha256": inputs_sha256,
-        "patch_sha256": patch_sha256,
-        "nvattest_revision": nvattest_revision,
-        "regorus_revision": regorus_revision,
-        "regorus_original_sha256": regorus_original_sha256,
-        "regorus_patched_sha256": regorus_patched_sha256,
-        "ca_bundle_sha256": ca_bundle_sha256,
-        "pcr_sha256_pins": pcr_sha256_pins,
-        "rims": rims,
-        "needed": needed,
-        "helper_sha256": helper_sha256 or "",
-        "schema": "gpu-appraisal-receipt-v1",
-        "steps": steps,
-        "link_boundary": LINK_PROBE_BOUNDARY,
-    }
-
-
-def write_receipt(
-    destination: pathlib.Path,
-    steps: List[Dict[str, Any]],
-    needed: Optional[List[str]] = None,
-    platform: str = "ios",
-    arch: str = "arm64",
-    helper_path: Optional[pathlib.Path] = None,
-    is_partial: bool = False,
-) -> Dict[str, Any]:
-    driver_path = ROOT / "scripts/mobile_native_build.py"
-    inputs_path = ROOT / "core/distribution/mobile/inputs.json"
-    patch_path = ROOT / "core/distribution/mobile/nvattest-mobile.patch"
-    ca_bundle_path = ROOT / "core/crates/solstone-core-spp-attest/share/ca/ca-bundle.pem"
-
-    if not hasattr(Build, "pins"):
-        Build.pins = json.loads(inputs_path.read_text(encoding="utf-8"))["inputs"]
-    nvattest_rev = Build.pins["nvattest"]["revision"]
-
-    regorus_info = load_regorus_build_revision()
-    regorus_rev = regorus_info.get("revision", "")
-    regorus_orig = regorus_info.get("original_sha256", "")
-    regorus_patched = regorus_info.get("sha256", "")
-
-    rims_dir = ROOT / "core/crates/solstone-core-spp-attest/rims"
-    rim_entries = []
-    if rims_dir.exists():
-        for r_file in sorted(rims_dir.iterdir()):
-            if r_file.suffix in (".xml", ".corim"):
-                rim_entries.append({
-                    "filename": r_file.name,
-                    "sha256": sha256(r_file),
-                })
-
-    pcr_pins = load_production_pcr_pins()
-
-    helper_digest = sha256(helper_path) if helper_path and helper_path.exists() else None
-
-    receipt = format_receipt(
-        steps=steps,
-        platform=platform,
-        arch=arch,
-        driver_sha256=sha256(driver_path) if driver_path.exists() else "",
-        inputs_sha256=sha256(inputs_path) if inputs_path.exists() else "",
-        patch_sha256=sha256(patch_path) if patch_path.exists() else "",
-        nvattest_revision=nvattest_rev,
-        regorus_revision=regorus_rev,
-        regorus_original_sha256=regorus_orig,
-        regorus_patched_sha256=regorus_patched,
-        ca_bundle_sha256=sha256(ca_bundle_path) if ca_bundle_path.exists() else "",
-        pcr_sha256_pins=pcr_pins,
-        rims=rim_entries,
-        needed=needed if needed is not None else [],
-        helper_sha256=helper_digest,
-        is_partial=is_partial,
+    log = build.receipts / "nvattest-static-symbols.log"
+    log.write_bytes(result.stdout + result.stderr)
+    unexpected = [
+        line
+        for line in result.stderr.decode(errors="replace").splitlines()
+        if line
+        and "Unknown attribute kind (105)" not in line
+        and not line.endswith(": no symbols")
+    ]
+    accepted = result.returncode == 0 or (
+        result.returncode == 1 and not unexpected and bool(result.stdout)
     )
+    build.summary["steps"].append(
+        {
+            "name": "nvattest-static-symbols",
+            "argv": list(map(str, argv)),
+            "cwd": str(REPO_ROOT),
+            "started_epoch": started,
+            "seconds": round(time.time() - started, 3),
+            "exit": result.returncode,
+            "accepted": accepted,
+            "accepted_nonzero_reason": (
+                "Apple nm cannot decode LLVM 22 attributes in Rust compiler_builtins; "
+                "the required C symbols remain readable and final helper linkage is authoritative"
+                if result.returncode == 1 and accepted
+                else ""
+            ),
+            "log": str(log),
+            "log_sha256": sha256(log),
+        }
+    )
+    build.save()
+    if not accepted:
+        raise ValueError(
+            f"nm failed with exit {result.returncode}; unexpected diagnostics: {unexpected[:5]}"
+        )
+    return result.stdout.decode(errors="replace")
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
-    return receipt
+
+def build_static(args: argparse.Namespace) -> None:
+    mobile_args = argparse.Namespace(
+        platform="ios",
+        work_dir=args.work_dir,
+        cache_dir=args.cache_dir,
+        jobs=args.jobs,
+        components=["nvattest"],
+        full_run=False,
+    )
+    build = Build(mobile_args)
+    try:
+        build.setup()
+        build.nvattest()
+
+        nvattest_dir = build.work / "build/nvattest"
+        dynamic_link = (nvattest_dir / "CMakeFiles/nvat.dir/link.txt").read_text()
+        dependencies = _static_dependencies(dynamic_link, nvattest_dir)
+        build.run("nvattest-static-configure", _configure_argv(build))
+        build.run(
+            "nvattest-static-build",
+            ["cmake", "--build", nvattest_dir, f"-j{args.jobs}", "--target", "nvat"],
+        )
+        primary = nvattest_dir / "libnvat.a"
+        archives = [primary, *dependencies]
+        missing = [str(path) for path in archives if not path.is_file()]
+        if missing:
+            raise ValueError(f"static closure member missing after rebuild: {missing}")
+
+        args.output_lib.parent.mkdir(parents=True, exist_ok=False)
+        aggregate = args.output_lib
+        build.run(
+            "nvattest-static-aggregate",
+            ["xcrun", "libtool", "-static", "-o", aggregate, *archives],
+        )
+        architecture = build.run("nvattest-static-architecture", ["lipo", "-archs", aggregate])
+        if architecture.read_text().strip() != "arm64":
+            raise ValueError("aggregate nvattest archive is not arm64")
+        symbols = _read_required_symbols(build, aggregate)
+        missing_symbols = [
+            name
+            for name in NVAT_PRODUCTION_SYMBOLS
+            if not re.search(rf"\b_?{re.escape(name)}$", symbols, re.MULTILINE)
+        ]
+        if missing_symbols:
+            raise ValueError(
+                f"aggregate nvattest archive lacks production symbols: {missing_symbols}"
+            )
+
+        args.resource_dir.mkdir(parents=True, exist_ok=False)
+        ca_source = build.work / "artifacts/nvattest/ca-bundle.pem"
+        shutil.copyfile(ca_source, args.resource_dir / "ca-bundle.pem")
+        rims_dir = REPO_ROOT / "core/crates/solstone-core-spp-attest/rims"
+        rims = []
+        for source in sorted(rims_dir.iterdir()):
+            if source.suffix not in (".xml", ".corim"):
+                continue
+            destination = args.resource_dir / source.name
+            shutil.copyfile(source, destination)
+            rims.append({"filename": source.name, "sha256": sha256(destination)})
+
+        record = {
+            "schema": "ios-gpu-appraisal-static-build-v1",
+            "complete": True,
+            "status": "passed",
+            "platform": "ios",
+            "arch": "arm64",
+            "mobile_native_build": build.summary,
+            "aggregate": {
+                "sha256": sha256(aggregate),
+                "size_bytes": aggregate.stat().st_size,
+            },
+            "static_archives": [
+                {
+                    "name": path.name,
+                    "sha256": sha256(path),
+                    "size_bytes": path.stat().st_size,
+                }
+                for path in archives
+            ],
+            "production_symbols": list(NVAT_PRODUCTION_SYMBOLS),
+            "resources": {
+                "ca_bundle_sha256": sha256(args.resource_dir / "ca-bundle.pem"),
+                "rims": rims,
+            },
+        }
+        record["record_sha256"] = _record_digest(record)
+        args.build_record.parent.mkdir(parents=True, exist_ok=True)
+        args.build_record.write_text(json.dumps(record, indent=2) + "\n")
+        build.summary["complete"] = True
+        build.save(0)
+    except Exception as error:
+        build.summary["error"] = str(error)
+        build.save(getattr(error, "returncode", 1))
+        raise
 
 
 def main() -> int:
-    sys.stderr.write("build_gpu_appraisal main is not intended for standalone execution\n")
-    return 1
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--work-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--cache-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--output-lib", type=pathlib.Path, required=True)
+    parser.add_argument("--resource-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--build-record", type=pathlib.Path, required=True)
+    parser.add_argument("--jobs", type=int, default=6)
+    args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
+    try:
+        build_static(args)
+    except Exception as error:
+        print(f"iOS appraisal native build failed: {error}", file=sys.stderr)
+        return getattr(error, "returncode", 1)
+    return 0
 
 
 if __name__ == "__main__":

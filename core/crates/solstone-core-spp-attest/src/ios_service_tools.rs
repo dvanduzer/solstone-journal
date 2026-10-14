@@ -39,7 +39,11 @@ const PLATFORM_IOS: u32 = 2;
 const CPUTYPE_ARM64: u32 = 0x0100_000c;
 const MH_EXECUTE: u32 = 2;
 const LC_BUILD_VERSION: u32 = 0x32;
+const LC_CODE_SIGNATURE: u32 = 0x1d;
 const MAX_IMAGE_SIZE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_RECEIPT_SIZE_BYTES: u64 = 1024 * 1024;
+const MAX_BUNDLE_MEMBER_SIZE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_BUNDLE_MEMBERS: usize = 64;
 const MAX_LOAD_COMMANDS: u32 = 512;
 const MAX_SIZEOFCMDS_BYTES: usize = 1024 * 1024;
 
@@ -48,6 +52,14 @@ const MAX_SIZEOFCMDS_BYTES: usize = 1024 * 1024;
 pub struct IosPackagedRimEntry {
     pub filename: String,
     pub sha256: String,
+}
+
+/// Receipt-bound regular file in the appraisal extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IosPackagedMemberEntry {
+    pub path: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 /// Signed companion build receipt for the iOS GPU appraisal helper.
@@ -70,8 +82,9 @@ pub struct IosGpuAppraisalReceipt {
     pub rims: Vec<IosPackagedRimEntry>,
     pub needed: Vec<String>,
     pub helper_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema: Option<String>,
+    pub schema: String,
+    pub build_record_sha256: String,
+    pub package_members: Vec<IosPackagedMemberEntry>,
     #[serde(default)]
     pub steps: Vec<serde_json::Value>,
 }
@@ -99,6 +112,7 @@ pub struct IosBundleMember {
     pub relative_path: String,
     pub is_regular_file: bool,
     pub is_symlink: bool,
+    pub size_bytes: u64,
     pub sha256: String,
     pub macho_facts: Option<IosMachoFacts>,
 }
@@ -252,6 +266,98 @@ pub fn inspect_ios_macho(bytes: &[u8]) -> Result<IosMachoFacts, IosVerifierRefus
     })
 }
 
+/// Hashes all Mach-O bytes except the embedded Apple code-signature blob.
+///
+/// The blob covers the receipt through CodeResources, so including it in a
+/// digest stored inside that receipt would be self-referential. The load
+/// command remains covered, as do every code and data byte.
+pub fn ios_macho_content_sha256(bytes: &[u8]) -> Result<String, IosVerifierRefusal> {
+    if bytes.len() < 32 || bytes.len() > MAX_IMAGE_SIZE_BYTES {
+        return Err(IosVerifierRefusal::IntegrityFailed(
+            "invalid mach-o size for content digest".into(),
+        ));
+    }
+    if u32::from_le_bytes(
+        bytes[0..4]
+            .try_into()
+            .map_err(|_| IosVerifierRefusal::IntegrityFailed("magic slice error".into()))?,
+    ) != 0xfeed_facf
+    {
+        return Err(IosVerifierRefusal::IntegrityFailed(
+            "helper is not a little-endian mach-o 64 image".into(),
+        ));
+    }
+    let ncmds = u32::from_le_bytes(
+        bytes[16..20]
+            .try_into()
+            .map_err(|_| IosVerifierRefusal::IntegrityFailed("header slice error".into()))?,
+    );
+    let sizeofcmds = u32::from_le_bytes(
+        bytes[20..24]
+            .try_into()
+            .map_err(|_| IosVerifierRefusal::IntegrityFailed("header slice error".into()))?,
+    ) as usize;
+    if ncmds > MAX_LOAD_COMMANDS || sizeofcmds > MAX_SIZEOFCMDS_BYTES {
+        return Err(IosVerifierRefusal::IntegrityFailed(
+            "mach-o command bounds exceeded for content digest".into(),
+        ));
+    }
+    let commands = bytes
+        .get(32..32 + sizeofcmds)
+        .ok_or_else(|| IosVerifierRefusal::IntegrityFailed("truncated load commands".into()))?;
+    let mut cursor = 0usize;
+    let mut signature = None;
+    for _ in 0..ncmds {
+        let header = commands
+            .get(cursor..cursor + 8)
+            .ok_or_else(|| IosVerifierRefusal::IntegrityFailed("truncated load command".into()))?;
+        let cmd =
+            u32::from_le_bytes(header[0..4].try_into().map_err(|_| {
+                IosVerifierRefusal::IntegrityFailed("load command slice error".into())
+            })?);
+        let cmdsize = u32::from_le_bytes(header[4..8].try_into().map_err(|_| {
+            IosVerifierRefusal::IntegrityFailed("load command size slice error".into())
+        })?) as usize;
+        if cmdsize < 8 || cursor + cmdsize > commands.len() {
+            return Err(IosVerifierRefusal::IntegrityFailed(
+                "invalid load command size".into(),
+            ));
+        }
+        if cmd == LC_CODE_SIGNATURE {
+            if cmdsize < 16 || signature.is_some() {
+                return Err(IosVerifierRefusal::IntegrityFailed(
+                    "invalid code-signature load command".into(),
+                ));
+            }
+            let dataoff =
+                u32::from_le_bytes(commands[cursor + 8..cursor + 12].try_into().map_err(|_| {
+                    IosVerifierRefusal::IntegrityFailed("code-signature offset slice error".into())
+                })?) as usize;
+            let datasize =
+                u32::from_le_bytes(commands[cursor + 12..cursor + 16].try_into().map_err(|_| {
+                    IosVerifierRefusal::IntegrityFailed("code-signature size slice error".into())
+                })?) as usize;
+            let end = dataoff.checked_add(datasize).ok_or_else(|| {
+                IosVerifierRefusal::IntegrityFailed("code-signature range overflow".into())
+            })?;
+            if dataoff < 32 + sizeofcmds || end > bytes.len() {
+                return Err(IosVerifierRefusal::IntegrityFailed(
+                    "code-signature range is outside mach-o".into(),
+                ));
+            }
+            signature = Some((dataoff, end));
+        }
+        cursor += cmdsize;
+    }
+    let (start, end) = signature.ok_or_else(|| {
+        IosVerifierRefusal::IntegrityFailed("missing code-signature load command".into())
+    })?;
+    let mut content = Vec::with_capacity(bytes.len() - (end - start));
+    content.extend_from_slice(&bytes[..start]);
+    content.extend_from_slice(&bytes[end..]);
+    Ok(sha256_hex(&content))
+}
+
 /// Pure decision logic for admitting an iOS confidential GPU appraisal helper.
 ///
 /// Validates receipt pins against compiled constants, verifies helper identity
@@ -264,10 +370,14 @@ pub fn ios_admission_decision(
     extension_point_name: &str,
 ) -> Result<AdmittedIosVerifier, IosVerifierRefusal> {
     // 1. Receipt status and execution metadata
-    if receipt.status != "passed" || !receipt.complete || receipt.exit != 0 {
+    if receipt.schema != "gpu-appraisal-receipt-v2"
+        || receipt.status != "passed"
+        || !receipt.complete
+        || receipt.exit != 0
+    {
         return Err(IosVerifierRefusal::ReceiptInvalid(format!(
-            "receipt did not pass: status={}, complete={}, exit={}",
-            receipt.status, receipt.complete, receipt.exit
+            "receipt did not pass: schema={}, status={}, complete={}, exit={}",
+            receipt.schema, receipt.status, receipt.complete, receipt.exit
         )));
     }
     if receipt.platform != "ios" {
@@ -351,20 +461,25 @@ pub fn ios_admission_decision(
     }
 
     let qualified_rims = crate::nvgpu::ManifestSet::QUALIFIED_595_71_05.entries();
-    if receipt.rims.len() != qualified_rims.len() {
+    let receipt_rims = receipt
+        .rims
+        .iter()
+        .map(|rim| (rim.filename.as_str(), rim.sha256.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if receipt.rims.len() != qualified_rims.len() || receipt_rims.len() != receipt.rims.len() {
         return Err(IosVerifierRefusal::PinMismatch(format!(
             "rim count mismatch: expected {}, got {}",
             qualified_rims.len(),
             receipt.rims.len()
         )));
     }
-    for (actual, expected) in receipt.rims.iter().zip(qualified_rims.iter()) {
-        if actual.filename != expected.filename() || actual.sha256 != expected.sha256() {
+    for expected in qualified_rims {
+        if receipt_rims.get(expected.filename()).copied() != Some(expected.sha256()) {
             return Err(IosVerifierRefusal::PinMismatch(format!(
-                "rim mismatch for {}: expected {}, got {}",
+                "rim mismatch for {}: expected {}, got {:?}",
                 expected.filename(),
                 expected.sha256(),
-                actual.sha256
+                receipt_rims.get(expected.filename())
             )));
         }
     }
@@ -382,14 +497,69 @@ pub fn ios_admission_decision(
     // 4. Bundle member regular file validation and closure completeness
     let helper_exe_path = format!("{IOS_HELPER_RELATIVE_PATH}/{IOS_HELPER_EXECUTABLE_NAME}");
     let receipt_rel_path = format!("{IOS_HELPER_RELATIVE_PATH}/gpu-appraisal-receipt.json");
+    let code_resources_rel_path =
+        format!("{IOS_HELPER_RELATIVE_PATH}/_CodeSignature/CodeResources");
     let ca_rel_path = format!("{IOS_HELPER_RELATIVE_PATH}/ca-bundle.pem");
+    let info_rel_path = format!("{IOS_HELPER_RELATIVE_PATH}/Info.plist");
+    let build_record_rel_path = format!("{IOS_HELPER_RELATIVE_PATH}/gpu-appraisal-build.json");
 
     let mut expected_paths = BTreeSet::new();
-    expected_paths.insert(helper_exe_path.clone());
-    expected_paths.insert(receipt_rel_path);
-    expected_paths.insert(ca_rel_path.clone());
+    expected_paths.insert(receipt_rel_path.clone());
+    expected_paths.insert(code_resources_rel_path.clone());
+    let mut packaged = std::collections::BTreeMap::new();
+    for member in &receipt.package_members {
+        let path = Path::new(&member.path);
+        if path.is_absolute()
+            || member.path.is_empty()
+            || path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || member.path == "gpu-appraisal-receipt.json"
+            || member.path == "_CodeSignature/CodeResources"
+            || member.size_bytes > MAX_BUNDLE_MEMBER_SIZE_BYTES
+            || !member.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || member.sha256.len() != 64
+        {
+            return Err(IosVerifierRefusal::ReceiptInvalid(format!(
+                "invalid package member record: {}",
+                member.path
+            )));
+        }
+        let full = format!("{IOS_HELPER_RELATIVE_PATH}/{}", member.path);
+        if packaged.insert(full.clone(), member).is_some() {
+            return Err(IosVerifierRefusal::ReceiptInvalid(format!(
+                "duplicate package member record: {}",
+                member.path
+            )));
+        }
+        expected_paths.insert(full);
+    }
+    if receipt.package_members.len() > MAX_BUNDLE_MEMBERS {
+        return Err(IosVerifierRefusal::ReceiptInvalid(format!(
+            "package member count {} exceeds cap {MAX_BUNDLE_MEMBERS}",
+            receipt.package_members.len()
+        )));
+    }
+    for required in [
+        &helper_exe_path,
+        &ca_rel_path,
+        &info_rel_path,
+        &build_record_rel_path,
+    ] {
+        if !expected_paths.contains(required) {
+            return Err(IosVerifierRefusal::ReceiptInvalid(format!(
+                "required package member absent from receipt: {required}"
+            )));
+        }
+    }
     for rim in qualified_rims {
-        expected_paths.insert(format!("{IOS_HELPER_RELATIVE_PATH}/{}", rim.filename()));
+        let path = format!("{IOS_HELPER_RELATIVE_PATH}/{}", rim.filename());
+        if !expected_paths.contains(&path) {
+            return Err(IosVerifierRefusal::ReceiptInvalid(format!(
+                "RIM absent from package member receipt: {}",
+                rim.filename()
+            )));
+        }
     }
 
     let mut found_paths = BTreeSet::new();
@@ -420,6 +590,14 @@ pub fn ios_admission_decision(
                 member.relative_path
             )));
         }
+        if let Some(expected) = packaged.get(&member.relative_path)
+            && (member.sha256 != expected.sha256 || member.size_bytes != expected.size_bytes)
+        {
+            return Err(IosVerifierRefusal::IntegrityFailed(format!(
+                "receipt-bound member drifted: {}",
+                member.relative_path
+            )));
+        }
         if member.relative_path == helper_exe_path {
             helper_member = Some(member);
         } else if member.relative_path == ca_rel_path {
@@ -441,6 +619,18 @@ pub fn ios_admission_decision(
                 }
             }
         }
+    }
+
+    let build_record = members
+        .iter()
+        .find(|member| member.relative_path == build_record_rel_path)
+        .ok_or_else(|| {
+            IosVerifierRefusal::IntegrityFailed("missing appraisal build record".into())
+        })?;
+    if build_record.sha256 != receipt.build_record_sha256 {
+        return Err(IosVerifierRefusal::IntegrityFailed(
+            "appraisal build record digest mismatch".into(),
+        ));
     }
 
     for expected in &expected_paths {
@@ -579,7 +769,7 @@ fn discover_app_bundle() -> Result<PathBuf, IosVerifierRefusal> {
     ))
 }
 
-/// Scans bundle members under `Extensions/Appraisal.appex` using symlink_metadata.
+/// Scans bundle members under `Extensions/Appraisal.appex` using symlink metadata.
 fn scan_bundle_members(
     app_root: &Path,
 ) -> Result<(IosGpuAppraisalReceipt, Vec<IosBundleMember>), IosVerifierRefusal> {
@@ -592,10 +782,19 @@ fn scan_bundle_members(
 
     // One receipt path only: Extensions/Appraisal.appex/gpu-appraisal-receipt.json
     let receipt_path = appraisal_dir.join("gpu-appraisal-receipt.json");
-    if !receipt_path.is_file() {
+    let receipt_metadata = std::fs::symlink_metadata(&receipt_path).map_err(|error| {
+        IosVerifierRefusal::Unavailable(format!("missing gpu-appraisal-receipt.json: {error}"))
+    })?;
+    if !receipt_metadata.is_file() || receipt_metadata.file_type().is_symlink() {
         return Err(IosVerifierRefusal::Unavailable(
-            "missing gpu-appraisal-receipt.json".into(),
+            "gpu-appraisal-receipt.json is not a regular file".into(),
         ));
+    }
+    if receipt_metadata.len() > MAX_RECEIPT_SIZE_BYTES {
+        return Err(IosVerifierRefusal::ReceiptInvalid(format!(
+            "receipt size {} exceeds cap {MAX_RECEIPT_SIZE_BYTES}",
+            receipt_metadata.len()
+        )));
     }
 
     let receipt_bytes = std::fs::read(&receipt_path)
@@ -603,69 +802,147 @@ fn scan_bundle_members(
     let receipt: IosGpuAppraisalReceipt = serde_json::from_slice(&receipt_bytes)
         .map_err(|e| IosVerifierRefusal::ReceiptInvalid(format!("failed parsing receipt: {e}")))?;
 
-    // Walk appraisal_dir with symlink_metadata. Do not follow symlinks.
     let mut members = Vec::new();
-    let entries = std::fs::read_dir(&appraisal_dir).map_err(|e| {
-        IosVerifierRefusal::Unavailable(format!("failed reading {IOS_HELPER_RELATIVE_PATH}: {e}"))
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            IosVerifierRefusal::IntegrityFailed(format!("directory entry error: {e}"))
-        })?;
-        let path = entry.path();
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-            IosVerifierRefusal::IntegrityFailed(format!(
-                "symlink_metadata error for {}: {e}",
-                path.display()
+    let mut pending = vec![appraisal_dir.clone()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|e| {
+            IosVerifierRefusal::Unavailable(format!(
+                "failed reading appraisal bundle directory {}: {e}",
+                directory.display()
             ))
         })?;
-        let filename = entry.file_name();
-        let filename_str = filename.to_string_lossy();
-        let relative_path = format!("{IOS_HELPER_RELATIVE_PATH}/{filename_str}");
-
-        let is_symlink = meta.file_type().is_symlink();
-        if is_symlink {
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                IosVerifierRefusal::IntegrityFailed(format!("directory entry error: {e}"))
+            })?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                IosVerifierRefusal::IntegrityFailed(format!(
+                    "symlink_metadata error for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let relative = path.strip_prefix(&appraisal_dir).map_err(|e| {
+                IosVerifierRefusal::IntegrityFailed(format!("appraisal member escaped bundle: {e}"))
+            })?;
+            let relative_path =
+                format!("{IOS_HELPER_RELATIVE_PATH}/{}", relative.to_string_lossy());
+            let is_symlink = meta.file_type().is_symlink();
+            if is_symlink {
+                members.push(IosBundleMember {
+                    relative_path,
+                    is_regular_file: false,
+                    is_symlink: true,
+                    size_bytes: 0,
+                    sha256: String::new(),
+                    macho_facts: None,
+                });
+                continue;
+            }
+            if meta.is_dir() {
+                if relative == Path::new("_CodeSignature") {
+                    pending.push(path);
+                    continue;
+                }
+                members.push(IosBundleMember {
+                    relative_path,
+                    is_regular_file: false,
+                    is_symlink: false,
+                    size_bytes: 0,
+                    sha256: String::new(),
+                    macho_facts: None,
+                });
+                continue;
+            }
+            if !meta.is_file() {
+                members.push(IosBundleMember {
+                    relative_path,
+                    is_regular_file: false,
+                    is_symlink: false,
+                    size_bytes: 0,
+                    sha256: String::new(),
+                    macho_facts: None,
+                });
+                continue;
+            }
+            if meta.len() > MAX_BUNDLE_MEMBER_SIZE_BYTES {
+                return Err(IosVerifierRefusal::IntegrityFailed(format!(
+                    "bundle member size {} exceeds cap {MAX_BUNDLE_MEMBER_SIZE_BYTES}: {}",
+                    meta.len(),
+                    path.display()
+                )));
+            }
+            let bytes = std::fs::read(&path).map_err(|e| {
+                IosVerifierRefusal::IntegrityFailed(format!(
+                    "failed reading {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let macho_facts = if relative == Path::new(IOS_HELPER_EXECUTABLE_NAME) {
+                Some(inspect_ios_macho(&bytes)?)
+            } else {
+                None
+            };
+            let sha256 = if macho_facts.is_some() {
+                ios_macho_content_sha256(&bytes)?
+            } else {
+                sha256_hex(&bytes)
+            };
             members.push(IosBundleMember {
                 relative_path,
-                is_regular_file: false,
-                is_symlink: true,
-                sha256: String::new(),
-                macho_facts: None,
-            });
-            continue;
-        }
-
-        let is_regular_file = meta.is_file();
-        if !is_regular_file {
-            members.push(IosBundleMember {
-                relative_path,
-                is_regular_file: false,
+                is_regular_file: true,
                 is_symlink: false,
-                sha256: String::new(),
-                macho_facts: None,
+                size_bytes: meta.len(),
+                sha256,
+                macho_facts,
             });
-            continue;
+            if members.len() > MAX_BUNDLE_MEMBERS + 2 {
+                return Err(IosVerifierRefusal::IntegrityFailed(format!(
+                    "bundle member count exceeds cap {}",
+                    MAX_BUNDLE_MEMBERS + 2
+                )));
+            }
         }
+    }
 
-        let bytes = std::fs::read(&path).map_err(|e| {
-            IosVerifierRefusal::IntegrityFailed(format!("failed reading {}: {e}", path.display()))
+    let info = plist::Value::from_file(appraisal_dir.join("Info.plist")).map_err(|error| {
+        IosVerifierRefusal::SubstitutedIdentity(format!("Info.plist parse failed: {error}"))
+    })?;
+    let dictionary = info.as_dictionary().ok_or_else(|| {
+        IosVerifierRefusal::SubstitutedIdentity("Info.plist root is not a dictionary".into())
+    })?;
+    let string_value = |key: &str| {
+        dictionary
+            .get(key)
+            .and_then(plist::Value::as_string)
+            .ok_or_else(|| {
+                IosVerifierRefusal::SubstitutedIdentity(format!(
+                    "Info.plist is missing string {key}"
+                ))
+            })
+    };
+    if string_value("CFBundleIdentifier")? != IOS_BUNDLE_IDENTIFIER
+        || string_value("CFBundleExecutable")? != IOS_HELPER_EXECUTABLE_NAME
+        || string_value("CFBundlePackageType")? != "XPC!"
+    {
+        return Err(IosVerifierRefusal::SubstitutedIdentity(
+            "Appraisal extension bundle identity drifted".into(),
+        ));
+    }
+    let extension_identifier = dictionary
+        .get("EXAppExtensionAttributes")
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|attributes| attributes.get("EXExtensionPointIdentifier"))
+        .and_then(plist::Value::as_string)
+        .ok_or_else(|| {
+            IosVerifierRefusal::SubstitutedIdentity(
+                "Info.plist is missing extension point identity".into(),
+            )
         })?;
-        let sha256 = sha256_hex(&bytes);
-
-        let macho_facts = if filename_str == IOS_HELPER_EXECUTABLE_NAME {
-            Some(inspect_ios_macho(&bytes)?)
-        } else {
-            None
-        };
-
-        members.push(IosBundleMember {
-            relative_path,
-            is_regular_file: true,
-            is_symlink: false,
-            sha256,
-            macho_facts,
-        });
+    if extension_identifier != IOS_BUNDLE_IDENTIFIER {
+        return Err(IosVerifierRefusal::SubstitutedIdentity(format!(
+            "unexpected extension point identifier: {extension_identifier}"
+        )));
     }
 
     Ok((receipt, members))
@@ -734,16 +1011,52 @@ mod tests {
     use super::*;
 
     fn valid_receipt() -> IosGpuAppraisalReceipt {
-        let qualified_rims = crate::nvgpu::ManifestSet::QUALIFIED_595_71_05
-            .entries()
-            .iter()
-            .map(|rim| IosPackagedRimEntry {
-                filename: rim.filename().to_string(),
-                sha256: rim.sha256().to_string(),
-            })
-            .collect();
+        let qualified_rims: Vec<IosPackagedRimEntry> =
+            crate::nvgpu::ManifestSet::QUALIFIED_595_71_05
+                .entries()
+                .iter()
+                .map(|rim| IosPackagedRimEntry {
+                    filename: rim.filename().to_string(),
+                    sha256: rim.sha256().to_string(),
+                })
+                .collect();
 
         let regorus_pin = solstone_core_distribution::regorus_build_revision_pin();
+
+        let helper_sha = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
+        let build_sha = "1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd";
+        let mut package_members = vec![
+            IosPackagedMemberEntry {
+                path: "Appraisal".into(),
+                sha256: helper_sha.into(),
+                size_bytes: 2048,
+            },
+            IosPackagedMemberEntry {
+                path: "Info.plist".into(),
+                sha256: "11".repeat(32),
+                size_bytes: 1,
+            },
+            IosPackagedMemberEntry {
+                path: "embedded.mobileprovision".into(),
+                sha256: "22".repeat(32),
+                size_bytes: 1,
+            },
+            IosPackagedMemberEntry {
+                path: "gpu-appraisal-build.json".into(),
+                sha256: build_sha.into(),
+                size_bytes: 1,
+            },
+            IosPackagedMemberEntry {
+                path: "ca-bundle.pem".into(),
+                sha256: solstone_core_distribution::pinned_ca_bundle_sha256().into(),
+                size_bytes: 1,
+            },
+        ];
+        package_members.extend(qualified_rims.iter().map(|rim| IosPackagedMemberEntry {
+            path: rim.filename.clone(),
+            sha256: rim.sha256.clone(),
+            size_bytes: 1,
+        }));
 
         IosGpuAppraisalReceipt {
             status: "passed".into(),
@@ -768,9 +1081,10 @@ mod tests {
                 "/usr/lib/libSystem.B.dylib".into(),
                 "/System/Library/Frameworks/Foundation.framework/Foundation".into(),
             ],
-            helper_sha256: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
-                .into(),
-            schema: None,
+            helper_sha256: helper_sha.into(),
+            schema: "gpu-appraisal-receipt-v2".into(),
+            build_record_sha256: build_sha.into(),
+            package_members,
             steps: Vec::new(),
         }
     }
@@ -780,6 +1094,7 @@ mod tests {
             relative_path: "Extensions/Appraisal.appex/Appraisal".into(),
             is_regular_file: true,
             is_symlink: false,
+            size_bytes: 2048,
             sha256: helper_sha.into(),
             macho_facts: Some(IosMachoFacts {
                 platform: PLATFORM_IOS,
@@ -802,28 +1117,36 @@ mod tests {
     }
 
     fn valid_members(helper_sha: &str) -> Vec<IosBundleMember> {
-        let mut members = Vec::new();
-        members.push(valid_helper_member(helper_sha));
-        members.push(IosBundleMember {
-            relative_path: "Extensions/Appraisal.appex/gpu-appraisal-receipt.json".into(),
-            is_regular_file: true,
-            is_symlink: false,
-            sha256: "receiptsha".into(),
-            macho_facts: None,
-        });
-        members.push(IosBundleMember {
-            relative_path: "Extensions/Appraisal.appex/ca-bundle.pem".into(),
-            is_regular_file: true,
-            is_symlink: false,
-            sha256: solstone_core_distribution::pinned_ca_bundle_sha256().into(),
-            macho_facts: None,
-        });
-        for rim in crate::nvgpu::ManifestSet::QUALIFIED_595_71_05.entries() {
-            members.push(IosBundleMember {
-                relative_path: format!("Extensions/Appraisal.appex/{}", rim.filename()),
+        let receipt = valid_receipt();
+        let mut members = vec![
+            valid_helper_member(helper_sha),
+            IosBundleMember {
+                relative_path: "Extensions/Appraisal.appex/gpu-appraisal-receipt.json".into(),
                 is_regular_file: true,
                 is_symlink: false,
-                sha256: rim.sha256().into(),
+                size_bytes: 1,
+                sha256: "receiptsha".into(),
+                macho_facts: None,
+            },
+            IosBundleMember {
+                relative_path: "Extensions/Appraisal.appex/_CodeSignature/CodeResources".into(),
+                is_regular_file: true,
+                is_symlink: false,
+                size_bytes: 1,
+                sha256: "signature".into(),
+                macho_facts: None,
+            },
+        ];
+        for expected in receipt.package_members {
+            if expected.path == "Appraisal" {
+                continue;
+            }
+            members.push(IosBundleMember {
+                relative_path: format!("Extensions/Appraisal.appex/{}", expected.path),
+                is_regular_file: true,
+                is_symlink: false,
+                size_bytes: expected.size_bytes,
+                sha256: expected.sha256,
                 macho_facts: None,
             });
         }
@@ -987,6 +1310,7 @@ mod tests {
             relative_path: "Extensions/Appraisal.appex/extra_file.txt".into(),
             is_regular_file: true,
             is_symlink: false,
+            size_bytes: 1,
             sha256: "somehash".into(),
             macho_facts: None,
         });
@@ -1093,5 +1417,23 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, IosVerifierRefusal::IntegrityFailed(_)));
+    }
+
+    #[test]
+    fn macho_content_digest_excludes_only_signature_blob() {
+        let mut image = vec![0u8; 52];
+        image[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        image[16..20].copy_from_slice(&1u32.to_le_bytes());
+        image[20..24].copy_from_slice(&16u32.to_le_bytes());
+        image[32..36].copy_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+        image[36..40].copy_from_slice(&16u32.to_le_bytes());
+        image[40..44].copy_from_slice(&48u32.to_le_bytes());
+        image[44..48].copy_from_slice(&4u32.to_le_bytes());
+        image[48..52].copy_from_slice(b"aaaa");
+        let first = ios_macho_content_sha256(&image).unwrap();
+        image[48..52].copy_from_slice(b"bbbb");
+        assert_eq!(first, ios_macho_content_sha256(&image).unwrap());
+        image[8] = 1;
+        assert_ne!(first, ios_macho_content_sha256(&image).unwrap());
     }
 }

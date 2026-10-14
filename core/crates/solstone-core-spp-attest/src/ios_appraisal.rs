@@ -18,8 +18,9 @@ use crate::tlv::GpuEnvelope;
 
 const MAX_NVATTEST_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVIDENCE_JSON_BYTES: usize = 1_048_576;
-const MAX_PROOFS_BYTES: usize = 262_144;
-const MAX_DETACHED_EAT_ENTRIES: usize = 32;
+const MAX_PROOFS_BYTES: usize = 16_384;
+const MAX_DETACHED_EAT_ENTRIES: usize = 16;
+const MAX_RESULT_COMPONENT_BYTES: usize = 2_097_152;
 
 /// A GPU appraisal reply from the out-of-process extension helper.
 #[derive(Clone, PartialEq, Eq)]
@@ -28,7 +29,7 @@ pub struct IosAppraisalReply {
     pub result_code: i32,
     pub result_message: String,
     pub claims: serde_json::Value,
-    pub detached_eat: Vec<String>,
+    pub detached_eat: serde_json::Value,
 }
 
 impl std::fmt::Debug for IosAppraisalReply {
@@ -37,7 +38,10 @@ impl std::fmt::Debug for IosAppraisalReply {
             .field("returncode", &self.returncode)
             .field("result_code", &self.result_code)
             .field("result_message", &self.result_message)
-            .field("detached_eat_count", &self.detached_eat.len())
+            .field(
+                "detached_eat_count",
+                &self.detached_eat.as_array().map_or(0, Vec::len),
+            )
             .finish()
     }
 }
@@ -47,6 +51,7 @@ impl std::fmt::Debug for IosAppraisalReply {
 pub enum AppraisalEvent {
     Start,
     Launched { pid: u32 },
+    RetiredWithoutLaunch,
     Reply(IosAppraisalReply),
     Exited { pid: u32 },
     Cancel,
@@ -79,6 +84,9 @@ enum MachineState {
     Replied {
         pid: u32,
         reply: IosAppraisalReply,
+    },
+    TerminalPendingLaunch {
+        result: AppraisalTerminalResult,
     },
     Terminal {
         result: AppraisalTerminalResult,
@@ -121,7 +129,9 @@ impl AppraisalStateMachine {
         // Enforce ownership check before starting
         if event == AppraisalEvent::Start {
             match &self.state {
-                MachineState::Running { .. } | MachineState::Replied { .. } => {
+                MachineState::Running { .. }
+                | MachineState::Replied { .. }
+                | MachineState::TerminalPendingLaunch { .. } => {
                     return Err(AppraisalStateMachineError::PendingOwnership);
                 }
                 MachineState::Terminal {
@@ -133,6 +143,27 @@ impl AppraisalStateMachine {
                 }
                 _ => {}
             }
+        }
+
+        if matches!(self.state, MachineState::TerminalPendingLaunch { .. }) {
+            let current = std::mem::replace(&mut self.state, MachineState::Initial);
+            let MachineState::TerminalPendingLaunch { result } = current else {
+                unreachable!();
+            };
+            self.state = match event {
+                AppraisalEvent::Launched { pid } => MachineState::Terminal {
+                    result,
+                    owned_pid: Some(pid),
+                    pid_exited: false,
+                },
+                AppraisalEvent::RetiredWithoutLaunch => MachineState::Terminal {
+                    result,
+                    owned_pid: None,
+                    pid_exited: true,
+                },
+                _ => MachineState::TerminalPendingLaunch { result },
+            };
+            return Ok(());
         }
 
         // Terminal state: result is locked and cannot be replaced.
@@ -201,45 +232,59 @@ impl AppraisalStateMachine {
                 owned_pid: None,
                 pid_exited: false,
             },
+            (MachineState::Initial, AppraisalEvent::RetiredWithoutLaunch) => {
+                MachineState::Terminal {
+                    result: AppraisalTerminalResult::Failed("launch retired before start".into()),
+                    owned_pid: None,
+                    pid_exited: true,
+                }
+            }
 
             (MachineState::Started, AppraisalEvent::Launched { pid }) => {
                 MachineState::Running { pid }
             }
-            (MachineState::Started, AppraisalEvent::Cancel) => MachineState::Terminal {
-                result: AppraisalTerminalResult::Cancelled,
-                owned_pid: None,
-                pid_exited: false,
-            },
-            (MachineState::Started, AppraisalEvent::Deadline) => MachineState::Terminal {
-                result: AppraisalTerminalResult::Deadline,
-                owned_pid: None,
-                pid_exited: false,
-            },
-            (MachineState::Started, AppraisalEvent::Disconnect) => MachineState::Terminal {
-                result: AppraisalTerminalResult::Disconnected,
-                owned_pid: None,
-                pid_exited: false,
-            },
-            (MachineState::Started, AppraisalEvent::Malformed(m)) => MachineState::Terminal {
-                result: AppraisalTerminalResult::Malformed(m),
-                owned_pid: None,
-                pid_exited: false,
-            },
-            (MachineState::Started, AppraisalEvent::SecondUse) => MachineState::Terminal {
-                result: AppraisalTerminalResult::SecondUse,
-                owned_pid: None,
-                pid_exited: false,
-            },
+            (MachineState::Started, AppraisalEvent::Cancel) => {
+                MachineState::TerminalPendingLaunch {
+                    result: AppraisalTerminalResult::Cancelled,
+                }
+            }
+            (MachineState::Started, AppraisalEvent::Deadline) => {
+                MachineState::TerminalPendingLaunch {
+                    result: AppraisalTerminalResult::Deadline,
+                }
+            }
+            (MachineState::Started, AppraisalEvent::Disconnect) => {
+                MachineState::TerminalPendingLaunch {
+                    result: AppraisalTerminalResult::Disconnected,
+                }
+            }
+            (MachineState::Started, AppraisalEvent::Malformed(m)) => {
+                MachineState::TerminalPendingLaunch {
+                    result: AppraisalTerminalResult::Malformed(m),
+                }
+            }
+            (MachineState::Started, AppraisalEvent::SecondUse) => {
+                MachineState::TerminalPendingLaunch {
+                    result: AppraisalTerminalResult::SecondUse,
+                }
+            }
             (MachineState::Started, AppraisalEvent::Exited { pid }) => MachineState::Terminal {
                 result: AppraisalTerminalResult::Failed("exited before launch".into()),
                 owned_pid: Some(pid),
                 pid_exited: true,
             },
-            (MachineState::Started, AppraisalEvent::Reply(_)) => MachineState::Terminal {
-                result: AppraisalTerminalResult::Failed("reply before launch".into()),
-                owned_pid: None,
-                pid_exited: false,
-            },
+            (MachineState::Started, AppraisalEvent::Reply(_)) => {
+                MachineState::TerminalPendingLaunch {
+                    result: AppraisalTerminalResult::Failed("reply before launch".into()),
+                }
+            }
+            (MachineState::Started, AppraisalEvent::RetiredWithoutLaunch) => {
+                MachineState::Terminal {
+                    result: AppraisalTerminalResult::Failed("launch retired".into()),
+                    owned_pid: None,
+                    pid_exited: true,
+                }
+            }
             (MachineState::Started, AppraisalEvent::Start) => MachineState::Started,
 
             (MachineState::Running { pid }, AppraisalEvent::Reply(reply)) => {
@@ -283,6 +328,15 @@ impl AppraisalStateMachine {
             (MachineState::Running { pid }, AppraisalEvent::Launched { .. })
             | (MachineState::Running { pid }, AppraisalEvent::Start) => {
                 MachineState::Running { pid }
+            }
+            (MachineState::Running { pid }, AppraisalEvent::RetiredWithoutLaunch) => {
+                MachineState::Terminal {
+                    result: AppraisalTerminalResult::Failed(
+                        "launch retirement reported after pid ownership".into(),
+                    ),
+                    owned_pid: Some(pid),
+                    pid_exited: false,
+                }
             }
 
             (MachineState::Replied { pid, reply }, AppraisalEvent::Exited { pid: exit_pid }) => {
@@ -344,7 +398,17 @@ impl AppraisalStateMachine {
             | (MachineState::Replied { pid, reply }, AppraisalEvent::Start) => {
                 MachineState::Replied { pid, reply }
             }
+            (MachineState::Replied { pid, .. }, AppraisalEvent::RetiredWithoutLaunch) => {
+                MachineState::Terminal {
+                    result: AppraisalTerminalResult::Failed(
+                        "launch retirement reported after reply".into(),
+                    ),
+                    owned_pid: Some(pid),
+                    pid_exited: false,
+                }
+            }
 
+            (MachineState::TerminalPendingLaunch { .. }, _) => unreachable!(),
             (MachineState::Terminal { .. }, _) => unreachable!(),
         };
 
@@ -358,6 +422,7 @@ impl AppraisalStateMachine {
     #[must_use]
     pub fn drain_ready(&self) -> bool {
         match &self.state {
+            MachineState::TerminalPendingLaunch { .. } => false,
             MachineState::Terminal {
                 owned_pid,
                 pid_exited,
@@ -371,6 +436,7 @@ impl AppraisalStateMachine {
     #[must_use]
     pub fn terminal_result(&self) -> Option<&AppraisalTerminalResult> {
         match &self.state {
+            MachineState::TerminalPendingLaunch { result } => Some(result),
             MachineState::Terminal { result, .. } => Some(result),
             _ => None,
         }
@@ -511,21 +577,27 @@ pub fn classify_ios_appraisal_result(
     owner_nonce: &[u8; 32],
     verification_time_unix: i64,
 ) -> Result<NvattestAcceptance, GpuAppraisalReason> {
-    if reply.detached_eat.len() > MAX_DETACHED_EAT_ENTRIES {
+    if serde_json::to_vec(&reply.claims)
+        .map_or(true, |bytes| bytes.len() > MAX_RESULT_COMPONENT_BYTES)
+        || serde_json::to_vec(&reply.detached_eat)
+            .map_or(true, |bytes| bytes.len() > MAX_RESULT_COMPONENT_BYTES)
+        || reply.result_message.len() > 4_096
+    {
         return Err(GpuAppraisalReason::GpuAppraisalFailed);
     }
-
-    let detached_eat_json = reply
+    if !reply
         .detached_eat
-        .iter()
-        .map(|jwt| serde_json::json!(["JWT", jwt]))
-        .collect::<Vec<_>>();
+        .as_array()
+        .is_some_and(|entries| entries.len() <= MAX_DETACHED_EAT_ENTRIES)
+    {
+        return Err(GpuAppraisalReason::GpuAppraisalFailed);
+    }
 
     let stdout_val = serde_json::json!({
         "result_code": reply.result_code,
         "result_message": reply.result_message,
         "claims": reply.claims,
-        "detached_eat": detached_eat_json,
+        "detached_eat": reply.detached_eat,
     });
 
     let stdout_str =
@@ -643,7 +715,7 @@ mod tests {
             result_code: 0,
             result_message: "Ok".into(),
             claims: serde_json::json!([{"x-nvidia-overall-result": true}]),
-            detached_eat: vec!["fake-jwt".into()],
+            detached_eat: serde_json::json!([["JWT", "fake-jwt"]]),
         }
     }
 
@@ -706,12 +778,12 @@ mod tests {
     }
 
     #[test]
-    fn state_machine_cancel_before_launch_is_immediately_drain_ready() {
+    fn state_machine_cancel_before_launch_retains_pending_activation() {
         let mut sm = AppraisalStateMachine::new();
         sm.handle_event(AppraisalEvent::Start).unwrap();
         sm.handle_event(AppraisalEvent::Cancel).unwrap();
 
-        assert!(sm.drain_ready());
+        assert!(!sm.drain_ready());
         assert_eq!(
             sm.terminal_result(),
             Some(&AppraisalTerminalResult::Cancelled)
@@ -729,6 +801,18 @@ mod tests {
         sm.handle_event(AppraisalEvent::Exited { pid: 5678 })
             .unwrap();
         assert!(sm.drain_ready());
+
+        let mut retired = AppraisalStateMachine::new();
+        retired.handle_event(AppraisalEvent::Start).unwrap();
+        retired.handle_event(AppraisalEvent::Cancel).unwrap();
+        retired
+            .handle_event(AppraisalEvent::RetiredWithoutLaunch)
+            .unwrap();
+        assert!(retired.drain_ready());
+        assert_eq!(
+            retired.terminal_result(),
+            Some(&AppraisalTerminalResult::Cancelled)
+        );
     }
 
     #[test]
@@ -946,7 +1030,7 @@ mod tests {
             result_code: 504,
             result_message: "Nonce mismatch in attestation".into(),
             claims: serde_json::json!([]),
-            detached_eat: vec![],
+            detached_eat: serde_json::json!([]),
         };
         let nonce = [0u8; 32];
         let err = classify_ios_appraisal_result(&reply, &nonce, 1_700_000_000).unwrap_err();
