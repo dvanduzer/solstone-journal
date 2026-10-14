@@ -1754,6 +1754,7 @@ fn write_stage(
     sealed_archives: Option<&SealedArchiveSet>,
     stage: &Path,
 ) -> Result<StagedWrite, ProduceError> {
+    let _xz_tars = crate::pinned_stage::XzTarScope::enter();
     select::stage_selected(selection, stage)?;
     let archives = stage_layout(
         repo,

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::digest::sha256_hex;
 use crate::inventory::StagedMember;
@@ -151,6 +153,62 @@ pub(crate) fn plan_pinned_input(
     Ok(plans)
 }
 
+thread_local! {
+    static XZ_TARS: RefCell<Option<BTreeMap<String, Rc<Vec<u8>>>>> = const { RefCell::new(None) };
+}
+
+/// While alive, each distinct `.tar.xz` input read on this thread is
+/// decompressed once, keyed by the sha256 of its compressed bytes.
+pub(crate) struct XzTarScope {
+    owner: bool,
+}
+
+impl XzTarScope {
+    pub(crate) fn enter() -> Self {
+        let owner = XZ_TARS.with(|tars| {
+            let mut tars = tars.borrow_mut();
+            if tars.is_some() {
+                return false;
+            }
+            *tars = Some(BTreeMap::new());
+            true
+        });
+        Self { owner }
+    }
+}
+
+impl Drop for XzTarScope {
+    fn drop(&mut self) {
+        if self.owner {
+            XZ_TARS.with(|tars| tars.borrow_mut().take());
+        }
+    }
+}
+
+fn xz_tar(entry: &str, bytes: &[u8], filename: &str) -> Result<Rc<Vec<u8>>, ProduceError> {
+    let key = XZ_TARS
+        .with(|tars| tars.borrow().is_some())
+        .then(|| sha256_hex(bytes));
+    if let Some(key) = &key
+        && let Some(tar) = XZ_TARS.with(|tars| tars.borrow().as_ref()?.get(key).cloned())
+    {
+        return Ok(tar);
+    }
+    let mut decompressed = Vec::new();
+    lzma_rs::xz_decompress(&mut &bytes[..], &mut decompressed).map_err(|e| {
+        ProduceError::new(format!("{entry}: xz decompress failed for {filename}: {e}"))
+    })?;
+    let tar = Rc::new(decompressed);
+    if let Some(key) = key {
+        XZ_TARS.with(|tars| {
+            if let Some(tars) = tars.borrow_mut().as_mut() {
+                tars.insert(key, Rc::clone(&tar));
+            }
+        });
+    }
+    Ok(tar)
+}
+
 pub(crate) fn collect_archive_members(
     entry: &str,
     bytes: &[u8],
@@ -163,10 +221,7 @@ pub(crate) fn collect_archive_members(
         let mut tar = tar::Archive::new(gz);
         parse_tar_members(entry, &mut tar, &mut members)?;
     } else if filename.ends_with(".tar.xz") {
-        let mut decompressed = Vec::new();
-        lzma_rs::xz_decompress(&mut &bytes[..], &mut decompressed).map_err(|e| {
-            ProduceError::new(format!("{entry}: xz decompress failed for {filename}: {e}"))
-        })?;
+        let decompressed = xz_tar(entry, bytes, filename)?;
         let mut tar = tar::Archive::new(&decompressed[..]);
         parse_tar_members(entry, &mut tar, &mut members)?;
     } else if filename.ends_with(".zip") {
@@ -407,10 +462,7 @@ pub(crate) fn extract_needed_members(
         let mut tar = tar::Archive::new(gz);
         extract_tar_members(entry, &mut tar, needed, &mut contents)?;
     } else if filename.ends_with(".tar.xz") {
-        let mut decompressed = Vec::new();
-        lzma_rs::xz_decompress(&mut &bytes[..], &mut decompressed).map_err(|e| {
-            ProduceError::new(format!("{entry}: xz decompress failed for {filename}: {e}"))
-        })?;
+        let decompressed = xz_tar(entry, bytes, filename)?;
         let mut tar = tar::Archive::new(&decompressed[..]);
         extract_tar_members(entry, &mut tar, needed, &mut contents)?;
     } else if filename.ends_with(".zip") {
@@ -943,6 +995,24 @@ mod tests {
         let xz_extracted =
             extract_and_verify_plans("entry-xz", &xz_tar, "test.tar.xz", &xz_plans).unwrap();
         assert_eq!(xz_extracted["xz_file.txt"], b"xz data");
+    }
+
+    #[test]
+    fn xz_tar_scope_decompresses_each_input_once() {
+        let xz = make_tar_xz(&[("a.txt", b"a", tar::EntryType::Regular, None)]);
+        let unscoped = xz_tar("e", &xz, "a.tar.xz").unwrap();
+        assert!(!Rc::ptr_eq(
+            &unscoped,
+            &xz_tar("e", &xz, "a.tar.xz").unwrap()
+        ));
+        {
+            let _scope = XzTarScope::enter();
+            let first = xz_tar("e", &xz, "a.tar.xz").unwrap();
+            let _nested = XzTarScope::enter();
+            assert!(Rc::ptr_eq(&first, &xz_tar("e", &xz, "a.tar.xz").unwrap()));
+            assert_eq!(*first, *unscoped);
+        }
+        assert!(XZ_TARS.with(|tars| tars.borrow().is_none()));
     }
 
     #[test]
@@ -1491,6 +1561,7 @@ mod tests {
     #[test]
     fn nvattest_inventory_targets_staged_and_admitted() {
         const EM_AARCH64: u16 = 183;
+        let _xz_tars = XzTarScope::enter();
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(3)
