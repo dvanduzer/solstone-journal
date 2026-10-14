@@ -6534,9 +6534,14 @@ mod tests {
     fn backup_excludes_endpoint_key_material_by_its_resolved_path() {
         let journal = Path::new("/journal");
         let args = backup_args(journal);
-        let endpoint = crate::restic_filesystem_path(&journal.join("mcp-endpoint"));
-        let chatgpt =
-            crate::restic_filesystem_path(&journal.join("config").join("chatgpt-sign-in.json*"));
+        let root = crate::restic_filesystem_path(journal);
+        let root = if cfg!(windows) {
+            root.replace('\\', "/")
+        } else {
+            root
+        };
+        let endpoint = format!("{root}/mcp-endpoint");
+        let chatgpt = format!("{root}/config/chatgpt-sign-in.json*");
         assert!(
             args.windows(2)
                 .any(|pair| pair[0] == "--exclude" && pair[1] == endpoint),
@@ -6628,16 +6633,21 @@ mod tests {
             without_exclude_file(&commands[1]),
             json_backup_args(&resolved)
         );
-        assert_eq!(commands[1][1], resolved.display().to_string());
+        assert_eq!(commands[1][1], crate::restic_filesystem_path(&resolved));
         assert_eq!(
             commands[1]
                 .windows(2)
                 .find(|pair| pair[0] == "--exclude" && pair[1].ends_with("/mcp-endpoint")),
             Some(
-                [
-                    "--exclude".to_owned(),
-                    resolved.join("mcp-endpoint").display().to_string()
-                ]
+                ["--exclude".to_owned(), {
+                    let root = crate::restic_filesystem_path(&resolved);
+                    let root = if cfg!(windows) {
+                        root.replace('\\', "/")
+                    } else {
+                        root
+                    };
+                    format!("{root}/mcp-endpoint")
+                }]
                 .as_slice()
             )
         );

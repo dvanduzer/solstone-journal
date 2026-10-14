@@ -528,7 +528,16 @@ mod tests {
         .expect("place journal below an ancestor");
         // The source was opened before this ancestor rename, so its retained root
         // remains authoritative despite the stale diagnostic spelling.
-        fs::rename(&outer, &moved_outer).expect("rename ancestor");
+        // Windows may prevent an ancestor rename while a descendant is retained.
+        let active_outer = match fs::rename(&outer, &moved_outer) {
+            Ok(()) => moved_outer,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert!(outer.is_dir());
+                assert!(!moved_outer.exists());
+                outer
+            }
+            Err(error) => panic!("rename ancestor: {error}"),
+        };
         assert_eq!(
             source
                 .open_file(&entry)
@@ -537,11 +546,26 @@ mod tests {
             b"segment"
         );
 
-        let original_child = moved_outer.join("journal/chronicle");
-        let displaced_child = moved_outer.join("journal/chronicle-original");
-        fs::rename(&original_child, &displaced_child).expect("move observed route directory");
+        let original_child = active_outer.join("journal").join("chronicle");
+        let displaced_child = active_outer.join("journal").join("chronicle-original");
+        match fs::rename(&original_child, &displaced_child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert!(original_child.is_dir());
+                assert!(!displaced_child.exists());
+                assert_eq!(
+                    source
+                        .open_file(&entry)
+                        .expect("retained source")
+                        .into_bytes(),
+                    b"segment"
+                );
+                return;
+            }
+            Err(error) => panic!("move observed route directory: {error}"),
+        }
         write(
-            &moved_outer.join("journal"),
+            &active_outer.join("journal"),
             "chronicle/20260101/segment.jsonl",
             b"replacement",
         );

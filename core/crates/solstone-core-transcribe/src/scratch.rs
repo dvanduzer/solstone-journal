@@ -94,10 +94,7 @@ mod tests {
         let path = root.join(name);
         fs::create_dir(&path).unwrap();
         fs::write(path.join("audio.f32le"), [0_u8; 8]).unwrap();
-        fs::File::open(&path)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(modified))
-            .unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(modified)).unwrap();
         path
     }
 

@@ -721,6 +721,8 @@ mod tests {
         assert_eq!(error.exit_code(), 64);
     }
 
+    // Unix probes open the declared library; Windows first verifies its managed package.
+    #[cfg(not(windows))]
     #[test]
     fn probe_missing_library_reports_library_unreadable() {
         let directory = tempfile::tempdir().unwrap();
@@ -732,6 +734,17 @@ mod tests {
             },
         })))
         .unwrap_err();
+        assert_eq!(error.reason(), "library-unreadable");
+        assert_eq!(error.exit_code(), 69);
+    }
+
+    #[test]
+    fn missing_library_reports_library_unreadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = match open_library(&directory.path().join("missing.so")) {
+            Ok(_) => panic!("missing library must be refused"),
+            Err(error) => error,
+        };
         assert_eq!(error.reason(), "library-unreadable");
         assert_eq!(error.exit_code(), 69);
     }

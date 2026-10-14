@@ -51,6 +51,7 @@ ureq = { workspace = true, features = ["multipart"] }
 nix = { workspace = true, features = ["process", "signal"] }
 
 [dev-dependencies]
+filetime = "0.2.29"
 temp-env = "0.3.6"
 socket2 = { workspace = true }
 solstone-core-installed-payload = { workspace = true }

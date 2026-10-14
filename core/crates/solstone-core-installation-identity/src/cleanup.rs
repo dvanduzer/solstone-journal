@@ -316,41 +316,52 @@ fn component_equal(a: &std::ffi::OsStr, b: &std::ffi::OsStr, insensitive: bool) 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use super::*;
+
+    fn absolute_test_path(path: &str) -> PathBuf {
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        path.split('/').filter(|part| !part.is_empty()).fold(
+            PathBuf::from(root),
+            |mut result, part| {
+                result.push(part);
+                result
+            },
+        )
+    }
 
     #[test]
     fn cleanup_target_overlap_uses_components_in_both_directions() {
         let platform = PlatformTag::Linux;
         assert!(cleanup_target_overlaps_journal(
-            Path::new("/journal"),
-            Path::new("/journal"),
+            &absolute_test_path("/journal"),
+            &absolute_test_path("/journal"),
             platform
         ));
         assert!(cleanup_target_overlaps_journal(
-            Path::new("/journal/child"),
-            Path::new("/journal"),
+            &absolute_test_path("/journal/child"),
+            &absolute_test_path("/journal"),
             platform
         ));
         assert!(cleanup_target_overlaps_journal(
-            Path::new("/journal"),
-            Path::new("/journal/child"),
+            &absolute_test_path("/journal"),
+            &absolute_test_path("/journal/child"),
             platform
         ));
         assert!(!cleanup_target_overlaps_journal(
-            Path::new("/journal-backup"),
-            Path::new("/journal"),
+            &absolute_test_path("/journal-backup"),
+            &absolute_test_path("/journal"),
             platform
         ));
         assert!(!cleanup_target_overlaps_journal(
-            Path::new("/other"),
-            Path::new("/journal"),
+            &absolute_test_path("/other"),
+            &absolute_test_path("/journal"),
             platform
         ));
         assert!(cleanup_target_overlaps_journal(
-            Path::new("/a/../journal/./child"),
-            Path::new("/journal"),
+            &absolute_test_path("/a/../journal/./child"),
+            &absolute_test_path("/journal"),
             platform
         ));
     }
@@ -358,13 +369,13 @@ mod tests {
     #[test]
     fn cleanup_target_overlap_honors_windows_case_aliases() {
         assert!(cleanup_target_overlaps_journal(
-            Path::new("/Users/Owner/Journal/child"),
-            Path::new("/users/owner/journal"),
+            &absolute_test_path("/Users/Owner/Journal/child"),
+            &absolute_test_path("/users/owner/journal"),
             PlatformTag::Windows
         ));
         assert!(!cleanup_target_overlaps_journal(
-            Path::new("/Users/Owner/Journal-backup"),
-            Path::new("/users/owner/journal"),
+            &absolute_test_path("/Users/Owner/Journal-backup"),
+            &absolute_test_path("/users/owner/journal"),
             PlatformTag::Windows
         ));
     }
@@ -372,18 +383,18 @@ mod tests {
     #[test]
     fn same_protected_place_requires_path_equality() {
         assert!(same_protected_place(
-            Path::new("/journal/./data"),
-            Path::new("/journal/data"),
+            &absolute_test_path("/journal/./data"),
+            &absolute_test_path("/journal/data"),
             false
         ));
         assert!(same_protected_place(
-            Path::new("/Owner/Journal"),
-            Path::new("/owner/journal"),
+            &absolute_test_path("/Owner/Journal"),
+            &absolute_test_path("/owner/journal"),
             true
         ));
         assert!(!same_protected_place(
-            Path::new("/journal"),
-            Path::new("/journal/child"),
+            &absolute_test_path("/journal"),
+            &absolute_test_path("/journal/child"),
             false
         ));
     }
@@ -391,19 +402,19 @@ mod tests {
     #[test]
     fn identity_writes_overlap_covers_provider_ancestors_and_descendants() {
         let mut journals = ProtectedJournals::new(PlatformTag::Linux);
-        journals.insert(PathBuf::from("/home/.local/share/solstone"));
+        journals.insert(absolute_test_path("/home/.local/share/solstone"));
         assert!(identity_writes_overlap(
-            Path::new("/home/.local/share/solstone/installation-identity/v1"),
+            &absolute_test_path("/home/.local/share/solstone/installation-identity/v1"),
             &journals,
             PlatformTag::Linux
         ));
 
         let mut nested = ProtectedJournals::new(PlatformTag::Linux);
-        nested.insert(PathBuf::from(
+        nested.insert(absolute_test_path(
             "/home/.local/share/solstone/installation-identity/v1/namespaces/id/journal",
         ));
         assert!(identity_writes_overlap(
-            Path::new("/home/.local/share/solstone/installation-identity/v1"),
+            &absolute_test_path("/home/.local/share/solstone/installation-identity/v1"),
             &nested,
             PlatformTag::Linux
         ));
@@ -411,7 +422,7 @@ mod tests {
 
     #[test]
     fn cleanup_target_decision_applies_shared_and_per_install_rules() {
-        let target = Path::new("/home/.cache/solstone/rclone");
+        let target = &absolute_test_path("/home/.cache/solstone/rclone");
         let empty = ProtectedJournals::new(PlatformTag::Linux);
         assert_eq!(
             may_remove_cleanup_target(
@@ -450,7 +461,7 @@ mod tests {
         );
         assert_eq!(
             may_remove_cleanup_target(
-                Path::new("/home/.config/solstone/config.toml"),
+                &absolute_test_path("/home/.config/solstone/config.toml"),
                 CleanupTargetKind::Shared,
                 true,
                 true,

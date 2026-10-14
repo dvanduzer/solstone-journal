@@ -531,6 +531,7 @@ fn browse_uses_recency_and_rowid_instead_of_bm25_ties() {
         .expect("collect old ordering");
     assert_eq!(old_order.first().map(String::as_str), Some("20260101"));
     assert_ne!(old_order[0], first.results[0].metadata.day);
+    drop(old_connection);
     fs::remove_dir_all(root).expect("cleanup recency index");
 }
 
@@ -2317,6 +2318,7 @@ fn fetch_day_hits_one_statement_no_union() {
     assert_eq!(hits[1].0, "20260102");
     assert_eq!(hits[2].0, "20260101");
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2368,6 +2370,7 @@ fn fetch_day_hits_per_day_limit_and_row_bound() {
     let total_fetched: usize = hits.iter().map(|(_, h)| h.len()).sum();
     assert_eq!(total_fetched, 6);
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2426,6 +2429,7 @@ fn fetch_day_hits_preserves_day_and_relevance_order() {
     assert_eq!(hits[1].0, "20260101");
     assert_eq!(hits[2].0, "20260103");
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2486,6 +2490,7 @@ fn fetch_day_hits_reuses_resolved_plan_without_reresolve() {
         "two fetch_day_hits calls"
     );
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2520,6 +2525,7 @@ fn resolve_counts_identical_requests_are_not_implicitly_deduped() {
         "indexer-query executes each resolve_counts independently without implicit cache"
     );
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2554,6 +2560,7 @@ fn has_rows_does_not_count_as_fetch_or_aggregate() {
         "probes must not count as fetch_hits_calls"
     );
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2590,6 +2597,7 @@ fn fetch_day_hits_empty_days_does_not_query() {
         "empty days must not dispatch fetch query"
     );
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2681,6 +2689,7 @@ fn fetch_day_hits_without_live_match_uses_recency() {
     assert_eq!(day_hits[1].metadata.path, "20260101/pulse_2.md");
     assert_eq!(day_hits[2].metadata.path, "20260101/pulse_1.md");
 
+    drop(owner_index);
     fs::remove_dir_all(root).unwrap();
 }
 

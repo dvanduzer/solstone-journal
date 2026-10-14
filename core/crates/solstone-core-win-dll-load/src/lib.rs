@@ -120,6 +120,10 @@ fn has_current_dir_component(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn absolute_test_path(relative: &str) -> PathBuf {
+        Path::new(if cfg!(windows) { r"C:\" } else { "/" }).join(relative)
+    }
+
     #[test]
     fn forward_slashes_become_backslashes_for_loadlibraryex() {
         // An inventory path joined onto the install root, as shipped in 2.0.39's
@@ -164,7 +168,10 @@ mod tests {
     #[test]
     fn parent_dir_component_is_traversal() {
         assert_eq!(
-            resolve_load(LoadPolicy::ApplicationDir, Path::new("/opt/../lib/x.dll")),
+            resolve_load(
+                LoadPolicy::ApplicationDir,
+                &absolute_test_path("opt/../lib/x.dll")
+            ),
             Err(PathError::TraversalComponent)
         );
     }
@@ -172,7 +179,10 @@ mod tests {
     #[test]
     fn cur_dir_component_is_traversal() {
         assert_eq!(
-            resolve_load(LoadPolicy::ApplicationDir, Path::new("/opt/app/./x.dll")),
+            resolve_load(
+                LoadPolicy::ApplicationDir,
+                &absolute_test_path("opt/app/./x.dll")
+            ),
             Err(PathError::TraversalComponent)
         );
     }
@@ -180,9 +190,12 @@ mod tests {
     #[test]
     fn clean_absolute_path_carries_application_dir_flags() {
         assert_eq!(
-            resolve_load(LoadPolicy::ApplicationDir, Path::new("/opt/app/x.dll")),
+            resolve_load(
+                LoadPolicy::ApplicationDir,
+                &absolute_test_path("opt/app/x.dll")
+            ),
             Ok(ResolvedLoad {
-                path: PathBuf::from("/opt/app/x.dll"),
+                path: absolute_test_path("opt/app/x.dll"),
                 flags: 0x0A00,
             })
         );

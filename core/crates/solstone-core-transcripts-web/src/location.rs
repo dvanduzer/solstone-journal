@@ -375,14 +375,14 @@ mod tests {
 
         // Set input mtimes slightly in the past before scan_day so the cache is strictly newer than inputs
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
-        let file_times = fs::FileTimes::new().set_modified(past);
+        let file_times = filetime::FileTime::from_system_time(past);
         for entry in fs::read_dir(&seg_dir).unwrap() {
             let entry = entry.unwrap();
-            let _ = fs::File::open(entry.path()).and_then(|f| f.set_times(file_times));
+            filetime::set_file_mtime(entry.path(), file_times).unwrap();
         }
         for entry in fs::read_dir(&loc_seg_dir).unwrap() {
             let entry = entry.unwrap();
-            let _ = fs::File::open(entry.path()).and_then(|f| f.set_times(file_times));
+            filetime::set_file_mtime(entry.path(), file_times).unwrap();
         }
 
         // Before scan_day writes stats.json, loc_day is absent from the month object
@@ -432,7 +432,7 @@ mod tests {
         fs::remove_file(seg_dir.join("location.jsonl")).unwrap();
         for entry in fs::read_dir(&seg_dir).unwrap() {
             let entry = entry.unwrap();
-            let _ = fs::File::open(entry.path()).and_then(|f| f.set_times(file_times));
+            filetime::set_file_mtime(entry.path(), file_times).unwrap();
         }
         solstone_core_journal_stats_cli::scan_day(
             solstone_core_journal_stats_cli::DayScanRequest {

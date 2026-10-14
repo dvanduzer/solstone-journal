@@ -27,4 +27,5 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+filetime = "0.2.29"
 tempfile = "3.24.0"

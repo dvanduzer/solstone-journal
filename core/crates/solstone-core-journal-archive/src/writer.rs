@@ -511,10 +511,10 @@ mod tests {
             .canonical_source()
             .to_str()
             .expect("UTF-8 canonical source");
-        assert!(!source_journal.contains('"'));
-        assert!(!source_journal.contains('\\'));
+        let source_journal =
+            serde_json::to_string(source_journal).expect("encode native source path");
         let expected = format!(
-            "{{\n  \"solstone_version\": \"2.3.4\",\n  \"exported_at\": \"2040-01-02T03:04:59Z\",\n  \"source_journal\": \"{source_journal}\",\n  \"day_count\": 0,\n  \"entity_count\": 0,\n  \"facet_count\": 0\n}}"
+            "{{\n  \"solstone_version\": \"2.3.4\",\n  \"exported_at\": \"2040-01-02T03:04:59Z\",\n  \"source_journal\": {source_journal},\n  \"day_count\": 0,\n  \"entity_count\": 0,\n  \"facet_count\": 0\n}}"
         );
         assert_eq!(contents, expected.as_bytes());
     }

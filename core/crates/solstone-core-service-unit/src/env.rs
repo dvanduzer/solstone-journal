@@ -47,7 +47,12 @@ mod tests {
             .unwrap(),
             id: InstallationId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             generation: Generation::new(1).unwrap(),
-            journal_token: JournalToken::from_raw_absolute(b"/journal".to_vec()).unwrap(),
+            journal_token: JournalToken::from_raw_absolute(if cfg!(windows) {
+                br"C:\journal".to_vec()
+            } else {
+                b"/journal".to_vec()
+            })
+            .unwrap(),
         }
     }
 

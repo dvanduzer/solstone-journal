@@ -4730,6 +4730,7 @@ name = "solstone-core-journal-archive"
 version = "2.0.46"
 dependencies = [
  "nix",
+ "serde_json",
  "solstone-core-journal-io",
  "zip 2.4.2",
 ]
@@ -4828,6 +4829,7 @@ name = "solstone-core-journal-stats-cli"
 version = "2.0.46"
 dependencies = [
  "chrono",
+ "filetime",
  "serde",
  "serde_json",
  "solstone-core-facets",
@@ -5740,6 +5742,7 @@ name = "solstone-core-system-health"
 version = "2.0.46"
 dependencies = [
  "chrono",
+ "filetime",
  "log",
  "regex",
  "serde",
@@ -5937,6 +5940,7 @@ name = "solstone-core-transcribe"
 version = "2.0.46"
 dependencies = [
  "chrono",
+ "filetime",
  "getrandom 0.3.4",
  "log",
  "nix",
@@ -6003,6 +6007,7 @@ dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
+ "filetime",
  "getrandom 0.3.4",
  "jsonschema",
  "nix",

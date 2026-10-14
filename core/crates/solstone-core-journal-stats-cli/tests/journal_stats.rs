@@ -150,10 +150,7 @@ fn value(document: StatsDocument) -> Value {
 }
 
 fn set_modified(path: &Path, modified: SystemTime) {
-    fs::File::open(path)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(modified))
-        .unwrap();
+    filetime::set_file_mtime(path, filetime::FileTime::from_system_time(modified)).unwrap();
 }
 
 #[test]

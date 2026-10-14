@@ -420,7 +420,8 @@ fn journal_is_operated(journal: &Path) -> bool {
         && config.get("mode") == Some(&Value::String("operated".into()))
 }
 
-#[cfg(test)]
+// These fixtures exercise Unix package admission; Windows verifies its worker manifest instead.
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
     use crate::engine::{Clock, prepare};

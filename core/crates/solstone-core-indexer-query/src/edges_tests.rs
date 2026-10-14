@@ -658,6 +658,7 @@ fn empty_partial_and_absent_indexes_have_distinct_results_without_writes() {
         .unwrap(),
         0
     );
+    drop(conn);
     cleanup(partial);
     let absent = root("absent");
     fs::create_dir_all(&absent).unwrap();
@@ -786,6 +787,7 @@ fn reader_opens_real_schema_without_creating_a_second_database() {
             .unwrap(),
         1
     );
+    drop(connection);
     cleanup(root);
 }
 

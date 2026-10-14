@@ -911,10 +911,11 @@ mod tests {
         write_file(&d3, "location.jsonl", "{\"lat\":0.0}\n");
         let marker = d3.join(".analyzing_audio");
         write_file(&d3, ".analyzing_audio", "{}\n");
-        fs::File::open(&marker)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(SystemTime::from(now)))
-            .unwrap();
+        filetime::set_file_mtime(
+            &marker,
+            filetime::FileTime::from_system_time(SystemTime::from(now)),
+        )
+        .unwrap();
 
         // 4. beside .analyze_failed_audio -> scan_day
         let d4 = root
