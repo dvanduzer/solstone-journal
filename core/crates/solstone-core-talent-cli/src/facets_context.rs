@@ -338,6 +338,7 @@ fn truncate_to_line_budget(prefix: &str, description: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     use super::*;
@@ -498,10 +499,13 @@ mod tests {
         assert!(!mixed.contains("bad"));
 
         // Unreadable / broken inventory fails loudly with Err
-        let blocked = root.path().join("facets");
-        fs::remove_dir_all(&blocked).expect("remove directory");
-        symlink("facets", &blocked).expect("self-referential facets path");
-        assert!(resolve_facets(root.path(), None).is_err());
+        #[cfg(unix)]
+        {
+            let blocked = root.path().join("facets");
+            fs::remove_dir_all(&blocked).expect("remove directory");
+            symlink("facets", &blocked).expect("self-referential facets path");
+            assert!(resolve_facets(root.path(), None).is_err());
+        }
     }
 
     /// The placeholder must become the owner's real facets.

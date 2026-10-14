@@ -741,6 +741,8 @@ mod tests {
         assert_ne!(first_signature.sha256, third_signature.sha256);
     }
 
+    // The codesign stand-in is a shell script, which only Unix hosts run.
+    #[cfg(unix)]
     #[test]
     fn helper_member_does_not_permit_disabled_library_validation() {
         use std::os::unix::fs::PermissionsExt;

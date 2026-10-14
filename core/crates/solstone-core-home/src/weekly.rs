@@ -1012,6 +1012,7 @@ fn first_card(context: &HomeContext) -> Value {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     use chrono::{TimeZone, Utc};
@@ -1599,13 +1600,16 @@ mod tests {
         fs::remove_dir(root.path().join("reflections/weekly/20260308.md")).unwrap();
 
         // md self-symlink (ELOOP) -> CouldntCheck
-        symlink(
-            root.path().join("reflections/weekly/20260308.md"),
-            root.path().join("reflections/weekly/20260308.md"),
-        )
-        .unwrap();
-        assert_eq!(judge(root.path(), sun), WeekJudgment::CouldntCheck);
-        fs::remove_file(root.path().join("reflections/weekly/20260308.md")).unwrap();
+        #[cfg(unix)]
+        {
+            symlink(
+                root.path().join("reflections/weekly/20260308.md"),
+                root.path().join("reflections/weekly/20260308.md"),
+            )
+            .unwrap();
+            assert_eq!(judge(root.path(), sun), WeekJudgment::CouldntCheck);
+            fs::remove_file(root.path().join("reflections/weekly/20260308.md")).unwrap();
+        }
 
         // Bad JSON syntax -> CouldntCheck
         write(
