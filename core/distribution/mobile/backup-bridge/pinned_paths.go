@@ -320,7 +320,7 @@ func clearDirectoryContents(fd int) error {
 			return err
 		}
 		if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
-			identityFD, err := openCleanupEntryAt(fd, child, stat.Mode)
+			identityFD, err := openCleanupEntryAt(fd, child, uint32(stat.Mode))
 			if err != nil {
 				return err
 			}
@@ -370,7 +370,7 @@ func clearDirectoryContents(fd int) error {
 			}
 			continue
 		}
-		childFD, err := openCleanupEntryAt(fd, child, stat.Mode)
+		childFD, err := openCleanupEntryAt(fd, child, uint32(stat.Mode))
 		if err != nil {
 			return err
 		}
