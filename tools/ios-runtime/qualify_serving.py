@@ -49,7 +49,9 @@ class Phone:
                 events.put(row)
             events.put(None)
         threading.Thread(target=capture, daemon=True).start()
-        return self.wait(lambda r: r['event'] == 'serve.start')
+        started = self.wait(lambda r: r['event'] == 'serve.start')
+        native(started['value']['reply'])
+        return started
 
     def wait(self, predicate, seconds=160):
         deadline = time.monotonic() + seconds
