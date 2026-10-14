@@ -44,9 +44,9 @@ the worker to finish, checks that no snapshot was published and compares the
 repository again after two seconds for late writes.
 
 Collect `Documents/backup-evidence.jsonl` from the app container together with
-`app-manifest.json` and the native build receipt. A phase passes only when its
-`phase.finished` event says `passed: true`; installation and process exit alone
-are insufficient. To repeat the first phase, uninstall this development app
+`app-manifest.json` and the native build receipt. A phase passes only when the process exits with code 0 and its matching
+`phase.finished` event says `passed: true`. Match console and durable events
+by PID. To repeat the first phase, uninstall this development app
 and reinstall it, which removes only its synthetic fixtures.
 
 The archive and this check cover local repositories. They do not establish
