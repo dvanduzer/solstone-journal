@@ -47,6 +47,43 @@ pub struct WorkHold {
     pub reason: String,
 }
 
+/// A completed discovery pass's history view, never a completion authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryProgress {
+    pub caught_up_since: Option<String>,
+    pub through_day: String,
+    pub segments_owed: u64,
+    pub daily_units_owed: u64,
+    pub set_aside_units: u64,
+    pub unreadable_days: usize,
+    pub sample: Option<HistorySample>,
+    pub net_per_hour: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySample {
+    pub local_day: String,
+    pub journal_version: String,
+    pub as_of_ms: i64,
+    pub owed: u64,
+    pub set_aside: u64,
+    pub unreadable: Vec<String>,
+}
+
+impl HistorySample {
+    pub fn net_per_hour(&self, previous: &Self) -> Option<f64> {
+        let elapsed = self.as_of_ms.checked_sub(previous.as_of_ms)?;
+        let finished = previous.owed.checked_sub(self.owed)?;
+        (self.local_day == previous.local_day
+            && self.journal_version == previous.journal_version
+            && self.set_aside == previous.set_aside
+            && self.unreadable == previous.unreadable
+            && elapsed > 0
+            && finished > 0)
+            .then(|| finished as f64 * 3_600_000.0 / elapsed as f64)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkInventory {
     pub version: u32,
@@ -58,6 +95,8 @@ pub struct WorkInventory {
     pub newest_day: Option<String>,
     pub bands: [BandProgress; 6],
     pub holds: Vec<WorkHold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryProgress>,
     pub unreadable: Vec<String>,
     /// When discovery will look again. A finished pass stays current until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +118,7 @@ impl Default for WorkInventory {
             newest_day: None,
             bands: std::array::from_fn(|_| BandProgress::default()),
             holds: Vec::new(),
+            history: None,
             unreadable: Vec::new(),
             next_pass_ms: None,
         }
@@ -124,6 +164,42 @@ pub fn read(journal: &Path) -> Result<Option<WorkInventory>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_rate_requires_two_comparable_decreasing_full_passes() {
+        let mut previous = HistorySample {
+            local_day: "20261013".into(),
+            journal_version: "test-version".into(),
+            as_of_ms: 1_000,
+            owed: 1_000,
+            set_aside: 0,
+            unreadable: Vec::new(),
+        };
+        let mut current = previous.clone();
+        current.as_of_ms += 3_600_000;
+        current.owed -= 300;
+        assert_eq!(current.net_per_hour(&previous), Some(300.0));
+        previous.local_day = "20261012".into();
+        assert_eq!(current.net_per_hour(&previous), None);
+        previous.local_day = current.local_day.clone();
+        previous.journal_version = "another-version".into();
+        assert_eq!(current.net_per_hour(&previous), None);
+        previous.journal_version = current.journal_version.clone();
+        previous.unreadable.push("unreadable day".into());
+        assert_eq!(current.net_per_hour(&previous), None);
+        current.unreadable = previous.unreadable.clone();
+        assert_eq!(current.net_per_hour(&previous), Some(300.0));
+        previous.set_aside = 1;
+        assert_eq!(current.net_per_hour(&previous), None);
+        previous.set_aside = 0;
+        previous.owed = current.owed;
+        assert_eq!(current.net_per_hour(&previous), None);
+        previous.owed -= 1;
+        assert_eq!(current.net_per_hour(&previous), None);
+        previous.owed = 1_000;
+        previous.as_of_ms = current.as_of_ms;
+        assert_eq!(current.net_per_hour(&previous), None);
+    }
 
     #[test]
     fn a_finished_pass_stays_current_until_the_next_one_is_due() {

@@ -930,7 +930,7 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   const { doc, context } = createEnvironment();
   const section = doc.createElement('section');
   section.id = 'workProgress';
-  for (const key of ['reach', 'bands', 'confirm', 'cost', 'details', 'allow', 'action-result']) {
+  for (const key of ['reach', 'history', 'bands', 'confirm', 'cost', 'details', 'allow', 'action-result']) {
     const child = doc.createElement('div');
     child.setAttribute('data-work-' + key, '');
     section.appendChild(child);
@@ -992,6 +992,29 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   context.work.inventory.complete = false;
   vm.runInContext('renderWorkProgress(work)', context);
   assert.strictEqual(cost.textContent.match(/\d+/g), null);
+  const history = section.querySelector('[data-work-history]');
+  assert.strictEqual(history.hidden, true);
+  context.work.inventory.history = { caught_up_since: '20260918', through_day: '20261011',
+    segments_owed: 223701, daily_units_owed: 10161, net_per_hour: null, set_aside_units: 2, unreadable_days: 1 };
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.strictEqual(history.hidden, false);
+  assert(history.textContent.includes((223701).toLocaleString()));
+  assert(history.textContent.includes((10161).toLocaleString()));
+  const noRate = history.textContent;
+  context.work.inventory.history.net_per_hour = 311;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.notStrictEqual(history.textContent, noRate);
+  context.work.inventory.history.net_per_hour = 0.25;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert(history.textContent.includes((0.25).toLocaleString()));
+  context.work.inventory.as_of_ms = now - 200000;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert(!history.textContent.includes((0.25).toLocaleString()));
+  context.work.inventory.history = null;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert.strictEqual(history.hidden, true);
+  assert.strictEqual(history.textContent, '');
+
   context.work.error = '<unreadable>';
   vm.runInContext('renderWorkProgress(work)', context);
   assert.strictEqual(section.querySelector('[data-work-details]').hidden, false);

@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- health now shows how far back your journal has caught up, how many older recordings and daily outputs are left, and the recent pace when it has enough progress to compare. items set aside and days it could not check are listed separately.
+
 - when you save your own endpoint in thinking settings, your journal now sends it one test image and tells you right away if the model didn't read it, so you can switch models. before, a model that can't read images only showed up later, as screens and photos that failed to process or were described wrongly.
 
 ### Fixed
