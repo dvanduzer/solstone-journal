@@ -6,6 +6,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import sqlite3
@@ -64,14 +65,20 @@ class Phone:
 
     def control(self, op, payload='', count=128, mode='reopen'):
         identifier = uuid.uuid4().hex
-        command = self.args.output / 'command.json'
-        command.write_text(json.dumps({'id': identifier, 'request': {
+        command = self.args.output / f'command-{identifier}.json'
+        data = json.dumps({'id': identifier, 'request': {
             'op': op, 'journal': self.args.suite, 'root': '', 'count': count,
-            'seconds': 0, 'revision': 0, 'mode': mode, 'storage': 'serving', 'payload': payload}}))
-        subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', self.args.device,
-                        '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
-                        '--source', str(command), '--destination', 'Documents/owner-command.json'],
-                       check=True, stdout=subprocess.DEVNULL)
+            'seconds': 0, 'revision': 0, 'mode': mode, 'storage': 'serving', 'payload': payload}})
+        descriptor = os.open(command, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, 'w') as stream:
+                stream.write(data)
+            subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', self.args.device,
+                            '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
+                            '--source', str(command), '--destination', 'Documents/owner-command.json'],
+                           check=True, stdout=subprocess.DEVNULL)
+        finally:
+            command.unlink(missing_ok=True)
         reply = self.wait(lambda r: r['event'] == 'owner.reply' and r['value'].get('id') == identifier)['value']
         assert reply['ok'], reply
         return reply['reply']
