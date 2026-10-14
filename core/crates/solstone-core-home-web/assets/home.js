@@ -35,6 +35,8 @@
   let root = null;
   let surface = null;
   let lastPulse = null;
+  let lastBackupIssue = null;
+  let backupObservedAt = null;
   let pulseRequest = null;
   let vitalsRequest = null;
   let narrativeRequest = null;
@@ -278,6 +280,7 @@
     lastPulse = data;
     pulseReadFailed = false;
     pulseObservedAt = Date.now();
+    observeBackup(data);
     paintedCardOrder = cardOrder(data);
     briefingSections = isPlainObject(data.briefing_sections) ? data.briefing_sections : {};
     const cards = [renderVitalsHtml(data)];
@@ -312,20 +315,35 @@
       severity: 'amber', href: '/app/health/#processingHolds' }));
   }
 
+  function observeBackup(pulse) {
+    if (pulse.backup?.available !== true || typeof pulse.backup.issue !== 'boolean') return;
+    backupObservedAt = Date.now();
+    lastBackupIssue = pulse.backup.issue === true
+      ? { text: "the backup key couldn't open your backup destination. check backup in health.",
+          severity: 'amber', href: '/app/health/#backup' } : null;
+  }
+
   function homeHealthGlance(pulse) {
     const g = Object.assign({}, pulse.health_glance || {});
     const baseIssues = g.issues || [];
     const holds = heldWorkIssues();
     const workCurrent = heldWorkCurrent && heldWorkSnapshot
       && Date.now() - heldWorkSnapshot.observedAt < 30000;
-    const current = (pulseReadFailed ? [] : baseIssues).concat(workCurrent ? holds : []);
+    const backupCurrent = !pulseReadFailed && pulse.backup?.available === true
+      && typeof pulse.backup.issue === 'boolean';
+    const backupIssues = lastBackupIssue ? [lastBackupIssue] : [];
+    const current = (pulseReadFailed ? [] : baseIssues).concat(workCurrent ? holds : [])
+      .concat(backupCurrent ? backupIssues : []);
     const retained = issue => Object.assign({}, issue, { text: 'last known: ' + issue.text, severity: 'amber' });
     g.issues = baseIssues.map(issue => pulseReadFailed ? retained(issue) : issue)
-      .concat(holds.map(issue => workCurrent ? issue : retained(issue)));
+      .concat(holds.map(issue => workCurrent ? issue : retained(issue)))
+      .concat(backupIssues.map(issue => backupCurrent ? issue : retained(issue)));
     const notes = [];
     const checked = at => at ? ' last check: ' + new Date(at).toLocaleString() + '.' : '';
     if (pulseReadFailed) notes.push({text:'service status is unavailable.' + checked(pulseObservedAt), href:'/app/health/'});
     if (!workCurrent) notes.push({text:'queued work status is unavailable.' + checked(heldWorkSnapshot?.observedAt), href:'/app/health/#processingHolds'});
+    const backupUnavailable = !backupCurrent && (pulse.backup || backupObservedAt);
+    if (backupUnavailable) notes.push({text:'backup status is unavailable.' + checked(backupObservedAt), href:'/app/health/#backup'});
     if (current.length) {
       g.verdict = 'attention';
       g.severity = current.some(issue => issue.severity === 'red') ? 'red' : 'amber';
@@ -333,7 +351,8 @@
     } else if (notes.length) {
       g.verdict = 'unavailable';
       g.severity = 'amber';
-      g.headline = pulseReadFailed ? 'service status is unavailable right now.' : 'queued work status is unavailable right now.';
+      g.headline = pulseReadFailed ? 'service status is unavailable right now.'
+        : !workCurrent ? 'queued work status is unavailable right now.' : 'backup status is unavailable right now.';
       g.last_observation = null;
       g.cta = null;
     }
@@ -385,8 +404,10 @@
     if (current?.outerHTML === html) return;
     replaceHomeSurface('vitals', html, []);
     if (focusedHref) {
-      Array.from(document.querySelectorAll('#pulse-vitals a'))
-        .find(link => link.getAttribute('href') === focusedHref)?.focus({ preventScroll: true });
+      const next = Array.from(document.querySelectorAll('#pulse-vitals a'))
+        .find(link => link.getAttribute('href') === focusedHref)
+        || document.querySelector('#pulse-vitals .pulse-vitals-health-link');
+      next?.focus({ preventScroll: true });
     }
   }
 
@@ -1102,6 +1123,7 @@
         lastPulse = Object.assign({}, lastPulse || {}, data);
         pulseReadFailed = false;
         pulseObservedAt = Date.now();
+        observeBackup(data);
         renderNeedsYou(data);
         renderConnections(data);
         renderVitals(data);
@@ -1145,6 +1167,7 @@
         lastPulse = Object.assign({}, lastPulse || {}, data);
         pulseReadFailed = false;
         pulseObservedAt = Date.now();
+        observeBackup(data);
         renderVitals(data);
         renderNeedsYou(data);
         renderConnections(data);

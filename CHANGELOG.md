@@ -8,11 +8,15 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- health now shows how far back your journal has caught up, how many older recordings and daily outputs are left, and the recent pace when it has enough progress to compare. items set aside and days it could not check are listed separately.
+
 - when you save your own endpoint in thinking settings, your journal now sends it one test image and tells you right away if the model didn't read it, so you can switch models. before, a model that can't read images only showed up later, as screens and photos that failed to process or were described wrongly.
 
 ### Fixed
 
 - backups and portable exports now keep entities and facets named cache or indexer. portable exports also keep files ending in .key; your next backup picks up previously skipped entities and facets automatically.
+- home now points to health when your current backup key can't open the destination. changing the setup removes the old warning; ordinary retries stay in backup details.
+
 - when an older day has daily results that were never made, your journal now makes them after finishing that day's recordings, before moving on to older recordings. before, those results waited until every older recording was finished.
 
 - new conversations you import from ChatGPT, Claude or Gemini now label your messages as "You" instead of "Human", so your journal can tell them apart from the assistant's replies. Claude messages without a known sender are labeled "Unknown".

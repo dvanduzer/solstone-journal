@@ -89,7 +89,15 @@ pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) 
         .route("/app/home/api/recover", post(removals::recover))
         .route(
             "/app/home/api/pulse",
-            get(move || pulse(pulse_root.clone(), pulse_clock.clone())),
+            get(
+                move |deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>| {
+                    pulse(
+                        pulse_root.clone(),
+                        pulse_clock.clone(),
+                        deps.map(|Extension(deps)| deps),
+                    )
+                },
+            ),
         )
         .route(
             "/app/home/api/briefing",
@@ -99,11 +107,19 @@ pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) 
         .with_state(journal_root)
 }
 
-async fn pulse(journal_root: PathBuf, clock: Clock) -> Response {
+async fn pulse(
+    journal_root: PathBuf,
+    clock: Clock,
+    backup: Option<solstone_core_backup_web::BackupWebDeps>,
+) -> Response {
     let now = clock.now();
     spawn_blocking_response(OwnerReadRole::HomePulse, move || {
         let context = solstone_core_home::HomeContext::new(journal_root, now);
-        Json(solstone_core_home::pulse::pulse_payload(&context)).into_response()
+        let mut payload = solstone_core_home::pulse::pulse_payload(&context);
+        if let Some(deps) = backup {
+            payload["backup"] = solstone_core_backup_web::home_backup_observation(&deps);
+        }
+        Json(payload).into_response()
     })
     .await
 }
@@ -515,6 +531,7 @@ mod tests {
             "today",
             "now",
             "health_glance",
+            "backup",
             "capture_health",
             "attention",
             "segment_count",

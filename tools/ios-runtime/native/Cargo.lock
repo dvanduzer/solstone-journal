@@ -3235,10 +3235,12 @@ name = "solstone-core-backup"
 version = "2.0.44"
 dependencies = [
  "getrandom 0.3.4",
+ "hmac",
  "nix",
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "solstone-core-installed-payload",
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
@@ -4913,6 +4915,7 @@ dependencies = [
  "chrono",
  "journal-mobile-serving",
  "libc",
+ "log",
  "serde_json",
  "sha2",
  "solstone-core-generate",
