@@ -12,6 +12,8 @@ pub mod generate;
 pub mod install;
 pub mod nvidia;
 pub mod plan;
+#[cfg(test)]
+mod test_support;
 pub(crate) mod tier;
 pub mod vulkan;
 
