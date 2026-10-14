@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- your journal now uses some of the objects it finds in screen frames and photos. they show as an "objects" line beside the frame's description, like "person ×2, car", and opening the frame or photo in transcripts outlines each one on the image. new recordings also list their objects so a search can find them.
+
 - health now shows how far back your journal has caught up, how many older recordings and daily outputs are left, and the recent pace when it has enough progress to compare. items set aside and days it could not check are listed separately.
 
 - when you save your own endpoint in thinking settings, your journal now sends it one test image and tells you right away if the model didn't read it, so you can switch models. before, a model that can't read images only showed up later, as screens and photos that failed to process or were described wrongly.

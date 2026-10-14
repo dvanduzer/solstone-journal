@@ -3076,7 +3076,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
 
     // Draw full-resolution frame to canvas (no caching)
     async drawFull(canvas, videoUrl, frameId, options = {}) {
-      const { boxCoords, participants } = options;
+      const { boxCoords, participants, objects } = options;
 
       try {
         const bitmap = await this.captureFullFrame(videoUrl, frameId);
@@ -3097,7 +3097,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
         const ctx = canvas.getContext('2d');
         ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
 
-        this._applyOverlays(ctx, canvas, bitmap.width, bitmap.height, { boxCoords, participants });
+        this._applyOverlays(ctx, canvas, bitmap.width, bitmap.height, { boxCoords, participants, objects });
 
         if (bitmap && typeof bitmap.close === 'function') {
           bitmap.close();
@@ -3111,10 +3111,62 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       }
     }
 
+    // Draw a still photo with its overlays; used when there are boxes to show.
+    async drawStill(canvas, imageUrl, options = {}) {
+      try {
+        const img = new Image();
+        img.src = imageUrl;
+        await img.decode();
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        this._applyOverlays(ctx, canvas, img.naturalWidth, img.naturalHeight, options);
+        canvas.classList.remove('loading');
+        return true;
+      } catch (err) {
+        canvas.classList.remove('loading');
+        console.warn('Still draw failed:', err);
+        return false;
+      }
+    }
+
     _applyOverlays(ctx, canvas, sourceWidth, sourceHeight, options = {}) {
-      const { boxCoords, participants } = options;
+      const { boxCoords, participants, objects } = options;
       const scaleX = canvas.width / sourceWidth;
       const scaleY = canvas.height / sourceHeight;
+
+      // Detected objects: boxes are in the detector's image pixels, which can
+      // differ from the decoded frame's size. When the shapes disagree (a photo
+      // the browser rotated from its orientation tag), the boxes would land in
+      // the wrong place, so none are drawn. Neutral ink, not a hue.
+      const items = objects?.items || [];
+      const detectorWidth = objects?.image?.width || sourceWidth;
+      const detectorHeight = objects?.image?.height || sourceHeight;
+      const sameShape = Math.abs(detectorWidth / detectorHeight - canvas.width / canvas.height)
+        <= 0.02 * (canvas.width / canvas.height);
+      if (items.length > 0 && sameShape) {
+        const objectScaleX = canvas.width / detectorWidth;
+        const objectScaleY = canvas.height / detectorHeight;
+        const ink = '#6E6453';
+        ctx.font = '12px system-ui, sans-serif';
+        for (const item of items) {
+          const [xMin, yMin, xMax, yMax] = item.bbox || [];
+          if (![xMin, yMin, xMax, yMax].every(Number.isFinite)) continue;
+          const x = xMin * objectScaleX;
+          const y = yMin * objectScaleY;
+          ctx.strokeStyle = ink;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x, y, (xMax - xMin) * objectScaleX, (yMax - yMin) * objectScaleY);
+          const label = String(item.label || '');
+          const textWidth = ctx.measureText(label).width;
+          const labelTop = Math.max(0, y - 18);
+          ctx.fillStyle = ink;
+          ctx.fillRect(x, labelTop, textWidth + 8, 18);
+          ctx.fillStyle = '#fff';
+          ctx.fillText(label, x + 4, labelTop + 13);
+        }
+      }
 
       if (boxCoords && boxCoords.length === 4) {
         const [xMin, yMin, xMax, yMax] = boxCoords;
@@ -6180,11 +6232,16 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       const frameId = f.source_ref?.frame_id;
       const boxCoords = f.source_ref?.box_2d;
       const participants = f.source_ref?.participants || [];
+      const objects = f.source_ref?.objects;
+      const imageUrl = getImageUrlForChunk(f);
 
-      if (videoUrl && frameId) {
+      if (imageUrl) {
+        frameCapture.drawStill(canvas, imageUrl, { objects });
+      } else if (videoUrl && frameId) {
         frameCapture.drawFull(canvas, videoUrl, frameId, {
           boxCoords,
-          participants
+          participants,
+          objects
         });
       } else {
         canvas.classList.remove('loading');
@@ -6214,9 +6271,9 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
             <button class="tr-modal-close" title="close (esc)" aria-label="close">&times;</button>
           </div>
           <div class="tr-modal-img-wrap">
-            ${imageUrl
+            ${imageUrl && !f.source_ref?.objects?.items?.length
               ? `<img id="trModalImage" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(altText)}">`
-              : '<canvas id="trModalCanvas" class="loading"></canvas>'}
+              : `<canvas id="trModalCanvas" class="loading" role="img" aria-label="${escapeHtml(altText)}"></canvas>`}
           </div>
           ${description ? `<div class="tr-modal-description">${escapeHtml(description)}</div>` : ''}
         </div>
@@ -6225,7 +6282,8 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
         </div>
       `;
 
-      // Draw video frames to modal canvas. Still images are loaded directly.
+      // Draw video frames, and stills that carry object boxes, to the modal canvas.
+      // Other still images are loaded directly.
       const canvas = modal.querySelector('#trModalCanvas');
       if (canvas) {
         drawFrame(canvas, f);

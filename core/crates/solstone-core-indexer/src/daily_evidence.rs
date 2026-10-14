@@ -32,6 +32,7 @@ const OUTPUTS: &[&str] = &[
     "_entities_entity_observer",
     "pulse",
     "topics",
+    "objects",
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1911,6 +1912,32 @@ mod tests {
         );
         let rev_changed = revision(&root, "schedule", None);
         assert_ne!(rev_before, rev_changed);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn objects_md_in_talents_excluded_from_daily_evidence_projection_and_revision() {
+        let root = root("objects-md-excluded");
+        write(
+            &root,
+            "chronicle/20260910/desk/090000_60/talents/sense.md",
+            "# Sense\n\nOriginal sense narrative.",
+        );
+        let rev_before = revision(&root, "schedule", None);
+        let proj_before = capture_day_projection(&root, "20260910").expect("capture before");
+
+        write(
+            &root,
+            "chronicle/20260910/desk/090000_60/talents/objects.md",
+            "# Objects\n\n- person: in 2 frames, up to 3 at once\n",
+        );
+        let rev_after = revision(&root, "schedule", None);
+        let proj_after = capture_day_projection(&root, "20260910").expect("capture after");
+
+        assert_eq!(rev_before, rev_after);
+        assert_eq!(proj_before.chunks, proj_after.chunks);
+        assert_eq!(proj_before.sources, proj_after.sources);
 
         fs::remove_dir_all(root).unwrap();
     }
