@@ -50,33 +50,6 @@ pub const KEY_LABEL_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const UNLOCK_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const VERIFY_TIMEOUT_SECONDS: u64 = 60 * 60;
 
-// Restic matches a no-slash pattern by basename at ANY depth, so bare `health`
-// was removed because it dropped historical root deletion-audit records
-// (`retention.log`, `pruning-runs/`), canonical per-day operational oplogs, and
-// per-day talent-provenance from every snapshot.
-pub const BACKUP_EXCLUDES: [&str; 20] = [
-    "*.sqlite*",
-    "indexer",
-    "cache",
-    ".cache",
-    ".removing_*",
-    "*.sock",
-    "*.pid",
-    "*.port",
-    "*.lock",
-    "*.tmp",
-    ".tmp*",
-    "brain.json",
-    "brain.log",
-    "brain-fingerprint.key",
-    "brain-refresh.lease",
-    "supervisor.ready",
-    "supervisor.start_time",
-    "parakeet-cpp.placement",
-    "scheduler.json",
-    "health/sync",
-];
-
 /// Write boundary for whole-journal restore attempts.
 pub trait RestoreRecorder {
     #[allow(clippy::too_many_arguments)] // Mirrors backup's owner-owned record API.
@@ -615,19 +588,12 @@ fn backup_args(resolved_journal: &Path) -> Vec<String> {
         "backup".into(),
         crate::restic_filesystem_path(resolved_journal),
     ];
-    for excluded in BACKUP_EXCLUDES {
-        args.extend(["--exclude".into(), excluded.into()]);
+    for excluded in solstone_core_journal_io::copy_excludes::COPY_EXCLUDES {
+        args.extend([
+            "--exclude".into(),
+            crate::restic_paths::rooted_exclude(resolved_journal, excluded),
+        ]);
     }
-    args.extend([
-        "--exclude".into(),
-        crate::restic_filesystem_path(&resolved_journal.join("mcp-endpoint")),
-        "--exclude".into(),
-        crate::restic_filesystem_path(
-            &resolved_journal
-                .join("config")
-                .join("chatgpt-sign-in.json*"),
-        ),
-    ]);
     args
 }
 
@@ -6269,9 +6235,12 @@ mod tests {
 
     #[test]
     fn excludes_are_exact_and_keep_durable_health() {
-        assert!(!BACKUP_EXCLUDES.contains(&"health"));
-        assert!(!BACKUP_EXCLUDES.contains(&"chatgpt-sign-in.json"));
-        assert!(!BACKUP_EXCLUDES.contains(&"config"));
+        assert!(!solstone_core_journal_io::copy_excludes::copy_excluded(
+            "health/retention.log"
+        ));
+        assert!(!solstone_core_journal_io::copy_excludes::copy_excluded(
+            "config/journal.json"
+        ));
     }
     #[test]
     fn backup_excludes_endpoint_key_material_by_its_resolved_path() {
@@ -6290,8 +6259,6 @@ mod tests {
                 .any(|pair| pair[0] == "--exclude" && pair[1] == chatgpt),
             "{args:?}"
         );
-        assert!(!BACKUP_EXCLUDES.contains(&"mcp-endpoint"));
-        assert!(!BACKUP_EXCLUDES.contains(&"chatgpt-sign-in.json*"));
     }
     #[test]
     fn verification_bucket_wraps_reference_weeks() {
@@ -6327,12 +6294,12 @@ mod tests {
         assert!(
             commands[1]
                 .windows(2)
-                .any(|pair| pair == ["--exclude", ".removing_*"])
+                .any(|pair| pair[0] == "--exclude" && pair[1].ends_with("/chronicle/*/.removing_*"))
         );
         assert!(
             commands[1]
                 .windows(2)
-                .any(|pair| pair == ["--exclude", "health/sync"])
+                .any(|pair| pair[0] == "--exclude" && pair[1].ends_with("/health/sync"))
         );
         assert!(
             !commands[1]
@@ -7605,3 +7572,7 @@ mod tests {
 #[cfg(test)]
 #[path = "engine_credential_exclusion_tests.rs"]
 mod credential_exclusion_tests;
+
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "engine_copy_tests.rs"]
+mod copy_tests;

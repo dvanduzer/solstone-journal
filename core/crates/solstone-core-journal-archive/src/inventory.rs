@@ -66,6 +66,7 @@ pub(crate) fn build(root: &impl AsFd) -> Result<Inventory, ArchiveError> {
                     },
                 ));
             }
+            JournalEntryKind::Socket if deny_member(member.as_str()) => {}
             kind => {
                 return Err(ArchiveError::UnsafeJournalEntry { member, kind });
             }
@@ -130,6 +131,7 @@ fn walk_directory(
                     },
                 ));
             }
+            JournalEntryKind::Socket if deny_member(member.as_str()) => {}
             kind => {
                 return Err(ArchiveError::UnsafeJournalEntry { member, kind });
             }
@@ -275,7 +277,7 @@ mod membership_tests {
     }
 
     #[test]
-    fn basename_exclude_is_any_depth_and_star_does_not_cross_slash() {
+    fn operational_excludes_preserve_unrelated_owner_files() {
         let temporary = TempDir::new("ac2");
         let root = journal(&temporary);
         write(&root, "chronicle/20260101/foo.sqlite", b"db");
@@ -283,7 +285,7 @@ mod membership_tests {
         write(&root, "chronicle/20260101/nested/apps/note.txt", b"nested");
         let source = ArchiveSource::open(&root).expect("open source");
         let names = members(&source);
-        assert!(!names.iter().any(|name| name.ends_with("foo.sqlite")));
+        assert!(names.iter().any(|name| name.ends_with("foo.sqlite")));
         assert!(
             names
                 .iter()
@@ -295,6 +297,41 @@ mod membership_tests {
                 .any(|name| name == "chronicle/20260101/nested/apps/note.txt"),
             "trailing-slash apps/ prunes only at top level: {names:?}"
         );
+    }
+
+    #[test]
+    fn colliding_owner_names_survive_beside_operational_controls() {
+        let temporary = TempDir::new("owner-names");
+        let root = journal(&temporary);
+        for member in [
+            "entities/cache/entity.json",
+            "entities/indexer/entity.json",
+            "facets/cache/facet.json",
+            "facets/indexer/facet.json",
+            "imports/item/original.key",
+            "imports/item/cache/owner.sqlite",
+            "chronicle/20260101/indexer/120000_60/slides.key",
+            "chronicle/20260101/source/120000_60/audio.jsonl.lock",
+            "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
+        ] {
+            write(&root, member, b"owner bytes");
+        }
+        for member in [
+            "indexer/journal.sqlite",
+            "chronicle/20260101/indexer/day.sqlite",
+            "health/brain-fingerprint.key",
+            "mcp-endpoint/pop.ed25519.pk8",
+            "config/.tmp_123_4.tmp",
+        ] {
+            write(&root, member, b"operational secret control");
+        }
+        let source = ArchiveSource::open(&root).unwrap();
+        let names = members(&source);
+        assert_eq!(names.len(), 9, "{names:?}");
+        assert!(names.contains(&"entities/cache/entity.json".to_owned()));
+        assert!(names.contains(&"facets/indexer/facet.json".to_owned()));
+        assert!(names.contains(&"chronicle/20260101/indexer/120000_60/slides.key".to_owned()));
+        assert!(!names.iter().any(|name| name.ends_with("day.sqlite")));
     }
 
     #[test]

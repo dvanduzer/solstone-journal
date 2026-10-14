@@ -64,6 +64,7 @@ solstone-core-local.workspace = true
 solstone-core-system.workspace = true
 
 [dev-dependencies]
+solstone-core-journal-archive.workspace = true
 serde_json.workspace = true
 solstone-core-indexer-store.workspace = true
 

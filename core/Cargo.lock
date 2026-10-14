@@ -4517,6 +4517,7 @@ dependencies = [
  "solstone-core-import",
  "solstone-core-indexer-store",
  "solstone-core-ingest-resolve",
+ "solstone-core-journal-archive",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-local",

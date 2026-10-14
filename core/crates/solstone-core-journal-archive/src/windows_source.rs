@@ -355,6 +355,64 @@ mod tests {
     }
 
     #[test]
+    fn windows_export_preserves_owner_names_and_omits_operational_secrets() {
+        let (_temporary, root) = fixture("owner-names");
+        let kept = [
+            "entities/cache/entity.json",
+            "entities/indexer/entity.json",
+            "facets/cache/facet.json",
+            "facets/indexer/facet.json",
+            "imports/item/original.key",
+            "chronicle/20260101/indexer/120000_60/slides.key",
+            "chronicle/20260101/source/120000_60/audio.jsonl.lock",
+            "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
+        ];
+        for member in kept {
+            write(&root, member, b"owner bytes");
+        }
+        for member in [
+            "indexer/journal.sqlite",
+            "chronicle/20260101/indexer/day.sqlite",
+            "health/brain-fingerprint.key",
+            "mcp-endpoint/pop.ed25519.pk8",
+            "config/.tmp_123_4.tmp",
+        ] {
+            write(&root, member, b"secret control");
+        }
+        let source = ArchiveSource::open(&root).unwrap();
+        let mut output = std::fs::File::create(root.parent().unwrap().join("copy.zip")).unwrap();
+        crate::encode_archive(
+            &crate::EncodeArchiveRequest {
+                source: &source,
+                solstone_version: "2.0.0",
+                exported_at: "2026-01-01T00:00:00Z",
+                day_window: None,
+            },
+            &mut output,
+        )
+        .unwrap();
+        for member in kept {
+            let entry = source
+                .inventory()
+                .entries()
+                .iter()
+                .find(|entry| entry.member_name().as_str() == member)
+                .expect(member);
+            assert_eq!(
+                source.open_file(entry).unwrap().into_bytes(),
+                b"owner bytes"
+            );
+        }
+        assert!(
+            !source.inventory().entries().iter().any(|entry| entry
+                .member_name()
+                .as_str()
+                .ends_with("day.sqlite")
+                || entry.member_name().as_str().starts_with("mcp-endpoint/"))
+        );
+    }
+
+    #[test]
     fn source_freezes_portable_members_and_checked_bytes() {
         let (_temporary, root) = fixture("ordinary");
         let source = ArchiveSource::open(&root).expect("open source");

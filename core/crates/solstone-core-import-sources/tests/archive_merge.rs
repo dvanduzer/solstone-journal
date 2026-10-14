@@ -1272,3 +1272,105 @@ fn an_import_never_files_one_entitys_notes_under_another_sharing_its_folder() {
     assert!(!robert.contains("about bob"), "{robert}");
     assert_eq!(result.merge_summary.entity_links_skipped, 1);
 }
+
+#[test]
+fn portable_export_and_merge_preserve_colliding_owner_names() {
+    use solstone_core_journal_archive::{ArchiveSource, EncodeArchiveRequest, encode_archive};
+    use std::io::Read;
+    for selected_id in ["cache", "indexer"] {
+        let tree = TempTree::new();
+        let source = tree.path.join("source");
+        let target = tree.path.join("target");
+        let mut kept = Vec::new();
+        for id in [selected_id] {
+            for family in ["entities", "facets"] {
+                let (name, bytes) = if family == "entities" {
+                    (
+                        format!("{family}/{id}/entity.json"),
+                        json!({"id":id,"name":id,"type":"Person"})
+                            .to_string()
+                            .into_bytes(),
+                    )
+                } else {
+                    (
+                        format!("{family}/{id}/facet.json"),
+                        json!({"name":id,"title":id}).to_string().into_bytes(),
+                    )
+                };
+                kept.push((name, bytes));
+            }
+        }
+        for name in [
+            "imports/item/original.key",
+            "imports/item/cache/owner.sqlite",
+            "chronicle/20260101/indexer/120000_60/slides.key",
+            "chronicle/20260101/source/120000_60/audio.jsonl.lock",
+            "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
+        ] {
+            kept.push((name.to_owned(), b"owner bytes".to_vec()));
+        }
+        let omitted = [
+            "indexer/journal.sqlite",
+            "chronicle/20260101/indexer/day.sqlite",
+            "health/brain-fingerprint.key",
+            "mcp-endpoint/pop.ed25519.pk8",
+            "config/.tmp_123_4.tmp",
+        ];
+        for (name, bytes) in kept
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .chain(
+                omitted
+                    .iter()
+                    .map(|name| (*name, b"synthetic secret".as_slice())),
+            )
+        {
+            let path = source.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let archive = tree.path.join("portable.zip");
+        let source = ArchiveSource::open(&source).unwrap();
+        encode_archive(
+            &EncodeArchiveRequest {
+                source: &source,
+                solstone_version: "2.0.0",
+                exported_at: "2026-01-01T00:00:00Z",
+                day_window: None,
+            },
+            &mut File::create(&archive).unwrap(),
+        )
+        .unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        for (name, bytes) in &kept {
+            let mut actual = Vec::new();
+            zip.by_name(name).unwrap().read_to_end(&mut actual).unwrap();
+            assert_eq!(&actual, bytes, "{name}");
+        }
+        for name in omitted {
+            assert!(zip.by_name(name).is_err(), "{name}");
+        }
+        drop(zip);
+        let merged = merge_journal_archive(&archive, &target, &options(&tree), None).unwrap();
+        assert_eq!(merged.merge_summary.entities_created, 1, "{merged:?}");
+        for (name, bytes) in &kept {
+            let actual =
+                fs::read(target.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
+            if name.starts_with("entities/") {
+                let actual: Value = serde_json::from_slice(&actual).unwrap();
+                assert_eq!(
+                    actual["name"],
+                    serde_json::from_slice::<Value>(bytes).unwrap()["name"]
+                );
+            } else if name.starts_with("facets/") {
+                let actual: Value = serde_json::from_slice(&actual).unwrap();
+                assert_eq!(
+                    actual["title"],
+                    serde_json::from_slice::<Value>(bytes).unwrap()["title"]
+                );
+            } else {
+                assert_eq!(&actual, bytes, "{name}");
+            }
+        }
+    }
+}

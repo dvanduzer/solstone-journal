@@ -219,6 +219,11 @@ powershell -NoProfile -File scripts\win-owner-evidence.ps1 -LeasePath "%JOURNAL_
 del /q "%JOURNAL_WIN_CI_ORDINARY_OWNER_LOG%" >nul 2>&1
 set "JOURNAL_WIN_CI_ORDINARY_OWNER_EVIDENCE=passed"
 
+echo === native restic owner-filename round trip ===
+call :run_exact_library "solstone-core-backup-runtime" "engine::copy_tests::real_restic_preserves_owner_names_and_excludes_operational_secrets" "full-tests" "ignored" || exit /b 1
+echo === cargo test --locked (portable archive owner filenames) ===
+call :run_exact_library "solstone-core-journal-archive" "windows_source::tests::windows_export_preserves_owner_names_and_omits_operational_secrets" || exit /b 1
+call :run_exact_integration "solstone-core-import-sources" "source_archive_contracts" "archive_merge::portable_export_and_merge_preserve_colliding_owner_names" || exit /b 1
 echo === cargo test --locked (journal-io library) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-journal-io --lib || exit /b 1
 echo === cargo test --locked (offload library with filesystem contracts) ===
