@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solstone_core_generate::GenerateResponse;
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
 use solstone_core_generate::OneShotClient;
 use solstone_core_generate_wire::{LaneOutcome, bundled_input, resolve_lane};
 use solstone_core_local::{ExactTextCount, GenerateInput, inspect_exact_text_admission};

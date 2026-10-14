@@ -26,6 +26,12 @@ solstone/talent/journal/references/facets.md
 solstone/talent/journal/references/logs.md
 solstone/talent/journal/references/storage.md
 solstone/talent/journal/SKILL.md
+solstone/talent/linked_presence.md
+solstone/talent/linked_presence.schema.json
+solstone/talent/linked_share.md
+solstone/talent/linked_share.schema.json
+solstone/talent/linked_share_activity.md
+solstone/talent/linked_share_activity.schema.json
 solstone/talent/morning_briefing.md
 solstone/talent/morning_briefing.schema.json
 solstone/talent/participation_entry.schema.json
