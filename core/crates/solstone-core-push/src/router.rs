@@ -1393,7 +1393,18 @@ mod tests {
         dispatch_responses: Mutex<Vec<Result<RelayReply, RelayFault>>>,
         post_bytes_response: Mutex<Option<Result<u16, RelayFault>>>,
         post_bytes_responses: Mutex<Vec<Result<u16, RelayFault>>>,
-        sleep_duration: Mutex<Option<Duration>>,
+        /// Holds the next relay call: signals the first sender, then waits on the receiver.
+        gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl MockTransport {
+        fn pass_gate(&self) {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(Duration::from_secs(5));
+            }
+        }
     }
 
     impl RelayTransport for MockTransport {
@@ -1403,9 +1414,7 @@ mod tests {
             body: &[u8],
             bearer_token: Option<&str>,
         ) -> Result<RelayReply, RelayFault> {
-            if let Some(dur) = *self.sleep_duration.lock().unwrap() {
-                std::thread::sleep(dur);
-            }
+            self.pass_gate();
             self.calls.lock().unwrap().push((
                 url.to_owned(),
                 body.to_vec(),
@@ -1466,9 +1475,7 @@ mod tests {
             headers: &[(&str, &str)],
             body: &[u8],
         ) -> Result<u16, RelayFault> {
-            if let Some(dur) = *self.sleep_duration.lock().unwrap() {
-                std::thread::sleep(dur);
-            }
+            self.pass_gate();
             self.bytes_calls.lock().unwrap().push((
                 url.to_owned(),
                 headers
@@ -3325,7 +3332,6 @@ mod tests {
         let root = root();
         setup_authorized_client(root.path(), CID_A);
         let transport = Arc::new(MockTransport::default());
-        *transport.sleep_duration.lock().unwrap() = Some(Duration::from_millis(200));
 
         let app = api_router_with_transport(root.path(), PORTAL_URL, transport.clone());
         set_test_clock(None);
@@ -3338,15 +3344,25 @@ mod tests {
         )
         .await;
 
+        let (entered_sender, entered) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        *transport.gate.lock().unwrap() = Some((entered_sender, release_receiver));
         let app_clone = app.clone();
         let handle = tokio::spawn(async move {
             call(&app_clone, "POST", "/api/push/test", Body::empty(), None).await
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        while entered.try_recv().is_err() && !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
         let (status_quick, _) = call(&app, "GET", "/api/push/status", Body::empty(), None).await;
         assert_eq!(status_quick, StatusCode::OK);
+        assert!(
+            !handle.is_finished(),
+            "the push test must still be in its relay call while status answers"
+        );
 
+        release.send(()).unwrap();
         let (status_slow, _) = handle.await.unwrap();
         assert_eq!(status_slow, StatusCode::OK);
     }
