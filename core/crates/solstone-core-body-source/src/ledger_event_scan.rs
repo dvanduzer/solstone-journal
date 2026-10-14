@@ -127,7 +127,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::decode_body_envelope;
-    use crate::parser::test_corpus::{fixture, generated_corpus};
+    use crate::parser::test_corpus::{fixture, generated_corpus, sweep_prefix_lengths};
 
     use super::*;
 
@@ -207,7 +207,7 @@ mod tests {
                 .find(|(candidate, _)| candidate == name)
                 .map(|(_, input)| input)
                 .expect("generated input");
-            for length in 1..input.len() {
+            for length in sweep_prefix_lengths(input) {
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| scan_body_ledger_event(
                         &input[..length],
@@ -220,7 +220,7 @@ mod tests {
             }
         }
         for (name, frame) in fixture_ledger_frames() {
-            for length in 1..frame.len() {
+            for length in sweep_prefix_lengths(&frame) {
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| scan_body_ledger_event(
                         &frame[..length],
