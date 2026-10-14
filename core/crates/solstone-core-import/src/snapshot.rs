@@ -232,6 +232,10 @@ pub fn verify_preview(
         .get("preview")
         .ok_or("the saved preview is missing")?;
     let options = &record["options"];
+    let preview_relative = relative
+        .strip_prefix(id)
+        .ok()
+        .and_then(|path| portable_relative(path).ok());
     if record["token"].as_str() != Some(token)
         || options["timestamp"].as_str() != Some(timestamp)
         || options["force"].as_bool() != Some(force)
@@ -255,12 +259,7 @@ pub fn verify_preview(
                 .map(str::trim)
                 .filter(|value| !value.is_empty() && *value != "null")
         || options["source"].as_str() != source_hint
-        || relative
-            .strip_prefix(id)
-            .ok()
-            .and_then(|path| portable_relative(path).ok())
-            .as_deref()
-            != record["relative"].as_str().map(Path::new)
+        || preview_relative.as_ref().and_then(|path| path.to_str()) != record["relative"].as_str()
     {
         return Err(
             "the source or settings changed after preview; preview again before importing"
@@ -385,6 +384,15 @@ mod tests {
         assert!(check("other", false, "office").is_err());
         assert!(check("token", true, "office").is_err());
         assert!(check("token", false, "home").is_err());
+        let mut metadata = crate::read_import_metadata(root.path(), ID).unwrap();
+        metadata.get_mut("preview").unwrap()["relative"] = json!(format!(
+            "{}/./{}",
+            relative.parent().unwrap().to_str().unwrap(),
+            relative.file_name().unwrap().to_str().unwrap(),
+        ));
+        crate::write_import_metadata(root.path(), ID, &metadata).unwrap();
+        assert!(check("token", false, "office").is_err());
+        save_preview(root.path(), &source, &relative, &digest);
         fs::write(&snapshot, b"tampered").unwrap();
         assert!(check("token", false, "office").is_err());
     }
