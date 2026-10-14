@@ -74,6 +74,9 @@ func TestRestoreStageRootDoesNotExposePayloadName(t *testing.T) {
 }
 
 func TestRestoreCleanupTraversesRestrictiveModes(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Fatal("mode 0000 cleanup is not evidence when euid is 0")
+	}
 	root := t.TempDir()
 	req, stagePath := pinnedRestoreFixture(t, root)
 	nested := filepath.Join(stagePath, "private", "nested")

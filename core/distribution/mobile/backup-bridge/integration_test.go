@@ -169,7 +169,6 @@ func TestWrongPasswordKeyScanHasRepositoryWideBound(t *testing.T) {
 // TestIntegrationLifecycle tests full real-repository operations and lifecycle.
 func TestIntegrationLifecycle(t *testing.T) {
 	tempDir := t.TempDir()
-	t.Chdir(tempDir)
 	repoPath := filepath.Join(tempDir, "repo")
 	sourceName := "source"
 	sourcePath := filepath.Join(tempDir, sourceName)

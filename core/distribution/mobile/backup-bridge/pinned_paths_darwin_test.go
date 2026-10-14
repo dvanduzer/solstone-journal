@@ -14,6 +14,9 @@ import (
 )
 
 func TestRestoreCleanupClearsDarwinImmutableFlags(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Fatal("UF_IMMUTABLE cleanup is not evidence when euid is 0")
+	}
 	root := t.TempDir()
 	req, stagePath := pinnedRestoreFixture(t, root)
 	child := filepath.Join(stagePath, "child")
