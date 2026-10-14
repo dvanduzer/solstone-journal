@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+#include "librestic_bridge.h"
+#include <dirent.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int legacy(restic_request *req, restic_result *result) {
+    uint64_t id=0;
+    if(restic_bridge_start(req,&id)||!id)return 1;
+    if(restic_bridge_wait(id,result)||restic_bridge_free(id))return 2;
+    return 0;
+}
+static int bad(restic_request *req,char *path,uint32_t len,int32_t expected){
+    uint64_t id=123;
+    int32_t result=restic_bridge_start_with_workspace(req,path,len,&id);
+    return result==expected && id==0 ? 0 : 1;
+}
+static int join(char *out,size_t size,const char *base,const char *name){
+    int n=snprintf(out,size,"%s/%s",base,name);return n>0&&(size_t)n<size?0:1;
+}
+int main(int argc,char **argv){
+    if(argc!=2)return 1;
+    char repo[4096],source[4096],workspace[4096],file[4096],link[4096];
+    if(join(repo,sizeof(repo),argv[1],"workspace-abi-repo")||join(source,sizeof(source),argv[1],"workspace-abi-source")||join(workspace,sizeof(workspace),argv[1],"workspace-abi-private"))return 2;
+    if(mkdir(repo,0700)||mkdir(source,0700)||mkdir(workspace,0700))return 3;
+    if(join(file,sizeof(file),source,"owner")||join(link,sizeof(link),source,"link"))return 4;
+    FILE *f=fopen(file,"wb");if(!f||fwrite("owner bytes",1,11,f)!=11||fclose(f))return 5;
+    if(symlink("private-symlink-plaintext-marker-924ba80e",link))return 6;
+    char password[]="workspace-caller-key";
+    restic_request req={0};restic_result *result=calloc(1,sizeof(*result));if(!result)return 7;
+    req.operation=1;req.password=password;req.password_len=(uint32_t)strlen(password);req.repo_path=repo;req.repo_path_len=(uint32_t)strlen(repo);
+    if(legacy(&req,result)||result->status)return 8;
+    if(bad(&req,workspace,(uint32_t)strlen(workspace),1))return 9;
+    req.operation=4;req.source_path=source;req.source_path_len=(uint32_t)strlen(source);
+    if(bad(NULL,workspace,(uint32_t)strlen(workspace),1)||bad(&req,NULL,1,1)||bad(&req,workspace,0,1)||bad(&req,(char *)(uintptr_t)1,4097,5)||bad(&req,"relative",8,1)||bad(&req,workspace,(uint32_t)strlen(workspace)+1,1))return 10;
+    if(restic_bridge_start_with_workspace(NULL,NULL,0,NULL)!=1)return 11;
+#if defined(__APPLE__)
+    memset(result,0,sizeof(*result));
+    if(legacy(&req,result)||result->status==0||result->snapshot_id[0])return 12;
+    req.operation=5;
+    if(legacy(&req,result)||result->status||result->snapshot_count!=0)return 17;
+    req.operation=4;
+#endif
+    char supplied[4096];memcpy(supplied,workspace,strlen(workspace)+1);
+    uint64_t id=0;
+    if(restic_bridge_start_with_workspace(&req,supplied,(uint32_t)strlen(supplied),&id)||!id)return 13;
+    memset(supplied,'x',strlen(supplied));memset(password,'x',strlen(password));
+    if(restic_bridge_wait(id,result)||result->status||strlen(result->snapshot_id)!=64||restic_bridge_free(id))return 14;
+    DIR *directory=opendir(workspace);if(!directory)return 15;
+    struct dirent *entry;int count=0;while((entry=readdir(directory))){if(strcmp(entry->d_name,".")&&strcmp(entry->d_name,".."))count++;}
+    if(closedir(directory)||count)return 16;
+    free(result);return 0;
+}

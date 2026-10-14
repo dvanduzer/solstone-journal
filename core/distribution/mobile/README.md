@@ -71,3 +71,8 @@ device endurance, signed packaging or an owner release. Mobile installed
 payload identities remain unshipped and are refused by package admission.
 
 See [porting guidance](../../../docs/PORTING.md) for the workspace boundaries.
+
+The standalone [callable backup device check](probes/backup/README.md) builds a
+separate local repository archive and exercises it in a development iPhone app.
+Its receipts and device results are separate from the native bundle's linkage
+checks and production service admission.

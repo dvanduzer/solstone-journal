@@ -369,6 +369,14 @@ func clearDirectoryContents(fd int) error {
 				_ = unix.Close(identityFD)
 				return errors.New("could not retain restore cleanup directory identity")
 			}
+			var openedStat unix.Stat_t
+			if err := unix.Fstat(identityFD, &openedStat); err != nil || openedStat.Dev != stat.Dev || openedStat.Ino != stat.Ino {
+				_ = identityFile.Close()
+				if err != nil {
+					return err
+				}
+				return errRestoreStageChanged
+			}
 			if err := clearFileFlags(identityFD); err != nil {
 				_ = identityFile.Close()
 				return err
@@ -440,6 +448,9 @@ func clearDirectoryContents(fd int) error {
 
 func closeRequestPaths(req *bridgeRequest) error {
 	var cleanupErr error
+	if req.metadataRoot != nil {
+		cleanupErr = cleanupMetadataWorkspace(req)
+	}
 	if req.restoreStage != nil && !req.restorePublished {
 		cleanupErr = clearDirectoryContents(int(req.restoreStage.Fd()))
 	}
@@ -474,6 +485,16 @@ func closeRequestPaths(req *bridgeRequest) error {
 		} else {
 			cleanupErr = syncDirectory(parentFD)
 		}
+	}
+	if req.metadataRoot != nil {
+		cleanupErr = errors.Join(cleanupErr, req.metadataRoot.Close())
+		req.metadataRoot = nil
+	}
+	if req.metadataFile != nil {
+		// Closing this retained flock descriptor releases custody only after the
+		// worker has stopped using the workspace and cleanup has been attempted.
+		cleanupErr = errors.Join(cleanupErr, req.metadataFile.Close())
+		req.metadataFile = nil
 	}
 	for _, file := range req.pathFiles {
 		_ = file.Close()

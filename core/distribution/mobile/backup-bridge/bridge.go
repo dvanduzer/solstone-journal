@@ -36,6 +36,7 @@ import "C"
 import (
 	"context"
 	"errors"
+	"golang.org/x/sys/unix"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -211,14 +212,25 @@ func allocateID(counter *atomic.Uint64) (uint64, int32) {
 	}
 }
 
+// rejectBridgeCall cleans admitted resources without masking retained scratch.
+func rejectBridgeCall(req *bridgeRequest, status int32) int32 {
+	err := closeRequestPaths(req)
+	zeroBytes(req.password)
+	zeroBytes(req.recoveryPassword)
+	if errors.Is(err, errMetadataCleanup) {
+		return StatusWorkspaceCleanupRequired
+	}
+	if err != nil {
+		return StatusFailed
+	}
+	return status
+}
+
 // startBridgeCall allocates a handle, initializes context, and launches the worker.
 func startBridgeCall(req bridgeRequest) (uint64, int32) {
 	id, status := allocateID(&nextID)
 	if status != StatusOk {
-		closeRequestPaths(&req)
-		zeroBytes(req.password)
-		zeroBytes(req.recoveryPassword)
-		return 0, status
+		return 0, rejectBridgeCall(&req, status)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -243,10 +255,7 @@ func startBridgeCall(req bridgeRequest) (uint64, int32) {
 	if running >= 4 || len(handles) >= 16 {
 		handlesMu.Unlock()
 		cancel()
-		closeRequestPaths(&req)
-		zeroBytes(req.password)
-		zeroBytes(req.recoveryPassword)
-		return 0, StatusBusy
+		return 0, rejectBridgeCall(&req, StatusBusy)
 	}
 	handles[id] = h
 	handlesMu.Unlock()
@@ -264,7 +273,7 @@ func finishCall(h *callHandle, result bridgeResult, wrote bool) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.cancelRequested || h.ctx.Err() != nil {
+	if (h.cancelRequested || h.ctx.Err() != nil) && result.diagnostic != DiagWorkspaceCleanupRequired {
 		result = bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}
 		if wrote {
 			result = bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}
@@ -296,8 +305,11 @@ func runWorker(h *callHandle, req bridgeRequest) {
 	wrote := false
 	result := bridgeResult{status: StatusInternal, diagnostic: DiagInternal}
 	defer func() {
+		panicValue := recover()
 		cleanupErr := closeRequestPaths(&req)
-		if recover() != nil {
+		if errors.Is(cleanupErr, errMetadataCleanup) {
+			result = bridgeResult{status: StatusFailed, diagnostic: DiagWorkspaceCleanupRequired}
+		} else if panicValue != nil {
 			result = bridgeResult{status: StatusInternal, diagnostic: DiagInternal}
 		} else if cleanupErr != nil {
 			if result.status == StatusOk && req.operation == OpRestore {
@@ -310,6 +322,12 @@ func runWorker(h *callHandle, req bridgeRequest) {
 		}
 		finishCall(h, result, wrote)
 	}()
+	if req.metadataRoot != nil {
+		if err := cleanupMetadataWorkspace(&req); err != nil {
+			result = bridgeResult{status: StatusFailed, diagnostic: DiagWorkspaceCleanupRequired}
+			return
+		}
+	}
 	if testGate != nil {
 		if err := testGate("before-restic", h.ctx); err != nil {
 			result = bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}
@@ -358,6 +376,44 @@ func restic_bridge_start(req *C.restic_request, outID *C.uint64_t) C.int32_t {
 		return C.int32_t(status)
 	}
 
+	id, status := startBridgeCall(breq)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+
+// A synchronous return of 10 means admitted scratch cleanup requires a retry.
+//
+//export restic_bridge_start_with_workspace
+func restic_bridge_start_with_workspace(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if req == nil || req.operation != C.int32_t(OpSnapshot) || workspace == nil || workspaceLen == 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	if workspaceLen > C.uint32_t(maxPathLen) {
+		return C.int32_t(StatusCapExceeded)
+	}
+	path := string(copyCBytes(workspace, workspaceLen))
+	if sanitizePath(path) != nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	breq, status := validateRequest(req)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	if err := pinMetadataWorkspace(&breq, path); err != nil {
+		_ = closeRequestPaths(&breq)
+		zeroBytes(breq.password)
+		zeroBytes(breq.recoveryPassword)
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return C.int32_t(StatusBusy)
+		}
+		return C.int32_t(StatusInvalidArgument)
+	}
 	id, status := startBridgeCall(breq)
 	if status == StatusOk {
 		*outID = C.uint64_t(id)

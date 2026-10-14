@@ -16,16 +16,17 @@ const (
 
 // Status codes returned by the bridge.
 const (
-	StatusOk                 int32 = 0
-	StatusInvalidArgument    int32 = 1
-	StatusFailed             int32 = 2
-	StatusCancelled          int32 = 3
-	StatusCancelledUncertain int32 = 4
-	StatusCapExceeded        int32 = 5
-	StatusBusy               int32 = 6
-	StatusInvalidHandle      int32 = 7
-	StatusInternal           int32 = 8
-	StatusCommittedUncertain int32 = 9
+	StatusOk                       int32 = 0
+	StatusInvalidArgument          int32 = 1
+	StatusFailed                   int32 = 2
+	StatusCancelled                int32 = 3
+	StatusCancelledUncertain       int32 = 4
+	StatusCapExceeded              int32 = 5
+	StatusBusy                     int32 = 6
+	StatusInvalidHandle            int32 = 7
+	StatusInternal                 int32 = 8
+	StatusCommittedUncertain       int32 = 9
+	StatusWorkspaceCleanupRequired int32 = 10
 )
 
 // Closed operation codes.
@@ -59,6 +60,7 @@ const (
 	DiagRestoreDestinationWrong  = "RESTORE_DESTINATION_INVALID"
 	DiagInternal                 = "INTERNAL_ERROR"
 	DiagCommittedUncertain       = "COMMITTED_UNCERTAIN"
+	DiagWorkspaceCleanupRequired = "WORKSPACE_CLEANUP_REQUIRED"
 )
 
 // Internal Go representation of caller request parameters.
@@ -74,6 +76,9 @@ type bridgeRequest struct {
 	// pathFiles pin caller-authorized directories for the complete asynchronous
 	// operation.
 	pathFiles            []*os.File
+	metadataPath         string
+	metadataRoot         *os.Root
+	metadataFile         *os.File
 	repoRoot             *os.Root
 	sourceRoot           *os.Root
 	restoreRoot          *os.Root

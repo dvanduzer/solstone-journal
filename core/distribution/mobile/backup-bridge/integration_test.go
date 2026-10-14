@@ -10,10 +10,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/data"
@@ -636,4 +639,101 @@ func TestAuthenticatedMalformedMetadataRefusesWithoutProcessPanic(t *testing.T) 
 		t.Fatal(err)
 	}
 	checkRefusal()
+}
+
+func TestConcurrentRestoresKeepRequestAuthorityAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	type fixture struct{ repo, source, destination, snapshot, contents, workspace string }
+	fixtures := make([]fixture, 2)
+	stamp := time.Unix(1700000000, 123456000)
+	password := []byte("concurrent-metadata-fixture")
+	for i := range fixtures {
+		base := t.TempDir()
+		f := fixture{repo: filepath.Join(base, "repo"), source: filepath.Join(base, "source"), destination: filepath.Join(base, "restore"), workspace: filepath.Join(base, "metadata"), contents: fmt.Sprintf("owner-%d", i)}
+		if err := os.Mkdir(f.source, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(f.workspace, 0700); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(f.source, "owner")
+		if err := os.WriteFile(path, []byte(f.contents), 0640); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Setxattr(path, "user.owner", []byte(f.contents), 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("owner", filepath.Join(f.source, "link")); err != nil {
+			t.Fatal(err)
+		}
+		init, err := executeInit(ctx, bridgeRequest{operation: OpInit, password: password, repoPath: f.repo}, func() {})
+		if err != nil || init.status != StatusOk {
+			t.Fatalf("init: %+v %v", init, err)
+		}
+		snapReq := bridgeRequest{operation: OpSnapshot, password: password, repoPath: f.repo, sourcePath: f.source}
+		if err := pinRequestPaths(&snapReq); err != nil {
+			t.Fatal(err)
+		}
+		if err := pinMetadataWorkspace(&snapReq, f.workspace); err != nil {
+			t.Fatal(err)
+		}
+		snap, err := executeSnapshot(ctx, snapReq, func() {})
+		if cleanupErr := closeRequestPaths(&snapReq); cleanupErr != nil {
+			t.Fatal(cleanupErr)
+		}
+		if err != nil || snap.status != StatusOk {
+			t.Fatalf("snapshot: %+v %v", snap, err)
+		}
+		f.snapshot = snap.snapshotID
+		fixtures[i] = f
+	}
+	start := make(chan struct{})
+	failures := make(chan error, 2)
+	for _, f := range fixtures {
+		go func(f fixture) {
+			<-start
+			req := bridgeRequest{operation: OpRestore, password: password, repoPath: f.repo, sourcePath: f.source, restorePath: f.destination, snapshotID: f.snapshot}
+			result, err := executeRestore(ctx, &req, func() {})
+			if err != nil || result.status != StatusOk {
+				failures <- fmt.Errorf("restore: %+v %w", result, err)
+				return
+			}
+			path := filepath.Join(f.destination, "source", "owner")
+			contents, err := os.ReadFile(path)
+			if err != nil || string(contents) != f.contents {
+				failures <- fmt.Errorf("content mismatch %q: %v", contents, err)
+				return
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				failures <- err
+				return
+			}
+			if info.Mode().Perm() != 0640 || !info.ModTime().Equal(stamp) {
+				failures <- fmt.Errorf("metadata mismatch: %v", info)
+				return
+			}
+			value := make([]byte, 64)
+			n, err := unix.Getxattr(path, "user.owner", value)
+			if err != nil || string(value[:n]) != f.contents {
+				failures <- fmt.Errorf("xattr mismatch: %v", err)
+				return
+			}
+			target, err := os.Readlink(filepath.Join(f.destination, "source", "link"))
+			if err != nil || target != "owner" {
+				failures <- fmt.Errorf("symlink mismatch %q: %v", target, err)
+				return
+			}
+			failures <- nil
+		}(f)
+	}
+	close(start)
+	for range fixtures {
+		if err := <-failures; err != nil {
+			t.Error(err)
+		}
+	}
 }

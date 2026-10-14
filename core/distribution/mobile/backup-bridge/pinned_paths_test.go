@@ -321,7 +321,7 @@ func TestMetadataOnlyOpenSurvivesPathReplacementAndNodeReStat(t *testing.T) {
 	}
 	defer adoptedRoot.Close()
 
-	rfs := newRootFS(adoptedRoot, "source")
+	rfs := newRootFS(adoptedRoot, "source", metadataWorkspace(t))
 	fileMeta, err := rfs.OpenFile("source/file.txt", os.O_RDONLY, true)
 	if err != nil {
 		t.Fatal(err)
@@ -375,7 +375,7 @@ func TestInRootEscapingSymlinkContentOpenFails(t *testing.T) {
 	}
 	defer adoptedRoot.Close()
 
-	rfs := newRootFS(adoptedRoot, "source")
+	rfs := newRootFS(adoptedRoot, "source", metadataWorkspace(t))
 	_, err = rfs.OpenFile("source/link-outside", os.O_RDONLY, false)
 	if err == nil {
 		t.Fatal("expected content open on symlink to fail")

@@ -173,12 +173,16 @@ func (b *rootBackend) Save(_ context.Context, h backend.Handle, rd backend.Rewin
 	}
 
 	dirFile, dirErr := b.root.OpenFile(dir, os.O_RDONLY, 0)
-	if dirErr == nil {
-		syncDirErr := unix.Fsync(int(dirFile.Fd()))
-		_ = dirFile.Close()
-		if syncDirErr != nil && !isSyncIgnored(syncDirErr) {
-			return syncDirErr
-		}
+	if dirErr != nil {
+		return dirErr
+	}
+	syncDirErr := unix.Fsync(int(dirFile.Fd()))
+	closeDirErr := dirFile.Close()
+	if syncDirErr != nil && !isSyncIgnored(syncDirErr) {
+		return syncDirErr
+	}
+	if closeDirErr != nil {
+		return closeDirErr
 	}
 
 	return nil

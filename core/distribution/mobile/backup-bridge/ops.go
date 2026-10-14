@@ -424,7 +424,7 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (b
 	if sourceName == "" {
 		sourceName = filepath.Base(req.sourcePath)
 	}
-	rootFS := newRootFS(req.sourceRoot, sourceName)
+	rootFS := newRootFS(req.sourceRoot, sourceName, req.metadataRoot)
 	arch := archiver.New(repo, rootFS, archiver.Options{})
 	// Upstream worker paths call Error for non-context failures. Returning the
 	// original error both aborts on first item failure and avoids a nil callback
@@ -592,19 +592,23 @@ func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWro
 	defer prog.Finish()
 
 	res := restorer.NewRestorer(repo, sn, restorer.Options{Progress: prog})
+	writeGate := testGate
+	var writeOnce sync.Once
+	var writeErr error
 	res.BeforeWrite = func() error {
+		writeOnce.Do(func() {
+			if writeGate != nil {
+				writeErr = writeGate("restore-write", lockCtx)
+			}
+		})
+		if writeErr != nil {
+			return writeErr
+		}
 		if req.pathsPinned {
 			return recheckRestoreParent(req)
 		}
 		return nil
 	}
-	restorer.SetRestoreWriteHook(func() error {
-		if testGate != nil {
-			return testGate("restore-write", lockCtx)
-		}
-		return nil
-	})
-	defer restorer.SetRestoreWriteHook(nil)
 
 	_, err = res.RestoreToRoot(lockCtx, req.restoreRoot)
 	if err != nil {

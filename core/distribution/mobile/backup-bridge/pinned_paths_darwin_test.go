@@ -77,3 +77,36 @@ func TestDarwinAdoptedRootReadsReplacedDirectory(t *testing.T) {
 		t.Fatal("replacement file visible through adopted root")
 	}
 }
+
+func TestDarwinSymlinkReplacementCannotOpenFIFOForIO(t *testing.T) {
+	root := t.TempDir()
+	parent, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	path := filepath.Join(root, "entry")
+	if err := os.Symlink("original-target", path); err != nil {
+		t.Fatal(err)
+	}
+	var expected unix.Stat_t
+	if err := unix.Fstatat(int(parent.Fd()), "entry", &expected, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the actual open/identity boundary with a stale symlink stat. The
+	// former read-mode open could block on the replacement before checking it.
+	file, err := openDarwinMetadataEntry(int(parent.Fd()), "entry", "entry", expected)
+	if file != nil {
+		file.Close()
+		t.Fatal("replacement FIFO acquired source identity")
+	}
+	if err == nil {
+		t.Fatal("replacement FIFO accepted")
+	}
+}

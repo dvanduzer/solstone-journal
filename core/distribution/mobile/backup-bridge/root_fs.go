@@ -24,16 +24,18 @@ var (
 )
 
 type rootFS struct {
-	root       *os.Root
-	sourcePath string
+	root         *os.Root
+	metadataRoot *os.Root
+	sourcePath   string
 }
 
 var _ fs.FS = &rootFS{}
 
-func newRootFS(root *os.Root, sourcePath string) *rootFS {
+func newRootFS(root *os.Root, sourcePath string, metadataRoot *os.Root) *rootFS {
 	return &rootFS{
-		root:       root,
-		sourcePath: filepath.Clean(sourcePath),
+		root:         root,
+		metadataRoot: metadataRoot,
+		sourcePath:   filepath.Clean(sourcePath),
 	}
 }
 
@@ -114,6 +116,11 @@ func (fsys *rootFS) OpenFile(name string, flag int, metadataOnly bool) (fs.File,
 	}
 
 	if metadataOnly {
+		file, err := openMetadataFile(fsys.root, rel)
+		if err != nil {
+			return nil, err
+		}
+		rf.file = file
 		return rf, nil
 	}
 
@@ -129,58 +136,48 @@ type rootFile struct {
 	relPath      string
 	metadataOnly bool
 	file         *os.File
+	info         os.FileInfo
 }
 
 var _ fs.File = &rootFile{}
 
 func (rf *rootFile) openContent() error {
-	rootFile, err := rf.fsys.root.OpenFile(".", os.O_RDONLY, 0)
+	metadata, err := openMetadataFile(rf.fsys.root, rf.relPath)
 	if err != nil {
 		return err
 	}
-	defer rootFile.Close()
-
-	parentFD, leaf, closeParent, err := openatParent(int(rootFile.Fd()), rf.relPath)
-	if err != nil {
-		return err
-	}
-	defer closeParent()
-
-	if leaf == "." {
-		fd, err := unix.Openat(parentFD, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return err
-		}
-		rf.file = os.NewFile(uintptr(fd), rf.relPath)
-		return nil
-	}
-
-	fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		if errors.Is(err, unix.EISDIR) {
-			fd, err = unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		}
-	}
-	if err != nil {
-		return err
-	}
-	rf.file = os.NewFile(uintptr(fd), rf.relPath)
-	return nil
+	defer metadata.Close()
+	rf.file, err = readableMetadataFile(metadata)
+	return err
 }
 
 func (rf *rootFile) MakeReadable() error {
 	if !rf.metadataOnly {
 		return errors.New("file is already opened for reading")
 	}
+	oldFile := rf.file
+	readable, err := readableMetadataFile(oldFile)
+	if err != nil {
+		return err
+	}
+	oldInfo, oldErr := oldFile.Stat()
+	newInfo, newErr := readable.Stat()
+	if oldErr != nil || newErr != nil || !os.SameFile(oldInfo, newInfo) {
+		_ = readable.Close()
+		return errors.Join(oldErr, newErr, errors.New("source file identity changed before readable open"))
+	}
+	rf.file = readable
+	_ = oldFile.Close()
 	rf.metadataOnly = false
-	return rf.openContent()
+	rf.info = nil
+	return nil
 }
 
 func (rf *rootFile) Read(p []byte) (n int, err error) {
 	if blockContentRead != nil {
 		blockContentRead()
 	}
-	if rf.file == nil {
+	if rf.file == nil || rf.metadataOnly {
 		return 0, errors.New("file not open for reading")
 	}
 	return rf.file.Read(p)
@@ -196,19 +193,38 @@ func (rf *rootFile) Close() error {
 }
 
 func (rf *rootFile) Readdirnames(n int) ([]string, error) {
-	if rf.file != nil {
+	if rf.file != nil && !rf.metadataOnly {
 		return rf.file.Readdirnames(n)
 	}
-	f, err := rf.fsys.root.OpenFile(rf.relPath, os.O_RDONLY, 0)
+	if rf.file == nil {
+		return nil, errors.New("source file is closed")
+	}
+	fd, err := unix.Openat(int(rf.file.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
+	f := os.NewFile(uintptr(fd), rf.relPath)
 	defer f.Close()
 	return f.Readdirnames(n)
 }
 
+func (rf *rootFile) fileInfo() (os.FileInfo, error) {
+	if rf.info != nil {
+		return rf.info, nil
+	}
+	if rf.file == nil {
+		return nil, errors.New("source file is closed")
+	}
+	info, err := rf.file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	rf.info = info
+	return info, nil
+}
+
 func (rf *rootFile) Stat() (*fs.ExtendedFileInfo, error) {
-	fi, err := rf.fsys.root.Lstat(rf.relPath)
+	fi, err := rf.fileInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +238,7 @@ func (rf *rootFile) ToNode(ignoreXattrListError bool, warnf func(format string, 
 		return nil, readXattrFault
 	}
 
-	fi, err := rf.fsys.root.Lstat(rf.relPath)
+	fi, err := rf.fileInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +270,7 @@ func (rf *rootFile) ToNode(ignoreXattrListError bool, warnf func(format string, 
 		node.Type = data.NodeTypeDir
 	case os.ModeSymlink:
 		node.Type = data.NodeTypeSymlink
-		target, err := rf.fsys.root.Readlink(rf.relPath)
+		target, err := readMetadataLink(rf.fsys.metadataRoot, rf.file)
 		if err != nil {
 			return nil, err
 		}
@@ -273,7 +289,7 @@ func (rf *rootFile) ToNode(ignoreXattrListError bool, warnf func(format string, 
 		return nil, fmt.Errorf("unsupported file type %v", fi.Mode().Type())
 	}
 
-	xattrs, err := readNodeXattrs(rf.fsys.root, rf.relPath, fi)
+	xattrs, err := readNodeFileXattrs(rf.fsys.root, rf.relPath, rf.file)
 	if err != nil {
 		return nil, err
 	}

@@ -292,6 +292,7 @@ class BridgeBuild:
 
         # Step: Run unit tests (no tags)
         self.run_step("go-test", [go_bin, "test", "-buildvcs=false", "./mobilebackup"], cwd=restic_dir, env=env)
+        self.run_step("rooted-metadata-tests", [go_bin, "test", "-buildvcs=false", "-run", "^TestRootRestoreMetadata", "./internal/restorer"], cwd=restic_dir, env=env)
         self.run_step(
             "receipt-control-tests",
             [sys.executable, BRIDGE_SRC_PATH / "check_build_receipts.py"],
@@ -320,7 +321,8 @@ class BridgeBuild:
         host_caller = host_artifacts / "caller.c"
         abi_repo = host_artifacts / "abi-repo"
         abi_source = host_artifacts / "abi-source"
-        host_caller.write_text(f'''#include "librestic_bridge.h"
+        shutil.copy2(BRIDGE_SRC_PATH / "abi_legacy.h", host_artifacts / "abi_legacy.h")
+        host_caller.write_text(f'''#include "abi_legacy.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -380,6 +382,13 @@ int main(void) {{
                          "-lpthread", "-ldl", "-lm", "-o", host_caller_bin]
         self.run_step("host-c-link", host_link, cwd=host_artifacts, env=env)
         self.run_step("host-c-run", [host_caller_bin], cwd=host_artifacts, env=env)
+
+        workspace_caller = host_artifacts / "workspace-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "workspace_caller.c.fixture", workspace_caller)
+        workspace_bin = host_artifacts / "workspace-caller"
+        workspace_link = [str(item) if item not in (host_caller, host_caller_bin) else str(workspace_caller if item == host_caller else workspace_bin) for item in host_link]
+        self.run_step("workspace-c-link", workspace_link, cwd=host_artifacts, env=env)
+        self.run_step("workspace-c-run", [workspace_bin, host_artifacts], cwd=host_artifacts, env=env)
 
         # Host behavioral execution above is independent of the device target.
         env.update(GOOS=goos, GOARCH=goarch)

@@ -1,61 +1,11 @@
-diff --git a/internal/archiver/archiver.go b/internal/archiver/archiver.go
-index 3121198..4cde8e3 100644
---- a/internal/archiver/archiver.go
-+++ b/internal/archiver/archiver.go
-@@ -945,6 +945,7 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
- 	if err != nil {
- 		return nil, restic.ID{}, nil, err
- 	}
-+	sn.Paths = targets
- 
- 	sn.ProgramVersion = opts.ProgramVersion
- 	sn.Excludes = opts.Excludes
-diff --git a/internal/fs/node.go b/internal/fs/node.go
-index f2371e1..73b1d97 100644
---- a/internal/fs/node.go
-+++ b/internal/fs/node.go
-@@ -130,6 +130,11 @@ func lookupUsername(uid uint32) string {
- 	return username
- }
- 
-+// LookupUsername returns the cached or resolved username for uid.
-+func LookupUsername(uid uint32) string {
-+	return lookupUsername(uid)
-+}
-+
- var (
- 	userNameLookupCache      = make(map[string]uint32)
- 	userNameLookupCacheMutex = sync.RWMutex{}
-@@ -190,6 +195,11 @@ func lookupGroup(gid uint32) string {
- 	return group
- }
- 
-+// LookupGroup returns the cached or resolved group name for gid.
-+func LookupGroup(gid uint32) string {
-+	return lookupGroup(gid)
-+}
-+
- var (
- 	groupNameLookupCache      = make(map[string]uint32)
- 	groupNameLookupCacheMutex = sync.RWMutex{}
 diff --git a/internal/restorer/filerestorer.go b/internal/restorer/filerestorer.go
-index 63dc3d6..5fb60ae 100644
 --- a/internal/restorer/filerestorer.go
 +++ b/internal/restorer/filerestorer.go
-@@ -3,7 +3,9 @@ package restorer
- import (
- 	"context"
- 	"fmt"
+@@ -5,0 +6 @@
 +	"os"
- 	"path/filepath"
+@@ -6,0 +8 @@
 +	"strings"
- 	"sync"
- 
- 	"golang.org/x/sync/errgroup"
-@@ -60,10 +62,12 @@ type fileRestorer struct {
- 
- 	allowRecursiveDelete bool
- 
+@@ -63,4 +65,6 @@
 -	dst   string
 -	files []*fileInfo
 -	Error func(string, error) error
@@ -66,13 +16,7 @@ index 63dc3d6..5fb60ae 100644
 +	files       []*fileInfo
 +	Error       func(string, error) error
 +	Info        func(string)
- }
- 
- func newFileRestorer(dst string,
-@@ -94,11 +98,43 @@ func newFileRestorer(dst string,
- 	}
- }
- 
+@@ -96,0 +101,29 @@
 +func newFileRestorerRoot(root *os.Root, beforeWrite func() error,
 +	blobsLoader blobsLoaderFn,
 +	idx func(restic.BlobType, restic.ID) []restic.PackedBlob,
@@ -102,21 +46,11 @@ index 63dc3d6..5fb60ae 100644
 +	}
 +}
 +
- func (r *fileRestorer) addFile(location string, content restic.IDs, size int64, state *fileState) {
- 	r.files = append(r.files, &fileInfo{location: location, blobs: content, size: size, state: state})
- }
- 
- func (r *fileRestorer) targetPath(location string) string {
+@@ -101,0 +135,3 @@
 +	if r.root != nil {
 +		return strings.TrimPrefix(filepath.Clean(location), "/")
 +	}
- 	return filepath.Join(r.dst, location)
- }
- 
-@@ -252,7 +288,13 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
- }
- 
- func (r *fileRestorer) truncateFileToSize(location string, size int64) error {
+@@ -255 +291,7 @@
 -	f, err := createFile(r.targetPath(location), size, false, r.allowRecursiveDelete)
 +	var f *os.File
 +	var err error
@@ -125,40 +59,21 @@ index 63dc3d6..5fb60ae 100644
 +	} else {
 +		f, err = createFile(r.targetPath(location), size, false, r.allowRecursiveDelete)
 +	}
- 	if err != nil {
- 		return err
- 	}
 diff --git a/internal/restorer/fileswriter.go b/internal/restorer/fileswriter.go
-index 5987132..b1cedde 100644
 --- a/internal/restorer/fileswriter.go
 +++ b/internal/restorer/fileswriter.go
-@@ -23,6 +23,8 @@ type filesWriter struct {
- 	allowRecursiveDelete bool
- 	cacheMu              sync.Mutex
- 	cache                *simplelru.LRU[string, *partialFile]
+@@ -25,0 +26,2 @@
 +	root                 *os.Root
 +	beforeWrite          func() error
- }
- 
- type filesWriterBucket struct {
-@@ -61,6 +63,13 @@ func newFilesWriter(count int, allowRecursiveDelete bool) *filesWriter {
- 	}
- }
- 
+@@ -61,0 +64,7 @@
++}
++
 +func newFilesWriterRoot(count int, allowRecursiveDelete bool, root *os.Root, beforeWrite func() error) *filesWriter {
 +	w := newFilesWriter(count, allowRecursiveDelete)
 +	w.root = root
 +	w.beforeWrite = beforeWrite
 +	return w
-+}
-+
- func openFile(path string) (*os.File, error) {
- 	f, err := fs.OpenFile(path, fs.O_WRONLY|fs.O_NOFOLLOW, 0600)
- 	if err != nil {
-@@ -210,7 +219,16 @@ func (w *filesWriter) writeToFile(path string, blob []byte, offset int64, create
- 		// Not in cache, open/create the file
- 		var f *os.File
- 		var err error
+@@ -213 +222,10 @@
 -		if createSize >= 0 {
 +		if w.root != nil {
 +			if createSize >= 0 {
@@ -170,18 +85,9 @@ index 5987132..b1cedde 100644
 +				return nil, err
 +			}
 +		} else if createSize >= 0 {
- 			f, err = createFile(path, createSize, sparse, w.allowRecursiveDelete)
- 			if err != nil {
- 				return nil, err
-@@ -262,3 +280,19 @@ func (w *filesWriter) flush() {
- 
- 	w.cache.Purge()
- }
+@@ -264,0 +283,13 @@
 +
 +func (w *filesWriter) createFileRoot(path string, createSize int64, sparse bool) (*os.File, error) {
-+	if err := triggerRestoreWriteHook(); err != nil {
-+		return nil, err
-+	}
 +	if w.beforeWrite != nil {
 +		if err := w.beforeWrite(); err != nil {
 +			return nil, err
@@ -194,31 +100,15 @@ index 5987132..b1cedde 100644
 +	return openRootFileRead(w.root, path)
 +}
 diff --git a/internal/restorer/restorer.go b/internal/restorer/restorer.go
-index ffcd138..91fe434 100644
 --- a/internal/restorer/restorer.go
 +++ b/internal/restorer/restorer.go
-@@ -6,6 +6,7 @@ import (
- 	"io"
- 	"os"
- 	"path/filepath"
+@@ -8,0 +9 @@
 +	"strings"
- 	"sync/atomic"
- 
- 	"github.com/restic/restic/internal/data"
-@@ -35,6 +36,9 @@ type Restorer struct {
- 	SelectFilter func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool)
- 
- 	XattrSelectFilter func(xattrName string) (xattrSelectedForRestore bool)
+@@ -37,0 +39,3 @@
 +
 +	root        *os.Root
 +	BeforeWrite func() error
- }
- 
- var restorerAbortOnAllErrors = func(_ string, err error) error { return err }
-@@ -484,6 +488,280 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error)
- 	return restoredFileCount, err
- }
- 
+@@ -486,0 +491,268 @@
 +// RestoreToRoot restores snapshot contents into the given root directory.
 +func (res *Restorer) RestoreToRoot(ctx context.Context, root *os.Root) (uint64, error) {
 +	res.root = root
@@ -310,9 +200,6 @@ index ffcd138..91fe434 100644
 +			if node.Type != data.NodeTypeFile {
 +				_, err := res.withOverwriteCheckRoot(ctx, node, target, location, false, nil, func(_ bool, _ *fileState) error {
 +					if !res.opts.DryRun {
-+						if err := triggerRestoreWriteHook(); err != nil {
-+							return err
-+						}
 +						if res.BeforeWrite != nil {
 +							if err := res.BeforeWrite(); err != nil {
 +								return err
@@ -332,9 +219,6 @@ index ffcd138..91fe434 100644
 +			if idx.Has(node.Inode, node.DeviceID) && idx.Value(node.Inode, node.DeviceID) != location {
 +				_, err := res.withOverwriteCheckRoot(ctx, node, target, location, true, nil, func(_ bool, _ *fileState) error {
 +					if !res.opts.DryRun {
-+						if err := triggerRestoreWriteHook(); err != nil {
-+							return err
-+						}
 +						if res.BeforeWrite != nil {
 +							if err := res.BeforeWrite(); err != nil {
 +								return err
@@ -493,15 +377,10 @@ index ffcd138..91fe434 100644
 +	return &fileState{matches, sizeMatches}, buf, nil
 +}
 +
- func (res *Restorer) removeUnexpectedFiles(ctx context.Context, target, location string, expectedFilenames []string) error {
- 	if !res.opts.Delete {
- 		panic("internal error")
 diff --git a/internal/restorer/root_io.go b/internal/restorer/root_io.go
-new file mode 100644
-index 0000000..2605d78
 --- /dev/null
 +++ b/internal/restorer/root_io.go
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,377 @@
 +//go:build darwin || ios || linux
 +
 +package restorer
@@ -512,7 +391,6 @@ index 0000000..2605d78
 +	"os"
 +	"path/filepath"
 +	"strings"
-+	"sync"
 +	"syscall"
 +
 +	"github.com/restic/restic/internal/data"
@@ -522,33 +400,6 @@ index 0000000..2605d78
 +var (
 +	errPathEscapes = errors.New("path escapes from parent")
 +)
-+
-+var (
-+	restoreWriteHookMu sync.Mutex
-+	restoreWriteHook   func() error
-+	restoreWriteOnce   sync.Once
-+)
-+
-+// SetRestoreWriteHook sets an observation hook called once on the first rooted file or directory create.
-+func SetRestoreWriteHook(hook func() error) {
-+	restoreWriteHookMu.Lock()
-+	restoreWriteHook = hook
-+	restoreWriteOnce = sync.Once{}
-+	restoreWriteHookMu.Unlock()
-+}
-+
-+func triggerRestoreWriteHook() error {
-+	var err error
-+	restoreWriteHookMu.Lock()
-+	hook := restoreWriteHook
-+	restoreWriteHookMu.Unlock()
-+	if hook != nil {
-+		restoreWriteOnce.Do(func() {
-+			err = hook()
-+		})
-+	}
-+	return err
-+}
 +
 +// openatParent resolves the parent directory descriptor of p relative to rootFD using O_NOFOLLOW.
 +// It returns parentFD and the leaf component name. If parentFD != rootFD, closeParent must be called.
@@ -599,10 +450,6 @@ index 0000000..2605d78
 +	target = strings.TrimPrefix(filepath.Clean(target), "/")
 +	if target == "." || target == "" {
 +		return nil
-+	}
-+
-+	if err := triggerRestoreWriteHook(); err != nil {
-+		return err
 +	}
 +	if res.BeforeWrite != nil {
 +		if err := res.BeforeWrite(); err != nil {
@@ -791,7 +638,9 @@ index 0000000..2605d78
 +		if xattrSelectFilter != nil && !xattrSelectFilter(attr.Name) {
 +			continue
 +		}
-+		_ = setXattrRoot(parentFD, leaf, isSymlink, attr.Name, attr.Value)
++		if err := setXattrRoot(parentFD, leaf, isSymlink, attr.Name, attr.Value); err != nil {
++			return err
++		}
 +	}
 +
 +	// 3. Timestamps
@@ -799,11 +648,25 @@ index 0000000..2605d78
 +		unix.NsecToTimespec(node.AccessTime.UnixNano()),
 +		unix.NsecToTimespec(node.ModTime.UnixNano()),
 +	}
-+	_ = unix.UtimesNanoAt(parentFD, leaf, times, unix.AT_SYMLINK_NOFOLLOW)
++	if err := unix.UtimesNanoAt(parentFD, leaf, times, unix.AT_SYMLINK_NOFOLLOW); err != nil {
++		return err
++	}
 +
 +	// 4. Chmod (non-symlink)
 +	if !isSymlink {
-+		_ = unix.Fchmodat(parentFD, leaf, uint32(node.Mode&os.ModePerm), unix.AT_SYMLINK_NOFOLLOW)
++		mode := uint32(node.Mode.Perm())
++		if node.Mode&os.ModeSetuid != 0 {
++			mode |= unix.S_ISUID
++		}
++		if node.Mode&os.ModeSetgid != 0 {
++			mode |= unix.S_ISGID
++		}
++		if node.Mode&os.ModeSticky != 0 {
++			mode |= unix.S_ISVTX
++		}
++		if err := unix.Fchmodat(parentFD, leaf, mode, unix.AT_SYMLINK_NOFOLLOW); err != nil {
++			return err
++		}
 +	}
 +
 +	return nil
@@ -896,25 +759,21 @@ index 0000000..2605d78
 +	return f, nil
 +}
 diff --git a/internal/restorer/root_io_darwin.go b/internal/restorer/root_io_darwin.go
-new file mode 100644
-index 0000000..bc6dace
 --- /dev/null
 +++ b/internal/restorer/root_io_darwin.go
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,27 @@
 +//go:build darwin || ios
 +
 +package restorer
 +
 +import (
-+	"errors"
-+
 +	"golang.org/x/sys/unix"
 +)
 +
 +func setXattrRoot(parentFD int, leaf string, isSymlink bool, name string, val []byte) error {
 +	var openFlags int = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 +	if isSymlink {
-+		openFlags = unix.O_SYMLINK | unix.O_NOFOLLOW | unix.O_CLOEXEC
++		openFlags = unix.O_SYMLINK | unix.O_CLOEXEC
 +	}
 +	fd, err := unix.Openat(parentFD, leaf, openFlags, 0)
 +	if err != nil {
@@ -924,78 +783,70 @@ index 0000000..bc6dace
 +		}
 +	}
 +	defer unix.Close(fd)
-+	err = unix.Fsetxattr(fd, name, val, 0)
-+	if err != nil && !errors.Is(err, unix.ENOTSUP) && !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EPERM) {
-+		return err
-+	}
-+	return nil
++	return unix.Fsetxattr(fd, name, val, 0)
 +}
 +
 +func mknodSpecialAt(parentFD int, leaf string, mode uint32, dev int) error {
 +	return unix.ENOTSUP
 +}
 diff --git a/internal/restorer/root_io_linux.go b/internal/restorer/root_io_linux.go
-new file mode 100644
-index 0000000..622cc0e
 --- /dev/null
 +++ b/internal/restorer/root_io_linux.go
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,23 @@
 +//go:build linux
 +
 +package restorer
 +
 +import (
-+	"errors"
-+	"unsafe"
-+
++	"fmt"
 +	"golang.org/x/sys/unix"
 +)
 +
 +func setXattrRoot(parentFD int, leaf string, isSymlink bool, name string, val []byte) error {
-+	cname, err := unix.BytePtrFromString(name)
++	fd, err := unix.Openat(parentFD, leaf, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 +	if err != nil {
 +		return err
-+	}
-+	var valPtr *byte
-+	if len(val) > 0 {
-+		valPtr = &val[0]
-+	}
-+	if isSymlink {
-+		fd, err := unix.Openat(parentFD, leaf, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-+		if err != nil {
-+			return err
-+		}
-+		defer unix.Close(fd)
-+		empty := []byte{0}
-+		_, _, errno := unix.Syscall6(
-+			unix.SYS_SETXATTRAT,
-+			uintptr(fd),
-+			uintptr(unsafe.Pointer(&empty[0])),
-+			uintptr(unsafe.Pointer(cname)),
-+			uintptr(unsafe.Pointer(valPtr)),
-+			uintptr(len(val)),
-+			uintptr(unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW),
-+		)
-+		if errno != 0 && errno != unix.ENOTSUP && errno != unix.EOPNOTSUPP && errno != unix.EPERM {
-+			return errno
-+		}
-+		return nil
-+	}
-+	fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-+	if err != nil {
-+		fd, err = unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-+		if err != nil {
-+			return err
-+		}
 +	}
 +	defer unix.Close(fd)
-+	err = unix.Fsetxattr(fd, name, val, 0)
-+	if err != nil && !errors.Is(err, unix.ENOTSUP) && !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EPERM) {
-+		return err
-+	}
-+	return nil
++	// Following the descriptor's procfs magic link addresses this inode itself,
++	// including a symlink inode, without resolving its user-visible target.
++	return unix.Setxattr(fmt.Sprintf("/proc/self/fd/%d", fd), name, val, 0)
 +}
 +
 +func mknodSpecialAt(parentFD int, leaf string, mode uint32, dev int) error {
 +	return unix.Mknodat(parentFD, leaf, mode, dev)
++}
+diff --git a/internal/restorer/root_metadata_test.go b/internal/restorer/root_metadata_test.go
+--- /dev/null
++++ b/internal/restorer/root_metadata_test.go
+@@ -0,0 +1,30 @@
++//go:build linux || darwin || ios
++
++package restorer
++
++import (
++	"github.com/restic/restic/internal/data"
++	"os"
++	"testing"
++	"time"
++)
++
++func TestRootRestoreMetadataRefusesRequiredXattrFailure(t *testing.T) {
++	root, err := os.OpenRoot(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer root.Close()
++	if err := root.WriteFile("owner", []byte("retained"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	res := &Restorer{root: root}
++	node := &data.Node{Type: data.NodeTypeFile, Mode: 0600, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()), AccessTime: time.Now(), ModTime: time.Now(), ExtendedAttributes: []data.ExtendedAttribute{{Name: "invalid\x00attribute", Value: []byte("value")}}}
++	if err := rootRestoreMetadata(res, node, "owner", nil, nil, false); err == nil {
++		t.Fatal("required xattr failure was silently accepted")
++	}
++	contents, err := root.ReadFile("owner")
++	if err != nil || string(contents) != "retained" {
++		t.Fatalf("content changed: %q %v", contents, err)
++	}
 +}
