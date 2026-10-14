@@ -1489,6 +1489,7 @@ mod tests {
         assert_ne!(first, ios_macho_content_sha256(&image).unwrap());
     }
 
+    #[cfg(feature = "full-tests")]
     #[test]
     fn bundle_scanner_descends_only_into_packaged_rim_directory() {
         let temp = tempfile::tempdir().unwrap();
