@@ -8,7 +8,7 @@
     "incomplete": "some of your journal couldn't be read, so the copy that was stored is incomplete.",
     "repo_missing": "your backup destination couldn't be found.",
     "locked": "the backup lock was already held.",
-    "auth_failed": "your destination credentials were refused.",
+    "auth_failed": "the backup key couldn't open the destination.",
     "timeout": "it ran out of time.",
     "_missing": "the reason wasn't recorded.",
     "restic_unavailable": "encrypted backup can't run on this computer.",

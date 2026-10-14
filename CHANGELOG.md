@@ -14,6 +14,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- home now points to health when your current backup key can't open the destination. changing the setup removes the old warning; ordinary retries stay in backup details.
+
 - when an older day has daily results that were never made, your journal now makes them after finishing that day's recordings, before moving on to older recordings. before, those results waited until every older recording was finished.
 
 - new conversations you import from ChatGPT, Claude or Gemini now label your messages as "You" instead of "Human", so your journal can tell them apart from the assistant's replies. Claude messages without a known sender are labeled "Unknown".
