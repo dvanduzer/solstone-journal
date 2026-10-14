@@ -3490,7 +3490,8 @@ class = "notice"
             !matches!(
                 entry,
                 Entry::PinnedMembers {
-                    input: crate::inventory::PinnedInput::CatalogAcquired { .. },
+                    input: crate::inventory::PinnedInput::CatalogAcquired { .. }
+                        | crate::inventory::PinnedInput::AuthorityCommitted { .. },
                     ..
                 }
             )
