@@ -136,9 +136,23 @@ fn substitute(value: &str, root: &Path) -> String {
         .canonicalize()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| root_text.clone());
-    value
-        .replace(&canonical, "<JOURNAL_ROOT>")
-        .replace(&root_text, "<JOURNAL_ROOT>")
+    let mut roots = vec![canonical.clone(), root_text];
+    if let Some(drive_path) = canonical.strip_prefix(r"\\?\")
+        && drive_path.as_bytes().get(1) == Some(&b':')
+    {
+        roots.push(drive_path.to_owned());
+    }
+    roots.sort_by_key(|text| std::cmp::Reverse(text.len()));
+    roots.dedup();
+    let mut normalized = value.to_owned();
+    for text in roots {
+        // Bodies may be raw JSON; decoded fields carry the unescaped native path.
+        let encoded = serde_json::to_string(&text).expect("encode fixture root");
+        normalized = normalized
+            .replace(&encoded[1..encoded.len() - 1], "<JOURNAL_ROOT>")
+            .replace(&text, "<JOURNAL_ROOT>");
+    }
+    normalized
 }
 fn normalize(value: &mut Value, root: &Path) {
     match value {

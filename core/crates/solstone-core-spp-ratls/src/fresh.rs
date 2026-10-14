@@ -147,12 +147,15 @@ pub fn resolve_nvattest_dir(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Duration};
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::{fs, path::Path};
 
     use super::perform_fresh_reattest;
+    #[cfg(unix)]
+    use crate::check_nvattest_readiness;
     use crate::{
-        AttestationFailureKind, AttestationStateStore, NvattestEnsureStatus,
-        check_nvattest_readiness, test_support::TempDir,
+        AttestationFailureKind, AttestationStateStore, NvattestEnsureStatus, test_support::TempDir,
     };
 
     #[test]
@@ -176,6 +179,7 @@ mod tests {
         assert_eq!(host, "confidential.example:8443");
     }
 
+    #[cfg(unix)]
     fn assert_prerequisite_failure(
         nvattest_dir: &Path,
         reason_code: &'static str,
@@ -197,6 +201,8 @@ mod tests {
         assert_eq!(state.get_attestation_state().failure, Some(failure));
     }
 
+    // This is a Unix bin/lib package fixture; Windows verifies its signed worker closure.
+    #[cfg(unix)]
     #[test]
     fn fresh_reattest_records_the_locator_cause_before_channel_establishment() {
         let root = TempDir::new("fresh");

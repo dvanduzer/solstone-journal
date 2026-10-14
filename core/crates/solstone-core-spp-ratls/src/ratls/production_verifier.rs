@@ -1141,6 +1141,8 @@ mod tests {
         }
     }
 
+    // This is a Unix bin/lib package fixture; Windows verifies its signed worker closure.
+    #[cfg(unix)]
     #[test]
     fn readiness_preserves_each_locator_cause() {
         let root = TempDir::new("readiness");

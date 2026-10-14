@@ -706,7 +706,7 @@ zeta                     observer     20260101   090000_1         123456\n"
             "good",
             record("good", 1, "20260101", "090000_1"),
         );
-        let bad = temporary.path().join("streams/bad.json");
+        let bad = temporary.path().join("streams").join("bad.json");
         fs::write(&bad, b"not json").unwrap();
         let run = bypass_run(&[], temporary.path());
         assert_eq!(run.exit_code, 3);
@@ -722,7 +722,7 @@ zeta                     observer     20260101   090000_1         123456\n"
     fn inspect_preserves_raw_legacy_bytes_and_reports_missing_or_malformed_path() {
         let temporary = TempDir::new().unwrap();
         let root = temporary.path().join("journal");
-        let path = root.join("streams/legacy.json");
+        let path = root.join("streams").join("legacy.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let raw = b"{\n  \"unknown\": 7, \"type\": \"legacy\", \"name\": \"legacy\"\n}";
         fs::write(&path, raw).unwrap();
@@ -741,14 +741,14 @@ zeta                     observer     20260101   090000_1         123456\n"
         assert_eq!(traversal.stdout, "Stream not found: ../../escaped\n");
         assert_eq!(traversal.exit_code, 1);
         assert_eq!(fs::read(&escaped).unwrap(), b"{\"outside\":true}");
-        fs::write(root.join("streams/bad.json"), b"{").unwrap();
+        fs::write(root.join("streams").join("bad.json"), b"{").unwrap();
         let run = bypass_run(&["bad"], &root);
         assert_eq!(run.exit_code, 3);
         assert_eq!(
             run.stderr,
             format!(
                 "Could not read stream {}: malformed record\n",
-                root.join("streams/bad.json").display()
+                root.join("streams").join("bad.json").display()
             )
         );
     }
@@ -793,7 +793,7 @@ zeta                     observer     20260101   090000_1         123456\n"
     fn rebuild_repairs_raw_record_without_normalizing_legacy_or_unknown_fields() {
         let temporary = TempDir::new().unwrap();
         let root = temporary.path();
-        let path = root.join("streams/legacy.json");
+        let path = root.join("streams").join("legacy.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "{\n  \"name\": \"legacy\",\n  \"type\": \"old\",\n  \"unknown\": {\"x\": 1},\n  \"host\": null,\n  \"platform\": null,\n  \"created_at\": 1,\n  \"last_day\": \"20260101\",\n  \"last_segment\": \"080000_1\",\n  \"seq\": 1\n}\n").unwrap();
         marker(
@@ -822,7 +822,7 @@ zeta                     observer     20260101   090000_1         123456\n"
             marker_value("missing", 2),
         );
         fs::create_dir_all(root.join("streams")).unwrap();
-        let malformed = root.join("streams/bad.json");
+        let malformed = root.join("streams").join("bad.json");
         fs::write(&malformed, b"{").unwrap();
         marker(
             root,

@@ -5939,8 +5939,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(non_materializable, 1);
-        assert_eq!(replayed, 12);
+        // Windows cannot materialize Unix surrogateescaped bytes; the lone surrogate is provenance only everywhere.
+        assert_eq!(non_materializable, if cfg!(unix) { 1 } else { 2 });
+        assert_eq!(replayed + non_materializable, fixture.port_cases.len());
     }
 
     #[test]
@@ -5973,8 +5974,9 @@ mod tests {
             );
             assert_eq!(render_service_diagnostic(&error), expected, "{}", case.id);
         }
-        assert_eq!(non_materializable, 1);
-        assert_eq!(replayed, 12);
+        // Windows cannot materialize Unix surrogateescaped bytes; the lone surrogate is provenance only everywhere.
+        assert_eq!(non_materializable, if cfg!(unix) { 1 } else { 2 });
+        assert_eq!(replayed + non_materializable, fixture.port_cases.len());
         #[cfg(unix)]
         {
             let argv = vec![
