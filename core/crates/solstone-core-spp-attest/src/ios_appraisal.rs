@@ -656,7 +656,19 @@ pub fn appraise_ios_gpu(
     proofs: Option<&[u8]>,
     verification_time: SystemTime,
 ) -> Result<GpuAppraisal, GpuAppraisalReason> {
-    if profile.manifests() != ManifestSet::QUALIFIED_595_71_05 {
+    // ManifestSet equality is pointer identity. Const promotion can give the
+    // same qualified set a different address across code generation units.
+    // Compare the complete pinned contents at this platform boundary.
+    if !profile
+        .manifests()
+        .entries()
+        .iter()
+        .map(|rim| (rim.filename(), rim.sha256(), rim.xml()))
+        .eq(ManifestSet::QUALIFIED_595_71_05
+            .entries()
+            .iter()
+            .map(|rim| (rim.filename(), rim.sha256(), rim.xml())))
+    {
         return Err(GpuAppraisalReason::NvattestUnavailable);
     }
     if profile.status() == StatusMode::OnlineNonce {
