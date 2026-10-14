@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- stopping or restarting your journal no longer waits several extra seconds when a background job left a helper program running. that time now goes to letting your journal's other programs stop cleanly.
+
 ## [2.0.45] - 2026-10-14
 
 on windows, this version also brings every change in [2.0.44](https://solstone.app/releases#v2.0.44), including its security fix, so please update. where 2.0.44 says offload, approving or restoring stays paused on windows, this version turns it back on.

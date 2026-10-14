@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+#![allow(clippy::disallowed_methods, reason = "the render harness drives node")]
+
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;

@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+#[cfg(feature = "full-tests")]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "full-tests")]
 use std::fs;
+#[cfg(feature = "full-tests")]
 use std::path::{Path, PathBuf};
 
 use quote::ToTokens;
@@ -11,6 +14,7 @@ use syn::visit::{self, Visit};
 
 const OWNER_HOST: &str = "updates.solstone.app";
 
+#[cfg(feature = "full-tests")]
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -229,7 +233,7 @@ impl<'ast> Visit<'ast> for TestSpanCollector {
 }
 
 fn scan_source(relative_path: &str, content: &str) -> Vec<Hit> {
-    if relative_path.contains("tests") {
+    if relative_path.contains("tests") || !content.contains(OWNER_HOST) {
         return Vec::new();
     }
     let syntax = match syn::parse_file(content) {
@@ -302,6 +306,7 @@ fn validate_hits(hits: &[Hit]) -> Vec<String> {
     errors
 }
 
+#[cfg(feature = "full-tests")]
 fn discover_inventory_packages(inventory_path: &Path) -> BTreeSet<String> {
     let content = fs::read_to_string(inventory_path).expect("read inventory.toml");
     let doc = content
@@ -348,6 +353,7 @@ fn discover_inventory_packages(inventory_path: &Path) -> BTreeSet<String> {
     packages
 }
 
+#[cfg(feature = "full-tests")]
 fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
     attrs.iter().find_map(|attr| {
         if !attr.path().is_ident("path") {
@@ -367,6 +373,7 @@ fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
     })
 }
 
+#[cfg(feature = "full-tests")]
 fn module_contexts(crate_root: &Path) -> BTreeMap<PathBuf, bool> {
     let src = crate_root.join("src");
     let mut roots = vec![src.join("lib.rs"), src.join("main.rs")];
@@ -402,6 +409,9 @@ fn module_contexts(crate_root: &Path) -> BTreeMap<PathBuf, bool> {
             Ok(c) => c,
             Err(_) => continue,
         };
+        if !crate::ci::may_declare_file_module(&content) {
+            continue;
+        }
         let syntax = match syn::parse_file(&content) {
             Ok(s) => s,
             Err(_) => continue,
@@ -450,6 +460,7 @@ fn module_contexts(crate_root: &Path) -> BTreeMap<PathBuf, bool> {
     contexts
 }
 
+#[cfg(feature = "full-tests")]
 fn scan_reachable_crates(repo_root: &Path) -> Vec<Hit> {
     let inventory_packages =
         discover_inventory_packages(&repo_root.join("core/distribution/inventory.toml"));
@@ -562,10 +573,6 @@ fn scan_reachable_crates(repo_root: &Path) -> Vec<Hit> {
         collect_rs_files(&src_dir, &mut files);
 
         for file in files {
-            let file_str = file.to_string_lossy();
-            if file_str.contains("tests") {
-                continue;
-            }
             if contexts.get(&file) == Some(&true) {
                 // reached only via test mod
                 continue;
@@ -629,6 +636,7 @@ pub const PRODUCTION_HOST_URL: &str = "https://updates.solstone.app/untracked";
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn owner_origin_host_production_contract_passes() {
     let root = repository_root();

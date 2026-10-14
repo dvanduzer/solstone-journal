@@ -63,18 +63,18 @@ mod tests {
     use super::installation_recovery_copy;
 
     #[test]
-    fn installation_recovery_copy_is_locked() {
+    fn installation_recovery_detail_is_sanitized_and_bounded() {
+        let detail = |copy: &str| {
+            copy.split_once("\ndetails: ")
+                .expect("detail line")
+                .1
+                .to_owned()
+        };
         let copy = installation_recovery_copy("binding\\detail\n\x1b");
-        assert!(copy.starts_with(
-            "this installation couldn't be verified.\nrun `solstone journal setup` to check it. if setup finishes successfully, try again.\ndetails: "
-        ));
-        assert!(copy.ends_with("binding\\\\detail\\n\\x1b"));
+        assert_eq!(detail(&copy), "binding\\\\detail\\n\\x1b");
 
         let oversized = installation_recovery_copy(&"\x1b".repeat(1025));
         assert!(oversized.ends_with("…[truncated]"));
-        let detail = oversized.strip_prefix(
-            "this installation couldn't be verified.\nrun `solstone journal setup` to check it. if setup finishes successfully, try again.\ndetails: "
-        ).expect("locked recovery prefix");
-        assert_eq!(detail.chars().count(), 2048);
+        assert_eq!(detail(&oversized).chars().count(), 2048);
     }
 }

@@ -86,15 +86,29 @@ fn now() -> i64 {
         .expect("unix timestamp fits i64")
 }
 
+/// One journal identity per test process, so every vector's pairing derives
+/// the same journal mark instead of a fresh one each time.
+fn committed_ca() -> &'static (String, String, String) {
+    static CA: std::sync::OnceLock<(String, String, String)> = std::sync::OnceLock::new();
+    CA.get_or_init(|| {
+        let ca = generate_ca().expect("CA");
+        (
+            ca.certificate_pem().to_string(),
+            ca.private_key_pem(),
+            jid_from_spki(ca.spki_der()).expect("JID"),
+        )
+    })
+}
+
 fn committed_identity(root: &Path) {
-    let ca = generate_ca().expect("CA");
+    let (certificate, private_key, jid) = committed_ca();
     fs::create_dir_all(root.join("link/ca")).expect("CA directory");
-    fs::write(root.join("link/ca/cert.pem"), ca.certificate_pem()).expect("CA certificate");
-    fs::write(root.join("link/ca/private.pem"), ca.private_key_pem()).expect("CA key");
+    fs::write(root.join("link/ca/cert.pem"), certificate).expect("CA certificate");
+    fs::write(root.join("link/ca/private.pem"), private_key).expect("CA key");
     fs::write(
         root.join("link/state.json"),
         serde_json::json!({
-            "instance_id": jid_from_spki(ca.spki_der()).expect("JID"),
+            "instance_id": jid,
             "home_label": "Home"
         })
         .to_string(),

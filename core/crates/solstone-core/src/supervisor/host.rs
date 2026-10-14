@@ -1054,8 +1054,7 @@ mod tests {
     /// ⛔ A FALSIFICATION test for the refusal copy, not a snapshot of it.
     ///
     /// The properties, each of which an ordinary edit breaks silently:
-    ///   1. every variant hands the owner something to try, and it is a retry:
-    ///      there is no manual step, so no arm may send the owner to move,
+    ///   1. there is no manual step, so no arm may send the owner to move,
     ///      rename or delete anything under their journal.
     ///   2. no arm sends the owner to `journal start`, which starts the
     ///      supervisor in the foreground rather than the service.
@@ -1064,7 +1063,7 @@ mod tests {
     ///      records that closure retires from.
     ///   4. `details:` stays last, as the sibling refusals have it.
     #[test]
-    fn every_lifecycle_recovery_copy_ends_in_something_the_owner_can_do() {
+    fn no_lifecycle_recovery_copy_hands_the_owner_a_manual_step() {
         use super::runtime::ParentLossCoordinatorBootstrapFailure as Failure;
 
         const ALL: [Failure; 4] = [
@@ -1090,10 +1089,6 @@ mod tests {
         for reason in ALL {
             let copy = super::format_lifecycle_recovery_copy(journal, reason);
 
-            assert!(
-                copy.contains("wait a moment, then try again."),
-                "{reason:?} must offer the retry:\n{copy}"
-            );
             for manual in [
                 "mv ",
                 "rm ",

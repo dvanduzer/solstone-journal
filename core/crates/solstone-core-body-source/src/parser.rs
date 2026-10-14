@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use crate::{BodyInteger, BodyString, BodyValue, ParseError};
 
 pub(crate) const MAX_NESTING: usize = 128;
+pub(crate) const MAX_INTEGER_DIGITS: usize = 4300;
 
 /// Decodes exactly one Python-3.12-compatible JSON text from UTF-8 bytes.
 pub fn parse(input: &[u8]) -> Result<BodyValue, ParseError> {
@@ -158,9 +159,9 @@ impl<'a> Parser<'a> {
             return Ok(Some(BodyValue::Number(number)));
         }
 
-        if digit_count > 4300 {
+        if digit_count > MAX_INTEGER_DIGITS {
             return Err(ParseError::NumberTooLong {
-                byte_offset: digit_start + 4300,
+                byte_offset: digit_start + MAX_INTEGER_DIGITS,
             });
         }
         let digits = &self.text[digit_start..cursor];
@@ -364,12 +365,13 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 pub(crate) mod test_corpus {
+    use std::collections::BTreeSet;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
 
     use serde_json::Value;
 
-    use super::{parse, parse_with_top_level_keys};
+    use super::{MAX_INTEGER_DIGITS, parse, parse_with_top_level_keys};
     use crate::{BodyString, BodyValue, ParseError, canonicalize};
 
     pub(crate) fn fixture_path(name: &str) -> PathBuf {
@@ -715,6 +717,31 @@ pub(crate) mod test_corpus {
         }
     }
 
+    /// Proper prefix lengths for a truncation sweep: all of them for an input
+    /// up to 1 KiB; for a longer one, both ends plus a window around each point
+    /// where a digit run reaches the integer length limit.
+    pub(crate) fn sweep_prefix_lengths(input: &[u8]) -> Vec<usize> {
+        const FULL_SWEEP_MAX: usize = 1024;
+        const EDGE: usize = 64;
+        const LIMIT_WINDOW: usize = 8;
+        if input.len() <= FULL_SWEEP_MAX {
+            return (1..input.len()).collect();
+        }
+        let mut lengths = (1..=EDGE)
+            .chain(input.len() - EDGE..input.len())
+            .collect::<BTreeSet<_>>();
+        for (index, byte) in input.iter().enumerate() {
+            if byte.is_ascii_digit() && (index == 0 || !input[index - 1].is_ascii_digit()) {
+                let limit = index + MAX_INTEGER_DIGITS;
+                lengths.extend(
+                    (limit - LIMIT_WINDOW..=limit + LIMIT_WINDOW)
+                        .filter(|length| *length < input.len()),
+                );
+            }
+        }
+        lengths.into_iter().collect()
+    }
+
     pub(crate) fn assert_entry_points_agree(input: &[u8]) {
         let public = catch_unwind(AssertUnwindSafe(|| parse(input)));
         assert!(public.is_ok(), "public parse panicked for {input:?}");
@@ -900,7 +927,7 @@ mod tests {
             .collect::<Vec<_>>();
         for (name, input) in inputs {
             assert_entry_points_agree(&input);
-            for length in 1..input.len() {
+            for length in sweep_prefix_lengths(&input) {
                 assert_entry_points_agree(&input[..length]);
             }
             assert!(!name.is_empty());

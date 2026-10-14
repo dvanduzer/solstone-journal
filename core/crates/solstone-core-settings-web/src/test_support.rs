@@ -3,12 +3,13 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use axum::Router;
 use serde_json::Value;
 use tempfile::TempDir;
 
-pub fn corpus() -> Value {
+static CORPUS: LazyLock<Value> = LazyLock::new(|| {
     let mut corpus = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../fixtures/convey_settings_corpus.json"
@@ -25,6 +26,10 @@ pub fn corpus() -> Value {
         &mut corpus,
     );
     corpus
+});
+
+pub fn corpus() -> Value {
+    CORPUS.clone()
 }
 
 pub fn established_root() -> TempDir {
@@ -94,8 +99,7 @@ fn malformed_config() -> Value {
 
 pub fn populated_root() -> TempDir {
     let root = TempDir::new().expect("temporary journal");
-    let corpus = corpus();
-    let files = corpus["phases"]["populated"]["_journal_tree"]["files"]
+    let files = CORPUS["phases"]["populated"]["_journal_tree"]["files"]
         .as_object()
         .expect("populated tree");
     for (relative, value) in files {

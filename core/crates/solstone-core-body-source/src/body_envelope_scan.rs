@@ -91,7 +91,7 @@ mod tests {
 
     use crate::parser::test_corpus::{
         alternating_containers, assert_body_value_bitwise_eq, fixture, fixture_inputs,
-        generated_corpus, repeated_objects, string_field,
+        generated_corpus, repeated_objects, string_field, sweep_prefix_lengths,
     };
     use crate::{BodyValue, EnvelopeErrorCode, EnvelopeErrorField, canonicalize, parse};
 
@@ -438,7 +438,7 @@ mod tests {
             "4300-digit integer",
         ] {
             let input = corpus_value(&corpus, name);
-            for length in 1..input.len() {
+            for length in sweep_prefix_lengths(input) {
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| scan_body_envelope(&input[..length]))).is_ok(),
                     "{name} prefix {length} panicked"

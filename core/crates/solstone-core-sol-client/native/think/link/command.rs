@@ -215,7 +215,7 @@ pub fn link_join(ctx: CommandContext<'_>) -> CommandOutput {
     let _ = fs::remove_file(bundle_dir.join("journal_metadata.json"));
     let _ = fs::remove_file(bundle_dir.join("serve_runtime.json"));
 
-    let mark_line = match spl_core::mark::mark_from_jid(&credential.instance_id) {
+    let mark_line = match crate::mark_text::mark_from_jid(&credential.instance_id) {
         Ok(mark) => format!(
             "journal mark: {}\n",
             format_spoken_mark(&mark.to_render_spec())
@@ -441,7 +441,7 @@ fn format_sighting_block(
         None => "unknown journal seen through the relay:".to_string(),
     };
     let what_answered = match &sighting.jid {
-        Some(jid) => match spl_core::mark::mark_from_jid(jid) {
+        Some(jid) => match crate::mark_text::mark_from_jid(jid) {
             Ok(mark) => {
                 let spoken = format_spoken_mark(&mark.to_render_spec());
                 format!("what answered:  {spoken} (claimed, not verified)")
@@ -451,7 +451,7 @@ fn format_sighting_block(
         },
         None => "what answered:  no identity presented".to_string(),
     };
-    let your_journal = match spl_core::mark::mark_from_jid(local_instance_id) {
+    let your_journal = match crate::mark_text::mark_from_jid(local_instance_id) {
         Ok(mark) => {
             let spoken = format_spoken_mark(&mark.to_render_spec());
             format!("your journal:   {spoken}")
@@ -2515,7 +2515,7 @@ mod tests {
         );
 
         let bundle = config.join("solstone-observer").join("spl").join("laptop");
-        let mark = spl_core::mark::mark_from_jid(instance_id).expect("mark");
+        let mark = crate::mark_text::mark_from_jid(instance_id).expect("mark");
         let spoken = format_spoken_mark(&mark.to_render_spec());
         assert_eq!(
             output.stdout,
@@ -3689,9 +3689,9 @@ mod tests {
         .expect("write");
 
         let other_jid = "01957597-2a5c-7d92-8ec2-e0f3408a0d9b";
-        let other_mark = spl_core::mark::mark_from_jid(other_jid).expect("other mark");
+        let other_mark = crate::mark_text::mark_from_jid(other_jid).expect("other mark");
         let other_spoken = format_spoken_mark(&other_mark.to_render_spec());
-        let local_mark = spl_core::mark::mark_from_jid(local_id).expect("local mark");
+        let local_mark = crate::mark_text::mark_from_jid(local_id).expect("local mark");
         let local_spoken = format_spoken_mark(&local_mark.to_render_spec());
 
         let snapshot = LinkServeStatusSnapshot {
@@ -3748,9 +3748,9 @@ mod tests {
         .expect("write");
 
         let other_jid = "01957597-2a5c-7d92-8ec2-e0f3408a0d9b";
-        let other_mark = spl_core::mark::mark_from_jid(other_jid).expect("other mark");
+        let other_mark = crate::mark_text::mark_from_jid(other_jid).expect("other mark");
         let other_spoken = format_spoken_mark(&other_mark.to_render_spec());
-        let local_mark = spl_core::mark::mark_from_jid(local_id).expect("local mark");
+        let local_mark = crate::mark_text::mark_from_jid(local_id).expect("local mark");
         let local_spoken = format_spoken_mark(&local_mark.to_render_spec());
 
         let snapshot = LinkServeStatusSnapshot {
@@ -3806,7 +3806,7 @@ mod tests {
         )
         .expect("write");
 
-        let local_mark = spl_core::mark::mark_from_jid(local_id).expect("local mark");
+        let local_mark = crate::mark_text::mark_from_jid(local_id).expect("local mark");
         let local_spoken = format_spoken_mark(&local_mark.to_render_spec());
 
         let snapshot = LinkServeStatusSnapshot {
@@ -3864,7 +3864,7 @@ mod tests {
         )
         .expect("write");
 
-        let local_mark = spl_core::mark::mark_from_jid(local_id).expect("local mark");
+        let local_mark = crate::mark_text::mark_from_jid(local_id).expect("local mark");
         let local_spoken = format_spoken_mark(&local_mark.to_render_spec());
 
         let snapshot = LinkServeStatusSnapshot {
@@ -3921,7 +3921,7 @@ mod tests {
         .expect("write");
 
         let other_jid = "01957597-2a5c-7d92-8ec2-e0f3408a0d9b";
-        let other_mark = spl_core::mark::mark_from_jid(other_jid).expect("other mark");
+        let other_mark = crate::mark_text::mark_from_jid(other_jid).expect("other mark");
         let other_spoken = format_spoken_mark(&other_mark.to_render_spec());
 
         let snapshot = LinkServeStatusSnapshot {
@@ -3978,9 +3978,9 @@ mod tests {
         .expect("write");
 
         let other_jid = "01957597-2a5c-7d92-8ec2-e0f3408a0d9b";
-        let other_mark = spl_core::mark::mark_from_jid(other_jid).expect("other mark");
+        let other_mark = crate::mark_text::mark_from_jid(other_jid).expect("other mark");
         let other_spoken = format_spoken_mark(&other_mark.to_render_spec());
-        let local_mark = spl_core::mark::mark_from_jid(local_id).expect("local mark");
+        let local_mark = crate::mark_text::mark_from_jid(local_id).expect("local mark");
         let local_spoken = format_spoken_mark(&local_mark.to_render_spec());
 
         let snapshot = LinkServeStatusSnapshot {
@@ -4049,9 +4049,9 @@ mod tests {
         .expect("write");
 
         let other_jid = "01957597-2a5c-7d92-8ec2-e0f3408a0d9b";
-        let other_mark = spl_core::mark::mark_from_jid(other_jid).expect("other mark");
+        let other_mark = crate::mark_text::mark_from_jid(other_jid).expect("other mark");
         let other_spoken = format_spoken_mark(&other_mark.to_render_spec());
-        let local_mark = spl_core::mark::mark_from_jid(local_id).expect("local mark");
+        let local_mark = crate::mark_text::mark_from_jid(local_id).expect("local mark");
         let local_spoken = format_spoken_mark(&local_mark.to_render_spec());
         assert_ne!(other_spoken, local_spoken);
 

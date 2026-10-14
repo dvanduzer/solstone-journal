@@ -3896,7 +3896,9 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::mpsc;
+    #[cfg(feature = "full-tests")]
+    use std::sync::mpsc::RecvTimeoutError;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -4531,6 +4533,7 @@ mod tests {
         assert_tree_unchanged(&fixture.root, before);
     }
 
+    #[cfg(feature = "full-tests")]
     #[cfg(target_os = "linux")]
     #[test]
     fn retained_readers_coexist_and_exclude_writer_sessions() {
@@ -4957,6 +4960,7 @@ mod tests {
         assert_tree_unchanged(&fixture.root, before);
     }
 
+    #[cfg(feature = "full-tests")]
     #[test]
     fn load_waits_for_an_owner_locked_adopted_replacement() {
         let _serial = serial();

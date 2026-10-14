@@ -2422,7 +2422,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn local_door_switch_writes_its_own_key_and_repairs_an_invalid_value() {
         let temp = TempDir::new_in(crate::test_scratch()).unwrap();
         let journal_root = temp.path();

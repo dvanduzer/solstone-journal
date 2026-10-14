@@ -10,15 +10,19 @@
 //! into a link folder itself -- in a string, in a formatted string, or in a
 //! chain of `.join(...)` calls.
 
+#[cfg(feature = "full-tests")]
 use std::fs;
+#[cfg(feature = "full-tests")]
 use std::path::{Path, PathBuf};
 
 /// The module that owns the layout.
+#[cfg(feature = "full-tests")]
 const OWNER: &str = "core/crates/solstone-core-entity/src/store/facet_links.rs";
 
 /// Read-only derived readers that match link-folder paths by pattern and need
 /// no link semantics, so going through the owner would add a dependency and
 /// nothing else. Each names its reason.
+#[cfg(feature = "full-tests")]
 const DERIVED_READERS: &[(&str, &str)] = &[
     (
         "core/crates/solstone-core-format/src/content/mod.rs",
@@ -32,6 +36,7 @@ const DERIVED_READERS: &[(&str, &str)] = &[
 
 const LINK_FILES: &[&str] = &["entity.json", "observations.jsonl"];
 
+#[cfg(feature = "full-tests")]
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -174,6 +179,7 @@ impl<'ast> syn::visit::Visit<'ast> for LayoutVisitor {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn production_sources(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let crates = root.join("core/crates");
@@ -187,6 +193,7 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+#[cfg(feature = "full-tests")]
 fn collect_rust(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(directory).expect("read source directory") {
         let path = entry.expect("source entry").path();
@@ -208,6 +215,7 @@ fn collect_rust(directory: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn only_the_link_folder_owner_spells_a_path_into_a_link_folder() {
     let root = repository_root();
@@ -228,6 +236,10 @@ fn only_the_link_folder_owner_spells_a_path_into_a_link_folder() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source");
+        // Every path the visitor reports spells `facets` in a literal.
+        if !source.contains("facets") {
+            continue;
+        }
         let file = match syn::parse_file(&source) {
             Ok(file) => file,
             Err(error) => {

@@ -22,9 +22,11 @@ These packages keep `runtime` in their default feature set, so ordinary producti
 `make ci` runs on every change, often several at once on one shared host. Write new tests so it stays unit-only.
 
 - **Routine:** logic, parsing, state transitions, error mapping, and contracts checked against committed fixtures. Temporary directories are fine: the Linux gate mounts `/tmp` and `/var/tmp` as memory-backed scratch, so journal writes and fsync are cheap there.
-- **Behind `full-tests`:** a test that starts a process (a stub script, `git`, a host tool, a re-exec of the test binary), opens a socket (TCP, UDP or Unix, loopback included), reads host state (`/proc`, network interfaces, installed tools), or waits on the wall clock. Mark the test function or module `#[cfg(all(test, feature = "full-tests"))]`; helpers used only by those tests take the same attribute. The topology check refuses a direct `Command::new` or socket constructor in routine test code, but it cannot see one behind a helper, so apply the rule yourself.
+- **Behind `full-tests`:** a test that starts a process (a stub script, `git`, a host tool, a re-exec of the test binary), opens a socket (TCP, UDP or Unix, loopback included), reads host state (`/proc`, network interfaces, installed tools), decompresses or stages a real release artifact, or waits on the wall clock. Mark the test function or module `#[cfg(all(test, feature = "full-tests"))]`; helpers used only by those tests take the same attribute. The topology check refuses a direct `Command::new` or socket constructor in routine test code, but it cannot see one behind a helper, so apply the rule yourself.
 - **In `make ci-full`:** a test that walks or parses the whole repository. Prefer a visibility boundary the compiler enforces (`pub(crate)`, a `test-hooks` re-export) to a scan.
 - **Nowhere:** a new test that pins the text of the Makefile, CI configuration or another file's source, and a test that enforces copy, casing, punctuation, color or other design choices. Assert what the code produces for an input, not how its strings or styles read.
+
+Keep each routine test well under a second at the dev profile's opt-level 0. Use the smallest input that proves the property: a short image strip rather than a 4K frame, a sample of prefixes rather than every prefix of a 5 KB input. Build an expensive fixture once per process with `OnceLock`, not once per test. A timeout or poll goes on an injected duration or tokio's paused clock, not a real wait.
 
 ## Fixture Journal
 

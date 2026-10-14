@@ -945,5 +945,6 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+#[allow(clippy::disallowed_methods, reason = "the harness drives node")]
 #[path = "review_transport/backup_observation.rs"]
 mod backup_observation;

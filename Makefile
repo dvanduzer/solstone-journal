@@ -597,9 +597,12 @@ check-rust-pdf-test:
 # months and it is in muscle memory. It now stages AND runs all three crates.
 check-rust-vad-analyze-test: check-rust-onnx-stage check-rust-onnx-test
 
+# One cargo fmt per crate, four at a time: the same files as `cargo fmt --all`
+# (every workspace member plus the path-only evidence crate), without running
+# 138 packages through rustfmt one after another.
 check-rust-fmt:
 	@$(REQUIRE_CARGO)
-	cargo fmt --manifest-path $(RUST_MANIFEST) --all -- --check
+	ls -d core/crates/*/ | xargs -P 4 -I{} cargo fmt --manifest-path {}Cargo.toml -- --check
 
 check-rust-msrv:
 	@$(REQUIRE_CARGO)

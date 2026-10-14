@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::digest::sha256_hex;
 use crate::inventory::StagedMember;
@@ -151,6 +153,62 @@ pub(crate) fn plan_pinned_input(
     Ok(plans)
 }
 
+thread_local! {
+    static XZ_TARS: RefCell<Option<BTreeMap<String, Rc<Vec<u8>>>>> = const { RefCell::new(None) };
+}
+
+/// While alive, each distinct `.tar.xz` input read on this thread is
+/// decompressed once, keyed by the sha256 of its compressed bytes.
+pub(crate) struct XzTarScope {
+    owner: bool,
+}
+
+impl XzTarScope {
+    pub(crate) fn enter() -> Self {
+        let owner = XZ_TARS.with(|tars| {
+            let mut tars = tars.borrow_mut();
+            if tars.is_some() {
+                return false;
+            }
+            *tars = Some(BTreeMap::new());
+            true
+        });
+        Self { owner }
+    }
+}
+
+impl Drop for XzTarScope {
+    fn drop(&mut self) {
+        if self.owner {
+            XZ_TARS.with(|tars| tars.borrow_mut().take());
+        }
+    }
+}
+
+fn xz_tar(entry: &str, bytes: &[u8], filename: &str) -> Result<Rc<Vec<u8>>, ProduceError> {
+    let key = XZ_TARS
+        .with(|tars| tars.borrow().is_some())
+        .then(|| sha256_hex(bytes));
+    if let Some(key) = &key
+        && let Some(tar) = XZ_TARS.with(|tars| tars.borrow().as_ref()?.get(key).cloned())
+    {
+        return Ok(tar);
+    }
+    let mut decompressed = Vec::new();
+    lzma_rs::xz_decompress(&mut &bytes[..], &mut decompressed).map_err(|e| {
+        ProduceError::new(format!("{entry}: xz decompress failed for {filename}: {e}"))
+    })?;
+    let tar = Rc::new(decompressed);
+    if let Some(key) = key {
+        XZ_TARS.with(|tars| {
+            if let Some(tars) = tars.borrow_mut().as_mut() {
+                tars.insert(key, Rc::clone(&tar));
+            }
+        });
+    }
+    Ok(tar)
+}
+
 pub(crate) fn collect_archive_members(
     entry: &str,
     bytes: &[u8],
@@ -163,10 +221,7 @@ pub(crate) fn collect_archive_members(
         let mut tar = tar::Archive::new(gz);
         parse_tar_members(entry, &mut tar, &mut members)?;
     } else if filename.ends_with(".tar.xz") {
-        let mut decompressed = Vec::new();
-        lzma_rs::xz_decompress(&mut &bytes[..], &mut decompressed).map_err(|e| {
-            ProduceError::new(format!("{entry}: xz decompress failed for {filename}: {e}"))
-        })?;
+        let decompressed = xz_tar(entry, bytes, filename)?;
         let mut tar = tar::Archive::new(&decompressed[..]);
         parse_tar_members(entry, &mut tar, &mut members)?;
     } else if filename.ends_with(".zip") {
@@ -407,10 +462,7 @@ pub(crate) fn extract_needed_members(
         let mut tar = tar::Archive::new(gz);
         extract_tar_members(entry, &mut tar, needed, &mut contents)?;
     } else if filename.ends_with(".tar.xz") {
-        let mut decompressed = Vec::new();
-        lzma_rs::xz_decompress(&mut &bytes[..], &mut decompressed).map_err(|e| {
-            ProduceError::new(format!("{entry}: xz decompress failed for {filename}: {e}"))
-        })?;
+        let decompressed = xz_tar(entry, bytes, filename)?;
         let mut tar = tar::Archive::new(&decompressed[..]);
         extract_tar_members(entry, &mut tar, needed, &mut contents)?;
     } else if filename.ends_with(".zip") {
@@ -946,6 +998,24 @@ mod tests {
     }
 
     #[test]
+    fn xz_tar_scope_decompresses_each_input_once() {
+        let xz = make_tar_xz(&[("a.txt", b"a", tar::EntryType::Regular, None)]);
+        let unscoped = xz_tar("e", &xz, "a.tar.xz").unwrap();
+        assert!(!Rc::ptr_eq(
+            &unscoped,
+            &xz_tar("e", &xz, "a.tar.xz").unwrap()
+        ));
+        {
+            let _scope = XzTarScope::enter();
+            let first = xz_tar("e", &xz, "a.tar.xz").unwrap();
+            let _nested = XzTarScope::enter();
+            assert!(Rc::ptr_eq(&first, &xz_tar("e", &xz, "a.tar.xz").unwrap()));
+            assert_eq!(*first, *unscoped);
+        }
+        assert!(XZ_TARS.with(|tars| tars.borrow().is_none()));
+    }
+
+    #[test]
     fn alias_symlink_resolution_and_refusals() {
         let zip_bytes = make_zip(&[
             ("target.txt", b"target content", 0o100644),
@@ -1331,177 +1401,11 @@ mod tests {
     }
 
     #[test]
-    fn nvattest_linux_authority_committed_resolve_and_stage() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .unwrap();
-        let input = crate::inventory::PinnedInput::AuthorityCommitted {
-            platform: "linux-x86_64".into(),
-            path: "core/models/assets/nvattest/libnvat-linux-x86_64-1.2.2-sol.7-archive.tar.xz"
-                .into(),
-        };
-        let (bytes, pin, filename) = resolve_pinned_input(
-            "nvattest-linux",
-            repo_root,
-            &catalog_input_cache_dir(repo_root),
-            "linux-x86_64",
-            &input,
-        )
-        .unwrap();
-
-        let needed_set = BTreeSet::from([
-            "bin/nvattest",
-            "lib/libnvat.so.1.2.2",
-            "share/ca/ca-bundle.pem",
-            "LICENSE",
-            "share/THIRD_PARTY_NOTICES.md",
-        ]);
-        let contents =
-            extract_needed_members("nvattest-linux", &bytes, &filename, &needed_set).unwrap();
-
-        let staged = vec![
-            test_staged_member(
-                "bin/nvattest",
-                "lib/solstone-nvattest/bin/nvattest",
-                0o755,
-                &sha256_hex(&contents["bin/nvattest"]),
-            ),
-            test_staged_member(
-                "lib/libnvat.so.1",
-                "lib/solstone-nvattest/lib/libnvat.so.1",
-                0o755,
-                &sha256_hex(&contents["lib/libnvat.so.1.2.2"]),
-            ),
-            test_staged_member(
-                "share/ca/ca-bundle.pem",
-                "lib/solstone-nvattest/share/ca/ca-bundle.pem",
-                0o644,
-                &sha256_hex(&contents["share/ca/ca-bundle.pem"]),
-            ),
-            test_staged_member(
-                "LICENSE",
-                "share/solstone-journal/licenses/nvattest/LICENSE",
-                0o644,
-                &sha256_hex(&contents["LICENSE"]),
-            ),
-            test_staged_member(
-                "share/THIRD_PARTY_NOTICES.md",
-                "share/solstone-journal/licenses/nvattest/THIRD_PARTY_NOTICES.md",
-                0o644,
-                &sha256_hex(&contents["share/THIRD_PARTY_NOTICES.md"]),
-            ),
-        ];
-        let ignored = vec!["lib/libnvat.so".into(), "lib/libnvat.so.1.2.2".into()];
-
-        let plans = plan_pinned_input("nvattest-linux", &bytes, &pin, &filename, &staged, &ignored)
-            .unwrap();
-        assert_eq!(plans[1].alias.as_deref(), Some("lib/libnvat.so.1"));
-        assert_eq!(plans[1].inner_path, "lib/libnvat.so.1.2.2");
-
-        let tmp = tempfile::tempdir().unwrap();
-        stage_pinned_plans("nvattest-linux", tmp.path(), &bytes, &filename, &plans).unwrap();
-        assert_no_symlinks_recursive(tmp.path());
-
-        let bin_bytes =
-            std::fs::read(tmp.path().join("lib/solstone-nvattest/bin/nvattest")).unwrap();
-        let so_bytes =
-            std::fs::read(tmp.path().join("lib/solstone-nvattest/lib/libnvat.so.1")).unwrap();
-        crate::elf::admit_elf(
-            "lib/solstone-nvattest/bin/nvattest",
-            &bin_bytes,
-            EM_X86_64,
-            "lib/solstone-nvattest/bin",
-            None,
-            &[("lib/solstone-nvattest/lib/libnvat.so.1", &so_bytes)],
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn macos_real_bytes() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(3)
             .unwrap();
-        let input = crate::inventory::PinnedInput::AuthorityCommitted {
-            platform: "macos-arm64".into(),
-            path: "core/models/assets/nvattest/libnvat-macos-arm64-1.2.2-sol.7-archive.tar.xz"
-                .into(),
-        };
-        let (bytes, pin, filename) = resolve_pinned_input(
-            "nvattest-mac",
-            repo_root,
-            &catalog_input_cache_dir(repo_root),
-            "macos-arm64",
-            &input,
-        )
-        .unwrap();
-
-        let needed_set = BTreeSet::from([
-            "bin/nvattest",
-            "lib/libnvat.1.2.2.dylib",
-            "share/ca/ca-bundle.pem",
-            "LICENSE",
-            "share/THIRD_PARTY_NOTICES.md",
-        ]);
-        let contents =
-            extract_needed_members("nvattest-mac", &bytes, &filename, &needed_set).unwrap();
-
-        let staged = vec![
-            test_staged_member(
-                "bin/nvattest",
-                "lib/solstone-nvattest/bin/nvattest",
-                0o755,
-                &sha256_hex(&contents["bin/nvattest"]),
-            ),
-            test_staged_member(
-                "lib/libnvat.1.dylib",
-                "lib/solstone-nvattest/lib/libnvat.1.dylib",
-                0o755,
-                &sha256_hex(&contents["lib/libnvat.1.2.2.dylib"]),
-            ),
-            test_staged_member(
-                "share/ca/ca-bundle.pem",
-                "lib/solstone-nvattest/share/ca/ca-bundle.pem",
-                0o644,
-                &sha256_hex(&contents["share/ca/ca-bundle.pem"]),
-            ),
-            test_staged_member(
-                "LICENSE",
-                "share/solstone-journal/licenses/nvattest/LICENSE",
-                0o644,
-                &sha256_hex(&contents["LICENSE"]),
-            ),
-            test_staged_member(
-                "share/THIRD_PARTY_NOTICES.md",
-                "share/solstone-journal/licenses/nvattest/THIRD_PARTY_NOTICES.md",
-                0o644,
-                &sha256_hex(&contents["share/THIRD_PARTY_NOTICES.md"]),
-            ),
-        ];
-        let ignored = vec!["lib/libnvat.dylib".into(), "lib/libnvat.1.2.2.dylib".into()];
-        let plans =
-            plan_pinned_input("nvattest-mac", &bytes, &pin, &filename, &staged, &ignored).unwrap();
-        assert_eq!(plans[1].alias.as_deref(), Some("lib/libnvat.1.dylib"));
-        assert_eq!(plans[1].inner_path, "lib/libnvat.1.2.2.dylib");
-
-        let tmp = tempfile::tempdir().unwrap();
-        stage_pinned_plans("nvattest-mac", tmp.path(), &bytes, &filename, &plans).unwrap();
-        assert_no_symlinks_recursive(tmp.path());
-
-        let bin_bytes =
-            std::fs::read(tmp.path().join("lib/solstone-nvattest/bin/nvattest")).unwrap();
-        crate::macho::admit_macho(
-            "lib/solstone-nvattest/bin/nvattest",
-            &bin_bytes,
-            crate::macho::cputype_arm64(),
-            (15, 0),
-            "lib/solstone-nvattest/bin",
-            None,
-            &["lib/solstone-nvattest/lib/libnvat.1.dylib"],
-        )
-        .unwrap();
 
         // CED macOS Metal ARM64
         let ced_mac_path =
@@ -1568,8 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn nvattest_inventory_targets_staged_and_admitted() {
-        const EM_AARCH64: u16 = 183;
+    fn nvattest_inventory_entries_shape() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(3)
@@ -1598,20 +1501,6 @@ mod tests {
                 "nvattest for {target_id} is a component entry and a notice entry"
             );
 
-            let input = match entries[0] {
-                crate::inventory::Entry::PinnedMembers { input, .. } => input,
-                _ => unreachable!(),
-            };
-            let (bytes, pin, filename) = resolve_pinned_input(
-                "nvattest",
-                repo_root,
-                &catalog_input_cache_dir(repo_root),
-                target_id,
-                input,
-            )
-            .unwrap();
-            let tmp = tempfile::tempdir().unwrap();
-            let mut all_staged = Vec::new();
             for entry in &entries {
                 let (class, staged, ignored) = match entry {
                     crate::inventory::Entry::PinnedMembers {
@@ -1664,6 +1553,64 @@ mod tests {
                         "ignored name {ign} must not be a dest or relpath in staged"
                     );
                 }
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn nvattest_inventory_targets_staged_and_admitted() {
+        const EM_AARCH64: u16 = 183;
+        let _xz_tars = XzTarScope::enter();
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        let inventory =
+            crate::inventory::load_inventory(&repo_root.join("core/distribution/inventory.toml"))
+                .unwrap();
+
+        for target_id in ["linux-x86_64", "linux-aarch64", "macos-arm64"] {
+            let entries: Vec<_> = inventory
+                .entry
+                .iter()
+                .filter(|e| match e {
+                    crate::inventory::Entry::PinnedMembers {
+                        component, targets, ..
+                    } => {
+                        component.as_deref() == Some("nvattest")
+                            && targets.iter().any(|t| t == target_id)
+                    }
+                    _ => false,
+                })
+                .collect();
+            assert_eq!(
+                entries.len(),
+                2,
+                "nvattest for {target_id} is a component entry and a notice entry"
+            );
+
+            let input = match entries[0] {
+                crate::inventory::Entry::PinnedMembers { input, .. } => input,
+                _ => unreachable!(),
+            };
+            let (bytes, pin, filename) = resolve_pinned_input(
+                "nvattest",
+                repo_root,
+                &catalog_input_cache_dir(repo_root),
+                target_id,
+                input,
+            )
+            .unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let mut all_staged = Vec::new();
+            for entry in &entries {
+                let (staged, ignored) = match entry {
+                    crate::inventory::Entry::PinnedMembers {
+                        staged, ignored, ..
+                    } => (staged.as_slice(), ignored.as_slice()),
+                    _ => unreachable!(),
+                };
                 let plans = plan_pinned_input("nvattest", &bytes, &pin, &filename, staged, ignored)
                     .unwrap();
                 stage_pinned_plans("nvattest", tmp.path(), &bytes, &filename, &plans).unwrap();

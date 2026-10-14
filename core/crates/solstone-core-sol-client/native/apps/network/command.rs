@@ -445,7 +445,7 @@ pub fn status(ctx: CommandContext<'_>) -> CommandOutput {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
-        let mark = match spl_core::mark::mark_from_jid(instance_id) {
+        let mark = match crate::mark_text::mark_from_jid(instance_id) {
             Ok(mark) => mark,
             Err(_) => return stderr("your journal's mark couldn't be read.", 1),
         };

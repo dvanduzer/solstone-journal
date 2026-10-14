@@ -1253,8 +1253,8 @@ mod tests {
 
     #[test]
     fn request_builder_preserves_resized_image_and_contract_defaults() {
-        let prepared = resize_for_vlm(DynamicImage::new_rgb8(3840, 2160));
-        assert_eq!(prepared.dimensions(), (1920, 1080));
+        let prepared = resize_for_vlm(DynamicImage::new_rgb8(3840, 2));
+        assert_eq!(prepared.dimensions(), (1920, 1));
         let request = build_generate_request(&encode_png(&prepared).unwrap());
         assert_eq!(request.id, None);
         assert_eq!(request.context, "observe.depict");
@@ -1280,7 +1280,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             image::load_from_memory(&decoded).unwrap().dimensions(),
-            (1920, 1080)
+            (1920, 1)
         );
     }
 
@@ -1965,8 +1965,8 @@ mod tests {
         assert_eq!(vlm_dimensions(1920, 1080), (1920, 1080));
         assert_eq!(vlm_dimensions(3840, 2160), (1920, 1080));
         assert_eq!(
-            resize_for_vlm(DynamicImage::new_rgb8(3840, 2160)).dimensions(),
-            (1920, 1080)
+            resize_for_vlm(DynamicImage::new_rgb8(3840, 2)).dimensions(),
+            (1920, 1)
         );
     }
 

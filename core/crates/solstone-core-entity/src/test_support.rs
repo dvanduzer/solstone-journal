@@ -248,13 +248,15 @@ pub(crate) fn normalization_divergences(
         .collect()
 }
 
+/// On success, returns the digest of the unsubstituted native sweep, taken in
+/// the same pass.
 pub(crate) fn verify_sweep_digest<F>(
     producer: F,
     divergences: &[SweepDivergence],
     expected_divergence_count: usize,
     expected_scalar_count: usize,
     expected_digest: &str,
-) -> Result<(), SweepVerificationError>
+) -> Result<String, SweepVerificationError>
 where
     F: Fn(&str) -> String,
 {
@@ -279,6 +281,7 @@ where
     }
 
     let mut digest = Sha256::new();
+    let mut raw_digest = Sha256::new();
     let mut scalar_count = 0;
     let mut visited_divergences = 0;
     for codepoint in 0u32..=0x10FFFF {
@@ -288,6 +291,8 @@ where
         scalar_count += 1;
         let input = format!("A{scalar}B");
         let native = producer(&input);
+        raw_digest.update(native.as_bytes());
+        raw_digest.update(b"\n");
         let line = if let Some(divergence) = divergence_map.get(&codepoint) {
             visited_divergences += 1;
             if native != divergence.native {
@@ -324,45 +329,7 @@ where
             actual,
         });
     }
-    Ok(())
-}
-
-pub(crate) fn verify_raw_sweep_digest<F>(
-    producer: F,
-    expected_scalar_count: usize,
-    expected_digest: &str,
-) -> Result<(), SweepVerificationError>
-where
-    F: Fn(&str) -> String,
-{
-    let mut digest = Sha256::new();
-    let mut scalar_count = 0;
-    for codepoint in 0u32..=0x10FFFF {
-        let Some(scalar) = char::from_u32(codepoint) else {
-            continue;
-        };
-        scalar_count += 1;
-        let input = format!("A{scalar}B");
-        let line = producer(&input);
-        digest.update(line.as_bytes());
-        digest.update(b"\n");
-    }
-
-    if scalar_count != expected_scalar_count {
-        return Err(SweepVerificationError::ScalarCountMismatch {
-            expected: expected_scalar_count,
-            actual: scalar_count,
-        });
-    }
-
-    let actual = format!("{:x}", digest.finalize());
-    if actual != expected_digest {
-        return Err(SweepVerificationError::DigestMismatch {
-            expected: expected_digest.to_string(),
-            actual,
-        });
-    }
-    Ok(())
+    Ok(format!("{:x}", raw_digest.finalize()))
 }
 
 fn parse_codepoint(value: &str) -> Result<u32, SweepVerificationError> {

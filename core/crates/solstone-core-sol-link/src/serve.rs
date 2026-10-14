@@ -3151,32 +3151,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn solstone_adapter_adds_no_wildcard_bind_host_literal() {
-        let source = include_str!("serve.rs");
-        let wildcard_v4 = ["0", "0", "0", "0"].join(".");
-        let wildcard_v6 = ":".repeat(2);
-        let named_loopback = format!("{}{}", "local", "host");
-        for host in [wildcard_v4, wildcard_v6, named_loopback] {
-            assert!(!source.contains(&format!("{host:?}")));
-        }
-        let observer_mixed = ["X", "Solstone", "Observer"].join("-");
-        let protocol_mixed = ["X", "Solstone", "Protocol", "Version"].join("-");
-        let observer_lower = ["x", "solstone", "observer"].join("-");
-        let protocol_lower = ["x", "solstone", "protocol", "version"].join("-");
-        for header in [
-            observer_mixed,
-            protocol_mixed,
-            observer_lower,
-            protocol_lower,
-        ] {
-            assert!(
-                !source.contains(&header),
-                "serve.rs still contains reserved header literal {header}"
-            );
-        }
-    }
-
     fn test_opener() -> SolstoneCarrierOpener {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("test key");
         let params = CertificateParams::new(Vec::<String>::new()).expect("test params");

@@ -4443,7 +4443,6 @@ dependencies = [
  "axum",
  "chrono",
  "log",
- "regex",
  "serde",
  "serde_json",
  "solstone-core-backup",

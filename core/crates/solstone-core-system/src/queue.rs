@@ -2371,6 +2371,10 @@ impl TaskQueue {
     }
 
     pub fn shutdown(&self) -> TaskQueueShutdownReport {
+        self.shutdown_with_timeout(TASK_QUEUE_SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> TaskQueueShutdownReport {
         let (active_count, snapshot, initial_forced): (usize, Vec<ShutdownSnapshot>, bool) = {
             let mut state = self.inner.state.lock().expect("queue state lock poisoned");
             state.shutdown = true;
@@ -2402,7 +2406,7 @@ impl TaskQueue {
                     process
                         .lock()
                         .expect("managed process lock poisoned")
-                        .terminate_exact(TASK_QUEUE_SHUTDOWN_TIMEOUT),
+                        .terminate_exact(timeout),
                     Err(TerminationError::ParentGraceTimeout)
                 )
             }) {
@@ -2413,15 +2417,12 @@ impl TaskQueue {
         for thread in threads {
             forced |= thread.join().unwrap_or(false);
         }
-        let deadline = Instant::now() + TASK_QUEUE_SHUTDOWN_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let mut state = self.inner.state.lock().expect("queue state lock poisoned");
-        while references.iter().any(|reference| {
-            state.active.contains_key(reference)
-                || state
-                    .held
-                    .values()
-                    .any(|h| &h.dispatch.submission.reference == reference)
-        }) {
+        while references
+            .iter()
+            .any(|reference| state.active.contains_key(reference))
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -2436,6 +2437,7 @@ impl TaskQueue {
                 break;
             }
         }
+        forced |= holds_any(&state, &references);
         TaskQueueShutdownReport {
             active_count,
             forced,
@@ -2512,13 +2514,10 @@ impl TaskQueue {
         }
 
         let mut state = self.inner.state.lock().expect("queue state lock poisoned");
-        while references.iter().any(|reference| {
-            state.active.contains_key(reference)
-                || state
-                    .held
-                    .values()
-                    .any(|h| &h.dispatch.submission.reference == reference)
-        }) {
+        while references
+            .iter()
+            .any(|reference| state.active.contains_key(reference))
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 forced = true;
@@ -2535,6 +2534,7 @@ impl TaskQueue {
                 break;
             }
         }
+        forced |= holds_any(&state, &references);
         TaskQueueShutdownReport {
             active_count,
             forced,
@@ -3981,6 +3981,16 @@ fn record_completion(
             }),
         );
     }
+}
+
+/// Shutdown reports a held reference as forced rather than waiting for it:
+/// only `enforce_deadlines` releases a held partition, and the supervisor has
+/// stopped calling it by the time it shuts the queue down.
+fn holds_any(state: &QueueState, references: &[String]) -> bool {
+    state
+        .held
+        .values()
+        .any(|held| references.contains(&held.dispatch.submission.reference))
 }
 
 fn finish_worker(inner: &QueueInner, partition: &Partition, reference: &str) -> Vec<Dispatch> {
@@ -7262,7 +7272,7 @@ mod tests {
                 },
             );
         }
-        let report = q1.shutdown();
+        let report = q1.shutdown_with_timeout(Duration::from_millis(50));
         assert_eq!(report.active_count, 1);
         assert!(report.forced);
 
@@ -7291,6 +7301,48 @@ mod tests {
         let report2 = q2.shutdown_until(Instant::now() + Duration::from_millis(100));
         assert_eq!(report2.active_count, 1);
         assert!(report2.forced);
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_out_its_deadline_for_a_live_hold() {
+        for bounded in [false, true] {
+            let queue = queue(true, 10, VecDeque::new());
+            let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let process: QueueProcessHandle =
+                Arc::new(Mutex::new(Box::new(FakeProcess::idle(1, cleanups))));
+            queue.inner.state.lock().unwrap().held.insert(
+                Partition::new("svc"),
+                HeldEntry {
+                    dispatch: dispatch("held-live-shutdown"),
+                    process: Some(process),
+                    owner_uid: current_task_uid(),
+                    bound_identities: Vec::new(),
+                    bound_first_terminate_at: BTreeMap::new(),
+                    first_held_at: Instant::now(),
+                    first_held_at_unix: 0,
+                    reasons: vec![ReasonCode::RootLive],
+                    exit_code: 0,
+                    termination_error: None,
+                    snapshot_unavailable: false,
+                    persisted: false,
+                    records: Vec::new(),
+                },
+            );
+            let (sender, receiver) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let report = if bounded {
+                    queue.shutdown_until(Instant::now() + Duration::from_secs(60))
+                } else {
+                    queue.shutdown_with_timeout(Duration::from_secs(60))
+                };
+                let _ = sender.send(report);
+            });
+            let report = receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a held partition must not hold shutdown until its deadline");
+            assert_eq!(report.active_count, 1);
+            assert!(report.forced);
+        }
     }
 
     #[test]

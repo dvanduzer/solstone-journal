@@ -4,7 +4,30 @@
 //! Formatting helpers for journal marks using external `spl_core` mark types.
 //! Punctuation here must match `solstone_core_sol_link::mark` (`spoken_mark` and `mark_words`).
 
-use spl_core::mark::{MarkError, MarkRenderSpec, mark_from_jid};
+use spl_core::mark::{MarkError, MarkRenderSpec};
+
+#[cfg(not(test))]
+pub(crate) use spl_core::mark::mark_from_jid;
+
+/// Test builds memoize successful derivations: each one is a deliberately
+/// slow Argon2id pass, and the tests reuse a handful of journal IDs.
+#[cfg(test)]
+pub(crate) fn mark_from_jid(jid: &str) -> Result<spl_core::mark::Mark, MarkError> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    static MARKS: LazyLock<Mutex<HashMap<String, spl_core::mark::Mark>>> =
+        LazyLock::new(Default::default);
+    if let Some(mark) = MARKS.lock().expect("mark memo").get(jid) {
+        return Ok(mark.clone());
+    }
+    let mark = spl_core::mark::mark_from_jid(jid)?;
+    MARKS
+        .lock()
+        .expect("mark memo")
+        .insert(jid.to_owned(), mark.clone());
+    Ok(mark)
+}
 
 pub(crate) fn spoken_mark(spec: &MarkRenderSpec) -> String {
     format!(

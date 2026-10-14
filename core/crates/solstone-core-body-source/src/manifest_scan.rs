@@ -83,7 +83,7 @@ pub fn scan_body_manifest(input: &[u8]) -> Result<ScannedBodyManifest, ManifestS
 mod tests {
     use crate::parser::test_corpus::{
         alternating_containers, assert_body_value_bitwise_eq, assert_entry_points_agree,
-        fixture_inputs, generated_corpus, repeated_objects,
+        fixture_inputs, generated_corpus, repeated_objects, sweep_prefix_lengths,
     };
     use crate::{BodyValue, ManifestScanError, parse};
 
@@ -140,7 +140,7 @@ mod tests {
                 );
             }
             assert_scan_refines_parse(&input, &name);
-            for length in 1..input.len() {
+            for length in sweep_prefix_lengths(&input) {
                 assert_scan_refines_parse(&input[..length], &format!("{name} prefix {length}"));
             }
         }

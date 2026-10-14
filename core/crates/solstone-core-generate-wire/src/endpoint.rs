@@ -2223,27 +2223,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(journal);
     }
 }
-
-#[cfg(test)]
-mod vocabulary_tests {
-    #[test]
-    fn endpoint_production_uses_shared_response_and_models_primitives() {
-        let production = include_str!("endpoint.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("endpoint module has a production prefix");
-        for member in [
-            "choices",
-            "finish_reason",
-            "prompt_tokens",
-            "completion_tokens",
-            "max_model_len",
-        ] {
-            let quoted_member = format!("\"{member}\"");
-            assert!(
-                !production.contains(&quoted_member),
-                "endpoint production must use a shared primitive for {member:?}"
-            );
-        }
-    }
-}

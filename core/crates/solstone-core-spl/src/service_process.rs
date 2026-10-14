@@ -1137,7 +1137,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wedged_callosum_never_blocks_terminal_emit_or_output_shutdown() -> Result<(), String> {
         let journal = TempJournal::new()?;
         let socket_path = journal.path().join("health").join("callosum.sock");

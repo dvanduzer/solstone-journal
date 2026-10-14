@@ -637,11 +637,6 @@ mod tests {
             hook.stderr,
             "Prompt 'hook' is a hook prompt and cannot be run directly.\n"
         );
-        let source = include_str!("show.rs");
-        let command_new = ["Command", "::new"].concat();
-        let process_module = ["std::", "process"].concat();
-        assert!(!source.contains(&command_new));
-        assert!(!source.contains(&process_module));
     }
 
     #[test]

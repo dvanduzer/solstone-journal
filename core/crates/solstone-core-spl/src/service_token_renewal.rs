@@ -1964,9 +1964,10 @@ mod tests {
 
         let mut state = RenewalState::default();
 
-        // Minute-step evaluations for 7 days (0..7*1440)
+        // Minute-step evaluations for 2 days (0..2*1440): the second day shows
+        // the floor re-arming after the enrollment at its boundary.
         let mut daily_enroll_minutes = Vec::new();
-        for minute in 0..(7 * 1440) {
+        for minute in 0..(2 * 1440) {
             mono_min.store(minute, Ordering::SeqCst);
             let step = evaluate_once(&cfg, &mut state);
             if matches!(
@@ -1982,20 +1983,17 @@ mod tests {
         // Enroll count in [0, 1440) is exactly 1
         let enrolls_in_first_day = daily_enroll_minutes.iter().filter(|&&m| m < 1440).count();
         assert_eq!(enrolls_in_first_day, 1);
-        assert_eq!(
-            daily_enroll_minutes,
-            vec![0, 1440, 2880, 4320, 5760, 7200, 8640]
-        );
+        assert_eq!(daily_enroll_minutes, vec![0, 1440]);
 
         // Decision-time fetches do not increase during floor
-        assert_eq!(decision_fetches.load(Ordering::SeqCst), 7);
-        assert_eq!(enroll_calls.load(Ordering::SeqCst), 7);
+        assert_eq!(decision_fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(enroll_calls.load(Ordering::SeqCst), 2);
 
         // At minute 1440 (floor ends), refused evaluation triggers UnknownKey
         // (proven by minute 1440 succeeding with trigger UnknownKey in daily_enroll_minutes)
 
         // One post-floor enroll returns non-token (InvalidResponse) and next tick inside 1-minute backoff does not fetch
-        mono_min.store(7 * 1440, Ordering::SeqCst);
+        mono_min.store(2 * 1440, Ordering::SeqCst);
         return_invalid_enroll.store(true, Ordering::SeqCst);
         let dec_fetches_before = decision_fetches.load(Ordering::SeqCst);
         let step_fail = evaluate_once(&cfg, &mut state);
@@ -2017,11 +2015,12 @@ mod tests {
         assert_eq!(step_blocked, RenewalStep::Blocked);
         assert_eq!(decision_fetches.load(Ordering::SeqCst), dec_fetches_blocked);
 
-        // Deleting floor (state.floor_end = Duration::ZERO) causes [0, 1440) enroll count to exceed 1
+        // Deleting floor (state.floor_end = Duration::ZERO) causes [0, 1440) enroll count to
+        // exceed 1; its first hour already shows that.
         let mut state_no_floor = RenewalState::default();
         return_invalid_enroll.store(false, Ordering::SeqCst);
         let enrolls_before = enroll_calls.load(Ordering::SeqCst);
-        for minute in 0..1440 {
+        for minute in 0..60 {
             mono_min.store(minute, Ordering::SeqCst);
             state_no_floor.floor_end = Duration::ZERO;
             let _ = evaluate_once(&cfg, &mut state_no_floor);

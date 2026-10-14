@@ -13,7 +13,7 @@ use solstone_core_entity_matching::{
 use super::test_support::{
     SweepVerificationError, entity_identity_fixture, entity_matching_fixture,
     matching_divergences_fixture, normalization_divergences, normalization_divergences_fixture,
-    slug_divergences, slug_divergences_fixture, verify_raw_sweep_digest, verify_sweep_digest,
+    slug_divergences, slug_divergences_fixture, verify_sweep_digest,
 };
 
 #[test]
@@ -247,7 +247,7 @@ fn slug_sweep_matches_fixture_with_reference_substitutions() {
     let divergences_fixture = slug_divergences_fixture();
     let divergences = slug_divergences(&divergences_fixture).expect("parse slug divergences");
 
-    verify_sweep_digest(
+    let raw_digest = verify_sweep_digest(
         entity_slug,
         &divergences,
         divergences_fixture.counts.total,
@@ -255,6 +255,10 @@ fn slug_sweep_matches_fixture_with_reference_substitutions() {
         &identity.entity_slug.sweep.sha256,
     )
     .expect("slug sweep matches corrected reference digest");
+    assert_ne!(
+        raw_digest, identity.entity_slug.sweep.sha256,
+        "raw slug sweep without substitution must fail the digest"
+    );
 }
 
 #[test]
@@ -272,20 +276,6 @@ fn normalization_sweep_matches_fixture_with_reference_substitutions() {
         &identity.normalize_resolution_query.sweep.sha256,
     )
     .expect("normalization sweep matches corrected reference digest");
-}
-
-#[test]
-fn raw_slug_sweep_without_substitution_fails_digest() {
-    let identity = entity_identity_fixture();
-    let result = verify_raw_sweep_digest(
-        entity_slug,
-        identity.entity_slug.sweep.scalar_values,
-        &identity.entity_slug.sweep.sha256,
-    );
-    assert!(matches!(
-        result,
-        Err(SweepVerificationError::DigestMismatch { .. })
-    ));
 }
 
 #[test]

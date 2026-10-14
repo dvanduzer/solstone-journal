@@ -149,7 +149,7 @@ async fn shell_redirect() -> Response {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use axum::{
         Router,
@@ -157,7 +157,6 @@ mod tests {
         http::{Request, StatusCode, header},
     };
     use chrono::{TimeZone, Timelike};
-    use regex::Regex;
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -617,143 +616,5 @@ mod tests {
                 .collect::<Vec<_>>();
         entries.sort();
         entries
-    }
-
-    fn joined(parts: &[&str]) -> String {
-        parts.concat()
-    }
-
-    fn forbidden_patterns() -> Vec<(String, Regex)> {
-        [
-            (
-                joined(&["direct-std-process-command"]),
-                joined(&[r"\bstd::process::Com", r"mand\b"]),
-            ),
-            (
-                joined(&["direct-tokio-process"]),
-                joined(&[r"\btokio::pro", r"cess\b"]),
-            ),
-            (
-                joined(&["direct-process-command"]),
-                joined(&[r"\bprocess::Com", r"mand\b"]),
-            ),
-            (
-                joined(&["direct-command-new"]),
-                joined(&[r"\bCom", r"mand::new\s*\("]),
-            ),
-            (
-                joined(&["direct-spawn-call"]),
-                joined(&[r"\.sp", r"awn\s*\("]),
-            ),
-            (
-                joined(&["direct-output-call"]),
-                joined(&[r"\.out", r"put\s*\("]),
-            ),
-            (
-                joined(&["direct-exec-call"]),
-                joined(&[r"\bex", r"ec(?:[lv][pe]?|ve)?\s*\("]),
-            ),
-            (
-                joined(&["py", "o3-reference"]),
-                joined(&[r"\b(?:py", r"o3|Py", r"O3)\b"]),
-            ),
-            (
-                joined(&["cp", "ython-reference"]),
-                joined(&[r"\b(?:cp", r"ython|CP", r"ython)\b"]),
-            ),
-            (
-                joined(&["python-fallback-symbol"]),
-                joined(&[r"\bpy", r"thon_(?:fall", r"back|dis", r"patch)\b"]),
-            ),
-            (
-                joined(&["compat-dispatch-symbol"]),
-                joined(&[r"\bcompat(?:ibility)?_dis", r"patch\b"]),
-            ),
-            (
-                joined(&["fall", "back-to-python-symbol"]),
-                joined(&[r"\bfall", r"back_to_py", r"thon\b"]),
-            ),
-            (
-                joined(&["python-fallback-string"]),
-                joined(&[
-                    r#"\b(?:fall"#,
-                    r#"back|dis"#,
-                    r#"patch)[^\n\"]*py"#,
-                    r"thon3?\b",
-                ]),
-            ),
-        ]
-        .into_iter()
-        .map(|(name, pattern)| (name, Regex::new(&pattern).expect("valid audit pattern")))
-        .collect()
-    }
-
-    fn walk_rust_sources(directory: &Path, sources: &mut Vec<(PathBuf, String)>) {
-        for entry in fs::read_dir(directory).expect("source directory") {
-            let entry = entry.expect("source entry");
-            let path = entry.path();
-            if path.is_dir() {
-                walk_rust_sources(&path, sources);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                sources.push((
-                    path,
-                    fs::read_to_string(entry.path()).expect("Rust source reads"),
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn source_audit_rejects_spawn_or_python_dispatch_patterns() {
-        // This audit reads this crate's source tree only, not its dependencies.
-        // The repository native-sol spawn checker does not include this crate, and
-        // CI's interpreter PATH poison only replaces a PATH lookup; it cannot prove
-        // that a shipped interpreter invocation is absent.
-        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut sources = Vec::new();
-        walk_rust_sources(&source_root, &mut sources);
-        let visited = sources
-            .iter()
-            .map(|(path, _)| {
-                path.strip_prefix(&source_root)
-                    .expect("source is under root")
-                    .display()
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
-        assert!(visited.iter().any(|path| path == "lib.rs"));
-        assert!(visited.iter().any(|path| path == "assets.rs"));
-        assert!(visited.iter().any(|path| path == "clock.rs"));
-        assert!(visited.iter().any(|path| path == "week.rs"));
-
-        let patterns = forbidden_patterns();
-        let probe = joined(&["Com", "mand::", "new("]);
-        assert!(
-            patterns
-                .iter()
-                .find(|(name, _)| name == "direct-command-new")
-                .expect("command pattern")
-                .1
-                .is_match(&probe)
-        );
-
-        let violations = sources
-            .iter()
-            .flat_map(|(path, source)| {
-                let relative = path
-                    .strip_prefix(&source_root)
-                    .expect("source is under root")
-                    .display()
-                    .to_string();
-                patterns
-                    .iter()
-                    .filter(move |(_, pattern)| pattern.is_match(source))
-                    .map(move |(name, _)| format!("{relative}: {name}"))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            violations.is_empty(),
-            "forbidden source patterns: {violations:?}"
-        );
     }
 }

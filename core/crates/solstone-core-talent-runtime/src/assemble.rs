@@ -372,14 +372,6 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     use super::*;
 
-    #[test]
-    fn assemble_source_has_no_process_spawn() {
-        // Criterion D8: preview assemble must not spawn a model process.
-        let source = include_str!("assemble.rs");
-        let command_new = ["Command", "::new"].concat();
-        assert!(!source.contains(&command_new));
-    }
-
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn activity_preview_contents_match_the_real_execute_provider_request() {

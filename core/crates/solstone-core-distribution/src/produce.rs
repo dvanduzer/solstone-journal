@@ -1754,6 +1754,7 @@ fn write_stage(
     sealed_archives: Option<&SealedArchiveSet>,
     stage: &Path,
 ) -> Result<StagedWrite, ProduceError> {
+    let _xz_tars = crate::pinned_stage::XzTarScope::enter();
     select::stage_selected(selection, stage)?;
     let archives = stage_layout(
         repo,
@@ -3490,7 +3491,8 @@ class = "notice"
             !matches!(
                 entry,
                 Entry::PinnedMembers {
-                    input: crate::inventory::PinnedInput::CatalogAcquired { .. },
+                    input: crate::inventory::PinnedInput::CatalogAcquired { .. }
+                        | crate::inventory::PinnedInput::AuthorityCommitted { .. },
                     ..
                 }
             )
