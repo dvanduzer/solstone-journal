@@ -101,6 +101,12 @@ call "%JOURNAL_WIN_CI_FFMPEG_ENV%" || ( echo ERROR: staged FFmpeg build toolchai
 del /q "%JOURNAL_WIN_CI_FFMPEG_ENV%" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\win-ci-ffmpeg-tools.ps1 -Mode assert -RepositoryRoot "%CD%" -ToolsRoot "%JOURNAL_WIN_CI_FFMPEG_TOOLS_ROOT%" || ( echo ERROR: staged FFmpeg build toolchain did not verify in this run's environment & exit /b 1 )
 
+echo === native restic owner-filename round trip ===
+call :run_exact_library "solstone-core-backup-runtime" "engine::copy_tests::real_restic_preserves_owner_names_and_excludes_operational_secrets" "full-tests" "ignored" || exit /b 1
+echo === cargo test --locked (portable archive owner filenames) ===
+call :run_exact_library "solstone-core-journal-archive" "windows_source::tests::windows_export_preserves_owner_names_and_omits_operational_secrets" || exit /b 1
+call :run_exact_integration "solstone-core-import-sources" "source_archive_contracts" "archive_merge::portable_export_and_merge_preserve_colliding_owner_names" || exit /b 1
+
 call :phase portable
 echo === cargo test --locked (retention architecture contract) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-retention --test architecture || exit /b 1

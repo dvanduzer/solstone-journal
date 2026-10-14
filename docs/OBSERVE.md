@@ -148,6 +148,7 @@ operation.
 See the [output reference](../core/payload/solstone/talent/journal/references/captures.md) for detailed extract schemas:
 - Audio transcripts: `audio.jsonl` with timestamps (speaker detection not included)
 - Screen analysis: `screen.jsonl` with frame-by-frame categorization
+- Protected video notes: `{segment}_protected_video.jsonl` on the next desktop segment. Each JSONL row has `t` of `protected_video`, `ts` and `end_ts` as epoch milliseconds, `service`, and optional `app` and `title`. Ingest stores the submitted name and does not validate the file; readers skip bad lines. A row means recording paused while that service's window was on screen; it is not proof the owner watched anything, and the interval ended before the segment that carries the file.
 
 ## Configuration
 

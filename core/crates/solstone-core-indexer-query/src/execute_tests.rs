@@ -3043,3 +3043,49 @@ fn repaired_memberships_deny_partial_rows_then_restore_only_authorized_results()
     assert!(final_results.iter().all(|r| !r.text.contains("foreign")));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn protected_video_notes_are_indexed_and_searchable_by_owner_but_excluded_from_connections() {
+    let root = temp_root("protected-video-scan");
+    let file_rel = "chronicle/20260910/desk/120000_60/120000_60_protected_video.jsonl";
+    let indexed_rel = "20260910/desk/120000_60/120000_60_protected_video.jsonl";
+    let fixture_a = r#"{"t":"protected_video","ts":1792027800000,"end_ts":1792030500000,"service":"Netflix","app":"Comet","title":"Netflix"}"#;
+    let malformed = "{";
+    let fixture_b = r#"{"t":"protected_video","ts":1000,"end_ts":91000,"service":"Apple TV"}"#;
+    write_rel(
+        &root,
+        file_rel,
+        &format!("{fixture_a}\n{malformed}\n{fixture_b}\n"),
+    );
+
+    scan_journal(&root, false).expect("scan journal");
+
+    let chunks: Vec<(String, String)> = read_only(&root)
+        .prepare("SELECT content, agent FROM chunks WHERE path = ?1")
+        .expect("prepare chunk query")
+        .query_map([indexed_rel], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query chunks")
+        .collect::<Result<_, _>>()
+        .expect("collect chunks");
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks.iter().all(|(_, agent)| agent == "protected_video"));
+
+    let owner_response = owner_search(&root, OwnerBoundary, &request("netflix"), reference_date())
+        .expect("owner search");
+    assert_eq!(owner_response.results.len(), 1);
+    assert_eq!(owner_response.results[0].metadata.path, indexed_rel);
+
+    let boundary = connection_boundary(
+        &["Transcripts", "Entities", "Facets"],
+        ConnectionScope::WholeJournal,
+    );
+    let connection_response = connection_search(&root, &boundary, "netflix");
+    assert!(
+        connection_response
+            .results
+            .iter()
+            .all(|hit| hit.metadata.path != indexed_rel)
+    );
+
+    fs::remove_dir_all(root).expect("cleanup protected video index");
+}

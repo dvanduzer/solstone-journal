@@ -4,7 +4,7 @@
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
-use solstone_core_backup::load_hosted_binding;
+use solstone_core_backup::{HostedBinding, backup_setup_fingerprint, load_hosted_binding};
 use solstone_core_offload::status::build_checked_offload_status;
 
 use crate::{
@@ -19,7 +19,7 @@ fn operation_value(operation: Option<&Operation>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn hosted_view(root: &Path, operation: Option<&Operation>) -> Value {
+fn hosted_view(binding: Option<&HostedBinding>, operation: Option<&Operation>) -> Value {
     if operation
         .is_some_and(|operation| operation.kind == "enable_hosted" && operation.phase != "done")
     {
@@ -28,7 +28,7 @@ fn hosted_view(root: &Path, operation: Option<&Operation>) -> Value {
 
     // Lift bound/bucket/prefix only. status_view has no success/operation and
     // errors when destination is missing.
-    match load_hosted_binding(root) {
+    match binding {
         Some(binding) => json!({
             "bound": true,
             "bucket": binding.bucket,
@@ -55,14 +55,64 @@ pub(crate) fn status_with_operation(
     operation: Option<&Operation>,
 ) -> Result<Value, ()> {
     let backup = config::backup(root)?;
+    let binding = load_hosted_binding(root);
+    let current_setup = backup
+        .get("last_backup")
+        .and_then(|result| result.get("setup_fingerprint"))
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .and_then(|stored| {
+            backup_setup_fingerprint(&backup, binding.as_ref()).map(|current| stored == current)
+        });
     let destination = backup.get("destination").and_then(Value::as_object);
     Ok(with_cleanup_admission(json!({
         "success": true, "enabled": backup.get("enabled").cloned().unwrap_or(Value::Null), "mode": backup.get("mode").cloned().unwrap_or(Value::Null),
         "destination": {"repository": destination.and_then(|d| d.get("repository")).cloned().unwrap_or(Value::Null), "backend": destination.and_then(|d| d.get("backend")).cloned().unwrap_or(Value::Null), "credentials_set": destination.and_then(|d| d.get("credentials")).is_some_and(|value| value.as_object().is_some_and(|value| !value.is_empty()))},
         "daily_key_set": backup.get("daily_key").is_some_and(|value| !value.is_null()), "recovery_key_set": backup.get("recovery_key").is_some_and(|value| !value.is_null()), "recovery_key_confirmed": backup.get("confirmed_recovery_key").and_then(Value::as_bool).unwrap_or(false),
         "retention": backup.get("retention").cloned().unwrap_or(Value::Null), "offload": backup.get("offload").cloned().unwrap_or(Value::Null), "schedule": solstone_core_backup_runtime::effective_backup_schedule(root),
-        "last_backup": backup.get("last_backup").cloned().unwrap_or(Value::Null), "last_prune": backup.get("last_prune").cloned().unwrap_or(Value::Null), "last_offload": backup.get("last_offload").cloned().unwrap_or(Value::Null), "last_verification": backup.get("last_verification").cloned().unwrap_or(Value::Null), "last_restore": backup.get("last_restore").cloned().unwrap_or(Value::Null), "hosted": hosted_view(root, operation), "operation": operation_value(operation)
+        "last_backup": backup.get("last_backup").cloned().unwrap_or(Value::Null), "last_backup_current_setup": current_setup, "last_prune": backup.get("last_prune").cloned().unwrap_or(Value::Null), "last_offload": backup.get("last_offload").cloned().unwrap_or(Value::Null), "last_verification": backup.get("last_verification").cloned().unwrap_or(Value::Null), "last_restore": backup.get("last_restore").cloned().unwrap_or(Value::Null), "hosted": hosted_view(binding.as_ref(), operation), "operation": operation_value(operation)
     })))
+}
+
+/// Home's small read-only observation. Historical or routine failures are quiet;
+/// inability to associate a qualified result is unavailable, never recovery.
+pub fn home_backup_observation(deps: &crate::BackupWebDeps) -> Value {
+    let Ok(status) = status(&deps.journal_root, &deps.operations) else {
+        return json!({"available": false});
+    };
+    let Some(enabled) = status["enabled"].as_bool() else {
+        return json!({"available": false});
+    };
+    if !enabled
+        || status["operation"].as_object().is_some_and(|op| {
+            op.get("phase")
+                .and_then(Value::as_str)
+                .is_none_or(|phase| !crate::operation::is_terminal(phase))
+        })
+    {
+        return json!({"available": true, "issue": false});
+    }
+    if !status["last_backup"].is_object() {
+        return json!({"available": false});
+    }
+    match &status["last_backup"]["status"] {
+        Value::Null => {}
+        Value::String(state) if matches!(state.as_str(), "error" | "ok") => {}
+        _ => return json!({"available": false}),
+    }
+    if status["last_backup"]["status"] != "error"
+        || status["last_backup"]["error_reason"] != "auth_failed"
+    {
+        return json!({"available": true, "issue": false});
+    }
+    // Records predating attempt provenance cannot justify a current warning.
+    if status["last_backup"].get("setup_fingerprint").is_none() {
+        return json!({"available": true, "issue": false});
+    }
+    match status["last_backup_current_setup"].as_bool() {
+        Some(current) => json!({"available": true, "issue": current}),
+        None => json!({"available": false}),
+    }
 }
 
 pub fn offload(
@@ -113,8 +163,68 @@ fn with_cleanup_admission(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::hosted_view;
+    #[test]
+    fn home_issue_suppresses_active_operation_but_returns_after_each_terminal_phase() {
+        use solstone_core_backup::{
+            Destination, generate_and_store_keys, record_backup_result, set_destination,
+            set_enabled,
+        };
+        let root = tempfile::tempdir().unwrap();
+        set_destination(
+            root.path(),
+            &Destination {
+                repository: "s3:fixture".into(),
+                backend: "s3".into(),
+                credentials: Map::new(),
+            },
+        )
+        .unwrap();
+        generate_and_store_keys(root.path()).unwrap();
+        set_enabled(root.path(), true).unwrap();
+        let config = solstone_core_backup::get_backup_config(root.path()).unwrap();
+        let fingerprint = backup_setup_fingerprint(&config, None).unwrap();
+        record_backup_result(
+            root.path(),
+            "error",
+            json!(100),
+            Value::Null,
+            json!("auth_failed"),
+            None,
+            Some(&fingerprint),
+        )
+        .unwrap();
+        let deps = crate::BackupWebDeps::new(root.path().into());
+        assert_eq!(home_backup_observation(&deps)["issue"], true);
+        let begin = crate::operation::begin(&deps.operations, "backup", None, None, None).unwrap();
+        assert_eq!(home_backup_observation(&deps)["issue"], false);
+        for phase in [
+            "cancelling",
+            "done",
+            "error",
+            "degraded",
+            "needs_subscription",
+            "refused",
+        ] {
+            deps.operations
+                .lock()
+                .unwrap()
+                .current
+                .as_mut()
+                .unwrap()
+                .view
+                .phase = phase.into();
+            assert_eq!(
+                home_backup_observation(&deps)["issue"],
+                crate::operation::is_terminal(phase),
+                "phase {phase}"
+            );
+        }
+        let _ = begin;
+    }
+
+    use super::{backup_setup_fingerprint, home_backup_observation, hosted_view};
     use crate::{operation::Operation, test_support::hosted_binding};
+    use serde_json::{Map, Value, json};
     use solstone_core_backup::save_hosted_binding;
 
     #[cfg(all(test, feature = "full-tests"))]
@@ -314,7 +424,10 @@ mod tests {
                         .expect("save hosted binding");
                 }
                 let operation = state.map(|(kind, phase)| operation(kind, phase));
-                let view = hosted_view(root.path(), operation.as_ref());
+                let view = hosted_view(
+                    solstone_core_backup::load_hosted_binding(root.path()).as_ref(),
+                    operation.as_ref(),
+                );
                 let expected = binding_present && expected_when_present;
 
                 assert_eq!(

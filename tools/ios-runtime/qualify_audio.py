@@ -147,8 +147,21 @@ def main():
         native(phone.control('audio-enable'))
         wait_audio(phone, lambda s: s['state'] == 'ready')
         first, fields, _ = upload('audio.m4a')
-        wait_audio(phone, lambda s: s['state'] == 'processing')
+        first_processing = wait_audio(phone, lambda s: s['state'] == 'processing' and '/' + first + '/' in s['input'])
         ping()
+        if not args.smoke:
+            # Start cold, then cancel before publication; record the observed wait.
+            assert first_processing.get('model_load_ms') is None, first_processing
+            began = time.monotonic()
+            native(phone.control('audio-cancel'))
+            status = wait_audio(phone, lambda s: s['state'] == 'cancelled')
+            cancelled = client.http('GET', transcript_uri(first))
+            assert not cancelled['chunks'], cancelled
+            (args.output / 'cold-first-use-cancel.json').write_text(json.dumps({
+                'segment': first, 'cancel_to_observed_seconds': time.monotonic() - began,
+                'first_processing': first_processing, 'status': status,
+                'transcript': cancelled}, indent=2))
+            native(phone.control('audio-resume'))
         completed(first)
         duplicate = client.call('request', **fields)
         assert duplicate['ok'] and json.loads(duplicate['value']['body'])['status'] == 'duplicate', duplicate
@@ -196,10 +209,12 @@ def main():
             processed.append(silent['last'])
             for mode in ('missing-model', 'corrupt-model'):
                 phone.launch(['--audio', '--audio-mode', mode])
-                status = wait_audio(phone, lambda s: s['state'] == 'failed')
+                # Model loading is deferred until an admitted input needs ASR.
+                segment, _, _ = upload('audio.m4a')
+                status = wait_audio(phone, lambda s: s['state'] == 'failed'
+                                    and '/' + segment + '/' in s.get('input', ''))
                 assert 'model' in status['error'].lower() or 'gguf' in status['error'].lower(), status
                 errors.append(status)
-                segment, _, _ = upload('audio.m4a')
                 ping()
                 phone.launch(['--audio'])
                 completed(segment)
@@ -313,7 +328,7 @@ def main():
                   'processed': processed, 'failures': errors, 'authenticated_identity_ms': responsiveness,
                   'transcripts': transcripts, 'npz': npzs,
                   'model_load_ms': sorted({audio_status(row)['model_load_ms'] for row in phone.rows
-                                           if audio_status(row) and 'model_load_ms' in audio_status(row)}),
+                                           if audio_status(row) and audio_status(row).get('model_load_ms') is not None}),
                   'storage_bytes': sum(file['bytes'] for file in files if 'bytes' in file),
                   'baseline_storage_bytes': sum(file['bytes'] for file in baseline['files'] if 'bytes' in file),
                   'original_bytes': sum(manifest[name]['bytes'] for name in submitted.values()),

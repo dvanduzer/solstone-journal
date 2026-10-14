@@ -343,6 +343,9 @@ pub struct EmbeddedConveyHandle {
     owner_router: Router,
     door: Arc<door::DoorLifecycle>,
     local_network_task: tokio::task::JoinHandle<()>,
+    link_health_task: tokio::task::JoinHandle<()>,
+    service_token_renewal_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    renewal_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(feature = "host")]
@@ -365,8 +368,28 @@ impl EmbeddedConveyHandle {
 
     pub fn shutdown(&self) {
         self.local_network_task.abort();
+        self.link_health_task.abort();
+        self.renewal_shutdown.send_replace(true);
         self.door.shutdown();
     }
+
+    /// Stop app-owned services and join any active token renewal before the
+    /// embedding app releases its journal or runtime.
+    pub async fn shutdown_and_wait(&self) {
+        self.shutdown();
+        join_embedded_renewal(&self.service_token_renewal_task).await;
+    }
+}
+
+#[cfg(feature = "host")]
+async fn join_embedded_renewal(slot: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>) {
+    // Retain ownership across a cancelled waiter, and make concurrent waiters
+    // observe completion rather than an empty slot while work is still active.
+    let mut task = slot.lock().await;
+    if let Some(task) = task.as_mut() {
+        let _ = task.await;
+    }
+    task.take();
 }
 
 #[cfg(feature = "host")]
@@ -399,6 +422,23 @@ pub async fn bind_embedded_device_door_with_payload(
     bind_embedded_router(journal_root, address, app).await
 }
 
+/// Compose app-owned routes using the same optional agent owner surface as the
+/// desktop host. The device authorization gate still admits every network call.
+#[cfg(feature = "host")]
+pub async fn bind_embedded_device_door_with_routes(
+    journal_root: PathBuf,
+    address: std::net::SocketAddrV4,
+    payload_root: Option<PathBuf>,
+    agents_routes: Router,
+) -> Result<EmbeddedConveyHandle, ConveyServeError> {
+    let roots = payload_root
+        .map(|payload| thinking_sol_reads::TalentRoots::from_payload_root(&payload))
+        .transpose()
+        .map_err(ConveyServeError::EmbeddedPayload)?;
+    let app = router_with_roots(journal_root.clone(), None, Some(agents_routes), roots);
+    bind_embedded_router(journal_root, address, app).await
+}
+
 #[cfg(feature = "host")]
 async fn bind_embedded_router(
     journal_root: PathBuf,
@@ -423,12 +463,13 @@ async fn bind_embedded_router(
             .map_err(ConveyServeError::EmbeddedRoot)?,
     );
     let cache: link_health_cache::RelayHealthCacheStore = Arc::new(std::sync::Mutex::new(None));
-    let router = app.layer(Extension(cache));
+    let router = app.layer(Extension(cache.clone()));
     let door_router = authorization_gate::authorized_router_with_router(
         router.clone(),
         journal_root.clone(),
         receiver,
     );
+    let service_root = journal_root.clone();
     let door = Arc::new(door::DoorLifecycle::new(door::DoorStartOptions {
         journal_root,
         port: address.port(),
@@ -458,10 +499,16 @@ async fn bind_embedded_router(
         ));
     let _ = door.ensure_started().await;
     let local_network_task = tokio::spawn(local_network::watch(door.clone()));
+    let (renewal_shutdown, renewal_stop) = tokio::sync::watch::channel(false);
+    let (link_health_task, service_token_renewal_task) =
+        start_relay_health_tasks(service_root, cache, Some(renewal_stop));
     Ok(EmbeddedConveyHandle {
         owner_router,
         door,
         local_network_task,
+        link_health_task,
+        service_token_renewal_task: tokio::sync::Mutex::new(Some(service_token_renewal_task)),
+        renewal_shutdown,
     })
 }
 
@@ -480,6 +527,40 @@ async fn embedded_root_gate(
             .into_response();
     }
     next.run(request).await
+}
+
+#[cfg(feature = "host")]
+fn start_relay_health_tasks(
+    journal_root: PathBuf,
+    cache: link_health_cache::RelayHealthCacheStore,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let link_health_task = tokio::spawn(link_health_cache::subscribe_relay_health(
+        journal_root.clone(),
+        cache.clone(),
+    ));
+    let renewal_health_cache = cache.clone();
+    let renewal_config = solstone_core_spl::RenewalConfig::production(
+        journal_root.clone(),
+        Arc::new(move || {
+            let cache = renewal_health_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            link_health_cache::service_token_health_from_cache(cache.as_ref(), now_ms)
+        }),
+    );
+    let service_token_renewal_task = match shutdown {
+        Some(shutdown) => tokio::spawn(solstone_core_spl::run_embedded_service_token_renewal(
+            renewal_config,
+            shutdown,
+        )),
+        None => solstone_core_spl::spawn_service_token_renewal(renewal_config),
+    };
+    (link_health_task, service_token_renewal_task)
 }
 
 /// Bind loopback and, when available, the paired-device door.
@@ -534,25 +615,11 @@ pub async fn bind_with_authorization(
             source,
         })?;
     let link_health_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let link_health_task = tokio::spawn(link_health_cache::subscribe_relay_health(
+    let (link_health_task, service_token_renewal_task) = start_relay_health_tasks(
         options.journal_root.clone(),
         link_health_cache.clone(),
-    ));
-    let renewal_health_cache = link_health_cache.clone();
-    let renewal_config = solstone_core_spl::RenewalConfig::production(
-        options.journal_root.clone(),
-        Arc::new(move || {
-            let cache = renewal_health_cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
-            link_health_cache::service_token_health_from_cache(cache.as_ref(), now_ms)
-        }),
+        None,
     );
-    let service_token_renewal_task = solstone_core_spl::spawn_service_token_renewal(renewal_config);
     let push_portal = std::env::var("SERVICES_PORTAL_URL")
         .unwrap_or_else(|_| agents_enable::DEFAULT_PORTAL_URL.to_owned())
         .trim_end_matches('/')
@@ -1443,6 +1510,38 @@ mod tests {
     use super::router;
     use crate::assets::lookup;
     use crate::registry::APP_REGISTRY;
+
+    #[cfg(feature = "host")]
+    #[tokio::test]
+    async fn renewal_drain_retains_active_work_across_concurrent_and_cancelled_waiters() {
+        use std::{future::Future, task::Poll};
+        let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = blocked.await;
+        });
+        let slot = tokio::sync::Mutex::new(Some(task));
+        let mut first = Box::pin(super::join_embedded_renewal(&slot));
+        let mut second = Box::pin(super::join_embedded_renewal(&slot));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(first);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        release.send(()).unwrap();
+        second.await;
+        assert!(slot.lock().await.is_none());
+    }
 
     #[test]
     fn activities_remains_a_known_native_app() {

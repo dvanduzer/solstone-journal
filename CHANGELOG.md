@@ -8,10 +8,20 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- your journal now uses some of the objects it finds in screen frames and photos. they show as an "objects" line beside the frame's description, like "person ×2, car", and opening the frame or photo in transcripts outlines each one on the image. new recordings also list their objects so a search can find them.
+
+- health now shows how far back your journal has caught up, how many older recordings and daily outputs are left, and the recent pace when it has enough progress to compare. items set aside and days it could not check are listed separately.
+
 - when you save your own endpoint in thinking settings, your journal now sends it one test image and tells you right away if the model didn't read it, so you can switch models. before, a model that can't read images only showed up later, as screens and photos that failed to process or were described wrongly.
 
 ### Fixed
 
+- backups and portable exports now keep entities and facets named cache or indexer. portable exports also keep files ending in .key; your next backup picks up previously skipped entities and facets automatically.
+- home now points to health when your current backup key can't open the destination. changing the setup removes the old warning; ordinary retries stay in backup details.
+
+- when an older day has daily results that were never made, your journal now makes them after finishing that day's recordings, before moving on to older recordings. before, those results waited until every older recording was finished.
+
+- new conversations you import from ChatGPT, Claude or Gemini now label your messages as "You" instead of "Human", so your journal can tell them apart from the assistant's replies. Claude messages without a known sender are labeled "Unknown".
 - when your journal can't set up its solstone.me address, the agents app now says the problem is on this computer and needs a fix, instead of saying this computer isn't reaching solstone.me and will keep trying. `solstone journal health logs` names the step that failed.
 - `solstone journal mcp token create` now says that an agent using a new token can't read your journal until you grant it access, and prints the command to do that.
 - on windows, media offload runs again. you can approve its proposals from the home page and bring the media back from the backup page or with `solstone journal backup offload restore`, including media an earlier version offloaded.

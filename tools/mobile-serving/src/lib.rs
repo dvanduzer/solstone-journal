@@ -8,11 +8,10 @@ use axum::{
     http::{Request, header::CONTENT_TYPE},
 };
 use serde_json::{Value, json};
-use solstone_core_convey_shell::{
-    EmbeddedConveyHandle, bind_embedded_device_door, bind_embedded_device_door_with_payload,
-};
+use solstone_core_convey_shell::{EmbeddedConveyHandle, bind_embedded_device_door_with_routes};
 use solstone_core_journal_io::JournalRoot;
-use std::{net::SocketAddrV4, path::PathBuf};
+use std::{net::SocketAddrV4, path::PathBuf, sync::Mutex, time::Duration};
+use tokio::{sync::watch, task::JoinHandle};
 
 #[cfg(feature = "audio")]
 mod audio;
@@ -27,11 +26,16 @@ pub struct OwnerResponse {
 pub struct MobileServing {
     #[cfg(feature = "audio")]
     audio: Option<audio::AudioWorker>,
-    #[cfg(feature = "audio")]
     bus: solstone_core_callosum::CallosumSocketServer,
     handle: EmbeddedConveyHandle,
     runtime: tokio::runtime::Runtime,
     root: JournalRoot,
+    services: Mutex<Option<AppServices>>,
+}
+
+struct AppServices {
+    shutdown: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl MobileServing {
@@ -70,7 +74,6 @@ impl MobileServing {
             .map_err(|e| e.to_string())?;
         // Keep the production ingest notification boundary live. Durable receipt
         // discovery provides restart recovery independently of this transient bus.
-        #[cfg(feature = "audio")]
         let bus = runtime
             .block_on(solstone_core_callosum::CallosumSocketServer::bind(
                 root.canonical_path().join("health/callosum.sock"),
@@ -78,30 +81,75 @@ impl MobileServing {
             .map_err(|e| e.to_string())?;
         let handle = runtime
             .block_on(async {
-                match payload_root {
-                    Some(payload) => {
-                        bind_embedded_device_door_with_payload(
-                            root.canonical_path().to_path_buf(),
-                            address,
-                            payload,
-                        )
-                        .await
-                    }
-                    None => {
-                        bind_embedded_device_door(root.canonical_path().to_path_buf(), address)
-                            .await
-                    }
-                }
+                bind_embedded_device_door_with_routes(
+                    root.canonical_path().to_path_buf(),
+                    address,
+                    payload_root,
+                    solstone_core_mcp_endpoint::owner_routes(root.canonical_path().to_path_buf()),
+                )
+                .await
             })
             .map_err(|e| e.to_string())?;
+        let (shutdown, mut stop) = watch::channel(false);
+        let mcp_root = root.canonical_path().to_path_buf();
+        let mut mcp_stop = stop.clone();
+        let mcp_task = runtime.spawn(async move {
+            loop {
+                if *mcp_stop.borrow() {
+                    break;
+                }
+                let result = solstone_core_mcp_endpoint::run_embedded_service(
+                    mcp_root.clone(),
+                    mcp_stop.clone(),
+                )
+                .await;
+                if *mcp_stop.borrow() {
+                    break;
+                }
+                if let Err(error) = result {
+                    log::warn!("embedded agent service stopped: {}", error.class());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    _ = mcp_stop.changed() => break,
+                }
+            }
+        });
+        let relay_root = root.canonical_path().to_path_buf();
+        let relay_task = runtime.spawn(async move {
+            loop {
+                if *stop.borrow() {
+                    break;
+                }
+                let result = solstone_core_spl::run_embedded_service(
+                    relay_root.clone(),
+                    solstone_core_spl::Verbosity::Quiet,
+                    stop.clone(),
+                )
+                .await;
+                if *stop.borrow() {
+                    break;
+                }
+                if let Err(error) = result {
+                    log::warn!("embedded relay service stopped: {}", error.class());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    _ = stop.changed() => break,
+                }
+            }
+        });
         Ok(Self {
             #[cfg(feature = "audio")]
             audio: None,
-            #[cfg(feature = "audio")]
             bus,
             handle,
             runtime,
             root,
+            services: Mutex::new(Some(AppServices {
+                shutdown,
+                tasks: vec![relay_task, mcp_task],
+            })),
         })
     }
 
@@ -206,9 +254,20 @@ impl MobileServing {
         if let Some(audio) = &self.audio {
             audio.stop();
         }
-        self.handle.shutdown();
-        #[cfg(feature = "audio")]
+        // Keep retirement serialized through the final bus stop. A concurrent
+        // caller must not observe the empty slot as proof of a completed stop.
+        let mut service_owner = self.services.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(services) = service_owner.take() {
+            let _ = services.shutdown.send(true);
+            self.runtime.block_on(async {
+                for task in services.tasks {
+                    let _ = task.await;
+                }
+            });
+        }
+        self.runtime.block_on(self.handle.shutdown_and_wait());
         self.runtime.block_on(self.bus.stop());
+        drop(service_owner);
     }
 }
 

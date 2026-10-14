@@ -1708,6 +1708,70 @@ fn make_unsigned_jwt(
     format!("{header}.{payload_b64}.sig")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_renewal_shutdown_joins_active_work_without_publishing() {
+    use solstone_core_spl::service_token_renewal::{JwksSet, run_embedded_service_token_renewal};
+    let (journal, _cleanup) = temp_harness_journal("spl-embedded-renewal-stop");
+    write_test_journal_config(&journal, "spl", Some("https://relay.invalid"));
+    let identity = load_or_create_service_identity(&journal).unwrap();
+    let old = make_unsigned_jwt(
+        Some("test-key"),
+        &identity.instance_id,
+        1,
+        100,
+        "session.listen",
+    );
+    let new = make_unsigned_jwt(
+        Some("test-key"),
+        &identity.instance_id,
+        1_000_000,
+        2_000_000,
+        "session.listen",
+    );
+    save_service_token(&journal, &old).unwrap();
+    let token_path = journal.join("link/tokens/account.json");
+    let before = std::fs::read(&token_path).unwrap();
+    let (entered, waiting) = oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, blocked) = std::sync::mpsc::sync_channel(0);
+    let blocked = Mutex::new(blocked);
+    let mut config = RenewalConfig::production(journal, Arc::new(ServiceTokenHealth::default));
+    config.tick = Duration::from_millis(1);
+    config.clock.now_unix = Arc::new(|| 1_000_000);
+    config.enroll = Arc::new(move |_, _, _, _| Ok(new.clone()));
+    config.jwks_fetch = Arc::new(|_| JwksSet::Healthy {
+        kids: vec!["test-key".into()],
+    });
+    config.before_commit = Arc::new(move || {
+        if let Some(entered) = entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        blocked
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+    });
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(run_embedded_service_token_renewal(config, receiver));
+    timeout(Duration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    stop.send(true).unwrap();
+    assert!(!task.is_finished(), "shutdown detached the active renewal");
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(token_path).unwrap(),
+        before,
+        "cancelled renewal published a token"
+    );
+}
+
 async fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), std::io::Error> {
     let mut data = Vec::new();
     let mut buf = [0u8; 1024];

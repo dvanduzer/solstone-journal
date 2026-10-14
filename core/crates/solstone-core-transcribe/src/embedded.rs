@@ -37,6 +37,34 @@ pub(crate) struct EmbeddedContext<'a> {
     pub(crate) cancel: &'a dyn Fn() -> bool,
 }
 
+pub(crate) fn select_backend(
+    resolved: Result<String, TranscribeError>,
+    embedded: Option<&EmbeddedContext<'_>>,
+    requested: Option<&str>,
+    config: &solstone_core_journal_config::JournalConfigRead,
+) -> Result<String, TranscribeError> {
+    if !matches!(&resolved, Ok(_) | Err(TranscribeError::SttSurface { .. })) {
+        return resolved;
+    }
+    // Lost credentials or endpoint fields must not turn a confidential choice
+    // into local inference. Keep that choice and let its normal admission refuse.
+    if embedded.is_some()
+        && crate::config::confidential_audio_enabled(config)
+        && !matches!(requested, Some("parakeet" | "parakeet-cpp"))
+        && (requested == Some("confidential")
+            || crate::backend::confidential::confidential_provenance(config).is_some())
+    {
+        return Ok("confidential".into());
+    }
+    match (resolved, embedded) {
+        (Ok(backend), _) if backend == "confidential" => Ok(backend),
+        (Ok(_), Some(runtime)) | (Err(TranscribeError::SttSurface { .. }), Some(runtime)) => {
+            Ok(runtime.asr.model_info().backend)
+        }
+        (resolved, _) => resolved,
+    }
+}
+
 impl EmbeddedContext<'_> {
     pub(crate) fn checkpoint(&self) -> Result<(), TranscribeError> {
         if (self.cancel)() {
@@ -109,11 +137,17 @@ pub fn process_embedded(
             detail: error.to_string(),
         }
     })?;
+    let backend = crate::requested_backend(None, &config).map_err(|detail| {
+        TranscribeError::ProcessingClaim {
+            path: audio.to_path_buf(),
+            detail,
+        }
+    })?;
     let outcome = crate::stage::process_one_with(
         audio,
         journal,
         false,
-        None,
+        backend,
         &config,
         &solstone_core_spp_ratls::AttestationStateStore::new(),
         Some(&context),
@@ -125,6 +159,253 @@ pub fn process_embedded(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct LocalRecognizer;
+    impl EmbeddedAsr for LocalRecognizer {
+        fn transcribe(&self, _: &[f32]) -> Result<Value, String> {
+            panic!("backend choice must not run inference")
+        }
+        fn model_info(&self) -> EmbeddedModelInfo {
+            EmbeddedModelInfo {
+                backend: "parakeet-cpp".into(),
+                model: "pinned-local".into(),
+                device: "cpu".into(),
+                compute_type: "q8_0".into(),
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_confidential_configuration_never_falls_back_to_local_inference() {
+        use crate::backend::{confidential, resolve_default_backend};
+        for (field, replacement) in [
+            ("credential", None),
+            ("credential", Some(Value::Null)),
+            ("credential", Some(Value::String(String::new()))),
+            ("endpoint_url", None),
+            ("served_model_id", None),
+        ] {
+            for (backend, audio_enabled, expected) in [
+                (None, true, "confidential"),
+                (Some("confidential"), true, "confidential"),
+                (Some("parakeet"), true, "parakeet-cpp"),
+                (Some("parakeet-cpp"), true, "parakeet-cpp"),
+                (None, false, "parakeet-cpp"),
+                (Some("confidential"), false, "parakeet-cpp"),
+            ] {
+                let mut value = serde_json::json!({
+                    "transcribe":{"confidential_audio":audio_enabled},
+                    "services":{"confidential":{
+                        "device":"abc", "endpoint_url":"https://endpoint", "served_model_id":"served",
+                        "credential_fingerprint_sha256":"cca56da30e3c8a13a11277193fd3263961e2e3d6d9f98038a91dac05e8fde16a"
+                    }},
+                    "providers":{
+                        "active":{"provider":"local","model":"served"},
+                        "local":{"endpoint_url":"https://endpoint","served_model_id":"served","credential":"endpoint-credential"}
+                    }
+                });
+                if let Some(backend) = backend {
+                    value["transcribe"]["backend"] = backend.into();
+                }
+                let local = value["providers"]["local"].as_object_mut().unwrap();
+                match replacement.clone() {
+                    Some(replacement) => {
+                        local.insert(field.into(), replacement);
+                    }
+                    None => {
+                        local.remove(field);
+                    }
+                }
+                let config = solstone_core_journal_config::JournalConfigRead {
+                    present: true,
+                    sha256: None,
+                    config: Some(value.as_object().unwrap().clone()),
+                };
+                let requested = crate::requested_backend(None, &config).unwrap();
+                let resolve = || {
+                    resolve_default_backend(
+                        requested,
+                        None,
+                        None,
+                        None,
+                        confidential::confidential_channel_plausible(&config),
+                        crate::config::confidential_audio_enabled(&config),
+                    )
+                    .map(|resolution| resolution.backend)
+                };
+                let context = EmbeddedContext {
+                    models: Path::new("unused"),
+                    scratch: Path::new("unused"),
+                    asr: &LocalRecognizer,
+                    cancel: &|| false,
+                };
+                assert_eq!(
+                    select_backend(resolve(), Some(&context), requested, &config).unwrap(),
+                    expected,
+                    "field={field}, backend={backend:?}, audio={audio_enabled}"
+                );
+                // The desktop resolver's result (including refusal) remains untouched.
+                let original = resolve();
+                let desktop = select_backend(resolve(), None, requested, &config);
+                assert_eq!(format!("{desktop:?}"), format!("{original:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_confidential_without_provenance_stays_confidential_for_normal_refusal() {
+        let value = serde_json::json!({"transcribe":{"backend":"confidential"}});
+        let config = solstone_core_journal_config::JournalConfigRead {
+            present: true,
+            sha256: None,
+            config: Some(value.as_object().unwrap().clone()),
+        };
+        let context = EmbeddedContext {
+            models: Path::new("unused"),
+            scratch: Path::new("unused"),
+            asr: &LocalRecognizer,
+            cancel: &|| false,
+        };
+        let selected = select_backend(
+            Err(TranscribeError::SttSurface {
+                available_bytes: None,
+                floor_bytes: None,
+            }),
+            Some(&context),
+            Some("confidential"),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(selected, "confidential");
+        assert!(
+            crate::backend::confidential::refuse_confidential_egress(&config, &selected, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn configured_local_choices_and_audio_opt_out_keep_the_embedded_local_lane() {
+        use crate::backend::{confidential, resolve_default_backend};
+        use solstone_core_journal_config::JournalConfigRead;
+        for (backend, audio_enabled, expected) in [
+            (Some("parakeet"), true, "parakeet-cpp"),
+            (Some("parakeet-cpp"), true, "parakeet-cpp"),
+            (None, false, "parakeet-cpp"),
+            (None, true, "confidential"),
+            (Some("confidential"), false, "parakeet-cpp"),
+        ] {
+            let mut value = serde_json::json!({
+                "transcribe":{"confidential_audio":audio_enabled},
+                "services":{"confidential":{
+                    "device":"abc", "endpoint_url":"https://endpoint",
+                    "served_model_id":"served",
+                    "credential_fingerprint_sha256":"cca56da30e3c8a13a11277193fd3263961e2e3d6d9f98038a91dac05e8fde16a"
+                }},
+                "providers":{
+                    "active":{"provider":"local","model":"served"},
+                    "local":{"endpoint_url":"https://endpoint","served_model_id":"served","credential":"endpoint-credential"}
+                }
+            });
+            if let Some(backend) = backend {
+                value["transcribe"]["backend"] = backend.into();
+            }
+            let config = JournalConfigRead {
+                present: true,
+                sha256: None,
+                config: Some(value.as_object().unwrap().clone()),
+            };
+            assert!(confidential::confidential_channel_plausible(&config));
+            let resolved = resolve_default_backend(
+                crate::requested_backend(None, &config).unwrap(),
+                None,
+                None,
+                None,
+                confidential::confidential_channel_plausible(&config),
+                crate::config::confidential_audio_enabled(&config),
+            )
+            .map(|resolution| resolution.backend);
+            let context = EmbeddedContext {
+                models: Path::new("unused"),
+                scratch: Path::new("unused"),
+                asr: &LocalRecognizer,
+                cancel: &|| false,
+            };
+            assert_eq!(
+                select_backend(
+                    resolved,
+                    Some(&context),
+                    crate::requested_backend(None, &config).unwrap(),
+                    &config
+                )
+                .unwrap(),
+                expected
+            );
+            assert!(matches!(
+                select_backend(
+                    Err(TranscribeError::Cancelled),
+                    Some(&context),
+                    crate::requested_backend(None, &config).unwrap(),
+                    &config
+                ),
+                Err(TranscribeError::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_configured_backend_refuses_before_processing_or_inference() {
+        let journal = tempfile::tempdir().unwrap();
+        std::fs::create_dir(journal.path().join("config")).unwrap();
+        std::fs::write(
+            journal.path().join("config/journal.json"),
+            br#"{"transcribe":{"backend":"invalid"}}"#,
+        )
+        .unwrap();
+        let result = process_embedded(
+            Path::new("nonexistent-audio.wav"),
+            journal.path(),
+            Path::new("unused-models"),
+            &journal.path().join("scratch"),
+            &LocalRecognizer,
+            &|| false,
+        );
+        assert!(
+            matches!(result, Err(TranscribeError::ProcessingClaim { detail, .. })
+            if detail.contains("invalid transcribe.backend"))
+        );
+    }
+
+    #[test]
+    fn confidential_selection_never_inspects_the_local_recognizer() {
+        struct LocalMustNotRun;
+        impl EmbeddedAsr for LocalMustNotRun {
+            fn transcribe(&self, _: &[f32]) -> Result<Value, String> {
+                panic!("local ASR selected")
+            }
+            fn model_info(&self) -> EmbeddedModelInfo {
+                panic!("local model inspected")
+            }
+        }
+        let context = EmbeddedContext {
+            models: Path::new("unused"),
+            scratch: Path::new("unused"),
+            asr: &LocalMustNotRun,
+            cancel: &|| false,
+        };
+        let config = solstone_core_journal_config::JournalConfigRead {
+            present: false,
+            sha256: None,
+            config: None,
+        };
+        assert_eq!(
+            select_backend(Ok("confidential".into()), Some(&context), None, &config).unwrap(),
+            "confidential"
+        );
+        assert_eq!(
+            select_backend(Ok("confidential".into()), None, None, &config).unwrap(),
+            "confidential"
+        );
+    }
 
     struct CancelDuringAsr(AtomicBool);
     impl EmbeddedAsr for CancelDuringAsr {

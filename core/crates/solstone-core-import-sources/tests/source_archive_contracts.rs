@@ -3,5 +3,6 @@
 
 #[path = "archive_merge.rs"]
 mod archive_merge;
+#[cfg(unix)]
 #[path = "source_immutability.rs"]
 mod source_immutability;

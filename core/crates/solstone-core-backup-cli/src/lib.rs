@@ -3774,7 +3774,16 @@ mod resolution_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        record_backup_result(journal, "ok", json!(now), json!("ready"), Value::Null, None).unwrap();
+        record_backup_result(
+            journal,
+            "ok",
+            json!(now),
+            json!("ready"),
+            Value::Null,
+            None,
+            None,
+        )
+        .unwrap();
         record_verification_result(journal, "ok", json!(now), Value::Null, json!("1/52")).unwrap();
         set_offload(
             journal,
@@ -3843,6 +3852,7 @@ mod resolution_tests {
             json!(1),
             json!("prior"),
             Value::Null,
+            None,
             None,
         )
         .unwrap();
@@ -4721,6 +4731,7 @@ mod resolution_tests {
             json!("prior"),
             Value::Null,
             None,
+            None,
         )
         .unwrap();
         let runner = RecordingRunner::new();
@@ -5364,6 +5375,7 @@ mod resolution_tests {
             Value::Null,
             json!("some_error"),
             Value::Null,
+            None,
             None,
         )
         .unwrap();

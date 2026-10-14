@@ -12,6 +12,25 @@ pub fn restic_filesystem_path(path: &Path) -> String {
     value.into_owned()
 }
 
+/// Bind an exclude to the literal source path, in restic's filesystem coordinates.
+pub(crate) fn rooted_exclude(root: &Path, relative_pattern: &str) -> String {
+    let root = restic_filesystem_path(root);
+    #[cfg(windows)]
+    let root = root.replace('\\', "/");
+    let mut literal = String::new();
+    for character in root.chars() {
+        match character {
+            '*' => literal.push_str("[*]"),
+            '?' => literal.push_str("[?]"),
+            '[' => literal.push_str("[[]"),
+            #[cfg(not(windows))]
+            '\\' => literal.push_str("\\\\"),
+            _ => literal.push(character),
+        }
+    }
+    format!("{}/{relative_pattern}", literal.trim_end_matches('/'))
+}
+
 /// Restic tree selectors use slash paths and a virtual drive directory on Windows.
 pub fn restic_tree_path(path: &Path) -> String {
     let value = restic_filesystem_path(path);

@@ -37,12 +37,9 @@ use zip::ZipArchive;
 
 use crate::{ArchiveSafetyPhase, ImportSourcesError, MergeMutationState};
 
-/// Trailing-slash authored tree prunes, copied from `PORTABLE_DENY` in
-/// `solstone-core-journal-archive/src/deny.rs` (the `config/` … `solstone/`
-/// entries, stored here without the slash).
-/// Intentionally independent of that list: import-sources must not depend on
-/// the export crate (capability-safe inventory + zip encode) just to warn when
-/// a zip still carries those trees. Do not pin the two together in a test.
+/// Installation and service trees reported as warnings during preview.
+/// These names are tested only at the archive root; they never prune an
+/// identically named entity, facet, import member or capture source.
 const AUTHORED_TOP_LEVEL_PRUNES: &[&str] = &[
     "config",
     "link",

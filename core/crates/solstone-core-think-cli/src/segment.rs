@@ -2927,6 +2927,7 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
             sense,
             &mut published,
         )?;
+        publish_segment_objects(context, log, segment_name, stream, segment, &mut published);
         Ok(change)
     })();
     if assignment_published {
@@ -3118,6 +3119,45 @@ fn publish_segment_topics<W: std::io::Write>(
         }
     }
     Ok(())
+}
+
+/// Publish `talents/objects.md`, emptying a previous one when nothing
+/// qualifies now. Object detection is enrichment: a failed write is logged and
+/// never fails the segment.
+fn publish_segment_objects<W: std::io::Write>(
+    context: &ThinkContext,
+    log: &mut RunLogWriter<W>,
+    segment_name: &str,
+    stream: Option<&str>,
+    segment_dir: &std::path::Path,
+    published: &mut BTreeSet<std::path::PathBuf>,
+) {
+    let objects_path = segment_dir.join("talents").join("objects.md");
+    let markdown = crate::objects::segment_objects_markdown(segment_dir);
+    if markdown.is_none() && !objects_path.exists() {
+        return;
+    }
+    match replace_text(&objects_path, markdown.as_deref().unwrap_or("")) {
+        Ok(()) => {
+            published.insert(objects_path);
+        }
+        Err(cause) => log.log(
+            "sense.objects_failed",
+            context.event_now_ms(),
+            segment_event(
+                context,
+                segment_name,
+                stream,
+                Map::from_iter([
+                    (
+                        "path".to_owned(),
+                        Value::String(objects_path.display().to_string()),
+                    ),
+                    ("cause".to_owned(), Value::String(cause)),
+                ]),
+            ),
+        ),
+    }
 }
 
 fn log_index_attempt<W: std::io::Write>(

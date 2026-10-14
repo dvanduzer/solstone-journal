@@ -5084,6 +5084,68 @@ mod tests {
 
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
+    fn explicit_missing_day_priority_survives_submission_and_queue_selection() {
+        use solstone_core_journal_config::work_priority::WorkBand;
+        let queue = queue(false, 10, VecDeque::new());
+        for (reference, day, segment, priority) in [
+            (
+                "older-recording",
+                "19990101",
+                Some("120000_60"),
+                "5:19990101120000",
+            ),
+            ("missing-day", "19990102", None, "5:19990102000000"),
+            (
+                "own-recording",
+                "19990102",
+                Some("120000_60"),
+                "5:19990102120000",
+            ),
+            ("remake-day", "19990103", None, "6:19990103000000"),
+        ] {
+            let mut command = vec!["journal", "think", "--day", day];
+            if let Some(segment) = segment {
+                command.extend(["--segment", segment]);
+            }
+            let ExecutionRequest::Bus(mut request) = command_request(&command, reference, None)
+            else {
+                unreachable!()
+            };
+            request.priority = Some(priority.parse().unwrap());
+            queue.submit(ExecutionRequest::Bus(request));
+        }
+        let mut state = queue.inner.state.lock().unwrap();
+        for submission in std::mem::take(&mut state.pending) {
+            enqueue_locked(&mut state, submission);
+        }
+        state.ready = true;
+        let mut order = Vec::new();
+        while !state.queues.is_empty() {
+            let dispatches = take_ready(
+                &mut state,
+                true,
+                selection_day(Path::new("")),
+                local_spending(),
+            );
+            assert!(!dispatches.is_empty());
+            for dispatch in dispatches {
+                order.push((dispatch.submission.reference, dispatch.priority.band));
+            }
+            state.running.clear();
+        }
+        assert_eq!(
+            order,
+            [
+                ("own-recording".into(), WorkBand::Completing),
+                ("missing-day".into(), WorkBand::Completing),
+                ("older-recording".into(), WorkBand::Completing),
+                ("remake-day".into(), WorkBand::Remake),
+            ]
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
     fn ladder_selects_globally_and_completion_wakes_other_lanes() {
         let queue = queue(false, 10, VecDeque::new());
         for (reference, mode, priority) in [

@@ -92,6 +92,13 @@ pub fn google_generate(request: &GenerateRequest, config: &Map<String, Value>) -
     google_generate_with(request, config, &mut transport)
 }
 
+pub(crate) fn google_generate_from_config(
+    request: &GenerateRequest,
+    config: &Map<String, Value>,
+) -> GoogleResult {
+    google_generate_with_lookup(request, config, &mut UreqGoogleTransport, |_| None)
+}
+
 fn google_generate_with<T: GoogleTransport>(
     request: &GenerateRequest,
     config: &Map<String, Value>,

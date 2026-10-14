@@ -164,6 +164,18 @@ async fn run_native_service_async(
     result
 }
 
+/// Run the production relay service inside an app-owned runtime. The app owns
+/// shutdown; this entry never installs process-wide signal handlers.
+pub async fn run_embedded_service(
+    journal_root: PathBuf,
+    verbosity: Verbosity,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), NativeServiceError> {
+    let callosum = CallosumOutput::start(journal_root.join("health/callosum.sock"));
+    let mut deps = ProcessServiceDeps::new(journal_root, callosum, verbosity, shutdown);
+    run_service(&mut deps).await.map_err(classify_service_error)
+}
+
 async fn wait_for_hosted_parent(
     parent: Arc<HostedServiceParentRuntime>,
     shutdown: watch::Sender<bool>,
@@ -749,9 +761,12 @@ async fn write_callosum_line(
     line: Vec<u8>,
 ) {
     if connection.is_none() {
+        let Ok(endpoint) = solstone_core_callosum::endpoint_path(socket_path) else {
+            return;
+        };
         *connection = match timeout(
             CALLOSUM_IO_TIMEOUT,
-            tokio::net::UnixStream::connect(socket_path),
+            tokio::net::UnixStream::connect(endpoint.as_ref()),
         )
         .await
         {

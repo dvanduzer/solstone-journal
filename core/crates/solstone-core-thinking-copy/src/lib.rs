@@ -46,10 +46,9 @@ pub const LANES: [Lane; 3] = [
     },
 ];
 
-/// What a journal with no hardware check says in place of turning confidential
-/// processing on. Every shipped journal has one; Windows reads this again only
-/// if its owners are held back.
-pub const CONFIDENTIAL_NOT_ON_PLATFORM: &str = "confidential processing isn't on windows yet.";
+/// Availability message when the current device has no admitted hardware check.
+pub const CONFIDENTIAL_NOT_ON_PLATFORM: &str =
+    "confidential processing isn't available on this device yet.";
 
 pub const CONFIDENTIAL_LANE_DETAIL: ConfidentialLaneDetail = ConfidentialLaneDetail {
     heading: "confidential processing",

@@ -212,3 +212,30 @@ fn rejects_non_utf8_canonical_root_ancestor() {
         Err(ArchiveError::InvalidJournal { .. })
     ));
 }
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn operational_socket_is_omitted_while_owner_socket_named_file_is_kept() {
+    use std::os::unix::net::UnixListener;
+    let temporary = TempDir::new("operational-socket");
+    let root = journal(&temporary);
+    directory(&root, "health");
+    let _socket = UnixListener::bind(root.join("health/callosum.sock")).unwrap();
+    write(&root, "entities/cache/entity.json", b"{}");
+    write(
+        &root,
+        "chronicle/20260101/source/120000_60/owner.sock",
+        b"owner",
+    );
+    let source = ArchiveSource::open(&root).expect("operational socket does not block export");
+    let names: Vec<_> = source
+        .inventory()
+        .entries()
+        .iter()
+        .map(|entry| entry.member_name().as_str())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"chronicle/20260101/source/120000_60/owner.sock"));
+    assert!(names.contains(&"entities/cache/entity.json"));
+    assert!(!names.contains(&"health/callosum.sock"));
+}

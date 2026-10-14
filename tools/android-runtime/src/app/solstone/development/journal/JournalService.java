@@ -10,7 +10,11 @@ import java.util.concurrent.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 public class JournalService extends Service {
-    final ExecutorService work=Executors.newSingleThreadExecutor();
+    final JournalExecution execution = JournalExecution.PROCESS;
+    final ExecutorService work=execution.work;
+    final ExecutorService thinking=execution.thinking;
+    final ThinkingAdmission thinkingAdmission = execution.admission;
+    boolean destroyed;
     Messenger incoming;
     public void onCreate() {
         super.onCreate();
@@ -20,12 +24,50 @@ public class JournalService extends Service {
                 final String root=m.getData().getString("root");
                 final int count=m.getData().getInt("count",1), id=m.arg1;
                 final Messenger reply=m.replyTo;
+                if (destroyed) {
+                    respond(reply,id,"{\"ok\":false,\"error\":\"service destroyed\"}",0);
+                    return;
+                }
                 if (op.equals("cancel") || op.equals("begin")) { respond(reply,id,Native.run(root,op,count),0); return; }
-                work.execute(()->{
-                    long start=SystemClock.elapsedRealtimeNanos();
-                    try { respond(reply,id,Native.run(root,op,count),SystemClock.elapsedRealtimeNanos()-start); }
-                    catch(Throwable e) { respond(reply,id,"{\"ok\":false,\"error\": "+JSONObject.quote(e.toString())+"}",SystemClock.elapsedRealtimeNanos()-start); }
-                });
+                String operation = "";
+                if (op.startsWith("serve:")) {
+                    try { operation = new JSONObject(op.substring(6)).optString("op"); }
+                    catch (JSONException e) { /* Native boundary returns the parse refusal. */ }
+                }
+                final boolean isThinking = operation.equals("generate") || operation.equals("talent");
+                final boolean isStop = operation.equals("stop"), isStart = operation.equals("start");
+                final long generation = thinkingAdmission.generation();
+                if (isStop) thinkingAdmission.stop();
+                final ThinkingAdmission.Ticket ticket = isThinking ? thinkingAdmission.admit() : null;
+                if (isThinking && ticket == null) {
+                    respond(reply,id,"{\"ok\":false,\"error\":\"thinking is stopped or busy\"}",0);
+                    return;
+                }
+                try {
+                    (isThinking ? thinking : work).execute(()->{
+                        long start=SystemClock.elapsedRealtimeNanos();
+                        try {
+                            if (isStop) thinkingAdmission.awaitIdle();
+                            String result;
+                            if (ticket != null && !ticket.current()) {
+                                result="{\"ok\":false,\"error\":\"server stopped\"}";
+                            } else {
+                                result=Native.run(root,op,count);
+                            }
+                            if (isStart && new JSONObject(result).optBoolean("ok")) {
+                                thinkingAdmission.opened(generation);
+                            }
+                            respond(reply,id,result,SystemClock.elapsedRealtimeNanos()-start);
+                        } catch(Throwable e) {
+                            respond(reply,id,"{\"ok\":false,\"error\": "+JSONObject.quote(e.toString())+"}",SystemClock.elapsedRealtimeNanos()-start);
+                        } finally {
+                            if (ticket != null) ticket.close();
+                        }
+                    });
+                } catch (RejectedExecutionException e) {
+                    if (ticket != null) ticket.close();
+                    respond(reply,id,"{\"ok\":false,\"error\":\"server stopped\"}",0);
+                }
             }
         });
     }
@@ -45,5 +87,11 @@ public class JournalService extends Service {
         }catch(Exception e){android.util.Log.e("JournalRuntime","worker evidence write failed",e);}
     }
     public IBinder onBind(Intent i) { return incoming.getBinder(); }
-    public void onDestroy() { evidence("service_destroyed","last binding released"); Native.run("","cancel",1); work.execute(()->Native.run("","serve:{\"op\":\"stop\"}",1));work.shutdown(); super.onDestroy(); }
+    public void onDestroy() {
+        destroyed = true;
+        evidence("service_destroyed","last binding released");
+        Native.run("","cancel",1);
+        execution.retire(()->Native.run("","serve:{\"op\":\"stop\"}",1));
+        super.onDestroy();
+    }
 }

@@ -15,7 +15,7 @@ use std::{
     ffi::{CStr, CString, OsStr, c_char},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        LazyLock, Mutex, Once,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -25,6 +25,44 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 static ROOT: Mutex<Option<JournalRoot>> = Mutex::new(None);
 static QUERY: Mutex<Option<OwnerIndex>> = Mutex::new(None);
 static SERVING: Mutex<Option<journal_mobile_serving::MobileServing>> = Mutex::new(None);
+static PAYLOAD: Mutex<Option<PathBuf>> = Mutex::new(None);
+static GENERATE: LazyLock<solstone_core_generate_wire::EndpointRuntime> =
+    LazyLock::new(solstone_core_generate_wire::EndpointRuntime::default);
+
+// The development host has no desktop logger. Retain existing door warnings
+// so a dropped TLS carrier can be correlated with its server-side cause.
+struct DoorWarnings;
+impl log::Log for DoorWarnings {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+            && metadata
+                .target()
+                .starts_with("solstone_core_convey_shell::door")
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "ios-door time_ms={} pid={} {}: {}",
+                chrono::Utc::now().timestamp_millis(),
+                std::process::id(),
+                record.level(),
+                record.args()
+            );
+        }
+    }
+    fn flush(&self) {}
+}
+fn install_door_warnings() {
+    static LOGGER: DoorWarnings = DoorWarnings;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+    });
+}
 fn fixture(i: u64, revision: u64) -> String {
     format!(
         "# Synthetic memory {i}\n\nauroraruntime document {i}: copper kite revision {revision}.\n"
@@ -177,7 +215,7 @@ fn run(v: Value) -> Result<Value, String> {
                 .ok_or("port must be between 1024 and 65535")? as u16;
             let address = std::net::SocketAddrV4::new(wifi_address()?, port);
             let payload = PathBuf::from(v["payload"].as_str().ok_or("missing bundled payload")?);
-            #[cfg(all(target_os = "ios", feature = "audio"))]
+            #[cfg(target_os = "ios")]
             {
                 let target = std::env::temp_dir().join("callosum.sock");
                 if !target.is_absolute() || target.as_os_str().len() >= 104 {
@@ -191,6 +229,25 @@ fn run(v: Value) -> Result<Value, String> {
                         if metadata.file_type().is_symlink()
                             && std::fs::read_link(&alias).map_err(|e| e.to_string())? == target => {
                     }
+                    // iOS changes the app container on reinstall. This alias is
+                    // app-owned transient IPC, so replace its link (never its
+                    // old target) with the current app-private endpoint.
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        let temporary = alias.with_file_name(format!(
+                            ".callosum-alias-{}-{}",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_err(|e| e.to_string())?
+                                .as_nanos()
+                        ));
+                        std::os::unix::fs::symlink(&target, &temporary)
+                            .map_err(|e| e.to_string())?;
+                        if let Err(error) = std::fs::rename(&temporary, &alias) {
+                            let _ = std::fs::remove_file(temporary);
+                            return Err(error.to_string());
+                        }
+                    }
                     Ok(_) => return Err("Callosum endpoint already has another binding".into()),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         std::os::unix::fs::symlink(&target, &alias).map_err(|e| e.to_string())?
@@ -201,8 +258,9 @@ fn run(v: Value) -> Result<Value, String> {
             let runtime = journal_mobile_serving::MobileServing::start_with_payload(
                 p.to_owned(),
                 address,
-                payload,
+                payload.clone(),
             )?;
+            *PAYLOAD.lock().map_err(|e| e.to_string())? = Some(payload);
             let status = runtime.status();
             *serving = Some(runtime);
             Ok(json!({"address":address.to_string(),"status":status}))
@@ -246,7 +304,47 @@ fn run(v: Value) -> Result<Value, String> {
             if let Some(serving) = SERVING.lock().map_err(|e| e.to_string())?.take() {
                 serving.shutdown();
             }
+            GENERATE.drain_idle_pool();
+            PAYLOAD.lock().map_err(|e| e.to_string())?.take();
             Ok(json!({"stopped":true}))
+        }
+        "serve-generate" | "serve-talent" => {
+            let payload = PAYLOAD
+                .lock()
+                .map_err(|e| e.to_string())?
+                .clone()
+                .ok_or("serving is stopped")?;
+            let raw = v["payload"].as_str().ok_or("missing thinking request")?;
+            let generate = |request: &solstone_core_generate::GenerateRequest| {
+                solstone_core_generate_wire::respond(request, &GENERATE, p, |_| None)
+                    .map_err(solstone_core_generate::ClientError::Decode)
+            };
+            if op == "serve-generate" {
+                let request = solstone_core_generate_wire::parse_one_shot_request(raw)?;
+                let response = generate(&request).map_err(|e| e.to_string())?;
+                let encoded = solstone_core_generate::encode_one_shot_response(&response)?;
+                return serde_json::from_str(&encoded).map_err(|e| e.to_string());
+            }
+            let request = serde_json::from_str::<serde_json::Map<String, Value>>(raw)
+                .map_err(|e| e.to_string())?;
+            let paths = solstone_core_talent_runtime::prepare::RuntimePaths {
+                talent_root: payload.join("solstone/talent"),
+                apps_root: payload.join("solstone/apps"),
+                templates_dir: payload.join("solstone/think/templates"),
+            };
+            let context = solstone_core_talent_runtime::ExecutionContext {
+                journal: p.to_owned(),
+            };
+            let mut events = Vec::new();
+            let outcome = solstone_core_talent_runtime::execute_request(
+                request,
+                &paths,
+                &context,
+                &generate,
+                &mut events,
+            );
+            Ok(json!({"outcome":format!("{outcome:?}"),
+                "events":String::from_utf8(events).map_err(|e|e.to_string())?}))
         }
         "serve-index" => {
             let report = solstone_core_indexer_store::scan::scan_journal(p, false)
@@ -276,6 +374,13 @@ fn run(v: Value) -> Result<Value, String> {
                     Ok(json!({"status":response.status,"body":response.body}))
                 }
             }
+        }
+        "serve-custody" => {
+            let requested = v["root"].as_str().ok_or("missing custody authority")?;
+            if std::fs::canonicalize(requested).map_err(|e| e.to_string())? != p {
+                return Err("custody journal does not match admitted root".into());
+            }
+            Ok(json!({"root_validated":true}))
         }
         "serve-inventory" => {
             if SERVING.lock().map_err(|e| e.to_string())?.is_some() {
@@ -500,13 +605,31 @@ fn run(v: Value) -> Result<Value, String> {
 pub unsafe extern "C" fn journal_runtime(input: *const c_char) -> *mut c_char {
     let start = Instant::now();
     let result = std::panic::catch_unwind(|| {
+        install_door_warnings();
         if input.is_null() {
             return Err("null request".into());
         }
         let s = unsafe { CStr::from_ptr(input) }
             .to_str()
             .map_err(|e| e.to_string())?;
-        run(serde_json::from_str(s).map_err(|e| e.to_string())?)
+        let request = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        #[cfg(target_os = "ios")]
+        {
+            // GCD worker stacks are too small for the debug build's nested
+            // router/TLS futures. Keep the caller's serial admission while
+            // executing native work on an explicitly bounded Rust stack.
+            let worker = std::thread::Builder::new()
+                .name("journal-native-call".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || run(request))
+                .map_err(|e| e.to_string())?;
+            match worker.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        run(request)
     });
     let body = match result {
         Ok(Ok(v)) => json!({"ok":true,"value":v}),

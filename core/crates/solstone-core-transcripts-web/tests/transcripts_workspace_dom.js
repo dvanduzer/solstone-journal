@@ -1943,6 +1943,42 @@ test('delete one location row from 3 rows: cancel, cancelled, not_deleted restor
   assert.deepStrictEqual(snapshotZoomPills(), initialZoomPills);
 });
 
+test('protected_video markdown chunk rendered in transcript panel and replaced on update', async () => {
+  const env = await createEnvironment();
+  const pills = getZoomPills(env.doc);
+  assert.ok(pills.length > 0, 'zoom pills should be present');
+
+  pills[0].dispatchEvent({ type: 'click' });
+  await env.releasePendingSegmentGets('analyzed', {
+    chunks: [
+      {
+        type: 'markdown',
+        markdown: 'PROTECTED_VIDEO_SENTINEL_9f3c',
+        time: '09:00:00',
+        timestamp: 1,
+      },
+    ],
+  });
+
+  assert.strictEqual(getActiveTab(env.doc), 'transcript');
+  const panel = env.doc.querySelector('#tr-tabpanel-transcript');
+  assert.ok(panel, 'transcript panel should exist');
+  const sentinelEntries = [...panel.querySelectorAll('.tr-entry')].filter((el) =>
+    (el.textContent || '').includes('PROTECTED_VIDEO_SENTINEL_9f3c')
+  );
+  assert.strictEqual(sentinelEntries.length, 1);
+
+  pills[0].dispatchEvent({ type: 'click' });
+  await env.releasePendingSegmentGets('analyzed', {
+    chunks: [],
+  });
+
+  const remainingEntries = [...env.doc.querySelectorAll('.tr-entry')].filter((el) =>
+    (el.textContent || '').includes('PROTECTED_VIDEO_SENTINEL_9f3c')
+  );
+  assert.strictEqual(remainingEntries.length, 0);
+});
+
 async function run() {
   for (const t of tests) {
     try {

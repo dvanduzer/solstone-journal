@@ -32,7 +32,7 @@ pub(crate) fn build(root: &impl AsFd) -> Result<Inventory, ArchiveError> {
                         .push(SkippedRootName::new(name_str));
                     continue;
                 }
-                if deny_member(&name_str) {
+                if deny_member(&name_str, false) {
                     continue;
                 }
                 inventory
@@ -52,7 +52,7 @@ pub(crate) fn build(root: &impl AsFd) -> Result<Inventory, ArchiveError> {
                 )?;
             }
             JournalEntryKind::RegularFile => {
-                if deny_member(&name_str) {
+                if deny_member(&name_str, true) {
                     continue;
                 }
                 count_file(&[], &name, &mut inventory);
@@ -66,6 +66,7 @@ pub(crate) fn build(root: &impl AsFd) -> Result<Inventory, ArchiveError> {
                     },
                 ));
             }
+            JournalEntryKind::Socket if deny_member(member.as_str(), false) => {}
             kind => {
                 return Err(ArchiveError::UnsafeJournalEntry { member, kind });
             }
@@ -102,7 +103,7 @@ fn walk_directory(
         let stat = stat_entry_for_count(directory, &name, &member)?;
         match classify(&stat) {
             JournalEntryKind::Directory => {
-                if deny_member(member.as_str()) {
+                if deny_member(member.as_str(), false) {
                     continue;
                 }
                 count_directory(&components, &name, inventory);
@@ -116,7 +117,7 @@ fn walk_directory(
                 walk_directory(&child, child_components, child_proofs, entries, inventory)?;
             }
             JournalEntryKind::RegularFile => {
-                if deny_member(member.as_str()) {
+                if deny_member(member.as_str(), true) {
                     continue;
                 }
                 count_file(&components, &name, inventory);
@@ -130,6 +131,7 @@ fn walk_directory(
                     },
                 ));
             }
+            JournalEntryKind::Socket if deny_member(member.as_str(), false) => {}
             kind => {
                 return Err(ArchiveError::UnsafeJournalEntry { member, kind });
             }
@@ -275,7 +277,7 @@ mod membership_tests {
     }
 
     #[test]
-    fn basename_exclude_is_any_depth_and_star_does_not_cross_slash() {
+    fn operational_excludes_preserve_unrelated_owner_files() {
         let temporary = TempDir::new("ac2");
         let root = journal(&temporary);
         write(&root, "chronicle/20260101/foo.sqlite", b"db");
@@ -283,7 +285,7 @@ mod membership_tests {
         write(&root, "chronicle/20260101/nested/apps/note.txt", b"nested");
         let source = ArchiveSource::open(&root).expect("open source");
         let names = members(&source);
-        assert!(!names.iter().any(|name| name.ends_with("foo.sqlite")));
+        assert!(names.iter().any(|name| name.ends_with("foo.sqlite")));
         assert!(
             names
                 .iter()
@@ -294,6 +296,58 @@ mod membership_tests {
                 .iter()
                 .any(|name| name == "chronicle/20260101/nested/apps/note.txt"),
             "trailing-slash apps/ prunes only at top level: {names:?}"
+        );
+    }
+
+    #[test]
+    fn colliding_owner_names_survive_beside_operational_controls() {
+        let temporary = TempDir::new("owner-names");
+        let root = journal(&temporary);
+        for member in [
+            "entities/cache/entity.json",
+            "entities/indexer/entity.json",
+            "facets/cache/facet.json",
+            "facets/indexer/facet.json",
+            "imports/item/original.key",
+            "imports/health-dedupe.sqlite-notes/original.key",
+            "imports/health-dedupe.sqlite-wal/original.key",
+            "chronicle/20260101/indexer/120001_60.sqlite/original.key",
+            "imports/item/.removing",
+            "imports/item/notes.removing_original",
+            "imports/health-dedupe.sqlite/original.key",
+            "chronicle/20260102/indexer/indexer.sqlite/original.key",
+            "imports/item/cache/owner.sqlite",
+            "chronicle/20260101/indexer/120000_60/slides.key",
+            "chronicle/20260101/source/120000_60/audio.jsonl.lock",
+            "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
+        ] {
+            write(&root, member, b"owner bytes");
+        }
+        for member in [
+            "indexer/journal.sqlite",
+            ".removing_root/owner.json",
+            "chronicle/20260101/.removing_flat/owner.json",
+            "chronicle/20260101/source/.removing_qualified/owner.json",
+            "imports/item/deep/.removing_deep/owner.json",
+            "chronicle/20260101/120000_60/.removing_original",
+            "imports/.health-dedupe.sqlite.rebuild-journal",
+            "chronicle/20260101/indexer/indexer.sqlite",
+            "health/brain-fingerprint.key",
+            "mcp-endpoint/pop.ed25519.pk8",
+            "config/.tmp_123_4.tmp",
+        ] {
+            write(&root, member, b"operational secret control");
+        }
+        let source = ArchiveSource::open(&root).unwrap();
+        let names = members(&source);
+        assert_eq!(names.len(), 16, "{names:?}");
+        assert!(names.contains(&"entities/cache/entity.json".to_owned()));
+        assert!(names.contains(&"facets/indexer/facet.json".to_owned()));
+        assert!(names.contains(&"chronicle/20260101/indexer/120000_60/slides.key".to_owned()));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "chronicle/20260101/indexer/indexer.sqlite")
         );
     }
 

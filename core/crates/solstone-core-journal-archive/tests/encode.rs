@@ -224,7 +224,7 @@ fn deny_list_zip_includes_new_roots_and_omits_pruned_trees() {
     assert!(names.contains(&"identity/partner.md".to_owned()));
     assert!(!names.iter().any(|name| name.starts_with("config")));
     assert!(!names.iter().any(|name| name.starts_with("apps")));
-    assert!(!names.iter().any(|name| name.ends_with("foo.sqlite")));
+    assert!(names.iter().any(|name| name.ends_with("foo.sqlite")));
 }
 
 #[test]

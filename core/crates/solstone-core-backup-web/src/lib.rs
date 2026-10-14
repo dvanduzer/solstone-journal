@@ -52,6 +52,7 @@ mod response;
 mod restore_prepare;
 pub mod restore_report;
 mod status;
+pub use status::home_backup_observation;
 mod teardown_report;
 mod validation;
 

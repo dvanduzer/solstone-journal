@@ -50,33 +50,6 @@ pub const KEY_LABEL_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const UNLOCK_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const VERIFY_TIMEOUT_SECONDS: u64 = 60 * 60;
 
-// Restic matches a no-slash pattern by basename at ANY depth, so bare `health`
-// was removed because it dropped historical root deletion-audit records
-// (`retention.log`, `pruning-runs/`), canonical per-day operational oplogs, and
-// per-day talent-provenance from every snapshot.
-pub const BACKUP_EXCLUDES: [&str; 20] = [
-    "*.sqlite*",
-    "indexer",
-    "cache",
-    ".cache",
-    ".removing_*",
-    "*.sock",
-    "*.pid",
-    "*.port",
-    "*.lock",
-    "*.tmp",
-    ".tmp*",
-    "brain.json",
-    "brain.log",
-    "brain-fingerprint.key",
-    "brain-refresh.lease",
-    "supervisor.ready",
-    "supervisor.start_time",
-    "parakeet-cpp.placement",
-    "scheduler.json",
-    "health/sync",
-];
-
 /// Write boundary for whole-journal restore attempts.
 pub trait RestoreRecorder {
     #[allow(clippy::too_many_arguments)] // Mirrors backup's owner-owned record API.
@@ -434,6 +407,7 @@ pub struct AdmittedCapability {
     pub(crate) timeout_seconds: u64,
     pub(crate) keys: BackupKeys,
     pub(crate) mode: AdmittedBackupMode,
+    setup_fingerprint: Option<String>,
     pub(crate) _private: (),
 }
 
@@ -615,20 +589,79 @@ fn backup_args(resolved_journal: &Path) -> Vec<String> {
         "backup".into(),
         crate::restic_filesystem_path(resolved_journal),
     ];
-    for excluded in BACKUP_EXCLUDES {
-        args.extend(["--exclude".into(), excluded.into()]);
+    for excluded in solstone_core_journal_io::copy_excludes::COPY_EXCLUDES {
+        args.extend([
+            "--exclude".into(),
+            crate::restic_paths::rooted_exclude(resolved_journal, excluded),
+        ]);
     }
-    args.extend([
-        "--exclude".into(),
-        crate::restic_filesystem_path(&resolved_journal.join("mcp-endpoint")),
-        "--exclude".into(),
-        crate::restic_filesystem_path(
-            &resolved_journal
-                .join("config")
-                .join("chatgpt-sign-in.json*"),
-        ),
-    ]);
     args
+}
+
+struct PreparedBackup {
+    args: Vec<String>,
+    // The child reads this file while running; keep it private and alive throughout.
+    _exclude_file: tempfile::NamedTempFile,
+}
+
+fn prepare_backup_args(root: &Path) -> std::io::Result<PreparedBackup> {
+    use solstone_core_journal_io::copy_excludes::{
+        BODY_DATABASES, LEGACY_DAY_DATABASES, SQLITE_SUFFIXES,
+    };
+    use std::io::Write;
+
+    let mut excludes = tempfile::NamedTempFile::new()?;
+    let mut add_slots = |parent: &str, names: &[&str]| -> std::io::Result<()> {
+        for name in names {
+            for suffix in SQLITE_SUFFIXES {
+                let member = format!("{parent}/{name}{suffix}");
+                match fs::symlink_metadata(root.join(&member)) {
+                    Ok(metadata) if metadata.is_dir() => continue,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                let pattern = crate::restic_paths::rooted_exclude(root, &member);
+                if pattern.contains(['\r', '\n']) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "journal path contains a line break",
+                    ));
+                }
+                // restic expands environment variables in exclude files.
+                writeln!(excludes, "{}", pattern.replace('$', "$$"))?;
+            }
+        }
+        Ok(())
+    };
+    add_slots("imports", BODY_DATABASES)?;
+    match fs::read_dir(root.join("chronicle")) {
+        Ok(days) => {
+            for day in days {
+                let day = day?;
+                let name = day.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.len() == 8
+                    && name.bytes().all(|byte| byte.is_ascii_digit())
+                    && day.file_type()?.is_dir()
+                {
+                    add_slots(&format!("chronicle/{name}/indexer"), LEGACY_DAY_DATABASES)?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    excludes.flush()?;
+    let mut args = backup_args(root);
+    args.extend([
+        "--exclude-file".into(),
+        crate::restic_filesystem_path(excludes.path()),
+    ]);
+    Ok(PreparedBackup {
+        args,
+        _exclude_file: excludes,
+    })
 }
 
 fn resolve_backup_journal(journal: &Path) -> std::io::Result<PathBuf> {
@@ -730,6 +763,13 @@ fn prepare_backup_run(journal: &Path) -> Result<AdmittedCapability, BackupAdmiss
     Ok(AdmittedCapability {
         resolved_journal,
         timeout_seconds: backup_timeout_seconds(&config),
+        setup_fingerprint: solstone_core_backup::backup_setup_fingerprint(
+            &config,
+            match &mode {
+                AdmittedBackupMode::Operated { binding } => Some(binding),
+                AdmittedBackupMode::Byo { .. } => None,
+            },
+        ),
         keys,
         mode,
         _private: (),
@@ -1018,7 +1058,12 @@ fn unreadable_sources(output: &crate::runner::ResticResult) -> Option<Unreadable
     })
 }
 
-fn record_backup(journal: &Path, clock: &dyn Clock, result: &BackupResult) {
+fn record_backup(
+    journal: &Path,
+    clock: &dyn Clock,
+    result: &BackupResult,
+    setup_fingerprint: Option<&str>,
+) {
     #[cfg(any(test, feature = "test-hooks"))]
     if run_backup_record_failure_hook(journal) {
         return;
@@ -1036,6 +1081,7 @@ fn record_backup(journal: &Path, clock: &dyn Clock, result: &BackupResult) {
             .clone()
             .map_or(Value::Null, Value::String),
         result.detail.as_deref(),
+        setup_fingerprint,
     );
 }
 
@@ -1054,7 +1100,7 @@ pub fn record_backup_error(journal: &Path, clock: &dyn Clock, reason: &str) -> B
         unreadable: None,
         detail: None,
     };
-    record_backup(journal, clock, &result);
+    record_backup(journal, clock, &result, None);
     result
 }
 
@@ -1138,8 +1184,28 @@ impl AdmittedCapability {
             timeout_seconds,
             keys,
             mode,
+            setup_fingerprint,
             _private: (),
         } = self;
+        let prepared = match prepare_backup_args(&resolved_journal) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let result = BackupResult {
+                    status: "error".into(),
+                    snapshot_id: None,
+                    error_reason: Some("failed".into()),
+                    unreadable: None,
+                    detail: Some(error.to_string()),
+                };
+                record_backup(
+                    &resolved_journal,
+                    services.clock,
+                    &result,
+                    setup_fingerprint.as_deref(),
+                );
+                return result;
+            }
+        };
         let runtime = match mode {
             AdmittedBackupMode::Byo { destination } => value_env(&destination)
                 .map(|backend_env| Runtime {
@@ -1176,7 +1242,7 @@ impl AdmittedCapability {
                 match restic(
                     services,
                     &runtime,
-                    backup_args(&resolved_journal),
+                    prepared.args.clone(),
                     true,
                     timeout_seconds,
                     None,
@@ -1281,7 +1347,12 @@ impl AdmittedCapability {
         } else {
             result
         };
-        record_backup(&resolved_journal, services.clock, &result);
+        record_backup(
+            &resolved_journal,
+            services.clock,
+            &result,
+            setup_fingerprint.as_deref(),
+        );
         result
     }
 
@@ -1298,7 +1369,12 @@ impl AdmittedCapability {
             unreadable: None,
             detail: Some(detail),
         };
-        record_backup(&self.resolved_journal, clock, &result);
+        record_backup(
+            &self.resolved_journal,
+            clock,
+            &result,
+            self.setup_fingerprint.as_deref(),
+        );
         result
     }
 }
@@ -3815,6 +3891,29 @@ mod tests {
             7
         }
     }
+    #[test]
+    fn admitted_tool_failure_keeps_original_setup_after_replacement() {
+        let journal = configured_journal();
+        let config = get_backup_config(journal.path()).unwrap();
+        let original = solstone_core_backup::backup_setup_fingerprint(&config, None).unwrap();
+        let capability = prepare(journal.path(), &FixedClock).unwrap();
+        let mut replacement = solstone_core_backup::get_destination(journal.path())
+            .unwrap()
+            .unwrap();
+        replacement.repository = "s3:replacement".into();
+        solstone_core_backup::set_destination(journal.path(), &replacement).unwrap();
+        capability.record_tool_error(
+            &FixedClock,
+            ClosedToolError::ResticUnavailable {
+                guidance: "synthetic guidance".into(),
+                detail: "synthetic tool failure".into(),
+            },
+        );
+        let result = get_backup_config(journal.path()).unwrap()["last_backup"].clone();
+        assert_eq!(result["setup_fingerprint"], original);
+        assert_eq!(result["error_reason"], "restic_unavailable");
+    }
+
     struct MutableClock(Rc<Cell<i64>>);
     impl Clock for MutableClock {
         fn now_unix(&self) -> i64 {
@@ -3840,6 +3939,19 @@ mod tests {
             stderr: vec![],
         }
     }
+    fn without_exclude_file(args: &[String]) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == "--exclude-file" {
+                iter.next();
+            } else {
+                result.push(arg.clone());
+            }
+        }
+        result
+    }
+
     fn json_backup_args(resolved_journal: &Path) -> Vec<String> {
         let mut args = backup_args(resolved_journal);
         args.extend(["--retry-lock".into(), "30m".into(), "--json".into()]);
@@ -3879,6 +3991,148 @@ mod tests {
             journal_maintenance: maintenance,
         }
     }
+    #[test]
+    fn database_selection_preserves_directories_and_keeps_argv_bounded() {
+        let journal = tempfile::tempdir().unwrap();
+        let root = journal.path();
+        fs::create_dir_all(root.join("imports/health-dedupe.sqlite")).unwrap();
+        fs::create_dir_all(root.join("chronicle/20260000/indexer/indexer.sqlite")).unwrap();
+        let small = prepare_backup_args(root).unwrap();
+        let argv_size: usize = small.args.iter().map(String::len).sum();
+        drop(small);
+        for day in 20260000..20260500 {
+            fs::create_dir_all(root.join(format!("chronicle/{day}/indexer"))).unwrap();
+        }
+        let prepared = prepare_backup_args(root).unwrap();
+        let policy = fs::read_to_string(prepared._exclude_file.path()).unwrap();
+        assert_eq!(policy.lines().count(), 8 + 500 * 8 - 2);
+        assert!(
+            !policy
+                .lines()
+                .any(|line| line.ends_with("/imports/health-dedupe.sqlite"))
+        );
+        assert!(
+            !policy
+                .lines()
+                .any(|line| line.ends_with("/chronicle/20260000/indexer/indexer.sqlite"))
+        );
+        assert!(
+            policy.lines().any(
+                |line| line.ends_with("/chronicle/20260499/indexer/transcripts.sqlite-journal")
+            )
+        );
+        assert_eq!(prepared.args.len(), backup_args(root).len() + 2);
+        assert_eq!(
+            prepared.args.iter().map(String::len).sum::<usize>(),
+            argv_size
+        );
+        let private_path = prepared._exclude_file.path().to_owned();
+        drop(prepared);
+        assert!(!private_path.exists());
+    }
+
+    #[test]
+    fn database_metadata_failure_does_not_invoke_restic_even_for_unlock() {
+        let journal = configured_journal();
+        fs::write(journal.path().join("chronicle"), b"invalid namespace").unwrap();
+        let fingerprint = solstone_core_backup::backup_setup_fingerprint(
+            &get_backup_config(journal.path()).unwrap(),
+            None,
+        )
+        .unwrap();
+        let runner = Script {
+            outputs: RefCell::new(VecDeque::new()),
+            commands: RefCell::new(vec![]),
+        };
+        let result = run_backup(
+            journal.path(),
+            &services(&runner, &Http, &FixedClock, &Maintenance),
+        );
+        assert_eq!(result.status, "error");
+        assert_eq!(result.error_reason.as_deref(), Some("failed"));
+        assert!(runner.commands.borrow().is_empty());
+        assert_eq!(
+            get_backup_config(journal.path()).unwrap()["last_backup"]["setup_fingerprint"],
+            fingerprint
+        );
+    }
+
+    #[test]
+    fn database_exclude_file_lives_through_the_child_and_is_removed_on_terminal_results() {
+        struct ReadsPolicy {
+            returncode: Option<i32>,
+            path: RefCell<Option<PathBuf>>,
+        }
+        impl ToolRunner for ReadsPolicy {
+            fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                if request.argv.iter().any(|arg| arg == "unlock") {
+                    return Ok(output(0, ""));
+                }
+                let index = request
+                    .argv
+                    .iter()
+                    .position(|arg| arg == "--exclude-file")
+                    .unwrap();
+                let path = PathBuf::from(&request.argv[index + 1]);
+                let text = fs::read_to_string(&path).expect("policy readable while restic runs");
+                assert!(
+                    text.lines()
+                        .any(|line| line.ends_with("/imports/health-dedupe.sqlite"))
+                );
+                *self.path.borrow_mut() = Some(path);
+                match self.returncode {
+                    Some(code) => Ok(output(
+                        code,
+                        "{\"message_type\":\"summary\",\"snapshot_id\":\"snap\"}",
+                    )),
+                    None => Err(io::Error::other("synthetic tool failure")),
+                }
+            }
+        }
+        for code in [Some(0), Some(1), None] {
+            let journal = configured_journal();
+            let runner = ReadsPolicy {
+                returncode: code,
+                path: RefCell::new(None),
+            };
+            let result = run_backup(
+                journal.path(),
+                &services(&runner, &Http, &FixedClock, &Maintenance),
+            );
+            assert_eq!(result.status, if code == Some(0) { "ok" } else { "error" });
+            assert!(
+                !runner
+                    .path
+                    .borrow()
+                    .as_ref()
+                    .expect("backup invoked")
+                    .exists()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrepresentable_exclude_file_root_fails_before_runner_invocation() {
+        let parent = tempfile::tempdir().unwrap();
+        let journal = parent.path().join("journal\nowner");
+        fs::create_dir(&journal).unwrap();
+        configure_journal(&journal);
+        let runner = Script {
+            outputs: RefCell::new(VecDeque::new()),
+            commands: RefCell::new(vec![]),
+        };
+        assert_eq!(
+            run_backup(
+                &journal,
+                &services(&runner, &Http, &FixedClock, &Maintenance)
+            )
+            .status,
+            "error"
+        );
+        assert!(runner.commands.borrow().is_empty());
+    }
+
     fn valid_backup_section(destination: Value) -> Value {
         json!({
             "enabled": true,
@@ -6269,9 +6523,12 @@ mod tests {
 
     #[test]
     fn excludes_are_exact_and_keep_durable_health() {
-        assert!(!BACKUP_EXCLUDES.contains(&"health"));
-        assert!(!BACKUP_EXCLUDES.contains(&"chatgpt-sign-in.json"));
-        assert!(!BACKUP_EXCLUDES.contains(&"config"));
+        assert!(!solstone_core_journal_io::copy_excludes::copy_excluded(
+            "health/retention.log"
+        ));
+        assert!(!solstone_core_journal_io::copy_excludes::copy_excluded(
+            "config/journal.json"
+        ));
     }
     #[test]
     fn backup_excludes_endpoint_key_material_by_its_resolved_path() {
@@ -6290,8 +6547,6 @@ mod tests {
                 .any(|pair| pair[0] == "--exclude" && pair[1] == chatgpt),
             "{args:?}"
         );
-        assert!(!BACKUP_EXCLUDES.contains(&"mcp-endpoint"));
-        assert!(!BACKUP_EXCLUDES.contains(&"chatgpt-sign-in.json*"));
     }
     #[test]
     fn verification_bucket_wraps_reference_weeks() {
@@ -6327,12 +6582,12 @@ mod tests {
         assert!(
             commands[1]
                 .windows(2)
-                .any(|pair| pair == ["--exclude", ".removing_*"])
+                .any(|pair| pair[0] == "--exclude" && pair[1].ends_with("/**/.removing_*"))
         );
         assert!(
             commands[1]
                 .windows(2)
-                .any(|pair| pair == ["--exclude", "health/sync"])
+                .any(|pair| pair[0] == "--exclude" && pair[1].ends_with("/health/sync"))
         );
         assert!(
             !commands[1]
@@ -6369,7 +6624,10 @@ mod tests {
         let commands = runner.commands.borrow();
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0], ["unlock"]);
-        assert_eq!(commands[1], json_backup_args(&resolved));
+        assert_eq!(
+            without_exclude_file(&commands[1]),
+            json_backup_args(&resolved)
+        );
         assert_eq!(commands[1][1], resolved.display().to_string());
         assert_eq!(
             commands[1]
@@ -6426,7 +6684,10 @@ mod tests {
 
         assert_eq!(result.status, "ok");
         let original = fs::canonicalize(source.path()).expect("source journal resolves");
-        assert_eq!(runner.commands.borrow()[1], json_backup_args(&original));
+        assert_eq!(
+            without_exclude_file(&runner.commands.borrow()[1]),
+            json_backup_args(&original)
+        );
         assert_one_resolution_attempt();
     }
 
@@ -6469,7 +6730,10 @@ mod tests {
 
         assert_eq!(result.status, "ok");
         let resolved = fs::canonicalize(&journal).expect("journal resolves");
-        assert_eq!(runner.commands.borrow()[1], json_backup_args(&resolved));
+        assert_eq!(
+            without_exclude_file(&runner.commands.borrow()[1]),
+            json_backup_args(&resolved)
+        );
         assert_one_resolution_attempt();
     }
 
@@ -6968,8 +7232,8 @@ mod tests {
             .position(|argument| argument == "backup")
             .expect("backup argument present");
         assert_eq!(
-            &requests[1].argv[backup_index..],
-            json_backup_args(&source_path).as_slice()
+            without_exclude_file(&requests[1].argv[backup_index..]),
+            json_backup_args(&source_path)
         );
         assert_eq!(
             requests[1].timeout,
@@ -7094,7 +7358,10 @@ mod tests {
         assert_eq!(result.status, "error");
         assert_eq!(result.error_reason.as_deref(), Some("failed"));
         let source_path = fs::canonicalize(source.path()).expect("source resolves");
-        assert_eq!(runner.commands.borrow()[1], json_backup_args(&source_path));
+        assert_eq!(
+            without_exclude_file(&runner.commands.borrow()[1]),
+            json_backup_args(&source_path)
+        );
         assert_eq!(
             solstone_core_backup::get_backup_config(source.path()).expect("source state reads")["last_backup"]
                 ["error_reason"],
@@ -7196,7 +7463,7 @@ mod tests {
             detail: None,
         };
 
-        record_backup(journal.path(), &clock, &result);
+        record_backup(journal.path(), &clock, &result, None);
 
         let config =
             solstone_core_backup::get_backup_config(journal.path()).expect("backup config reads");
@@ -7219,7 +7486,7 @@ mod tests {
         arm_backup_record_failure_hook(expected.path().to_path_buf());
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            record_backup(actual.path(), &clock, &result);
+            record_backup(actual.path(), &clock, &result, None);
         }))
         .expect_err("wrong record target rejects");
         let message = panic
@@ -7232,7 +7499,7 @@ mod tests {
         assert!(message.contains(&actual.path().display().to_string()));
 
         clear_backup_record_failure_hook();
-        record_backup(actual.path(), &clock, &result);
+        record_backup(actual.path(), &clock, &result, None);
         let config =
             solstone_core_backup::get_backup_config(actual.path()).expect("backup config reads");
         assert_eq!(config["last_backup"]["status"], "error");
@@ -7253,14 +7520,14 @@ mod tests {
         reset_backup_record_failure_hook();
         install_backup_record_failure_hook(journal.path().to_path_buf());
 
-        record_backup(journal.path(), &clock, &result);
+        record_backup(journal.path(), &clock, &result, None);
 
         assert!(!backup_record_failure_hook_armed());
         assert_eq!(
             backup_record_failure_hook_consumed_target().as_deref(),
             Some(journal.path())
         );
-        record_backup(journal.path(), &clock, &result);
+        record_backup(journal.path(), &clock, &result, None);
         let config =
             solstone_core_backup::get_backup_config(journal.path()).expect("backup config reads");
         assert_eq!(config["last_backup"]["status"], "error");
@@ -7605,3 +7872,7 @@ mod tests {
 #[cfg(test)]
 #[path = "engine_credential_exclusion_tests.rs"]
 mod credential_exclusion_tests;
+
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "engine_copy_tests.rs"]
+mod copy_tests;

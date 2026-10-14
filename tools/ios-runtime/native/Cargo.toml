@@ -15,10 +15,14 @@ serde_json = "1"
 sha2 = "0.10"
 chrono = "0.4"
 libc = "0.2"
+log = "0.4"
 journal-mobile-serving = { path = "../../mobile-serving" }
 solstone-core-journal-io = { path = "../../../core/crates/solstone-core-journal-io", features = ["test-hooks"] }
 solstone-core-indexer-store = { path = "../../../core/crates/solstone-core-indexer-store" }
 solstone-core-indexer-query = { path = "../../../core/crates/solstone-core-indexer-query" }
+solstone-core-generate = { path = "../../../core/crates/solstone-core-generate" }
+solstone-core-generate-wire = { path = "../../../core/crates/solstone-core-generate-wire" }
+solstone-core-talent-runtime = { path = "../../../core/crates/solstone-core-talent-runtime" }
 
 [patch.crates-io]
 ffmpeg-sys-next = { path = "../../../core/vendor/ffmpeg-sys-next" }

@@ -24,6 +24,7 @@ pub mod atomic;
 pub mod bounded_read;
 #[cfg(unix)]
 pub mod claim_remove;
+pub mod copy_excludes;
 pub mod cortex_use;
 mod create_only_retry;
 pub mod daily_unit;

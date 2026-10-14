@@ -74,7 +74,7 @@ enum Engine {
           throw NSError(domain: "host-path-is-not-authority", code: 1)
         }
         var request = message
-        if request.op == "open" { request.root = root }
+        if request.op == "open" || request.op == "serve-custody" { request.root = root }
         if request.op == "serve-start" {
           guard let payload = Bundle.main.url(forResource: "JournalPayload", withExtension: nil) else {
             throw NSError(domain: "packaged-payload-missing", code: 1)
@@ -93,6 +93,23 @@ enum Engine {
         }
         defer { journal_runtime_free(p) }
         out["journal"] = try JSONSerialization.jsonObject(with: Data(String(cString: p).utf8))
+        if request.op == "serve-custody" {
+          guard let journal = out["journal"] as? [String: Any],
+            let result = journal["result"] as? [String: Any], result["ok"] as? Bool == true
+          else { throw NSError(domain: "root-validation-failed", code: 1) }
+          var files: [[String: Any]] = []
+          for name in ["", "config/journal.json", "link/ca/private.pem"] {
+            let url = URL(fileURLWithPath: root).appendingPathComponent(name)
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let resources = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
+            files.append([
+              "path": name, "excluded_from_backup": resources.isExcludedFromBackup.map { $0 as Any } ?? NSNull(),
+              "protection": String(describing: attributes[.protectionKey] ?? "unknown"),
+              "posix_permissions": attributes[.posixPermissions] ?? NSNull(),
+            ])
+          }
+          out["custody"] = files
+        }
       }
       out["after"] = resources()
       return Reply(

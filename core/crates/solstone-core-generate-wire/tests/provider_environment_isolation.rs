@@ -276,3 +276,77 @@ fn openai_conventional_key_ignored() {
     );
     emit_receipt(&expected);
 }
+
+#[test]
+fn embedded_config_is_not_replaced_by_inherited_probe_overrides() {
+    use solstone_core_generate_wire as wire;
+    let case = "embedded_config_is_not_replaced_by_inherited_probe_overrides";
+    let expected = receipt(case, Some("candidate"), None, None);
+    if !enter(
+        case,
+        &[
+            (PROVIDER_OVERRIDE_ENV, "local"),
+            (MODEL_OVERRIDE_ENV, "inherited-model"),
+            (API_KEY_OVERRIDE_ENV, "inherited-key"),
+            (wire::overrides::BASE_URL_OVERRIDE_ENV, "http://127.0.0.1:9"),
+        ],
+        &expected,
+    ) {
+        return;
+    }
+    let journal =
+        std::env::temp_dir().join(format!("generate-embedded-config-{}", std::process::id()));
+    std::fs::create_dir(&journal).unwrap();
+    let request = wire::parse_one_shot_request(
+        &json!({
+            "schema":solstone_core_generate::contract()["schema_identifiers"]["request"],
+            "context":"settings.cloud.validate_key",
+            "contents":[{"type":"text","text":"test"}],
+            "max_output_tokens":64
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let runtime = wire::EndpointRuntime::default();
+    for (config, provider, code) in [
+        (
+            json!({"providers":{"active":{"provider":"unknown"}}}),
+            "unknown",
+            None,
+        ),
+        (
+            json!({"providers":{"active":{"provider":"google","model":"candidate"}}}),
+            "google",
+            Some("provider_key_missing"),
+        ),
+        (
+            json!({"env":{"GOOGLE_API_KEY":"candidate"},"providers":{"active":{"provider":"google"}}}),
+            "google",
+            Some("model_missing"),
+        ),
+    ] {
+        let config = config.as_object().unwrap();
+        let before = config.clone();
+        let response = wire::respond_with_config(&request, &runtime, &journal, config, |_| {
+            panic!("candidate probe must not enter local inference")
+        })
+        .unwrap();
+        let solstone_core_generate::GenerateResponse::Refused(response) = response else {
+            panic!("incomplete candidate must refuse before egress");
+        };
+        assert_eq!(response.provider.as_deref(), Some(provider));
+        if let Some(code) = code {
+            assert_eq!(
+                response
+                    .reason_code
+                    .as_ref()
+                    .map(solstone_core_generate::ReasonCodeValue::as_wire),
+                Some(code)
+            );
+        }
+        assert_eq!(*config, before);
+    }
+    assert!(!journal.join("config/journal.json").exists());
+    std::fs::remove_dir(journal).unwrap();
+    emit_receipt(&expected);
+}

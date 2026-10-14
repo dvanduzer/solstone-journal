@@ -459,7 +459,7 @@
       reach.textContent = `${inventory.days_inspected} of ${inventory.days_total} days checked (${range}). `
         + (!fresh ? 'last known progress, checked ' + new Date(inventory.as_of_ms).toLocaleString() + '.'
           : inventory.complete ? 'the inspection covers the whole journal.' : 'the inspection is incomplete.');
-      const names = ['today', 'your requests and yesterday', 'recent days', 'imports', 'older recordings', 'older day updates'];
+      const names = ['today', 'your requests and yesterday', 'recent days', 'imports', 'finishing older days', 'updating older days'];
       inventory.bands.forEach((band, i) => {
         const row = document.createElement('li');
         row.textContent = names[i] + ': ' + band.segments_complete + ' recordings ready, '
@@ -471,6 +471,25 @@
           + (band.prerequisite_held ? '; ' + band.prerequisite_held + ' waiting for recordings' : '') + '.';
         rows.appendChild(row);
       });
+    }
+    const history = section.querySelector('[data-work-history]');
+    const progress = inventory?.history;
+    history.hidden = !progress;
+    history.textContent = '';
+    if (progress) {
+      const count = value => Number(value).toLocaleString();
+      const day = key => new Date(Number(key.slice(0, 4)), Number(key.slice(4, 6)) - 1, Number(key.slice(6, 8)))
+        .toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+      const range = progress.caught_up_since
+        ? `history caught up back to ${day(progress.caught_up_since)}`
+        : inventory.oldest_day && inventory.oldest_day <= progress.through_day
+          ? 'older history is still catching up' : 'no older history to check';
+      const parts = [range, `${count(progress.segments_owed)} recordings and ${count(progress.daily_units_owed)} daily outputs left`];
+      if (fresh && progress.net_per_hour > 0) parts.push(`about ${progress.net_per_hour.toLocaleString(undefined, { maximumSignificantDigits: 3 })} an hour`);
+      if (progress.set_aside_units) parts.push(`${count(progress.set_aside_units)} items set aside`);
+      if (progress.unreadable_days) parts.push(`${count(progress.unreadable_days)} days could not be checked`);
+      history.textContent = (!fresh ? 'last checked: ' : '') + parts.join(' · ')
+        + `. through ${day(progress.through_day)}; today and yesterday are separate.`;
     }
     const cost = section.querySelector('[data-work-cost]');
     const older = inventory?.bands?.slice(4);

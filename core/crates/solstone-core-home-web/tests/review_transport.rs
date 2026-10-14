@@ -943,3 +943,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "review_transport/backup_observation.rs"]
+mod backup_observation;

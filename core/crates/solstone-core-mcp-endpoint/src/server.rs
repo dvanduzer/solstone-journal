@@ -127,18 +127,23 @@ async fn serve_with_permit_pool(
     sessions: Arc<SessionTable>,
     permits: Arc<Semaphore>,
 ) -> Result<(), ServerError> {
-    loop {
+    let mut connections = tokio::task::JoinSet::new();
+    let result = loop {
         if *shutdown.borrow() {
-            return Ok(());
+            break Ok(());
         }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
+                    break Ok(());
                 }
             }
+            _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
-                let (socket, _) = accepted.map_err(|_| ServerError::Accept)?;
+                let (socket, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) => break Err(ServerError::Accept),
+                };
                 let Some(permit) = try_acquire_connection_permit(&permits) else {
                     drop(socket);
                     continue;
@@ -148,7 +153,7 @@ async fn serve_with_permit_pool(
                 let connection_oauth = Arc::clone(&oauth);
                 let connection_shutdown = shutdown.clone();
                 let connection_sessions = Arc::clone(&sessions);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _permit = permit;
                     let _ = handle_connection(
                         socket,
@@ -162,7 +167,12 @@ async fn serve_with_permit_pool(
                 });
             }
         }
-    }
+    };
+    drop(listener);
+    // The embedding runtime survives this listener. Own every accepted task,
+    // including peers still in their preface or TLS handshake, through teardown.
+    connections.shutdown().await;
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1592,6 +1602,35 @@ mod tests {
         assert_eq!(client.read(&mut response).await.expect("client reads"), 0);
         wait_for_permits(&server.permits, CONNECTION_PERMITS).await;
         server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_closes_accepted_preface_and_handshake_connections() {
+        for send_preface in [false, true] {
+            let (server_config, _) = tls_configs();
+            let server = ServerHarness::start(server_config).await;
+            let permits = Arc::clone(&server.permits);
+            let mut socket = TcpStream::connect(server.address).await.unwrap();
+            if send_preface {
+                socket.write_all(VALID_PROXY_PREFACE).await.unwrap();
+            }
+            wait_for_permits(&permits, CONNECTION_PERMITS - 1).await;
+            tokio::time::timeout(Duration::from_secs(1), server.stop())
+                .await
+                .expect("shutdown does not wait for handshake deadlines");
+            assert_eq!(permits.available_permits(), CONNECTION_PERMITS);
+            let mut byte = [0];
+            match tokio::time::timeout(Duration::from_secs(1), socket.read(&mut byte))
+                .await
+                .unwrap()
+            {
+                Ok(count) => assert_eq!(count, 0),
+                Err(error) => assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                )),
+            }
+        }
     }
 
     #[tokio::test]

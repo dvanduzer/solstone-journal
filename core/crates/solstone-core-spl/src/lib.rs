@@ -83,7 +83,7 @@ pub use relay_websocket::{
 pub use service_token_renewal::{
     JwksSet, Outcome, RenewalClock, RenewalConfig, RenewalState, RenewalStep,
     SERVICE_TOKEN_RENEWAL_TICK, SkipClass, Trigger, age_reached, classify_jwks, evaluate_once,
-    share_bp, spawn_service_token_renewal,
+    run_embedded_service_token_renewal, share_bp, spawn_service_token_renewal,
 };
 
 #[cfg(feature = "test-hooks")]
@@ -96,7 +96,8 @@ pub use service::{
     StartedRelay, run_service,
 };
 pub use service_process::{
-    NativeServiceError, run_native_service, run_native_service_with_hosted_parent,
+    NativeServiceError, run_embedded_service, run_native_service,
+    run_native_service_with_hosted_parent,
 };
 pub use service_shutdown::{RelayStop, ServiceShutdownError, stop_relay_run};
 pub use service_transition::{
