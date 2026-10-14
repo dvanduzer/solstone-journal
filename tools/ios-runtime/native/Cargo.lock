@@ -4913,6 +4913,7 @@ dependencies = [
  "chrono",
  "journal-mobile-serving",
  "libc",
+ "log",
  "serde_json",
  "sha2",
  "solstone-core-generate",

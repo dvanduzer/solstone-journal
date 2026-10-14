@@ -15,7 +15,7 @@ use std::{
     ffi::{CStr, CString, OsStr, c_char},
     path::{Path, PathBuf},
     sync::{
-        LazyLock, Mutex,
+        LazyLock, Mutex, Once,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -28,6 +28,41 @@ static SERVING: Mutex<Option<journal_mobile_serving::MobileServing>> = Mutex::ne
 static PAYLOAD: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GENERATE: LazyLock<solstone_core_generate_wire::EndpointRuntime> =
     LazyLock::new(solstone_core_generate_wire::EndpointRuntime::default);
+
+// The development host has no desktop logger. Retain existing door warnings
+// so a dropped TLS carrier can be correlated with its server-side cause.
+struct DoorWarnings;
+impl log::Log for DoorWarnings {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+            && metadata
+                .target()
+                .starts_with("solstone_core_convey_shell::door")
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "ios-door time_ms={} pid={} {}: {}",
+                chrono::Utc::now().timestamp_millis(),
+                std::process::id(),
+                record.level(),
+                record.args()
+            );
+        }
+    }
+    fn flush(&self) {}
+}
+fn install_door_warnings() {
+    static LOGGER: DoorWarnings = DoorWarnings;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+    });
+}
 fn fixture(i: u64, revision: u64) -> String {
     format!(
         "# Synthetic memory {i}\n\nauroraruntime document {i}: copper kite revision {revision}.\n"
@@ -570,6 +605,7 @@ fn run(v: Value) -> Result<Value, String> {
 pub unsafe extern "C" fn journal_runtime(input: *const c_char) -> *mut c_char {
     let start = Instant::now();
     let result = std::panic::catch_unwind(|| {
+        install_door_warnings();
         if input.is_null() {
             return Err("null request".into());
         }
