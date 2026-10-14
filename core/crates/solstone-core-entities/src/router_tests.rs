@@ -5889,7 +5889,14 @@ fn a_resumed_entity_delete_keeps_an_entity_created_again_under_the_same_id() {
     // took the same id.
     fs::remove_dir_all(j.path().join("entities/target")).unwrap();
     seed_created_entity(j.path(), "target", "Target", 1_800_000_000_000);
-    std::thread::sleep(Duration::from_millis(200));
+    // Its window passed while the journal was down.
+    let mut record = delete_record(j.path(), &pending).unwrap();
+    record["commit_at_ms"] = json!(chrono::Utc::now().timestamp_millis() - 1);
+    write(
+        j.path(),
+        &format!("config/entity-deletes/{pending}.json"),
+        record,
+    );
 
     let _next_start = held_router(j.path(), Duration::from_secs(10));
     let record = wait_for_delete_state(j.path(), &pending, "not_deleted");
