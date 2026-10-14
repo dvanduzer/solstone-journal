@@ -230,7 +230,11 @@ async fn status_shape_preserves_backup_phase_discrimination() {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(body.as_object().expect("object").len(), 17);
+        assert_eq!(body.as_object().expect("object").len(), 18);
+        assert!(
+            body["last_backup_current_setup"].is_null(),
+            "historical fixtures have no setup provenance"
+        );
         if phase == "broken" {
             assert_eq!(body["last_backup"]["error_reason"], "locked");
             assert_eq!(body["last_verification"]["reason"], "read_data_mismatch");
@@ -271,6 +275,7 @@ async fn backup_status_preserves_written_success_through_failure_and_destination
         json!("saved-copy"),
         json!("incomplete"),
         None,
+        None,
     )
     .unwrap();
     record_backup_result(
@@ -279,6 +284,7 @@ async fn backup_status_preserves_written_success_through_failure_and_destination
         json!(200),
         Value::Null,
         json!("timeout"),
+        None,
         None,
     )
     .unwrap();

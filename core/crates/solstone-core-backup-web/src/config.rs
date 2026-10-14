@@ -46,10 +46,26 @@ pub fn backup(root: &Path) -> Result<Map<String, Value>, ()> {
         .map_err(|_| ())?
         .config
         .unwrap_or_default();
-    Ok(merge_backup(config.get("backup").unwrap_or(&Value::Null))
+    // Defaults fill absent configuration, not malformed observations.
+    if let Some(source) = config.get("backup") {
+        let source = source.as_object().ok_or(())?;
+        if source.get("enabled").is_some_and(|v| !v.is_boolean())
+            || source
+                .get("mode")
+                .is_some_and(|v| !matches!(v.as_str(), Some("byo" | "operated")))
+            || source.get("last_backup").is_some_and(|v| !v.is_object())
+            || source
+                .get("destination")
+                .and_then(|v| v.get("credentials"))
+                .is_some_and(|v| !v.is_object())
+        {
+            return Err(());
+        }
+    }
+    merge_backup(config.get("backup").unwrap_or(&Value::Null))
         .as_object()
         .cloned()
-        .unwrap())
+        .ok_or(())
 }
 pub fn mutate<T>(
     root: &Path,

@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use hmac::{Hmac, Mac};
 use serde_json::{Map, Value};
+use sha2::Sha256;
 use solstone_core_journal_config::read_journal_config;
 use solstone_core_journal_config_write::{
     BoundConfigOutcome, BoundConfigRefusal, CommitConfigError, ConfigExpectation,
@@ -238,6 +240,50 @@ pub(crate) fn cleared_backup_configuration(
     Some(replacement)
 }
 
+/// Opaque identity of the destination and backup key used by an admitted copy.
+/// Schedule/history changes do not change it. Missing setup is unknown.
+pub fn backup_setup_fingerprint(
+    config: &Map<String, Value>,
+    binding: Option<&HostedBinding>,
+) -> Option<String> {
+    let keys = build_keys(config.get("daily_key"), config.get("recovery_key")).ok()??;
+    let target = match config.get("mode").and_then(Value::as_str)? {
+        "byo" => {
+            let destination = destination_from_config(config)?;
+            serde_json::json!([
+                "byo",
+                destination.repository,
+                destination.backend,
+                destination.credentials
+            ])
+        }
+        "operated" => {
+            let b = binding?;
+            serde_json::json!([
+                "operated",
+                b.broker_endpoint,
+                b.account_id,
+                b.instance_id,
+                b.bucket,
+                b.prefix,
+                b.broker_token
+            ])
+        }
+        _ => return None,
+    };
+    let mut inputs = serde_json::json!(["backup-setup-v1", target]);
+    inputs.sort_all_objects();
+    let mut mac = Hmac::<Sha256>::new_from_slice(keys.daily_key.as_bytes()).ok()?;
+    mac.update(&serde_json::to_vec(&inputs).ok()?);
+    Some(
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
 pub fn record_backup_result(
     journal: &Path,
     status: &str,
@@ -245,6 +291,7 @@ pub fn record_backup_result(
     snapshot_id: Value,
     error_reason: Value,
     detail: Option<&str>,
+    setup_fingerprint: Option<&str>,
 ) -> Result<(), BackupError> {
     let mut map = Map::from_iter([
         ("time".into(), time),
@@ -254,6 +301,12 @@ pub fn record_backup_result(
     ]);
     if let Some(detail) = detail {
         map.insert("detail".into(), Value::String(detail.into()));
+    }
+    if let Some(fingerprint) = setup_fingerprint {
+        map.insert(
+            "setup_fingerprint".into(),
+            Value::String(fingerprint.into()),
+        );
     }
     mutate_backup_section(journal, |backup| {
         // Keep the successful operation's whole result, including incomplete-copy
@@ -778,6 +831,7 @@ mod tests {
             json!("snap"),
             Value::Null,
             None,
+            None,
         )
         .unwrap();
         record_prune_result(journal.path(), "anything", json!(6), Value::Null).unwrap();
@@ -798,6 +852,7 @@ mod tests {
             Value::Null,
             json!("reason"),
             Some("detail-code"),
+            None,
         )
         .unwrap();
         let config2 = get_backup_config(journal.path()).unwrap();
@@ -831,6 +886,7 @@ mod tests {
             json!("first"),
             json!("incomplete"),
             Some("unreadable-source"),
+            None,
         )
         .unwrap();
         let success =
@@ -850,6 +906,7 @@ mod tests {
                 Value::Null,
                 json!("timeout"),
                 None,
+                None,
             )
             .unwrap();
             let view = status_view(journal.path()).unwrap();
@@ -864,6 +921,7 @@ mod tests {
             json!("next"),
             Value::Null,
             None,
+            None,
         )
         .unwrap();
         let view = status_view(journal.path()).unwrap();
@@ -871,6 +929,66 @@ mod tests {
         assert_eq!(view["last_backup"]["last_success"]["time"], 400);
         assert!(view["last_backup"]["last_success"]["error_reason"].is_null());
         assert!(view["last_backup"]["last_success"].get("detail").is_none());
+    }
+
+    #[test]
+    fn setup_identity_covers_copy_inputs_and_ignores_object_order_and_schedule() {
+        let mut config = serde_json::json!({"mode":"byo", "daily_key":"daily",
+            "recovery_key":"0123456789ABCDEFGHJKMNPQRSTVWXYZ0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+            "destination":{"repository":"s3:repo","backend":"s3","credentials":{"a":"one","b":{"c":"two","d":"three"}}}
+        }).as_object().unwrap().clone();
+        let fingerprint = backup_setup_fingerprint(&config, None).unwrap();
+        config["destination"]["credentials"] =
+            serde_json::from_str(r#"{"b":{"d":"three","c":"two"},"a":"one"}"#).unwrap();
+        config.insert("schedule".into(), serde_json::json!({"every":300}));
+        config.insert("last_backup".into(), serde_json::json!({"status":"ok"}));
+        assert_eq!(
+            backup_setup_fingerprint(&config, None).unwrap(),
+            fingerprint
+        );
+        let mut changed = config.clone();
+        changed.insert("daily_key".into(), serde_json::json!("different"));
+        assert_ne!(
+            backup_setup_fingerprint(&changed, None).unwrap(),
+            fingerprint
+        );
+        changed = config.clone();
+        changed.insert(
+            "recovery_key".into(),
+            serde_json::json!("1123456789ABCDEFGHJKMNPQRSTVWXYZ0123456789ABCDEFGHJKMNPQRSTVWXYZ"),
+        );
+        assert_eq!(
+            backup_setup_fingerprint(&changed, None).unwrap(),
+            fingerprint,
+            "recovery key is not used by a copy"
+        );
+        config.insert("mode".into(), serde_json::json!("operated"));
+        let binding = HostedBinding {
+            broker_endpoint: "https://broker".into(),
+            account_id: "account".into(),
+            instance_id: "instance".into(),
+            bucket: "bucket".into(),
+            prefix: "prefix".into(),
+            broker_token: "token".into(),
+        };
+        let operated = backup_setup_fingerprint(&config, Some(&binding)).unwrap();
+        assert_ne!(operated, fingerprint);
+        assert!(backup_setup_fingerprint(&config, None).is_none());
+        for field in 0..6 {
+            let mut changed = binding.clone();
+            match field {
+                0 => changed.broker_endpoint.push('x'),
+                1 => changed.account_id.push('x'),
+                2 => changed.instance_id.push('x'),
+                3 => changed.bucket.push('x'),
+                4 => changed.prefix.push('x'),
+                _ => changed.broker_token.push('x'),
+            }
+            assert_ne!(
+                backup_setup_fingerprint(&config, Some(&changed)).unwrap(),
+                operated
+            );
+        }
     }
 
     #[test]
@@ -889,6 +1007,7 @@ mod tests {
                 json!(200),
                 Value::Null,
                 json!("locked"),
+                None,
                 None,
             )
             .unwrap();

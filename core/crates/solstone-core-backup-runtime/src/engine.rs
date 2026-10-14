@@ -434,6 +434,7 @@ pub struct AdmittedCapability {
     pub(crate) timeout_seconds: u64,
     pub(crate) keys: BackupKeys,
     pub(crate) mode: AdmittedBackupMode,
+    setup_fingerprint: Option<String>,
     pub(crate) _private: (),
 }
 
@@ -730,6 +731,13 @@ fn prepare_backup_run(journal: &Path) -> Result<AdmittedCapability, BackupAdmiss
     Ok(AdmittedCapability {
         resolved_journal,
         timeout_seconds: backup_timeout_seconds(&config),
+        setup_fingerprint: solstone_core_backup::backup_setup_fingerprint(
+            &config,
+            match &mode {
+                AdmittedBackupMode::Operated { binding } => Some(binding),
+                AdmittedBackupMode::Byo { .. } => None,
+            },
+        ),
         keys,
         mode,
         _private: (),
@@ -1018,7 +1026,12 @@ fn unreadable_sources(output: &crate::runner::ResticResult) -> Option<Unreadable
     })
 }
 
-fn record_backup(journal: &Path, clock: &dyn Clock, result: &BackupResult) {
+fn record_backup(
+    journal: &Path,
+    clock: &dyn Clock,
+    result: &BackupResult,
+    setup_fingerprint: Option<&str>,
+) {
     #[cfg(any(test, feature = "test-hooks"))]
     if run_backup_record_failure_hook(journal) {
         return;
@@ -1036,6 +1049,7 @@ fn record_backup(journal: &Path, clock: &dyn Clock, result: &BackupResult) {
             .clone()
             .map_or(Value::Null, Value::String),
         result.detail.as_deref(),
+        setup_fingerprint,
     );
 }
 
@@ -1054,7 +1068,7 @@ pub fn record_backup_error(journal: &Path, clock: &dyn Clock, reason: &str) -> B
         unreadable: None,
         detail: None,
     };
-    record_backup(journal, clock, &result);
+    record_backup(journal, clock, &result, None);
     result
 }
 
@@ -1138,6 +1152,7 @@ impl AdmittedCapability {
             timeout_seconds,
             keys,
             mode,
+            setup_fingerprint,
             _private: (),
         } = self;
         let runtime = match mode {
@@ -1281,7 +1296,12 @@ impl AdmittedCapability {
         } else {
             result
         };
-        record_backup(&resolved_journal, services.clock, &result);
+        record_backup(
+            &resolved_journal,
+            services.clock,
+            &result,
+            setup_fingerprint.as_deref(),
+        );
         result
     }
 
@@ -1298,7 +1318,12 @@ impl AdmittedCapability {
             unreadable: None,
             detail: Some(detail),
         };
-        record_backup(&self.resolved_journal, clock, &result);
+        record_backup(
+            &self.resolved_journal,
+            clock,
+            &result,
+            self.setup_fingerprint.as_deref(),
+        );
         result
     }
 }
@@ -3815,6 +3840,29 @@ mod tests {
             7
         }
     }
+    #[test]
+    fn admitted_tool_failure_keeps_original_setup_after_replacement() {
+        let journal = configured_journal();
+        let config = get_backup_config(journal.path()).unwrap();
+        let original = solstone_core_backup::backup_setup_fingerprint(&config, None).unwrap();
+        let capability = prepare(journal.path(), &FixedClock).unwrap();
+        let mut replacement = solstone_core_backup::get_destination(journal.path())
+            .unwrap()
+            .unwrap();
+        replacement.repository = "s3:replacement".into();
+        solstone_core_backup::set_destination(journal.path(), &replacement).unwrap();
+        capability.record_tool_error(
+            &FixedClock,
+            ClosedToolError::ResticUnavailable {
+                guidance: "synthetic guidance".into(),
+                detail: "synthetic tool failure".into(),
+            },
+        );
+        let result = get_backup_config(journal.path()).unwrap()["last_backup"].clone();
+        assert_eq!(result["setup_fingerprint"], original);
+        assert_eq!(result["error_reason"], "restic_unavailable");
+    }
+
     struct MutableClock(Rc<Cell<i64>>);
     impl Clock for MutableClock {
         fn now_unix(&self) -> i64 {
@@ -7196,7 +7244,7 @@ mod tests {
             detail: None,
         };
 
-        record_backup(journal.path(), &clock, &result);
+        record_backup(journal.path(), &clock, &result, None);
 
         let config =
             solstone_core_backup::get_backup_config(journal.path()).expect("backup config reads");
@@ -7219,7 +7267,7 @@ mod tests {
         arm_backup_record_failure_hook(expected.path().to_path_buf());
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            record_backup(actual.path(), &clock, &result);
+            record_backup(actual.path(), &clock, &result, None);
         }))
         .expect_err("wrong record target rejects");
         let message = panic
@@ -7232,7 +7280,7 @@ mod tests {
         assert!(message.contains(&actual.path().display().to_string()));
 
         clear_backup_record_failure_hook();
-        record_backup(actual.path(), &clock, &result);
+        record_backup(actual.path(), &clock, &result, None);
         let config =
             solstone_core_backup::get_backup_config(actual.path()).expect("backup config reads");
         assert_eq!(config["last_backup"]["status"], "error");
@@ -7253,14 +7301,14 @@ mod tests {
         reset_backup_record_failure_hook();
         install_backup_record_failure_hook(journal.path().to_path_buf());
 
-        record_backup(journal.path(), &clock, &result);
+        record_backup(journal.path(), &clock, &result, None);
 
         assert!(!backup_record_failure_hook_armed());
         assert_eq!(
             backup_record_failure_hook_consumed_target().as_deref(),
             Some(journal.path())
         );
-        record_backup(journal.path(), &clock, &result);
+        record_backup(journal.path(), &clock, &result, None);
         let config =
             solstone_core_backup::get_backup_config(journal.path()).expect("backup config reads");
         assert_eq!(config["last_backup"]["status"], "error");

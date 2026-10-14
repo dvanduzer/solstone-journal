@@ -156,7 +156,8 @@
             "enabled": false,
             "every": null
           },
-          "success": true
+          "success": true,
+          "last_backup_current_setup": null
         },
         "method": "GET",
         "path": "/app/backup/status",
@@ -658,7 +659,8 @@
             "enabled": false,
             "every": null
           },
-          "success": true
+          "success": true,
+          "last_backup_current_setup": null
         },
         "method": "GET",
         "path": "/app/backup/status",
@@ -977,7 +979,8 @@
             "enabled": false,
             "every": null
           },
-          "success": true
+          "success": true,
+          "last_backup_current_setup": null
         },
         "method": "GET",
         "path": "/app/backup/status",
@@ -1296,7 +1299,8 @@
             "enabled": false,
             "every": null
           },
-          "success": true
+          "success": true,
+          "last_backup_current_setup": null
         },
         "method": "GET",
         "path": "/app/backup/status",
