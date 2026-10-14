@@ -1354,6 +1354,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
             json!({"path": EDGES_SCHEMA_PATH, "mtime": EDGES_SCHEMA_VERSION})
         );
         assert_sqlite_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup reset root");
     }
 
@@ -1541,6 +1542,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
             .query_row("SELECT path FROM files", [], |row| row.get(0))
             .unwrap();
         assert!(surviving.contains("070100_17"));
+        drop(conn);
         fs::remove_dir_all(&journal).unwrap();
     }
 
@@ -1676,6 +1678,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
             1
         );
         assert_eq!(count_path(&conn, "files", "facets/chat/logs/chat.jsonl"), 1);
+        drop(conn);
         fs::remove_dir_all(&journal).unwrap();
     }
 
@@ -1756,6 +1759,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
                 1,
                 "sibling a-b chunk must remain"
             );
+            drop(conn);
             fs::remove_dir_all(&journal).unwrap();
         }
     }
@@ -1824,6 +1828,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(&journal).unwrap();
     }
 
@@ -1901,6 +1906,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
             1
         );
 
+        drop(conn);
         fs::remove_dir_all(&journal).unwrap();
     }
 
@@ -1925,6 +1931,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
         assert_eq!(counts.chunks, 0);
         let conn = open_index(&journal).unwrap();
         assert_eq!(count_path(&conn, "files", "20260805/talents/flow.md"), 1);
+        drop(conn);
         fs::remove_dir_all(&journal).unwrap();
     }
 

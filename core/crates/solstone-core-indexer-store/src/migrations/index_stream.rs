@@ -175,11 +175,12 @@ mod tests {
         assert_eq!(report.deleted(), 3);
         assert_eq!(
             report.removed,
-            [
-                "indexer/journal.sqlite",
-                "indexer/journal.sqlite-wal",
-                "indexer/journal.sqlite-shm"
-            ]
+            ["journal.sqlite", "journal.sqlite-wal", "journal.sqlite-shm"].map(|name| Path::new(
+                "indexer"
+            )
+            .join(name)
+            .to_string_lossy()
+            .into_owned())
         );
         for artifact in ["journal.sqlite", "journal.sqlite-wal", "journal.sqlite-shm"] {
             assert!(!root.join("indexer").join(artifact).exists());
@@ -193,7 +194,13 @@ mod tests {
 
         let report = remove_legacy_index_artifacts(&root).expect("removal runs");
 
-        assert_eq!(report.removed, ["indexer/journal.sqlite"]);
+        assert_eq!(
+            report.removed,
+            [Path::new("indexer")
+                .join("journal.sqlite")
+                .to_string_lossy()
+                .into_owned()]
+        );
         fs::remove_dir_all(root).expect("remove test root");
     }
 

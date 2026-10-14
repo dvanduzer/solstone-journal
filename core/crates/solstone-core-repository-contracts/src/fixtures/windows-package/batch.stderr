@@ -1,0 +1,10 @@
+   Compiling batch-empty v0.0.0 (/capture/core/batch-empty)
+   Compiling batch-pass-a v0.0.0 (/capture/core/batch-pass-a)
+   Compiling batch-fail v0.0.0 (/capture/core/batch-fail)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src/lib.rs (core/target/debug/deps/batch_empty-b734318e21fc4d4f)
+     Running unittests src/lib.rs (core/target/debug/deps/batch_fail-089dfeb2371687a9)
+error: test failed, to rerun pass `-p batch-fail --lib`
+     Running unittests src/lib.rs (core/target/debug/deps/batch_pass_a-63ce4f18a20ca35b)
+error: 1 target failed:
+    `-p batch-fail --lib`

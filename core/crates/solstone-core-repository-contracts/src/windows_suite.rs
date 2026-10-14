@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
@@ -217,6 +217,203 @@ pub struct WindowsPlanItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowsPlan {
     pub items: Vec<WindowsPlanItem>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WindowsPackageBatch {
+    pub packages: Vec<String>,
+    pub features: Vec<String>,
+    pub timeout_seconds: u64,
+}
+
+pub fn is_package_suite(item: &WindowsPlanItem) -> bool {
+    item.id.starts_with("package::") && item.target == "lib" && item.policy.is_none()
+}
+
+pub fn windows_package_batches(plan: &WindowsPlan) -> Vec<WindowsPackageBatch> {
+    let mut batches = BTreeMap::<Vec<String>, WindowsPackageBatch>::new();
+    for item in &plan.items {
+        if !is_package_suite(item) || item.status != PlanStatus::Ready {
+            continue;
+        }
+        let batch = batches
+            .entry(item.required_features.clone())
+            .or_insert_with(|| WindowsPackageBatch {
+                packages: Vec::new(),
+                features: item.required_features.clone(),
+                timeout_seconds: 0,
+            });
+        batch.packages.push(item.package.clone());
+        batch.timeout_seconds += item.timeout_seconds;
+    }
+    batches.into_values().collect()
+}
+
+pub fn cargo_package_names(output: &str) -> Result<BTreeMap<String, String>, String> {
+    #[derive(Deserialize)]
+    struct Package {
+        id: String,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Metadata {
+        packages: Vec<Package>,
+    }
+    let metadata: Metadata = serde_json::from_str(output)
+        .map_err(|error| format!("invalid Cargo package metadata: {error}"))?;
+    let mut names = BTreeMap::new();
+    for package in metadata.packages {
+        if names.insert(package.id, package.name).is_some() {
+            return Err("duplicate Cargo package identity".to_owned());
+        }
+    }
+    if names.is_empty() {
+        return Err("Cargo metadata contains no packages".to_owned());
+    }
+    Ok(names)
+}
+
+pub fn package_test_artifacts(
+    output: &str,
+    names: &BTreeMap<String, String>,
+    batch: &WindowsPackageBatch,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut artifacts = BTreeMap::new();
+    let mut finished = false;
+    for line in output
+        .lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+    {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("invalid Cargo artifact message: {error}"))?;
+        if value["reason"] == "build-finished" {
+            if finished || value["success"] != true {
+                return Err("Cargo batch did not finish successfully exactly once".to_owned());
+            }
+            finished = true;
+        }
+        if value["reason"] != "compiler-artifact"
+            || value["profile"]["test"] != true
+            || !value["target"]["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+        {
+            continue;
+        }
+        let id = value["package_id"]
+            .as_str()
+            .ok_or("test artifact lacks package_id")?;
+        let name = names
+            .get(id)
+            .ok_or_else(|| format!("unknown Cargo package identity {id}"))?;
+        if !batch.packages.contains(name) {
+            continue;
+        }
+        let executable = value["executable"]
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| format!("package {name}: missing test executable"))?;
+        let features = value["features"]
+            .as_array()
+            .ok_or_else(|| format!("package {name}: missing artifact features"))?;
+        if !batch
+            .features
+            .iter()
+            .all(|feature| features.iter().any(|actual| actual == feature))
+        {
+            return Err(format!("package {name}: artifact lacks declared features"));
+        }
+        if artifacts
+            .insert(name.clone(), PathBuf::from(executable))
+            .is_some()
+        {
+            return Err(format!("package {name}: duplicate test executable"));
+        }
+    }
+    if !finished {
+        return Err("Cargo batch output lacks build-finished".to_owned());
+    }
+    Ok(artifacts)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PackageTestResult {
+    pub executed: usize,
+    pub passed: bool,
+}
+
+pub fn package_batch_results(
+    stdout: &str,
+    stderr: &str,
+    artifacts: &BTreeMap<String, PathBuf>,
+    batch: &WindowsPackageBatch,
+) -> Result<BTreeMap<String, PackageTestResult>, String> {
+    let filename = |path: &str| path.rsplit(['/', '\\']).next().unwrap().to_owned();
+    let mut binary_names = BTreeMap::new();
+    for (name, path) in artifacts {
+        if binary_names
+            .insert(filename(&path.to_string_lossy()), name)
+            .is_some()
+        {
+            return Err("duplicate Cargo binary filename".to_owned());
+        }
+    }
+    let header = Regex::new(r"^\s*Running unittests .* \((.+)\)\s*$").unwrap();
+    let mut order = Vec::new();
+    for line in stderr.lines() {
+        if let Some(capture) = header.captures(line) {
+            let key = filename(&capture[1]);
+            let name = binary_names
+                .get(&key)
+                .ok_or_else(|| format!("unidentified test binary {key}"))?;
+            order.push((*name).clone());
+        }
+    }
+    let running = Regex::new(r"^running (\d+) tests?$").unwrap();
+    let result =
+        Regex::new(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;")
+            .unwrap();
+    let mut active = None;
+    let mut results = Vec::new();
+    for line in stdout.lines() {
+        if let Some(capture) = running.captures(line) {
+            if active.is_some() {
+                return Err("nested or incomplete library test output".to_owned());
+            }
+            active = Some(capture[1].parse::<usize>().map_err(|e| e.to_string())?);
+        } else if let Some(capture) = result.captures(line) {
+            let total = active.take().ok_or("library result lacks a start")?;
+            let passed = capture[2].parse::<usize>().map_err(|e| e.to_string())?;
+            let failed = capture[3].parse::<usize>().map_err(|e| e.to_string())?;
+            let ignored = capture[4].parse::<usize>().map_err(|e| e.to_string())?;
+            if total != passed + failed + ignored
+                || (capture.get(1).unwrap().as_str() == "ok") != (failed == 0)
+            {
+                return Err("inconsistent library test totals".to_owned());
+            }
+            results.push(PackageTestResult {
+                executed: passed + failed,
+                passed: failed == 0,
+            });
+        }
+    }
+    if active.is_some() || order.len() != batch.packages.len() || results.len() != order.len() {
+        return Err("incomplete Cargo binary/result inventory; no batch credit".to_owned());
+    }
+    let mut named = BTreeMap::new();
+    for (name, result) in order.into_iter().zip(results) {
+        if named.insert(name, result).is_some() {
+            return Err("duplicate library test result".to_owned());
+        }
+    }
+    if batch
+        .packages
+        .iter()
+        .any(|package| !named.contains_key(package))
+    {
+        return Err("missing selected library test result".to_owned());
+    }
+    Ok(named)
 }
 
 pub fn plan_windows(
@@ -1383,6 +1580,182 @@ mod tests {
                 "--",
                 "--test-threads=1",
             ]
+        );
+    }
+
+    fn captured_package_batch() -> WindowsPackageBatch {
+        WindowsPackageBatch {
+            packages: vec![
+                "solstone-core-about".to_owned(),
+                "solstone-core-memory-original".to_owned(),
+            ],
+            features: vec![],
+            timeout_seconds: 600,
+        }
+    }
+
+    #[test]
+    fn package_batches_group_features_and_keep_the_total_existing_timeout_budget() {
+        let mut registry = test_fixture_registry();
+        registry.package_suites = vec![
+            package_suite("first", &["windows"], &[]),
+            package_suite("second", &["windows"], &["full-tests"]),
+            package_suite("third", &["windows"], &[]),
+        ];
+        let mut plan = plan_windows(&registry, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        plan.items
+            .iter_mut()
+            .find(|i| i.package == "third")
+            .unwrap()
+            .timeout_seconds = 1200;
+        let batches = windows_package_batches(&plan);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].packages, ["first", "third"]);
+        assert_eq!(batches[0].timeout_seconds, 1800);
+        assert_eq!(batches[1].features, ["full-tests"]);
+        assert_eq!(
+            plan.items
+                .iter()
+                .find(|i| i.package == "first")
+                .unwrap()
+                .timeout_seconds,
+            600
+        );
+    }
+
+    #[test]
+    fn captured_cargo_artifacts_bind_executables_by_identity_instead_of_output_order() {
+        let names =
+            cargo_package_names(include_str!("fixtures/windows-package/metadata.json")).unwrap();
+        let output = include_str!("fixtures/windows-package/artifacts.jsonl");
+        let batch = captured_package_batch();
+        let artifacts = package_test_artifacts(output, &names, &batch).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert!(
+            artifacts["solstone-core-about"]
+                .to_string_lossy()
+                .contains("solstone_core_about-")
+        );
+        assert!(
+            artifacts["solstone-core-memory-original"]
+                .to_string_lossy()
+                .contains("solstone_core_memory_original-")
+        );
+        let missing = output
+            .lines()
+            .filter(|line| !line.contains("solstone-core-about"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let artifacts = package_test_artifacts(&missing, &names, &batch).unwrap();
+        assert!(!artifacts.contains_key("solstone-core-about"));
+        assert!(artifacts.contains_key("solstone-core-memory-original"));
+    }
+
+    #[test]
+    fn captured_cargo_artifacts_refuse_duplicate_partial_unknown_and_wrong_feature_evidence() {
+        let names =
+            cargo_package_names(include_str!("fixtures/windows-package/metadata.json")).unwrap();
+        let output = include_str!("fixtures/windows-package/artifacts.jsonl");
+        let mut batch = captured_package_batch();
+        let duplicate = format!("{}\n{output}", output.lines().next().unwrap());
+        assert!(
+            package_test_artifacts(&duplicate, &names, &batch)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(package_test_artifacts(&output[..output.len() / 2], &names, &batch).is_err());
+        assert!(package_test_artifacts(output, &BTreeMap::new(), &batch).is_err());
+        assert!(
+            package_test_artifacts(
+                &output.replace("\"success\": true", "\"success\": false"),
+                &names,
+                &batch
+            )
+            .is_err()
+        );
+        batch.features.push("full-tests".to_owned());
+        assert!(
+            package_test_artifacts(output, &names, &batch)
+                .unwrap_err()
+                .contains("features")
+        );
+    }
+
+    #[test]
+    fn captured_mixed_cargo_batch_credits_binary_identity_and_refuses_a_missing_middle_result() {
+        let names =
+            cargo_package_names(include_str!("fixtures/windows-package/batch-metadata.json"))
+                .unwrap();
+        let stdout = include_str!("fixtures/windows-package/batch.stdout");
+        let stderr = include_str!("fixtures/windows-package/batch.stderr");
+        let batch = WindowsPackageBatch {
+            packages: vec![
+                "batch-pass-a".to_owned(),
+                "batch-fail".to_owned(),
+                "batch-empty".to_owned(),
+            ],
+            features: vec![],
+            timeout_seconds: 1800,
+        };
+        let artifacts = package_test_artifacts(stdout, &names, &batch).unwrap();
+        let results = package_batch_results(stdout, stderr, &artifacts, &batch).unwrap();
+        assert_eq!(
+            results["batch-pass-a"],
+            PackageTestResult {
+                executed: 1,
+                passed: true
+            }
+        );
+        assert_eq!(
+            results["batch-fail"],
+            PackageTestResult {
+                executed: 2,
+                passed: false
+            }
+        );
+        assert_eq!(
+            results["batch-empty"],
+            PackageTestResult {
+                executed: 0,
+                passed: true
+            }
+        );
+        let start = stdout.find("running 2 tests").unwrap();
+        let end = start + stdout[start..].find("test result:").unwrap();
+        let end = end + stdout[end..].find('\n').unwrap();
+        let missing = format!("{}{}", &stdout[..start], &stdout[end..]);
+        assert!(package_batch_results(&missing, stderr, &artifacts, &batch).is_err());
+        let missing_header = stderr
+            .lines()
+            .filter(|line| !line.contains("batch_fail-"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(package_batch_results(stdout, &missing_header, &artifacts, &batch).is_err());
+        let duplicate_header = format!(
+            "{stderr}\n{}",
+            stderr
+                .lines()
+                .find(|line| line.contains("Running unittests"))
+                .unwrap()
+        );
+        assert!(package_batch_results(stdout, &duplicate_header, &artifacts, &batch).is_err());
+        assert!(
+            package_batch_results(
+                &stdout.replace("running 2 tests", "running 3 tests"),
+                stderr,
+                &artifacts,
+                &batch
+            )
+            .is_err()
+        );
+        assert!(
+            package_batch_results(
+                stdout,
+                &stderr.replace("batch_fail-", "unknown-"),
+                &artifacts,
+                &batch
+            )
+            .is_err()
         );
     }
 

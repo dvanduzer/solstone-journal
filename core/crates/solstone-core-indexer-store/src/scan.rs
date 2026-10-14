@@ -1906,6 +1906,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup delete file classification");
     }
 
@@ -2825,6 +2826,7 @@ mod tests {
                 ),
             ]
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge value bind root");
     }
 
@@ -2883,6 +2885,7 @@ mod tests {
             0
         );
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup observation failure root");
     }
 
@@ -2938,6 +2941,7 @@ mod tests {
         assert_eq!(second.edge_rows_inserted, 0);
         let conn = Connection::open(db_path(&root)).expect("open db after second scan");
         assert_eq!(count(&conn, "SELECT count(*) FROM edges"), 3);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge copresence root");
     }
 
@@ -3015,6 +3019,7 @@ mod tests {
             Some(0)
         );
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge failure root");
     }
 
@@ -3097,6 +3102,7 @@ mod tests {
             1
         );
         assert!(edge_file_mtime(&conn, "facets/work/entities/20260304.jsonl").unwrap() > 0);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup candidate load failure root");
     }
 
@@ -3123,6 +3129,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup invalid segment edge root");
     }
 
@@ -3219,6 +3226,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup removed edge file root");
     }
 
@@ -3261,6 +3269,7 @@ mod tests {
         );
         assert_eq!(edge_file_mtime(&conn, rel), Some(prior_mtime));
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge removal trigger root");
     }
 
@@ -3315,6 +3324,7 @@ mod tests {
                 "facets/work/entities/20260304.jsonl".to_string(),
             )]
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup changed edge file root");
     }
 
@@ -3405,6 +3415,7 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.0 == "bob" && row.1 == "cora" && row.3 == "new-sibling" && row.4 == sibling_rel
         }));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge trigger root");
     }
 
@@ -3472,6 +3483,7 @@ mod tests {
         assert_eq!(retry.edge_rows_inserted, 1);
         let conn = Connection::open(db_path(&root)).expect("open db after retry");
         assert!(edge_file_mtime(&conn, target).is_some());
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge interruption root");
     }
 
@@ -3520,6 +3532,7 @@ mod tests {
         assert_eq!(second.rows, 1);
         let conn = Connection::open(db_path(&root)).expect("open db after second rebuild");
         assert_eq!(edge_rows(&conn), before_rows);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge rebuild root");
     }
 
@@ -3585,6 +3598,7 @@ mod tests {
         );
         assert_eq!(edge_file_mtime(&conn, rel), Some(0));
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge rebuild trigger root");
     }
 
@@ -3630,6 +3644,7 @@ mod tests {
         let conn = Connection::open(db_path(&root)).expect("open index after corrupt rebuild");
         assert_eq!(edge_rows(&conn), before_rows);
         assert_eq!(edge_file_mtime(&conn, rel), before_mtime);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup corrupt rebuild root");
     }
 
@@ -3686,6 +3701,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge rescan file root");
     }
 
@@ -3722,6 +3738,7 @@ mod tests {
         let conn = Connection::open(db_path(&root)).expect("open index after corrupt rescan");
         assert_eq!(edge_rows(&conn), before_rows);
         assert_eq!(edge_file_mtime(&conn, rel), before_mtime);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup corrupt edge rescan root");
     }
 
@@ -3782,6 +3799,7 @@ mod tests {
         );
         assert_eq!(edge_file_mtime(&conn, rel), Some(0));
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge rescan failure root");
     }
 
@@ -3826,6 +3844,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup mtime root");
     }
 
@@ -3847,6 +3866,7 @@ mod tests {
         );
         let conn = Connection::open(db_path(&root)).expect("open db");
         assert_eq!(chunk_content(&conn, rel), "# Flow\n\nkept alpha");
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup markdown warning root");
     }
 
@@ -3884,6 +3904,7 @@ mod tests {
         let conn = Connection::open(db_path(&root)).expect("open db after retry");
         assert_eq!(chunk_content(&conn, rel), "# Flow\n\nnew content");
         assert!(file_mtime(&conn, rel) > 0);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup content trigger root");
     }
 
@@ -3923,6 +3944,7 @@ mod tests {
         assert_eq!(retry.indexed, 1);
         let conn = Connection::open(db_path(&root)).expect("open db after retry");
         assert!(file_mtime(&conn, target) > 0);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup content interruption root");
     }
 
@@ -3952,6 +3974,7 @@ mod tests {
         assert_eq!(chunk_content(&conn, rel), "# Flow\n\nold content");
         assert_eq!(file_mtime(&conn, rel), 0);
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup rescan trigger root");
     }
 
@@ -3979,6 +4002,7 @@ mod tests {
         assert_eq!(chunk_content(&conn, rel), "# Flow\n\nremove me");
         assert!(file_mtime(&conn, rel) > 0);
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup content removal trigger root");
     }
 
@@ -4026,6 +4050,7 @@ mod tests {
         );
         assert_eq!(non_aggregate_rows(&conn), before_rows);
         assert_eq!(file_rows(&conn), before_files);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup migration preservation root");
     }
 
@@ -4090,6 +4115,7 @@ mod tests {
             0
         );
         drop_trigger(&conn, "assert_children_before_aggregate_delete");
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup migration catch-up root");
     }
 
@@ -4138,6 +4164,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup migration rescan-file root");
     }
 
@@ -4204,6 +4231,7 @@ mod tests {
                 &format!("SELECT count(*) FROM chunks WHERE path='{child}'")
             ) > 0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup migration abort root");
     }
 
@@ -4251,6 +4279,7 @@ mod tests {
                 .expect("completed marker")
                 .completed
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup bounded migration root");
     }
 
@@ -4269,6 +4298,7 @@ mod tests {
         let conn = Connection::open(db_path(&root)).expect("open db");
         assert!(file_mtime(&conn, rel) > 0);
         assert!(chunk_content(&conn, rel).contains("historical text"));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup historical talent root");
     }
 
@@ -4329,6 +4359,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup edge light removed root");
     }
 
@@ -4392,6 +4423,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup historical edge removal root");
     }
 
@@ -4435,6 +4467,7 @@ mod tests {
                 "SELECT count(*) FROM chunks WHERE path='20240101/talents/keep.md'"
             ) > 0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup historical content root");
     }
 
@@ -4704,6 +4737,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup marker-stream root");
     }
 
@@ -4805,6 +4839,7 @@ mod tests {
             )
             .expect("facet log row");
         assert_eq!(action_log_agent, "action");
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup jsonl families root");
     }
 
@@ -4945,6 +4980,7 @@ mod tests {
                 "facets/work/entities/some-slug.jsonl".to_string(),
             ]
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup facet entities root");
     }
 
@@ -5015,6 +5051,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup entity search root");
     }
 
@@ -5034,6 +5071,7 @@ mod tests {
             count(&conn, "SELECT count(*) FROM chunks WHERE agent='entity'"),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup empty entity search root");
     }
 
@@ -5098,6 +5136,7 @@ mod tests {
                 count: 1,
             })
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup entity trigger root");
     }
 
@@ -5136,6 +5175,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup python real root");
     }
 
@@ -5239,6 +5279,7 @@ mod tests {
         assert!(watermark.mtime > 0);
         assert_eq!(watermark.count, initial.count);
         assert!(initial.mtime > 0);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup data change root");
     }
 
@@ -5274,6 +5315,7 @@ mod tests {
             read_entity_search_watermark(&conn).expect("read zero watermark"),
             Some(EntitySearchWatermark { mtime: 0, count: 0 })
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup remove all root");
     }
 
@@ -5326,6 +5368,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup blocked-only root");
     }
 
@@ -5368,6 +5411,7 @@ mod tests {
         let row = chunk_row(&conn, "entity_search:alice");
         assert_eq!(row.2, "entity");
         assert_eq!(row.5, "Alice Johnson (Person)\nFresh row");
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup clean rebuild root");
     }
 
@@ -5411,6 +5455,7 @@ mod tests {
             1
         );
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup mixed entity rows root");
     }
 
@@ -5450,6 +5495,7 @@ mod tests {
             updated_rowids["entity_search:bob"],
             initial_rowids["entity_search:bob"]
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup per-entity diff root");
     }
 
@@ -5491,6 +5537,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup rename root");
     }
 
@@ -5520,6 +5567,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup repair root");
     }
 
@@ -5561,6 +5609,7 @@ mod tests {
                 .rows,
             recovered
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup full recovery root");
     }
 
@@ -5600,6 +5649,7 @@ mod tests {
             count(&conn, "SELECT count(*) FROM chunks WHERE agent='entity'"),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup delete/add root");
     }
 
@@ -5630,6 +5680,7 @@ mod tests {
             1
         );
         assert_eq!(entity_watermark(&conn).count, 1);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup reset light root");
     }
 
@@ -5677,6 +5728,7 @@ mod tests {
             ),
             0
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup legacy migration root");
     }
 
@@ -5731,6 +5783,7 @@ mod tests {
         assert_eq!(row.3, None);
         assert_eq!(row.4, "");
         assert!(row.5.contains("Planning Session"));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup structured import root");
     }
 
@@ -5786,6 +5839,7 @@ mod tests {
         assert_eq!(row.3, None);
         assert_eq!(row.4, "");
         assert!(row.5.contains("**User:**"));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup ai chat import root");
     }
 
@@ -5821,6 +5875,7 @@ mod tests {
             content.contains("zarquon threshold"),
             "indexed chunk must carry the owner's text, got {content}"
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup generic text import root");
     }
 
@@ -5853,6 +5908,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup zero ai chat import root");
     }
 
@@ -5959,6 +6015,7 @@ mod tests {
                 "{rel} did not produce a chunk"
             );
         }
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup all families root");
     }
 
@@ -6031,6 +6088,7 @@ mod tests {
         assert!(all_content.contains("Fallback page text"));
         assert!(all_content.contains("Status toast: All changes saved"));
         assert!(!all_content.contains("Promotions tab collapsed"));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup browser stream root");
     }
 
@@ -6095,6 +6153,7 @@ mod tests {
             .expect("second day accumulator row");
         assert!(second.contains(r#""title":"Second pulse""#));
         assert!(second.contains(r#""detail":"afternoon check""#));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup day accumulator root");
     }
 
@@ -6193,6 +6252,7 @@ mod tests {
         assert_eq!(morning_row.3, None);
         assert_eq!(morning_row.4, "");
         assert!(morning_row.5.contains("## Your Day"));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup talent json root");
     }
 
@@ -6253,6 +6313,7 @@ mod tests {
                 "{path}"
             );
         }
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup invalid talent json root");
     }
 
@@ -6307,6 +6368,7 @@ mod tests {
                 "{path}"
             );
         }
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup empty talent json root");
     }
 
@@ -6359,6 +6421,7 @@ mod tests {
             ),
             1
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup zero jsonl root");
     }
 
@@ -6400,6 +6463,7 @@ not json
             )
             .expect("event content");
         assert!(content.contains("### Meeting: Planning"));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup non-object jsonl root");
     }
 
@@ -6423,6 +6487,7 @@ not json
             )
             .expect("short segment metadata row");
         assert_eq!(row, ("default".to_string(), "afternoon".to_string()));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup short segment root");
     }
 
@@ -6458,6 +6523,7 @@ not json
             )
             .expect("news metadata row");
         assert_eq!(news_row, ("work".to_string(), "news".to_string()));
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup lowercase root");
     }
 
@@ -6504,6 +6570,7 @@ not json
         assert!(third.merge_steps_spent < MERGE_BUDGET);
         let conn = open_index(&root).expect("open converged index");
         assert_eq!(fts_segment_count(&conn), after_second);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup bounded merge root");
     }
 
@@ -6616,6 +6683,7 @@ not json
             1
         );
         assert_sqlite_and_fts_integrity(&conn);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup reset root");
     }
 
@@ -6662,6 +6730,7 @@ not json
         assert_eq!(chunk_content(&conn, SHAPE_SCAN_REL), "## Inbox - Gmail");
         let row = chunk_row(&conn, SHAPE_SCAN_REL);
         assert_eq!(row.2, "browser");
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup scan written browser");
     }
 
@@ -6679,6 +6748,7 @@ not json
         assert_eq!(chunk_content(&conn, CHAT_REL), "## Inbox - Gmail");
         let row = chunk_row(&conn, CHAT_REL);
         assert_eq!(row.2, "browser");
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup rescan written browser");
     }
 
@@ -6717,6 +6787,7 @@ not json
                 !chunk_contents_contain(&conn, "**Owner** Need a diff"),
                 "{label}"
             );
+            drop(conn);
             fs::remove_dir_all(root).expect("cleanup unusable scan");
         }
     }

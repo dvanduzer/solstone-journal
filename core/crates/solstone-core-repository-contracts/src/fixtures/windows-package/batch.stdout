@@ -1,0 +1,35 @@
+{"reason":"compiler-artifact","package_id":"path+file:///capture/core/batch-fail#0.0.0","manifest_path":"/capture/core/batch-fail/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"batch_fail","src_path":"/capture/core/batch-fail/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/capture/core/target/debug/deps/batch_fail-089dfeb2371687a9"],"executable":"/capture/core/target/debug/deps/batch_fail-089dfeb2371687a9","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///capture/core/batch-empty#0.0.0","manifest_path":"/capture/core/batch-empty/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"batch_empty","src_path":"/capture/core/batch-empty/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/capture/core/target/debug/deps/batch_empty-b734318e21fc4d4f"],"executable":"/capture/core/target/debug/deps/batch_empty-b734318e21fc4d4f","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///capture/core/batch-pass-a#0.0.0","manifest_path":"/capture/core/batch-pass-a/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"batch_pass_a","src_path":"/capture/core/batch-pass-a/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/capture/core/target/debug/deps/batch_pass_a-63ce4f18a20ca35b"],"executable":"/capture/core/target/debug/deps/batch_pass_a-63ce4f18a20ca35b","fresh":false}
+{"reason":"build-finished","success":true}
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test fails ... FAILED
+test passes ... ok
+
+failures:
+
+---- fails stdout ----
+
+thread 'fails' (1605604) panicked at batch-fail/src/lib.rs:2:22:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    fails
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test passes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

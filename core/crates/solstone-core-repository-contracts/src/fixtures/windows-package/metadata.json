@@ -1,0 +1,12 @@
+{
+  "packages": [
+    {
+      "id": "path+file:///checkout/core/crates/solstone-core-about#2.0.46",
+      "name": "solstone-core-about"
+    },
+    {
+      "id": "path+file:///checkout/core/crates/solstone-core-memory-original#2.0.46",
+      "name": "solstone-core-memory-original"
+    }
+  ]
+}

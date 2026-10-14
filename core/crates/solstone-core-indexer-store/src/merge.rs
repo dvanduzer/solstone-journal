@@ -242,6 +242,7 @@ mod tests {
                 "Source".to_owned()
             )
         );
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup root");
     }
 
@@ -272,6 +273,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM edges", [], edge_count)
             .expect("edge count");
         assert_eq!(count, 0);
+        drop(conn);
         fs::remove_dir_all(root).expect("cleanup root");
     }
 
