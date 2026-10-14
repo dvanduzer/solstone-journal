@@ -573,15 +573,14 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     use std::{os::unix::fs::PermissionsExt, time::Duration};
 
-    use super::{
-        GpuAppraisalReason, GpuAppraiser, GpuStatusInput, NvattestGpuAppraiser,
-        write_production_appraisal_staging,
-    };
+    #[cfg(all(test, feature = "full-tests"))]
+    use super::write_production_appraisal_staging;
+    use super::{GpuAppraisalReason, GpuAppraiser, GpuStatusInput, NvattestGpuAppraiser};
+    #[cfg(all(test, feature = "full-tests"))]
     use crate::nvgpu::{GpuProfile, ManifestSet, StatusMode};
-    use crate::{
-        test_support::fixture_bytes,
-        tlv::{GpuEnvelope, GpuField, decode_gpu_envelope},
-    };
+    #[cfg(all(test, feature = "full-tests"))]
+    use crate::tlv::{GpuEnvelope, GpuField};
+    use crate::{test_support::fixture_bytes, tlv::decode_gpu_envelope};
 
     static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -614,6 +613,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "full-tests"))]
     fn staging_envelope() -> GpuEnvelope {
         GpuEnvelope {
             fields: vec![
@@ -636,6 +636,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn production_staging_without_android_authority_uses_process_temp() {
         let proof = b"desktop-proof";
