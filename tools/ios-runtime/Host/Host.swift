@@ -231,7 +231,7 @@ final class AppraisalHostBridge: @unchecked Sendable {
       if let item = object[key] { summary[key] = item }
     }
     if let reply = object["reply"] as? [String: Any] {
-      for key in ["bridge_attempt", "pid", "returncode", "result_code", "result_message"] {
+      for key in ["bridge_attempt", "pid", "returncode", "result_code", "result_message", "main_thread_init"] {
         if let item = reply[key] { summary["reply_\(key)"] = item }
       }
       summary["reply_claims_count"] = (reply["claims"] as? [Any])?.count ?? -1
@@ -438,6 +438,9 @@ final class AppraisalHostBridge: @unchecked Sendable {
           throw NSError(domain: "appraisal-hello", code: 1)
         }
         let pid = pid_t(pidNumber.int32Value)
+        let aliveProbe = kill(pid, 0)
+        let aliveProbeErrno = aliveProbe == -1 ? errno : 0
+        print("event=ios_verifier_alive attempt=\(attempt) pid=\(pid) kill_zero_result=\(aliveProbe) errno=\(aliveProbeErrno)")
         self.lock.lock()
         self.activePid = pid
         let cancelledAfterHello = self.isCancelled

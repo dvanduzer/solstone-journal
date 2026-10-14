@@ -508,6 +508,18 @@ pub fn ios_admission_decision(
     expected_paths.insert(receipt_rel_path.clone());
     expected_paths.insert(code_resources_rel_path.clone());
     let mut packaged = std::collections::BTreeMap::new();
+    let mut allowed_members = BTreeSet::from([
+        IOS_HELPER_EXECUTABLE_NAME.to_owned(),
+        "Info.plist".to_owned(),
+        "embedded.mobileprovision".to_owned(),
+        "gpu-appraisal-build.json".to_owned(),
+        "ca-bundle.pem".to_owned(),
+    ]);
+    allowed_members.extend(
+        qualified_rims
+            .iter()
+            .map(|rim| format!("{IOS_RIM_DIRECTORY}/{}", rim.filename())),
+    );
     for member in &receipt.package_members {
         let path = Path::new(&member.path);
         if path.is_absolute()
@@ -517,6 +529,7 @@ pub fn ios_admission_decision(
                 .any(|component| !matches!(component, std::path::Component::Normal(_)))
             || member.path == "gpu-appraisal-receipt.json"
             || member.path == "_CodeSignature/CodeResources"
+            || !allowed_members.contains(&member.path)
             || member.size_bytes > MAX_BUNDLE_MEMBER_SIZE_BYTES
             || !member.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
             || member.sha256.len() != 64
@@ -1346,6 +1359,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, IosVerifierRefusal::IntegrityFailed(_)));
+    }
+
+    #[test]
+    fn pure_decision_refuses_self_declared_extra_member() {
+        let mut receipt = valid_receipt();
+        let mut members = valid_members(&receipt.helper_sha256);
+        receipt.package_members.push(IosPackagedMemberEntry {
+            path: "unqualified.xml".into(),
+            sha256: "11".repeat(32),
+            size_bytes: 1,
+        });
+        members.push(IosBundleMember {
+            relative_path: format!("{IOS_HELPER_RELATIVE_PATH}/unqualified.xml"),
+            is_regular_file: true,
+            is_symlink: false,
+            size_bytes: 1,
+            sha256: "11".repeat(32),
+            macho_facts: None,
+        });
+        assert!(matches!(
+            ios_admission_decision(
+                &receipt,
+                &members,
+                IOS_BUNDLE_IDENTIFIER,
+                IOS_EXTENSION_POINT_HOST,
+                IOS_EXTENSION_POINT_NAME,
+            ),
+            Err(IosVerifierRefusal::ReceiptInvalid(_))
+        ));
     }
 
     #[test]
