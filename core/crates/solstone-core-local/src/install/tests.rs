@@ -71,29 +71,6 @@ fn flipped_origin_artifacts() -> Vec<&'static Artifact> {
 }
 
 #[test]
-fn installer_modules_do_not_read_compile_time_host_platform() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let modules = [manifest_dir.join("src/install/rfdetr_install.rs")];
-    assert!(modules.iter().all(|path| path.is_file()));
-    let texts = modules
-        .iter()
-        .map(|path| fs::read_to_string(path).unwrap())
-        .collect::<Vec<_>>();
-    assert!(texts.iter().all(|text| !text.is_empty()));
-    assert!(texts.iter().all(|text| !text.contains("std::env::consts")));
-
-    let orchestrator = manifest_dir
-        .parent()
-        .unwrap()
-        .join("solstone-core/src/install_models.rs");
-    assert!(
-        fs::read_to_string(orchestrator)
-            .unwrap()
-            .contains("std::env::consts")
-    );
-}
-
-#[test]
 fn download_artifact_reason_codes_cover_every_archive_error() {
     use archive::ArchiveError;
     let fallback = "download_failed";

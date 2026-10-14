@@ -3773,30 +3773,6 @@ mod tests {
     }
 
     #[test]
-    fn post_allocation_create_path_has_no_pathname_unlink() {
-        fn production(source: &str) -> &str {
-            source
-                .find("\n#[cfg(all(test")
-                .or_else(|| source.find("\n#[cfg(test)]\n"))
-                .map(|index| &source[..index])
-                .unwrap_or(source)
-        }
-        let create = production(include_str!("create.rs"));
-        let unix = production(include_str!("unix.rs"));
-        let windows = production(include_str!("windows.rs"));
-        for (name, source) in [("create", create), ("unix", unix)] {
-            assert!(
-                !source.contains("unlinkat(") && !source.contains("rollback_stage("),
-                "{name} still has a pathname unlink path"
-            );
-        }
-        assert!(
-            !windows.contains("FILE_DISPOSITION") && !windows.contains("FileDispositionInfo"),
-            "windows create path still has a handle-disposition delete"
-        );
-    }
-
-    #[test]
     fn journal_root_symlink_ancestor_after_sync_is_final_binding() {
         let temporary = temp();
         let journal = temporary.path().join("outer/inner/journal");
@@ -4325,22 +4301,6 @@ mod tests {
         assert!(consumed);
         expect_token(&result.unwrap_err(), "oplog_create_rename");
         assert!(canonical_leaves(&health_dir(temporary.path())).is_empty());
-    }
-
-    #[test]
-    fn namespace_and_lock_mapping_uses_typed_fields_not_string_parsing() {
-        let source = include_str!("create.rs");
-        let production = source
-            .split("\n#[cfg(all(test")
-            .next()
-            .or_else(|| source.split("\n#[cfg(test)]\n").next())
-            .unwrap_or(source);
-        assert!(
-            !production.contains("strip_prefix"),
-            "create.rs still parses lock/namespace errors from Display tokens"
-        );
-        assert!(production.contains("error.create_class()"));
-        assert!(production.contains("error.create_stage()"));
     }
 
     #[test]

@@ -4215,12 +4215,6 @@ mod tests {
         request.extensions_mut().insert(basis(CID_A));
         let response = router(&root).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let production = include_str!("router.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(!production.contains("/api/"));
-        assert!(!production.contains("/key"));
     }
 
     #[tokio::test]

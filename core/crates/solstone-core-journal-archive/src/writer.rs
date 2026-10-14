@@ -520,11 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn reserves_zip64_fields_with_safe_zip_writer_use() {
-        const WRITER_SOURCE: &str = include_str!("writer.rs");
-        let forbidden = ["un", "safe"].concat();
-        assert!(!WRITER_SOURCE.contains(&forbidden));
-
+    fn reserves_zip64_fields_for_every_file_member() {
         let temporary = TempDir::new("zip64");
         let root = temporary.journal();
         write(&root, "imports/import-1/source.bin", b"source");

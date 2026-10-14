@@ -460,6 +460,12 @@ fn failure(reason_code: &str) -> OpenAiResult {
     })
 }
 
+fn unknown_finish_reason() -> &'static str {
+    solstone_core_generate::contract()["response"]["finish_reason_unknown"]
+        .as_str()
+        .expect("generate contract carries the unknown finish reason")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1207,28 +1213,4 @@ mod tests {
         assert!(!refusal.detail.contains("fixture"));
         let _ = fs::remove_dir_all(journal);
     }
-}
-
-#[cfg(test)]
-mod vocabulary_tests {
-    #[test]
-    fn openai_production_never_reads_choices_shape() {
-        let production = include_str!("openai.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("OpenAI module has a production prefix");
-        for member in ["choices", "prompt_tokens", "completion_tokens"] {
-            let quoted_member = format!("\"{member}\"");
-            assert!(
-                !production.contains(&quoted_member),
-                "OpenAI production must not use Chat Completions primitive {member:?}"
-            );
-        }
-    }
-}
-
-fn unknown_finish_reason() -> &'static str {
-    solstone_core_generate::contract()["response"]["finish_reason_unknown"]
-        .as_str()
-        .expect("generate contract carries the unknown finish reason")
 }

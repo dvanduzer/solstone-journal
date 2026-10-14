@@ -1,0 +1,5 @@
+# Production code in this crate serves the home surface and never starts a process.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "the home surface never starts a process" },
+    { path = "tokio::process::Command::new", reason = "the home surface never starts a process", allow-invalid = true },
+]
