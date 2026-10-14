@@ -207,8 +207,8 @@ where
         call.request.timeout_s,
         crate::endpoint::thinking_headroom(call.endpoint, call.config),
     );
-    crate::confidential_pacing::run(call.journal_path, priority, timeout, |remaining| {
-        if priority.band < solstone_core_journal_config::work_priority::WorkBand::Import {
+    paced(call.journal_path, priority, timeout, |remaining| {
+        if !priority.band.is_background() {
             return confidential_generate_unpaced_with(call, readiness, establish);
         }
         let mut bounded = call.request.clone();
@@ -221,6 +221,29 @@ where
             readiness,
             establish,
         )
+    })
+}
+
+/// Older calls share the journal's one background slot and pause older work
+/// after a failure; a local admission failure reads as exhausted capacity.
+fn paced(
+    journal: &Path,
+    priority: solstone_core_journal_config::work_priority::WorkPriority,
+    timeout: Duration,
+    generate: impl FnOnce(Duration) -> ConfidentialResult,
+) -> ConfidentialResult {
+    solstone_core_local::admission::run_confidential_call(
+        journal,
+        priority,
+        timeout,
+        generate,
+        |result| !matches!(result, ConfidentialResult::Generated(_)),
+    )
+    .unwrap_or_else(|detail| {
+        ConfidentialResult::Failed(EndpointFailure {
+            reason_code: Some("local_capacity_exhausted".into()),
+            detail: Some(detail),
+        })
     })
 }
 
@@ -582,7 +605,7 @@ pub mod test_support {
         timeout: Duration,
         generate: impl FnOnce(Duration) -> ConfidentialResult,
     ) -> ConfidentialResult {
-        crate::confidential_pacing::run(journal, priority, timeout, generate)
+        paced(journal, priority, timeout, generate)
     }
 
     pub fn confidential_generate_over_channel(

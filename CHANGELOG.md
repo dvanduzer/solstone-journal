@@ -6,8 +6,13 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- with confidential processing, your journal no longer waits between requests while it catches up on older recordings and days, so it gets through them faster.
+
 ### Fixed
 
+- with confidential processing, older recordings and days waiting their turn no longer hold up new recordings and recent days. your journal works on one older item at a time, and newer work starts ahead of older work still waiting.
 - stopping or restarting your journal no longer waits several extra seconds when a background job left a helper program running. that time now goes to letting your journal's other programs stop cleanly.
 
 ## [2.0.46] - 2026-10-14

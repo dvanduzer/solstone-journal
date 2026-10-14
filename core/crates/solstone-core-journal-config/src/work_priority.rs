@@ -23,6 +23,13 @@ pub enum WorkBand {
     Remake = 6,
 }
 
+impl WorkBand {
+    /// Imports and history (bands 4-6) run behind newer work, never ahead of it.
+    pub fn is_background(self) -> bool {
+        self >= Self::Import
+    }
+}
+
 /// Source time, not enqueue time, decides newest-first order within a band.
 /// The key is YYYYMMDDHHMMSS; zero means no dated source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

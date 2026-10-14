@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Cross-process priority admission for bundled local inference.
+//! Cross-process priority admission: bundled local inference's slots, and the
+//! one slot older confidential calls share.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use solstone_core_journal_config::work_priority::WorkPriority;
 use uuid::Uuid;
@@ -60,6 +61,114 @@ impl Drop for WaitTicket {
 
 pub fn admission_dir(journal_path: &Path) -> PathBuf {
     journal_path.join("health/local-inference-admission")
+}
+
+/// The engine sends no retry interval, so a failed older confidential call
+/// pauses older work for at least this long. It is the journal's own backoff.
+const FAILURE_PAUSE: Duration = Duration::from_secs(60);
+/// No pause is longer. One that ends further away than this was left by a
+/// clock that has since moved back, and must not stall older work for days.
+const LONGEST_PAUSE: Duration = Duration::from_secs(3600);
+const PAUSE_FILE: &str = "next-call.json";
+
+fn confidential_background_dir(journal_path: &Path) -> PathBuf {
+    journal_path.join("health/confidential-background")
+}
+
+/// Run one confidential model call. Foreground calls run at once. Older calls
+/// share the journal's one background slot, waiting for it within `timeout`,
+/// and a failed one pauses older work. Nothing here sleeps but the slot wait:
+/// the task queue starts older work only once [`confidential_background_open`],
+/// so the pause spaces older tasks. The rest of a task already running is not
+/// held by it: holding it would hold that task's lane.
+pub fn run_confidential_call<T>(
+    journal_path: &Path,
+    priority: WorkPriority,
+    timeout: Duration,
+    call: impl FnOnce(Duration) -> T,
+    failed: impl FnOnce(&T) -> bool,
+) -> Result<T, String> {
+    if !priority.band.is_background() {
+        return Ok(call(timeout));
+    }
+    let waiting = Instant::now();
+    let root = confidential_background_dir(journal_path);
+    let _permit = acquire_local_slot(&root, 1, Some(timeout), false, priority)
+        .map_err(|error| format!("confidential background admission: {error:?}"))?;
+    let remaining = timeout
+        .checked_sub(waiting.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or("confidential background wait exhausted the request timeout")?;
+    let started = Instant::now();
+    let result = call(remaining);
+    if failed(&result) {
+        let pause = started.elapsed().clamp(FAILURE_PAUSE, LONGEST_PAUSE);
+        let until = SystemTime::now() + pause;
+        // Best effort: the call already failed, and its own result says why.
+        let _ = pause_until(&root, until);
+    }
+    Ok(result)
+}
+
+/// Whether older confidential work may start now: no call holds or awaits the
+/// background slot and no failed call's pause is still running. Never waits.
+/// An unreadable slot fails closed; foreground work never consults it.
+pub fn confidential_background_open(journal_path: &Path) -> bool {
+    let root = confidential_background_dir(journal_path);
+    let now = SystemTime::now();
+    let paused = paused_until(&root);
+    let moved_clock = paused > now + LONGEST_PAUSE + FAILURE_PAUSE;
+    (paused <= now || moved_clock) && is_idle(&root, 1).unwrap_or(false)
+}
+
+fn pause_until(root: &Path, until: SystemTime) -> std::io::Result<()> {
+    // Round up: a pause must not end before the time it was asked for.
+    let millis = until
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_nanos()
+        .div_ceil(1_000_000);
+    let staged = root.join(format!(".{PAUSE_FILE}-{}", Uuid::new_v4().simple()));
+    fs::write(&staged, millis.to_string())?;
+    fs::rename(&staged, root.join(PAUSE_FILE)).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
+    })
+}
+
+/// An unreadable pause is no pause: it is advice, and damage must not stop work.
+fn paused_until(root: &Path) -> SystemTime {
+    fs::read(root.join(PAUSE_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<u64>(&bytes).ok())
+        .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+/// Whether a caller could take a slot now without waiting behind anyone. A
+/// held slot or a live waiter answers `false` at once.
+fn is_idle(root: &Path, capacity: u32) -> Result<bool, AdmissionError> {
+    let tickets = match wait_tickets(root) {
+        Err(AdmissionError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(true);
+        }
+        tickets => tickets?,
+    };
+    // A ticket whose lock is free belongs to a waiter that has gone.
+    let slots = (0..capacity).map(|index| root.join(format!("slot-{index}.lock")));
+    for path in tickets.into_iter().chain(slots) {
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if is_delete_pending(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        match lock_exclusive(file) {
+            Ok(_free) => {}
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    Ok(true)
 }
 
 /// Acquire the highest-ranked waiting call, optionally requiring every slot.
@@ -668,6 +777,92 @@ mod tests {
                 WorkPriority::default(),
             )
             .unwrap(),
+        );
+    }
+
+    #[test]
+    fn older_confidential_calls_share_one_slot_and_a_failure_pauses_older_work() {
+        let journal = tempfile::tempdir().unwrap();
+        let root = confidential_background_dir(journal.path());
+        let older: WorkPriority = "5:1".parse().unwrap();
+        assert!(confidential_background_open(journal.path()));
+        let held = acquire_local_slot(&root, 1, Some(ACQUIRE_DEADLINE), false, older).unwrap();
+        assert!(!confidential_background_open(journal.path()));
+        for band in 1..=3 {
+            let priority = format!("{band}:1").parse().unwrap();
+            let ran =
+                run_confidential_call(journal.path(), priority, Duration::ZERO, |_| 7, |_| false);
+            assert_eq!(ran, Ok(7), "foreground band {band} bypasses the slot");
+        }
+        let waited = run_confidential_call(
+            journal.path(),
+            older,
+            Duration::from_millis(30),
+            |_| panic!("the slot is held"),
+            |_: &()| false,
+        );
+        assert!(waited.is_err());
+        drop(held);
+
+        let ran =
+            run_confidential_call(journal.path(), older, ACQUIRE_DEADLINE, |_| "ok", |_| false);
+        assert_eq!(ran, Ok("ok"));
+        assert!(
+            confidential_background_open(journal.path()),
+            "success leaves no pause"
+        );
+
+        let before = SystemTime::now();
+        let ran =
+            run_confidential_call(journal.path(), older, ACQUIRE_DEADLINE, |_| "no", |_| true);
+        assert_eq!(ran, Ok("no"));
+        assert!(paused_until(&root) >= before + FAILURE_PAUSE);
+        assert!(!confidential_background_open(journal.path()));
+        // The pause is the queue's to honour: an admitted call is not held by it.
+        let ran =
+            run_confidential_call(journal.path(), older, ACQUIRE_DEADLINE, |_| "ok", |_| false);
+        assert_eq!(ran, Ok("ok"));
+    }
+
+    #[test]
+    fn the_open_check_never_waits_and_sees_holders_waiters_and_pauses() {
+        let journal = tempfile::tempdir().unwrap();
+        let root = confidential_background_dir(journal.path());
+        fs::create_dir_all(&root).unwrap();
+        let live = root.join("wait-5-00000000000000000001-00000000000000000001-live.ticket");
+        let waiter = File::create(&live).unwrap();
+        waiter.try_lock().unwrap();
+        assert!(
+            !confidential_background_open(journal.path()),
+            "a live waiter"
+        );
+        drop(waiter);
+        assert!(
+            confidential_background_open(journal.path()),
+            "a gone waiter"
+        );
+        let pause = |text: &str| fs::write(root.join(PAUSE_FILE), text).unwrap();
+        for damage in ["not a time".to_owned(), u64::MAX.to_string()] {
+            pause(&damage);
+            assert!(
+                confidential_background_open(journal.path()),
+                "damage is no pause"
+            );
+        }
+        let millis = |at: SystemTime| {
+            at.duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .to_string()
+        };
+        pause(&millis(SystemTime::now() + Duration::from_secs(60)));
+        assert!(!confidential_background_open(journal.path()));
+        pause(&millis(SystemTime::now() - Duration::from_secs(1)));
+        assert!(confidential_background_open(journal.path()));
+        pause(&millis(SystemTime::now() + 2 * LONGEST_PAUSE));
+        assert!(
+            confidential_background_open(journal.path()),
+            "a clock moved back"
         );
     }
 }

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+use solstone_core_journal_config::work_priority::WorkPriority;
 use solstone_core_system::lifecycle::{SupervisorLifecycle, WriterId};
 #[cfg(unix)]
 use solstone_core_system::lifecycle::{
@@ -45,6 +46,8 @@ fn main() {
             let _ = std::io::stderr().write_all(b"stderr-line\n");
         }
         "sleep" => std::thread::sleep(Duration::from_secs(30)),
+        "think" => think_worker(),
+        "hold-background-slot" => hold_background_slot(args),
         #[cfg(unix)]
         "fork-member" => {
             let ready_path = args.next().expect("ready path");
@@ -583,4 +586,53 @@ fn publish(path: impl AsRef<std::path::Path>, contents: &str) {
     staged.push(".partial");
     std::fs::write(&staged, contents).expect("stage fixture file");
     std::fs::rename(&staged, path).expect("publish fixture file");
+}
+
+/// A stand-in think worker: one model call through confidential admission at
+/// the priority its queue gave it, logged around the call.
+fn think_worker() {
+    let journal = PathBuf::from(std::env::var_os("SOLSTONE_TEST_JOURNAL").expect("journal"));
+    let reference = std::env::args().next_back().expect("reference");
+    let priority = WorkPriority::from_environment().expect("work priority");
+    model_call(&journal, priority, || {
+        log_model(&format!("start {reference}"));
+        std::thread::sleep(Duration::from_millis(100));
+        log_model(&format!("end {reference}"));
+    });
+}
+
+/// Holds the background slot as a long older call would, until released.
+fn hold_background_slot(mut args: impl Iterator<Item = String>) {
+    let journal = PathBuf::from(args.next().expect("journal"));
+    let ready = args.next().expect("ready path");
+    let release = PathBuf::from(args.next().expect("release path"));
+    model_call(&journal, "4:0".parse().expect("priority"), || {
+        publish(&ready, "held");
+        // Bounded, so a killed test run cannot orphan a holder forever.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !release.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+}
+
+fn model_call(journal: &std::path::Path, priority: WorkPriority, call: impl FnOnce()) {
+    solstone_core_local::admission::run_confidential_call(
+        journal,
+        priority,
+        Duration::from_secs(30),
+        |_| call(),
+        |_| false,
+    )
+    .expect("confidential admission");
+}
+
+fn log_model(line: &str) {
+    let path = std::env::var_os("SOLSTONE_TEST_MODEL_LOG").expect("model log");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut log| log.write_all(format!("{line}\n").as_bytes()))
+        .expect("append model log");
 }
