@@ -1,3 +1,23 @@
+diff --git a/internal/archiver/archiver.go b/internal/archiver/archiver.go
+--- a/internal/archiver/archiver.go
++++ b/internal/archiver/archiver.go
+@@ -947,0 +948 @@
++	sn.Paths = targets
+diff --git a/internal/fs/node.go b/internal/fs/node.go
+--- a/internal/fs/node.go
++++ b/internal/fs/node.go
+@@ -132,0 +133,5 @@
++// LookupUsername returns the cached or resolved username for uid.
++func LookupUsername(uid uint32) string {
++	return lookupUsername(uid)
++}
++
+@@ -190,0 +196,5 @@
++}
++
++// LookupGroup returns the cached or resolved group name for gid.
++func LookupGroup(gid uint32) string {
++	return lookupGroup(gid)
 diff --git a/internal/restorer/filerestorer.go b/internal/restorer/filerestorer.go
 --- a/internal/restorer/filerestorer.go
 +++ b/internal/restorer/filerestorer.go
