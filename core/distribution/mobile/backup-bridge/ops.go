@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -16,24 +17,15 @@ import (
 
 	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/backend"
-	"github.com/restic/restic/internal/backend/local"
 	"github.com/restic/restic/internal/checker"
 	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/data"
-	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/restorer"
 	"github.com/restic/restic/internal/ui/progress"
 	"github.com/restic/restic/internal/ui/restore"
 )
-
-// localConfig returns a local backend configuration with the target directory path set.
-func localConfig(path string) local.Config {
-	cfg := local.NewConfig()
-	cfg.Path = path
-	return cfg
-}
 
 // Restic accepts immutable strings and may make internal copies. Only the bridge's
 // owned mutable credential buffers are explicitly cleared; no complete memory-wipe guarantee is made.
@@ -154,8 +146,28 @@ func safeScanKey(ctx context.Context, repo *repository.Repository, password stri
 	return winningID, nil
 }
 
+func mapPinError(op int32, err error) bridgeResult {
+	diag := DiagInvalidArgument
+	if op == OpRestore {
+		diag = DiagRestoreDestinationWrong
+		if errors.Is(err, errRestoreExists) {
+			diag = DiagRestoreDestinationExists
+		} else if errors.Is(err, errRestoreNonEmpty) {
+			diag = DiagRestoreNonEmpty
+		}
+	}
+	return bridgeResult{status: StatusInvalidArgument, diagnostic: diag}
+}
+
 // executeInit initializes a new repository.
 func executeInit(ctx context.Context, req bridgeRequest, setWrote func()) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
@@ -169,7 +181,7 @@ func executeInit(ctx context.Context, req bridgeRequest, setWrote func()) (bridg
 		return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 	}
 
-	be, err := local.Create(ctx, localConfig(req.repoPath), nil)
+	be, err := createRootBackend(req.repoRoot)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
 	}
@@ -216,10 +228,17 @@ func executeInit(ctx context.Context, req bridgeRequest, setWrote func()) (bridg
 
 // executeOpen opens a repository and verifies the password.
 func executeOpen(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := local.Open(ctx, localConfig(req.repoPath), nil)
+	be, err := newRootBackend(req.repoRoot)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -249,6 +268,13 @@ func executeOpen(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
 
 // executeAddRecoveryKey adds a recovery key wrapping the existing master key.
 func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func()) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
 	if len(req.password) == len(req.recoveryPassword) &&
 		subtle.ConstantTimeCompare(req.password, req.recoveryPassword) == 1 {
 		return bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}, errors.New("passwords must not be equal")
@@ -259,7 +285,7 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 	recPw, clearRec := passwordString(req.recoveryPassword)
 	defer clearRec()
 
-	be, err := local.Open(ctx, localConfig(req.repoPath), nil)
+	be, err := newRootBackend(req.repoRoot)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -312,9 +338,9 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 
 	newID := newKey.ID()
 
-	// Verification is a separate local.Open and safe scan with only the recovery password.
+	// Verification is a separate backend open and safe scan with only the recovery password.
 	verified := false
-	beVerify, err := local.Open(lockCtx, localConfig(req.repoPath), nil)
+	beVerify, err := newRootBackend(req.repoRoot)
 	if err == nil {
 		repoVerify, err := repository.New(guardedBackend{beVerify}, repository.Options{})
 		if err == nil {
@@ -344,11 +370,18 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 }
 
 // executeSnapshot creates a snapshot of sourcePath.
-func executeSnapshot(ctx context.Context, req bridgeRequest, filesystem fs.FS, setWrote func()) (bridgeResult, error) {
+func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := local.Open(ctx, localConfig(req.repoPath), nil)
+	be, err := newRootBackend(req.repoRoot)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -387,7 +420,12 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, filesystem fs.FS, s
 	if err := repo.LoadIndex(lockCtx, &progress.NoopPrinter{}); err != nil {
 		return refusalResult(err, DiagRepoCorrupt), err
 	}
-	arch := archiver.New(repo, filesystem, archiver.Options{})
+	sourceName := req.sourceName
+	if sourceName == "" {
+		sourceName = filepath.Base(req.sourcePath)
+	}
+	rootFS := newRootFS(req.sourceRoot, sourceName)
+	arch := archiver.New(repo, rootFS, archiver.Options{})
 	// Upstream worker paths call Error for non-context failures. Returning the
 	// original error both aborts on first item failure and avoids a nil callback
 	// if cancellation races an in-flight filesystem operation.
@@ -398,7 +436,7 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, filesystem fs.FS, s
 		Time:     time.Now(),
 	}
 
-	_, snID, _, err := arch.Snapshot(lockCtx, []string{req.sourcePath}, opts)
+	_, snID, _, err := arch.Snapshot(lockCtx, []string{sourceName}, opts)
 	if err != nil {
 		if strings.Contains(err.Error(), "snapshot is empty") {
 			return bridgeResult{status: StatusFailed, diagnostic: DiagSnapshotEmpty}, err
@@ -414,10 +452,17 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, filesystem fs.FS, s
 
 // executeListSnapshots lists all snapshots in the repository.
 func executeListSnapshots(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := local.Open(ctx, localConfig(req.repoPath), nil)
+	be, err := newRootBackend(req.repoRoot)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -486,23 +531,18 @@ func executeRestore(ctx context.Context, req *bridgeRequest, setWrote func()) (b
 	return executeRestoreWithPublisher(ctx, req, setWrote, promoteRestoreStage)
 }
 
-func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWrote func(), publish func(*bridgeRequest) error) (bridgeResult, error) {
+func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWrote func(), publish func(context.Context, *bridgeRequest) error) (bridgeResult, error) {
 	if !req.pathsPinned {
-		if err := validateRestoreDest(req.restorePath); err != nil {
-			diag := DiagRestoreDestinationWrong
-			if errors.Is(err, errRestoreNonEmpty) {
-				diag = DiagRestoreNonEmpty
-			} else if errors.Is(err, errRestoreExists) {
-				diag = DiagRestoreDestinationExists
-			}
-			return bridgeResult{status: StatusInvalidArgument, diagnostic: diag}, err
+		if err := pinRequestPaths(req); err != nil {
+			return mapPinError(req.operation, err), err
 		}
+		defer closeRequestPaths(req)
 	}
 
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := local.Open(ctx, localConfig(req.repoPath), nil)
+	be, err := newRootBackend(req.repoRoot)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -552,7 +592,21 @@ func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWro
 	defer prog.Finish()
 
 	res := restorer.NewRestorer(repo, sn, restorer.Options{Progress: prog})
-	_, err = res.RestoreTo(lockCtx, req.restorePath)
+	res.BeforeWrite = func() error {
+		if req.pathsPinned {
+			return recheckRestoreParent(req)
+		}
+		return nil
+	}
+	restorer.SetRestoreWriteHook(func() error {
+		if testGate != nil {
+			return testGate("restore-write", lockCtx)
+		}
+		return nil
+	})
+	defer restorer.SetRestoreWriteHook(nil)
+
+	_, err = res.RestoreToRoot(lockCtx, req.restoreRoot)
 	if err != nil {
 		if lockCtx.Err() != nil {
 			return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, lockCtx.Err()
@@ -560,7 +614,7 @@ func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWro
 		return bridgeResult{status: StatusFailed, diagnostic: scrubError(err, *req)}, err
 	}
 	if req.pathsPinned {
-		if err := publish(req); err != nil {
+		if err := publish(ctx, req); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, err
 			}
@@ -576,10 +630,17 @@ func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWro
 
 // executeCheck runs repository integrity verification.
 func executeCheck(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := local.Open(ctx, localConfig(req.repoPath), nil)
+	be, err := newRootBackend(req.repoRoot)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -684,6 +745,9 @@ func scrubError(err error, req bridgeRequest) string {
 		return DiagOk
 	}
 	s := err.Error()
+	if strings.Contains(s, ".solstone-restore-staging-") || strings.Contains(s, "/dev/fd/") {
+		return DiagIoFailed
+	}
 	errBytes := []byte(s)
 	if (len(req.password) > 0 && bytes.Contains(errBytes, req.password)) ||
 		(len(req.recoveryPassword) > 0 && bytes.Contains(errBytes, req.recoveryPassword)) {

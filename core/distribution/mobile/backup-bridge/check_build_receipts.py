@@ -26,6 +26,9 @@ class TestBackupBridgeBuild(unittest.TestCase):
         shutil.copy2(bridge_build.ROOT / "scripts/android_cross_build.py", stage / "scripts/android_cross_build.py")
         shutil.copy2(bridge_build.INPUTS_PATH, stage / "core/distribution/mobile/inputs.json")
         shutil.copytree(bridge_build.BRIDGE_SRC_PATH, stage / "core/distribution/mobile/backup-bridge")
+        for p in stage.rglob("*"):
+            p.chmod(0o755 if p.is_dir() else 0o644)
+        stage.chmod(0o755)
         spec = importlib.util.spec_from_file_location(
             "staged_backup_bridge_build_" + str(id(root)), stage / "scripts/backup_bridge_build.py"
         )
@@ -101,6 +104,29 @@ class TestBackupBridgeBuild(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "immutable staged inputs"):
                 bridge_build.BridgeBuild(args)
+
+    def test_missing_rooted_restorer_patch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module, args = self.staged_build(root)
+            patch = root / "build/immutable-input/core/distribution/mobile/backup-bridge/restic-rooted-restorer.patch"
+            if patch.exists():
+                patch.unlink()
+            build = module.BridgeBuild(args)
+            with mock.patch.object(build, "check_host"):
+                with self.assertRaisesRegex(ValueError, "rooted restorer patch is missing or empty"):
+                    build.execute()
+
+    def test_invalid_rooted_restorer_patch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module, args = self.staged_build(root)
+            patch = root / "build/immutable-input/core/distribution/mobile/backup-bridge/restic-rooted-restorer.patch"
+            patch.write_text("invalid diff without git header\n")
+            build = module.BridgeBuild(args)
+            with mock.patch.object(build, "check_host"):
+                with self.assertRaisesRegex(ValueError, "not a git unified diff"):
+                    build.execute()
 
 
 if __name__ == "__main__":

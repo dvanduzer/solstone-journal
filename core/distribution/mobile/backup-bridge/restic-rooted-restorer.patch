@@ -1,0 +1,1001 @@
+diff --git a/internal/archiver/archiver.go b/internal/archiver/archiver.go
+index 3121198..4cde8e3 100644
+--- a/internal/archiver/archiver.go
++++ b/internal/archiver/archiver.go
+@@ -945,6 +945,7 @@ func (arch *Archiver) Snapshot(ctx context.Context, targets []string, opts Snaps
+ 	if err != nil {
+ 		return nil, restic.ID{}, nil, err
+ 	}
++	sn.Paths = targets
+ 
+ 	sn.ProgramVersion = opts.ProgramVersion
+ 	sn.Excludes = opts.Excludes
+diff --git a/internal/fs/node.go b/internal/fs/node.go
+index f2371e1..73b1d97 100644
+--- a/internal/fs/node.go
++++ b/internal/fs/node.go
+@@ -130,6 +130,11 @@ func lookupUsername(uid uint32) string {
+ 	return username
+ }
+ 
++// LookupUsername returns the cached or resolved username for uid.
++func LookupUsername(uid uint32) string {
++	return lookupUsername(uid)
++}
++
+ var (
+ 	userNameLookupCache      = make(map[string]uint32)
+ 	userNameLookupCacheMutex = sync.RWMutex{}
+@@ -190,6 +195,11 @@ func lookupGroup(gid uint32) string {
+ 	return group
+ }
+ 
++// LookupGroup returns the cached or resolved group name for gid.
++func LookupGroup(gid uint32) string {
++	return lookupGroup(gid)
++}
++
+ var (
+ 	groupNameLookupCache      = make(map[string]uint32)
+ 	groupNameLookupCacheMutex = sync.RWMutex{}
+diff --git a/internal/restorer/filerestorer.go b/internal/restorer/filerestorer.go
+index 63dc3d6..5fb60ae 100644
+--- a/internal/restorer/filerestorer.go
++++ b/internal/restorer/filerestorer.go
+@@ -3,7 +3,9 @@ package restorer
+ import (
+ 	"context"
+ 	"fmt"
++	"os"
+ 	"path/filepath"
++	"strings"
+ 	"sync"
+ 
+ 	"golang.org/x/sync/errgroup"
+@@ -60,10 +62,12 @@ type fileRestorer struct {
+ 
+ 	allowRecursiveDelete bool
+ 
+-	dst   string
+-	files []*fileInfo
+-	Error func(string, error) error
+-	Info  func(string)
++	dst         string
++	root        *os.Root
++	beforeWrite func() error
++	files       []*fileInfo
++	Error       func(string, error) error
++	Info        func(string)
+ }
+ 
+ func newFileRestorer(dst string,
+@@ -94,11 +98,43 @@ func newFileRestorer(dst string,
+ 	}
+ }
+ 
++func newFileRestorerRoot(root *os.Root, beforeWrite func() error,
++	blobsLoader blobsLoaderFn,
++	idx func(restic.BlobType, restic.ID) []restic.PackedBlob,
++	connections uint,
++	sparse bool,
++	allowRecursiveDelete bool,
++	startWarmup startWarmupFn,
++	progress *restore.Progress) *fileRestorer {
++
++	workerCount := int(connections)
++
++	return &fileRestorer{
++		idx:                  idx,
++		blobsLoader:          blobsLoader,
++		startWarmup:          startWarmup,
++		filesWriter:          newFilesWriterRoot(workerCount, allowRecursiveDelete, root, beforeWrite),
++		zeroChunk:            repository.ZeroChunk(),
++		sparse:               sparse,
++		progress:             progress,
++		allowRecursiveDelete: allowRecursiveDelete,
++		workerCount:          workerCount,
++		dst:                  "",
++		root:                 root,
++		beforeWrite:          beforeWrite,
++		Error:                restorerAbortOnAllErrors,
++		Info:                 func(_ string) {},
++	}
++}
++
+ func (r *fileRestorer) addFile(location string, content restic.IDs, size int64, state *fileState) {
+ 	r.files = append(r.files, &fileInfo{location: location, blobs: content, size: size, state: state})
+ }
+ 
+ func (r *fileRestorer) targetPath(location string) string {
++	if r.root != nil {
++		return strings.TrimPrefix(filepath.Clean(location), "/")
++	}
+ 	return filepath.Join(r.dst, location)
+ }
+ 
+@@ -252,7 +288,13 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
+ }
+ 
+ func (r *fileRestorer) truncateFileToSize(location string, size int64) error {
+-	f, err := createFile(r.targetPath(location), size, false, r.allowRecursiveDelete)
++	var f *os.File
++	var err error
++	if r.root != nil {
++		f, err = r.filesWriter.createFileRoot(r.targetPath(location), size, false)
++	} else {
++		f, err = createFile(r.targetPath(location), size, false, r.allowRecursiveDelete)
++	}
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/internal/restorer/fileswriter.go b/internal/restorer/fileswriter.go
+index 5987132..b1cedde 100644
+--- a/internal/restorer/fileswriter.go
++++ b/internal/restorer/fileswriter.go
+@@ -23,6 +23,8 @@ type filesWriter struct {
+ 	allowRecursiveDelete bool
+ 	cacheMu              sync.Mutex
+ 	cache                *simplelru.LRU[string, *partialFile]
++	root                 *os.Root
++	beforeWrite          func() error
+ }
+ 
+ type filesWriterBucket struct {
+@@ -61,6 +63,13 @@ func newFilesWriter(count int, allowRecursiveDelete bool) *filesWriter {
+ 	}
+ }
+ 
++func newFilesWriterRoot(count int, allowRecursiveDelete bool, root *os.Root, beforeWrite func() error) *filesWriter {
++	w := newFilesWriter(count, allowRecursiveDelete)
++	w.root = root
++	w.beforeWrite = beforeWrite
++	return w
++}
++
+ func openFile(path string) (*os.File, error) {
+ 	f, err := fs.OpenFile(path, fs.O_WRONLY|fs.O_NOFOLLOW, 0600)
+ 	if err != nil {
+@@ -210,7 +219,16 @@ func (w *filesWriter) writeToFile(path string, blob []byte, offset int64, create
+ 		// Not in cache, open/create the file
+ 		var f *os.File
+ 		var err error
+-		if createSize >= 0 {
++		if w.root != nil {
++			if createSize >= 0 {
++				f, err = w.createFileRoot(path, createSize, sparse)
++				if err != nil {
++					return nil, err
++				}
++			} else if f, err = w.openFileRoot(path); err != nil {
++				return nil, err
++			}
++		} else if createSize >= 0 {
+ 			f, err = createFile(path, createSize, sparse, w.allowRecursiveDelete)
+ 			if err != nil {
+ 				return nil, err
+@@ -262,3 +280,19 @@ func (w *filesWriter) flush() {
+ 
+ 	w.cache.Purge()
+ }
++
++func (w *filesWriter) createFileRoot(path string, createSize int64, sparse bool) (*os.File, error) {
++	if err := triggerRestoreWriteHook(); err != nil {
++		return nil, err
++	}
++	if w.beforeWrite != nil {
++		if err := w.beforeWrite(); err != nil {
++			return nil, err
++		}
++	}
++	return openRootFileCreate(w.root, path, createSize, sparse, w.allowRecursiveDelete)
++}
++
++func (w *filesWriter) openFileRoot(path string) (*os.File, error) {
++	return openRootFileRead(w.root, path)
++}
+diff --git a/internal/restorer/restorer.go b/internal/restorer/restorer.go
+index ffcd138..91fe434 100644
+--- a/internal/restorer/restorer.go
++++ b/internal/restorer/restorer.go
+@@ -6,6 +6,7 @@ import (
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"sync/atomic"
+ 
+ 	"github.com/restic/restic/internal/data"
+@@ -35,6 +36,9 @@ type Restorer struct {
+ 	SelectFilter func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool)
+ 
+ 	XattrSelectFilter func(xattrName string) (xattrSelectedForRestore bool)
++
++	root        *os.Root
++	BeforeWrite func() error
+ }
+ 
+ var restorerAbortOnAllErrors = func(_ string, err error) error { return err }
+@@ -484,6 +488,280 @@ func (res *Restorer) RestoreTo(ctx context.Context, dst string) (uint64, error)
+ 	return restoredFileCount, err
+ }
+ 
++// RestoreToRoot restores snapshot contents into the given root directory.
++func (res *Restorer) RestoreToRoot(ctx context.Context, root *os.Root) (uint64, error) {
++	res.root = root
++	restoredFileCount := uint64(0)
++
++	rootInfo, err := root.Stat(".")
++	if err != nil {
++		return 0, err
++	}
++	if !rootInfo.IsDir() {
++		return 0, errors.New("restore destination is not a directory")
++	}
++
++	idx := NewHardlinkIndex[string]()
++	filerestorer := newFileRestorerRoot(root, res.BeforeWrite, res.repo.LoadBlobsFromPack, res.repo.LookupBlob,
++		res.repo.Connections(), res.opts.Sparse, res.opts.Delete, res.repo.StartWarmup, res.opts.Progress)
++	filerestorer.Error = res.Error
++	filerestorer.Info = res.Info
++
++	var buf []byte
++
++	// first tree pass: create directories and collect all files to restore
++	err = res.traverseTree(ctx, ".", *res.sn.Tree, treeVisitor{
++		enterDir: func(_ *data.Node, target, location string) error {
++			if location != string(filepath.Separator) {
++				res.opts.Progress.AddFile(0)
++			}
++			return rootEnsureDir(res, target)
++		},
++
++		visitNode: func(node *data.Node, target, location string) error {
++			if err := rootEnsureDir(res, filepath.Dir(target)); err != nil {
++				return err
++			}
++
++			if node.Type != data.NodeTypeFile {
++				res.opts.Progress.AddFile(0)
++				return nil
++			}
++
++			if node.Links > 1 {
++				if idx.Has(node.Inode, node.DeviceID) {
++					res.opts.Progress.AddFile(0)
++					return nil
++				}
++				idx.Add(node.Inode, node.DeviceID, location)
++			}
++
++			var checkErr error
++			buf, checkErr = res.withOverwriteCheckRoot(ctx, node, target, location, false, buf, func(updateMetadataOnly bool, matches *fileState) error {
++				if updateMetadataOnly {
++					res.opts.Progress.AddSkippedFile(location, node.Size)
++				} else {
++					res.opts.Progress.AddFile(node.Size)
++					if !res.opts.DryRun {
++						filerestorer.addFile(location, node.Content, int64(node.Size), matches)
++					} else {
++						action := restoreui.ActionFileUpdated
++						if matches == nil {
++							action = restoreui.ActionFileRestored
++						}
++						res.opts.Progress.AddProgress(location, action, node.Size, node.Size)
++					}
++				}
++				res.trackFile(location, updateMetadataOnly)
++				if !updateMetadataOnly {
++					restoredFileCount++
++				}
++				return nil
++			})
++			return checkErr
++		},
++	})
++	if err != nil {
++		return 0, err
++	}
++
++	if !res.opts.DryRun {
++		err = filerestorer.restoreFiles(ctx)
++		if err != nil {
++			return 0, err
++		}
++	}
++
++	// second tree pass: restore special files and filesystem metadata
++	err = res.traverseTree(ctx, ".", *res.sn.Tree, treeVisitor{
++		visitNode: func(node *data.Node, target, location string) error {
++			targetRel := strings.TrimPrefix(filepath.Clean(target), "/")
++			if node.Type != data.NodeTypeFile {
++				_, err := res.withOverwriteCheckRoot(ctx, node, target, location, false, nil, func(_ bool, _ *fileState) error {
++					if !res.opts.DryRun {
++						if err := triggerRestoreWriteHook(); err != nil {
++							return err
++						}
++						if res.BeforeWrite != nil {
++							if err := res.BeforeWrite(); err != nil {
++								return err
++							}
++						}
++						_ = rootRemove(res.root, targetRel)
++						if err := rootNodeCreateAt(res, node, targetRel); err != nil {
++							return err
++						}
++					}
++					res.opts.Progress.AddProgress(location, restoreui.ActionOtherRestored, 0, 0)
++					return rootRestoreMetadata(res, node, targetRel, res.Warn, res.XattrSelectFilter, res.opts.OwnershipByName)
++				})
++				return err
++			}
++
++			if idx.Has(node.Inode, node.DeviceID) && idx.Value(node.Inode, node.DeviceID) != location {
++				_, err := res.withOverwriteCheckRoot(ctx, node, target, location, true, nil, func(_ bool, _ *fileState) error {
++					if !res.opts.DryRun {
++						if err := triggerRestoreWriteHook(); err != nil {
++							return err
++						}
++						if res.BeforeWrite != nil {
++							if err := res.BeforeWrite(); err != nil {
++								return err
++							}
++						}
++						_ = rootRemove(res.root, targetRel)
++						linkTarget := filerestorer.targetPath(idx.Value(node.Inode, node.DeviceID))
++						if err := rootRestoreHardlink(res, node, linkTarget, targetRel); err != nil {
++							return err
++						}
++					}
++					res.opts.Progress.AddProgress(location, restoreui.ActionOtherRestored, 0, 0)
++					return rootRestoreMetadata(res, node, targetRel, res.Warn, res.XattrSelectFilter, res.opts.OwnershipByName)
++				})
++				return err
++			}
++
++			if _, ok := res.hasRestoredFile(location); ok {
++				return rootRestoreMetadata(res, node, targetRel, res.Warn, res.XattrSelectFilter, res.opts.OwnershipByName)
++			}
++			return nil
++		},
++		leaveDir: func(node *data.Node, target, location string, expectedFilenames []string) error {
++			if node == nil {
++				return nil
++			}
++			targetRel := strings.TrimPrefix(filepath.Clean(target), "/")
++			err := rootRestoreMetadata(res, node, targetRel, res.Warn, res.XattrSelectFilter, res.opts.OwnershipByName)
++			if err == nil {
++				res.opts.Progress.AddProgress(location, restoreui.ActionDirRestored, 0, 0)
++			}
++			return err
++		},
++	})
++	return restoredFileCount, err
++}
++
++func (res *Restorer) withOverwriteCheckRoot(ctx context.Context, node *data.Node, target, location string, isHardlink bool, buf []byte, cb func(updateMetadataOnly bool, matches *fileState) error) ([]byte, error) {
++	rel := strings.TrimPrefix(filepath.Clean(target), "/")
++	overwrite, err := shouldOverwriteRoot(res.opts.Overwrite, node, res.root, rel)
++	if err != nil {
++		return buf, err
++	} else if !overwrite {
++		size := node.Size
++		if isHardlink {
++			size = 0
++		}
++		res.opts.Progress.AddSkippedFile(location, size)
++		return buf, nil
++	}
++
++	var matches *fileState
++	updateMetadataOnly := false
++	if node.Type == data.NodeTypeFile && !isHardlink {
++		var verifyErr error
++		matches, buf, verifyErr = res.verifyFileRoot(ctx, res.root, rel, node, false, res.opts.Overwrite == OverwriteIfChanged, buf)
++		if verifyErr != nil {
++			if errors.Is(verifyErr, os.ErrNotExist) {
++				updateMetadataOnly = false
++			} else {
++				return buf, verifyErr
++			}
++		} else if matches != nil {
++			updateMetadataOnly = !matches.NeedsRestore()
++		} else {
++			updateMetadataOnly = false
++		}
++	}
++
++	return buf, cb(updateMetadataOnly, matches)
++}
++
++func shouldOverwriteRoot(overwrite OverwriteBehavior, node *data.Node, root *os.Root, rel string) (bool, error) {
++	if overwrite == OverwriteAlways || overwrite == OverwriteIfChanged {
++		return true, nil
++	}
++
++	fi, err := root.Lstat(rel)
++	if err != nil {
++		if errors.Is(err, os.ErrNotExist) {
++			return true, nil
++		}
++		return false, err
++	}
++
++	switch overwrite {
++	case OverwriteIfNewer:
++		return node.ModTime.After(fi.ModTime()), nil
++	case OverwriteNever:
++		return false, nil
++	}
++	panic("unknown overwrite behavior")
++}
++
++func (res *Restorer) verifyFileRoot(ctx context.Context, root *os.Root, rel string, node *data.Node, failFast bool, trustMtime bool, buf []byte) (*fileState, []byte, error) {
++	f, err := openRootFileRead(root, rel)
++	if err != nil {
++		return nil, buf, err
++	}
++	defer func() {
++		_ = f.Close()
++	}()
++
++	fi, err := f.Stat()
++	sizeMatches := true
++	switch {
++	case err != nil:
++		return nil, buf, err
++	case !fi.Mode().IsRegular():
++		return nil, buf, errors.Errorf("Expected %s to be a regular file", rel)
++	case int64(node.Size) != fi.Size():
++		if failFast {
++			return nil, buf, errors.Errorf("Invalid file size for %s: expected %d, got %d",
++				rel, node.Size, fi.Size())
++		}
++		sizeMatches = false
++	}
++
++	if trustMtime && fi.ModTime().Equal(node.ModTime) && sizeMatches {
++		return &fileState{nil, sizeMatches}, buf, nil
++	}
++
++	matches := make([]bool, len(node.Content))
++	var offset int64
++	for i, blobID := range node.Content {
++		if ctx.Err() != nil {
++			return nil, buf, ctx.Err()
++		}
++		length, found := res.repo.LookupBlobSize(restic.DataBlob, blobID)
++		if !found {
++			return nil, buf, errors.Errorf("Unable to fetch blob %s", blobID)
++		}
++
++		if length > uint(cap(buf)) {
++			buf = make([]byte, 2*length)
++		}
++		buf = buf[:length]
++
++		_, err = f.ReadAt(buf, offset)
++		if err == io.EOF && !failFast {
++			sizeMatches = false
++			break
++		}
++		if err != nil {
++			return nil, buf, err
++		}
++		matches[i] = blobID.Equal(restic.Hash(buf))
++		if failFast && !matches[i] {
++			return nil, buf, errors.Errorf(
++				"Unexpected content in %s, starting at offset %d",
++				rel, offset)
++		}
++		offset += int64(length)
++	}
++
++	return &fileState{matches, sizeMatches}, buf, nil
++}
++
+ func (res *Restorer) removeUnexpectedFiles(ctx context.Context, target, location string, expectedFilenames []string) error {
+ 	if !res.opts.Delete {
+ 		panic("internal error")
+diff --git a/internal/restorer/root_io.go b/internal/restorer/root_io.go
+new file mode 100644
+index 0000000..2605d78
+--- /dev/null
++++ b/internal/restorer/root_io.go
+@@ -0,0 +1,393 @@
++//go:build darwin || ios || linux
++
++package restorer
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"syscall"
++
++	"github.com/restic/restic/internal/data"
++	"golang.org/x/sys/unix"
++)
++
++var (
++	errPathEscapes = errors.New("path escapes from parent")
++)
++
++var (
++	restoreWriteHookMu sync.Mutex
++	restoreWriteHook   func() error
++	restoreWriteOnce   sync.Once
++)
++
++// SetRestoreWriteHook sets an observation hook called once on the first rooted file or directory create.
++func SetRestoreWriteHook(hook func() error) {
++	restoreWriteHookMu.Lock()
++	restoreWriteHook = hook
++	restoreWriteOnce = sync.Once{}
++	restoreWriteHookMu.Unlock()
++}
++
++func triggerRestoreWriteHook() error {
++	var err error
++	restoreWriteHookMu.Lock()
++	hook := restoreWriteHook
++	restoreWriteHookMu.Unlock()
++	if hook != nil {
++		restoreWriteOnce.Do(func() {
++			err = hook()
++		})
++	}
++	return err
++}
++
++// openatParent resolves the parent directory descriptor of p relative to rootFD using O_NOFOLLOW.
++// It returns parentFD and the leaf component name. If parentFD != rootFD, closeParent must be called.
++func openatParent(rootFD int, p string) (int, string, func(), error) {
++	p = strings.TrimPrefix(filepath.Clean(p), "/")
++	if p == "." || p == "" {
++		return rootFD, ".", func() {}, nil
++	}
++	dir := filepath.Dir(p)
++	leaf := filepath.Base(p)
++	if dir == "." || dir == "" {
++		return rootFD, leaf, func() {}, nil
++	}
++
++	comps := strings.Split(dir, "/")
++	curFD := rootFD
++	for _, comp := range comps {
++		if comp == "" || comp == "." {
++			continue
++		}
++		if comp == ".." {
++			if curFD != rootFD {
++				_ = unix.Close(curFD)
++			}
++			return -1, "", nil, errPathEscapes
++		}
++		nextFD, err := unix.Openat(curFD, comp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
++		if curFD != rootFD {
++			_ = unix.Close(curFD)
++		}
++		if err != nil {
++			return -1, "", nil, err
++		}
++		curFD = nextFD
++	}
++
++	return curFD, leaf, func() {
++		if curFD != rootFD {
++			_ = unix.Close(curFD)
++		}
++	}, nil
++}
++
++func rootEnsureDir(res *Restorer, target string) error {
++	if res.opts.DryRun {
++		return nil
++	}
++	target = strings.TrimPrefix(filepath.Clean(target), "/")
++	if target == "." || target == "" {
++		return nil
++	}
++
++	if err := triggerRestoreWriteHook(); err != nil {
++		return err
++	}
++	if res.BeforeWrite != nil {
++		if err := res.BeforeWrite(); err != nil {
++			return err
++		}
++	}
++
++	fi, err := res.root.Lstat(target)
++	if err != nil && !errors.Is(err, os.ErrNotExist) {
++		return fmt.Errorf("failed to check for directory: %w", err)
++	}
++	if err == nil && !fi.IsDir() {
++		if err := rootRemove(res.root, target); err != nil {
++			return fmt.Errorf("failed to remove stale item: %w", err)
++		}
++	}
++
++	return rootMkdirAll(res.root, target, 0700)
++}
++
++func rootMkdirAll(root *os.Root, target string, perm os.FileMode) error {
++	target = strings.TrimPrefix(filepath.Clean(target), "/")
++	if target == "." || target == "" {
++		return nil
++	}
++
++	rootFile, err := root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return err
++	}
++	defer rootFile.Close()
++	rootFD := int(rootFile.Fd())
++
++	comps := strings.Split(target, "/")
++	curFD := rootFD
++	for _, comp := range comps {
++		if comp == "" || comp == "." {
++			continue
++		}
++		if comp == ".." {
++			if curFD != rootFD {
++				_ = unix.Close(curFD)
++			}
++			return errPathEscapes
++		}
++		mkdirErr := unix.Mkdirat(curFD, comp, uint32(perm))
++		if mkdirErr != nil && !errors.Is(mkdirErr, unix.EEXIST) {
++			if curFD != rootFD {
++				_ = unix.Close(curFD)
++			}
++			return mkdirErr
++		}
++		nextFD, openErr := unix.Openat(curFD, comp, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
++		if curFD != rootFD {
++			_ = unix.Close(curFD)
++		}
++		if openErr != nil {
++			return openErr
++		}
++		curFD = nextFD
++	}
++	if curFD != rootFD {
++		_ = unix.Close(curFD)
++	}
++	return nil
++}
++
++func rootRemove(root *os.Root, p string) error {
++	p = strings.TrimPrefix(filepath.Clean(p), "/")
++	if p == "." || p == "" {
++		return nil
++	}
++	rootFile, err := root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return err
++	}
++	defer rootFile.Close()
++	parentFD, leaf, closeParent, err := openatParent(int(rootFile.Fd()), p)
++	if err != nil {
++		return err
++	}
++	defer closeParent()
++
++	var stat unix.Stat_t
++	if err := unix.Fstatat(parentFD, leaf, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
++		if errors.Is(err, unix.ENOENT) {
++			return nil
++		}
++		return err
++	}
++	if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
++		return unix.Unlinkat(parentFD, leaf, unix.AT_REMOVEDIR)
++	}
++	return unix.Unlinkat(parentFD, leaf, 0)
++}
++
++func rootNodeCreateAt(res *Restorer, node *data.Node, target string) error {
++	rootFile, err := res.root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return err
++	}
++	defer rootFile.Close()
++	parentFD, leaf, closeParent, err := openatParent(int(rootFile.Fd()), target)
++	if err != nil {
++		return err
++	}
++	defer closeParent()
++
++	switch node.Type {
++	case data.NodeTypeDir:
++		err = unix.Mkdirat(parentFD, leaf, uint32(node.Mode))
++		if err != nil && !errors.Is(err, unix.EEXIST) {
++			return err
++		}
++		return nil
++	case data.NodeTypeFile:
++		fd, err := unix.Openat(parentFD, leaf, unix.O_CREAT|unix.O_WRONLY|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
++		if err != nil {
++			return err
++		}
++		return unix.Close(fd)
++	case data.NodeTypeSymlink:
++		return unix.Symlinkat(node.LinkTarget, parentFD, leaf)
++	case data.NodeTypeDev:
++		return mknodSpecialAt(parentFD, leaf, syscall.S_IFBLK|0600, int(node.Device))
++	case data.NodeTypeCharDev:
++		return mknodSpecialAt(parentFD, leaf, syscall.S_IFCHR|0600, int(node.Device))
++	case data.NodeTypeFifo:
++		return mknodSpecialAt(parentFD, leaf, syscall.S_IFIFO|0600, 0)
++	case data.NodeTypeSocket:
++		return nil
++	default:
++		return fmt.Errorf("filetype %q not implemented", node.Type)
++	}
++}
++
++func rootRestoreHardlink(res *Restorer, node *data.Node, target, path string) error {
++	rootFile, err := res.root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return err
++	}
++	defer rootFile.Close()
++	rootFD := int(rootFile.Fd())
++
++	parentTarget, leafTarget, closeTarget, err := openatParent(rootFD, target)
++	if err != nil {
++		return err
++	}
++	defer closeTarget()
++
++	parentPath, leafPath, closePath, err := openatParent(rootFD, path)
++	if err != nil {
++		return err
++	}
++	defer closePath()
++
++	return unix.Linkat(parentTarget, leafTarget, parentPath, leafPath, 0)
++}
++
++func rootRestoreMetadata(res *Restorer, node *data.Node, target string, warn func(msg string), xattrSelectFilter func(xattrName string) bool, ownershipByName bool) error {
++	rootFile, err := res.root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return err
++	}
++	defer rootFile.Close()
++	parentFD, leaf, closeParent, err := openatParent(int(rootFile.Fd()), target)
++	if err != nil {
++		return err
++	}
++	defer closeParent()
++
++	// 1. Chown
++	if err := unix.Fchownat(parentFD, leaf, int(node.UID), int(node.GID), unix.AT_SYMLINK_NOFOLLOW); err != nil {
++		if os.Geteuid() != 0 && (errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EPERM)) {
++			// ignore permission error when not root
++		} else if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
++			// ignore unsupported
++		} else {
++			return err
++		}
++	}
++
++	// 2. Xattrs
++	isSymlink := node.Type == data.NodeTypeSymlink
++	for _, attr := range node.ExtendedAttributes {
++		if xattrSelectFilter != nil && !xattrSelectFilter(attr.Name) {
++			continue
++		}
++		_ = setXattrRoot(parentFD, leaf, isSymlink, attr.Name, attr.Value)
++	}
++
++	// 3. Timestamps
++	times := []unix.Timespec{
++		unix.NsecToTimespec(node.AccessTime.UnixNano()),
++		unix.NsecToTimespec(node.ModTime.UnixNano()),
++	}
++	_ = unix.UtimesNanoAt(parentFD, leaf, times, unix.AT_SYMLINK_NOFOLLOW)
++
++	// 4. Chmod (non-symlink)
++	if !isSymlink {
++		_ = unix.Fchmodat(parentFD, leaf, uint32(node.Mode&os.ModePerm), unix.AT_SYMLINK_NOFOLLOW)
++	}
++
++	return nil
++}
++
++func openRootFileCreate(root *os.Root, path string, createSize int64, sparse bool, allowRecursiveDelete bool) (*os.File, error) {
++	rootFile, err := root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer rootFile.Close()
++	parentFD, leaf, closeParent, err := openatParent(int(rootFile.Fd()), path)
++	if err != nil {
++		return nil, err
++	}
++	defer closeParent()
++
++	fd, err := unix.Openat(parentFD, leaf, unix.O_CREAT|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
++	if err != nil && errors.Is(err, os.ErrPermission) {
++		_ = unix.Fchmodat(parentFD, leaf, 0600, unix.AT_SYMLINK_NOFOLLOW)
++		fd, err = unix.Openat(parentFD, leaf, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
++	}
++
++	var f *os.File
++	var fi os.FileInfo
++	if err == nil {
++		f = os.NewFile(uintptr(fd), path)
++		fi, err = f.Stat()
++		if err != nil {
++			_ = f.Close()
++			return nil, err
++		}
++	}
++
++	mustReplace := (f == nil) || !fi.Mode().IsRegular()
++	if !mustReplace {
++		if stat, ok := fi.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
++			mustReplace = true
++		}
++	}
++
++	if mustReplace {
++		if f != nil {
++			_ = f.Close()
++		}
++		_ = unix.Unlinkat(parentFD, leaf, 0)
++		_ = unix.Unlinkat(parentFD, leaf, unix.AT_REMOVEDIR)
++
++		newFD, openErr := unix.Openat(parentFD, leaf, unix.O_CREAT|unix.O_WRONLY|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
++		if openErr != nil {
++			return nil, openErr
++		}
++		f = os.NewFile(uintptr(newFD), path)
++		fi, err = f.Stat()
++		if err != nil {
++			_ = f.Close()
++			return nil, err
++		}
++	}
++
++	return ensureSize(f, fi, createSize, sparse)
++}
++
++func openRootFileRead(root *os.Root, path string) (*os.File, error) {
++	rootFile, err := root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer rootFile.Close()
++	parentFD, leaf, closeParent, err := openatParent(int(rootFile.Fd()), path)
++	if err != nil {
++		return nil, err
++	}
++	defer closeParent()
++
++	fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, err
++	}
++	f := os.NewFile(uintptr(fd), path)
++	fi, err := f.Stat()
++	if err != nil {
++		_ = f.Close()
++		return nil, err
++	}
++	if !fi.Mode().IsRegular() {
++		_ = f.Close()
++		return nil, fmt.Errorf("unexpected file type %v at %q", fi.Mode().Type(), path)
++	}
++	return f, nil
++}
+diff --git a/internal/restorer/root_io_darwin.go b/internal/restorer/root_io_darwin.go
+new file mode 100644
+index 0000000..bc6dace
+--- /dev/null
++++ b/internal/restorer/root_io_darwin.go
+@@ -0,0 +1,33 @@
++//go:build darwin || ios
++
++package restorer
++
++import (
++	"errors"
++
++	"golang.org/x/sys/unix"
++)
++
++func setXattrRoot(parentFD int, leaf string, isSymlink bool, name string, val []byte) error {
++	var openFlags int = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
++	if isSymlink {
++		openFlags = unix.O_SYMLINK | unix.O_NOFOLLOW | unix.O_CLOEXEC
++	}
++	fd, err := unix.Openat(parentFD, leaf, openFlags, 0)
++	if err != nil {
++		fd, err = unix.Openat(parentFD, leaf, openFlags|unix.O_DIRECTORY, 0)
++		if err != nil {
++			return err
++		}
++	}
++	defer unix.Close(fd)
++	err = unix.Fsetxattr(fd, name, val, 0)
++	if err != nil && !errors.Is(err, unix.ENOTSUP) && !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EPERM) {
++		return err
++	}
++	return nil
++}
++
++func mknodSpecialAt(parentFD int, leaf string, mode uint32, dev int) error {
++	return unix.ENOTSUP
++}
+diff --git a/internal/restorer/root_io_linux.go b/internal/restorer/root_io_linux.go
+new file mode 100644
+index 0000000..622cc0e
+--- /dev/null
++++ b/internal/restorer/root_io_linux.go
+@@ -0,0 +1,59 @@
++//go:build linux
++
++package restorer
++
++import (
++	"errors"
++	"unsafe"
++
++	"golang.org/x/sys/unix"
++)
++
++func setXattrRoot(parentFD int, leaf string, isSymlink bool, name string, val []byte) error {
++	cname, err := unix.BytePtrFromString(name)
++	if err != nil {
++		return err
++	}
++	var valPtr *byte
++	if len(val) > 0 {
++		valPtr = &val[0]
++	}
++	if isSymlink {
++		fd, err := unix.Openat(parentFD, leaf, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
++		if err != nil {
++			return err
++		}
++		defer unix.Close(fd)
++		empty := []byte{0}
++		_, _, errno := unix.Syscall6(
++			unix.SYS_SETXATTRAT,
++			uintptr(fd),
++			uintptr(unsafe.Pointer(&empty[0])),
++			uintptr(unsafe.Pointer(cname)),
++			uintptr(unsafe.Pointer(valPtr)),
++			uintptr(len(val)),
++			uintptr(unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW),
++		)
++		if errno != 0 && errno != unix.ENOTSUP && errno != unix.EOPNOTSUPP && errno != unix.EPERM {
++			return errno
++		}
++		return nil
++	}
++	fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
++	if err != nil {
++		fd, err = unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
++		if err != nil {
++			return err
++		}
++	}
++	defer unix.Close(fd)
++	err = unix.Fsetxattr(fd, name, val, 0)
++	if err != nil && !errors.Is(err, unix.ENOTSUP) && !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EPERM) {
++		return err
++	}
++	return nil
++}
++
++func mknodSpecialAt(parentFD int, leaf string, mode uint32, dev int) error {
++	return unix.Mknodat(parentFD, leaf, mode, dev)
++}

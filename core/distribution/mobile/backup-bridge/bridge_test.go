@@ -276,15 +276,23 @@ func TestPinnedDirectorySurvivesCallerPathReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pinned.Close()
+
+	adoptedRoot, err := adoptRoot(original, pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adoptedRoot.Close()
+
 	if err := os.Rename(original, moved); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(root, original); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(filepath.Join(descriptorPath(pinned), "owner.txt"))
+
+	data, err := adoptedRoot.ReadFile("owner.txt")
 	if err != nil || string(data) != "retained" {
-		t.Fatalf("descriptor path redirected after replacement: %q %v", data, err)
+		t.Fatalf("adopted root redirected after replacement: %q %v", data, err)
 	}
 }
 

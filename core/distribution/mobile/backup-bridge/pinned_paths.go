@@ -6,20 +6,17 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/restic/restic/internal/fs"
 	"golang.org/x/sys/unix"
 )
-
-const pinnedPathPrefix = "/dev/fd/"
 
 const restoreStagePrefix = ".solstone-restore-staging-"
 
@@ -56,10 +53,26 @@ func openPinnedDirectory(path string) (*os.File, error) {
 	return file, nil
 }
 
-func descriptorPath(file *os.File) string {
-	// The terminal '/.' makes lstat/open-with-no-follow observe the retained
-	// directory rather than the /dev/fd symlink that names its descriptor.
-	return fmt.Sprintf("%s%d/.", pinnedPathPrefix, file.Fd())
+func adoptRoot(path string, pinned *os.File) (*os.Root, error) {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, errPinnedIdentity
+	}
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		_ = root.Close()
+		return nil, errPinnedIdentity
+	}
+	pinnedInfo, err := pinned.Stat()
+	if err != nil {
+		_ = root.Close()
+		return nil, errPinnedIdentity
+	}
+	if !os.SameFile(rootInfo, pinnedInfo) {
+		_ = root.Close()
+		return nil, errPinnedIdentity
+	}
+	return root, nil
 }
 
 func sameDirectory(a, b *os.File) (bool, error) {
@@ -144,12 +157,30 @@ func ensureDirectoryEmpty(file *os.File) error {
 	return nil
 }
 
-func pinRequestPaths(req *bridgeRequest) error {
+func pinRequestPaths(req *bridgeRequest) (err error) {
+	defer func() {
+		if err != nil {
+			_ = closeRequestPaths(req)
+		}
+	}()
 	repo, err := openPinnedDirectory(req.repoPath)
+	if err != nil {
+		if req.operation == OpInit && (errors.Is(err, unix.ENOENT) || os.IsNotExist(err)) {
+			if mkErr := os.MkdirAll(req.repoPath, 0700); mkErr != nil {
+				return mkErr
+			}
+			repo, err = openPinnedDirectory(req.repoPath)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	req.pathFiles = append(req.pathFiles, repo)
+	repoRoot, err := adoptRoot(req.repoPath, repo)
 	if err != nil {
 		return err
 	}
-	req.pathFiles = append(req.pathFiles, repo)
+	req.repoRoot = repoRoot
 
 	var source *os.File
 	if req.operation == OpSnapshot || req.operation == OpRestore {
@@ -165,24 +196,27 @@ func pinRequestPaths(req *bridgeRequest) error {
 			}
 			return errPathOverlap
 		}
-		req.sourcePinnedPath = descriptorPath(source)
-		// Present a stable virtual root to the archiver so snapshot names do
-		// not expose the descriptor number or the app-container parent path.
-		// pinnedFS translates all I/O back to the retained directory.
+		sourceRoot, err := adoptRoot(originalSource, source)
+		if err != nil {
+			return err
+		}
+		req.sourceRoot = sourceRoot
 		sourceName := filepath.Base(originalSource)
 		if sourceName == string(filepath.Separator) || sourceName == "." {
 			return errPathOverlap
 		}
-		req.sourcePath = sourceName
+		req.sourceName = sourceName
 	}
 
 	if req.operation == OpRestore {
 		originalRestore := req.restorePath
-		parent, openErr := openPinnedDirectory(filepath.Dir(originalRestore))
+		parentPath := filepath.Dir(originalRestore)
+		parent, openErr := openPinnedDirectory(parentPath)
 		if openErr != nil {
 			return openErr
 		}
 		req.pathFiles = append(req.pathFiles, parent)
+		req.restoreParentPath = parentPath
 		name := filepath.Base(originalRestore)
 		var destinationStat unix.Stat_t
 		if statErr := unix.Fstatat(int(parent.Fd()), name, &destinationStat, unix.AT_SYMLINK_NOFOLLOW); statErr == nil {
@@ -191,6 +225,9 @@ func pinRequestPaths(req *bridgeRequest) error {
 			return statErr
 		}
 		for _, other := range []*os.File{repo, source} {
+			if other == nil {
+				continue
+			}
 			insideOther, overlapErr := directoryContains(other, parent)
 			if overlapErr != nil {
 				return overlapErr
@@ -243,13 +280,17 @@ func pinRequestPaths(req *bridgeRequest) error {
 			_ = unix.Unlinkat(int(parent.Fd()), stageRootName, unix.AT_REMOVEDIR)
 			return errors.New("could not retain restore staging payload")
 		}
-		// The caller can see the outer random name in its selected parent, but
-		// cannot enumerate the independently random payload name. Publication
-		// uses the already-open root descriptor and restores read permission only
-		// during owned cleanup. Deliberate same-UID chmod/tampering is outside the
-		// bridge boundary because that authority can also rewrite the destination
-		// immediately after a successful return.
+		stagePath := filepath.Join(parentPath, stageRootName, stageName)
+		restoreRoot, adoptErr := adoptRoot(stagePath, stage)
+		if adoptErr != nil {
+			_ = stage.Close()
+			_ = unix.Unlinkat(stageRootFD, stageName, unix.AT_REMOVEDIR)
+			_ = stageRoot.Close()
+			_ = unix.Unlinkat(int(parent.Fd()), stageRootName, unix.AT_REMOVEDIR)
+			return adoptErr
+		}
 		if err := unix.Fchmod(stageRootFD, 0300); err != nil {
+			_ = restoreRoot.Close()
 			_ = stage.Close()
 			_ = unix.Unlinkat(stageRootFD, stageName, unix.AT_REMOVEDIR)
 			_ = stageRoot.Close()
@@ -257,16 +298,15 @@ func pinRequestPaths(req *bridgeRequest) error {
 			return err
 		}
 		req.pathFiles = append(req.pathFiles, stageRoot, stage)
+		req.restoreRoot = restoreRoot
 		req.restoreParent = parent
 		req.restoreStageRoot = stageRoot
 		req.restoreStage = stage
 		req.restoreName = name
 		req.restoreStageRootName = stageRootName
 		req.restoreStageName = stageName
-		req.restorePath = descriptorPath(stage)
 	}
 
-	req.repoPath = descriptorPath(repo)
 	req.pathsPinned = true
 	return nil
 }
@@ -439,10 +479,47 @@ func closeRequestPaths(req *bridgeRequest) error {
 		_ = file.Close()
 	}
 	req.pathFiles = nil
+	if req.repoRoot != nil {
+		_ = req.repoRoot.Close()
+		req.repoRoot = nil
+	}
+	if req.sourceRoot != nil {
+		_ = req.sourceRoot.Close()
+		req.sourceRoot = nil
+	}
+	if req.restoreRoot != nil {
+		_ = req.restoreRoot.Close()
+		req.restoreRoot = nil
+	}
+	req.pathsPinned = false
+	req.sourceName = ""
 	return cleanupErr
 }
 
-func promoteRestoreStage(req *bridgeRequest) error {
+func recheckRestoreParent(req *bridgeRequest) error {
+	if req.restoreParent == nil || req.restoreParentPath == "" {
+		return errors.New("restore parent not pinned")
+	}
+	root, err := os.OpenRoot(req.restoreParentPath)
+	if err != nil {
+		return errPinnedIdentity
+	}
+	defer root.Close()
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		return errPinnedIdentity
+	}
+	parentInfo, err := req.restoreParent.Stat()
+	if err != nil {
+		return errPinnedIdentity
+	}
+	if !os.SameFile(rootInfo, parentInfo) {
+		return errPinnedIdentity
+	}
+	return nil
+}
+
+func promoteRestoreStage(ctx context.Context, req *bridgeRequest) error {
 	if req.restoreStageName == "" {
 		return nil
 	}
@@ -472,6 +549,14 @@ func promoteRestoreStage(req *bridgeRequest) error {
 	if !matches {
 		return errRestoreStageChanged
 	}
+	if testGate != nil {
+		if err := testGate("before-publish", ctx); err != nil {
+			return err
+		}
+	}
+	if err := recheckRestoreParent(req); err != nil {
+		return err
+	}
 	if err := publishDirectory(int(req.restoreStageRoot.Fd()), req.restoreStageName, parentFD, req.restoreName); err != nil {
 		return err
 	}
@@ -487,31 +572,4 @@ func promoteRestoreStage(req *bridgeRequest) error {
 		return errors.Join(errRestoreCommittedUncertain, err)
 	}
 	return nil
-}
-
-// pinnedFS preserves the original source name stored in a snapshot while all
-// filesystem reads are anchored below its retained descriptor.
-type pinnedFS struct {
-	fs.FS
-	original string
-	pinned   string
-}
-
-func (p pinnedFS) translate(path string) string {
-	if path == p.original {
-		return p.pinned
-	}
-	prefix := p.original + string(filepath.Separator)
-	if strings.HasPrefix(path, prefix) {
-		return filepath.Join(p.pinned, strings.TrimPrefix(path, prefix))
-	}
-	return path
-}
-
-func (p pinnedFS) OpenFile(name string, flag int, metadataOnly bool) (fs.File, error) {
-	return p.FS.OpenFile(p.translate(name), flag, metadataOnly)
-}
-
-func (p pinnedFS) Lstat(name string) (*fs.ExtendedFileInfo, error) {
-	return p.FS.Lstat(p.translate(name))
 }

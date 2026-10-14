@@ -188,6 +188,13 @@ class BridgeBuild:
     def execute(self):
         self.check_host()
 
+        rooted_patch = BRIDGE_SRC_PATH / "restic-rooted-restorer.patch"
+        if not rooted_patch.is_file() or rooted_patch.stat().st_size == 0:
+            raise ValueError(f"rooted restorer patch is missing or empty: {rooted_patch}")
+        patch_text = rooted_patch.read_text(errors="replace")
+        if not patch_text.startswith("diff --git "):
+            raise ValueError(f"rooted restorer patch is not a git unified diff: {rooted_patch}")
+
         # 1. Acquire and extract restic
         restic_pin = dict(self.inputs["restic"])
         restic_pin["filename"] = f"restic-{restic_pin['sha256']}.tar.gz"
@@ -208,6 +215,9 @@ class BridgeBuild:
         safety_patch = BRIDGE_SRC_PATH / "restic-library-safety.patch"
         self.run_step("library-safety-overlay", ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", safety_patch], cwd=restic_dir)
         self.receipt["library_safety_patch_sha256"] = sha256(safety_patch)
+
+        self.run_step("rooted-restorer-overlay", ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", rooted_patch], cwd=restic_dir)
+        self.receipt["rooted_restorer_patch_sha256"] = sha256(rooted_patch)
 
         # Copy bridge files into restic/mobilebackup/
         pkg_dir = restic_dir / "mobilebackup"

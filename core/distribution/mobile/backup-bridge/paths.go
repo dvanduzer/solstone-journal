@@ -26,6 +26,7 @@ var (
 	errRestoreStageChanged       = errors.New("restore staging identity changed")
 	errRestoreNonEmpty           = errors.New("restore destination is not empty")
 	errPathOverlap               = errors.New("paths must not overlap or enclose each other")
+	errPinnedIdentity            = errors.New("pinned path identity mismatch")
 )
 
 var knownSchemes = []string{

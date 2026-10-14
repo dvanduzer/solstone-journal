@@ -39,8 +39,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
-
-	"github.com/restic/restic/internal/fs"
 )
 
 // Handle states.
@@ -253,7 +251,7 @@ func startBridgeCall(req bridgeRequest) (uint64, int32) {
 	handles[id] = h
 	handlesMu.Unlock()
 
-	go runWorker(h, req, fs.Local{})
+	go runWorker(h, req)
 
 	return id, StatusOk
 }
@@ -287,14 +285,14 @@ func publishRestoreForHandle(h *callHandle, req *bridgeRequest) error {
 	if h.cancelRequested || h.ctx.Err() != nil {
 		return context.Canceled
 	}
-	err := promoteRestoreStage(req)
+	err := promoteRestoreStage(h.ctx, req)
 	if err == nil || errors.Is(err, errRestoreCommittedUncertain) {
 		h.publicationCommitted = true
 	}
 	return err
 }
 
-func runWorker(h *callHandle, req bridgeRequest, filesystem fs.FS) {
+func runWorker(h *callHandle, req bridgeRequest) {
 	wrote := false
 	result := bridgeResult{status: StatusInternal, diagnostic: DiagInternal}
 	defer func() {
@@ -331,14 +329,11 @@ func runWorker(h *callHandle, req bridgeRequest, filesystem fs.FS) {
 	case OpAddRecoveryKey:
 		result, _ = executeAddRecoveryKey(h.ctx, req, markWrite)
 	case OpSnapshot:
-		if req.pathsPinned {
-			filesystem = pinnedFS{FS: filesystem, original: req.sourcePath, pinned: req.sourcePinnedPath}
-		}
-		result, _ = executeSnapshot(h.ctx, req, filesystem, markWrite)
+		result, _ = executeSnapshot(h.ctx, req, markWrite)
 	case OpListSnapshots:
 		result, _ = executeListSnapshots(h.ctx, req)
 	case OpRestore:
-		result, _ = executeRestoreWithPublisher(h.ctx, &req, markWrite, func(req *bridgeRequest) error {
+		result, _ = executeRestoreWithPublisher(h.ctx, &req, markWrite, func(_ context.Context, req *bridgeRequest) error {
 			return publishRestoreForHandle(h, req)
 		})
 	case OpCheck:

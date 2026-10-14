@@ -15,10 +15,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/restic/restic/internal/backend/local"
 	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/data"
-	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
 )
@@ -70,7 +68,6 @@ func TestPinnedCallablePathsDoNotFollowReplacements(t *testing.T) {
 	result, err = executeSnapshot(
 		ctx,
 		snapshotReq,
-		pinnedFS{FS: fs.Local{}, original: snapshotReq.sourcePath, pinned: snapshotReq.sourcePinnedPath},
 		func() {},
 	)
 	closeRequestPaths(&snapshotReq)
@@ -169,42 +166,13 @@ func TestWrongPasswordKeyScanHasRepositoryWideBound(t *testing.T) {
 	}
 }
 
-type blockingFS struct {
-	fs.Local
-	onReadEntered chan struct{}
-	blockReadCh   chan struct{}
-	once          sync.Once
-}
-
-type blockingFile struct {
-	fs.File
-	bfs *blockingFS
-}
-
-func (b *blockingFS) OpenFile(name string, flag int, metadataOnly bool) (fs.File, error) {
-	f, err := b.Local.OpenFile(name, flag, metadataOnly)
-	if err != nil {
-		return nil, err
-	}
-	return &blockingFile{File: f, bfs: b}, nil
-}
-
-func (bf *blockingFile) Read(p []byte) (n int, err error) {
-	bf.bfs.once.Do(func() {
-		close(bf.bfs.onReadEntered)
-		<-bf.bfs.blockReadCh
-	})
-	return bf.File.Read(p)
-}
-
 // TestIntegrationLifecycle tests full real-repository operations and lifecycle.
 func TestIntegrationLifecycle(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Chdir(tempDir)
 	repoPath := filepath.Join(tempDir, "repo")
-	// Snapshot the app-owned relative root. Absolute paths also archive their
-	// synthetic ancestors, whose ownership can be unmapped in user namespaces.
-	sourcePath := "source"
+	sourceName := "source"
+	sourcePath := filepath.Join(tempDir, sourceName)
 	restorePath := filepath.Join(tempDir, "restore")
 
 	if err := os.Mkdir(sourcePath, 0700); err != nil {
@@ -288,7 +256,7 @@ func TestIntegrationLifecycle(t *testing.T) {
 		repoPath:   repoPath,
 		sourcePath: sourcePath,
 	}
-	snapRes1, err := executeSnapshot(ctx, snapReq, fs.Local{}, func() {})
+	snapRes1, err := executeSnapshot(ctx, snapReq, func() {})
 	if err != nil || snapRes1.status != StatusOk {
 		t.Fatalf("Snapshot 1 failed: status=%d, diag=%s, err=%v", snapRes1.status, snapRes1.diagnostic, err)
 	}
@@ -298,7 +266,7 @@ func TestIntegrationLifecycle(t *testing.T) {
 	if err := os.WriteFile(secondFile, []byte("second payload"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	snapRes2, err := executeSnapshot(ctx, snapReq, fs.Local{}, func() {})
+	snapRes2, err := executeSnapshot(ctx, snapReq, func() {})
 	if err != nil || snapRes2.status != StatusOk {
 		t.Fatalf("Snapshot 2 failed: status=%d, diag=%s, err=%v", snapRes2.status, snapRes2.diagnostic, err)
 	}
@@ -362,20 +330,19 @@ func TestIntegrationLifecycle(t *testing.T) {
 	}
 
 	// Remove the caller-owned destination; publication requires an absent name.
-	_ = os.Remove(dummyFile)
-	_ = os.Remove(restorePath)
+	_ = os.RemoveAll(restorePath)
 
 	// 10. Clean restore and byte-for-byte check
 	restoreRes, err := executeRestore(ctx, &restoreReq, func() {})
 	if err != nil || restoreRes.status != StatusOk {
 		t.Fatalf("Restore failed: status=%d, diag=%s, err=%v", restoreRes.status, restoreRes.diagnostic, err)
 	}
-	restoredFile := filepath.Join(restorePath, sourcePath, "hello.txt")
+	restoredFile := filepath.Join(restorePath, sourceName, "hello.txt")
 	restoredBytes, err := os.ReadFile(restoredFile)
 	if err != nil || !bytes.Equal(restoredBytes, testData) {
 		t.Fatalf("restored data mismatch: %v", err)
 	}
-	secondBytes, err := os.ReadFile(filepath.Join(restorePath, sourcePath, "second.txt"))
+	secondBytes, err := os.ReadFile(filepath.Join(restorePath, sourceName, "second.txt"))
 	if err != nil || !bytes.Equal(secondBytes, []byte("second payload")) {
 		t.Fatalf("changed snapshot missing second file: %v", err)
 	}
@@ -386,10 +353,10 @@ func TestIntegrationLifecycle(t *testing.T) {
 	if result, err := executeRestore(ctx, &originalReq, func() {}); err != nil || result.status != StatusOk {
 		t.Fatalf("original restore failed: %v %v", result, err)
 	}
-	if _, err := os.Stat(filepath.Join(originalRestore, sourcePath, "second.txt")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(originalRestore, sourceName, "second.txt")); !os.IsNotExist(err) {
 		t.Fatal("original snapshot acquired later content")
 	}
-	originalBytes, err := os.ReadFile(filepath.Join(originalRestore, sourcePath, "hello.txt"))
+	originalBytes, err := os.ReadFile(filepath.Join(originalRestore, sourceName, "hello.txt"))
 	if err != nil || !bytes.Equal(originalBytes, testData) {
 		t.Fatalf("original snapshot bytes differ: %v", err)
 	}
@@ -464,11 +431,18 @@ func TestInProgressCancel(t *testing.T) {
 	}
 
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
-	bfs := &blockingFS{
-		Local:         fs.Local{},
-		onReadEntered: make(chan struct{}),
-		blockReadCh:   make(chan struct{}),
+	onReadEntered := make(chan struct{})
+	blockReadCh := make(chan struct{})
+	var readOnce sync.Once
+	blockContentRead = func() {
+		readOnce.Do(func() {
+			close(onReadEntered)
+			<-blockReadCh
+		})
 	}
+	defer func() {
+		blockContentRead = nil
+	}()
 
 	snapReq := bridgeRequest{
 		operation:  OpSnapshot,
@@ -483,17 +457,17 @@ func TestInProgressCancel(t *testing.T) {
 
 	go func() {
 		defer close(doneCh)
-		snapRes, snapErr = executeSnapshot(cancelCtx, snapReq, bfs, func() {})
+		snapRes, snapErr = executeSnapshot(cancelCtx, snapReq, func() {})
 	}()
 
 	// Wait until file Read is actively blocked
-	<-bfs.onReadEntered
+	<-onReadEntered
 
 	// Cancel operation while inside restic
 	cancelFunc()
 
 	// Unblock Read
-	close(bfs.blockReadCh)
+	close(blockReadCh)
 
 	// Wait for worker to finish
 	<-doneCh
@@ -550,7 +524,7 @@ func TestCorruptedPackCheck(t *testing.T) {
 	if result, err := executeInit(ctx, bridgeRequest{operation: OpInit, password: pass, repoPath: repoPath}, func() {}); err != nil || result.status != StatusOk {
 		t.Fatalf("fixture init failed: %v %v", result, err)
 	}
-	if result, err := executeSnapshot(ctx, bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}, fs.Local{}, func() {}); err != nil || result.status != StatusOk {
+	if result, err := executeSnapshot(ctx, bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}, func() {}); err != nil || result.status != StatusOk {
 		t.Fatalf("fixture snapshot failed: %v %v", result, err)
 	}
 	if result, err := executeCheck(ctx, bridgeRequest{operation: OpCheck, password: pass, repoPath: repoPath}); err != nil || result.status != StatusOk {
@@ -592,7 +566,17 @@ func TestAuthenticatedMalformedMetadataRefusesWithoutProcessPanic(t *testing.T) 
 	if result, err := executeInit(ctx, req, func() {}); err != nil || result.status != StatusOk {
 		t.Fatalf("init: %v %v", result, err)
 	}
-	be, err := local.Open(ctx, localConfig(repoPath), nil)
+	repoFile, err := openPinnedDirectory(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repoFile.Close()
+	repoRoot, err := adoptRoot(repoPath, repoFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repoRoot.Close()
+	be, err := newRootBackend(repoRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

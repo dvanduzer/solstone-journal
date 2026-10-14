@@ -33,3 +33,44 @@ func TestRestoreCleanupClearsDarwinImmutableFlags(t *testing.T) {
 		t.Fatalf("flagged restore staging retained: %v", err)
 	}
 }
+
+func TestDarwinAdoptedRootReadsReplacedDirectory(t *testing.T) {
+	root := t.TempDir()
+	original := filepath.Join(root, "source")
+	moved := filepath.Join(root, "moved")
+	if err := os.Mkdir(original, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(original, "owner.txt"), []byte("retained"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := openPinnedDirectory(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinned.Close()
+
+	adoptedRoot, err := adoptRoot(original, pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adoptedRoot.Close()
+
+	if err := os.Rename(original, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(original, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(original, "replacement.txt"), []byte("wrong"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := adoptedRoot.ReadFile("owner.txt")
+	if err != nil || string(data) != "retained" {
+		t.Fatalf("adopted root redirected after directory replacement: %q %v", data, err)
+	}
+	if _, err := adoptedRoot.Stat("replacement.txt"); !os.IsNotExist(err) {
+		t.Fatal("replacement file visible through adopted root")
+	}
+}

@@ -68,14 +68,16 @@ type bridgeRequest struct {
 	recoveryPassword []byte
 	repoPath         string
 	sourcePath       string
+	sourceName       string
 	restorePath      string
 	snapshotID       string
 	// pathFiles pin caller-authorized directories for the complete asynchronous
-	// operation. The callable entrypoint replaces repository and restore paths
-	// with descriptor-backed paths; sourcePinnedPath is used only by pinnedFS so
-	// the snapshot retains the caller-visible source name.
+	// operation.
 	pathFiles            []*os.File
-	sourcePinnedPath     string
+	repoRoot             *os.Root
+	sourceRoot           *os.Root
+	restoreRoot          *os.Root
+	restoreParentPath    string
 	restoreParent        *os.File
 	restoreStageRoot     *os.File
 	restoreStage         *os.File

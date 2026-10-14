@@ -11,6 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/restic/restic/internal/data"
+	"github.com/restic/restic/internal/repository"
+	"github.com/restic/restic/internal/restic"
 )
 
 func pinnedRestoreFixture(t *testing.T, root string) (*bridgeRequest, string) {
@@ -41,7 +45,7 @@ func pinnedRestoreFixture(t *testing.T, root string) (*bridgeRequest, string) {
 		t.Fatal(err)
 	}
 	return &bridgeRequest{
-		restoreParent: parent, restoreStageRoot: stageRoot, restoreStage: stage,
+		restoreParent: parent, restoreParentPath: root, restoreStageRoot: stageRoot, restoreStage: stage,
 		restoreName: "restore", restoreStageRootName: stageRootName, restoreStageName: stageName,
 		pathFiles: []*os.File{parent, stageRoot, stage},
 	}, stagePath
@@ -108,7 +112,7 @@ func TestRestorePromotionPublishesAbsentDestination(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stagePath, "owner.txt"), []byte("restored"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := promoteRestoreStage(req); err != nil {
+	if err := promoteRestoreStage(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(destination, "owner.txt"))
@@ -134,7 +138,7 @@ func TestRestorePromotionNeverReplacesConcurrentDestination(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("keep"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := promoteRestoreStage(req); err == nil {
+	if err := promoteRestoreStage(context.Background(), req); err == nil {
 		t.Fatal("concurrent destination was replaced")
 	}
 	data, err := os.ReadFile(marker)
@@ -167,7 +171,7 @@ func TestRestorePublicationUsesPinnedStageRoot(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("keep"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := promoteRestoreStage(req); err != nil {
+	if err := promoteRestoreStage(context.Background(), req); err != nil {
 		t.Fatalf("pinned staging payload was not published: %v", err)
 	}
 	data, err := os.ReadFile(filepath.Join(root, "restore", "owner.txt"))
@@ -199,7 +203,7 @@ func TestRestorePublicationRefusesChangedPayloadAlias(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stagePath, "attacker.txt"), []byte("wrong"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := promoteRestoreStage(req); !errors.Is(err, errRestoreStageChanged) {
+	if err := promoteRestoreStage(context.Background(), req); !errors.Is(err, errRestoreStageChanged) {
 		t.Fatalf("changed payload alias was not refused: %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "restore")); !os.IsNotExist(err) {
@@ -280,7 +284,7 @@ func TestRestoreReportsCommittedUncertainAfterPostPublishSyncFailure(t *testing.
 		return originalSync(fd)
 	}
 	defer func() { syncDirectory = originalSync }()
-	err := promoteRestoreStage(req)
+	err := promoteRestoreStage(context.Background(), req)
 	if !errors.Is(err, errRestoreCommittedUncertain) {
 		t.Fatalf("committed uncertainty not reported: %v", err)
 	}
@@ -289,5 +293,451 @@ func TestRestoreReportsCommittedUncertainAfterPostPublishSyncFailure(t *testing.
 	}
 	if err := closeRequestPaths(req); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMetadataOnlyOpenSurvivesPathReplacementAndNodeReStat(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.Mkdir(sourceDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	testFile := filepath.Join(sourceDir, "file.txt")
+	if err := os.WriteFile(testFile, []byte("initial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := openPinnedDirectory(sourceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinned.Close()
+
+	adoptedRoot, err := adoptRoot(sourceDir, pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adoptedRoot.Close()
+
+	rfs := newRootFS(adoptedRoot, "source")
+	fileMeta, err := rfs.OpenFile("source/file.txt", os.O_RDONLY, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fileMeta.Close()
+
+	if err := os.WriteFile(testFile, []byte("updated larger content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := fileMeta.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size != int64(len("updated larger content")) {
+		t.Fatalf("expected updated size, got %d", st.Size)
+	}
+
+	node, err := fileMeta.ToNode(false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Size != uint64(len("updated larger content")) {
+		t.Fatalf("expected node updated size, got %d", node.Size)
+	}
+}
+
+func TestInRootEscapingSymlinkContentOpenFails(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.Mkdir(sourceDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(root, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(sourceDir, "link-outside")); err != nil {
+		t.Fatal(err)
+	}
+
+	pinned, err := openPinnedDirectory(sourceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pinned.Close()
+
+	adoptedRoot, err := adoptRoot(sourceDir, pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adoptedRoot.Close()
+
+	rfs := newRootFS(adoptedRoot, "source")
+	_, err = rfs.OpenFile("source/link-outside", os.O_RDONLY, false)
+	if err == nil {
+		t.Fatal("expected content open on symlink to fail")
+	}
+}
+
+func TestSnapshotFailsWhenDirectoryUnreadableOrXattrFault(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	sourcePath := filepath.Join(root, "source")
+	if err := os.Mkdir(repoPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sourcePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "file.txt"), []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pass := []byte("fault_password")
+	initReq := bridgeRequest{operation: OpInit, password: pass, repoPath: repoPath}
+	if err := pinRequestPaths(&initReq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeInit(ctx, initReq, func() {}); err != nil {
+		closeRequestPaths(&initReq)
+		t.Fatal(err)
+	}
+	closeRequestPaths(&initReq)
+
+	readXattrFault = errors.New("synthetic xattr fault")
+	defer func() { readXattrFault = nil }()
+
+	snapReq := bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}
+	if err := pinRequestPaths(&snapReq); err != nil {
+		t.Fatal(err)
+	}
+	defer closeRequestPaths(&snapReq)
+	res, err := executeSnapshot(ctx, snapReq, func() {})
+	if err == nil || res.status == StatusOk {
+		t.Fatal("expected snapshot to fail on xattr fault")
+	}
+}
+
+func TestSnapshotPathsAndRootNodeOmitDescriptorOrStageNames(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	sourcePath := filepath.Join(root, "source")
+	if err := os.Mkdir(repoPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sourcePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "file.txt"), []byte("content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pass := []byte("test_password")
+	initReq := bridgeRequest{operation: OpInit, password: pass, repoPath: repoPath}
+	if err := pinRequestPaths(&initReq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeInit(ctx, initReq, func() {}); err != nil {
+		closeRequestPaths(&initReq)
+		t.Fatal(err)
+	}
+	closeRequestPaths(&initReq)
+
+	snapReq := bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}
+	if err := pinRequestPaths(&snapReq); err != nil {
+		t.Fatal(err)
+	}
+	res, err := executeSnapshot(ctx, snapReq, func() {})
+	closeRequestPaths(&snapReq)
+	if err != nil || res.status != StatusOk {
+		t.Fatalf("snapshot failed: %v", err)
+	}
+
+	repoFile, err := openPinnedDirectory(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repoFile.Close()
+	repoRoot, err := adoptRoot(repoPath, repoFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repoRoot.Close()
+	be, err := newRootBackend(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer be.Close()
+	repo, err := repository.New(guardedBackend{be}, repository.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := safeScanKey(ctx, repo, string(pass)); err != nil {
+		t.Fatal(err)
+	}
+	snID, err := restic.ParseID(res.snapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sn, err := data.LoadSnapshot(ctx, repo, snID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sn.Paths) != 1 || sn.Paths[0] != "source" {
+		t.Fatalf("expected sn.Paths to be ['source'], got %v", sn.Paths)
+	}
+}
+
+func TestRestoreParentReplacedBeforeWrites(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	sourcePath := filepath.Join(root, "source")
+	parentDir := filepath.Join(root, "parent")
+	restorePath := filepath.Join(parentDir, "restore")
+	for _, p := range []string{repoPath, sourcePath, parentDir} {
+		if err := os.Mkdir(p, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "file.txt"), []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pass := []byte("restore_pass")
+	initReq := bridgeRequest{operation: OpInit, password: pass, repoPath: repoPath}
+	if err := pinRequestPaths(&initReq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeInit(ctx, initReq, func() {}); err != nil {
+		closeRequestPaths(&initReq)
+		t.Fatal(err)
+	}
+	closeRequestPaths(&initReq)
+
+	snapReq := bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}
+	if err := pinRequestPaths(&snapReq); err != nil {
+		t.Fatal(err)
+	}
+	snapRes, err := executeSnapshot(ctx, snapReq, func() {})
+	closeRequestPaths(&snapReq)
+	if err != nil || snapRes.status != StatusOk {
+		t.Fatal(err)
+	}
+
+	restoreReq := bridgeRequest{
+		operation:   OpRestore,
+		password:    pass,
+		repoPath:    repoPath,
+		sourcePath:  sourcePath,
+		restorePath: restorePath,
+		snapshotID:  snapRes.snapshotID,
+	}
+	if err := pinRequestPaths(&restoreReq); err != nil {
+		t.Fatal(err)
+	}
+	defer closeRequestPaths(&restoreReq)
+
+	movedParent := filepath.Join(root, "moved-parent")
+	if err := os.Rename(parentDir, movedParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(parentDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := executeRestore(ctx, &restoreReq, func() {})
+	if err == nil || res.status == StatusOk {
+		t.Fatal("expected restore to fail after parent directory replacement before writes")
+	}
+}
+
+func TestRestoreParentReplacedDuringWrites(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	sourcePath := filepath.Join(root, "source")
+	parentDir := filepath.Join(root, "parent")
+	restorePath := filepath.Join(parentDir, "restore")
+	for _, p := range []string{repoPath, sourcePath, parentDir} {
+		if err := os.Mkdir(p, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "file.txt"), []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pass := []byte("restore_pass")
+	initReq := bridgeRequest{operation: OpInit, password: pass, repoPath: repoPath}
+	if err := pinRequestPaths(&initReq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeInit(ctx, initReq, func() {}); err != nil {
+		closeRequestPaths(&initReq)
+		t.Fatal(err)
+	}
+	closeRequestPaths(&initReq)
+
+	snapReq := bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}
+	if err := pinRequestPaths(&snapReq); err != nil {
+		t.Fatal(err)
+	}
+	snapRes, err := executeSnapshot(ctx, snapReq, func() {})
+	closeRequestPaths(&snapReq)
+	if err != nil || snapRes.status != StatusOk {
+		t.Fatal(err)
+	}
+
+	restoreReq := bridgeRequest{
+		operation:   OpRestore,
+		password:    pass,
+		repoPath:    repoPath,
+		sourcePath:  sourcePath,
+		restorePath: restorePath,
+		snapshotID:  snapRes.snapshotID,
+	}
+	if err := pinRequestPaths(&restoreReq); err != nil {
+		t.Fatal(err)
+	}
+	defer closeRequestPaths(&restoreReq)
+
+	testGate = func(point string, _ context.Context) error {
+		if point == "restore-write" {
+			moved := filepath.Join(root, "parent-moved")
+			if err := os.Rename(parentDir, moved); err != nil {
+				return err
+			}
+			if err := os.Mkdir(parentDir, 0700); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	defer func() { testGate = nil }()
+
+	res, err := executeRestore(ctx, &restoreReq, func() {})
+	if err == nil || res.status == StatusOk {
+		t.Fatal("expected restore to fail when parent directory is replaced during writes")
+	}
+}
+
+func TestRestoreParentReplacedBeforePublication(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	sourcePath := filepath.Join(root, "source")
+	parentDir := filepath.Join(root, "parent")
+	restorePath := filepath.Join(parentDir, "restore")
+	for _, p := range []string{repoPath, sourcePath, parentDir} {
+		if err := os.Mkdir(p, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "file.txt"), []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pass := []byte("restore_pass")
+	initReq := bridgeRequest{operation: OpInit, password: pass, repoPath: repoPath}
+	if err := pinRequestPaths(&initReq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeInit(ctx, initReq, func() {}); err != nil {
+		closeRequestPaths(&initReq)
+		t.Fatal(err)
+	}
+	closeRequestPaths(&initReq)
+
+	snapReq := bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}
+	if err := pinRequestPaths(&snapReq); err != nil {
+		t.Fatal(err)
+	}
+	snapRes, err := executeSnapshot(ctx, snapReq, func() {})
+	closeRequestPaths(&snapReq)
+	if err != nil || snapRes.status != StatusOk {
+		t.Fatal(err)
+	}
+
+	restoreReq := bridgeRequest{
+		operation:   OpRestore,
+		password:    pass,
+		repoPath:    repoPath,
+		sourcePath:  sourcePath,
+		restorePath: restorePath,
+		snapshotID:  snapRes.snapshotID,
+	}
+	if err := pinRequestPaths(&restoreReq); err != nil {
+		t.Fatal(err)
+	}
+	defer closeRequestPaths(&restoreReq)
+
+	testGate = func(point string, _ context.Context) error {
+		if point == "before-publish" {
+			moved := filepath.Join(root, "parent-moved-pub")
+			if err := os.Rename(parentDir, moved); err != nil {
+				return err
+			}
+			if err := os.Mkdir(parentDir, 0700); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	defer func() { testGate = nil }()
+
+	res, err := executeRestore(ctx, &restoreReq, func() {})
+	if err == nil || res.status == StatusOk {
+		t.Fatal("expected restore publication to fail after parent directory replaced before publication")
+	}
+}
+
+func TestRepositoryDirectoryReplacementPreservesRetainedRepo(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	sourcePath := filepath.Join(root, "source")
+	if err := os.Mkdir(repoPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sourcePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourcePath, "file.txt"), []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pass := []byte("repo_replace_pass")
+	initReq := bridgeRequest{operation: OpInit, password: pass, repoPath: repoPath}
+	if err := pinRequestPaths(&initReq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeInit(ctx, initReq, func() {}); err != nil {
+		closeRequestPaths(&initReq)
+		t.Fatal(err)
+	}
+	closeRequestPaths(&initReq)
+
+	snapReq := bridgeRequest{operation: OpSnapshot, password: pass, repoPath: repoPath, sourcePath: sourcePath}
+	if err := pinRequestPaths(&snapReq); err != nil {
+		t.Fatal(err)
+	}
+	defer closeRequestPaths(&snapReq)
+
+	movedRepo := filepath.Join(root, "repo-moved")
+	if err := os.Rename(repoPath, movedRepo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(repoPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := executeSnapshot(ctx, snapReq, func() {})
+	if err != nil || res.status != StatusOk {
+		t.Fatalf("snapshot failed on retained repo: %v (result=%+v)", err, res)
+	}
+
+	entries, err := os.ReadDir(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("replacement repo directory was written to: %d entries", len(entries))
 	}
 }
