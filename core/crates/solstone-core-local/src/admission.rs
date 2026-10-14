@@ -444,6 +444,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::test_support::lock_released;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -808,7 +809,7 @@ mod tests {
             run_confidential_call(journal.path(), older, ACQUIRE_DEADLINE, |_| "ok", |_| false);
         assert_eq!(ran, Ok("ok"));
         assert!(
-            confidential_background_open(journal.path()),
+            lock_released(|| confidential_background_open(journal.path())),
             "success leaves no pause"
         );
 
@@ -838,7 +839,7 @@ mod tests {
         );
         drop(waiter);
         assert!(
-            confidential_background_open(journal.path()),
+            lock_released(|| confidential_background_open(journal.path())),
             "a gone waiter"
         );
         let pause = |text: &str| fs::write(root.join(PAUSE_FILE), text).unwrap();

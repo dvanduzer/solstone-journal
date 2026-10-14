@@ -14,6 +14,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - with confidential processing, older recordings and days waiting their turn no longer hold up new recordings and recent days. your journal works on one older item at a time, and newer work starts ahead of older work still waiting.
 - stopping or restarting your journal no longer waits several extra seconds when a background job left a helper program running. that time now goes to letting your journal's other programs stop cleanly.
+- media offload runs again on a large journal. a check it runs first mistook your journal's ordinary activity for unfinished work, so offload stopped before it began. nothing was removed, and your media stayed on this computer.
 
 ## [2.0.46] - 2026-10-14
 

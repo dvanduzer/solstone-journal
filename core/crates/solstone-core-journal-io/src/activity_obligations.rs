@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::journal_root::{JournalEntryKind, JournalRoot};
-use crate::media::{MediaDirectory, MediaEntry, RootCarrierObservation};
+use crate::media::{MediaDirectory, MediaEntry, MediaIdentity, RootCarrierObservation};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryBudget {
@@ -249,6 +249,45 @@ enum Role {
     Health,
     Offload,
     Intents,
+}
+
+/// Required children each role enters by name.
+fn frontiers(role: Role) -> &'static [(&'static str, Role)] {
+    match role {
+        Role::Root => &[("chronicle", Role::Chronicle(0)), ("health", Role::Health)],
+        Role::Health => &[("offload", Role::Offload)],
+        Role::Offload => &[("restore-intents", Role::Intents)],
+        Role::Chronicle(_) | Role::Intents => &[],
+    }
+}
+
+/// What a directory's final listing must still match. A live journal keeps
+/// writing while the walk runs, so the size and times of ordinary entries are
+/// not evidence: only stages, intents and the identity of each entered child.
+#[derive(PartialEq)]
+enum Relisted<'a> {
+    Evidence(&'a MediaEntry),
+    Entered(&'a OsStr, JournalEntryKind, MediaIdentity),
+}
+
+fn relisted(entries: &[MediaEntry], role: Role) -> Vec<Relisted<'_>> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if matches!(role, Role::Intents) || is_stage_namespace_name(&entry.name) {
+                Some(Relisted::Evidence(entry))
+            } else if (matches!(role, Role::Chronicle(0..=1))
+                && entry.kind != JournalEntryKind::RegularFile)
+                || frontiers(role)
+                    .iter()
+                    .any(|(name, _)| entry.name == OsStr::new(name))
+            {
+                Some(Relisted::Entered(&entry.name, entry.kind, entry.identity))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -614,45 +653,18 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
                 }
             }
         }
-        match role {
-            Role::Root => {
-                self.frontier(
-                    directory,
-                    &entries,
-                    relative,
-                    "chronicle",
-                    Role::Chronicle(0),
-                    &mut missing,
-                )?;
-                self.frontier(
-                    directory,
-                    &entries,
-                    relative,
-                    "health",
-                    Role::Health,
-                    &mut missing,
-                )?;
-            }
-            Role::Health => self.frontier(
+        for &(name, child_role) in frontiers(role) {
+            self.frontier(
                 directory,
                 &entries,
                 relative,
-                "offload",
-                Role::Offload,
+                name,
+                child_role,
                 &mut missing,
-            )?,
-            Role::Offload => self.frontier(
-                directory,
-                &entries,
-                relative,
-                "restore-intents",
-                Role::Intents,
-                &mut missing,
-            )?,
-            _ => {}
+            )?;
         }
         (self.checkpoint)(Checkpoint::BeforeFinalList, relative);
-        if self.entries(directory, relative)? != entries {
+        if relisted(&self.entries(directory, relative)?, role) != relisted(&entries, role) {
             return Err(error(RecoveryObservationFailure::Changed, relative));
         }
         for name in missing {
@@ -1151,6 +1163,53 @@ mod tests {
         assert!(observed.entries().is_empty());
         assert!(stage.is_dir());
         assert_eq!(f.observed().unwrap().entries().len(), 1);
+    }
+
+    #[test]
+    fn ordinary_writes_during_the_walk_complete_but_a_late_stage_or_changed_child_refuses() {
+        for late in ["none", "stage", "replaced", "new_child"] {
+            let f = Fixture::new();
+            f.directory("chronicle/20260101/stream");
+            f.directory("health/offload/restore-intents");
+            f.directory("indexer");
+            fs::write(f.path("journal.log"), b"line").unwrap();
+            let mut hit = false;
+            let observed = observe_with(&f.root, Limits::default(), |point, relative| {
+                if point != Checkpoint::BeforeFinalList {
+                    return;
+                }
+                if relative == Path::new("chronicle") {
+                    fs::write(f.path("chronicle/20260101/segment.json"), b"new").unwrap();
+                }
+                if relative == Path::new("chronicle/20260101") && late == "new_child" {
+                    f.directory("chronicle/20260101/unwalked");
+                    hit = true;
+                }
+                if relative == Path::new("") {
+                    fs::write(f.path("indexer/index.db-wal"), b"live").unwrap();
+                    fs::write(f.path("health/supervisor.json"), b"live").unwrap();
+                    fs::write(f.path("journal.log"), b"line\nline").unwrap();
+                    f.directory("mcp-endpoint");
+                    match late {
+                        "stage" => f.directory(".tmp-offload-late"),
+                        "replaced" => {
+                            fs::rename(f.path("health"), f.path("health.saved")).unwrap();
+                            f.directory("health/offload/restore-intents");
+                        }
+                        _ => {}
+                    }
+                    hit = true;
+                }
+            });
+            assert!(hit);
+            match late {
+                "none" => assert!(observed.unwrap().entries().is_empty()),
+                _ => assert_eq!(
+                    observed.unwrap_err().failure,
+                    RecoveryObservationFailure::Changed
+                ),
+            }
+        }
     }
 
     #[test]

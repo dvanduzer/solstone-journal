@@ -1429,7 +1429,7 @@ fn native_backup_grammar_never_reaches_a_poisoned_interpreter() {
         );
         if argv == ["offload", "run"] {
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains("offload did not finish."),
+                String::from_utf8_lossy(&output.stdout).contains("reason=preparation_refused"),
                 "empty configuration must retain the actual offload refusal"
             );
         }

@@ -318,20 +318,12 @@ impl Drop for HelperChild {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[cfg(not(windows))]
-    #[cfg(all(test, feature = "full-tests"))]
-    use std::fs;
-    #[cfg(unix)]
-    #[cfg(all(test, feature = "full-tests"))]
-    use std::os::unix::fs::PermissionsExt;
 
     #[cfg(all(test, feature = "full-tests"))]
     fn write_stub(body: &str) -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join(HELPER);
-        fs::write(&path, body).unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&path, body.as_bytes());
         (root, path)
     }
 

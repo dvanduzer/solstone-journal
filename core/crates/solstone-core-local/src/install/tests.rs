@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use solstone_core_assets::{Artifact, Backend, Platform, catalog, resolve};
 
 use crate::nvidia::NVIDIA_PROBE_SCHEMA;
+use crate::test_support::lock_released;
 
 const PARAKEET_TEST_KEY: &str = "x86_64-unknown-linux-gnu";
 
@@ -216,7 +217,7 @@ fn metal_runtime_requires_the_supported_platform_without_ready_state() {
     assert_eq!(current.install_state, "failed");
     assert_eq!(current.error_code.as_deref(), Some("unsupported_platform"));
     assert!(lease::lease_path(&root, "local").exists());
-    assert!(!lease::is_held(&root, "local").unwrap());
+    assert!(lock_released(|| !lease::is_held(&root, "local").unwrap()));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -280,8 +281,7 @@ fn metal_candidate_inspect_is_pure_and_reports_component_reasons_and_fit() {
     let model = cache.join("models/local__qwen3.5-4b");
     fs::create_dir_all(&runtime).unwrap();
     fs::create_dir_all(&model).unwrap();
-    fs::write(runtime.join("llama-server"), b"#!/bin/sh\nexit 0\n").unwrap();
-    archive::make_executable(&runtime.join("llama-server")).unwrap();
+    crate::test_support::write_executable(&runtime.join("llama-server"), b"#!/bin/sh\nexit 0\n");
     fs::write(model.join("Qwen3.5-4B-Q4_K_M.gguf"), b"model").unwrap();
     fs::write(model.join("mmproj-F16.gguf"), b"projector").unwrap();
     let runtime_manifest = manifest::build_manifest(
@@ -334,17 +334,16 @@ fn metal_candidate_inspect_is_pure_and_reports_component_reasons_and_fit() {
         "deferred_until_launch"
     );
     let marker = root.join("probe-ran");
-    fs::write(
-        runtime.join("llama-server"),
-        format!("#!/bin/sh\ntouch {}\n", marker.display()),
-    )
-    .unwrap();
+    crate::test_support::write_executable(
+        &runtime.join("llama-server"),
+        format!("#!/bin/sh\ntouch {}\n", marker.display()).as_bytes(),
+    );
     assert_eq!(
         metal_candidate::inspect_with(&candidate_request(&root), "aarch64-apple-darwin").unwrap()["reason_code"],
         "sha256_mismatch"
     );
     assert!(!marker.exists(), "failed proof must not execute the binary");
-    fs::write(runtime.join("llama-server"), b"#!/bin/sh\nexit 0\n").unwrap();
+    crate::test_support::write_executable(&runtime.join("llama-server"), b"#!/bin/sh\nexit 0\n");
 
     status::begin(
         &root,
@@ -1356,6 +1355,7 @@ fn an_install_whose_installer_is_gone_reads_interrupted_not_in_progress() {
     assert_eq!(running["in_flight"], true);
     assert_eq!(running["install"]["install_state"], "downloading");
     drop(held);
+    assert!(lock_released(|| !lease::is_held(&root, "parakeet").unwrap()));
 
     let gone = inspect_parakeet(&root, PARAKEET_TEST_KEY);
     assert_eq!(gone["in_flight"], false);
@@ -3485,6 +3485,7 @@ fn cancellation_fences_attempt_and_requires_writer_lease_release() {
     assert_eq!(still_live.unwrap_err().exit_code, 75);
     assert_eq!(status::read_status(&journal, "local").unwrap(), initial);
     drop(held);
+    assert!(lock_released(|| !lease::is_held(&journal, "local").unwrap()));
     let cancelled = super::cancel_local_bootstrap(&journal, "local", attempt, |_| {
         panic!("free lease needs no signal")
     })
