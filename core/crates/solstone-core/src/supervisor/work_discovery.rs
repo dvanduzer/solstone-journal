@@ -2040,16 +2040,19 @@ mod tests {
         );
     }
 
-    /// Yesterday's daily work is early work, and checking whether it is still
+    /// Owner-requested daily work is early work, and checking whether it is still
     /// owed reads the whole day. A pass must not check it again after every
     /// older day it inspects when nothing about the early work has changed.
     #[test]
     fn early_work_is_not_checked_again_after_every_older_day() {
         let root = fixture("local");
-        let yesterday = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
+        // Stay clear of yesterday's intentional hold just after UTC midnight,
+        // while retaining band-2 early admission through the owner request.
+        let recent_day = (chrono::Utc::now().date_naive() - chrono::Duration::days(2))
             .format("%Y%m%d")
             .to_string();
-        thought_without_receipt(root.path(), &yesterday, &["090000_60", "100000_60"]);
+        thought_without_receipt(root.path(), &recent_day, &["090000_60", "100000_60"]);
+        work_intent::register(root.path(), &recent_day, false).unwrap();
         let older = 24;
         for n in 0..older {
             segment(
@@ -2062,8 +2065,8 @@ mod tests {
         STILL_OWED_CHECKS.with(|checks| checks.set(0));
         reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
         let checks = STILL_OWED_CHECKS.with(|checks| checks.get());
-        assert!(queue.contains_reference(&format!("supervisor-work-{yesterday}-daily")));
-        // One early admission after yesterday, then the final admission of the
+        assert!(queue.contains_reference(&format!("supervisor-work-{recent_day}-daily")));
+        // One early admission after the recent day, then the final admission of the
         // ranking: a few checks, not one more per older day.
         assert!(
             checks < older,
