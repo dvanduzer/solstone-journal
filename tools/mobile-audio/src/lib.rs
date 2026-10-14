@@ -48,6 +48,21 @@ fn verify_model(path: &Path) -> Result<(), String> {
 }
 
 impl Parakeet {
+    /// Identity of the maintained recognizer, before allocating its context.
+    pub fn pinned_model_info() -> EmbeddedModelInfo {
+        EmbeddedModelInfo {
+            backend: "parakeet-cpp".into(),
+            model: "tdt-0.6b-v3-q8_0".into(),
+            device: if cfg!(target_os = "ios") {
+                "auto"
+            } else {
+                "cpu"
+            }
+            .into(),
+            compute_type: "q8_0".into(),
+        }
+    }
+
     /// Verify and load the maintained model. Scratch is app-private and shared
     /// with the production VAD/speaker pipeline; ASR itself accepts PCM directly.
     pub fn new(model: &Path, scratch: &Path) -> Result<Self, String> {
@@ -85,17 +100,7 @@ impl EmbeddedAsr for Parakeet {
     }
 
     fn model_info(&self) -> EmbeddedModelInfo {
-        EmbeddedModelInfo {
-            backend: "parakeet-cpp".into(),
-            model: "tdt-0.6b-v3-q8_0".into(),
-            device: if cfg!(target_os = "ios") {
-                "auto"
-            } else {
-                "cpu"
-            }
-            .into(),
-            compute_type: "q8_0".into(),
-        }
+        Self::pinned_model_info()
     }
 }
 
