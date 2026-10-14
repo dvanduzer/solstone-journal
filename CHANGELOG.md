@@ -10,9 +10,17 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - stopping or restarting your journal no longer waits several extra seconds when a background job left a helper program running. that time now goes to letting your journal's other programs stop cleanly.
 
+## [2.0.46] - 2026-10-14
+
+on windows, this version brings every change in [2.0.45](https://solstone.app/releases#v2.0.45) and [2.0.44](https://solstone.app/releases#v2.0.44), including the security fix in 2.0.44, so please update. where 2.0.44 says offload, approving or restoring is paused or isn't available on windows, this version turns it back on.
+
+### Fixed
+
+- on mac, confidential processing works again. in 2.0.45, health said processing needed attention and that your journal's install didn't match. your install was fine: your journal couldn't check the service, so it sent nothing and kept that work for later. it catches up after you update, with nothing for you to redo.
+
 ## [2.0.45] - 2026-10-14
 
-on windows, this version also brings every change in [2.0.44](https://solstone.app/releases#v2.0.44), including its security fix, so please update. where 2.0.44 says offload, approving or restoring stays paused on windows, this version turns it back on.
+2.0.45 isn't available on windows. on windows, your journal stays on 2.0.43 and gets these changes, and those in 2.0.44, in a later version.
 
 ### Changed
 
