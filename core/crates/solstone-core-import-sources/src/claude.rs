@@ -153,11 +153,12 @@ fn parse_conversation(
         };
         entries.push(ParsedEntry {
             timestamp,
-            speaker: if string_at(message, "sender") == Some("human") {
-                "Human".to_owned()
-            } else {
-                "Assistant".to_owned()
-            },
+            speaker: match string_at(message, "sender") {
+                Some("human") => "Human",
+                Some("assistant") => "Assistant",
+                _ => "Unknown",
+            }
+            .to_owned(),
             text: text.to_owned(),
             model_slug: None,
             thread: conversation_index,

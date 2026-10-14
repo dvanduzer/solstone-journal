@@ -353,37 +353,36 @@ pub(crate) fn process_one_with(
         .as_ref()
         .map(|audio| audio.len() as f64 / f64::from(SAMPLE_RATE));
 
-    let resolve_backend = || match resolve_default_backend(
-        explicit_backend,
-        local_stt_backend(),
-        read_available_bytes(),
-        platform_floor_bytes(),
-        confidential::confidential_channel_plausible(config),
-        confidential_audio_enabled(config),
-    ) {
-        Ok(resolution) => Ok(resolution.backend),
-        Err(error) => {
-            emit_backend_error(
-                BackendErrorContext {
-                    audio_path,
-                    journal_path,
-                    audio_seconds,
-                    reduced_seconds,
-                    timings: &timings,
-                    vad: &vad,
-                },
-                &error,
-                None,
-            );
-            Err(error)
-        }
+    let resolve_backend = || {
+        resolve_default_backend(
+            explicit_backend,
+            local_stt_backend(),
+            read_available_bytes(),
+            platform_floor_bytes(),
+            confidential::confidential_channel_plausible(config),
+            confidential_audio_enabled(config),
+        )
+        .map(|resolution| resolution.backend)
     };
     #[cfg(all(feature = "embedded", unix))]
-    let backend = embedded
-        .map(|runtime| runtime.asr.model_info().backend)
-        .map_or_else(resolve_backend, Ok)?;
+    let backend =
+        crate::embedded::select_backend(resolve_backend(), embedded, explicit_backend, config);
     #[cfg(not(all(feature = "embedded", unix)))]
-    let backend = resolve_backend()?;
+    let backend = resolve_backend();
+    let backend = backend.inspect_err(|error| {
+        emit_backend_error(
+            BackendErrorContext {
+                audio_path,
+                journal_path,
+                audio_seconds,
+                reduced_seconds,
+                timings: &timings,
+                vad: &vad,
+            },
+            error,
+            None,
+        );
+    })?;
     // 🔴 Reduce anyway when the confidential limit would otherwise refuse this audio.
     //
     // `reduce_audio_if_needed` declines when the VAD result is noisy AND speech-dense,
@@ -410,10 +409,12 @@ pub(crate) fn process_one_with(
 
     let mut asr_at = None;
     #[cfg(all(feature = "embedded", unix))]
-    let embedded_dispatched = embedded.map(|runtime| {
-        asr_at = Some(Instant::now());
-        runtime.transcribe(statement_audio)
-    });
+    let embedded_dispatched = embedded
+        .filter(|_| backend != "confidential")
+        .map(|runtime| {
+            asr_at = Some(Instant::now());
+            runtime.transcribe(statement_audio)
+        });
     let dispatch = || {
         if backend == "confidential" {
             // 🔴 Cap on what is actually SENT, not on the whole segment. `statement_audio`
@@ -440,6 +441,8 @@ pub(crate) fn process_one_with(
                         &backend,
                         statement_audio,
                         attestation_state,
+                        #[cfg(all(feature = "embedded", unix))]
+                        embedded,
                     )
                 },
             )
@@ -451,6 +454,8 @@ pub(crate) fn process_one_with(
                 &backend,
                 statement_audio,
                 attestation_state,
+                #[cfg(all(feature = "embedded", unix))]
+                embedded,
             )
         }
     };
@@ -686,6 +691,7 @@ fn dispatch_backend(
     backend: &str,
     statement_audio: &[f32],
     attestation_state: &AttestationStateStore,
+    #[cfg(all(feature = "embedded", unix))] embedded: Option<&crate::embedded::EmbeddedContext<'_>>,
 ) -> Result<(parakeet_cpp::TranscriptionResponse, parakeet_cpp::ModelInfo), TranscribeError> {
     if uses_parakeet_cpp(backend) {
         return dispatch_after_egress_gate(config, backend, || {
@@ -714,6 +720,16 @@ fn dispatch_backend(
     }
     if backend == "confidential" {
         return dispatch_after_egress_gate(config, backend, || {
+            #[cfg(all(feature = "embedded", unix))]
+            if let Some(runtime) = embedded {
+                return confidential::transcribe_cancellable(
+                    statement_audio,
+                    journal_path,
+                    config,
+                    attestation_state,
+                    &|| runtime.checkpoint(),
+                );
+            }
             confidential::transcribe(statement_audio, journal_path, config, attestation_state)
         });
     }
@@ -2044,8 +2060,16 @@ mod tests {
         let dummy_journal = Path::new("/dummy/journal");
 
         for config in [&active_config, &empty_config] {
-            let error =
-                super::dispatch_backend(config, dummy_journal, "remote", &[], &store).unwrap_err();
+            let error = super::dispatch_backend(
+                config,
+                dummy_journal,
+                "remote",
+                &[],
+                &store,
+                #[cfg(all(feature = "embedded", unix))]
+                None,
+            )
+            .unwrap_err();
             match error {
                 TranscribeError::BackendNotImplemented { backend } => {
                     assert_eq!(backend, "remote");

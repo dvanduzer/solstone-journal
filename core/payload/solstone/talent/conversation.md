@@ -47,7 +47,9 @@ Who acted. `from` and `to`, and credit in the body, say who acted:
 - a person's name: someone else, as the source names them.
 - `"unknown"`: the source does not show who. Never guess `"you"`.
 
-Who spoke. In a transcript, a line under `You:` is yours: the journal recognized your voice. A line under a person's name is theirs, recognized by their voice. `Speaker 1`, `Speaker 2` and other unnamed speakers are not identified, and none of them is you. When no line is under `You:`, you said nothing in that transcript, and nothing said in it is yours.
+Who spoke. In a recording transcript, a line under `You:` is yours: the journal recognized your voice. A line under a person's name is theirs, recognized by their voice. `Speaker 1`, `Speaker 2` and other unnamed speakers are not identified, and none of them is you. When no line is under `You:`, you said nothing in that recording, and nothing said in it is yours.
+
+In an imported AI conversation, `You:` labels your messages and `Assistant:` labels the assistant's replies. These are written messages, not voice recognition. `Unknown:` is unassigned; never treat it as you or the assistant.
 
 Body requirements:
 - Write one tight paragraph in chronological order.

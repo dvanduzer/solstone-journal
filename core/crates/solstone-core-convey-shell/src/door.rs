@@ -797,6 +797,29 @@ pub(super) async fn start(options: DoorStartOptions) -> DoorStart {
             };
         }
     };
+    // An app binds its LAN door to one selected interface, rather than every
+    // interface. Retain the same authenticated door on loopback for the relay
+    // and its exact-socket pairing admissions. Desktop wildcard and loopback
+    // listeners already cover that address.
+    let loopback_listener = if bind_ip != Ipv4Addr::UNSPECIFIED && bind_ip != Ipv4Addr::LOCALHOST {
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, bound.port())).await {
+            Ok(listener) => Some(listener),
+            Err(source) => {
+                return DoorStart {
+                    outcome: DoorOutcome::BindFailed {
+                        port: bound.port(),
+                        source,
+                    },
+                    refresh_task: None,
+                    accept_task: None,
+                    pairing_reaper_task: None,
+                    pairing_cap_refusals: None,
+                };
+            }
+        }
+    } else {
+        None
+    };
     let label = match solstone_core_sol_link::mark::mark_words_from_jid(identity.instance_id()) {
         Ok(label) => label,
         Err(error) => {
@@ -889,6 +912,7 @@ pub(super) async fn start(options: DoorStartOptions) -> DoorStart {
     });
     let accept_task = tokio::spawn(accept_loop(
         listener,
+        loopback_listener,
         options.router,
         config,
         options.stream_stall_timeout,
@@ -1029,6 +1053,7 @@ async fn record_pair_dispatch(state: &Arc<PairingCarrierState>, status: StatusCo
 
 async fn accept_loop(
     listener: TcpListener,
+    loopback_listener: Option<TcpListener>,
     router: Router,
     config: Arc<DoorConnectionConfig>,
     stream_stall_timeout: Duration,
@@ -1040,6 +1065,12 @@ async fn accept_loop(
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
+            accepted = async {
+                match &loopback_listener {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => accepted,
             Some(_) = network_carriers.join_next(), if !network_carriers.is_empty() => continue,
         };
         let Ok((stream, peer)) = accepted else {
@@ -1674,68 +1705,79 @@ mod tests {
     #[tokio::test]
     async fn local_network_choice_rebinds_the_door_between_loopback_and_the_network() {
         use solstone_core_sol_link::ca::{generate_ca, jid_from_spki};
-
-        let journal = tempfile::TempDir::new_in(std::env::temp_dir()).expect("journal creates");
-        let root = journal.path();
-        let ca = generate_ca().expect("CA");
-        std::fs::create_dir_all(root.join("link/ca")).expect("CA directory");
-        std::fs::write(root.join("link/ca/cert.pem"), ca.certificate_pem()).expect("CA cert");
-        std::fs::write(root.join("link/ca/private.pem"), ca.private_key_pem()).expect("CA key");
-        std::fs::write(
+        for interface in [None, Some(Ipv4Addr::new(127, 0, 0, 2))] {
+            let journal = tempfile::TempDir::new_in(std::env::temp_dir()).expect("journal creates");
+            let root = journal.path();
+            let ca = generate_ca().expect("CA");
+            std::fs::create_dir_all(root.join("link/ca")).expect("CA directory");
+            std::fs::write(root.join("link/ca/cert.pem"), ca.certificate_pem()).expect("CA cert");
+            std::fs::write(root.join("link/ca/private.pem"), ca.private_key_pem()).expect("CA key");
+            std::fs::write(
             root.join("link/state.json"),
             serde_json::json!({"instance_id": jid_from_spki(ca.spki_der()).expect("JID"), "home_label": "Home"})
                 .to_string(),
         )
         .expect("state");
-        std::fs::create_dir_all(root.join("config")).expect("config directory");
-        std::fs::write(
-            root.join("config/journal.json"),
-            br#"{"setup":{"completed_at":1},"pairing":{"local_network":false}}"#,
-        )
-        .expect("config");
-        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .and_then(|probe| probe.local_addr())
-            .expect("free port")
-            .port();
-        let (authorization_sender, _) = watch::channel(DeviceDoorAuthorization::from(
-            AuthorizedClientsRead::Missing,
-        ));
-        let lifecycle = DoorLifecycle::new(DoorStartOptions {
-            journal_root: root.to_path_buf(),
-            port,
-            network_ipv4: None,
-            handshake_timeout: Duration::from_secs(1),
-            stream_stall_timeout: Duration::from_secs(1),
-            router: Router::new(),
-            carrier_loop_iterations: Arc::new(AtomicU64::new(0)),
-            handshake_authorization_read_ticks: Arc::new(AtomicU64::new(0)),
-            authorization_sender,
-            relay_admissions: Arc::new(RelayAdmissionRegistry::new()),
-        });
+            std::fs::create_dir_all(root.join("config")).expect("config directory");
+            std::fs::write(
+                root.join("config/journal.json"),
+                br#"{"setup":{"completed_at":1},"pairing":{"local_network":false}}"#,
+            )
+            .expect("config");
+            let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .and_then(|probe| probe.local_addr())
+                .expect("free port")
+                .port();
+            let (authorization_sender, _) = watch::channel(DeviceDoorAuthorization::from(
+                AuthorizedClientsRead::Missing,
+            ));
+            let lifecycle = DoorLifecycle::new(DoorStartOptions {
+                journal_root: root.to_path_buf(),
+                port,
+                network_ipv4: interface,
+                handshake_timeout: Duration::from_secs(1),
+                stream_stall_timeout: Duration::from_secs(1),
+                router: Router::new(),
+                carrier_loop_iterations: Arc::new(AtomicU64::new(0)),
+                handshake_authorization_read_ticks: Arc::new(AtomicU64::new(0)),
+                authorization_sender,
+                relay_admissions: Arc::new(RelayAdmissionRegistry::new()),
+            });
 
-        assert!(lifecycle.ensure_started().await, "door starts");
-        assert_eq!(
-            lifecycle.bound_addr(),
-            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
-        );
-        assert_eq!(lifecycle.listening_on_network(), Some(false));
+            assert!(lifecycle.ensure_started().await, "door starts");
+            assert_eq!(
+                lifecycle.bound_addr(),
+                Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            );
+            assert_eq!(lifecycle.listening_on_network(), Some(false));
 
-        crate::local_network::save(root, true).expect("open saves");
-        assert!(lifecycle.rebind().await, "door rebinds open");
-        assert_eq!(
-            lifecycle.bound_addr(),
-            Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-        );
-        assert_eq!(lifecycle.listening_on_network(), Some(true));
+            crate::local_network::save(root, true).expect("open saves");
+            assert!(lifecycle.rebind().await, "door rebinds open");
+            assert_eq!(
+                lifecycle.bound_addr(),
+                Some(SocketAddr::from((
+                    interface.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                    port
+                )))
+            );
+            assert_eq!(lifecycle.listening_on_network(), Some(interface.is_none()));
+            // Both the selected interface and relay forwarding target are live.
+            tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .expect("relay loopback accepts");
+            tokio::net::TcpStream::connect((interface.unwrap_or(Ipv4Addr::LOCALHOST), port))
+                .await
+                .expect("selected network accepts");
 
-        crate::local_network::save(root, false).expect("close saves");
-        assert!(lifecycle.rebind().await, "door rebinds closed");
-        assert_eq!(
-            lifecycle.bound_addr(),
-            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
-        );
-        lifecycle.shutdown();
-        assert!(!lifecycle.rebind().await, "a stopped door stays stopped");
+            crate::local_network::save(root, false).expect("close saves");
+            assert!(lifecycle.rebind().await, "door rebinds closed");
+            assert_eq!(
+                lifecycle.bound_addr(),
+                Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            );
+            lifecycle.shutdown();
+            assert!(!lifecycle.rebind().await, "a stopped door stays stopped");
+        }
     }
 
     #[test]

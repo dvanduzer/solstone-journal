@@ -4,8 +4,10 @@
 mod support;
 
 use chrono::{FixedOffset, Utc};
-use serde_json::json;
-use solstone_core_import_sources::{chatgpt, claude};
+use serde_json::{Value, json};
+use solstone_core_format::content::{RawPerceptFamily, produce_raw_percept_chunks};
+use solstone_core_import::RegistrySource;
+use solstone_core_import_sources::{chatgpt, claude, conversations, gemini};
 use support::{TempTree, write_zip};
 
 #[test]
@@ -25,6 +27,114 @@ fn conversation_entries_keep_roles_timestamps_and_five_minute_windows() {
         assert_eq!(plan.segments[0].entries[0].start, "00:00:00");
         assert_eq!(plan.segments[0].entries[1].start, "00:01:00");
     }
+}
+
+#[test]
+fn imported_user_messages_reach_talent_sources_as_the_owner() {
+    let tree = TempTree::new();
+    let cases = [
+        (
+            RegistrySource::Chatgpt,
+            chatgpt::plan(&support::chatgpt_archive(&tree), &Utc).unwrap(),
+            vec![("You", "Hello"), ("Assistant", "Hi")],
+        ),
+        (
+            RegistrySource::Claude,
+            claude::plan(&support::claude_archive(&tree), &Utc).unwrap(),
+            vec![("You", "Hello"), ("Assistant", "Hi")],
+        ),
+        (
+            RegistrySource::Gemini,
+            gemini::plan(&support::gemini_archive(&tree), &Utc).unwrap(),
+            vec![
+                ("You", "prompt only"),
+                ("Assistant", "response only &\u{a0}!?"),
+                ("You", "name fallback"),
+                ("Assistant", "both"),
+            ],
+        ),
+    ];
+
+    for (source, plan, expected) in cases {
+        let rendered = conversations::render(source, plan, "owner-test");
+        assert_eq!(rendered.files.len(), 1, "{}", source.name());
+        let file = &rendered.files[0];
+        let rows = file
+            .contents
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), expected.len(), "{}", source.name());
+        let rel = format!(
+            "{}/import.{}/{}/{}",
+            file.day,
+            source.name(),
+            file.segment,
+            file.name
+        );
+        // The transcript source loader uses the raw audio renderer for these rows.
+        let presented = produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, &file.contents);
+        assert_eq!(presented.error, None);
+        assert_eq!(presented.chunks.len(), expected.len());
+        for ((row, chunk), (speaker, text)) in rows.iter().zip(&presented.chunks).zip(&expected) {
+            assert_eq!(row["speaker"], *speaker, "{}", source.name());
+            assert_eq!(row["text"], *text);
+            assert_eq!(row["source"], "import");
+            assert!(chunk.content.contains(&format!("{speaker}: {text}")));
+        }
+        assert_eq!(rendered.items[0]["preview"], expected[0].1);
+    }
+}
+
+#[test]
+fn claude_unfamiliar_or_missing_senders_are_not_assigned_to_either_participant() {
+    let tree = TempTree::new();
+    let path = tree.path().join("unknown-senders.zip");
+    let messages = [
+        json!({"sender": "human", "text": "owner message"}),
+        json!({"sender": "assistant", "text": "assistant message"}),
+        json!({"sender": "tool", "text": "tool message"}),
+        json!({"sender": "user", "text": "unrecognized native sender"}),
+        json!({"text": "missing sender"}),
+        json!({"sender": null, "text": "null sender"}),
+        json!({"sender": 7, "text": "non-string sender"}),
+    ];
+    write_zip(
+        &path,
+        &[(
+            "conversations.json".to_owned(),
+            json!([{
+                "created_at": "2026-03-11T12:00:00Z",
+                "chat_messages": messages
+            }])
+            .to_string()
+            .into_bytes(),
+        )],
+    );
+    let plan = claude::plan(&path, &Utc).unwrap();
+    let rendered = conversations::render(RegistrySource::Claude, plan, "unknown-test");
+    let rows = rendered.files[0]
+        .contents
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), messages.len());
+    let expected = [
+        "You",
+        "Assistant",
+        "Unknown",
+        "Unknown",
+        "Unknown",
+        "Unknown",
+        "Unknown",
+    ];
+    for ((row, message), speaker) in rows.iter().zip(&messages).zip(expected) {
+        assert_eq!(row["speaker"], speaker);
+        assert_eq!(row["text"], message["text"]);
+    }
+    assert_eq!(rendered.items[0]["preview"], "owner message");
 }
 
 #[test]

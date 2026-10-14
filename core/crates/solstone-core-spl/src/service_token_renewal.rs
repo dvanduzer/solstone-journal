@@ -358,6 +358,17 @@ fn validate_new_token(
 }
 
 pub fn evaluate_once(config: &RenewalConfig, state: &mut RenewalState) -> RenewalStep {
+    evaluate_once_unless_cancelled(config, state, &|| false)
+}
+
+fn evaluate_once_unless_cancelled(
+    config: &RenewalConfig,
+    state: &mut RenewalState,
+    cancelled: &dyn Fn() -> bool,
+) -> RenewalStep {
+    if cancelled() {
+        return RenewalStep::Current;
+    }
     // 1. Skips (no HTTP)
     let is_spl = read_journal_config(&config.journal_root)
         .ok()
@@ -454,6 +465,9 @@ pub fn evaluate_once(config: &RenewalConfig, state: &mut RenewalState) -> Renewa
     };
 
     // 4. Trigger fired: perform enrollment
+    if cancelled() {
+        return RenewalStep::Current;
+    }
     let relay_base = relay_url(&config.journal_root);
     let pem = ca.public_key_spki_pem();
     let enroll_res = (config.enroll)(&relay_base, &identity.instance_id, &pem, EnrollMode::Renew);
@@ -480,6 +494,9 @@ pub fn evaluate_once(config: &RenewalConfig, state: &mut RenewalState) -> Renewa
             } else {
                 (config.before_commit)();
                 mutate_service_configuration(&config.journal_root, || {
+                    if cancelled() {
+                        return Outcome::Superseded;
+                    }
                     let current_tok = match load_link_service_token(&config.journal_root) {
                         LinkServiceTokenRead::Present(t) => t,
                         _ => return Outcome::Superseded,
@@ -621,6 +638,43 @@ pub fn spawn_service_token_renewal(config: RenewalConfig) -> tokio::task::JoinHa
             }
         }
     })
+}
+
+/// App-owned renewal lifecycle. Shutdown waits for an active blocking appraisal
+/// to finish and prevents its token from being committed after cancellation.
+pub async fn run_embedded_service_token_renewal(
+    config: RenewalConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut state = RenewalState::default();
+    loop {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(config.tick) => {},
+            _ = shutdown.changed() => return,
+        }
+        let config_clone = config.clone();
+        let state_clone = state.clone();
+        let stop = shutdown.clone();
+        // Deliberately join this work even if shutdown arrives during HTTP.
+        match tokio::task::spawn_blocking(move || {
+            let mut state = state_clone;
+            let cancelled = || *stop.borrow() || stop.has_changed().is_err();
+            evaluate_once_unless_cancelled(&config_clone, &mut state, &cancelled);
+            state
+        })
+        .await
+        {
+            Ok(new_state) => state = new_state,
+            Err(_) => {
+                state.backoff_deadline =
+                    (config.clock.now_mono)() + (config.jitter)(Duration::from_secs(6 * 3600));
+                log::warn!("private-link service token renewal evaluation did not complete");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

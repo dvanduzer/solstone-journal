@@ -120,6 +120,7 @@ pub(crate) fn refuse_confidential_egress(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn transcribe_with<R, E, S>(
     audio: &[f32],
     journal_path: &Path,
@@ -137,6 +138,36 @@ where
         Duration,
     ) -> Result<(solstone_core_spp_ratls::CompositeVerdict, S), &'static str>,
 {
+    transcribe_with_checkpoint(
+        audio,
+        journal_path,
+        config,
+        state,
+        readiness,
+        establish,
+        &|| Ok(()),
+    )
+}
+
+fn transcribe_with_checkpoint<R, E, S>(
+    audio: &[f32],
+    journal_path: &Path,
+    config: &JournalConfigRead,
+    state: &AttestationStateStore,
+    readiness: R,
+    establish: E,
+    checkpoint: &dyn Fn() -> Result<(), TranscribeError>,
+) -> Result<(TranscriptionResponse, ModelInfo), TranscribeError>
+where
+    R: FnOnce(&Path) -> NvattestEnsureStatus,
+    S: AttestedIo,
+    E: FnOnce(
+        &solstone_core_spp_ratls::RatlsEndpoint,
+        &Path,
+        Duration,
+    ) -> Result<(solstone_core_spp_ratls::CompositeVerdict, S), &'static str>,
+{
+    checkpoint()?;
     let endpoint = confidential_endpoint(config)?;
     if endpoint.credential.is_none() {
         return Err(deferred(
@@ -180,6 +211,7 @@ where
         }
         deferred_from_attestation(state, now)
     })?;
+    checkpoint()?;
     if let Err(error) = solstone_core_brain::clear_transcription_verification(journal_path) {
         log::warn!(
             "confidential transcription verification was not cleared for {}: {error}",
@@ -193,6 +225,7 @@ where
     ) {
         return Err(deferred(code, "the confidential admission probe failed"));
     }
+    checkpoint()?;
     let response = send_multipart_request(
         &mut channel.stream,
         &channel.host,
@@ -211,6 +244,16 @@ pub(crate) fn transcribe(
     config: &JournalConfigRead,
     state: &AttestationStateStore,
 ) -> Result<(TranscriptionResponse, ModelInfo), TranscribeError> {
+    transcribe_cancellable(audio, journal_path, config, state, &|| Ok(()))
+}
+
+pub(crate) fn transcribe_cancellable(
+    audio: &[f32],
+    journal_path: &Path,
+    config: &JournalConfigRead,
+    state: &AttestationStateStore,
+    checkpoint: &dyn Fn() -> Result<(), TranscribeError>,
+) -> Result<(TranscriptionResponse, ModelInfo), TranscribeError> {
     #[cfg(not(windows))]
     let readiness = |_: &Path| match solstone_core_spp_ratls::resolve_nvattest_from_current_exe() {
         Ok(_) => NvattestEnsureStatus::AlreadyInstalled,
@@ -221,13 +264,14 @@ pub(crate) fn transcribe(
     };
     #[cfg(windows)]
     let readiness = |dir: &Path| solstone_core_spp_ratls::check_nvattest_readiness(dir);
-    transcribe_with(
+    transcribe_with_checkpoint(
         audio,
         journal_path,
         config,
         state,
         readiness,
         establish_fresh_production_channel,
+        checkpoint,
     )
 }
 
@@ -612,6 +656,44 @@ mod tests {
         assert_deferred_reason(error, "attestation_unreachable");
         assert_eq!(readiness_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(channel_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancellation_after_attestation_prevents_audio_egress() {
+        use std::sync::{Arc, Mutex, atomic::AtomicBool};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let stopped = cancelled.clone();
+        let output = written.clone();
+        let error = super::transcribe_with_checkpoint(
+            &[0.0; 160],
+            Path::new("/unused"),
+            &active_config(),
+            &AttestationStateStore::new(),
+            |_| NvattestEnsureStatus::AlreadyInstalled,
+            move |_, _, _| {
+                stopped.store(true, Ordering::SeqCst);
+                Ok((
+                    verdict(),
+                    MockAttestedStream::new(
+                        Vec::new(),
+                        output,
+                        Arc::new(AtomicBool::new(true)),
+                        Arc::new(AtomicBool::new(false)),
+                    ),
+                ))
+            },
+            &|| {
+                if cancelled.load(Ordering::SeqCst) {
+                    Err(TranscribeError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, TranscribeError::Cancelled));
+        assert!(written.lock().unwrap().is_empty());
     }
 
     #[test]

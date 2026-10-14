@@ -28,9 +28,15 @@ pub fn render(source: RegistrySource, plan: ImportPlan, import_id: &str) -> Rend
         let mut contents = Value::Object(header).to_string();
         contents.push('\n');
         for entry in &segment.entries {
+            // Imported user-side messages belong to the journal owner.
+            let speaker = if entry.speaker == "Human" {
+                "You"
+            } else {
+                &entry.speaker
+            };
             let row = json!({
                 "start": entry.start,
-                "speaker": entry.speaker,
+                "speaker": speaker,
                 "text": entry.text,
                 "source": "import",
             });
