@@ -176,10 +176,10 @@ cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-convey-shel
 call :phase native-dispatch
 echo === cargo test --locked (Windows brain owner dispatcher) ===
 call :run_exact_integration "solstone-core-journal-bin" "windows_hosted_native_exit" "unhosted_journal_brain_owner_dispatches_to_native_binary" || exit /b 1
-call :run_exact_binary "solstone-core" "solstone-core" "brain_owner::tests::owner_refresh_bundled_success_converges_to_ready" "full-tests,journal-mcp-endpoint" || exit /b 1
-call :run_exact_binary "solstone-core" "solstone-core" "brain_owner::tests::owner_refresh_bundled_prerequisite_failures_skip_generate_and_stay_non_ready" "full-tests,journal-mcp-endpoint" || exit /b 1
-call :run_exact_binary "solstone-core" "solstone-core" "brain_owner::tests::owner_refresh_generate_failure_records_unhealthy_or_blocked" "full-tests,journal-mcp-endpoint" || exit /b 1
-call :run_exact_binary "solstone-core" "solstone-core" "brain_owner::tests::owner_refresh_stale_expected_fingerprint_short_circuits" "full-tests,journal-mcp-endpoint" || exit /b 1
+call :run_exact_library "solstone-core-brain-owner" "tests::full::owner_refresh_bundled_success_converges_to_ready" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-brain-owner" "tests::full::owner_refresh_bundled_prerequisite_failures_skip_generate_and_stay_non_ready" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-brain-owner" "tests::full::owner_refresh_generate_failure_records_unhealthy_or_blocked" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-brain-owner" "tests::full::owner_refresh_stale_expected_fingerprint_short_circuits" "full-tests" || exit /b 1
 
 echo === cargo test --locked (Windows installer process identity) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core --bin solstone-core --features full-tests,journal-mcp-endpoint install_provider::tests::local_install_reaches_existing_lease_with_current_process_identity -- --exact --nocapture || exit /b 1
