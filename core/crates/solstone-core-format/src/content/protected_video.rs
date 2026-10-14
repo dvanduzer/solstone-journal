@@ -62,12 +62,12 @@ pub(super) fn render(records: &[JsonObject]) -> ProducedChunks {
         };
 
         let title_clause = match title {
-            Some(title) => format!(", window title {title}"),
+            Some(title) => format!(", titled \"{title}\","),
             None => String::new(),
         };
 
         let prose = format!(
-            "## Protected video: {service}\n\nRecording (screen and audio) was paused for {duration} before this recording resumed, while a {service} window was on screen{app_clause}{title_clause}."
+            "## Protected video: {service}\n\nA {service} window was on screen{app_clause}{title_clause} for about {duration} while intake (screen and audio) was paused."
         );
 
         chunks.push(recorded_chunk(prose, ts, record));
