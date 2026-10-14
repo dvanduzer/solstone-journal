@@ -5,8 +5,10 @@
 import argparse, hashlib, json, os, pathlib, re, shutil, subprocess, time, zipfile
 import xml.etree.ElementTree as ET
 from provenance import source_manifest
-p=argparse.ArgumentParser(); p.add_argument('--root',required=True); p.add_argument('--sdk',required=True); p.add_argument('--java',required=True); p.add_argument('--application-id', default='app.solstone.development.journal'); args=p.parse_args()
+p=argparse.ArgumentParser(); p.add_argument('--root',required=True); p.add_argument('--sdk',required=True); p.add_argument('--java',required=True); p.add_argument('--application-id', default='app.solstone.development.journal'); p.add_argument('--debug-keystore',required=True,type=pathlib.Path); args=p.parse_args()
 if not re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+', args.application_id): p.error('invalid application id')
+key=args.debug_keystore.resolve(strict=True)
+if not key.is_file(): p.error('regular retained debug keystore required')
 root=pathlib.Path(args.root).resolve(); sdk=pathlib.Path(args.sdk); java=pathlib.Path(args.java); build=root/'build'; build.mkdir(exist_ok=True)
 (build/'source-manifest.json').write_text(json.dumps(source_manifest(root.parents[1]),indent=2)+'\n')
 tools=sdk/'build-tools/35.0.0'; jar=sdk/'platforms/android-36/android.jar'; commands=[]
@@ -42,13 +44,14 @@ with zipfile.ZipFile(unsigned,'a',compression=zipfile.ZIP_DEFLATED) as z:
   for asset in sorted((payload/'solstone').rglob('*')):
     if asset.is_file(): z.write(asset,'assets/journal-payload/'+str(asset.relative_to(payload)))
 aligned=build/'aligned.apk'; run([tools/'zipalign','-P','16','-f','4',unsigned,aligned])
-key=build/'debug-keystore.p12'
-if not key.exists(): run([java/'bin/keytool','-genkeypair','-keystore',key,'-storepass','android','-keypass','android','-alias','androiddebugkey','-keyalg','RSA','-keysize','2048','-validity','365','-dname','CN=Journal Development'])
 signed=build/'journal-process-runtime.apk'
 run([tools/'apksigner','sign','--ks',key,'--ks-pass','pass:android','--key-pass','pass:android','--ks-key-alias','androiddebugkey','--out',signed,aligned])
-run([tools/'apksigner','verify','--verbose','--print-certs',signed]); run([tools/'zipalign','-c','-P','16','-v','4',signed])
+run([tools/'apksigner','verify','--verbose','--print-certs',signed])
+signers=re.findall(r'^Signer #\d+ certificate SHA-256 digest: ([0-9a-f]{64})$',commands[-1]['output'],re.M)
+if len(signers)!=1: raise ValueError('one verified development signer required')
+run([tools/'zipalign','-c','-P','16','-v','4',signed])
 members=[]
 with zipfile.ZipFile(signed) as z:
   for i in z.infolist(): members.append({'name':i.filename,'bytes':i.file_size,'compressed_bytes':i.compress_size,'sha256':hashlib.sha256(z.read(i)).hexdigest()})
-(build/'artifact-manifest.json').write_text(json.dumps({'application_id':args.application_id,'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'members':members},indent=2))
-print(json.dumps({'application_id':args.application_id,'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'commands':len(commands)}))
+(build/'artifact-manifest.json').write_text(json.dumps({'application_id':args.application_id,'signer_sha256':signers[0],'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'members':members},indent=2))
+print(json.dumps({'application_id':args.application_id,'signer_sha256':signers[0],'apk':str(signed),'apk_sha256':hashlib.sha256(signed.read_bytes()).hexdigest(),'commands':len(commands)}))
