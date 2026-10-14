@@ -308,6 +308,23 @@ fn priority(
     priority
 }
 
+/// Missing daily outputs complete history alongside that day's recordings.
+/// A mixed day takes the same band; explicit owner/import priorities win.
+fn daily_priority(
+    mut priority: WorkPriority,
+    coverage: &daily_coverage::DailyCoverage,
+) -> WorkPriority {
+    if priority.band == WorkBand::Remake
+        && coverage
+            .units
+            .iter()
+            .any(|unit| unit.state.is_owed() && unit.owed_by.as_deref() == Some("never_made"))
+    {
+        priority.band = WorkBand::Completing;
+    }
+    priority
+}
+
 fn task(
     day: &str,
     segment: Option<(&str, &str)>,
@@ -823,8 +840,8 @@ fn inspect_day(
     let explicit = intent
         .map(|_| WorkBand::Waiting)
         .or_else(|| imported.then_some(WorkBand::Import));
-    let p = priority(day, None, today, explicit);
     let coverage = daily_coverage::read_daily_coverage(journal, day)?;
+    let p = daily_priority(priority(day, None, today, explicit), &coverage);
     work.candidates.extend(daily_retries(
         journal,
         day,
@@ -1473,6 +1490,80 @@ mod tests {
     }
 
     #[test]
+    fn missing_old_daily_outputs_follow_their_recordings_before_older_history() {
+        let root = fixture("local");
+        let day = "19990102";
+        segment(root.path(), day, "120000_60");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        let mut coverage = daily_coverage::read_daily_coverage(root.path(), day).unwrap();
+        assert!(coverage.units.iter().any(|unit| unit.state.is_owed()));
+        let missing = daily_priority(priority(day, None, today, None), &coverage);
+        assert_eq!(missing.band, WorkBand::Completing);
+        assert_eq!(missing.source_time, 19990102000000);
+        for unit in &mut coverage.units {
+            unit.owed_by = Some("evidence_changed".into());
+        }
+        let remake = daily_priority(priority(day, None, today, None), &coverage);
+        assert_eq!(remake.band, WorkBand::Remake);
+        let index = coverage
+            .units
+            .iter()
+            .position(|unit| unit.state.is_owed())
+            .unwrap();
+        coverage.units[index].owed_by = Some("never_made".into());
+        assert_eq!(daily_priority(remake, &coverage), missing);
+        coverage.units[index].state = CoverageState::Current;
+        assert_eq!(daily_priority(remake, &coverage), remake);
+        coverage.units[index].state = CoverageState::Outstanding;
+        for band in [
+            WorkBand::Now,
+            WorkBand::Waiting,
+            WorkBand::Recent,
+            WorkBand::Import,
+        ] {
+            let explicit = priority(day, None, today, Some(band));
+            assert_eq!(daily_priority(explicit, &coverage), explicit);
+        }
+        let mut ranked = Vec::new();
+        retain_best(
+            &mut ranked,
+            vec![
+                task(
+                    "19990101",
+                    Some(("120000_60", "notes")),
+                    priority("19990101", Some("120000_60"), today, None),
+                    None,
+                ),
+                task(
+                    "19990103",
+                    None,
+                    priority("19990103", None, today, None),
+                    None,
+                ),
+                task(day, None, missing, None),
+                task(
+                    day,
+                    Some(("120000_60", "notes")),
+                    priority(day, Some("120000_60"), today, None),
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|task| task.request.reference.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "supervisor-work-19990102-notes-120000_60",
+                "supervisor-work-19990102-daily",
+                "supervisor-work-19990101-notes-120000_60",
+                "supervisor-work-19990103-daily",
+            ]
+        );
+    }
+
+    #[test]
     fn capped_global_maintenance_is_discovered_on_today_without_recordings() {
         let root = fixture("local");
         let today = daily_coverage::local_day(root.path(), chrono::Utc::now());
@@ -1720,11 +1811,9 @@ mod tests {
                     .any(|error| error.contains("broken.json"))
             );
             assert_eq!(report.bands[5].activities_owed, 6);
-            assert!(
-                queue.any_reference(
-                    |reference| reference.starts_with("supervisor-activity-20040101-")
-                )
-            );
+            // Never-made daily outputs now precede these old activity retries.
+            assert!(report.bands[4].daily_units_owed > 0);
+            assert!(queue.contains_reference("supervisor-work-20040101-daily"));
             assert!(
                 !queue.any_reference(
                     |reference| reference.starts_with("supervisor-activity-19990101-")
@@ -1951,16 +2040,19 @@ mod tests {
         );
     }
 
-    /// Yesterday's daily work is early work, and checking whether it is still
+    /// Owner-requested daily work is early work, and checking whether it is still
     /// owed reads the whole day. A pass must not check it again after every
     /// older day it inspects when nothing about the early work has changed.
     #[test]
     fn early_work_is_not_checked_again_after_every_older_day() {
         let root = fixture("local");
-        let yesterday = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
+        // Stay clear of yesterday's intentional hold just after UTC midnight,
+        // while retaining band-2 early admission through the owner request.
+        let recent_day = (chrono::Utc::now().date_naive() - chrono::Duration::days(2))
             .format("%Y%m%d")
             .to_string();
-        thought_without_receipt(root.path(), &yesterday, &["090000_60", "100000_60"]);
+        thought_without_receipt(root.path(), &recent_day, &["090000_60", "100000_60"]);
+        work_intent::register(root.path(), &recent_day, false).unwrap();
         let older = 24;
         for n in 0..older {
             segment(
@@ -1973,8 +2065,8 @@ mod tests {
         STILL_OWED_CHECKS.with(|checks| checks.set(0));
         reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
         let checks = STILL_OWED_CHECKS.with(|checks| checks.get());
-        assert!(queue.contains_reference(&format!("supervisor-work-{yesterday}-daily")));
-        // One early admission after yesterday, then the final admission of the
+        assert!(queue.contains_reference(&format!("supervisor-work-{recent_day}-daily")));
+        // One early admission after the recent day, then the final admission of the
         // ranking: a few checks, not one more per older day.
         assert!(
             checks < older,
