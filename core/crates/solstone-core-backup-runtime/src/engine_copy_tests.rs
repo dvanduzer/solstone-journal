@@ -181,8 +181,10 @@ fn pinned_windows_restic(directory: &Path) -> std::path::PathBuf {
         .expect("read restic fixture");
     let archive = directory.join("restic.zip");
     fs::write(&archive, bytes).unwrap();
-    let license =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../distribution/licenses/restic/LICENSE");
+    let license = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../distribution/licenses/restic/LICENSE"),
+    )
+    .expect("canonical restic license path");
     let admitted =
         solstone_core_distribution::produce::windows_archives::admit_restic(&archive, &license)
             .expect("producer pins admit restic fixture");
