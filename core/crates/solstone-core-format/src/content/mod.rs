@@ -14,6 +14,7 @@ mod imports;
 mod morning_briefing;
 mod observations;
 mod projections;
+mod protected_video;
 mod raw_screen;
 mod screen;
 mod sense;
@@ -53,6 +54,8 @@ pub enum Family {
     AgentMemory,
     /// One piece of a Strava workout. This family is path-selected only.
     Workout,
+    /// A pause while a protected-video window was on screen. This family is path-selected only.
+    ProtectedVideo,
 }
 
 /// Content that can be rendered for direct consumption but is deliberately
@@ -64,7 +67,7 @@ pub enum RawPerceptFamily {
 }
 
 #[cfg(test)]
-const ALL_FAMILIES: [Family; 16] = [
+const ALL_FAMILIES: [Family; 17] = [
     Family::Markdown,
     Family::Event,
     Family::Activity,
@@ -81,6 +84,7 @@ const ALL_FAMILIES: [Family; 16] = [
     Family::MorningBriefing,
     Family::AgentMemory,
     Family::Workout,
+    Family::ProtectedVideo,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +286,12 @@ pub(crate) const INDEX_FAMILY_PATTERNS: &[FamilyPattern] = &[
     FamilyPattern {
         pattern: "*/*/*/browser_*.jsonl",
         family: Family::Browser,
+        root: PatternRoot::DayRooted,
+        disposition: IndexDisposition::Excluded,
+    },
+    FamilyPattern {
+        pattern: "*/*/*/*_protected_video.jsonl",
+        family: Family::ProtectedVideo,
         root: PatternRoot::DayRooted,
         disposition: IndexDisposition::Excluded,
     },
@@ -552,6 +562,7 @@ pub fn produce_chunks_by_shape(
         Family::StructuredImport => imports::render(records),
         Family::AiChat => ai_chat::render(rel_text, records),
         Family::Browser => browser::render(records),
+        Family::ProtectedVideo => protected_video::render(records),
         Family::DayAccumulator => day_accumulator::render(rel_text, records),
         Family::FacetEntity => facet_entities::render(rel_text, records),
         Family::Observation => observations::render(rel_text, records),

@@ -30,7 +30,7 @@ pub(super) fn render(records: &[JsonObject]) -> ProducedChunks {
     }
 }
 
-fn integer_milliseconds(value: &Value) -> Option<i64> {
+pub(super) fn integer_milliseconds(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         let number = value.as_f64()?;
         (number.is_finite()

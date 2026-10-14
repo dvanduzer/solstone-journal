@@ -54,7 +54,10 @@ enum WrittenLookup {
 /// value or the file is [`ContentResolution::Unrecognized`].
 pub fn resolve_content_shape(content_path: &Path, rel: &str) -> ContentResolution {
     if let Some(spec) = super::resolve_spec(rel)
-        && matches!(spec.family, Family::AgentMemory | Family::Workout)
+        && matches!(
+            spec.family,
+            Family::AgentMemory | Family::Workout | Family::ProtectedVideo
+        )
     {
         return ContentResolution::Indexed(spec.family);
     }
@@ -354,6 +357,23 @@ mod tests {
         assert_eq!(
             resolve_content_shape(&path, CHAT_REL),
             ContentResolution::Unindexed(RawPerceptFamily::RawScreen)
+        );
+    }
+
+    #[test]
+    fn protected_video_shape_name_is_unparsed_and_ignores_sidecar() {
+        assert_eq!(parse_shape_name("ProtectedVideo"), None);
+
+        let temporary = TempDir::new("protected-video-shapes");
+        let note_rel = "20260910/desk/120000_60/120000_60_protected_video.jsonl";
+        let note_path = content_path(&temporary.path, note_rel);
+        write(
+            &note_path.with_file_name(SHAPE_SIDECAR_BASENAME),
+            r#"{"120000_60_protected_video.jsonl":"Browser"}"#,
+        );
+        assert_eq!(
+            resolve_content_shape(&note_path, note_rel),
+            ContentResolution::Indexed(Family::ProtectedVideo)
         );
     }
 }

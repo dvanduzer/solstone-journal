@@ -140,7 +140,7 @@ impl SourceCounts {
         for entry in entries {
             match entry.prefix {
                 "transcript" | "memory_original" => counts.transcripts += 1,
-                "percept" | "browser" => counts.percepts += 1,
+                "percept" | "browser" | "protected_video" => counts.percepts += 1,
                 "agent_output" => counts.talents += 1,
                 _ => {}
             }
@@ -825,6 +825,45 @@ fn process_segment(
                 }
             }
         }
+        let mut protected_video = files
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_protected_video.jsonl"))
+            })
+            .collect::<Vec<_>>();
+        protected_video.sort();
+        for path in protected_video {
+            match fs::read_to_string(path) {
+                Ok(text) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    let content = produce_chunks(Family::ProtectedVideo, name, &text)
+                        .chunks
+                        .into_iter()
+                        .map(|chunk| chunk.content)
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if !content.is_empty() {
+                        entries.push(entry(
+                            start,
+                            end,
+                            segment,
+                            "protected_video",
+                            content,
+                            stream.clone(),
+                            None,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    log::warn!("unable to read JSONL input {}: {error}", path.display());
+                }
+            }
+        }
     }
     if !matches!(sources.talents, TalentSource::Disabled) {
         let talents = segment.path.join("talents");
@@ -1140,6 +1179,7 @@ fn groups_to_markdown(mut entries: Vec<Entry>) -> ScreenTranscript {
                 }
                 "percept" => lines.push("### Screen Activity".into()),
                 "browser" => lines.push("### Browser Content".into()),
+                "protected_video" => lines.push("### Protected video".into()),
                 "agent_output" => lines.push(format!(
                     "### {} summary",
                     entry.output_name.as_deref().unwrap_or("output")
@@ -1675,6 +1715,66 @@ mod tests {
             Value::from(SourceCounts::default()),
             json!({"transcripts": 0, "percepts": 0, "talents": 0})
         );
+    }
+
+    #[test]
+    fn protected_video_transcript_clustering_and_counts() {
+        let root = TempDir::new().unwrap();
+        let segment = segment(&root);
+        fs::write(
+            segment.join("browser_events.jsonl"),
+            r#"{"t":"segment_start","ts":1,"title":"Inbox"}"#,
+        )
+        .unwrap();
+
+        let (m1, _) = cluster(
+            root.path(),
+            DAY,
+            &sources(false, true, TalentSource::Disabled),
+        );
+
+        let row_a = r#"{"t":"protected_video","ts":1792027800000,"end_ts":1792030500000,"service":"Netflix","app":"Comet","title":"Netflix"}"#;
+        let row_b = r#"{"t":"protected_video","ts":1000,"end_ts":91000,"service":"Apple TV"}"#;
+        let note_path = segment.join("090000_60_protected_video.jsonl");
+        fs::write(&note_path, format!("{row_a}\n{row_b}\n")).unwrap();
+
+        let (m2, counts_m2) = cluster(
+            root.path(),
+            DAY,
+            &sources(false, true, TalentSource::Disabled),
+        );
+
+        assert!(m2.contains("### Protected video"));
+        let lines: Vec<&str> = m2.lines().collect();
+        let netflix_idx = lines
+            .iter()
+            .position(|l| l.contains("## Protected video: Netflix"))
+            .expect("netflix heading in m2");
+        assert!(netflix_idx > 0);
+        let heading_line = lines[netflix_idx - 1];
+        assert_eq!(heading_line, "### Protected video");
+        assert_ne!(heading_line, "### Screen Activity");
+        assert_ne!(heading_line, "### Browser Content");
+
+        assert_eq!(counts_m2.percepts, 2);
+
+        fs::write(&note_path, "{\n42\n").unwrap();
+        let (m_bad, counts_bad) = cluster(
+            root.path(),
+            DAY,
+            &sources(false, true, TalentSource::Disabled),
+        );
+        assert!(!m_bad.contains("### Protected video"));
+        assert_eq!(counts_bad.percepts, 1);
+
+        fs::remove_file(&note_path).unwrap();
+        let (m3, _) = cluster(
+            root.path(),
+            DAY,
+            &sources(false, true, TalentSource::Disabled),
+        );
+        assert!(m2.starts_with(&m1));
+        assert_eq!(m3, m1);
     }
 
     #[test]

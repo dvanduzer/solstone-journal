@@ -180,6 +180,22 @@ fn prepare_segment(
                 Ok(entries) => browser_chunks(&mut chunks, zone, name, &entries),
                 Err(error) => warnings.push(warning("browser", path, error, now)),
             }
+        } else if name.ends_with("_protected_video.jsonl") {
+            match fs::read_to_string(path) {
+                Ok(text) => {
+                    let produced = produce_chunks(Family::ProtectedVideo, name, &text);
+                    for chunk in produced.chunks {
+                        let timestamp = chunk.occurrence_time_ms.map(|value| value.0).unwrap_or(0);
+                        chunks.push(json!({
+                            "type": "markdown",
+                            "time": local_time(zone, timestamp),
+                            "timestamp": timestamp,
+                            "markdown": chunk.content,
+                        }));
+                    }
+                }
+                Err(error) => warnings.push(warning("protected_video", path, error, now)),
+            }
         }
     }
     for raw_path in &unclaimed_images.raw_paths {
@@ -1920,5 +1936,43 @@ mod tests {
         let inv_keys: Vec<String> = inv_val.as_object().unwrap().keys().cloned().collect();
         assert_eq!(&inv_keys[..base_keys.len()], &base_keys[..]);
         assert_eq!(&inv_keys[base_keys.len()..], &["holds_location"]);
+    }
+
+    #[test]
+    fn prepare_segment_protected_video_produces_markdown_chunks_without_warnings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let segment_dir = root.join("chronicle/20260101/field/120000_60");
+        std::fs::create_dir_all(&segment_dir).unwrap();
+
+        let row_a = r#"{"t":"protected_video","ts":1792027800000,"end_ts":1792030500000,"service":"Netflix","app":"Comet","title":"Netflix"}"#;
+        let malformed = "{\n";
+        let row_b = r#"{"t":"protected_video","ts":1000,"end_ts":91000,"service":"Apple TV"}"#;
+        std::fs::write(
+            segment_dir.join("120000_60_protected_video.jsonl"),
+            format!("{row_a}\n{malformed}\n{row_b}\n"),
+        )
+        .unwrap();
+
+        let value =
+            super::prepare_segment(root, "20260101", "field", "120000_60", chrono::Utc::now())
+                .unwrap();
+
+        let chunks = value["chunks"].as_array().expect("chunks array");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0]["type"], "markdown");
+        assert_eq!(chunks[1]["type"], "markdown");
+        assert_eq!(value["warnings"], 0);
+        let warning_details = value["warning_details"]
+            .as_array()
+            .expect("warning details array");
+        assert!(warning_details.is_empty());
+
+        assert_eq!(chunks[0]["timestamp"], 1_000_i64);
+        assert_eq!(chunks[1]["timestamp"], 1_792_027_800_000_i64);
+
+        let zone = solstone_core_journal_config::owner_zone(root);
+        assert_eq!(chunks[0]["time"], local_time(zone, 1_000));
+        assert_eq!(chunks[1]["time"], local_time(zone, 1_792_027_800_000));
     }
 }
