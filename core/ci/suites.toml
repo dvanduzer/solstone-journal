@@ -979,7 +979,8 @@ id = "package::solstone-core-journal-app"
 package = "solstone-core-journal-app"
 set = "component"
 areas = ["journal"]
-platforms = ["linux", "macos", "windows"]
+# This package has no library; Windows runs its updater_transport suite below.
+platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -5084,6 +5085,19 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-journal-app::updater_transport"
+package = "solstone-core-journal-app"
+target = "updater_transport"
+set = "component"
+areas = ["journal"]
+platforms = ["linux", "macos", "windows"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]

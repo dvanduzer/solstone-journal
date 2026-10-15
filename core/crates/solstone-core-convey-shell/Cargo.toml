@@ -242,3 +242,6 @@ x509-parser = "0.16.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 solstone-core-mcp-endpoint.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+solstone-core-callosum = { workspace = true, features = ["full-tests"] }
