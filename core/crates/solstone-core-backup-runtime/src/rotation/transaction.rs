@@ -1756,7 +1756,8 @@ mod tests {
             }
         }
     }
-    #[cfg(all(windows, feature = "full-tests"))]
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(windows)]
     #[test]
     #[ignore = "requires native restic; set SOLSTONE_NATIVE_RESTIC and a fixture root"]
     fn native_restic_publication_failure_keeps_original_and_resumes_saved_candidate() {
@@ -1770,6 +1771,7 @@ mod tests {
             fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
                 assert!(request.pass_fds.is_empty());
                 let mut child = Command::new(&request.program)
+                    .arg("--no-cache")
                     .args(&request.argv)
                     .env_clear()
                     .envs(&request.env)
