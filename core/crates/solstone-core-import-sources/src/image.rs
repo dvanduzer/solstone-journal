@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use base64::Engine;
-use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike};
 use chrono_tz::Tz;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
@@ -108,11 +108,21 @@ pub enum ImageImportError {
         start: String,
         attempts: u32,
     },
+    CouldNotDetectTimestamp {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for ImageImportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CouldNotDetectTimestamp { path } => {
+                write!(
+                    formatter,
+                    "could not detect creation timestamp for image: {}",
+                    path.display()
+                )
+            }
             Self::MissingSource { path } => {
                 write!(formatter, "image source is missing: {}", path.display())
             }
@@ -196,15 +206,85 @@ pub fn detect(path: &Path) -> bool {
             .is_some_and(is_image_extension)
 }
 
+pub fn detected_creation_stamp(
+    path: &Path,
+    filename: Option<&str>,
+    zone: Tz,
+) -> Option<solstone_core_import::Timestamp> {
+    let extra_exif = (|| {
+        let mut reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+        if !matches!(
+            reader.format(),
+            Some(ImageFormat::Png | ImageFormat::WebP | ImageFormat::Tiff)
+        ) {
+            return None;
+        }
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(16 * 1024 * 1024);
+        reader.limits(limits);
+        reader.into_decoder().ok()?.exif_metadata().ok().flatten()
+    })();
+    solstone_core_import::detect_creation_with_exif(path, filename, zone, extra_exif.as_deref())
+}
+
+fn place_image_timestamp(
+    path: &Path,
+    zone: Tz,
+    owner_timestamp: Option<&str>,
+    fallback_timestamp: Option<&str>,
+    extra_exif: Option<&[u8]>,
+) -> Result<solstone_core_import::Timestamp, ImageImportError> {
+    if let Some(owner) = owner_timestamp
+        && let Ok(ts) = solstone_core_import::validate_timestamp(owner)
+    {
+        return Ok(ts);
+    }
+    let filename = path.file_name().and_then(|name| name.to_str());
+    if let Some(detected) =
+        solstone_core_import::detect_creation_with_exif(path, filename, zone, extra_exif)
+    {
+        return Ok(detected);
+    }
+    if let Some(fallback) = fallback_timestamp
+        && let Ok(ts) = solstone_core_import::validate_timestamp(fallback)
+    {
+        return Ok(ts);
+    }
+    Err(ImageImportError::CouldNotDetectTimestamp {
+        path: path.to_path_buf(),
+    })
+}
+
 /// Preview one image source without writing any journal state, dated on the
 /// owner's day in `zone`.
-pub fn preview(path: &Path, zone: Tz) -> ImportPreview {
-    let Ok((image, format, modified, _)) = read_image(path) else {
+pub fn preview(
+    path: &Path,
+    zone: Tz,
+    owner_timestamp: Option<&str>,
+    fallback_timestamp: Option<&str>,
+) -> ImportPreview {
+    let Ok((image, format, _, _, exif)) = read_image(path) else {
         return degenerate_preview();
     };
-    let timestamp = DateTime::<Utc>::from(modified).with_timezone(&zone);
     let Some((format, _)) = format_details(format) else {
         return degenerate_preview();
+    };
+    let Ok(decided_stamp) = place_image_timestamp(
+        path,
+        zone,
+        owner_timestamp,
+        fallback_timestamp,
+        exif.as_deref(),
+    ) else {
+        return degenerate_preview();
+    };
+    let Ok(naive) = NaiveDateTime::parse_from_str(decided_stamp.as_str(), "%Y%m%d_%H%M%S") else {
+        return degenerate_preview();
+    };
+    let timestamp = match zone.from_local_datetime(&naive) {
+        chrono::offset::LocalResult::Single(dt) => dt,
+        chrono::offset::LocalResult::Ambiguous(earliest, _) => earliest,
+        chrono::offset::LocalResult::None => return degenerate_preview(),
     };
     ImportPreview {
         date_range: (
@@ -222,15 +302,43 @@ pub fn preview_size(
     path: &Path,
     journal: &Path,
     zone: Tz,
+    owner_timestamp: Option<&str>,
+    fallback_timestamp: Option<&str>,
 ) -> Result<solstone_core_import::size::ImportSize, ImageImportError> {
-    let (_, format, modified, _) = read_image(path)?;
+    let (_, format, _, _, exif) = read_image(path)?;
     if format_details(format).is_none() {
         return Err(ImageImportError::UndecodableSource {
             path: path.to_path_buf(),
             detail: format!("unsupported image format {format:?}"),
         });
     }
-    let timestamp = DateTime::<Utc>::from(modified).with_timezone(&zone);
+    let decided_stamp = place_image_timestamp(
+        path,
+        zone,
+        owner_timestamp,
+        fallback_timestamp,
+        exif.as_deref(),
+    )?;
+    let final_stamp =
+        solstone_core_import::source_timestamp_for_preview(journal, &decided_stamp, path)
+            .unwrap_or(decided_stamp);
+    let naive =
+        NaiveDateTime::parse_from_str(final_stamp.as_str(), "%Y%m%d_%H%M%S").map_err(|error| {
+            ImageImportError::UndecodableSource {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        })?;
+    let timestamp = match zone.from_local_datetime(&naive) {
+        chrono::offset::LocalResult::Single(dt) => dt,
+        chrono::offset::LocalResult::Ambiguous(earliest, _) => earliest,
+        chrono::offset::LocalResult::None => {
+            return Err(ImageImportError::UndecodableSource {
+                path: path.to_path_buf(),
+                detail: "invalid local timestamp in timezone".to_owned(),
+            });
+        }
+    };
     let extension = path
         .extension()
         .map(|value| format!(".{}", value.to_string_lossy().to_ascii_lowercase()))
@@ -270,14 +378,38 @@ pub fn prepare_image(
     path: &Path,
     wire: &dyn WireClient,
     zone: Tz,
+    owner_timestamp: Option<&str>,
+    fallback_timestamp: Option<&str>,
 ) -> Result<PreparedImage, ImageImportError> {
-    let (image, format, modified, orientation) = read_image(path)?;
+    let (image, format, modified, orientation, exif) = read_image(path)?;
     let (format_name, mime_type) =
         format_details(format).ok_or_else(|| ImageImportError::UndecodableSource {
             path: path.to_path_buf(),
             detail: format!("unsupported image format {format:?}"),
         })?;
-    let timestamp = DateTime::<Utc>::from(modified).with_timezone(&zone);
+    let decided_stamp = place_image_timestamp(
+        path,
+        zone,
+        owner_timestamp,
+        fallback_timestamp,
+        exif.as_deref(),
+    )?;
+    let naive = NaiveDateTime::parse_from_str(decided_stamp.as_str(), "%Y%m%d_%H%M%S").map_err(
+        |error| ImageImportError::UndecodableSource {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        },
+    )?;
+    let timestamp = match zone.from_local_datetime(&naive) {
+        chrono::offset::LocalResult::Single(dt) => dt,
+        chrono::offset::LocalResult::Ambiguous(earliest, _) => earliest,
+        chrono::offset::LocalResult::None => {
+            return Err(ImageImportError::UndecodableSource {
+                path: path.to_path_buf(),
+                detail: "invalid local timestamp in timezone".to_owned(),
+            });
+        }
+    };
     let day = timestamp.format("%Y%m%d").to_string();
     let segment = format!("{}_0", timestamp.format("%H%M%S"));
     let extension = path
@@ -582,9 +714,16 @@ pub fn install_and_publish_image(
     publication: &dyn PublicationOperations,
     mut progress: Option<&mut dyn FnMut(&ProgressUpdate)>,
 ) -> Result<ImageImportResult, ImageImportError> {
+    let effective_start = solstone_core_import::read_provenance(journal_root, import_id)
+        .ok()
+        .flatten()
+        .and_then(|m| solstone_core_import::stored_source_timestamp(&m, import_id).ok())
+        .and_then(|ts| NaiveDateTime::parse_from_str(ts.as_str(), "%Y%m%d_%H%M%S").ok())
+        .unwrap_or_else(|| prepared.timestamp.naive_local());
+
     let claimed = claim_image_segment(
         journal_root,
-        prepared.timestamp.naive_local(),
+        effective_start,
         &prepared.path,
         &prepared.extension,
     )?;
@@ -695,13 +834,19 @@ pub fn import_image(
     wire: &dyn WireClient,
 ) -> Result<ImageImportResult, ImageImportError> {
     let zone = solstone_core_journal_config::owner_zone(journal_root);
-    let prepared = prepare_image(path, wire, zone)?;
+    let prepared = prepare_image(path, wire, zone, None, None)?;
     install_and_publish_image(&prepared, journal_root, import_id, publication, progress)
 }
 
-fn read_image(
-    path: &Path,
-) -> Result<(DynamicImage, ImageFormat, SystemTime, Orientation), ImageImportError> {
+type DecodedImage = (
+    DynamicImage,
+    ImageFormat,
+    SystemTime,
+    Orientation,
+    Option<Vec<u8>>,
+);
+
+fn read_image(path: &Path) -> Result<DecodedImage, ImageImportError> {
     let metadata = fs::metadata(path).map_err(|error| match error.kind() {
         io::ErrorKind::NotFound => ImageImportError::MissingSource {
             path: path.to_path_buf(),
@@ -738,10 +883,11 @@ fn read_image(
     let mut decoder = ImageReader::with_format(Cursor::new(bytes.as_slice()), format)
         .into_decoder()
         .map_err(undecodable)?;
+    let exif = decoder.exif_metadata().ok().flatten();
     // An unreadable orientation tag leaves the pixels as stored rather than failing the import.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let image = DynamicImage::from_decoder(decoder).map_err(undecodable)?;
-    Ok((image, format, modified, orientation))
+    Ok((image, format, modified, orientation, exif))
 }
 
 /// The copy of an imported image that goes to the vision model: decoded pixels only, turned
@@ -1029,6 +1175,24 @@ mod tests {
         }
     }
 
+    fn import_image(
+        path: &Path,
+        journal_root: &Path,
+        import_id: &str,
+        progress: Option<&mut dyn FnMut(&ProgressUpdate)>,
+        publication: &dyn PublicationOperations,
+        wire: &dyn WireClient,
+    ) -> Result<ImageImportResult, ImageImportError> {
+        let zone = solstone_core_journal_config::owner_zone(journal_root);
+        let selected =
+            DateTime::<chrono::Utc>::from(fs::metadata(path).unwrap().modified().unwrap())
+                .with_timezone(&zone)
+                .format("%Y%m%d_%H%M%S")
+                .to_string();
+        let prepared = super::prepare_image(path, wire, zone, Some(&selected), None)?;
+        super::install_and_publish_image(&prepared, journal_root, import_id, publication, progress)
+    }
+
     fn generated(text: &str) -> GenerateResponse {
         GenerateResponse::Generated(Box::new(GeneratedResponse {
             id: None,
@@ -1064,6 +1228,40 @@ mod tests {
             .write_to(&mut bytes, ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    #[test]
+    fn upload_temp_names_do_not_hide_png_creation_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["photo.png", "upload.tmp"] {
+            let path = root.path().join(name);
+            fs::write(
+                &path,
+                include_bytes!("../../solstone-core-import/tests/fixtures/creation-photo.png"),
+            )
+            .unwrap();
+            let stamp = detected_creation_stamp(&path, Some("photo.png"), Tz::UTC)
+                .expect("PNG creation time");
+            assert_eq!(stamp.as_str(), "20260624_003000");
+        }
+    }
+
+    #[test]
+    fn a_metadata_free_image_requires_a_date_or_a_named_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("photo.png");
+        fs::write(&source, png_bytes()).unwrap();
+        let wire = RecordingWire {
+            request: RefCell::new(None),
+        };
+        assert!(matches!(
+            super::prepare_image(&source, &wire, Tz::UTC, None, None),
+            Err(ImageImportError::CouldNotDetectTimestamp { .. })
+        ));
+        let fallback =
+            super::prepare_image(&source, &wire, Tz::UTC, None, Some("20260623_183000")).unwrap();
+        assert_eq!(fallback.day, "20260623");
+        assert!(fallback.segment.starts_with("183000"));
     }
 
     #[test]
@@ -1174,8 +1372,14 @@ mod tests {
         let wire = RecordingWire {
             request: RefCell::new(None),
         };
-        let prepared =
-            prepare_image(&path, &wire, solstone_core_journal_config::host_zone()).unwrap();
+        let prepared = prepare_image(
+            &path,
+            &wire,
+            solstone_core_journal_config::host_zone(),
+            Some("20260510_120000"),
+            None,
+        )
+        .unwrap();
         assert_eq!(prepared.format, ImageFormat::Jpeg);
         assert_eq!(fs::read(&path).unwrap(), source);
         let request = wire.request.borrow_mut().take().unwrap();
@@ -1367,7 +1571,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pic.png");
         fs::write(&path, b"not an image").unwrap();
-        let preview = preview(&path, solstone_core_journal_config::host_zone());
+        let preview = preview(&path, solstone_core_journal_config::host_zone(), None, None);
         assert_eq!(preview.date_range, (String::new(), String::new()));
         assert_eq!(preview.item_count, 0);
         assert_eq!(preview.entity_count, 0);
@@ -2439,5 +2643,114 @@ mod tests {
             fs::read(target_dir.path().join("original.png")).unwrap(),
             img_bytes
         );
+    }
+
+    /// A JPEG with an APP1 Exif segment holding:
+    /// - Header: 0xFF 0xD8 (SOI), 0xFF 0xE1 (APP1 marker), length (be u16), b"Exif\0\0"
+    /// - TIFF header: "II" (little-endian), 0x002A (u16), 0x00000008 (u32 offset to IFD0)
+    /// - IFD0 at offset 8:
+    ///   - Entry count: 1 (u16)
+    ///   - Tag 0x8769 (Exif IFD pointer, LONG, count 1, value offset 26)
+    ///   - Next IFD: 0 (u32)
+    /// - Exif IFD at offset 26:
+    ///   - Entry count: 2 (u16)
+    ///   - Tag 0x0132 (ModifyDate, ASCII, count 20, value offset 56): "1999:01:01 00:00:00\0"
+    ///   - Tag 0x9003 (DateTimeOriginal, ASCII, count 20, value offset 76): "2026:05:10 14:30:00\0"
+    ///   - Next IFD: 0 (u32)
+    /// - String values:
+    ///   - offset 56: b"1999:01:01 00:00:00\0"
+    ///   - offset 76: b"2026:05:10 14:30:00\0"
+    /// - Image data: encoded JPEG stream following SOI
+    fn jpeg_with_exif_dates(dt_original: &str, mod_date: &str) -> Vec<u8> {
+        let pixels = ImageBuffer::from_fn(4, 4, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        });
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(&mut encoded, 80)
+            .encode_image(&DynamicImage::ImageRgb8(pixels))
+            .unwrap();
+        assert_eq!(&encoded[..2], [0xff, 0xd8]);
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(&[b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let exif_ifd_offset = 26u32;
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x8769u16.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&exif_ifd_offset.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let dt_bytes = format!("{dt_original}\0").into_bytes();
+        let mod_bytes = format!("{mod_date}\0").into_bytes();
+        let num_entries = 2u16;
+        let ifd_len = 2 + (num_entries as usize * 12) + 4;
+        let mut string_data_offset = (26 + ifd_len) as u32;
+
+        tiff.extend_from_slice(&num_entries.to_le_bytes());
+
+        // Entry 1: Tag 0x0132 (ModifyDate)
+        tiff.extend_from_slice(&0x0132u16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(mod_bytes.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&string_data_offset.to_le_bytes());
+        string_data_offset += mod_bytes.len() as u32;
+
+        // Entry 2: Tag 0x9003 (DateTimeOriginal)
+        tiff.extend_from_slice(&0x9003u16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(dt_bytes.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&string_data_offset.to_le_bytes());
+
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        tiff.extend_from_slice(&mod_bytes);
+        tiff.extend_from_slice(&dt_bytes);
+
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let length = u16::try_from(payload.len() + 2).unwrap();
+        let mut jpeg = encoded[..2].to_vec();
+        jpeg.extend_from_slice(&[0xff, 0xe1]);
+        jpeg.extend_from_slice(&length.to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        jpeg.extend_from_slice(&encoded[2..]);
+        jpeg
+    }
+
+    #[test]
+    fn exif_photo_preview_size_and_prepare_share_creation_day() {
+        let temp = tempfile::tempdir().unwrap();
+        let photo_path = temp.path().join("photo.jpg");
+        fs::write(
+            &photo_path,
+            jpeg_with_exif_dates("2026:05:10 14:30:00", "1999:01:01 00:00:00"),
+        )
+        .unwrap();
+
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_704_067_200);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&photo_path)
+            .unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+
+        let preview_res = preview(&photo_path, Tz::UTC, None, None);
+        assert_eq!(preview_res.date_range.0, "20260510");
+        assert_eq!(preview_res.date_range.1, "20260510");
+
+        let journal_dir = tempfile::tempdir().unwrap();
+        let size_res = preview_size(&photo_path, journal_dir.path(), Tz::UTC, None, None).unwrap();
+        let size_day = &size_res.recordings.iter().next().unwrap().day;
+        assert_eq!(size_day, "20260510");
+
+        let wire = RecordingWire {
+            request: RefCell::new(None),
+        };
+        let prepared = prepare_image(&photo_path, &wire, Tz::UTC, None, None).unwrap();
+        assert_eq!(prepared.day, "20260510");
+        assert!(prepared.segment.starts_with("143000"));
     }
 }

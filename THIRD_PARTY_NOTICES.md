@@ -975,7 +975,8 @@ the shared Mac libraries and are not linked into the app.
 ## Sparkle
 
 - project: sparkle-project/Sparkle
-- version: 2.9.4 (exact pin in `platforms/macos/Package.swift`)
+- version: 2.9.4 with a downstream download-origin restriction, supplied by the exact `solstone-macos` support revision in `platforms/macos/Package.swift`
+- patch and build provenance: [solstone-macos/vendor/sparkle](https://github.com/solpbc/solstone-macos/tree/main/vendor/sparkle)
 - license: see below
 - source: https://github.com/sparkle-project/Sparkle/tree/2.9.4
 

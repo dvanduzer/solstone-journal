@@ -123,7 +123,8 @@ pub fn bind_import_record(
     if let Some(hash) = &source_hash
         && let Some(import_id) = matching_record_id(journal_root, requested, hash)?
     {
-        let source_timestamp = source_timestamp_of(journal_root, &import_id)?;
+        let source_timestamp =
+            carry_source_instant(source_timestamp_of(journal_root, &import_id)?, requested);
         return Ok(BoundImport {
             import_id,
             source_timestamp,
@@ -160,9 +161,19 @@ pub fn source_timestamp_for_preview(
     }
     let hash = hash_source(source)?;
     match matching_record_id(journal_root, requested, &hash)? {
-        Some(id) => source_timestamp_of(journal_root, &id),
+        Some(id) => source_timestamp_of(journal_root, &id)
+            .map(|stored| carry_source_instant(stored, requested)),
         None => Ok(requested.clone()),
     }
+}
+
+fn carry_source_instant(stored: Timestamp, requested: &Timestamp) -> Timestamp {
+    if stored.as_str() == requested.as_str()
+        && let Some(instant) = requested.source_instant()
+    {
+        return stored.with_source_instant(instant);
+    }
+    stored
 }
 
 /// The source time stored on a record.
@@ -193,6 +204,38 @@ pub fn remember_source_hash(
     let mut metadata = read_import_metadata(journal_root, import_id)?;
     metadata.insert("source_hash".to_owned(), json!(source_hash.as_str()));
     write_import_metadata(journal_root, import_id, &metadata).map(|_| ())
+}
+
+/// Look up the stored source timestamp for an existing record matching `source_hash`.
+pub fn stored_source_timestamp_for_hash(
+    journal_root: &Path,
+    source_hash: &SourceHash,
+) -> Result<Option<Timestamp>, ImportError> {
+    if let Some(import_id) = occupant_record_id(journal_root, source_hash)? {
+        return Ok(Some(source_timestamp_of(journal_root, &import_id)?));
+    }
+    let scan = find_manifest_by_hash_where(journal_root, source_hash, |_| true)?;
+    if let Some(found) = scan.found {
+        if let Some(source_ts) = found
+            .manifest
+            .get("source_timestamp")
+            .and_then(Value::as_str)
+            && let Ok(ts) = validate_timestamp(source_ts)
+        {
+            return Ok(Some(ts));
+        }
+        if let Some(day) = found
+            .manifest
+            .get("days_affected")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(Value::as_str)
+            && let Ok(ts) = validate_timestamp(&format!("{day}_000000"))
+        {
+            return Ok(Some(ts));
+        }
+    }
+    Ok(None)
 }
 
 enum AddressedRecord {

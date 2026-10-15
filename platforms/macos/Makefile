@@ -41,7 +41,7 @@ RELEASE_IDENTITY        = python3 $(SUPPORT_SCRIPTS)/release_identity.py
 JOURNAL_DIST_VERSION   := $(shell /usr/bin/env python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["CFBundleShortVersionString"])' Sources/journal/Info.plist 2>/dev/null || echo 0.0.0)
 JOURNAL_DIST_BUILD     := $(shell /usr/bin/env python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["CFBundleVersion"])' Sources/journal/Info.plist 2>/dev/null || echo 0)
 JOURNAL_DMG_NAME       ?= $(shell $(RELEASE_IDENTITY) identity --app journal --version '$(JOURNAL_DIST_VERSION)' --build '$(JOURNAL_DIST_BUILD)' --field dmg_name 2>/dev/null)
-SPARKLE_ARTIFACT_DIR   ?= .build/artifacts/sparkle/Sparkle
+SPARKLE_ARTIFACT_DIR   ?= $(MACOS_SUPPORT_ROOT)/vendor/sparkle
 SPARKLE_FRAMEWORK      ?= $(SPARKLE_ARTIFACT_DIR)/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework
 # The DMG window art is shared with the capture app's image.
 DMG_BACKGROUND         ?= $(MACOS_SUPPORT_ROOT)/assets/dmg-background@2x.png
@@ -113,6 +113,7 @@ support-check:
 		test "$$ACTUAL" = "$$PINNED" || { echo "error: MACOS_SUPPORT_ROOT=$(MACOS_SUPPORT_ROOT) is at '$$ACTUAL', not the pinned $$PINNED (run 'make resolve', or pass a clean checkout of solstone-macos at the pin)"; exit 1; }; \
 		test -z "$$(git -C '$(MACOS_SUPPORT_ROOT)' status --porcelain)" || { echo "error: MACOS_SUPPORT_ROOT=$(MACOS_SUPPORT_ROOT) is dirty"; exit 1; }; \
 		echo "support: solstone-macos $$PINNED at $(MACOS_SUPPORT_ROOT)"
+	@python3 $(SUPPORT_SCRIPTS)/sparkle_dependency.py verify
 
 # Run tests
 test:

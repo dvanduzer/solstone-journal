@@ -137,6 +137,7 @@ impl ImportPipeline for CheckpointPipeline {
 
 #[derive(Default)]
 struct ImportedPipeline {
+    instants: RefCell<Vec<Option<DateTime<chrono::Utc>>>>,
     calls: RefCell<Vec<(Option<String>, PipelineAuto<'static>)>>,
 }
 impl ImportPipeline for ImportedPipeline {
@@ -149,6 +150,7 @@ impl ImportPipeline for ImportedPipeline {
             PipelineAuto::Disabled => PipelineAuto::Disabled,
             PipelineAuto::Value(_) => unreachable!("Plaud always enables auto"),
         };
+        self.instants.borrow_mut().push(request.source_instant);
         self.calls
             .borrow_mut()
             .push((request.timestamp.map(str::to_owned), auto));
@@ -413,6 +415,15 @@ fn save_keeps_past_and_near_future_timestamps_without_fallback() {
     )
     .unwrap();
 
+    assert_eq!(
+        pipeline
+            .instants
+            .borrow()
+            .iter()
+            .map(|instant| instant.unwrap().timestamp())
+            .collect::<Vec<_>>(),
+        [near_future, past]
+    );
     for (id, timestamp) in [("past", past), ("near", near_future)] {
         let entry = &outcome.state.root()["files"][id];
         assert_eq!(entry["import_timestamp"], device_timestamp(timestamp));

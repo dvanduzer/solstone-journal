@@ -8,13 +8,26 @@ use std::fmt;
 use regex::Regex;
 
 /// A timestamp which has passed the import timestamp validators.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Timestamp(String);
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Timestamp(String, Option<chrono::DateTime<chrono::Utc>>);
 
 impl Timestamp {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Known source instant, retained while planning elapsed media time.
+    #[must_use]
+    pub fn source_instant(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.1
+    }
+
+    /// Retain an exporter-provided instant alongside its owner-local wall stamp.
+    #[must_use]
+    pub fn with_source_instant(mut self, instant: chrono::DateTime<chrono::Utc>) -> Self {
+        self.1 = Some(instant);
+        self
     }
 
     /// Calendar-day half of the stamp (`YYYYMMDD`).
@@ -152,5 +165,5 @@ pub fn validate_timestamp(raw: &str) -> Result<Timestamp, TimestampError> {
             message: "day is out of range for month".to_owned(),
         });
     }
-    Ok(Timestamp(raw.to_owned()))
+    Ok(Timestamp(raw.to_owned(), None))
 }

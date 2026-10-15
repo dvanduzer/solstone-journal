@@ -136,7 +136,11 @@ fn image_import_preserves_source_and_records_its_segment_contract() {
     let source_root = tree.path().join("source");
     let journal = tree.path().join("journal");
     fs::create_dir(&source_root).unwrap();
-    let source = source_root.join("picture.PNG");
+    let source = source_root.join(format!(
+        "picture_{}.PNG",
+        DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(1_768_977_600))
+            .format("%Y%m%d_%H%M%S")
+    ));
     ImageBuffer::<Rgb<u8>, _>::from_pixel(4, 4, Rgb([255, 0, 0]))
         .save(&source)
         .unwrap();
@@ -157,6 +161,8 @@ fn image_import_preserves_source_and_records_its_segment_contract() {
         &source,
         &journal,
         solstone_core_journal_config::owner_zone(&journal),
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(size.recordings.len(), 1);
@@ -233,7 +239,11 @@ fn unavailable_description_doors_preserve_the_installed_original() {
         ("wire-failure", &FailingWire as &dyn WireClient),
     ] {
         let tree = TempTree::new();
-        let source = tree.path().join("picture.png");
+        let source = tree.path().join(format!(
+            "picture_{}.png",
+            DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(1_768_977_600))
+                .format("%Y%m%d_%H%M%S")
+        ));
         let journal = tree.path().join("journal");
         ImageBuffer::<Rgb<u8>, _>::from_pixel(4, 4, Rgb([255, 0, 0]))
             .save(&source)
@@ -273,7 +283,11 @@ fn unavailable_description_doors_preserve_the_installed_original() {
 #[test]
 fn image_original_is_dirtied_before_a_later_transcript_failure() {
     let tree = TempTree::new();
-    let source = tree.path().join("picture.png");
+    let source = tree.path().join(format!(
+        "picture_{}.png",
+        DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(1_768_977_600))
+            .format("%Y%m%d_%H%M%S")
+    ));
     let journal = tree.path().join("journal");
     ImageBuffer::<Rgb<u8>, _>::from_pixel(4, 4, Rgb([255, 0, 0]))
         .save(&source)
@@ -322,7 +336,11 @@ fn image_original_is_dirtied_before_a_later_transcript_failure() {
 #[test]
 fn image_install_marker_failure_is_typed_and_retains_original() {
     let tree = TempTree::new();
-    let source = tree.path().join("picture.png");
+    let source = tree.path().join(format!(
+        "picture_{}.png",
+        DateTime::<Local>::from(UNIX_EPOCH + Duration::from_secs(1_768_977_600))
+            .format("%Y%m%d_%H%M%S")
+    ));
     let journal = tree.path().join("journal");
     ImageBuffer::<Rgb<u8>, _>::from_pixel(4, 4, Rgb([255, 0, 0]))
         .save(&source)

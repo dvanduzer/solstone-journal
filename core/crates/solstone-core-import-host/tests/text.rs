@@ -257,6 +257,7 @@ async fn ac1_text_import_n_greater_than_one_success_direct_and_routes() {
         None,
         None,
         &wire,
+        None,
     );
 
     let finish = finish_import_attempt(
@@ -429,6 +430,7 @@ async fn ac2_zero_segment_through_producer_routes_success_zero_events_zero() {
         None,
         None,
         &wire,
+        None,
     );
     let TextImportOutcome::Success(work) = &outcome else {
         panic!("expected Success with zero segments, got {:?}", outcome);
@@ -552,6 +554,7 @@ async fn ac3_1_error_after_n_writes_partial_publication() {
         None,
         None,
         &wire,
+        None,
     );
 
     let TextImportOutcome::Failed { created, error } = &outcome else {
@@ -674,6 +677,7 @@ async fn ac3_2_marker_failure_identities_published() {
         None,
         None,
         &wire,
+        None,
     );
 
     let TextImportOutcome::Failed { created, error } = &outcome else {
@@ -740,6 +744,7 @@ async fn ac3_3_error_before_write_failed_empty_no_publication() {
         None,
         None,
         &wire,
+        None,
     );
 
     let TextImportOutcome::Failed { created, .. } = &outcome else {
@@ -1274,6 +1279,7 @@ async fn ac6_callosum_exact_events_and_stream_record_on_text_import() {
         None,
         None,
         &wire,
+        None,
     );
     assert_eq!(outcome.created().len(), 2);
 

@@ -99,6 +99,7 @@ pub struct PipelineImportRequest<'a> {
     pub source: &'a Path,
     pub source_kind: &'static str,
     pub timestamp: Option<&'a str>,
+    pub source_instant: Option<DateTime<chrono::Utc>>,
     pub auto: PipelineAuto<'a>,
 }
 
@@ -173,6 +174,7 @@ pub struct PlaudSyncOutcome {
 
 struct ResolvedImportTimestamp {
     timestamp: String,
+    source_instant: DateTime<chrono::Utc>,
     used_fallback: bool,
 }
 
@@ -426,10 +428,12 @@ fn import_file(
         source: &destination,
         source_kind: "plaud",
         timestamp: Some(&selected),
+        source_instant: Some(resolved.source_instant),
         auto: PipelineAuto::Enabled,
     }) {
         Ok(PipelineOutcome::Imported) => Ok(ResolvedImportTimestamp {
             timestamp: selected,
+            source_instant: resolved.source_instant,
             used_fallback: resolved.used_fallback,
         }),
         Ok(PipelineOutcome::Skipped { .. })
@@ -462,6 +466,7 @@ fn import_timestamp(
     if device_time.signed_duration_since(now) <= Duration::hours(48) {
         return Some(ResolvedImportTimestamp {
             timestamp: device_time.format("%Y%m%d_%H%M%S").to_string(),
+            source_instant: device_time.with_timezone(&chrono::Utc),
             used_fallback: false,
         });
     }
@@ -472,6 +477,7 @@ fn import_timestamp(
         if used_fallback_timestamps.insert(timestamp.clone()) {
             return Some(ResolvedImportTimestamp {
                 timestamp,
+                source_instant: fallback_time.with_timezone(&chrono::Utc),
                 used_fallback: true,
             });
         }

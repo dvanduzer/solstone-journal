@@ -108,7 +108,7 @@ pub const HELP: &str = concat!(
     "Import a media file into the journal\n\n",
     "positional arguments:\n  media                 Path to audio or text file\n\n",
     "options:\n  -h, --help            show this help message and exit\n",
-    "  --timestamp TIMESTAMP\n                        Generic .txt/.md use this, or --auto to adopt last-modified time\n",
+    "  --timestamp TIMESTAMP\n                        Generic .txt/.md use this, or --auto to adopt a detected timestamp (--timestamp YYYYMMDD_HHMMSS)\n",
     "  --facet FACET\n  --setting SETTING\n",
     "  --source SOURCE       Required for classified formats (ics, vault, chat export, image, PDF)\n",
     "  --force               Force re-import; body sources create a separate import\n",
@@ -157,7 +157,7 @@ pub fn resolution_skipped(reason: crate::SkipReason) -> String {
             "this file was already imported; use --force to import it again"
         }
         crate::SkipReason::NoDeterministicMatch => {
-            "no date could be read from the file; name one with --timestamp"
+            "no date could be read from the file; name one with --timestamp YYYYMMDD_HHMMSS"
         }
         crate::SkipReason::TimestampRequired => {
             "the file's date needs confirming; rerun with --timestamp or --auto"

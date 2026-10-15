@@ -1,21 +1,12 @@
 {
-  "originHash" : "74ac602e4bb09fd317bb2ee5ae3f438827dad06ad05f45375f7ac0b1ab8a5640",
+  "originHash" : "60fccf6f772814b60bcdc2dd8c7ad50dce3cccadf7902eaed03e33aa2cb87a2c",
   "pins" : [
     {
       "identity" : "solstone-macos",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/solpbc/solstone-macos.git",
       "state" : {
-        "revision" : "5b1d1937686827d6c30483f7477b29995bb47a3d"
-      }
-    },
-    {
-      "identity" : "sparkle",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/sparkle-project/Sparkle",
-      "state" : {
-        "revision" : "b6496a74a087257ef5e6da1c5b29a447a60f5bd7",
-        "version" : "2.9.4"
+        "revision" : "6a6da2bfedb062156d1e2a7e8a7c5eec2ba57608"
       }
     }
   ],

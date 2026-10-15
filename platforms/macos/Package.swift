@@ -8,7 +8,7 @@ import PackageDescription
 // runtime this repository builds. The shared Mac libraries (core types, the journal mark,
 // updates and the watchdog) come from solstone-macos at one exact commit; bump the revision
 // and Package.resolved together, never to a branch or tag.
-let supportRevision = "5b1d1937686827d6c30483f7477b29995bb47a3d"
+let supportRevision = "6a6da2bfedb062156d1e2a7e8a7c5eec2ba57608"
 
 let package = Package(
     name: "SolstoneJournalMac",
@@ -26,7 +26,6 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/solpbc/solstone-macos.git", revision: supportRevision),
-        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.4"),
     ],
     targets: [
         .target(
@@ -56,7 +55,7 @@ let package = Package(
                 .target(name: "JournalRuntime"),
                 .product(name: "JournalMarkKit", package: "solstone-macos"),
                 .product(name: "UpdateKit", package: "solstone-macos"),
-                .product(name: "Sparkle", package: "Sparkle")
+                .product(name: "Sparkle", package: "solstone-macos")
             ],
             path: "Sources/journal",
             exclude: [

@@ -66,6 +66,8 @@ pub struct RegistryDispatch {
     pub dry_run: bool,
     pub json: bool,
     pub force: bool,
+    pub owner_timestamp: Option<String>,
+    pub fallback_timestamp: Option<String>,
 }
 
 /// A manual CLI import prints its size before the mutating invocation. Recurring
@@ -114,6 +116,97 @@ fn preview_arguments_with(
         }
         _ => Ok(None),
     }
+}
+
+/// Resolve a force-import day notice through the same argument grammar and supervisor
+/// preflight as execution. This reads no source until the supervisor allows the import.
+pub fn force_day_notice_for_args(
+    args: &[String],
+    journal: &Path,
+) -> Result<Option<String>, CliRun> {
+    force_day_notice_with(args, journal, || require_solstone(journal))
+}
+
+fn force_day_notice_with(
+    args: &[String],
+    journal: &Path,
+    preflight: impl FnOnce() -> Result<(), SupervisorRefusal>,
+) -> Result<Option<String>, CliRun> {
+    let Ok(ParsedCommand::Import(options)) = parse_arguments(args) else {
+        return Ok(None);
+    };
+    if !options.force || options.dry_run {
+        return Ok(None);
+    }
+    if let Err(refusal) = preflight() {
+        return Err(refusal_run(refusal));
+    }
+    let Some(media) = options
+        .media
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.is_file())
+    else {
+        return Ok(None);
+    };
+    let extension = media
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let selected = options
+        .source
+        .as_deref()
+        .and_then(RegistrySource::from_name)
+        .or_else(|| {
+            if ["txt", "md", "m4a"].contains(&extension.as_str()) {
+                return None;
+            }
+            solstone_core_import::detect::ORDERED_FILE_IMPORTER_NAMES
+                .iter()
+                .filter_map(|name| RegistrySource::from_name(name))
+                .find(|source| {
+                    solstone_core_import_sources::registry::claims(*source, media).unwrap_or(false)
+                })
+        });
+    if selected
+        .is_some_and(|source| !matches!(source, RegistrySource::Image | RegistrySource::Document))
+    {
+        // Export containers have dates on their individual entries; their outer names
+        // do not select a recording day.
+        return Ok(None);
+    }
+    let zone = solstone_core_journal_config::owner_zone(journal);
+    let fresh = if let Some(raw) = options.timestamp.as_deref() {
+        solstone_core_import::validate_timestamp(raw).ok()
+    } else {
+        solstone_core_import_sources::image::detected_creation_stamp(
+            media,
+            media.file_name().and_then(|name| name.to_str()),
+            zone,
+        )
+    };
+    let Some(fresh) = fresh else {
+        return Ok(None);
+    };
+    let hash = solstone_core_import::hash_source(media)
+        .map_err(|error| failure("", &format!("{error}\n"), 1))?;
+    let stored = solstone_core_import::stored_source_timestamp_for_hash(journal, &hash)
+        .map_err(|error| failure("", &format!("{error}\n"), 1))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    if selected == Some(RegistrySource::Document) && options.timestamp.is_none() {
+        return Ok((fresh.day() != stored.day()).then(|| format!(
+            "notice: this file's name dates to {}, and a previous import was recorded on {}. the PDF's own dates may select a different day. choose --timestamp to set its date. existing recordings are not moved.\n",
+            fresh.day(), stored.day(),
+        )));
+    }
+    let planned = solstone_core_import::source_timestamp_for_preview(journal, &fresh, media)
+        .map_err(|error| failure("", &format!("{error}\n"), 1))?;
+    Ok(solstone_core_import::force_day_notice(
+        &fresh, &stored, &planned,
+    ))
 }
 
 /// Run the importer grammar with the process environment and local supervisor probe.
@@ -255,7 +348,11 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
         return rendered(failure("", &format!("{error}\n"), 1));
     }
     if let Some(token) = &options.preview_token {
-        let timestamp = options.timestamp.as_deref().unwrap_or_default();
+        let timestamp = options
+            .preview_stamp
+            .as_deref()
+            .or(options.timestamp.as_deref())
+            .unwrap_or_default();
         if let Err(error) = solstone_core_import::snapshot::verify_preview(
             journal_path,
             Path::new(media),
@@ -300,8 +397,7 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             timestamp,
             ..
         } => {
-            let (run, import_id) =
-                run_audio(media, &options, journal_path, timestamp.as_str(), true);
+            let (run, import_id) = run_audio(media, &options, journal_path, &timestamp, true);
             imported(run, &import_id, options.dry_run)
         }
         ResolutionOutcome::Resolved {
@@ -323,6 +419,8 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             dry_run: options.dry_run,
             json: options.json,
             force: options.force,
+            owner_timestamp: options.timestamp.clone(),
+            fallback_timestamp: options.fallback_timestamp.clone(),
         }),
     }
 }
@@ -355,11 +453,12 @@ fn run_audio(
     media: &str,
     options: &Options,
     journal_path: &Path,
-    timestamp: &str,
+    source_stamp: &solstone_core_import::Timestamp,
     wait_for_processing: bool,
 ) -> (CliRun, String) {
+    let timestamp = source_stamp.as_str();
     if options.dry_run {
-        let semantic = solstone_core_import::validate_timestamp(timestamp)
+        let semantic = Ok::<_, solstone_core_import::TimestampError>(source_stamp.clone())
             .map_err(|error| error.to_string())
             .and_then(|requested| {
                 solstone_core_import::source_timestamp_for_preview(
@@ -379,6 +478,7 @@ fn run_audio(
             Err(error) => return (failure("", &format!("{error}\n"), 1), timestamp.to_owned()),
         };
         let request = AudioImportRequest {
+            source_instant: semantic.source_instant(),
             source_media: PathBuf::from(media),
             journal_root: journal_path.to_path_buf(),
             day: base_timestamp.format("%Y%m%d").to_string(),
@@ -399,7 +499,7 @@ fn run_audio(
             timestamp.to_owned(),
         );
     }
-    let requested = match solstone_core_import::validate_timestamp(timestamp) {
+    let requested = match Ok::<_, solstone_core_import::TimestampError>(source_stamp.clone()) {
         Ok(value) => value,
         Err(error) => {
             return (failure("", &format!("{error}\n"), 1), timestamp.to_owned());
@@ -472,6 +572,7 @@ fn run_audio(
         }
     };
     let request = AudioImportRequest {
+        source_instant: source_timestamp.source_instant(),
         source_media: PathBuf::from(media),
         journal_root: journal_path.to_path_buf(),
         day: source_timestamp.day().to_owned(),
@@ -589,6 +690,7 @@ fn run_text(
                 &day_dir,
                 &timestamp.clock(),
                 stream,
+                timestamp.source_instant(),
             ) {
                 Ok(size) => success(size.render(options.json)),
                 Err(error) => failure("", &format!("{error}\n"), 1),
@@ -652,6 +754,7 @@ fn run_text(
         stream,
         options.facet.as_deref(),
         options.setting.as_deref(),
+        source_timestamp.source_instant(),
     );
     let input = match &outcome {
         TextImportOutcome::Success(work) => ImportTerminalInput::Success(&work.created),
@@ -728,6 +831,7 @@ fn options_ref<'a>(options: &'a Options, media: &'a str) -> ResolutionOptions<'a
         dry_run: options.dry_run,
         deterministic_only: options.deterministic_only,
         force: options.force,
+        fallback_timestamp: options.fallback_timestamp.as_deref(),
     }
 }
 
@@ -768,12 +872,13 @@ fn resolve(
     let zone = solstone_core_journal_config::owner_zone(journal_path);
     let mut seams = ResolutionSeams {
         apple_detector: solstone_core_body_ingest::detect_apple_source,
-        // The source crate depends on this crate, so a direct call here would
-        // introduce a Cargo cycle. Explicit source selection still reaches the
-        // resolver and then returns the named boundary refusal below.
+        // The source crate does not depend on this crate. The host pre-classifies
+        // through solstone_core_import_sources::registry::claims in classify_export.
+        // The resolver seam stays no_registry_claim so selection is not applied twice.
         claims: no_registry_claim,
         deterministic_detector: |path: &Path, name: Option<&str>| {
-            file_mtime_timestamp(path, name, zone)
+            solstone_core_import_sources::image::detected_creation_stamp(path, name, zone)
+                .map(solstone_core_import::DetectedTimestamp::new)
         },
         model_detector: unavailable_model_timestamp,
         // Generic manifest deduplication is performed above with the resolved
@@ -839,8 +944,7 @@ fn requires_registry_classification(path: &Path) -> bool {
         return true;
     };
     !(GENERIC_AUDIO_EXTENSIONS.contains(&extension.as_str())
-        || GENERIC_TEXT_EXTENSIONS.contains(&extension.as_str())
-        || extension == "pdf")
+        || GENERIC_TEXT_EXTENSIONS.contains(&extension.as_str()))
 }
 
 fn is_generic_media(path: &Path) -> bool {
@@ -876,19 +980,6 @@ fn looks_like_media_path(value: &str) -> bool {
         || value.contains('/')
         || value.contains('\\')
         || Path::new(value).extension().is_some()
-}
-
-/// A file's last-modified time, as a wall time in the owner zone.
-fn file_mtime_timestamp(
-    path: &Path,
-    _: Option<&str>,
-    zone: chrono_tz::Tz,
-) -> Option<solstone_core_import::DetectedTimestamp> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    let datetime = chrono::DateTime::<chrono::Utc>::from(modified).with_timezone(&zone);
-    solstone_core_import::validate_timestamp(&datetime.format("%Y%m%d_%H%M%S").to_string())
-        .ok()
-        .map(solstone_core_import::DetectedTimestamp::new)
 }
 
 fn unavailable_model_timestamp(
@@ -1078,13 +1169,18 @@ impl ImportPipeline for GenericAudioPipeline<'_> {
                 timestamp,
                 ..
             } => {
-                let (run, _) = run_audio(
-                    &media,
-                    &options,
-                    self.journal_path,
-                    timestamp.as_str(),
-                    false,
-                );
+                let timestamp = if let Some(instant) = request.source_instant {
+                    solstone_core_import::source_timestamp_for_preview(
+                        self.journal_path,
+                        &timestamp,
+                        request.source,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .with_source_instant(instant)
+                } else {
+                    timestamp
+                };
+                let (run, _) = run_audio(&media, &options, self.journal_path, &timestamp, false);
                 if run.exit_code == 0 {
                     Ok(PipelineOutcome::Imported)
                 } else {
@@ -1582,6 +1678,8 @@ struct Options {
     snapshot_digest: Option<String>,
     preview_token: Option<String>,
     preview_zone: Option<String>,
+    preview_stamp: Option<String>,
+    fallback_timestamp: Option<String>,
 }
 
 enum ParsedCommand {
@@ -1664,6 +1762,8 @@ fn takes_value(argument: &str) -> bool {
         argument,
         "--preview-token"
             | "--preview-zone"
+            | "--preview-stamp"
+            | "--fallback-timestamp"
             | "--snapshot-digest"
             | "--timestamp"
             | "--facet"
@@ -1682,6 +1782,8 @@ fn assign_value(options: &mut Options, name: &str, value: &str) -> Result<(), St
     match name {
         "--preview-zone" => options.preview_zone = Some(value.to_owned()),
         "--preview-token" => options.preview_token = Some(value.to_owned()),
+        "--preview-stamp" => options.preview_stamp = Some(value.to_owned()),
+        "--fallback-timestamp" => options.fallback_timestamp = Some(value.to_owned()),
         "--snapshot-digest" => options.snapshot_digest = Some(value.to_owned()),
         "--timestamp" => options.timestamp = Some(value.to_owned()),
         "--source" => options.source = Some(value.to_owned()),
@@ -1780,6 +1882,37 @@ fn failure(stdout: &str, stderr: &str, exit_code: i32) -> CliRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_notice_uses_positional_date_and_actual_binding_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("note.txt");
+        fs::write(&source, "same note").unwrap();
+        let old = solstone_core_import::validate_timestamp("20260101_120000").unwrap();
+        solstone_core_import::bind_import_record(root.path(), &old, Some(&source)).unwrap();
+        let args = vec![
+            source.display().to_string(),
+            "20260201_120000".into(),
+            "--force".into(),
+            "--json".into(),
+        ];
+        let before = solstone_core_import::snapshot::fingerprint(root.path()).unwrap();
+        let notice = force_day_notice_with(&args, root.path(), || Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(notice.contains("previous import used 20260101"));
+        assert!(notice.contains("will use 20260201"));
+        assert_eq!(
+            before,
+            solstone_core_import::snapshot::fingerprint(root.path()).unwrap()
+        );
+        let refused = force_day_notice_with(&args, root.path(), || {
+            Err(SupervisorRefusal::SpawnedUnavailable)
+        })
+        .unwrap_err();
+        assert_eq!(refused.exit_code, 75);
+        assert!(refused.stdout.is_empty() && refused.stderr.is_empty());
+    }
 
     #[test]
     fn local_preview_binds_bytes_and_owner_zone_before_mutation() {

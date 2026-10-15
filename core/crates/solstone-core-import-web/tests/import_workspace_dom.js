@@ -285,6 +285,8 @@ class FocusableElement extends Element {
 function makeHarness(ids) {
   const elements = Object.fromEntries(Object.entries(ids).map(([id, value]) => [id, new Element(value)]));
   const requests = [];
+  const navigations = [];
+  const pending = [];
   const document = {
     getElementById(id) { return elements[id] || null; },
   };
@@ -307,6 +309,8 @@ function makeHarness(ids) {
     fetch,
     Error,
     console,
+    navigations,
+    pending,
   });
   vm.runInContext([
     "const settingInput = document.getElementById('settingInput');",
@@ -315,13 +319,13 @@ function makeHarness(ids) {
     'let currentGuidedSaved = null;',
     'let importEvents = {};',
     'const isTerminalDuplicate = () => false;',
-    'const trackPendingImport = () => {};',
+    'const trackPendingImport = id => pending.push(id);',
     'const loadImports = () => {};',
-    'const navigateTo = () => {};',
+    'const navigateTo = view => navigations.push(view);',
     'const closeDetectModal = () => {};',
     'const showDetect = () => {};',
   ].join('\n'), context);
-  return { context, elements, requests };
+  return { context, elements, requests, navigations, pending };
 }
 
 function formObject(formData) {
@@ -401,6 +405,45 @@ async function runConfirmSubmit() {
   assertFacetAbsentAndSettingPreserved(harness.requests[0], 'confirm setting');
   assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(harness.requests[3].options.body), 'facet'));
   cases += 1;
+}
+
+async function runSourceTimeAndProgressIdentityStaySeparate() {
+  for (const kind of ['guided', 'quick']) {
+    for (const returnedId of ['20260623_183001', '20260701_120000']) {
+      const sourceTime = '20260623_183000';
+      const recordId = '20260623_183001';
+      const h = makeHarness({ guidedStartBtn: '', guidedSettingInput: '',
+        startBtn: '', timestampInput: sourceTime, savedPath: '/saved', settingInput: '' });
+      h.context.IMPORT_TERMINAL_EVENTS = new Set(['completed', 'error', 'declined']);
+      h.context.fetch = async (url, options) => {
+        h.requests.push({ url, options });
+        return { ok: true, json: async () => url.endsWith('/preview')
+          ? { preview_token: 'preview-1', size: { recordings: 1, days: 1 } }
+          : url.endsWith('/start') ? { import_id: returnedId } : {} };
+      };
+      const saved = { path: '/saved', timestamp: recordId, source_timestamp: sourceTime };
+      vm.runInContext(`currentGuidedSaved = ${JSON.stringify(saved)}`, h.context);
+      h.context.window._quickSaved = saved;
+      let start;
+      if (kind === 'guided') {
+        vm.runInContext(functionSource(workspace, 'startGuidedImport'), h.context);
+        start = () => h.context.startGuidedImport({ name: 'image', display_name: 'Images' });
+      } else {
+        const body = arrowBody(workspace, "startBtn.addEventListener('click', async () =>");
+        vm.runInContext(`async function confirmImport() ${body}`, h.context);
+        start = () => h.context.confirmImport();
+      }
+      await start();
+      await start();
+      const submission = h.requests.find(row => row.url.endsWith('/start'));
+      const payload = JSON.parse(submission.options.body);
+      assert.strictEqual(payload.timestamp, sourceTime, `${kind} submits the source time`);
+      assert.strictEqual(payload.import_id, recordId, `${kind} identifies the staged record`);
+      assert.deepStrictEqual(h.pending, [returnedId], `${kind} tracks the returned identity`);
+      assert.deepStrictEqual(h.navigations, [`progress/${returnedId}`], `${kind} follows the returned identity`);
+      cases += 1;
+    }
+  }
 }
 
 function runHistoryHeaderSummary() {
@@ -858,11 +901,11 @@ function runTerminalImportEventsNotOverwrittenByStart() {
 
   const startSrc = functionSource(workspace, 'startGuidedImport');
   assert.ok(
-    startSrc.includes('IMPORT_TERMINAL_EVENTS.has(importEvents[ts].event)'),
+    startSrc.includes('IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event)'),
     'start-path terminal guard is present'
   );
   assert.ok(
-    startSrc.includes('...(importEvents[ts] || {})'),
+    startSrc.includes('...(importEvents[importId] || {})'),
     'start-path spread preserves an existing terminal event'
   );
 
@@ -3370,6 +3413,7 @@ Promise.resolve()
   .then(runQuickSubmit)
   .then(runGuidedSubmit)
   .then(runConfirmSubmit)
+  .then(runSourceTimeAndProgressIdentityStaySeparate)
   .then(runHistoryHeaderSummary)
   .then(runImportRowColumns)
   .then(runProgressPanelUpdatesOnCompletion)

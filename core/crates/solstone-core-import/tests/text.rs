@@ -142,6 +142,7 @@ fn run(path: &Path, day: &Path, start: &str, wire: &dyn WireClient) -> TextImpor
         None,
         None,
         wire,
+        None,
     )
 }
 
@@ -402,7 +403,7 @@ fn a_meeting_that_crosses_midnight_continues_into_the_next_day() {
             ("20260311".to_owned(), "235800_300".to_owned(), 86_280),
             ("20260311".to_owned(), "235800_300".to_owned(), 86_280),
             ("20260311".to_owned(), "235800_300".to_owned(), 86_280),
-            ("20260311".to_owned(), "235800_300".to_owned(), 86_579),
+            ("20260312".to_owned(), "000259_300".to_owned(), 179),
             ("20260312".to_owned(), "000300_300".to_owned(), 180),
             ("20260312".to_owned(), "002800_300".to_owned(), 1_755),
             ("20260312".to_owned(), "005800_300".to_owned(), 3_603),
@@ -414,7 +415,7 @@ fn a_meeting_that_crosses_midnight_continues_into_the_next_day() {
             .is_file()
     );
     assert_stream_generation(&day, 1);
-    assert_stream_generation(&next, 3);
+    assert_stream_generation(&next, 4);
 }
 
 #[test]
@@ -562,6 +563,7 @@ fn header_keeps_caller_and_model_setting_slots_distinct() {
         Some("work"),
         Some("caller-setting"),
         &wire,
+        None,
     );
     let created = outcome.created();
     assert_eq!(created.len(), 1);
@@ -588,7 +590,7 @@ fn raw_back_reference_is_destination_independent() {
     ] {
         let wire = RecordingWire::always(no_engine);
         let outcome = process_transcript_with_wire(
-            &source, day_dir, "12:00:00", import_id, stream, None, None, &wire,
+            &source, day_dir, "12:00:00", import_id, stream, None, None, &wire, None,
         );
         let created = outcome.created();
         assert_eq!(created.len(), 1);
@@ -744,7 +746,8 @@ fn spring_tile_keeps_real_instants_through_the_reader() {
         "## 00:00:00\n**Ana:** First\n## 00:03:00\n**Ben:** Second\n## 00:05:00\n**Ana:** Third\n";
     let (_temporary, source, day) = setup_in_zone("spring.txt", text, "20260308", "America/Denver");
     let preview_size =
-        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text").unwrap();
+        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text", None)
+            .unwrap();
     let created = run_ok(&source, &day, "01:58:00", &RecordingWire::always(no_engine));
     assert_eq!(created.len(), 2);
     assert_eq!(created[0].day, "20260308");
@@ -817,7 +820,8 @@ fn fall_back_tile_keeps_both_one_fifty_eight_instants() {
     let text = "## 00:00:00\n**Ana:** First\n## 00:05:00\n**Ben:** Second\n## 01:00:00\n**Ana:** Third\n## 01:05:00\n**Ben:** Fourth\n";
     let (_temporary, source, day) = setup_in_zone("fall.txt", text, "20261101", "America/Denver");
     let preview_size =
-        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text").unwrap();
+        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text", None)
+            .unwrap();
     let created = run_ok(&source, &day, "01:58:00", &RecordingWire::always(no_engine));
     assert_eq!(created.len(), 4);
     assert_eq!(created[0].day, "20261101");
@@ -920,7 +924,8 @@ fn ordinary_day_clocks_stay_on_the_wall_time() {
     let (_temporary, source, day) =
         setup_in_zone("ordinary.txt", text, "20260311", "America/Denver");
     let preview_size =
-        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text").unwrap();
+        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text", None)
+            .unwrap();
     let created = run_ok(&source, &day, "01:58:00", &RecordingWire::always(no_engine));
     assert_eq!(created.len(), 2);
     assert_eq!(created[0].day, "20260311");
@@ -992,7 +997,8 @@ fn kolkata_midnight_rolls_to_the_next_local_day() {
     let text = "# 2026-03-11\n## 00:00:00\n**Ana:** late\n## 00:05:00\n**Ben:** next day\n";
     let (_temporary, source, day) = setup_in_zone("kolkata.txt", text, "20260311", "Asia/Kolkata");
     let preview_size =
-        solstone_core_import::text::preview(&source, &day, "23:58:00", "import.text").unwrap();
+        solstone_core_import::text::preview(&source, &day, "23:58:00", "import.text", None)
+            .unwrap();
     let created = run_ok(&source, &day, "23:58:00", &RecordingWire::always(no_engine));
     assert_eq!(created.len(), 2);
     assert_eq!(created[0].day, "20260311");
@@ -1045,7 +1051,8 @@ fn missing_spring_start_writes_no_chronicle_segment() {
     let text = "# 2026-03-08\n## 00:00:00\n**Ana:** hello\n";
     let (temporary, source, day) = setup_in_zone("missing.txt", text, "20260308", "America/Denver");
     let preview_err =
-        solstone_core_import::text::preview(&source, &day, "02:30:00", "import.text").unwrap_err();
+        solstone_core_import::text::preview(&source, &day, "02:30:00", "import.text", None)
+            .unwrap_err();
     match preview_err {
         TextImportError::LocalTimeMissing {
             day: failed_day,
@@ -1067,6 +1074,7 @@ fn missing_spring_start_writes_no_chronicle_segment() {
         None,
         None,
         &wire,
+        None,
     );
     match outcome {
         TextImportOutcome::Failed {
@@ -1096,7 +1104,8 @@ fn inline_clocks_cross_midnight_onto_the_next_local_day() {
     let (_temporary, source, day) =
         setup_in_zone("midnight.txt", text, "20260311", "America/Denver");
     let preview_size =
-        solstone_core_import::text::preview(&source, &day, "12:00:00", "import.text").unwrap();
+        solstone_core_import::text::preview(&source, &day, "12:00:00", "import.text", None)
+            .unwrap();
     let created = run_ok(&source, &day, "12:00:00", &RecordingWire::always(no_engine));
     assert_eq!(created.len(), 2);
     assert_eq!(created[0].day, "20260311");
@@ -1166,6 +1175,73 @@ fn inline_clocks_cross_midnight_onto_the_next_local_day() {
         produced1.chunks[0].occurrence_time_ms,
         Some(OccurrenceTimeMs(expected1)),
     );
+}
+
+#[test]
+fn a_single_elapsed_tile_splits_at_the_owner_day_boundary() {
+    for (name, text, start) in [
+        (
+            "clock-midnight.txt",
+            "[23:59:00] Alex: before\n[00:01:00] Blair: after\n",
+            "12:00:00",
+        ),
+        (
+            "elapsed-midnight.txt",
+            "## 00:00:00\n**Alex:** before\n## 00:02:00\n**Blair:** after\n",
+            "23:59:00",
+        ),
+    ] {
+        let (_temporary, source, day) = setup_in_zone(name, text, "20260311", "America/Denver");
+        let preview =
+            solstone_core_import::text::preview(&source, &day, start, "import.text", None).unwrap();
+        let created = run_ok(&source, &day, start, &RecordingWire::always(no_engine));
+        assert_eq!(created.len(), 2, "{name}");
+        assert_eq!(preview.recordings.len(), 2, "{name}");
+        for (item, expected_day, expected_text, hour, minute) in [
+            (&created[0], "20260311", "before", 5, 59),
+            (&created[1], "20260312", "after", 6, 1),
+        ] {
+            assert_eq!(item.day, expected_day, "{name}");
+            assert!(preview.recordings.iter().any(|recording|
+                recording.day == item.day && recording.segment == item.segment));
+            let bytes = fs::read_to_string(&item.path).unwrap();
+            let rel = format!(
+                "{expected_day}/import.text/{}/conversation_transcript.jsonl",
+                item.segment
+            );
+            let produced = produce_chunks(Family::AiChat, &rel, &bytes);
+            assert_eq!(produced.chunks.len(), 1, "{name}");
+            assert!(produced.chunks[0].content.contains(expected_text));
+            let expected = chrono::NaiveDate::from_ymd_opt(2026, 3, 12)
+                .unwrap()
+                .and_hms_opt(hour, minute, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+            assert_eq!(
+                produced.chunks[0].occurrence_time_ms,
+                Some(OccurrenceTimeMs(expected)),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn out_of_day_clocks_do_not_become_a_midnight_crossing() {
+    for clock in ["24:00:00", "999:00:00"] {
+        let text = format!("[{clock}] Alex: before\n[00:01:00] Blair: after\n");
+        let (_temporary, source, day) = setup("invalid-clock.txt", &text);
+        let created = run_ok(&source, &day, "12:00:00", &RecordingWire::always(no_engine));
+        assert_eq!(created.len(), 1);
+        let saved = rows(&created[0].path);
+        assert_eq!(saved[0]["untimed"], true);
+        assert!(saved.iter().any(|row| {
+            row["text"]
+                .as_str()
+                .is_some_and(|value| value.contains(clock))
+        }));
+    }
 }
 
 #[cfg(feature = "full-tests")]
@@ -1261,6 +1337,7 @@ fn owner_zone_beats_the_host_zone() {
         None,
         None,
         &wire,
+        None,
     );
     match outcome {
         TextImportOutcome::Failed {
@@ -1272,4 +1349,58 @@ fn owner_zone_beats_the_host_zone() {
         }
         other => panic!("expected LocalTimeMissing, got {other:?}"),
     }
+}
+
+#[test]
+fn limitless_utc_keeps_the_second_repeated_hour_for_elapsed_text() {
+    let text = "## 00:00:00\n**Ana:** first\n## 00:05:00\n**Ana:** later\n";
+    let (_temp, source, day) = setup_in_zone(
+        "limitless_pendant_2026-11-01T08-58-00_to_2026-11-01T09-10-00.txt",
+        text,
+        "20261101",
+        "America/Denver",
+    );
+    let stamp = solstone_core_import::detect_creation(
+        &source,
+        source.file_name().and_then(|name| name.to_str()),
+        chrono_tz::America::Denver,
+    )
+    .unwrap();
+    assert_eq!(stamp.as_str(), "20261101_015800");
+    let preview = solstone_core_import::text::preview(
+        &source,
+        &day,
+        "01:58:00",
+        "import.text",
+        stamp.source_instant(),
+    )
+    .unwrap();
+    assert_eq!(
+        preview
+            .recordings
+            .iter()
+            .map(|row| row.segment.as_str())
+            .collect::<Vec<_>>(),
+        ["015800_300", "020300_300"]
+    );
+    let outcome = process_transcript_with_wire(
+        &source,
+        &day,
+        "01:58:00",
+        "20261101_015800",
+        "import.text",
+        None,
+        None,
+        &RecordingWire::always(no_engine),
+        stamp.source_instant(),
+    );
+    assert!(matches!(outcome, TextImportOutcome::Success(_)));
+    assert_eq!(
+        outcome
+            .created()
+            .iter()
+            .map(|row| row.segment.as_str())
+            .collect::<Vec<_>>(),
+        ["015800_300", "020300_300"]
+    );
 }

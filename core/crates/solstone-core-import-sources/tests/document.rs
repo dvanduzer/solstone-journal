@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::collections::VecDeque;
-use std::fs;
+use std::fs::{self, File, FileTimes};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -22,8 +22,9 @@ use solstone_core_generate::{
 };
 use solstone_core_import::{CreatedSegment, PublicationOperations, observe_source_immutability};
 use solstone_core_import_sources::document::{
-    DocumentImportRequest, DocumentModelClient, PdfCommand, PdfMetadata, PdfPage, PdfPayload,
-    PdfWorker, PdfWorkerRequest, SystemPdfWorker, WorkerFailure, import,
+    DocumentImportRequest, DocumentModelClient, DocumentPreviewRequest, PdfCommand, PdfMetadata,
+    PdfPage, PdfPayload, PdfWorker, PdfWorkerRequest, SystemPdfWorker, WorkerFailure, import,
+    prepare_document_import, preview, preview_size,
 };
 use solstone_core_indexer_store::scan::RescanFileStatus;
 use solstone_core_segment::{StreamAdvance, UnboundStreamAdvanceError, advance_unbound_stream};
@@ -80,6 +81,7 @@ fn ac1_document_text_layer_imports_verbatim_with_zero_model_calls() {
             password: None,
             now: SystemTime::now(),
             zone: solstone_core_journal_config::owner_zone(tree.journal()),
+            owner_timestamp: None,
         },
         tree.journal(),
         false,
@@ -902,6 +904,7 @@ fn document_rejects_invalid_worker_protocol_before_artifact_writes() {
             password: None,
             force: false,
             now: SystemTime::now(),
+            owner_timestamp: None,
         },
         &worker,
         &model,
@@ -994,6 +997,7 @@ fn two_same_time_pdfs_claim_distinct_segments_and_keep_both_originals() {
             password: None,
             force: false,
             now: when,
+            owner_timestamp: None,
         },
         &worker,
         &model,
@@ -1065,6 +1069,7 @@ fn mixed_batch_keeps_the_installed_sibling_when_the_next_claim_crosses_the_day()
             password: None,
             force: false,
             now: when,
+            owner_timestamp: None,
         },
         &worker,
         &model,
@@ -1133,6 +1138,7 @@ fn document_import_refuses_a_full_probe_and_an_occupied_day_boundary() {
             password: None,
             force: false,
             now: when,
+            owner_timestamp: None,
         },
         &worker,
         &model,
@@ -1175,6 +1181,7 @@ fn document_import_refuses_a_full_probe_and_an_occupied_day_boundary() {
             password: None,
             force: true,
             now: end,
+            owner_timestamp: None,
         },
         &worker,
         &model,
@@ -1240,6 +1247,7 @@ fn run_import<'a>(
             password: None,
             force: false,
             now,
+            owner_timestamp: None,
         },
         worker,
         model,
@@ -1653,4 +1661,285 @@ impl Drop for TestTree {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.root).unwrap();
     }
+}
+
+#[test]
+fn pdf_twins_timestamp_resolution_ladder_and_directory_boundary() {
+    let tree = TestTree::new();
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let old_mtime = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+    let pdf_bytes = b"%PDF-1.4 twin test bytes";
+    let model = FakeModel::generated([]);
+
+    // 1. Single file, owner_timestamp: Some("20260301_153000"):
+    //    preview date range, preview_size recording day, and prepare_document_import timestamp_source
+    //    are 20260301 / owner. This wins even when the payload has a different credible creation date.
+    let file1 = tree.pdf("owner_override.pdf", pdf_bytes);
+    File::options()
+        .write(true)
+        .open(&file1)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old_mtime))
+        .unwrap();
+    let mut pl1 = payload(vec![page(1, 50, 0.0, Some("doc text"))]);
+    pl1.metadata.creation_date = Some("2026-05-10T14:30:00Z".to_owned());
+    let worker1 = FakeWorker::new(vec![Ok(pl1.clone()), Ok(pl1.clone()), Ok(pl1.clone())]);
+    let prev1 = preview(
+        DocumentPreviewRequest {
+            source: &file1,
+            password: None,
+            now,
+            zone: chrono_tz::Tz::UTC,
+            owner_timestamp: Some("20260301_153000"),
+        },
+        &worker1,
+    );
+    assert_eq!(prev1.date_range.0, "20260301");
+    assert_eq!(prev1.date_range.1, "20260301");
+
+    let size1 = preview_size(
+        DocumentPreviewRequest {
+            source: &file1,
+            password: None,
+            now,
+            zone: chrono_tz::Tz::UTC,
+            owner_timestamp: Some("20260301_153000"),
+        },
+        tree.journal(),
+        false,
+        &worker1,
+    )
+    .unwrap();
+    assert_eq!(size1.recordings.iter().next().unwrap().day, "20260301");
+
+    let prep1 = prepare_document_import(
+        &DocumentImportRequest {
+            source: &file1,
+            journal_root: tree.journal(),
+            import_dir: tree.import_dir(),
+            import_id: "twin-test-1",
+            revision: None,
+            password: None,
+            force: false,
+            now,
+            owner_timestamp: Some("20260301_153000"),
+        },
+        &worker1,
+        &model,
+    );
+    assert_eq!(prep1.items[0].timestamp_source, "owner");
+    assert!(
+        prep1.items[0]
+            .segment_dir
+            .starts_with(tree.journal().join("chronicle/20260301"))
+    );
+
+    // 2. Single file, owner_timestamp: None, filename note_20260402_101500.pdf,
+    //    payload creation_date absent or equal to that wall time: source filename, day 20260402.
+    let file2 = tree.pdf("note_20260402_101500.pdf", pdf_bytes);
+    File::options()
+        .write(true)
+        .open(&file2)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old_mtime))
+        .unwrap();
+    let mut pl2 = payload(vec![page(1, 50, 0.0, Some("doc text"))]);
+    pl2.metadata.creation_date = None;
+    let worker2 = FakeWorker::new(vec![Ok(pl2)]);
+    let prep2 = prepare_document_import(
+        &DocumentImportRequest {
+            source: &file2,
+            journal_root: tree.journal(),
+            import_dir: tree.import_dir(),
+            import_id: "twin-test-2",
+            revision: None,
+            password: None,
+            force: false,
+            now,
+            owner_timestamp: None,
+        },
+        &worker2,
+        &model,
+    );
+    assert_eq!(prep2.items[0].timestamp_source, "filename");
+    assert!(
+        prep2.items[0]
+            .segment_dir
+            .starts_with(tree.journal().join("chronicle/20260402"))
+    );
+
+    // 3. The same bytes and payload with a name that has no stamp and owner_timestamp: None:
+    //    today's order. If the payload has an in-window mod_date, source is pdf-metadata
+    //    and the day is that date, not the file mtime.
+    let file3 = tree.pdf("plain_notes.pdf", pdf_bytes);
+    File::options()
+        .write(true)
+        .open(&file3)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old_mtime))
+        .unwrap();
+    let mut pl3 = payload(vec![page(1, 50, 0.0, Some("doc text"))]);
+    pl3.metadata.creation_date = None;
+    pl3.metadata.mod_date = Some("2026-05-01T12:00:00Z".to_owned());
+    let worker3 = FakeWorker::new(vec![Ok(pl3)]);
+    let prep3 = prepare_document_import(
+        &DocumentImportRequest {
+            source: &file3,
+            journal_root: tree.journal(),
+            import_dir: tree.import_dir(),
+            import_id: "twin-test-3",
+            revision: None,
+            password: None,
+            force: false,
+            now,
+            owner_timestamp: None,
+        },
+        &worker3,
+        &model,
+    );
+    assert_eq!(prep3.items[0].timestamp_source, "pdf-metadata");
+    assert!(
+        prep3.items[0]
+            .segment_dir
+            .starts_with(tree.journal().join("chronicle/20260501"))
+    );
+
+    // 4. Filename 20260101_080000.pdf plus a credible in-window creation_date on a
+    //    different owner-zone day: source is not filename. The creation date wins through
+    //    the existing ladder (pdf-metadata).
+    let file4 = tree.pdf("20260101_080000.pdf", pdf_bytes);
+    File::options()
+        .write(true)
+        .open(&file4)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old_mtime))
+        .unwrap();
+    let mut pl4 = payload(vec![page(1, 50, 0.0, Some("doc text"))]);
+    pl4.metadata.creation_date = Some("2026-06-15T09:00:00Z".to_owned());
+    let worker4 = FakeWorker::new(vec![Ok(pl4)]);
+    let prep4 = prepare_document_import(
+        &DocumentImportRequest {
+            source: &file4,
+            journal_root: tree.journal(),
+            import_dir: tree.import_dir(),
+            import_id: "twin-test-4",
+            revision: None,
+            password: None,
+            force: false,
+            now,
+            owner_timestamp: None,
+        },
+        &worker4,
+        &model,
+    );
+    assert_ne!(prep4.items[0].timestamp_source, "filename");
+    assert_eq!(prep4.items[0].timestamp_source, "pdf-metadata");
+    assert!(
+        prep4.items[0]
+            .segment_dir
+            .starts_with(tree.journal().join("chronicle/20260615"))
+    );
+
+    // 5. A directory of two PDFs, request owner_timestamp: Some("20260301_153000"):
+    //    that stamp is not applied. Each file keeps its own payload date.
+    let dir = tree.sources().join("two_pdfs");
+    fs::create_dir_all(&dir).unwrap();
+    let file5a = dir.join("doc_a.pdf");
+    let file5b = dir.join("doc_b.pdf");
+    fs::write(&file5a, pdf_bytes).unwrap();
+    fs::write(&file5b, pdf_bytes).unwrap();
+    File::options()
+        .write(true)
+        .open(&file5a)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old_mtime))
+        .unwrap();
+    File::options()
+        .write(true)
+        .open(&file5b)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(old_mtime))
+        .unwrap();
+
+    let mut pl5a = payload(vec![page(1, 50, 0.0, Some("doc a"))]);
+    pl5a.metadata.creation_date = Some("2026-07-01T10:00:00Z".to_owned());
+    let mut pl5b = payload(vec![page(1, 50, 0.0, Some("doc b"))]);
+    pl5b.metadata.creation_date = Some("2026-08-01T10:00:00Z".to_owned());
+
+    let worker5 = FakeWorker::new(vec![Ok(pl5a), Ok(pl5b)]);
+    let prep5 = prepare_document_import(
+        &DocumentImportRequest {
+            source: &dir,
+            journal_root: tree.journal(),
+            import_dir: tree.import_dir(),
+            import_id: "twin-test-5",
+            revision: None,
+            password: None,
+            force: false,
+            now,
+            owner_timestamp: Some("20260301_153000"),
+        },
+        &worker5,
+        &model,
+    );
+    assert_eq!(prep5.items.len(), 2);
+    for item in &prep5.items {
+        assert_ne!(item.timestamp_source, "owner");
+        assert_eq!(item.timestamp_source, "pdf-metadata");
+    }
+    let has_day_0701 = prep5.items.iter().any(|item| {
+        item.segment_dir
+            .starts_with(tree.journal().join("chronicle/20260701"))
+    });
+    let has_day_0801 = prep5.items.iter().any(|item| {
+        item.segment_dir
+            .starts_with(tree.journal().join("chronicle/20260801"))
+    });
+    assert!(has_day_0701);
+    assert!(has_day_0801);
+}
+
+#[test]
+fn a_pdf_owner_time_in_a_dst_gap_is_refused_before_extraction_or_writes() {
+    let tree = TestTree::new();
+    let source = tree.pdf("notes.pdf", b"%PDF-1.4 fixture");
+    fs::create_dir_all(tree.journal().join("config")).unwrap();
+    fs::write(
+        tree.journal().join("config/journal.json"),
+        br#"{"identity":{"timezone":"America/New_York"}}"#,
+    )
+    .unwrap();
+    let worker = FakeWorker::new(vec![]);
+    let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let result = preview_size(
+        DocumentPreviewRequest {
+            source: &source,
+            password: None,
+            now,
+            zone: chrono_tz::America::New_York,
+            owner_timestamp: Some("20260308_023000"),
+        },
+        tree.journal(),
+        false,
+        &worker,
+    );
+    assert!(result.unwrap_err().contains("does not exist"));
+    let prepared = prepare_document_import(
+        &DocumentImportRequest {
+            source: &source,
+            journal_root: tree.journal(),
+            import_dir: tree.import_dir(),
+            import_id: "gap",
+            revision: None,
+            password: None,
+            force: false,
+            now,
+            owner_timestamp: Some("20260308_023000"),
+        },
+        &worker,
+        &FakeModel::generated([]),
+    );
+    assert!(prepared.items.is_empty());
+    assert!(!prepared.hard_failures.is_empty());
+    assert!(!tree.journal().join("chronicle").exists());
 }

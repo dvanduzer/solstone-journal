@@ -97,6 +97,7 @@ pub struct ResolutionOptions<'a> {
     pub dry_run: bool,
     pub deterministic_only: bool,
     pub force: bool,
+    pub fallback_timestamp: Option<&'a str>,
 }
 
 /// Named externally-owned resolution decisions.
@@ -273,6 +274,24 @@ where
     }
     let timestamp = if let Some(raw) = options.timestamp {
         validate(raw)?
+    } else if selected == Some(RegistrySource::Image) {
+        let detected = (seams.deterministic_detector)(
+            options.media,
+            options.media.file_name().and_then(|value| value.to_str()),
+        );
+        match detected {
+            Some(answer) => answer.timestamp,
+            None if options.deterministic_only => {
+                return Ok(ResolutionOutcome::Skipped {
+                    reason: SkipReason::NoDeterministicMatch,
+                    detected_timestamp: None,
+                });
+            }
+            None => match options.fallback_timestamp {
+                Some(raw) => validate(raw)?,
+                None => return Err(ResolutionError::CouldNotDetectTimestamp),
+            },
+        }
     } else if selected.is_some() {
         (seams.generated_timestamp)()
     } else {
@@ -280,22 +299,6 @@ where
             options.media,
             options.media.file_name().and_then(|value| value.to_str()),
         );
-        let detected = match detected {
-            Some(answer) => Some(answer),
-            None if options.deterministic_only => {
-                return Ok(ResolutionOutcome::Skipped {
-                    reason: SkipReason::NoDeterministicMatch,
-                    detected_timestamp: None,
-                });
-            }
-            None => match (seams.model_detector)(options.media, options.auto.guidance()) {
-                Ok(answer) => answer,
-                Err(ModelDetectionError::Unavailable) => None,
-                Err(ModelDetectionError::Failed(source)) => {
-                    return Err(ResolutionError::ModelDetectionFailed { source });
-                }
-            },
-        };
         match detected {
             Some(answer) if options.auto.adopts() => answer.timestamp,
             Some(answer) => {
@@ -304,7 +307,40 @@ where
                     detected_timestamp: Some(answer.timestamp),
                 });
             }
-            None => return Err(ResolutionError::CouldNotDetectTimestamp),
+            None if options.deterministic_only => {
+                return Ok(ResolutionOutcome::Skipped {
+                    reason: SkipReason::NoDeterministicMatch,
+                    detected_timestamp: None,
+                });
+            }
+            None => {
+                let model_detected =
+                    match (seams.model_detector)(options.media, options.auto.guidance()) {
+                        Ok(answer) => answer,
+                        Err(ModelDetectionError::Unavailable) => None,
+                        Err(ModelDetectionError::Failed(source)) => {
+                            return Err(ResolutionError::ModelDetectionFailed { source });
+                        }
+                    };
+                match model_detected {
+                    Some(answer) if options.auto.adopts() => answer.timestamp,
+                    Some(answer) => {
+                        return Ok(ResolutionOutcome::Skipped {
+                            reason: SkipReason::TimestampRequired,
+                            detected_timestamp: Some(answer.timestamp),
+                        });
+                    }
+                    None => {
+                        if let Some(fallback) = options.fallback_timestamp
+                            && let Ok(ts) = validate_timestamp(fallback)
+                        {
+                            ts
+                        } else {
+                            return Err(ResolutionError::CouldNotDetectTimestamp);
+                        }
+                    }
+                }
+            }
         }
     };
     if selected.is_none() && options.media.is_dir() {

@@ -170,6 +170,7 @@ pub fn sync_audio_save(
             source: &candidate.source,
             source_kind: "audio",
             timestamp: None,
+            source_instant: None,
             auto: pipeline_auto(&request.auto),
         });
         let entry = catalogued

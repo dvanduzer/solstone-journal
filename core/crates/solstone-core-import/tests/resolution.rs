@@ -46,6 +46,7 @@ fn opt(media: &Path) -> ResolutionOptions<'_> {
         dry_run: true,
         deterministic_only: false,
         force: false,
+        fallback_timestamp: None,
     }
 }
 fn answer() -> DetectedTimestamp {
@@ -726,4 +727,100 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         .collect::<Vec<_>>();
     rows.sort();
     rows
+}
+
+#[test]
+fn deterministic_only_none_skips_with_no_deterministic_match() {
+    let tree = Tree::new();
+    let file = tree.file("sample.txt");
+    let mut options = opt(&file);
+    options.deterministic_only = true;
+    let mut seam = seams();
+    seam.deterministic_detector = |_, _| None;
+    let outcome = solstone_core_import::detect::resolve_import(&options, &mut seam).unwrap();
+    assert_eq!(
+        outcome,
+        ResolutionOutcome::Skipped {
+            reason: SkipReason::NoDeterministicMatch,
+            detected_timestamp: None,
+        }
+    );
+    let msg =
+        solstone_core_import::cli_render::resolution_skipped(SkipReason::NoDeterministicMatch);
+    assert!(msg.contains("YYYYMMDD_HHMMSS"));
+}
+
+#[test]
+fn auto_adopts_none_none_no_fallback_errors_could_not_detect() {
+    let tree = Tree::new();
+    let file = tree.file("generic.bin");
+    let mut options = opt(&file);
+    options.auto = AutoTimestamp::Bare;
+    let mut seam = seams();
+    seam.deterministic_detector = |_, _| None;
+    seam.model_detector = |_, _| Ok(None);
+    let outcome = solstone_core_import::detect::resolve_import(&options, &mut seam);
+    assert!(matches!(
+        outcome,
+        Err(ResolutionError::CouldNotDetectTimestamp)
+    ));
+}
+
+#[test]
+fn explicit_timestamp_wins_for_image_over_detector() {
+    let tree = Tree::new();
+    let file = tree.file("photo.jpg");
+    let mut options = opt(&file);
+    options.source = Some("image");
+    options.timestamp = Some("20260301_120000");
+    let mut seam = seams();
+    seam.claims = |src, _| Ok(src == RegistrySource::Image);
+    seam.deterministic_detector = |_, _| {
+        Some(DetectedTimestamp::new(
+            validate_timestamp("20260510_143000").unwrap(),
+        ))
+    };
+    let outcome = solstone_core_import::detect::resolve_import(&options, &mut seam).unwrap();
+    match outcome {
+        ResolutionOutcome::Resolved {
+            timestamp, source, ..
+        } => {
+            assert_eq!(source, ResolvedSource::Registry(RegistrySource::Image));
+            assert_eq!(timestamp.as_str(), "20260301_120000");
+        }
+        _ => panic!("expected resolved outcome"),
+    }
+}
+
+#[test]
+fn fallback_is_an_explicit_option_for_generic_files_and_unknown_date_images() {
+    let tree = Tree::new();
+    let generic_file = tree.file("generic.bin");
+    let mut generic_options = opt(&generic_file);
+    generic_options.fallback_timestamp = Some("20260701_100000");
+    let mut seam = seams();
+    seam.deterministic_detector = |_, _| None;
+    seam.model_detector = |_, _| Ok(None);
+    let outcome =
+        solstone_core_import::detect::resolve_import(&generic_options, &mut seam).unwrap();
+    match outcome {
+        ResolutionOutcome::Resolved { timestamp, .. } => {
+            assert_eq!(timestamp.as_str(), "20260701_100000");
+        }
+        _ => panic!("expected resolved generic outcome"),
+    }
+
+    let image_file = tree.file("photo.jpg");
+    let mut image_options = opt(&image_file);
+    image_options.source = Some("image");
+    image_options.fallback_timestamp = Some("20260701_100000");
+    let mut seam2 = seams();
+    seam2.claims = |src, _| Ok(src == RegistrySource::Image);
+    seam2.deterministic_detector = |_, _| None;
+    seam2.model_detector = |_, _| Ok(None);
+    let image_outcome = solstone_core_import::detect::resolve_import(&image_options, &mut seam2);
+    let ResolutionOutcome::Resolved { timestamp, .. } = image_outcome.unwrap() else {
+        panic!("resolved fallback")
+    };
+    assert_eq!(timestamp.as_str(), "20260701_100000");
 }
