@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Native process-tree containment, isolated by the full-tests Cargo feature.
-#![cfg(windows)]
 
+#[cfg(windows)]
 use solstone_core_repository_contracts::windows_suite::{spawn_process_tree, wait_bounded};
+#[cfg(windows)]
 use std::process::Command;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
 #[allow(unsafe_code)]
+#[cfg(windows)]
 fn prove_descendant_cleanup(parent_waits: bool) {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("descendant.pid");
@@ -75,11 +80,16 @@ fn prove_descendant_cleanup(parent_waits: bool) {
 }
 
 #[test]
+#[cfg(windows)]
 fn timeout_terminates_the_native_descendant_lifetime() {
     prove_descendant_cleanup(true);
 }
 
 #[test]
+#[cfg(windows)]
 fn parent_completion_terminates_the_native_descendant_lifetime() {
     prove_descendant_cleanup(false);
 }
+
+#[path = "common/windows_package_runner.rs"]
+mod package_runner;

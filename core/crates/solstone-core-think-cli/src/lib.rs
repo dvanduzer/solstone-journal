@@ -1144,13 +1144,28 @@ mod tests {
         entries: &[(&str, &str)],
     ) -> (std::path::PathBuf, std::path::PathBuf) {
         let talents = root.join("talent");
-        fs::create_dir_all(&talents).unwrap();
-        for (name, contents) in entries {
-            fs::write(talents.join(format!("{name}.md")), contents).unwrap();
-        }
         let apps = root.join("apps");
+        fs::create_dir_all(&talents).unwrap();
         fs::create_dir_all(&apps).unwrap();
+        for (name, contents) in entries {
+            fs::write(fixture_talent_path(&talents, &apps, name), contents).unwrap();
+        }
         (talents, apps)
+    }
+
+    pub(crate) fn fixture_talent_path(
+        talents: &Path,
+        apps: &Path,
+        name: &str,
+    ) -> std::path::PathBuf {
+        // App talent keys use a colon in requests, but their files live under
+        // apps/<app>/talent. A literal colon creates an NTFS alternate stream.
+        let path = match name.split_once(':') {
+            Some((app, talent)) => apps.join(app).join("talent").join(format!("{talent}.md")),
+            None => talents.join(format!("{name}.md")),
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
     }
 
     impl Log for TestLogger {

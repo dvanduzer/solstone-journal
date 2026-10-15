@@ -7,6 +7,7 @@ pub mod ci;
 mod payload_inventory;
 pub mod release_manifest;
 pub mod windows_crosscheck;
+pub mod windows_package;
 pub mod windows_suite;
 
 #[cfg(test)]

@@ -2891,7 +2891,7 @@ mod tests {
             } else {
                 ""
             };
-            fs::write(ctx.talent_root.join(format!("{name}.md")), format!(
+            fs::write(crate::tests::fixture_talent_path(&ctx.talent_root, &ctx.apps_root, name), format!(
                 "{{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"{schedule}\",\"priority\":{priority},\"output\":\"{output}\"{hook}\n}}\n"
             )).unwrap();
         }
@@ -3020,7 +3020,7 @@ mod tests {
                 } else {
                     ""
                 };
-                fs::write(ctx.talent_root.join(format!("{name}.md")), format!(
+                fs::write(crate::tests::fixture_talent_path(&ctx.talent_root, &ctx.apps_root, name), format!(
                     "{{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"{schedule}\",\"priority\":{priority},\"output\":\"{output}\"{hook}\n}}\n"
                 )).unwrap();
             }
@@ -3520,7 +3520,7 @@ mod tests {
             )
             .unwrap();
             fs::write(
-                ctx.talent_root.join("entities:detection.md"),
+                crate::tests::fixture_talent_path(&ctx.talent_root, &ctx.apps_root, "entities:detection"),
                 "{\n\"type\": \"generate\", \"max_output_tokens\": 1024, \"schedule\": \"segment\", \"priority\": 2, \"output\": \"json\"\n}\n",
             )
             .unwrap();

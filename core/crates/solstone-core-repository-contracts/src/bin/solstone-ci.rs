@@ -11,13 +11,15 @@ use solstone_core_repository_contracts::ci::{
     scan_routine_boundaries, validate_registry,
 };
 use solstone_core_repository_contracts::release_manifest::{ManifestSelection, run_manifest_check};
+use solstone_core_repository_contracts::windows_package::{
+    capture_child, execute_windows_packages,
+};
 use solstone_core_repository_contracts::windows_suite::{
     OwnerEvidenceSnapshot, PlanStatus, SourceBinding, WINDOWS_COVERAGE_SCHEMA,
     WindowsCoverageReport, WindowsDisposition, WindowsPlan, WindowsSuiteEvidenceRow,
-    cargo_package_names, host_evidence_for_control, is_package_suite, judge, package_batch_results,
-    package_test_artifacts, parse_executed_count, plan_windows, resolve_default_controls,
-    resolve_default_probes, spawn_process_tree, verify_command_output, verify_owner_credit,
-    wait_bounded, windows_package_batches,
+    host_evidence_for_control, is_package_suite, judge, parse_executed_count, plan_windows,
+    resolve_default_controls, resolve_default_probes, spawn_process_tree, verify_command_output,
+    verify_owner_credit, wait_bounded,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -44,6 +46,9 @@ fn main() {
 fn run() -> Result<i32, String> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "plan".to_owned());
+    if command == "windows-package-child" {
+        return capture_child(args.collect());
+    }
     let repo = repo_root()?;
     let registry_path = repo.join("core/ci/suites.toml");
 
@@ -297,230 +302,6 @@ fn get_lock_sha256(repo: &Path) -> Result<String, String> {
     Ok(format!("{hash:x}"))
 }
 
-struct WindowsCommandCapture {
-    exit_code: i32,
-    timed_out: bool,
-    stdout: String,
-    stderr: String,
-    logs: Vec<String>,
-}
-
-fn run_windows_package_command(
-    repo: &Path,
-    argv: &[String],
-    prefix: &Path,
-    timeout_seconds: u64,
-) -> Result<WindowsCommandCapture, String> {
-    let stdout_path = prefix.with_extension("stdout.log");
-    let stderr_path = prefix.with_extension("stderr.log");
-    let command_path = prefix.with_extension("command.json");
-    fs::write(
-        &command_path,
-        serde_json::to_vec(argv).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("write {}: {e}", command_path.display()))?;
-    let mut command = Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .current_dir(repo)
-        .stdout(File::create(&stdout_path).map_err(|e| e.to_string())?)
-        .stderr(File::create(&stderr_path).map_err(|e| e.to_string())?);
-    let mut tree =
-        spawn_process_tree(&mut command).map_err(|e| format!("spawn {}: {e}", argv.join(" ")))?;
-    let result = wait_bounded(
-        &mut tree,
-        Duration::from_secs(timeout_seconds),
-        Instant::now,
-        thread::sleep,
-    );
-    let stdout = fs::read_to_string(&stdout_path).map_err(|e| e.to_string())?;
-    let stderr = fs::read_to_string(&stderr_path).map_err(|e| e.to_string())?;
-    // Keep the separate raw streams in the outer gate's durable log as well.
-    println!(
-        "WINDOWS_PACKAGE_COMMAND {}",
-        serde_json::to_string(argv).map_err(|e| e.to_string())?
-    );
-    for (path, text) in [
-        (&stdout_path, stdout.as_str()),
-        (&stderr_path, stderr.as_str()),
-    ] {
-        println!("WINDOWS_PACKAGE_LOG_BEGIN {}", path.display());
-        print!("{text}");
-        println!("\nWINDOWS_PACKAGE_LOG_END {}", path.display());
-    }
-    let _ = std::io::stdout().flush();
-    let (exit_code, timed_out) = match result {
-        Ok(status) => (status.code().unwrap_or(1), false),
-        Err(error) => {
-            eprintln!("Windows package command {}: {error}", argv.join(" "));
-            (-1, error == "timed out")
-        }
-    };
-    Ok(WindowsCommandCapture {
-        exit_code,
-        timed_out,
-        stdout,
-        stderr,
-        logs: vec![stdout_path, stderr_path, command_path]
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect(),
-    })
-}
-
-fn execute_windows_packages(
-    repo: &Path,
-    plan: &WindowsPlan,
-    target_dir: &Path,
-    invocation_id: &str,
-    binding: &SourceBinding,
-) -> Result<Vec<WindowsSuiteEvidenceRow>, String> {
-    let batches = windows_package_batches(plan);
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    let metadata_argv = [
-        "cargo",
-        "metadata",
-        "--manifest-path",
-        "core/Cargo.toml",
-        "--locked",
-        "--no-deps",
-        "--format-version=1",
-    ]
-    .map(str::to_owned);
-    let metadata = run_windows_package_command(
-        repo,
-        &metadata_argv,
-        &target_dir.join(format!("journal-win-package-metadata-{invocation_id}")),
-        batches.iter().map(|b| b.timeout_seconds).max().unwrap(),
-    );
-    let names = metadata.as_ref().map_err(Clone::clone).and_then(|capture| {
-        if capture.exit_code != 0 {
-            return Err("Cargo package metadata failed".to_owned());
-        }
-        cargo_package_names(&capture.stdout)
-    });
-    let mut rows = Vec::new();
-    for (batch_index, batch) in batches.iter().enumerate() {
-        let mut argv = [
-            "cargo",
-            "test",
-            "--manifest-path",
-            "core/Cargo.toml",
-            "--locked",
-            "--lib",
-            "--no-fail-fast",
-            "--message-format=json",
-            "--color=never",
-        ]
-        .map(str::to_owned)
-        .to_vec();
-        for package in &batch.packages {
-            argv.extend(["-p".to_owned(), package.clone()]);
-        }
-        if !batch.features.is_empty() {
-            argv.push("--features".to_owned());
-            argv.push(
-                batch
-                    .packages
-                    .iter()
-                    .flat_map(|package| {
-                        batch
-                            .features
-                            .iter()
-                            .map(move |feature| format!("{package}/{feature}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
-        argv.extend(["--".to_owned(), "--test-threads=1".to_owned()]);
-        let capture = run_windows_package_command(
-            repo,
-            &argv,
-            &target_dir.join(format!(
-                "journal-win-package-batch-{batch_index}-{invocation_id}"
-            )),
-            batch.timeout_seconds,
-        );
-        let results = names.as_ref().map_err(Clone::clone).and_then(|names| {
-            let capture = capture.as_ref().map_err(Clone::clone)?;
-            if capture.timed_out {
-                return Err("Cargo package batch timed out".to_owned());
-            }
-            let artifacts = package_test_artifacts(&capture.stdout, names, batch)?;
-            let results =
-                package_batch_results(&capture.stdout, &capture.stderr, &artifacts, batch)?;
-            if (capture.exit_code == 0) != results.values().all(|r| r.passed) {
-                return Err("Cargo exit disagrees with library test results".to_owned());
-            }
-            Ok(results)
-        });
-        for package in &batch.packages {
-            let item = plan
-                .items
-                .iter()
-                .find(|i| is_package_suite(i) && &i.package == package)
-                .unwrap();
-            let mut row = WindowsSuiteEvidenceRow {
-                suite_id: item.id.clone(),
-                disposition: WindowsDisposition::Failed,
-                commands: vec![argv.join(" ")],
-                exit_codes: vec![capture.as_ref().map_or(1, |c| c.exit_code)],
-                log_paths: Vec::new(),
-                features: item.required_features.clone(),
-                executed_counts: vec![0],
-                commit: binding.commit.clone(),
-                cargo_lock_sha256: binding.cargo_lock_sha256.clone(),
-                invocation_id: invocation_id.to_owned(),
-                nonce: None,
-                owner_account: None,
-                owner_sid: None,
-                elevated: None,
-                rail_matched: None,
-            };
-            for capture in [&metadata, &capture]
-                .into_iter()
-                .filter_map(|capture| capture.as_ref().ok())
-            {
-                row.log_paths.extend(capture.logs.iter().cloned());
-            }
-            match &results {
-                Err(error) => {
-                    eprintln!("suite {}: {error}", item.id);
-                    if capture.as_ref().is_ok_and(|c| c.timed_out) {
-                        row.disposition = WindowsDisposition::TimedOut;
-                    }
-                }
-                Ok(results) => {
-                    let result = &results[package];
-                    row.executed_counts = vec![result.executed];
-                    row.disposition = if result.executed == 0 {
-                        WindowsDisposition::Unexecuted
-                    } else if result.passed {
-                        WindowsDisposition::Passed
-                    } else {
-                        WindowsDisposition::Failed
-                    };
-                }
-            }
-            println!(
-                "WIN_SUITE {} disposition={}",
-                item.id,
-                match row.disposition {
-                    WindowsDisposition::Passed => "passed",
-                    WindowsDisposition::TimedOut => "timed-out",
-                    WindowsDisposition::Unexecuted => "unexecuted",
-                    _ => "failed",
-                }
-            );
-            rows.push(row);
-        }
-    }
-    Ok(rows)
-}
-
 fn execute_windows_run(
     repo: &Path,
     plan: &WindowsPlan,
@@ -567,10 +348,16 @@ fn execute_windows_run(
     let target_dir = repo.join("core/target");
     let _ = fs::create_dir_all(&target_dir);
 
-    let mut rows = execute_windows_packages(repo, plan, &target_dir, &invocation_id, &binding)?;
-    let mut any_failed = rows
-        .iter()
-        .any(|row| row.disposition != WindowsDisposition::Passed);
+    let package_run = execute_windows_packages(
+        repo,
+        plan,
+        &target_dir,
+        &invocation_id,
+        &binding,
+        &env::current_exe().map_err(|e| e.to_string())?,
+    )?;
+    let mut any_failed = package_run.failed();
+    let mut rows = package_run.rows;
 
     for item in &plan.items {
         if is_package_suite(item) && item.status == PlanStatus::Ready {
@@ -1894,154 +1681,6 @@ fn repo_root() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "full-tests")]
-    #[test]
-    fn package_batches_credit_each_real_binary_and_retain_separate_batch_logs() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path();
-        let target = repo.join("core/target");
-        fs::create_dir_all(&target).unwrap();
-        let cases = [
-            (
-                "batch-pass-a",
-                "#[test] fn passes() { assert_eq!(std::env::current_dir().unwrap(), std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"))); }",
-                vec![],
-            ),
-            (
-                "batch-fail",
-                "#[test] fn passes() {}\n#[test] fn fails() { assert_eq!(1, 2); }",
-                vec![],
-            ),
-            ("batch-empty", "pub fn value() -> u8 { 1 }", vec![]),
-            (
-                "batch-feature",
-                "#[test] fn base() {}\n#[cfg(feature=\"full-tests\")] #[test] fn enabled_a() {}\n#[cfg(feature=\"full-tests\")] #[test] fn enabled_b() {}",
-                vec!["full-tests".to_owned()],
-            ),
-        ];
-        let members = cases
-            .iter()
-            .map(|(name, _, _)| format!("\"{name}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        fs::write(
-            repo.join("core/Cargo.toml"),
-            format!("[workspace]\nmembers=[{members}]\nresolver=\"3\"\n"),
-        )
-        .unwrap();
-        let mut items = Vec::new();
-        for (name, source, features) in cases {
-            let dir = repo.join("core").join(name);
-            fs::create_dir_all(dir.join("src")).unwrap();
-            fs::write(dir.join("Cargo.toml"), format!("[package]\nname=\"{name}\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[features]\nfull-tests=[]\n")).unwrap();
-            fs::write(dir.join("src/lib.rs"), source).unwrap();
-            items.push(
-                solstone_core_repository_contracts::windows_suite::WindowsPlanItem {
-                    id: format!("package::{name}"),
-                    package: name.to_owned(),
-                    target: "lib".to_owned(),
-                    required_features: features,
-                    timeout_seconds: 120,
-                    serial_group: None,
-                    default_full: true,
-                    status: PlanStatus::Ready,
-                    commands: vec![],
-                    policy: None,
-                },
-            );
-        }
-        assert!(
-            Command::new("cargo")
-                .args(["generate-lockfile", "--manifest-path", "core/Cargo.toml"])
-                .current_dir(repo)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let binding = SourceBinding {
-            commit: "a".repeat(40),
-            cargo_lock_sha256: "b".repeat(64),
-            owner_account: None,
-            prepared_owner_nonce: None,
-        };
-        let rows =
-            execute_windows_packages(repo, &WindowsPlan { items }, &target, "capture", &binding)
-                .unwrap();
-        let rows: BTreeMap<_, _> = rows
-            .into_iter()
-            .map(|row| (row.suite_id.clone(), row))
-            .collect();
-        assert_eq!(
-            rows["package::batch-pass-a"].disposition,
-            WindowsDisposition::Passed
-        );
-        assert_eq!(rows["package::batch-pass-a"].executed_counts, [1]);
-        assert_eq!(
-            rows["package::batch-fail"].disposition,
-            WindowsDisposition::Failed
-        );
-        assert_eq!(rows["package::batch-fail"].executed_counts, [2]);
-        assert_eq!(
-            rows["package::batch-empty"].disposition,
-            WindowsDisposition::Unexecuted
-        );
-        assert_eq!(
-            rows["package::batch-feature"].disposition,
-            WindowsDisposition::Passed
-        );
-        assert_eq!(rows["package::batch-feature"].executed_counts, [3]);
-        let mut build_logs = BTreeSet::new();
-        for row in rows.values() {
-            for log in &row.log_paths {
-                assert!(Path::new(log).is_file(), "missing retained log {log}");
-                if log.contains("package-batch-") && log.ends_with(".stdout.log") {
-                    build_logs.insert(log.clone());
-                }
-            }
-            let stdout = row
-                .log_paths
-                .iter()
-                .find(|log| log.contains("package-batch-") && log.ends_with(".stdout.log"))
-                .unwrap();
-            let output = fs::read_to_string(stdout).unwrap();
-            assert_eq!(
-                output
-                    .lines()
-                    .filter(|line| line.starts_with("test result:"))
-                    .count(),
-                if row.features.is_empty() { 3 } else { 1 }
-            );
-        }
-        assert_eq!(build_logs.len(), 2);
-    }
-
-    #[cfg(feature = "full-tests")]
-    #[test]
-    #[ignore]
-    fn package_capture_timeout_child() {
-        thread::sleep(Duration::from_secs(60));
-    }
-
-    #[cfg(feature = "full-tests")]
-    #[test]
-    fn package_command_timeout_is_bounded_and_never_earns_a_success_exit() {
-        let root = tempfile::tempdir().unwrap();
-        let argv = vec![
-            env::current_exe().unwrap().display().to_string(),
-            "--exact".to_owned(),
-            "tests::package_capture_timeout_child".to_owned(),
-            "--ignored".to_owned(),
-        ];
-        let start = Instant::now();
-        let capture =
-            run_windows_package_command(root.path(), &argv, &root.path().join("timeout"), 1)
-                .unwrap();
-        assert!(capture.timed_out);
-        assert_eq!(capture.exit_code, -1);
-        assert!(start.elapsed() < Duration::from_secs(10));
-        assert_eq!(parse_executed_count(&capture.stdout), 0);
-    }
 
     fn registry() -> Registry {
         Registry {
