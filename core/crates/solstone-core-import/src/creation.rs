@@ -1214,7 +1214,9 @@ mod tests {
 
         // Set file mtime to 2024-01-01 so an mtime answer fails
         let old_time = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
-        File::open(&path)
+        File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(FileTimes::new().set_modified(old_time))
             .unwrap();
@@ -1237,7 +1239,9 @@ mod tests {
 
         // Set mtime to 2023-01-01
         let old_time = UNIX_EPOCH + Duration::from_secs(1_672_531_200);
-        File::open(&path)
+        File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(FileTimes::new().set_modified(old_time))
             .unwrap();
@@ -1303,7 +1307,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         // 2026-03-08 02:30:00 does not exist in America/New_York (clocks jump 02:00 -> 03:00)
         let name = "2026-03-08 02:30:00.jpg";
-        let path = temp.path().join(name);
+        let path = temp.path().join("source.jpg");
         fs::write(&path, b"dummy").unwrap();
 
         assert_eq!(detect_creation(&path, Some(name), New_York), None);
@@ -1313,7 +1317,7 @@ mod tests {
     fn zone_free_wall_time_preserved() {
         let temp = tempfile::tempdir().unwrap();
         let name = "2026-06-15 15:45:00.jpg";
-        let path = temp.path().join(name);
+        let path = temp.path().join("source.jpg");
         fs::write(&path, b"dummy").unwrap();
 
         let detected = detect_creation(&path, Some(name), New_York);
