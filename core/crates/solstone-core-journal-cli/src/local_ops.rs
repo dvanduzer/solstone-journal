@@ -2684,13 +2684,7 @@ mod facet_merge_tests {
         );
         assert_eq!(
             listed_after(&stdout, "Entity fields"),
-            [format!(
-                "{}: 1",
-                Path::new("entities")
-                    .join("ada")
-                    .join("entity.json")
-                    .display()
-            )]
+            ["entities/ada/entity.json: 1"]
         );
         assert!(
             stdout.contains("The settings in the facet.json of 'source'"),

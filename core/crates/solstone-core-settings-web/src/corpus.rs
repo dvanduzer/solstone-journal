@@ -138,7 +138,7 @@ pub(crate) fn normalize(value: Value, path: &str, root: &str) -> (Value, Vec<Str
     if let Value::String(value) = value {
         if value.contains(root) {
             hits.push(format!("{path}#journal_root"));
-            if path == "/config/path"
+            if path == "config.path"
                 && let Ok(relative) = std::path::Path::new(&value).strip_prefix(root)
                 && relative
                     .components()
