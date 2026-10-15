@@ -467,10 +467,7 @@ fn guard_refusal_display_names_releases_and_head_for_operators() {
 
 #[test]
 fn guard_current_cuda_keys_pinned_by_their_releases_and_head() {
-    let keys = [
-        "runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz",
-        "runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-arm64-sol1.tar.gz",
-    ];
+    let keys = ["runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz"];
     for key in keys {
         let mut owners = historical_origin_pins()
             .unwrap()
@@ -489,18 +486,22 @@ fn guard_current_cuda_keys_pinned_by_their_releases_and_head() {
 
 #[test]
 fn guard_outgoing_cuda_key_pinned_by_historical_releases_not_head() {
-    let key = "runtimes/llama-cuda13/b10068/llama-b10068-bin-linux-cuda13-amd64-sol1.tar.gz";
-    let expected = historical_origin_pins()
-        .unwrap()
-        .into_iter()
-        .filter(|(_, pins)| pins.iter().any(|pin| pin.origin_key == key))
-        .map(|(version, _)| PinOwner::Release(version))
-        .collect::<Vec<_>>();
-    assert!(!expected.is_empty());
-    assert_eq!(
-        assess_prune_with_current_support(key).unwrap(),
-        PruneAssessment::PinnedBy { owners: expected }
-    );
+    for key in [
+        "runtimes/llama-cuda13/b10068/llama-b10068-bin-linux-cuda13-amd64-sol1.tar.gz",
+        "runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-arm64-sol1.tar.gz",
+    ] {
+        let expected = historical_origin_pins()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, pins)| pins.iter().any(|pin| pin.origin_key == key))
+            .map(|(version, _)| PinOwner::Release(version))
+            .collect::<Vec<_>>();
+        assert!(!expected.is_empty());
+        assert_eq!(
+            assess_prune_with_current_support(key).unwrap(),
+            PruneAssessment::PinnedBy { owners: expected }
+        );
+    }
 }
 
 #[test]
@@ -549,19 +550,23 @@ fn guard_current_vulkan_keys_pinned_by_their_releases_and_head() {
 }
 
 #[test]
-fn guard_selected_metal_key_is_pinned_by_head_and_any_release_owners() {
-    let key = "assets/llama-server-vulkan/b11669/llama-b11669-bin-macos-arm64.tar.gz";
-    let mut owners = historical_origin_pins()
-        .unwrap()
-        .into_iter()
-        .filter(|(_, pins)| pins.iter().any(|pin| pin.origin_key == key))
-        .map(|(version, _)| PinOwner::Release(version))
-        .collect::<Vec<_>>();
-    owners.push(PinOwner::HeadUnreleased);
-    assert_eq!(
-        assess_prune_with_current_support(key).unwrap(),
-        PruneAssessment::PinnedBy { owners }
-    );
+fn guard_selected_b11669_keys_are_pinned_by_head_and_any_release_owners() {
+    for key in [
+        "assets/llama-server-vulkan/b11669/llama-b11669-bin-macos-arm64.tar.gz",
+        "runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-arm64-sol1.tar.gz",
+    ] {
+        let mut owners = historical_origin_pins()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, pins)| pins.iter().any(|pin| pin.origin_key == key))
+            .map(|(version, _)| PinOwner::Release(version))
+            .collect::<Vec<_>>();
+        owners.push(PinOwner::HeadUnreleased);
+        assert_eq!(
+            assess_prune_with_current_support(key).unwrap(),
+            PruneAssessment::PinnedBy { owners }
+        );
+    }
 }
 
 #[test]

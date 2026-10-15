@@ -711,7 +711,7 @@ Files: `libcudart.so.13`, `libcublas.so.13`,
 `libcublasLt.so.13`.
 
 Source:
-- linux x86_64 archive `llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz` and linux arm64 archive `llama-b11429-bin-linux-cuda13-arm64-sol1.tar.gz` each carry CUDA Toolkit 13.4.1 components. Each archive is packaged with the MIT license file `licenses/llama.cpp-LICENSE.txt` and the unmodified EULA at `licenses/NVIDIA-CUDA-EULA-13.4.1.html`. The archive root also contains `provenance.json`.
+- linux x86_64 archive `llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz` and linux arm64 archive `llama-b11669-bin-linux-cuda13-arm64-sol1.tar.gz` each carry CUDA Toolkit 13.4.1 components. Each archive is packaged with the MIT license file `licenses/llama.cpp-LICENSE.txt` and the unmodified EULA at `licenses/NVIDIA-CUDA-EULA-13.4.1.html`. The archive root also contains `provenance.json`.
 
 License: NVIDIA CUDA Toolkit End User License Agreement, Release 13.4.1
 for linux x86_64 and linux arm64, including the CUDA Toolkit

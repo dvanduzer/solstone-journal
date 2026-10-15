@@ -461,7 +461,7 @@ fn candidates(target: &str) -> Result<Vec<RuntimeFetch>, FetchSetError> {
             // llama-server-cuda arm64
             let a = find_catalog_row(
                 "llama-server-cuda",
-                "llama-b11429-bin-linux-cuda13-arm64-sol1.tar.gz",
+                "llama-b11669-bin-linux-cuda13-arm64-sol1.tar.gz",
                 Some("aarch64-unknown-linux-gnu"),
             );
             rows.push(RuntimeFetch {
@@ -653,7 +653,7 @@ mod tests {
         "assets/parakeet-model/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q8_0.gguf",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-cpu-arm64.tar.gz",
         "assets/parakeet-server/v0.6.1/parakeet-v0.6.1-bin-linux-vulkan-arm64.tar.gz",
-        "runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-arm64-sol1.tar.gz",
+        "runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-arm64-sol1.tar.gz",
     ];
 
     const ORACLE_MACOS_ARM64: &[&str] = &[
