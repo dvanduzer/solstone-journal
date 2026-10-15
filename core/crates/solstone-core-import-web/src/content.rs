@@ -35,45 +35,41 @@ fn read_jsonl(path: &Path) -> Result<Vec<Value>, std::io::Error> {
     Ok(items)
 }
 
-fn source_type(directory: &Path) -> String {
-    if let Ok(text) = fs::read_to_string(directory.join("imported.json"))
-        && let Ok(value) = serde_json::from_str::<Value>(&text)
-    {
+fn source_type(root: &Path, directory: &Path) -> Result<String, std::io::Error> {
+    if let Some(value) = json_from_file(root, &directory.join("imported.json"))? {
         if let Some(st) = value
             .get("source_type")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            return st.to_owned();
+            return Ok(st.to_owned());
         }
         if let Some(imp) = value
             .get("importer")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            return imp.to_owned();
+            return Ok(imp.to_owned());
         }
     }
-    if let Ok(text) = fs::read_to_string(directory.join("manifest.json"))
-        && let Ok(value) = serde_json::from_str::<Value>(&text)
+    if let Some(value) = json_from_file(root, &directory.join("manifest.json"))?
         && let Some(st) = value
             .get("source_type")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
     {
-        return st.to_owned();
+        return Ok(st.to_owned());
     }
-    if let Ok(text) = fs::read_to_string(directory.join("import.json"))
-        && let Ok(value) = serde_json::from_str::<Value>(&text)
+    if let Some(value) = json_from_file(root, &directory.join("import.json"))?
         && let Some(st) = value
             .get("source_type")
             .or_else(|| value.get("source"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
     {
-        return st.to_owned();
+        return Ok(st.to_owned());
     }
-    String::new()
+    Ok(String::new())
 }
 
 fn backfill_type(source_type: &str) -> &'static str {
@@ -209,24 +205,41 @@ fn derive_content_items(
     Ok(Some(entries))
 }
 
-fn json_from_file(path: &Path) -> Option<Value> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+fn json_from_file(root: &Path, path: &Path) -> Result<Option<Value>, std::io::Error> {
+    // Optional metadata may be absent or malformed; refused containment is
+    // different, because source identity also controls deletion filtering.
+    let path = contained_file(root, path)?;
+    Ok(fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
 
-fn image_content_items(_root: &Path, directory: &Path) -> Option<Vec<Value>> {
+fn metadata_read_error(detail: std::io::Error) -> Response {
+    error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "that import metadata couldn't be read.",
+        "import_metadata_failed",
+        detail.to_string(),
+    )
+}
+
+fn image_content_items(
+    root: &Path,
+    directory: &Path,
+) -> Result<Option<Vec<Value>>, std::io::Error> {
     let imported_path = directory.join("imported.json");
-    let imported: Value = json_from_file(&imported_path).unwrap_or(Value::Null);
+    let imported: Value = json_from_file(root, &imported_path)?.unwrap_or(Value::Null);
     let manifest_path = directory.join("manifest.json");
-    let manifest: Value = json_from_file(&manifest_path).unwrap_or(Value::Null);
-    let import_meta: Value = json_from_file(&directory.join("import.json")).unwrap_or(Value::Null);
+    let manifest: Value = json_from_file(root, &manifest_path)?.unwrap_or(Value::Null);
+    let import_meta: Value =
+        json_from_file(root, &directory.join("import.json"))?.unwrap_or(Value::Null);
 
     let is_image = imported.get("importer").and_then(Value::as_str) == Some("image")
         || manifest.get("source_type").and_then(Value::as_str) == Some("image")
         || import_meta.get("source").and_then(Value::as_str) == Some("image");
 
     if !is_image {
-        return None;
+        return Ok(None);
     }
 
     let title = import_meta
@@ -234,10 +247,12 @@ fn image_content_items(_root: &Path, directory: &Path) -> Option<Vec<Value>> {
         .and_then(Value::as_str)
         .unwrap_or("Image import");
 
-    let segments = imported.get("segments").and_then(Value::as_array)?.clone();
+    let Some(segments) = imported.get("segments").and_then(Value::as_array) else {
+        return Ok(None);
+    };
 
     let mut items = Vec::new();
-    for (idx, seg) in segments.into_iter().enumerate() {
+    for (idx, seg) in segments.iter().enumerate() {
         let day = seg.get("day").and_then(Value::as_str).unwrap_or("");
         let key = seg.get("segment").and_then(Value::as_str).unwrap_or("");
         let stream = seg
@@ -255,20 +270,24 @@ fn image_content_items(_root: &Path, directory: &Path) -> Option<Vec<Value>> {
             }));
         }
     }
-    if items.is_empty() { None } else { Some(items) }
+    Ok(if items.is_empty() { None } else { Some(items) })
 }
 
 /// Audio has no `content_manifest.jsonl` writer and no `manifest.json`, so its gate has
 /// only the one live disjunct `image_content_items` also has: `import.json`'s `source`
 /// field, planted at upload time by `source_for()` and never overwritten by admission.
-fn audio_content_items(_root: &Path, directory: &Path) -> Option<Vec<Value>> {
+fn audio_content_items(
+    root: &Path,
+    directory: &Path,
+) -> Result<Option<Vec<Value>>, std::io::Error> {
     let imported_path = directory.join("imported.json");
-    let imported: Value = json_from_file(&imported_path).unwrap_or(Value::Null);
-    let import_meta: Value = json_from_file(&directory.join("import.json")).unwrap_or(Value::Null);
+    let imported: Value = json_from_file(root, &imported_path)?.unwrap_or(Value::Null);
+    let import_meta: Value =
+        json_from_file(root, &directory.join("import.json"))?.unwrap_or(Value::Null);
 
     let is_audio = import_meta.get("source").and_then(Value::as_str) == Some("audio");
     if !is_audio {
-        return None;
+        return Ok(None);
     }
 
     let title = import_meta
@@ -276,10 +295,12 @@ fn audio_content_items(_root: &Path, directory: &Path) -> Option<Vec<Value>> {
         .and_then(Value::as_str)
         .unwrap_or("Audio import");
 
-    let segments = imported.get("segments").and_then(Value::as_array)?.clone();
+    let Some(segments) = imported.get("segments").and_then(Value::as_array) else {
+        return Ok(None);
+    };
 
     let mut items = Vec::new();
-    for (idx, seg) in segments.into_iter().enumerate() {
+    for (idx, seg) in segments.iter().enumerate() {
         let day = seg.get("day").and_then(Value::as_str).unwrap_or("");
         let key = seg.get("segment").and_then(Value::as_str).unwrap_or("");
         let stream = seg
@@ -297,7 +318,7 @@ fn audio_content_items(_root: &Path, directory: &Path) -> Option<Vec<Value>> {
             }));
         }
     }
-    if items.is_empty() { None } else { Some(items) }
+    Ok(if items.is_empty() { None } else { Some(items) })
 }
 
 fn content_manifest(root: &Path, timestamp: &str) -> Result<(PathBuf, Vec<Value>), Box<Response>> {
@@ -343,16 +364,21 @@ fn content_manifest(root: &Path, timestamp: &str) -> Result<(PathBuf, Vec<Value>
                 }
             }
         }
-        let source_type = source_type(&directory);
+        let source_type =
+            source_type(root, &directory).map_err(|e| Box::new(metadata_read_error(e)))?;
         items.retain(|item| !names_deleted_segment(root, &source_type, item));
         return Ok((directory, items));
     }
 
-    if let Some(items) = image_content_items(root, &directory) {
+    if let Some(items) =
+        image_content_items(root, &directory).map_err(|e| Box::new(metadata_read_error(e)))?
+    {
         return Ok((directory, items));
     }
 
-    if let Some(items) = audio_content_items(root, &directory) {
+    if let Some(items) =
+        audio_content_items(root, &directory).map_err(|e| Box::new(metadata_read_error(e)))?
+    {
         return Ok((directory, items));
     }
 
@@ -384,7 +410,10 @@ pub(crate) async fn list(
         Ok(value) => value,
         Err(response) => return *response,
     };
-    let mut source_type = source_type(&directory);
+    let mut source_type = match source_type(&state.root, &directory) {
+        Ok(value) => value,
+        Err(error) => return metadata_read_error(error),
+    };
     if source_type.is_empty()
         && let Some(first) = items.first()
     {
@@ -477,7 +506,10 @@ pub(crate) async fn detail(
     else {
         return import_not_found("Item not found");
     };
-    let source_type = source_type(&directory);
+    let source_type = match source_type(&state.root, &directory) {
+        Ok(value) => value,
+        Err(error) => return metadata_read_error(error),
+    };
     let content = match read_item_content(&state.root, &source_type, &item) {
         Ok(content) => content,
         Err(detail) => {
@@ -493,11 +525,31 @@ pub(crate) async fn detail(
 }
 
 fn contained_file(root: &Path, path: &Path) -> Result<PathBuf, std::io::Error> {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    let rel_str = rel
-        .to_str()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-utf8 path"))?;
-    solstone_core_journal_io::contained_path(root, rel_str)
+    let canonical_root;
+    let relative = match path.strip_prefix(root) {
+        Ok(relative) => relative,
+        Err(_) if path.is_relative() => path,
+        Err(_) => {
+            // A previous containment call can have returned Windows' verbatim
+            // spelling. Only match the canonical root; do not resolve an
+            // arbitrary outside input to make it fit.
+            canonical_root = fs::canonicalize(root)?;
+            path.strip_prefix(&canonical_root)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?
+        }
+    };
+    let parts = relative
+        .components()
+        .map(|part| match part {
+            std::path::Component::Normal(name) => name
+                .to_str()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Native separators are syntax, while backslashes inside a Unix filename
+    // remain part of the name and are still refused by the logical-path API.
+    solstone_core_journal_io::contained_path(root, &parts.join("/"))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
 }
 
@@ -621,6 +673,204 @@ fn read_item_content(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn native_and_canonical_content_paths_read_exact_bytes_and_refuse_outside_paths() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("journal");
+        fs::create_dir(&root).unwrap();
+        #[cfg(windows)]
+        let root = PathBuf::from(
+            root.canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .strip_prefix(r"\\?\")
+                .unwrap(),
+        );
+        let relative = Path::new("chronicle")
+            .join("20260101")
+            .join("import.chatgpt")
+            .join("090000_300");
+        let directory = root.join(&relative);
+        fs::create_dir_all(&directory).unwrap();
+        let transcript = directory.join("conversation_transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{}\n{\"speaker\":\"You\",\"text\":\"inside transcript\"}\n",
+        )
+        .unwrap();
+        fs::write(directory.join("note_transcript.md"), "inside markdown").unwrap();
+        let canonical = transcript.canonicalize().unwrap();
+        #[cfg(windows)]
+        assert!(
+            canonical.strip_prefix(&root).is_err(),
+            "fixture must force the canonical-root fallback"
+        );
+        for path in [
+            &transcript,
+            &canonical,
+            &relative.join("conversation_transcript.jsonl"),
+        ] {
+            let resolved = contained_file(&root, path).unwrap();
+            assert_eq!(fs::read(resolved).unwrap(), fs::read(&transcript).unwrap());
+        }
+        let item = json!({"segments":[{"day":"20260101","key":"090000_300"}]});
+        assert_eq!(
+            read_item_content(&root, "chatgpt", &item).unwrap(),
+            vec![
+                json!({"speaker":"You","text":"inside transcript"}),
+                json!({"type":"markdown","content":"inside markdown"})
+            ]
+        );
+        let outside = temporary.path().join("outside.jsonl");
+        fs::write(&outside, "{}\n{\"text\":\"outside marker\"}\n").unwrap();
+        assert!(contained_file(&root, &outside).is_err());
+        assert!(
+            contained_file(
+                &root,
+                &root.join("chronicle").join("..").join("outside.jsonl")
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            // POSIX symlink fixture; Windows' lexical/canonical cases remain above.
+            fs::remove_file(&transcript).unwrap();
+            std::os::unix::fs::symlink(&outside, &transcript).unwrap();
+            assert!(read_item_content(&root, "chatgpt", &item).is_err());
+            assert!(
+                fs::read_to_string(&outside)
+                    .unwrap()
+                    .contains("outside marker")
+            );
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    fn seed_legacy_source_rows(root: &Path) -> PathBuf {
+        let directory = root.join("imports").join("20260101_120000");
+        fs::create_dir_all(&directory).unwrap();
+        let mut rows = Vec::new();
+        for (id, key) in [("active", "090000_300"), ("deleted", "100000_300")] {
+            let segment = root
+                .join("chronicle")
+                .join("20260101")
+                .join("import.chatgpt")
+                .join(key);
+            fs::create_dir_all(&segment).unwrap();
+            if id == "deleted" {
+                fs::write(segment.join("tombstone.json"), b"{}").unwrap();
+            }
+            rows.push(json!({"id":id,"title":format!("title {id}"),"preview":format!("preview {id}"),"segments":[{"day":"20260101","key":key}]}).to_string());
+        }
+        fs::write(
+            directory.join("content_manifest.jsonl"),
+            rows.join("\n") + "\n",
+        )
+        .unwrap();
+        directory
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn contained_source_precedence_and_optional_fallback_keep_deleted_legacy_rows_hidden() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path();
+        let directory = seed_legacy_source_rows(root);
+        fs::write(
+            directory.join("imported.json"),
+            r#"{"source_type":"chatgpt"}"#,
+        )
+        .unwrap();
+        fs::write(directory.join("import.json"), r#"{"source":"audio"}"#).unwrap();
+        let check = || {
+            assert_eq!(source_type(root, &directory).unwrap(), "chatgpt");
+            let (_, rows) = content_manifest(root, "20260101_120000").unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row["id"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["active"]
+            );
+        };
+        check();
+        fs::write(directory.join("import.json"), r#"{"source":"chatgpt"}"#).unwrap();
+        fs::remove_file(directory.join("imported.json")).unwrap();
+        check();
+        fs::write(directory.join("imported.json"), b"{").unwrap();
+        check();
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    async fn assert_metadata_refusal(response: Response) {
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["reason_code"], "import_metadata_failed");
+        let text = std::str::from_utf8(&body).unwrap();
+        for marker in ["outside marker", "title deleted", "preview deleted"] {
+            assert!(!text.contains(marker), "{text}");
+        }
+    }
+
+    // POSIX external-leaf fixture; portable content and deletion controls stay active.
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[tokio::test]
+    async fn refused_metadata_is_an_error_and_cannot_expose_deleted_or_external_content() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("journal");
+        let directory = seed_legacy_source_rows(&root);
+        let outside = temporary.path().join("external.json");
+        fs::write(&outside, r#"{"source_type":"chatgpt","importer":"image","segments":[{"day":"20260101","segment":"090000_300"}],"marker":"outside marker"}"#).unwrap();
+        std::os::unix::fs::symlink(&outside, directory.join("imported.json")).unwrap();
+        let state = AppState { root: root.clone() };
+        assert_metadata_refusal(
+            list(
+                State(state.clone()),
+                AxumPath("20260101_120000".into()),
+                Query(HashMap::new()),
+            )
+            .await,
+        )
+        .await;
+        assert_metadata_refusal(
+            detail(
+                State(state.clone()),
+                AxumPath(("20260101_120000".into(), "deleted".into())),
+            )
+            .await,
+        )
+        .await;
+        assert!(source_type(&root, &directory).is_err());
+        assert!(image_content_items(&root, &directory).is_err());
+        assert!(audio_content_items(&root, &directory).is_err());
+        fs::remove_file(directory.join("content_manifest.jsonl")).unwrap();
+        for source in ["image", "audio"] {
+            fs::write(
+                directory.join("import.json"),
+                json!({"source":source}).to_string(),
+            )
+            .unwrap();
+            assert_metadata_refusal(
+                list(
+                    State(state.clone()),
+                    AxumPath("20260101_120000".into()),
+                    Query(HashMap::new()),
+                )
+                .await,
+            )
+            .await;
+        }
+        assert!(
+            fs::read_to_string(outside)
+                .unwrap()
+                .contains("outside marker")
+        );
+    }
 
     #[test]
     fn rebuilt_conversation_previews_use_the_owner_message() {
