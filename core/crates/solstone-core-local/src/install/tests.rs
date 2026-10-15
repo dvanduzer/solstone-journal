@@ -4753,13 +4753,18 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
     let _ = run_local_with_gpu_admission(&object, mac_exact);
     assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
 
-    // 2. UnsupportedDarwin -> unsupported_platform, zero counters.
+    // 2. Metal refuses an explicit unsupported target before acquisition.
+    // Injecting hardware admission does not override native target resolution:
+    // an Apple Silicon test host remains a supported Metal target.
     TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
     TEST_INSTALL_MODEL_COUNT.with(|count| count.set(0));
-    let mut darwin_obj = object.clone();
-    darwin_obj.insert("backend".into(), "metal".into());
-    let err = run_local_with_gpu_admission(&darwin_obj, LocalHardwareAdmission::UnsupportedDarwin)
-        .unwrap_err();
+    let err = super::local_target_for_key(
+        &root,
+        "local/qwen3.5-4b",
+        super::LocalBackend::Metal,
+        "x86_64-apple-darwin",
+    )
+    .unwrap_err();
     assert_eq!(
         err.envelope.error.as_ref().unwrap().reason_code,
         "unsupported_platform"
@@ -4769,6 +4774,23 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
         0
     );
     assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let mut darwin_obj = object.clone();
+        darwin_obj.insert("backend".into(), "metal".into());
+        let err =
+            run_local_with_gpu_admission(&darwin_obj, LocalHardwareAdmission::UnsupportedDarwin)
+                .unwrap_err();
+        assert_eq!(
+            err.envelope.error.as_ref().unwrap().reason_code,
+            "unsupported_platform"
+        );
+        assert_eq!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+    }
 
     // 3. Linux NVIDIA memory just below GPU_DEVICE_LOCAL_MIN_BYTES refuses. Exactly that many bytes proceeds.
     TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));

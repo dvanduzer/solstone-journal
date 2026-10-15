@@ -1106,11 +1106,17 @@ mod tests {
 
         use std::os::unix::ffi::OsStrExt;
         let unreadable = std::ffi::OsStr::from_bytes(b"old\xff.log");
-        fs::write(f.path("chronicle/20260101/health").join(unreadable), b"old").unwrap();
-        assert_eq!(
-            f.observed().unwrap_err().failure,
-            RecoveryObservationFailure::Io
-        );
+        match fs::write(f.path("chronicle/20260101/health").join(unreadable), b"old") {
+            Ok(()) => assert_eq!(
+                f.observed().unwrap_err().failure,
+                RecoveryObservationFailure::Io
+            ),
+            // APFS refuses this fixture before the observer can see it. The
+            // pure Unix classifier still checks the unrepresentable bytes.
+            #[cfg(target_os = "macos")]
+            Err(error) if error.raw_os_error() == Some(nix::libc::EILSEQ) => {}
+            Err(error) => panic!("could not create the invalid-byte fixture: {error}"),
+        }
     }
 
     #[test]

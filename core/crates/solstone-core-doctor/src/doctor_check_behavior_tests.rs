@@ -2117,9 +2117,9 @@ fn default_stt_fixture_matrix_delegates_and_checks_coreml() {
     config_backend(&coreml, "parakeet");
     coreml.platform = Platform::Darwin;
     coreml.host_arch = "arm64".into();
-    let cache = coreml
-        .home_dir
-        .join("Library/Application Support/solstone/parakeet/models/cache");
+    let cache = solstone_core_journal_config::parakeet_coreml::default_parakeet_coreml_cache_dir(
+        &coreml.home_dir,
+    );
     fs::create_dir_all(&cache).unwrap();
     let model = cache.parent().unwrap().join("parakeet-tdt-0.6b-v3");
     for artifact in solstone_core_assets::catalog()
