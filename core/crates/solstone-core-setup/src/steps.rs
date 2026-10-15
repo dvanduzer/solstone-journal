@@ -3595,6 +3595,9 @@ mod tests {
             active,
             Some(json!({"provider": "local", "model": LOCAL_MODEL}))
         );
+        // Windows setup admissions share the real LocalAppData owner gate,
+        // even when fixtures supply different home paths.
+        drop(setup);
 
         // Existing local selection on a below-bar Mac stays selected and does not bootstrap:
         let report_below_bar = darwin_arm64_check_report(Some(16 * gib - 1), Some(8 * gib), 100);
@@ -3623,6 +3626,7 @@ mod tests {
         );
         let config: Value = serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
         assert_eq!(config["providers"]["active"], owner["providers"]["active"]);
+        drop(setup);
         assert!(runner.requests.is_empty(), "bootstrap must not run");
 
         // A different provider stays:
