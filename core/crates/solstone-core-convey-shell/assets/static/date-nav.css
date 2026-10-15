@@ -138,7 +138,7 @@
   border: 1px solid var(--hairline);
   border-radius: var(--radius-sm);
   background: var(--paper);
-  color: var(--orange-ink);
+  color: var(--orange-text-aa);
   font: inherit;
   font-size: var(--text-min);
   font-weight: var(--weight-medium);
@@ -179,6 +179,14 @@
 .date-nav-content__row {
   display: grid;
   gap: var(--space-2);
+}
+
+.date-nav-content__weekday {
+  color: var(--ink-faint);
+  font-size: var(--text-min);
+  font-weight: var(--weight-medium);
+  line-height: 1;
+  text-align: center;
 }
 
 .date-nav-content__cell {

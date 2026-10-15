@@ -594,6 +594,25 @@ async function run() {
   assert.ok(cell20261002, 'cell 20261002 exists');
   assert.strictEqual(cell20261002.disabled, false, 'future cell 20261002 is not disabled under allow_future');
 
+  // The 1st sits under its own weekday, Sunday-first: October 1, 2026 is a Thursday.
+  const dayGrid = documentObj.querySelector('[data-date-nav-grid]');
+  const [weekdayRow, firstWeek, secondWeek] = dayGrid.children;
+  assert.strictEqual(weekdayRow.querySelectorAll('[role="columnheader"]').length, 7, 'day grid has seven weekday headers');
+  assert.strictEqual(firstWeek.children.length, 7, 'first week row fills seven columns');
+  assert.strictEqual(firstWeek.children.indexOf(cell20261001), 4, 'October 1, 2026 sits in the Thursday column');
+  assert.strictEqual(secondWeek.children[0].dataset.value, '20261004', 'second week starts on Sunday, October 4');
+
+  // Down keeps the column: from the 1st to the 8th.
+  documentObj.querySelector('[data-date-nav-root]').dispatchEvent({
+    type: 'keydown',
+    key: 'ArrowDown',
+    target: cell20261001,
+    preventDefault: () => {},
+    stopPropagation: () => {},
+  });
+  const cell20261008 = cells.find((c) => c.dataset.value === '20261008');
+  assert.strictEqual(cell20261008.tabIndex, 0, 'ArrowDown from October 1 moves to October 8');
+
   // 3. Heading element contains one [data-zone-note]
   const headingNote = headingEl.querySelector('[data-zone-note]');
   assert.ok(headingNote, 'heading contains one [data-zone-note]');

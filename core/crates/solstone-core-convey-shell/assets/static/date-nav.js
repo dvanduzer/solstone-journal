@@ -751,10 +751,11 @@
     return button;
   }
 
-  function appendRows(cells, columns) {
+  function appendRows(cells, columns, header = null) {
     clearGrid();
     state.grid.className = `date-nav-content__grid date-nav-content__grid--${columns}`;
     state.grid.dataset.cols = String(columns);
+    if (header) state.grid.appendChild(header);
     for (let index = 0; index < cells.length; index += columns) {
       const row = document.createElement('div');
       row.className = 'date-nav-content__row';
@@ -853,7 +854,10 @@
     }
     state.currentMax = maxPositive(values);
 
+    // Sunday-first, like the weeks zoom: the 1st sits under its own weekday.
     const cells = [];
+    const leading = new Date(year, monthIndex, 1).getDay();
+    for (let index = 0; index < leading; index += 1) cells.push(padCell());
     for (let day = 1; day <= daysInMonth; day += 1) {
       const key = `${month}${String(day).padStart(2, '0')}`;
       const count = coerceCount(data[key]);
@@ -869,7 +873,30 @@
         })
       );
     }
-    appendRows(cells, 7);
+    appendRows(cells, 7, weekdayHeader());
+  }
+
+  function weekdayHeader() {
+    const row = document.createElement('div');
+    row.className = 'date-nav-content__row date-nav-content__weekdays';
+    row.setAttribute('role', 'row');
+    WEEKDAYS.forEach((name) => {
+      const heading = document.createElement('span');
+      heading.className = 'date-nav-content__weekday';
+      heading.setAttribute('role', 'columnheader');
+      heading.setAttribute('aria-label', name);
+      heading.textContent = name.charAt(0);
+      row.appendChild(heading);
+    });
+    return row;
+  }
+
+  // An empty slot before the 1st: not a day, never focusable.
+  function padCell() {
+    const pad = document.createElement('span');
+    pad.className = 'date-nav-content__pad';
+    pad.setAttribute('role', 'gridcell');
+    return pad;
   }
 
   function renderWeeks() {
@@ -962,13 +989,19 @@
     return Number(state.grid?.dataset.cols) || 7;
   }
 
+  // Moves by grid position, so up and down keep the column, and steps past
+  // cells that can't be picked rather than counting only the pickable ones.
   function moveGridFocus(event, offset) {
-    const cells = focusableCells();
+    const cells = Array.from(state.grid?.querySelectorAll('[data-date-nav-cell]') || []);
     const currentIndex = cells.indexOf(event.target);
-    if (currentIndex < 0 || cells.length === 0) return;
+    if (currentIndex < 0) return;
     event.preventDefault();
-    const nextIndex = Math.max(0, Math.min(cells.length - 1, currentIndex + offset));
-    focusGridCell(cells, nextIndex);
+    for (let index = currentIndex + offset; index >= 0 && index < cells.length; index += offset) {
+      if (!cells[index].disabled) {
+        focusGridCell(cells, index);
+        return;
+      }
+    }
   }
 
   function handleGridKeydown(event) {

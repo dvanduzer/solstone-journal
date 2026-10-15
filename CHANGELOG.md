@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- in the date picker, each day now sits under its day of the week, and the days of the week are labeled along the top. before, every month started in the first column, so most dates looked like they fell on the wrong day. the up and down arrow keys now move a week at a time.
 - on windows, links to saved output from a thinking run open again.
 - on windows, `solstone link join` can finish pairing and save connection settings.
 - on windows, you can preview an import again.
