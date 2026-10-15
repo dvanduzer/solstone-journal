@@ -5287,6 +5287,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "socket2",
+ "solstone-core-format",
  "solstone-core-journal-io",
  "solstone-core-processing-record",
  "unicode-normalization",

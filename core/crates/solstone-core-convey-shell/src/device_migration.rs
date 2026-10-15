@@ -188,4 +188,514 @@ mod tests {
         assert_eq!(decision["replaced_cid"], previous_cid);
         assert_eq!(decision["checkpoint"], "complete");
     }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    mod replacement_proof_tests {
+        use std::fs;
+        use std::path::Path;
+
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode, header};
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+        use solstone_core_callosum::CallosumSocketServer;
+        use solstone_core_convey_http::identity::{AccessBasis, Carrier, LinkedDeviceCid};
+        use solstone_core_sol_link::device_migration::{Choice, DecisionRequest, ReplacesCid};
+        use solstone_core_sol_link::ledger::{AuthorizationLedger, ClientEntry, ClientRole};
+        use tower::ServiceExt;
+
+        use super::decide_and_resume;
+
+        const CID_A: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CID_B: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        fn basis(cid: &str) -> AccessBasis {
+            AccessBasis::LinkedDevice {
+                carrier: Carrier::Direct,
+                cid: LinkedDeviceCid::try_from(cid).expect("valid test cid"),
+                leaf_spki: vec![0x30, 0x00],
+            }
+        }
+
+        fn multipart_one(envelope: Value, name: &str, bytes: &[u8]) -> (String, Vec<u8>) {
+            let boundary = "device-migration-test-boundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"envelope\"\r\n\r\n{envelope}\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name}\"\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            (format!("multipart/form-data; boundary={boundary}"), body)
+        }
+
+        fn multipart_two(
+            envelope: Value,
+            name1: &str,
+            bytes1: &[u8],
+            name2: &str,
+            bytes2: &[u8],
+        ) -> (String, Vec<u8>) {
+            let boundary = "device-migration-test-boundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"envelope\"\r\n\r\n{envelope}\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name1}\"\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(bytes1);
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name2}\"\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(bytes2);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            (format!("multipart/form-data; boundary={boundary}"), body)
+        }
+
+        async fn request(
+            app: &axum::Router,
+            method: &str,
+            uri: &str,
+            cid: &str,
+            body: Vec<u8>,
+            content_type: Option<String>,
+        ) -> (StatusCode, Value) {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::from(body))
+                .expect("request");
+            req.headers_mut().insert(
+                "X-Solstone-Protocol-Version",
+                header::HeaderValue::from_static("3"),
+            );
+            if let Some(content_type) = content_type {
+                req.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    content_type.parse().expect("content type"),
+                );
+            }
+            req.extensions_mut().insert(basis(cid));
+            let response = app.clone().oneshot(req).await.expect("response");
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (
+                status,
+                serde_json::from_slice(&body).expect("JSON response"),
+            )
+        }
+
+        fn digest(bytes: &[u8]) -> String {
+            format!("{:x}", Sha256::digest(bytes))
+        }
+
+        #[tokio::test]
+        async fn explicit_replace_lists_ancestor_and_keeps_custody() {
+            let journal = tempfile::TempDir::new().unwrap();
+            let root = journal.path();
+            let mut ledger = AuthorizationLedger::new(root);
+            ledger
+                .add(ClientEntry::new(
+                    CID_A,
+                    "Device A",
+                    "2026-09-01T00:00:00Z",
+                    "fixture-instance",
+                    ClientRole::Roleless,
+                ))
+                .unwrap();
+            ledger
+                .add(ClientEntry::new(
+                    CID_B,
+                    "Device B",
+                    "2026-09-01T00:00:00Z",
+                    "fixture-instance",
+                    ClientRole::Roleless,
+                ))
+                .unwrap();
+
+            let push_path = root.join("config/push-registry.json");
+            fs::create_dir_all(push_path.parent().unwrap()).unwrap();
+            fs::write(&push_path, br#"{"version":2,"devices":[]}"#).unwrap();
+
+            fs::create_dir_all(root.join("health")).unwrap();
+            let _callosum = CallosumSocketServer::bind(root.join("health/callosum.sock"))
+                .await
+                .expect("Callosum server");
+            let app = solstone_core_ingest::api_router(root);
+
+            let day = "20260805";
+            let seg_a = "150000_60";
+            let source = "mic";
+            let audio_bytes = b"distinct audio flac content";
+            let screen_bytes = b"distinct screen mp4 content";
+            let (ct, body) = multipart_two(
+                json!({
+                    "day": day,
+                    "segment": seg_a,
+                    "source": source,
+                    "files": [{"submitted": "audio.flac"}, {"submitted": "screen.mp4"}],
+                }),
+                "audio.flac",
+                audio_bytes,
+                "screen.mp4",
+                screen_bytes,
+            );
+            let (status, upload_resp) =
+                request(&app, "POST", "/app/devices/ingest", CID_A, body, Some(ct)).await;
+            assert_eq!(status, StatusCode::OK, "{upload_resp}");
+
+            let mut seg_dir: Option<std::path::PathBuf> = None;
+            for stream_entry in fs::read_dir(root.join("chronicle").join(day)).unwrap() {
+                let p = stream_entry.unwrap().path().join(seg_a);
+                if p.is_dir() {
+                    seg_dir = Some(p);
+                    break;
+                }
+            }
+            let seg_dir = seg_dir.expect("segment directory exists");
+            let screen_path = seg_dir.join("screen.mp4");
+            assert!(screen_path.is_file());
+            fs::remove_file(&screen_path).unwrap();
+            let sidecar_content = format!(
+                "{}\n",
+                json!({
+                    "_solstone_processing": {
+                        "schema": "solstone.processing.v1",
+                        "state": "analyzed",
+                        "handler": "describe",
+                        "input_size": screen_bytes.len(),
+                    }
+                })
+            );
+            fs::write(seg_dir.join("screen.jsonl"), sidecar_content).unwrap();
+
+            let (status, listing_a) = request(
+                &app,
+                "GET",
+                &format!("/app/devices/ingest/segments/{day}?source={source}"),
+                CID_A,
+                Vec::new(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let items_a = listing_a["items"].as_array().expect("items array");
+            assert_eq!(items_a.len(), 1);
+            assert_eq!(items_a[0]["key"], seg_a);
+            let files_a = items_a[0]["files"].as_array().expect("files array");
+            let audio_file_a = files_a.iter().find(|f| f["name"] == "audio.flac").unwrap();
+            let screen_file_a = files_a.iter().find(|f| f["name"] == "screen.mp4").unwrap();
+
+            assert_eq!(audio_file_a["status"], "present");
+            assert_eq!(audio_file_a["size"], audio_bytes.len());
+            assert_eq!(audio_file_a["sha256"], digest(audio_bytes));
+            assert_eq!(fs::read(seg_dir.join("audio.flac")).unwrap(), audio_bytes);
+
+            assert_eq!(screen_file_a["status"], "processed");
+            assert_eq!(screen_file_a["size"], screen_bytes.len());
+            assert_eq!(screen_file_a["sha256"], digest(screen_bytes));
+            assert!(!screen_path.exists());
+
+            let body_b = serde_json::to_vec(&DecisionRequest {
+                protocol_version: 1,
+                operation_id: "123e4567-e89b-42d3-a456-426614174099".to_owned(),
+                choice: Choice::ReplaceDevice,
+                replaces_cid: ReplacesCid::Cid(CID_A.to_owned()),
+            })
+            .unwrap();
+            let decision_resp = decide_and_resume(root, CID_B, &body_b).unwrap();
+            assert_eq!(decision_resp.state.as_wire(), "replaced_device");
+
+            let (status, listing_b_pre) = request(
+                &app,
+                "GET",
+                &format!("/app/devices/ingest/segments/{day}?source={source}"),
+                CID_B,
+                Vec::new(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let items_b_pre = listing_b_pre["items"].as_array().expect("items array");
+            assert_eq!(items_b_pre.len(), 1);
+            assert_eq!(items_b_pre[0]["key"], seg_a);
+            let files_b_pre = items_b_pre[0]["files"].as_array().expect("files array");
+            let audio_b_pre = files_b_pre
+                .iter()
+                .find(|f| f["name"] == "audio.flac")
+                .unwrap();
+            let screen_b_pre = files_b_pre
+                .iter()
+                .find(|f| f["name"] == "screen.mp4")
+                .unwrap();
+            assert_eq!(audio_b_pre["status"], "present");
+            assert_eq!(audio_b_pre["size"], audio_bytes.len());
+            assert_eq!(audio_b_pre["sha256"], digest(audio_bytes));
+            assert_eq!(screen_b_pre["status"], "processed");
+            assert_eq!(screen_b_pre["size"], screen_bytes.len());
+            assert_eq!(screen_b_pre["sha256"], digest(screen_bytes));
+
+            let seg_b1 = "150100_60";
+            let b_bytes = b"b segment content";
+            let (ct, body) = multipart_one(
+                json!({
+                    "day": day,
+                    "segment": seg_b1,
+                    "source": source,
+                    "files": [{"submitted": "audio.flac"}],
+                }),
+                "audio.flac",
+                b_bytes,
+            );
+            let (status, upload_b) = request(
+                &app,
+                "POST",
+                "/app/devices/ingest",
+                CID_B,
+                body.clone(),
+                Some(ct.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{upload_b}");
+
+            let a_stream = fs::read_to_string(seg_dir.join("stream.json")).unwrap();
+            let a_marker: Value = serde_json::from_str(&a_stream).unwrap();
+            let a_stream_name = a_marker["stream"].as_str().unwrap();
+
+            let b_seg_dir = root
+                .join("chronicle")
+                .join(day)
+                .join(a_stream_name)
+                .join(seg_b1);
+            assert!(b_seg_dir.join("stream.json").is_file());
+            let b_marker_before: Value =
+                serde_json::from_str(&fs::read_to_string(b_seg_dir.join("stream.json")).unwrap())
+                    .unwrap();
+            let marker_seq_before = b_marker_before["seq"].as_u64().unwrap();
+            assert_eq!(marker_seq_before, 2);
+
+            let streams_dir = root.join("streams");
+            let stream_files_before: Vec<_> = fs::read_dir(&streams_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            assert_eq!(stream_files_before.len(), 1);
+            let stream_record_path = stream_files_before[0].path();
+            let record_before: Value =
+                serde_json::from_str(&fs::read_to_string(&stream_record_path).unwrap()).unwrap();
+            let record_seq_before = record_before["seq"].as_u64().unwrap();
+            assert_eq!(record_seq_before, 2);
+
+            let (status, retry_b) =
+                request(&app, "POST", "/app/devices/ingest", CID_B, body, Some(ct)).await;
+            assert_eq!(status, StatusCode::OK, "{retry_b}");
+            assert_eq!(retry_b["status"], "duplicate");
+
+            let b_marker_after: Value =
+                serde_json::from_str(&fs::read_to_string(b_seg_dir.join("stream.json")).unwrap())
+                    .unwrap();
+            assert_eq!(b_marker_after["seq"], marker_seq_before);
+            assert_eq!(b_marker_after["stream"], a_stream_name);
+
+            let stream_files_after: Vec<_> = fs::read_dir(&streams_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            assert_eq!(stream_files_after.len(), 1);
+
+            let record_after: Value =
+                serde_json::from_str(&fs::read_to_string(&stream_files_after[0].path()).unwrap())
+                    .unwrap();
+            assert_eq!(record_after["seq"], record_seq_before);
+
+            let seg_b2 = "160000_60";
+            let (ct, body) = multipart_one(
+                json!({
+                    "day": day,
+                    "segment": seg_b2,
+                    "source": source,
+                    "files": [{"submitted": "screen.mp4"}],
+                }),
+                "screen.mp4",
+                screen_bytes,
+            );
+            let (status, upload_b2) =
+                request(&app, "POST", "/app/devices/ingest", CID_B, body, Some(ct)).await;
+            assert_eq!(status, StatusCode::OK, "{upload_b2}");
+
+            assert!(!screen_path.exists());
+            assert_eq!(fs::read(seg_dir.join("audio.flac")).unwrap(), audio_bytes);
+
+            let (status, listing_after) = request(
+                &app,
+                "GET",
+                &format!("/app/devices/ingest/segments/{day}?source={source}"),
+                CID_A,
+                Vec::new(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let items_after = listing_after["items"].as_array().expect("items array");
+            let item_150000 = items_after.iter().find(|it| it["key"] == seg_a).unwrap();
+            let files_150000 = item_150000["files"].as_array().expect("files");
+            let screen_150000 = files_150000
+                .iter()
+                .find(|f| f["name"] == "screen.mp4")
+                .unwrap();
+            assert_eq!(screen_150000["status"], "processed");
+        }
+
+        #[tokio::test]
+        async fn new_device_keeps_identical_bytes_on_separate_streams() {
+            let journal = tempfile::TempDir::new().unwrap();
+            let root = journal.path();
+            let mut ledger = AuthorizationLedger::new(root);
+            ledger
+                .add(ClientEntry::new(
+                    CID_A,
+                    "Device A",
+                    "2026-09-01T00:00:00Z",
+                    "fixture-instance",
+                    ClientRole::Roleless,
+                ))
+                .unwrap();
+            ledger
+                .add(ClientEntry::new(
+                    CID_B,
+                    "Device B",
+                    "2026-09-01T00:00:00Z",
+                    "fixture-instance",
+                    ClientRole::Roleless,
+                ))
+                .unwrap();
+
+            let push_path = root.join("config/push-registry.json");
+            fs::create_dir_all(push_path.parent().unwrap()).unwrap();
+            fs::write(&push_path, br#"{"version":2,"devices":[]}"#).unwrap();
+
+            let body_b = serde_json::to_vec(&DecisionRequest {
+                protocol_version: 1,
+                operation_id: "123e4567-e89b-42d3-a456-426614174098".to_owned(),
+                choice: Choice::NewDevice,
+                replaces_cid: ReplacesCid::Missing,
+            })
+            .unwrap();
+            let decision_resp = decide_and_resume(root, CID_B, &body_b).unwrap();
+            assert_eq!(decision_resp.state.as_wire(), "new_device");
+
+            fs::create_dir_all(root.join("health")).unwrap();
+            let _callosum = CallosumSocketServer::bind(root.join("health/callosum.sock"))
+                .await
+                .expect("Callosum server");
+            let app = solstone_core_ingest::api_router(root);
+
+            let day = "20260805";
+            let source = "mic";
+            let identical_bytes = b"identical sound bytes";
+
+            let (ct_a, body_a) = multipart_one(
+                json!({
+                    "day": day,
+                    "segment": "120000_60",
+                    "source": source,
+                    "files": [{"submitted": "audio.flac"}],
+                }),
+                "audio.flac",
+                identical_bytes,
+            );
+            let (status, upload_a) = request(
+                &app,
+                "POST",
+                "/app/devices/ingest",
+                CID_A,
+                body_a,
+                Some(ct_a),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{upload_a}");
+
+            let (ct_b, body_b) = multipart_one(
+                json!({
+                    "day": day,
+                    "segment": "130000_60",
+                    "source": source,
+                    "files": [{"submitted": "audio.flac"}],
+                }),
+                "audio.flac",
+                identical_bytes,
+            );
+            let (status, upload_b) = request(
+                &app,
+                "POST",
+                "/app/devices/ingest",
+                CID_B,
+                body_b,
+                Some(ct_b),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{upload_b}");
+
+            let streams_dir = root.join("streams");
+            let stream_files: Vec<_> = fs::read_dir(&streams_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            assert_eq!(stream_files.len(), 2);
+
+            let (status, listing_a) = request(
+                &app,
+                "GET",
+                &format!("/app/devices/ingest/segments/{day}?source={source}"),
+                CID_A,
+                Vec::new(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let items_a = listing_a["items"].as_array().expect("items array");
+            assert_eq!(items_a.len(), 1);
+            assert_eq!(items_a[0]["key"], "120000_60");
+
+            let (status, listing_b) = request(
+                &app,
+                "GET",
+                &format!("/app/devices/ingest/segments/{day}?source={source}"),
+                CID_B,
+                Vec::new(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let items_b = listing_b["items"].as_array().expect("items array");
+            assert_eq!(items_b.len(), 1);
+            assert_eq!(items_b[0]["key"], "130000_60");
+        }
+    }
 }

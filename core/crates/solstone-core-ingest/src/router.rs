@@ -2846,8 +2846,21 @@ mod tests {
                 assert_eq!(marker["seq"], sequence);
                 assert_eq!(
                     marker["prev_segment"],
-                    if newer { "120002_1" } else { "120000_1" }
+                    if newer {
+                        Value::Null
+                    } else {
+                        Value::String("120000_1".to_owned())
+                    }
                 );
+                if newer {
+                    let prior_marker: Value = serde_json::from_slice(
+                        &fs::read(root.join("chronicle/20260804/device/120002_1/stream.json"))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(prior_marker["seq"], 2);
+                    assert_eq!(prior_marker["prev_segment"], "120000_1");
+                }
                 assert_eq!(manifest()["stream_advance_pending"], false);
                 assert_eq!(
                     call_upload(&app, second, "audio.flac", b"second").await.0,
@@ -3353,6 +3366,152 @@ mod tests {
         assert_eq!(stream_record(&root, stream)["seq"], 2);
         assert_eq!(stream_record(&root, stream)["last_segment"], "120001_1");
         assert_eq!(fs::read(segment.join("audio.flac")).unwrap(), b"sound");
+    }
+
+    #[tokio::test]
+    async fn backward_or_noncomparable_capture_stores_a_null_predecessor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        seed_authorized_client_with_label(&root, CID_A, "desk-mic");
+        let app = router(&root);
+        let source = "mic";
+        let stream = "desk-mic_mic";
+
+        // 1. 20260805 / 246000_60 — seq 1, prev_day and prev_segment JSON null.
+        let req1 = json!({
+            "day": "20260805",
+            "segment": "246000_60",
+            "source": source,
+            "files": [{"submitted":"audio.flac"}],
+        });
+        let bytes1 = b"audio 1";
+        let (status1, _) = call_upload(&app, req1.clone(), "audio.flac", bytes1).await;
+        assert_eq!(status1, StatusCode::OK);
+        let seg1 = root.join(format!("chronicle/20260805/{stream}/246000_60"));
+        assert_eq!(fs::read(seg1.join("audio.flac")).unwrap(), bytes1);
+        let marker1_bytes_before = fs::read(seg1.join("stream.json")).unwrap();
+        let marker1: Value = serde_json::from_slice(&marker1_bytes_before).unwrap();
+        assert_eq!(marker1["seq"], 1);
+        assert_eq!(marker1["prev_day"], Value::Null);
+        assert_eq!(marker1["prev_segment"], Value::Null);
+
+        // 2. 20260805 / 150000_60 — null predecessor, seq 2. Step 1 marker bytes unchanged.
+        let req2 = json!({
+            "day": "20260805",
+            "segment": "150000_60",
+            "source": source,
+            "files": [{"submitted":"audio.flac"}],
+        });
+        let bytes2 = b"audio 2";
+        let (status2, _) = call_upload(&app, req2.clone(), "audio.flac", bytes2).await;
+        assert_eq!(status2, StatusCode::OK);
+        let seg2 = root.join(format!("chronicle/20260805/{stream}/150000_60"));
+        assert_eq!(fs::read(seg2.join("audio.flac")).unwrap(), bytes2);
+        assert_eq!(
+            fs::read(seg1.join("stream.json")).unwrap(),
+            marker1_bytes_before
+        );
+        let marker2: Value =
+            serde_json::from_slice(&fs::read(seg2.join("stream.json")).unwrap()).unwrap();
+        assert_eq!(marker2["seq"], 2);
+        assert_eq!(marker2["prev_day"], Value::Null);
+        assert_eq!(marker2["prev_segment"], Value::Null);
+
+        // 3. 20260805 / 150000_61 — predecessor day 20260805, segment 150000_60, seq 3.
+        let req3 = json!({
+            "day": "20260805",
+            "segment": "150000_61",
+            "source": source,
+            "files": [{"submitted":"audio.flac"}],
+        });
+        let bytes3 = b"audio 3";
+        let (status3, _) = call_upload(&app, req3.clone(), "audio.flac", bytes3).await;
+        assert_eq!(status3, StatusCode::OK);
+        let seg3 = root.join(format!("chronicle/20260805/{stream}/150000_61"));
+        assert_eq!(fs::read(seg3.join("audio.flac")).unwrap(), bytes3);
+        let marker3: Value =
+            serde_json::from_slice(&fs::read(seg3.join("stream.json")).unwrap()).unwrap();
+        assert_eq!(marker3["seq"], 3);
+        assert_eq!(marker3["prev_day"], "20260805");
+        assert_eq!(marker3["prev_segment"], "150000_60");
+
+        // 4. 20260805 / 150100_60 — predecessor 150000_61, seq 4.
+        let req4 = json!({
+            "day": "20260805",
+            "segment": "150100_60",
+            "source": source,
+            "files": [{"submitted":"audio.flac"}],
+        });
+        let bytes4 = b"audio 4";
+        let (status4, _) = call_upload(&app, req4.clone(), "audio.flac", bytes4).await;
+        assert_eq!(status4, StatusCode::OK);
+        let seg4 = root.join(format!("chronicle/20260805/{stream}/150100_60"));
+        assert_eq!(fs::read(seg4.join("audio.flac")).unwrap(), bytes4);
+        let marker4_bytes_before = fs::read(seg4.join("stream.json")).unwrap();
+        let marker4: Value = serde_json::from_slice(&marker4_bytes_before).unwrap();
+        assert_eq!(marker4["seq"], 4);
+        assert_eq!(marker4["prev_day"], "20260805");
+        assert_eq!(marker4["prev_segment"], "150000_61");
+
+        // 5. 20260805 / 140000_60 — null predecessor, seq 5. Step 4 marker bytes unchanged.
+        let req5 = json!({
+            "day": "20260805",
+            "segment": "140000_60",
+            "source": source,
+            "files": [{"submitted":"audio.flac"}],
+        });
+        let bytes5 = b"audio 5";
+        let (status5, _) = call_upload(&app, req5.clone(), "audio.flac", bytes5).await;
+        assert_eq!(status5, StatusCode::OK);
+        let seg5 = root.join(format!("chronicle/20260805/{stream}/140000_60"));
+        assert_eq!(fs::read(seg5.join("audio.flac")).unwrap(), bytes5);
+        assert_eq!(
+            fs::read(seg4.join("stream.json")).unwrap(),
+            marker4_bytes_before
+        );
+        let marker5_bytes_before = fs::read(seg5.join("stream.json")).unwrap();
+        let marker5: Value = serde_json::from_slice(&marker5_bytes_before).unwrap();
+        assert_eq!(marker5["seq"], 5);
+        assert_eq!(marker5["prev_day"], Value::Null);
+        assert_eq!(marker5["prev_segment"], Value::Null);
+
+        // 6. 20260804 / 230000_60 — null predecessor, seq 6. Step 5 marker bytes unchanged.
+        let req6 = json!({
+            "day": "20260804",
+            "segment": "230000_60",
+            "source": source,
+            "files": [{"submitted":"audio.flac"}],
+        });
+        let bytes6 = b"audio 6";
+        let (status6, _) = call_upload(&app, req6.clone(), "audio.flac", bytes6).await;
+        assert_eq!(status6, StatusCode::OK);
+        let seg6 = root.join(format!("chronicle/20260804/{stream}/230000_60"));
+        assert_eq!(fs::read(seg6.join("audio.flac")).unwrap(), bytes6);
+        assert_eq!(
+            fs::read(seg5.join("stream.json")).unwrap(),
+            marker5_bytes_before
+        );
+        let marker6: Value =
+            serde_json::from_slice(&fs::read(seg6.join("stream.json")).unwrap()).unwrap();
+        assert_eq!(marker6["seq"], 6);
+        assert_eq!(marker6["prev_day"], Value::Null);
+        assert_eq!(marker6["prev_segment"], Value::Null);
+
+        // 7. Retry step 5 with the same bytes. Response status is duplicate. Marker stays seq 5 with null predecessor. Stream record seq stays 6 and last_segment stays 230000_60.
+        let (status7, body7) = call_upload(&app, req5, "audio.flac", bytes5).await;
+        assert_eq!(status7, StatusCode::OK);
+        assert_eq!(body7["status"], "duplicate");
+        let marker5_after: Value =
+            serde_json::from_slice(&fs::read(seg5.join("stream.json")).unwrap()).unwrap();
+        assert_eq!(marker5_after["seq"], 5);
+        assert_eq!(marker5_after["prev_day"], Value::Null);
+        assert_eq!(marker5_after["prev_segment"], Value::Null);
+        let stream_rec = stream_record(&root, stream);
+        assert_eq!(stream_rec["seq"], 6);
+        assert_eq!(stream_rec["last_segment"], "230000_60");
+
+        // Assert a single streams/*.json for that source.
+        assert_eq!(stream_record_count(&root), 1);
     }
 
     #[tokio::test]

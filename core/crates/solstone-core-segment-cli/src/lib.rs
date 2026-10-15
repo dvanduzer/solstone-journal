@@ -1600,4 +1600,208 @@ mod tests {
             b"{\"sentinel\":true}\n"
         );
     }
+
+    #[test]
+    fn null_predecessor_boundary_passes_and_a_missing_link_fails() {
+        use crate::read::{Check, describe_next};
+        use solstone_core_segment::{
+            PairedStreamBase, StreamAllocationBase, StreamHints, advance_bound_stream,
+            bind_paired_stream,
+        };
+
+        let check_passed = |chks: &[Check], name: &str| -> bool {
+            chks.iter().find(|c| c.name == name).unwrap().passed
+        };
+        let cid = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hints = StreamHints::default();
+        let base = PairedStreamBase {
+            origin: StreamAllocationBase::ClientLabel,
+            input: "phone",
+        };
+
+        // Passing journal, one source:
+        // Advance 20260805 / 150000_60, then 20260805 / 140000_60 (earlier clock → null predecessor, seq 2).
+        let pass_temp = TempDir::new().unwrap();
+        let pass_root = pass_temp.path();
+        let bound1 = bind_paired_stream(
+            pass_root,
+            "20260805",
+            "150000_60",
+            &base,
+            cid,
+            "mic",
+            &hints,
+        )
+        .unwrap();
+        advance_bound_stream(
+            &bound1.stream,
+            "20260805",
+            "150000_60",
+            &bound1.segment,
+            hints.clone(),
+            cid,
+            "mic",
+        )
+        .unwrap();
+
+        let bound2 = bind_paired_stream(
+            pass_root,
+            "20260805",
+            "140000_60",
+            &base,
+            cid,
+            "mic",
+            &hints,
+        )
+        .unwrap();
+        advance_bound_stream(
+            &bound2.stream,
+            "20260805",
+            "140000_60",
+            &bound2.segment,
+            hints.clone(),
+            cid,
+            "mic",
+        )
+        .unwrap();
+
+        let loc1 =
+            SegmentLocation::resolve(pass_root, "20260805", &bound1.stream, "150000_60").unwrap();
+        let loc2 =
+            SegmentLocation::resolve(pass_root, "20260805", &bound2.stream, "140000_60").unwrap();
+
+        let chks1 = checks(pass_root, &loc1);
+        let chks2 = checks(pass_root, &loc2);
+
+        assert!(check_passed(&chks1, "backward chain"));
+        assert!(check_passed(&chks1, "forward chain"));
+        assert!(check_passed(&chks2, "backward chain"));
+        assert!(check_passed(&chks2, "forward chain"));
+
+        let next_desc = describe_next(pass_root, &loc1, &bound1.stream);
+        assert!(next_desc.contains("20260805"));
+        assert!(next_desc.contains("140000_60"));
+        assert_ne!(next_desc, "(none)");
+
+        // Failing case 1: Forward pair 120000_60 then 120100_60. Delete earlier directory. Later segment backward chain fails.
+        let fail1_temp = TempDir::new().unwrap();
+        let fail1_root = fail1_temp.path();
+        let f1_bound1 = bind_paired_stream(
+            fail1_root,
+            "20260805",
+            "120000_60",
+            &base,
+            cid,
+            "mic",
+            &hints,
+        )
+        .unwrap();
+        advance_bound_stream(
+            &f1_bound1.stream,
+            "20260805",
+            "120000_60",
+            &f1_bound1.segment,
+            hints.clone(),
+            cid,
+            "mic",
+        )
+        .unwrap();
+        let f1_bound2 = bind_paired_stream(
+            fail1_root,
+            "20260805",
+            "120100_60",
+            &base,
+            cid,
+            "mic",
+            &hints,
+        )
+        .unwrap();
+        advance_bound_stream(
+            &f1_bound2.stream,
+            "20260805",
+            "120100_60",
+            &f1_bound2.segment,
+            hints.clone(),
+            cid,
+            "mic",
+        )
+        .unwrap();
+
+        fs::remove_dir_all(f1_bound1.segment.path()).unwrap();
+        let f1_loc2 =
+            SegmentLocation::resolve(fail1_root, "20260805", &f1_bound2.stream, "120100_60")
+                .unwrap();
+        let f1_chks2 = checks(fail1_root, &f1_loc2);
+        assert!(!check_passed(&f1_chks2, "backward chain"));
+
+        // Failing case 2: Three advances (20260805/150000_60, 20260805/140000_60, 20260804/120000_60). Delete middle directory. First segment forward chain fails.
+        let fail2_temp = TempDir::new().unwrap();
+        let fail2_root = fail2_temp.path();
+        let f2_b1 = bind_paired_stream(
+            fail2_root,
+            "20260805",
+            "150000_60",
+            &base,
+            cid,
+            "mic",
+            &hints,
+        )
+        .unwrap();
+        advance_bound_stream(
+            &f2_b1.stream,
+            "20260805",
+            "150000_60",
+            &f2_b1.segment,
+            hints.clone(),
+            cid,
+            "mic",
+        )
+        .unwrap();
+        let f2_b2 = bind_paired_stream(
+            fail2_root,
+            "20260805",
+            "140000_60",
+            &base,
+            cid,
+            "mic",
+            &hints,
+        )
+        .unwrap();
+        advance_bound_stream(
+            &f2_b2.stream,
+            "20260805",
+            "140000_60",
+            &f2_b2.segment,
+            hints.clone(),
+            cid,
+            "mic",
+        )
+        .unwrap();
+        let f2_b3 = bind_paired_stream(
+            fail2_root,
+            "20260804",
+            "120000_60",
+            &base,
+            cid,
+            "mic",
+            &hints,
+        )
+        .unwrap();
+        advance_bound_stream(
+            &f2_b3.stream,
+            "20260804",
+            "120000_60",
+            &f2_b3.segment,
+            hints.clone(),
+            cid,
+            "mic",
+        )
+        .unwrap();
+
+        fs::remove_dir_all(f2_b2.segment.path()).unwrap();
+        let f2_loc1 =
+            SegmentLocation::resolve(fail2_root, "20260805", &f2_b1.stream, "150000_60").unwrap();
+        let f2_chks1 = checks(fail2_root, &f2_loc1);
+        assert!(!check_passed(&f2_chks1, "forward chain"));
+    }
 }

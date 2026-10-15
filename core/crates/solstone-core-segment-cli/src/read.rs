@@ -277,14 +277,69 @@ fn describe_prev(
     }
 }
 
-fn describe_next(journal: &Path, location: &SegmentLocation, stream: &str) -> String {
-    match next_segment(journal, &location.day, stream, &location.segment) {
-        Err(message) => message.trim().to_owned(),
-        Ok(Some(next)) => format!("{}/{}/{}", next.day, stream, next.segment),
-        Ok(None) if is_tail(journal, &location.day, stream, &location.segment) => {
-            "(tail)".to_owned()
+enum ForwardResolution {
+    Successor(SegmentLocation),
+    Tail,
+    Missing,
+}
+
+fn resolve_forward(
+    journal: &Path,
+    location: &SegmentLocation,
+    stream: &str,
+    marker: Option<&Value>,
+) -> Result<ForwardResolution, String> {
+    if let Some(next) = next_segment(journal, &location.day, stream, &location.segment)? {
+        return Ok(ForwardResolution::Successor(next));
+    }
+    if is_tail(journal, &location.day, stream, &location.segment) {
+        return Ok(ForwardResolution::Tail);
+    }
+    if let Some(target_seq) = marker
+        .and_then(|m| m.get("seq"))
+        .and_then(Value::as_u64)
+        .and_then(|seq| seq.checked_add(1))
+    {
+        let mut candidates = Vec::new();
+        for (scan_day, _) in list_days(journal).unwrap_or_default() {
+            for candidate in list_segments(journal, &scan_day).unwrap_or_default() {
+                let Ok(Some(candidate_marker)) = read_marker(candidate.path()) else {
+                    continue;
+                };
+                if marker_stream(&candidate_marker) != Some(stream) {
+                    continue;
+                }
+                if candidate_marker.get("seq").and_then(Value::as_u64) != Some(target_seq) {
+                    continue;
+                }
+                let prev_day_null_or_absent =
+                    matches!(candidate_marker.get("prev_day"), None | Some(Value::Null));
+                let prev_segment_null_or_absent = matches!(
+                    candidate_marker.get("prev_segment"),
+                    None | Some(Value::Null)
+                );
+                if prev_day_null_or_absent && prev_segment_null_or_absent {
+                    candidates.push(require_discovered(&scan_day, &candidate)?);
+                }
+            }
         }
-        Ok(None) => "(none)".to_owned(),
+        if !candidates.is_empty() {
+            candidates.sort_by_key(|loc| loc.token());
+            return Ok(ForwardResolution::Successor(candidates.remove(0)));
+        }
+    }
+    Ok(ForwardResolution::Missing)
+}
+
+pub(crate) fn describe_next(journal: &Path, location: &SegmentLocation, stream: &str) -> String {
+    let marker = read_marker(&location.path).ok().flatten();
+    match resolve_forward(journal, location, stream, marker.as_ref()) {
+        Err(message) => message.trim().to_owned(),
+        Ok(ForwardResolution::Successor(next)) => {
+            format!("{}/{}/{}", next.day, stream, next.segment)
+        }
+        Ok(ForwardResolution::Tail) => "(tail)".to_owned(),
+        Ok(ForwardResolution::Missing) => "(none)".to_owned(),
     }
 }
 
@@ -334,16 +389,16 @@ pub(crate) fn checks(journal: &Path, location: &SegmentLocation) -> Vec<Check> {
             _ => (false, "prev_segment set without prev_day".to_owned()),
         },
     };
-    let forward = match next_segment(journal, &location.day, stream, &location.segment) {
+    let forward = match resolve_forward(journal, location, stream, marker.as_ref()) {
         Err(message) => (false, message.trim().to_owned()),
-        Ok(Some(next)) => (
+        Ok(ForwardResolution::Successor(next)) => (
             true,
             format!("next segment {}/{}/{}", next.day, stream, next.segment),
         ),
-        Ok(None) if is_tail(journal, &location.day, stream, &location.segment) => {
-            (true, "stream tail".to_owned())
+        Ok(ForwardResolution::Tail) => (true, "stream tail".to_owned()),
+        Ok(ForwardResolution::Missing) => {
+            (false, "next segment not found, not stream tail".to_owned())
         }
-        Ok(None) => (false, "next segment not found, not stream tail".to_owned()),
     };
     let index = read_segment_index(journal, &location.index_rel);
     let index_check = match &index {
