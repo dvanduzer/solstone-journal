@@ -4720,6 +4720,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solstone-core-about",
+ "tempfile",
  "ureq",
  "velopack",
  "webview2-com",

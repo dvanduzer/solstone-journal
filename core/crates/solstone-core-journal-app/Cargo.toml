@@ -9,6 +9,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+full-tests = []
+
 [[bin]]
 name = "journal-app"
 path = "src/main.rs"
@@ -24,6 +27,11 @@ unsafe_code = "allow"
 solstone-core-about.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.24.0"
+ureq = { workspace = true }
+velopack = { workspace = true, features = ["public-utils"] }
 
 [target.'cfg(windows)'.dependencies]
 ureq = { workspace = true }
