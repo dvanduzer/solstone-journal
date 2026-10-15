@@ -36,4 +36,3 @@ package func loadInstalledModels(from directory: URL, version: AsrModelVersion) 
         version: version
     )
 }
-
