@@ -3238,10 +3238,7 @@ mod tests {
             )
             .unwrap();
             let when = std::time::SystemTime::now() - Duration::from_secs(age_secs);
-            std::fs::File::open(&dir)
-                .unwrap()
-                .set_modified(when)
-                .unwrap();
+            filetime::set_file_mtime(&dir, filetime::FileTime::from_system_time(when)).unwrap();
             dir
         };
         let abandoned = stage("20260801_000000", "strava", 2 * 60 * 60);

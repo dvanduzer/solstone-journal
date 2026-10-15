@@ -417,8 +417,10 @@ mod tests {
                     snapshot.insert(
                         path.strip_prefix(root)
                             .expect("under root")
-                            .to_string_lossy()
-                            .to_string(),
+                            .iter()
+                            .map(|part| part.to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/"),
                         fs::read(path).expect("file bytes"),
                     );
                 }

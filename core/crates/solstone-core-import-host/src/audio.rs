@@ -1478,7 +1478,19 @@ mod publication_tests {
                     match mutation {
                         "deleted" => fs::write(segment.join("tombstone.json"), b"{}").unwrap(),
                         "replaced" => {
-                            fs::rename(&segment, root.path().join("previous")).unwrap();
+                            let renamed = fs::rename(&segment, root.path().join("previous"));
+                            #[cfg(windows)]
+                            if let Err(error) = &renamed {
+                                // Windows protects the live admitted directory from replacement.
+                                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+                                assert!(segment.is_dir());
+                                assert!(!root.path().join("previous").exists());
+                                assert!(!output.exists());
+                                return Err(AudioSliceError::InputUnreadable {
+                                    detail: "fixture namespace replacement was refused".into(),
+                                });
+                            }
+                            renamed.unwrap();
                             fs::create_dir(&segment).unwrap();
                         }
                         _ => (),

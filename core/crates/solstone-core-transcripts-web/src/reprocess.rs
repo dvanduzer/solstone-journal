@@ -836,10 +836,11 @@ mod tests {
         assert!(!failed_marker_path(root.path(), "audio").exists());
 
         let marker = create_analyzing_marker(root.path(), "audio").expect("marker");
-        fs::File::open(&marker.path)
-            .unwrap()
-            .set_modified(UNIX_EPOCH)
-            .unwrap();
+        filetime::set_file_mtime(
+            &marker.path,
+            filetime::FileTime::from_system_time(UNIX_EPOCH),
+        )
+        .unwrap();
         assert_eq!(
             super::modality_signals(
                 root.path(),
@@ -859,7 +860,7 @@ mod tests {
         let root = TempDir::new().expect("shims");
         let adjacent = root.path().join("adjacent");
         fs::create_dir_all(&adjacent).unwrap();
-        let sibling = adjacent.join("solstone-core");
+        let sibling = adjacent.join(format!("solstone-core{}", std::env::consts::EXE_SUFFIX));
         fs::write(&sibling, b"helper").unwrap();
         #[cfg(unix)]
         {
