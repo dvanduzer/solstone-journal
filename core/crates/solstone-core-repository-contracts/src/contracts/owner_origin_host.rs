@@ -8,7 +8,6 @@ use std::fs;
 #[cfg(feature = "full-tests")]
 use std::path::{Path, PathBuf};
 
-use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
@@ -93,21 +92,28 @@ fn cfg_requires_test(attr: &syn::Attribute) -> bool {
     if !attr.path().is_ident("cfg") {
         return false;
     }
-    let s = attr.meta.to_token_stream().to_string();
-    if s.contains("not ( test )") || s.contains("not(test)") {
-        return false;
-    }
-    fn names_test(tokens: proc_macro2::TokenStream) -> bool {
-        tokens.into_iter().any(|token| match token {
-            proc_macro2::TokenTree::Ident(ident) => ident == "test",
-            proc_macro2::TokenTree::Group(group) => names_test(group.stream()),
+    fn requires_test(meta: &syn::Meta) -> bool {
+        match meta {
+            syn::Meta::Path(path) => path.is_ident("test"),
+            syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+                let Ok(children) = list.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                ) else {
+                    return false;
+                };
+                if list.path.is_ident("all") {
+                    children.iter().any(requires_test)
+                } else {
+                    // any(windows, test) is production on Windows. Only an
+                    // alternative set that always requires test is test-only.
+                    children.iter().all(requires_test)
+                }
+            }
             _ => false,
-        })
+        }
     }
-    match &attr.meta {
-        syn::Meta::List(list) => names_test(list.tokens.clone()),
-        _ => false,
-    }
+    attr.parse_args::<syn::Meta>()
+        .is_ok_and(|meta| requires_test(&meta))
 }
 
 fn is_test_attr(attr: &syn::Attribute) -> bool {
@@ -634,6 +640,24 @@ pub const PRODUCTION_HOST_URL: &str = "https://updates.solstone.app/untracked";
         !errors.is_empty(),
         "untracked production sample must fail validation"
     );
+}
+
+#[test]
+fn a_module_built_for_windows_or_tests_is_still_production() {
+    let syntax: syn::ItemMod = syn::parse_quote! {
+        #[cfg(any(windows, test))]
+        mod update;
+    };
+    assert!(!syntax.attrs.iter().any(cfg_requires_test));
+    let source = r#"
+#[cfg(any(windows, test))]
+mod update {
+    const FEED_URL: &str = "https://updates.solstone.app/untracked";
+}
+"#;
+    let hits = scan_source("core/crates/sample/src/lib.rs", source);
+    assert_eq!(hits.len(), 1);
+    assert!(!validate_hits(&hits).is_empty());
 }
 
 #[cfg(feature = "full-tests")]

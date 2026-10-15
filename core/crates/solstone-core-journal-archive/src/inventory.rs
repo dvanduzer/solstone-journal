@@ -320,6 +320,7 @@ mod membership_tests {
             "chronicle/20260101/indexer/120000_60/slides.key",
             "chronicle/20260101/source/120000_60/audio.jsonl.lock",
             "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
+            "imports/item/peers/original.txt",
         ] {
             write(&root, member, b"owner bytes");
         }
@@ -335,12 +336,14 @@ mod membership_tests {
             "health/brain-fingerprint.key",
             "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",
+            "peers/remote/client.key",
+            "peers/remote/client.crt",
         ] {
             write(&root, member, b"operational secret control");
         }
         let source = ArchiveSource::open(&root).unwrap();
         let names = members(&source);
-        assert_eq!(names.len(), 16, "{names:?}");
+        assert_eq!(names.len(), 17, "{names:?}");
         assert!(names.contains(&"entities/cache/entity.json".to_owned()));
         assert!(names.contains(&"facets/indexer/facet.json".to_owned()));
         assert!(names.contains(&"chronicle/20260101/indexer/120000_60/slides.key".to_owned()));
@@ -358,9 +361,18 @@ mod membership_tests {
         write(&root, "config/journal.json", b"{}");
         write(&root, "apps/observer/x.json", b"{}");
         write(&root, "chronicle/20260101/a.txt", b"a");
+        write(&root, "peers/remote/client.key", b"key");
+        write(&root, "peers/remote/client.crt", b"crt");
+        write(&root, "imports/item/peers/original.txt", b"txt");
         let source = ArchiveSource::open(&root).expect("open source");
         let names = members(&source);
-        assert_eq!(names, vec!["chronicle/20260101/a.txt".to_owned()]);
+        assert_eq!(
+            names,
+            vec![
+                "chronicle/20260101/a.txt".to_owned(),
+                "imports/item/peers/original.txt".to_owned(),
+            ]
+        );
         assert_eq!(
             source
                 .inventory()
@@ -368,7 +380,7 @@ mod membership_tests {
                 .iter()
                 .map(|name| name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["apps", "config"]
+            vec!["apps", "config", "peers"]
         );
     }
 }

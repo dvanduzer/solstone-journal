@@ -8,6 +8,11 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- security fix: exports from older journals could include private keys for connections to other journals, giving a copy of those keys to anyone you shared the export with. exports now leave out those keys.
+- changing your backup recovery key now saves and checks the replacement before removing the old key. if removal is interrupted, trying again finishes the same change.
+- small orange links and labels in your journal dashboard are easier to read in light appearance. if your journal's mark cannot be read, its placeholder now follows the dashboard's appearance. opening support keeps the navigation in place.
+- security fix: a redirect could disclose an install or update request to another website. the linux installer's wget downloads now check each redirect before following it, and windows update checks and downloads refuse redirects.
+- the location accuracy download prompt now names updates.solstone.app.
 - returning to health or known voices takes less time on large journals.
 - in the date picker, each day now sits under its day of the week, and the days of the week are labeled along the top. before, every month started in the first column, so most dates looked like they fell on the wrong day. the up and down arrow keys now move a week at a time.
 - on windows, links to saved output from a thinking run open again.

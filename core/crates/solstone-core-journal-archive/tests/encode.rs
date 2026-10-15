@@ -431,3 +431,86 @@ fn exported_archives_never_report_a_fault_for_an_unchanged_source() {
     );
     assert!(result.is_ok());
 }
+
+#[test]
+fn portable_zip_omits_legacy_peer_credentials() {
+    let temporary = TempDir::new("encode-peers");
+    let root = journal(&temporary);
+    write(&root, "peers/remote/client.key", b"peer-key-sentinel-7f3a");
+    write(&root, "peers/remote/client.crt", b"peer-crt-sentinel-9c2e");
+    write(
+        &root,
+        "imports/item/peers/original.txt",
+        b"nested-peers-owner-4b81",
+    );
+    write(&root, "chronicle/20260101/note.txt", b"ordinary-note-1d60");
+
+    let pre_key = fs::read(root.join("peers/remote/client.key")).expect("read client.key");
+    let pre_crt = fs::read(root.join("peers/remote/client.crt")).expect("read client.crt");
+
+    let source = ArchiveSource::open(&root).expect("open source");
+    let path = temporary.path().join("archive.zip");
+    let mut file = File::create(&path).expect("create output");
+    encode_archive(&request(&source), &mut file).expect("encode");
+
+    let mut archive = ZipArchive::new(File::open(&path).expect("open archive output"))
+        .expect("parse archive output");
+    let mut members = Vec::new();
+    for index in 0..archive.len() {
+        let mut member = archive.by_index(index).expect("member");
+        let name = member.name().to_owned();
+        let mut body = Vec::new();
+        member.read_to_end(&mut body).expect("read member body");
+        members.push((name, body));
+    }
+
+    for (name, _) in &members {
+        assert!(
+            name != "peers" && name != "peers/" && !name.starts_with("peers/"),
+            "forbidden peer member name: {name}"
+        );
+    }
+
+    let key_sentinel = b"peer-key-sentinel-7f3a";
+    let crt_sentinel = b"peer-crt-sentinel-9c2e";
+    for (name, body) in &members {
+        assert!(
+            !body
+                .windows(key_sentinel.len())
+                .any(|window| window == key_sentinel),
+            "key sentinel found in {name}"
+        );
+        assert!(
+            !body
+                .windows(crt_sentinel.len())
+                .any(|window| window == crt_sentinel),
+            "crt sentinel found in {name}"
+        );
+    }
+
+    let note = members
+        .iter()
+        .find(|(name, _)| name == "chronicle/20260101/note.txt");
+    assert_eq!(
+        note.map(|(_, body)| body.as_slice()),
+        Some(&b"ordinary-note-1d60"[..]),
+        "missing or wrong chronicle note"
+    );
+    let owner = members
+        .iter()
+        .find(|(name, _)| name == "imports/item/peers/original.txt");
+    assert_eq!(
+        owner.map(|(_, body)| body.as_slice()),
+        Some(&b"nested-peers-owner-4b81"[..]),
+        "missing or wrong owner text"
+    );
+
+    assert_eq!(
+        fs::read(root.join("peers/remote/client.key")).expect("source client.key"),
+        pre_key
+    );
+    assert_eq!(
+        fs::read(root.join("peers/remote/client.crt")).expect("source client.crt"),
+        pre_crt
+    );
+}

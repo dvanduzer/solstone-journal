@@ -8,12 +8,10 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::time::Duration;
 
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
 use solstone_core_backup::archive_admission::ArchiveCancellation;
 use solstone_core_backup::{BackupError, Destination, assemble_backend_env};
 
 use crate::destination::validate_destination;
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
 use crate::runner::run_restic_with_stdin_cancellable;
 use crate::runner::{PassedHandle, ToolRunner, run_restic, run_restic_with_stdin};
 
@@ -233,7 +231,6 @@ pub fn remove_key(
     )
 }
 
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
 pub(crate) fn capture_rotation_key_id(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -247,7 +244,6 @@ pub(crate) fn capture_rotation_key_id(
         .map(|(id, _)| id)
         .ok_or(RepoError::Failed)
 }
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
 pub(crate) fn remove_rotation_key(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -281,7 +277,6 @@ pub(crate) fn remove_rotation_key(
     }
 }
 
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
 pub(crate) fn strict_key_list_absence(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -297,7 +292,6 @@ pub(crate) fn strict_key_list_absence(
     )
 }
 
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
 fn strict_key_list(
     runner: &dyn ToolRunner,
     destination: &Destination,

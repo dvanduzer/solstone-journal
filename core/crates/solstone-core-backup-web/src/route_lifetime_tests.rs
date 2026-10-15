@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use solstone_core_backup_runtime::hosted_runtime::HttpError;
 #[cfg(not(windows))]
-use solstone_core_backup_runtime::test_support::rotate_android_recovery_key;
+use solstone_core_backup_runtime::rotate_recovery_key;
 use solstone_core_backup_runtime::{HttpRequest, HttpResponse, HttpTransport};
 #[cfg(not(windows))]
 use solstone_core_backup_runtime::{ToolOutput, ToolRequest, ToolRunner};
@@ -656,7 +656,7 @@ fn rotation_after_remove_key_holds_drain_until_local_publish() {
                 rclone_path: None,
             };
             let runner = lifetime_runner(&worker_deps);
-            let result = rotate_android_recovery_key(
+            let result = rotate_recovery_key(
                 &worker_deps.journal_root,
                 &services(&worker_deps, &runner, &tools),
             );
@@ -793,7 +793,7 @@ fn store_rotation(
         rclone_path: None,
     };
     let runner = lifetime_runner(deps);
-    let result = rotate_android_recovery_key(&deps.journal_root, &services(deps, &runner, &tools));
+    let result = rotate_recovery_key(&deps.journal_root, &services(deps, &runner, &tools));
     *stored.lock().unwrap() = Some(result);
 }
 

@@ -21,7 +21,6 @@ use velopack::bundle::Manifest;
 use velopack::sources::{FileSource, UpdateSource};
 use velopack::{
     Error, UpdateCheck, UpdateInfo, UpdateManager, UpdateOptions, VelopackAsset, VelopackAssetFeed,
-    download,
 };
 
 use crate::prefs::{self, CheckInterval, Prefs};
@@ -35,6 +34,27 @@ const CHANNEL: &str = "win";
 #[derive(Clone)]
 struct FirstPartyFeed {
     base: String,
+}
+
+// A feed entry may name only a sibling file, and neither request follows
+// redirects. The updater must not contact a different host before verifying
+// the downloaded package: that would already disclose an installation.
+fn request_without_redirects(url: &str) -> Result<ureq::http::Response<ureq::Body>, Error> {
+    let response = ureq::agent()
+        .get(url)
+        .config()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .map_err(|error| Error::Other(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(Error::Other(format!(
+            "the update origin returned HTTP {}",
+            response.status()
+        )));
+    }
+    Ok(response)
 }
 
 impl FirstPartyFeed {
@@ -66,7 +86,10 @@ impl UpdateSource for FirstPartyFeed {
             "{}/releases.{channel}.json",
             self.base.trim_end_matches('/')
         );
-        let json = download::download_url_as_string(&url)?;
+        let json = request_without_redirects(&url)?
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| Error::Other(error.to_string()))?;
         serde_json::from_str(&json).map_err(Error::from)
     }
 
@@ -77,11 +100,30 @@ impl UpdateSource for FirstPartyFeed {
         progress_sender: Option<Sender<i16>>,
     ) -> Result<(), Error> {
         let url = self.asset_url(&asset.FileName)?;
-        download::download_url_to_file(&url, local_file, move |percent| {
+        let response = request_without_redirects(&url)?;
+        let total = asset.Size;
+        let mut received = 0_u64;
+        let mut reader = response.into_body().into_reader();
+        let mut file = std::fs::File::create(local_file)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            use std::io::{Read, Write};
+            let size = reader.read(&mut buffer)?;
+            if size == 0 {
+                break;
+            }
+            file.write_all(&buffer[..size])?;
+            received = received.saturating_add(size as u64);
+            let percent = if total > 0 {
+                ((u128::from(received) * 100 / u128::from(total)).min(100)) as i16
+            } else {
+                0
+            };
             if let Some(sender) = &progress_sender {
                 let _ = sender.send(percent);
             }
-        })
+        }
+        Ok(())
     }
 }
 
@@ -387,5 +429,113 @@ mod tests {
         ] {
             assert!(!asset_name_is_plain(outside), "{outside}");
         }
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn redirect_is_refused_before_contacting_its_destination() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_url = format!("http://{}", origin.local_addr().unwrap());
+        let destination_url = format!(
+            "http://localhost:{}",
+            destination.local_addr().unwrap().port()
+        );
+        origin.set_nonblocking(true).unwrap();
+        let origin_server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match origin.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no origin request arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("origin server: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: {destination_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        destination.set_nonblocking(true).unwrap();
+        let trap = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match destination.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nleak").unwrap();
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("redirect trap: {error}"),
+                }
+            }
+            false
+        });
+        let result = super::request_without_redirects(&origin_url);
+        origin_server.join().unwrap();
+        let contacted = trap.join().unwrap();
+        assert!(result.is_err(), "redirect must refuse");
+        assert!(!contacted, "redirect destination received a request");
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn a_sibling_package_streams_to_disk_and_reports_progress() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        use velopack::sources::UpdateSource;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let feed = super::FirstPartyFeed {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut request = [0; 4096];
+                        let size = stream.read(&mut request).unwrap();
+                        assert!(request[..size].starts_with(b"GET /package.nupkg "));
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbytes").unwrap();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no package request arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("package server: {error}"),
+                }
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("package.nupkg");
+        let asset = velopack::VelopackAsset {
+            FileName: "package.nupkg".to_owned(),
+            Size: 5,
+            ..Default::default()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let result = feed.download_release_entry(&asset, &path, Some(sender));
+        server.join().unwrap();
+        result.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"bytes");
+        assert_eq!(receiver.into_iter().last(), Some(100));
     }
 }

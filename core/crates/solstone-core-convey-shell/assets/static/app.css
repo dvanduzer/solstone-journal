@@ -622,7 +622,7 @@ body.has-managed-dialog .workspace {
 .app-rail-link.is-current,
 .app-dock-link.is-current {
   background: color-mix(in srgb, var(--orange-ink) 18%, transparent);
-  color: var(--orange-ink);
+  color: var(--ink);
   position: relative;
 }
 
@@ -1360,7 +1360,7 @@ a:focus-visible {
 }
 
 .surface-state-action > a:not([class]) {
-  color: var(--orange-ink);
+  color: var(--orange-text-aa);
   text-decoration: none;
   font-weight: 500;
 }
@@ -1457,7 +1457,7 @@ a:focus-visible {
 .surface-state-detail summary {
   width: fit-content;
   margin: 0 auto 6px;
-  color: var(--orange-ink);
+  color: var(--orange-text-aa);
   cursor: pointer;
 }
 
@@ -1466,7 +1466,7 @@ a:focus-visible {
   padding: 0;
   border: 0;
   background: transparent;
-  color: var(--orange-ink);
+  color: var(--orange-text-aa);
   font: inherit;
   cursor: pointer;
 }

@@ -776,7 +776,7 @@
       actions = `<button type="button" data-accuracy="remove">remove location accuracy</button>
         <span class="map-muted">frees ${escapeHtml(bytes(installed.size_bytes))}; names go back to the nearby town.</span>`;
     } else if (installed && offered) {
-      body = `<p>location accuracy is on. a newer download is ready: ${escapeHtml(bytes(offered.size_bytes))}.</p>`;
+      body = `<p>location accuracy is on. a newer download is ready from updates.solstone.app: ${escapeHtml(bytes(offered.size_bytes))}.</p>`;
       actions = `<button type="button" data-accuracy="download">update</button>
         <button type="button" data-accuracy="remove">remove location accuracy</button>`;
     } else if (installed) {
@@ -784,7 +784,7 @@
       actions = `<button type="button" data-accuracy="remove">remove location accuracy</button>`;
     } else {
       body = `<p>with location accuracy, ${escapeHtml(what)} without it, a visit is named by the nearby town.</p>
-        <p class="map-muted">it's ${escapeHtml(bytes(offered.size_bytes))}, the same download for everyone, so getting it says nothing about where you've been. names are looked up on your computer.</p>`;
+        <p class="map-muted">it's ${escapeHtml(bytes(offered.size_bytes))} from updates.solstone.app, the same download for everyone, so getting it says nothing about where you've been. names are looked up on your computer.</p>`;
       actions = `<button type="button" data-accuracy="download">download ${escapeHtml(bytes(offered.size_bytes))}</button>`;
     }
     const failures = {
@@ -922,7 +922,7 @@
     const L = window.L;
     const element = document.getElementById("map-canvas");
     if (!L || !element || !data.map) return;
-    const ink = cssColor("--ink-soft", "#6b5f55");
+    const ink = cssColor("--ink-soft", "#5B5246");
     const orange = cssColor("--orange", "#e8913a");
     const map = L.map(element, { attributionControl: false, zoomSnap: 0.5, worldCopyJump: false });
     const [west, south, east, north] = data.map.bounds;

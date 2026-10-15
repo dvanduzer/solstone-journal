@@ -1085,8 +1085,8 @@
   function renderUnavailableIdentityMark(container) {
     if (!container) return;
     container.innerHTML = '<div class="link-mark-chips">' +
-      '<div class="link-mark-chip unavailable" style="border-color: #d1c7b7; background: #eae5dc;"><span style="font-size: 24px; font-weight: 700; color: #6E6453;">?</span></div>' +
-      '<div class="link-mark-chip unavailable" style="border-color: #d1c7b7; background: #eae5dc;"><span style="font-size: 24px; font-weight: 700; color: #6E6453;">?</span></div>' +
+      '<div class="link-mark-chip unavailable" style="border-color: var(--hairline); background: var(--cream-bright);"><span style="font-size: 24px; font-weight: 700; color: var(--ink-faint);">?</span></div>' +
+      '<div class="link-mark-chip unavailable" style="border-color: var(--hairline); background: var(--cream-bright);"><span style="font-size: 24px; font-weight: 700; color: var(--ink-faint);">?</span></div>' +
       '</div><div class="link-mark-words"><span>mark</span><span class="link-mark-sep">·</span><span>unavailable</span></div>';
     container.setAttribute('role', 'img');
     container.setAttribute('aria-label', "your journal's mark, unavailable right now");

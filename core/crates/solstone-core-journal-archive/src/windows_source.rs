@@ -373,6 +373,7 @@ mod tests {
             "chronicle/20260101/indexer/120000_60/slides.key",
             "chronicle/20260101/source/120000_60/audio.jsonl.lock",
             "chronicle/20260101/source/120000_60/.tmp_123_4.tmp",
+            "imports/item/peers/original.txt",
         ];
         for member in kept {
             write(&root, member, b"owner bytes");
@@ -389,6 +390,8 @@ mod tests {
             "health/brain-fingerprint.key",
             "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",
+            "peers/remote/client.key",
+            "peers/remote/client.crt",
         ];
         for member in omitted {
             write(&root, member, b"secret control");
@@ -405,6 +408,14 @@ mod tests {
             &mut output,
         )
         .unwrap();
+        assert_eq!(
+            fs::read(root.join("peers/remote/client.key")).unwrap(),
+            b"secret control"
+        );
+        assert_eq!(
+            fs::read(root.join("peers/remote/client.crt")).unwrap(),
+            b"secret control"
+        );
         for member in kept {
             let entry = source
                 .inventory()

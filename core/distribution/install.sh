@@ -599,7 +599,9 @@ fetch_url() {
 			rm -f "$_hdrs"
 		elif command -v wget >/dev/null 2>&1; then
 			_hdrs=$(mktemp "$WORK/solstone-install-headers-XXXXXX")
-			if wget -qS -O "$_dest" "$_current" 2>"$_hdrs"; then
+			# The shell validates each Location before the next request. wget's
+			# default redirect following would bypass that origin check.
+			if wget --max-redirect=0 -qS -O "$_dest" "$_current" 2>"$_hdrs"; then
 				_code=200
 			else
 				_code=$(awk '/^  HTTP\//{print $2; exit}' "$_hdrs")
