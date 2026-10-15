@@ -355,7 +355,7 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn post_bytes_201_huge_or_stalled_body_returns_ok_before_finish() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::thread;
 
         let listener = bind_local().unwrap();
@@ -363,8 +363,7 @@ mod tests {
 
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf).unwrap();
+            read_small_post(&mut stream);
             // Declare huge content length but only write a few bytes of body
             stream
                 .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 1000000\r\n\r\npartial")
