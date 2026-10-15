@@ -525,19 +525,25 @@ mod tests {
 
     #[test]
     fn deletion_and_replaced_parent_refuse() {
-        let (root, segment, raw) = fixture();
+        let (_root, segment, raw) = fixture();
         let claims = OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).unwrap();
         let input = InputObservation::capture(&claims, &raw).unwrap();
         fs::write(segment.join("tombstone.json"), b"{}").unwrap();
         assert!(input.commit(&claims).is_err());
-        fs::remove_file(segment.join("tombstone.json")).unwrap();
-        fs::rename(&segment, root.path().join("moved")).unwrap();
-        fs::create_dir(&segment).unwrap();
-        fs::write(&raw, b"before").unwrap();
-        assert!(input.commit(&claims).is_err());
-        assert!(!segment.join("audio.jsonl").exists());
+        // Unix permits this forged ancestry while descendant claim handles remain open.
+        #[cfg(unix)]
+        {
+            fs::remove_file(segment.join("tombstone.json")).unwrap();
+            fs::rename(&segment, _root.path().join("moved")).unwrap();
+            fs::create_dir(&segment).unwrap();
+            fs::write(&raw, b"before").unwrap();
+            assert!(input.commit(&claims).is_err());
+            assert!(!segment.join("audio.jsonl").exists());
+        }
     }
 
+    // Unix permits renaming this subtree while descendant claim handles remain open.
+    #[cfg(unix)]
     #[test]
     fn reused_path_cannot_transfer_a_claim_to_another_directory() {
         let (root, segment, raw) = fixture();
@@ -550,6 +556,8 @@ mod tests {
         assert!(claims.commit(&segment).is_err());
     }
 
+    // Unix permits transplanting ancestry while descendant claim handles remain open.
+    #[cfg(unix)]
     #[test]
     fn transplanted_segment_cannot_transfer_to_a_replacement_journal() {
         let (root, segment, raw) = fixture();
@@ -720,7 +728,9 @@ mod tests {
 
     #[test]
     fn held_commit_refuses_tombstone_replacement_and_transplanted_ancestry() {
-        for change in 0..3 {
+        // Only Unix permits the rename forgeries; tombstone changes apply everywhere.
+        let changes = if cfg!(unix) { 3 } else { 1 };
+        for change in 0..changes {
             let (root, segment, _raw) = fixture();
             let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
             let commit = claims.commit(&segment).unwrap();
@@ -759,12 +769,16 @@ mod tests {
         let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
         let commit = claims.commit(&segment).unwrap();
         commit.revalidate().unwrap();
-        let parent = root.path().join("parent");
-        let moved = root.path().join("moved");
-        fs::rename(&parent, &moved).unwrap();
-        assert!(commit.revalidate().is_err());
-        fs::rename(&moved, &parent).unwrap();
-        commit.revalidate().unwrap();
+        // Only Unix permits moving and restoring an ancestor with retained children.
+        #[cfg(unix)]
+        {
+            let parent = root.path().join("parent");
+            let moved = root.path().join("moved");
+            fs::rename(&parent, &moved).unwrap();
+            assert!(commit.revalidate().is_err());
+            fs::rename(&moved, &parent).unwrap();
+            commit.revalidate().unwrap();
+        }
     }
 
     #[test]

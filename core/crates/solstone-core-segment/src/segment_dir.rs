@@ -307,7 +307,12 @@ pub fn owner_deletion_state(segment_dir: &Path) -> Result<OwnerDeletionState, Se
                 }
             }
         }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            check_missing_segment_ancestors(segment_dir).map_err(|source| SegmentError::Io {
+                path: segment_dir.to_path_buf(),
+                source,
+            })?;
+        }
         Err(source) => {
             return Err(SegmentError::Io {
                 path: segment_dir.to_path_buf(),
@@ -337,6 +342,25 @@ pub fn owner_deletion_state(segment_dir: &Path) -> Result<OwnerDeletionState, Se
             source,
         }),
     }
+}
+
+// Windows can report a missing path when an ancestor is a file. This only
+// classifies absence; it does not admit a path or exclude namespace changes.
+fn check_missing_segment_ancestors(segment_dir: &Path) -> io::Result<()> {
+    for parent in segment_dir.ancestors().skip(1) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        match std::fs::metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => return Err(io::ErrorKind::NotADirectory.into()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(source),
+        }
+    }
+    Err(io::ErrorKind::Other.into())
 }
 
 fn validate_component(value: &str, kind: &'static str) -> Result<(), SegmentError> {
@@ -435,9 +459,11 @@ mod tests {
     fn resolves_default_stream_directly_under_day() {
         let temporary = TempDir::new();
         let root = temporary.path();
-        fs::create_dir_all(root.join("chronicle/20260804")).unwrap();
+        let day = root.join("chronicle").join("20260804");
+        fs::create_dir_all(&day).unwrap();
+        let canonical_day = fs::canonicalize(&day).unwrap();
         let resolved = SegmentDir::resolve(root, "20260804", "120000_60", DEFAULT_STREAM).unwrap();
-        assert_eq!(resolved.path, root.join("chronicle/20260804/120000_60"));
+        assert_eq!(resolved.path, canonical_day.join("120000_60"));
     }
 
     #[cfg(unix)]
@@ -505,7 +531,16 @@ mod tests {
         let file_parent = root.join("parent_file");
         fs::write(&file_parent, b"not a dir").unwrap();
         let bad_child = file_parent.join("child");
-        assert!(owner_deleted(&bad_child).is_err());
+        let assert_obstruction = |requested: &Path| match owner_deleted(requested).unwrap_err() {
+            SegmentError::Io { path, source } => {
+                assert_eq!(path, requested);
+                assert_eq!(source.kind(), io::ErrorKind::NotADirectory);
+            }
+            other => panic!("unexpected obstruction error: {other:?}"),
+        };
+        assert_obstruction(&bad_child);
+        assert_obstruction(&file_parent.join("missing_parent").join("child"));
+        assert!(!owner_deleted(&root.join("missing_parent").join("child")).unwrap());
 
         // 6. A non-directory staged marker still occupies the key.
         let occupied_seg = parent.join("occupied_key");
@@ -694,8 +729,20 @@ mod tests {
             fs::create_dir(&fixture.segment).unwrap();
             assert!(observed.state().is_err());
             let observed = fixture.open(16);
-            fs::remove_dir(&fixture.segment).unwrap();
-            assert!(observed.state().is_err());
+            #[cfg(windows)]
+            {
+                // Windows refuses removal while the retained child is open.
+                assert!(fs::remove_dir(&fixture.segment).is_err());
+                assert_eq!(observed.state().unwrap(), OwnerDeletionState::Live);
+                drop(observed);
+                fs::remove_dir(&fixture.segment).unwrap();
+            }
+            #[cfg(not(windows))]
+            {
+                fs::remove_dir(&fixture.segment).unwrap();
+                assert!(observed.state().is_err());
+                drop(observed);
+            }
             fs::write(&fixture.segment, b"not directory").unwrap();
             assert!(
                 RetainedOwnerDeletion::open(

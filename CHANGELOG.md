@@ -12,6 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- on windows, links to saved output from a thinking run open again.
 - on windows, `solstone link join` can finish pairing and save connection settings.
 - on windows, you can preview an import again.
 - with confidential processing, older recordings and days waiting their turn no longer hold up new recordings and recent days. your journal works on one older item at a time, and newer work starts ahead of older work still waiting.
