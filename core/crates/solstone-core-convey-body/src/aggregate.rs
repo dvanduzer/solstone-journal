@@ -273,8 +273,9 @@ mod tests {
         let first = read_health_dedupe_stats(temporary.path()).unwrap().unwrap();
         let second = read_health_dedupe_stats(temporary.path()).unwrap().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        let connection =
-            Connection::open(temporary.path().join("imports/health-dedupe.sqlite")).unwrap();
+        let database_path = temporary.path().join("imports/health-dedupe.sqlite");
+        let modified = fs::metadata(&database_path).unwrap().modified().unwrap();
+        let connection = Connection::open(&database_path).unwrap();
         connection
             .execute(
                 "INSERT INTO health_dedupe VALUES ('synthetic-next', 'apple_health', 'synthetic_type', '2024-01-09T00:00:00Z')",
@@ -282,6 +283,16 @@ mod tests {
             )
             .unwrap();
         drop(connection);
+        // Make the signature change explicit even when native timestamps coalesce writes.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&database_path)
+            .unwrap();
+        file.set_times(
+            fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        drop(file);
         let changed = read_health_dedupe_stats(temporary.path()).unwrap().unwrap();
         assert_eq!(changed.total, 2);
         assert!(!Arc::ptr_eq(&first, &changed));
