@@ -822,14 +822,46 @@ mod tests {
         let claims = OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).unwrap();
         let input = InputObservation::capture(&claims, &raw).unwrap();
         let commit = input.commit(&claims).unwrap();
-        assert!(crate::relocate_segment(&relocation).is_err());
+        let held = SegmentMutation::acquire(&source.path, no_wait())
+            .err()
+            .unwrap();
+        assert_eq!(held.kind(), io::ErrorKind::WouldBlock);
+        let crate::RelocationRefusal::Failed(refused) =
+            crate::relocate_segment(&relocation).unwrap_err()
+        else {
+            panic!("held commit must refuse at segment exclusion");
+        };
+        assert_eq!(refused.to_string(), held.to_string());
         fs::write(raw.with_extension("jsonl"), b"current proof").unwrap();
         drop(commit);
+        for end in [&source, &target] {
+            drop(SegmentMutation::acquire(&end.path, no_wait()).unwrap());
+        }
+        #[cfg(windows)]
+        {
+            // Windows keeps the directory in place while its child handles remain open.
+            let crate::RelocationRefusal::Failed(refused) =
+                crate::relocate_segment(&relocation).unwrap_err()
+            else {
+                panic!("open child handles must refuse the directory pivot");
+            };
+            assert_ne!(refused.to_string(), held.to_string());
+            assert_eq!(fs::read(&raw).unwrap(), b"before");
+            assert_eq!(
+                fs::read(raw.with_extension("jsonl")).unwrap(),
+                b"current proof"
+            );
+            assert!(!destination.exists());
+            assert!(input.commit(&claims).is_ok());
+            drop(input);
+            drop(claims);
+        }
         crate::relocate_segment(&relocation).unwrap();
         assert_eq!(
             fs::read(destination.join("audio.jsonl")).unwrap(),
             b"current proof"
         );
+        #[cfg(not(windows))]
         assert!(input.commit(&claims).is_err());
         assert!(!segment.exists());
     }

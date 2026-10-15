@@ -317,6 +317,7 @@ mod tests {
                 format!("\n{{\"id\":\"kept\",\"custom\":true}}\n\n{bad}\n{{\"id\":\"last\"}}\n");
             for operation in 0..3 {
                 fs::write(&path, &original).unwrap();
+                let expected_path = fs::canonicalize(&path).unwrap();
                 let result = match operation {
                     0 => add_activity(root.path(), "work", serde_json::json!({"id":"new"}))
                         .map(|_| ()),
@@ -330,7 +331,7 @@ mod tests {
                         &error,
                         FacetWriteError::Read(FacetStoreError::MalformedActivityDefinition {
                             path: actual, line: 4, ..
-                        }) if actual == &path
+                        }) if actual == &expected_path
                     ),
                     "{error}"
                 );

@@ -2494,7 +2494,7 @@ mod claim_tests {
                         // Windows holds the admitted directory against replacement.
                         assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
                         assert!(directory.is_dir());
-                        claims.revalidate().unwrap();
+                        claims.commit(&directory).unwrap().revalidate().unwrap();
                         assert!(!destination.exists());
                         continue;
                     }
