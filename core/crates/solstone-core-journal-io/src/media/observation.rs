@@ -37,9 +37,25 @@ impl MediaDirectory {
     /// Two guarded complete walks. None means the limit was exceeded, never
     /// empty coverage. This does not freeze writers or mint destructive authority.
     pub fn entries(&self, maximum: usize) -> io::Result<Option<Vec<MediaEntry>>> {
+        self.listed(maximum, platform::entries)
+    }
+
+    /// `entries`, keeping UTF-8 names the portable rules refuse, such as old
+    /// logs named with a colon. A name that is not UTF-8 still refuses. Only
+    /// for an observer that classifies every name itself: such a name still
+    /// cannot be opened or read through this type.
+    pub fn entries_keeping_any_name(&self, maximum: usize) -> io::Result<Option<Vec<MediaEntry>>> {
+        self.listed(maximum, platform::entries_keeping_any_name)
+    }
+
+    fn listed(
+        &self,
+        maximum: usize,
+        list: fn(&platform::Directory, usize) -> io::Result<Option<Vec<MediaEntry>>>,
+    ) -> io::Result<Option<Vec<MediaEntry>>> {
         self.revalidate()?;
         let before = self.inner.stamp()?;
-        let Some(first) = platform::entries(&self.inner, maximum)? else {
+        let Some(first) = list(&self.inner, maximum)? else {
             self.revalidate()?;
             return Ok(None);
         };
@@ -48,7 +64,7 @@ impl MediaDirectory {
         if self.inner.stamp()? != before {
             return Err(changed());
         }
-        let Some(second) = platform::entries(&self.inner, maximum)? else {
+        let Some(second) = list(&self.inner, maximum)? else {
             return Err(changed());
         };
         self.revalidate()?;

@@ -478,8 +478,10 @@ impl<F: FnMut(Checkpoint, &Path)> Reader<F> {
         directory: &MediaDirectory,
         relative: &Path,
     ) -> Result<Vec<MediaEntry>, RecoveryObservationError> {
+        // The census classifies every name itself, so a UTF-8 name the portable
+        // rules refuse (old logs named with a colon) is not a refusal here.
         let entries = directory
-            .entries(self.limits.maximum(RecoveryBudget::DirectoryEntries))
+            .entries_keeping_any_name(self.limits.maximum(RecoveryBudget::DirectoryEntries))
             .map_err(|source| io_error(relative, source))?
             .ok_or_else(|| {
                 error(
@@ -1067,6 +1069,47 @@ mod tests {
         assert_eq!(
             fs::read(f.path("chronicle/20260101/020000_001/.hidden.flac")).unwrap(),
             b"raw"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_the_portable_rules_refuse_are_classified_not_refused() {
+        let f = Fixture::new();
+        f.directory("chronicle/20260101/health");
+        f.directory("health");
+        for file in [
+            "chronicle/20260101/health/12:00:00_think.log",
+            "chronicle/20260101/notes?.md",
+            "chronicle/old*.txt",
+            "health/run:1.log",
+            "trailing.",
+        ] {
+            fs::write(f.path(file), b"old").unwrap();
+        }
+        assert!(f.observed().unwrap().entries().is_empty());
+
+        f.directory("chronicle/20260101/health/.tmp-offload-a:b");
+        let held = f.observed().unwrap();
+        assert!(matches!(
+            held.entries(),
+            [NativeObligation::Stage { relative, .. }]
+                if relative == Path::new("chronicle/20260101/health/.tmp-offload-a:b")
+        ));
+
+        f.directory("chronicle/20260101/stream:1");
+        assert_eq!(
+            f.observed().unwrap_err().failure,
+            RecoveryObservationFailure::Io
+        );
+        fs::remove_dir(f.path("chronicle/20260101/stream:1")).unwrap();
+
+        use std::os::unix::ffi::OsStrExt;
+        let unreadable = std::ffi::OsStr::from_bytes(b"old\xff.log");
+        fs::write(f.path("chronicle/20260101/health").join(unreadable), b"old").unwrap();
+        assert_eq!(
+            f.observed().unwrap_err().failure,
+            RecoveryObservationFailure::Io
         );
     }
 
