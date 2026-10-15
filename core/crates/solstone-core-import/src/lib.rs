@@ -14,9 +14,11 @@ pub mod cli_render;
 pub mod connect;
 pub mod consent_gate;
 pub mod contract;
+pub mod creation;
 pub mod dedupe;
 pub mod detect;
 pub mod events;
+pub mod force_notice;
 pub mod heartbeat;
 pub mod metadata;
 pub mod projection;
@@ -36,6 +38,7 @@ pub mod timestamp;
 pub use allocate::{
     AllocatedImport, BoundImport, IMPORT_ID_PROBE_LIMIT, allocate_import_id, bind_import_record,
     remember_source_hash, source_timestamp_for_preview, stored_source_timestamp,
+    stored_source_timestamp_for_hash,
 };
 pub use connect::{OuraConnectOutcome, OuraConnectRequest, connect_oura};
 pub use consent_gate::{
@@ -47,6 +50,7 @@ pub use contract::{
     SaveRequest, SourceHash, SourceImmutabilityReport, SyncBackendRequest, SyncGuidance,
     SyncPreviewRequest, SyncSaveRequest, observe_source_immutability, should_write_manifest,
 };
+pub use creation::{decide, detect_creation, detect_creation_with_exif, exif_creation_candidates};
 pub use dedupe::{
     ImportManifestBackfillReport, ManifestMatch, ManifestScan, ManifestSkip, ManifestSkipReason,
     ManifestWriteRequest, backfill_retained_import_manifests, find_manifest_by_hash,
@@ -62,6 +66,7 @@ pub use events::{
     emit_file_imported, emit_importer_completed, emit_importer_error, emit_importer_started,
     emit_importer_status, emit_observe_observed, emit_observe_observing, emit_supervisor_drain,
 };
+pub use force_notice::{flush_force_notice, flush_force_notice_then, force_day_notice};
 pub use heartbeat::{HeartbeatExit, ImportHeartbeat};
 pub use metadata::{
     AttemptFacts, AttemptHolder, AttemptRead, AttemptState, IMPORT_FAILED_REASON,

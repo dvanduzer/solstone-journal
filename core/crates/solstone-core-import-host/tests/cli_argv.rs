@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, TimeZone};
 use serde_json::Value;
 use solstone_core_callosum::CallosumSocketServer;
 use solstone_core_import::cli_render::CliRun;
@@ -202,18 +202,25 @@ fn generic_text_v1_transcript_takes_its_times_from_the_file_with_no_model() {
         .collect()
     };
     let first = rows("100000_300");
+    let source_ms = solstone_core_journal_config::owner_zone(journal.path())
+        .from_local_datetime(
+            &NaiveDateTime::parse_from_str("20260818_100000", "%Y%m%d_%H%M%S").unwrap(),
+        )
+        .earliest()
+        .unwrap()
+        .timestamp_millis();
     assert_eq!(
         first[1..],
         [
-            serde_json::json!({"start": "00:00:00", "text": "# Planning sync", "source": "import"}),
-            serde_json::json!({"start": "00:00:00", "speaker": "Ana Lima", "text": "Let's begin.", "source": "import"}),
+            serde_json::json!({"start": "00:00:00", "source_ms":source_ms, "text": "# Planning sync", "source": "import"}),
+            serde_json::json!({"start": "00:00:00", "source_ms":source_ms, "speaker": "Ana Lima", "text": "Let's begin.", "source": "import"}),
         ]
     );
     let second = rows("100500_300");
     assert_eq!(
         second[1..],
         [
-            serde_json::json!({"start": "00:02:30", "speaker": "Ben Okafor", "text": "The file keeps  my words.", "source": "import"})
+            serde_json::json!({"start": "00:02:30", "source_ms":source_ms + 450_000, "speaker": "Ben Okafor", "text": "The file keeps  my words.", "source": "import"})
         ]
     );
 }
@@ -264,7 +271,8 @@ fn missing_timestamp_guidance_is_not_success() {
     );
     assert_eq!(result.exit_code, 1, "stdout={}", result.stdout);
     assert!(
-        result.stderr.contains("detected timestamp") && result.stderr.contains("or --auto"),
+        result.stderr.contains("Could not detect timestamp")
+            && result.stderr.contains("--timestamp"),
         "stderr={}",
         result.stderr
     );
@@ -305,6 +313,7 @@ fn production_audio_import_runtime_waits_on_a_bound_callosum_socket() {
     let journal = temporary.path().join("journal");
     fs::create_dir_all(journal.join("health")).unwrap();
     let request = AudioImportRequest {
+        source_instant: None,
         source_media: temporary.path().join("source.m4a"),
         journal_root: journal.clone(),
         day: "20260811".to_owned(),
@@ -400,6 +409,7 @@ fn run_wait_cli(wait: ProcessingWaitFn) -> CliRun {
     let journal = temporary.path().join("journal");
     fs::create_dir_all(journal.join("health")).unwrap();
     let request = AudioImportRequest {
+        source_instant: None,
         source_media: temporary.path().join("source.m4a"),
         journal_root: journal,
         day: "20260811".to_owned(),
@@ -653,6 +663,7 @@ fn place_audio(
 ) -> Result<(), ImportError> {
     let runtime = audio_import_runtime().expect("audio import runtime");
     let request = AudioImportRequest {
+        source_instant: None,
         source_media: source.to_path_buf(),
         journal_root: journal.to_path_buf(),
         day: source_stamp[..8].to_owned(),
@@ -756,6 +767,7 @@ fn wait_success_still_reports_complete() {
     let journal = temporary.path().join("journal");
     fs::create_dir_all(journal.join("health")).unwrap();
     let request = AudioImportRequest {
+        source_instant: None,
         source_media: temporary.path().join("source.m4a"),
         journal_root: journal,
         day: "20260811".to_owned(),
@@ -801,6 +813,7 @@ fn partial_remux_without_failed_or_stalled_wait_still_succeeds() {
     let journal = temporary.path().join("journal");
     fs::create_dir_all(journal.join("health")).unwrap();
     let request = AudioImportRequest {
+        source_instant: None,
         source_media: temporary.path().join("source.m4a"),
         journal_root: journal,
         day: "20260811".to_owned(),

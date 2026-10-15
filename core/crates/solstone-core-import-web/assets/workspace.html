@@ -939,11 +939,13 @@ function duplicateNoticeText(duplicate = {}, inProgress = false) {
 function showDetect(res) {
   invalidateImportPreview('quick');
   window._quickSaved = res;
-  document.getElementById('timestampInput').value = res.timestamp || '';
+  document.getElementById('timestampInput').value = res.source_timestamp || res.timestamp || '';
   document.getElementById('savedPath').value = res.path;
   const duplicateNotice = document.getElementById('detectDuplicateNotice');
   if (duplicateNotice) {
-    duplicateNotice.innerHTML = '';
+    duplicateNotice.textContent = ['upload_fallback', 'path_fallback'].includes(res.diagnostics?.timestamp_detection_method)
+      ? 'no creation date was found in this file. choose its date, or keep the upload date.'
+      : res.diagnostics?.timestamp_detection_method === 'document_dates' ? 'this PDF uses its own dates. you can choose a date for this file.' : '';
   }
   startBtn.style.display = '';
   startBtn.disabled = false;
@@ -2040,6 +2042,7 @@ async function prepareImportPreview(kind, payload, setting, button) {
     panel.textContent = `${size.recordings} ${size.recordings === 1 ? 'recording' : 'recordings'} across ${size.days} ${size.days === 1 ? 'day' : 'days'}`;
     if (size.other_units) panel.textContent += ` · ${size.other_units[1]} ${size.other_units[0]}`;
     if (size.skipped) panel.textContent += ` · ${size.skipped} skipped`;
+    if (data.force_notice) panel.textContent += ` · ${data.force_notice}`;
     if (!ready) panel.textContent += ' · nothing to import';
   }
   restoreImportButton(kind, button);
@@ -2371,7 +2374,8 @@ startBtn.addEventListener('click', async () => {
     }
 
     if (revision !== previewRevisions.quick) return;
-    const payload = { path, timestamp: ts, import_id: window._quickSaved?.timestamp };
+    const payload = { path, timestamp: ts, import_id: window._quickSaved?.timestamp,
+      timestamp_override: ts !== (window._quickSaved?.source_timestamp || window._quickSaved?.timestamp) };
     const previewToken = await prepareImportPreview('quick', payload, setting, startBtn);
     preparedPreview = !previewToken && revision === previewRevisions.quick && Boolean(importPreviews.quick?.ready);
     if (!previewToken || revision !== previewRevisions.quick) return;

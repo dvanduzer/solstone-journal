@@ -59,6 +59,8 @@ fn input(root: &Path, data: &Value) -> Result<Input, String> {
     }
     let options = json!({
         "timestamp": timestamp,
+        "timestamp_override": crate::lifecycle::owner_timestamp_choice(data, &metadata).is_some(),
+        "resolved_timestamp": data.get("resolved_timestamp").and_then(Value::as_str),
         "force": data.get("force").and_then(Value::as_bool).unwrap_or(false),
         "source": source_hint(&metadata),
         "setting": metadata.get("setting"),
@@ -103,6 +105,9 @@ async fn plan_using(
 ) -> Result<Value, String> {
     let mut metadata = metadata.clone();
     metadata.remove("preview");
+    if options["timestamp_override"].as_bool().unwrap_or(false) {
+        metadata.insert("owner_timestamp".to_owned(), options["timestamp"].clone());
+    }
     let path = path.to_str().ok_or("the source path is not UTF-8")?;
     // Start imports an image or document by the kind it was saved as, with or without a source
     // hint. The planner only recognizes those kinds when told, so it is told the same kind.
@@ -185,7 +190,32 @@ async fn create_preview(root: PathBuf, data: Value, program: &Path) -> Result<Va
     let token = format!("{:x}", Sha256::digest(record.to_string().as_bytes()));
     let mut record = record;
     record["token"] = json!(token);
-    let response = json!({"preview_token": token, "import_id": input.id, "size": size});
+    let notice = if input.options["force"].as_bool() == Some(true) {
+        let previous = input
+            .metadata
+            .get("source_timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or(&input.id);
+        let planned = input.options["timestamp"]
+            .as_str()
+            .ok_or("missing timestamp")?;
+        let fresh = input.options["resolved_timestamp"]
+            .as_str()
+            .unwrap_or(planned);
+        match (
+            solstone_core_import::validate_timestamp(fresh),
+            solstone_core_import::validate_timestamp(previous),
+            solstone_core_import::validate_timestamp(planned),
+        ) {
+            (Ok(fresh), Ok(previous), Ok(planned)) => {
+                solstone_core_import::force_day_notice(&fresh, &previous, &planned)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let response = json!({"preview_token": token, "import_id": input.id, "size": size, "force_notice": notice});
     tokio::task::spawn_blocking(move || {
         let mut metadata =
             read_import_metadata(&root, &input.id).map_err(|error| error.to_string())?;

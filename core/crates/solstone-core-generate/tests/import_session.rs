@@ -258,6 +258,7 @@ fn oracle_13_one_child_and_same_branches() {
         None,
         None,
         &wire,
+        None,
     );
     let TextImportOutcome::Success(work) = outcome else {
         panic!("expected success outcome");
@@ -293,6 +294,7 @@ fn oracle_13_one_child_and_same_branches() {
         None,
         None,
         &oneshot_wire,
+        None,
     );
     let TextImportOutcome::Success(work_oneshot) = outcome_oneshot else {
         panic!("expected oneshot success");
@@ -328,6 +330,7 @@ fn oracle_13_one_child_and_same_branches() {
         None,
         None,
         &wire_refuse_session,
+        None,
     );
     let TextImportOutcome::Success(work_refuse_session) = outcome_refuse_session else {
         panic!("expected success on refuse segment");
@@ -352,6 +355,7 @@ fn oracle_13_one_child_and_same_branches() {
         None,
         None,
         &wire_refuse_oneshot,
+        None,
     );
     let TextImportOutcome::Success(work_refuse_oneshot) = outcome_refuse_oneshot else {
         panic!("expected success on oneshot refuse segment");
@@ -393,6 +397,7 @@ fn oracle_13_one_child_and_same_branches() {
         None,
         None,
         &sibling_wire,
+        None,
     );
     assert!(matches!(outcome_sibling, TextImportOutcome::Success(_)));
 
@@ -410,6 +415,7 @@ fn oracle_13_one_child_and_same_branches() {
         None,
         None,
         &missing_wire,
+        None,
     );
     // A model that cannot start changes nothing the file carries: the import lands.
     let TextImportOutcome::Success(work_missing) = outcome_missing else {
@@ -473,6 +479,7 @@ fn oracle_13_one_child_and_same_branches() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let pub_ops = FakePublication;
     let doc_result = import_document(doc_req, &worker, &doc_model, &pub_ops);
@@ -534,6 +541,7 @@ fn oracle_13_one_child_and_same_branches() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let doc_result_oneshot = import_document(
         doc_req_oneshot,
@@ -585,6 +593,7 @@ fn oracle_13_one_child_and_same_branches() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let doc_res_missing = import_document(
         doc_req_missing,
@@ -642,6 +651,7 @@ fn oracle_13_one_child_and_same_branches() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let doc_res_refused = import_document(
         doc_req_refused,
@@ -698,6 +708,7 @@ fn oracle_14_resubmit_once() {
         None,
         None,
         &wire,
+        None,
     );
     assert!(matches!(outcome, TextImportOutcome::Success(_)));
 
@@ -751,6 +762,7 @@ fn oracle_14_resubmit_once() {
         None,
         None,
         &wire_always,
+        None,
     );
     assert!(matches!(outcome_always, TextImportOutcome::Success(_)));
     let reqs_always_log = read_request_log(&reqs_always);
@@ -786,6 +798,7 @@ fn oracle_14_resubmit_once() {
         None,
         None,
         &wire_refuse,
+        None,
     );
     let reqs_refuse_log = read_request_log(&reqs_refuse);
     assert_eq!(
@@ -841,6 +854,7 @@ fn oracle_14_resubmit_once() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let pub_ops = FakePublication;
     let doc_result = import_document(doc_req, &worker, &doc_model, &pub_ops);
@@ -923,6 +937,7 @@ fn oracle_14_resubmit_once() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let doc_res_always =
         import_document(doc_req_always, &worker_always, &doc_model_always, &pub_ops);
@@ -990,6 +1005,7 @@ fn oracle_14_resubmit_once() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let doc_res_ref = import_document(doc_req_ref, &worker_ref, &doc_model_ref, &pub_ops);
     let doc_reqs_ref_log = read_request_log(&doc_reqs_ref);
@@ -1074,6 +1090,7 @@ fn oracle_15_child_death_respawns_later() {
         None,
         None,
         &wire,
+        None,
     );
     assert!(matches!(outcome2, TextImportOutcome::Success(_)));
     let pid2 = read_pid_file(&pid_path);
@@ -1136,6 +1153,7 @@ fn oracle_15_child_death_respawns_later() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let pub_ops = FakePublication;
     let _ = import_document(doc_req1, &worker1, &doc_model, &pub_ops);
@@ -1174,6 +1192,7 @@ fn oracle_15_child_death_respawns_later() {
         password: None,
         force: false,
         now: SystemTime::now(),
+        owner_timestamp: None,
     };
     let doc_res2 = import_document(doc_req2, &worker2, &doc_model, &pub_ops);
     assert_eq!(doc_res2.entries_written, 1);

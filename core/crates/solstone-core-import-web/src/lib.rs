@@ -33,8 +33,6 @@ pub(crate) struct AppState {
     root: PathBuf,
 }
 
-pub use lifecycle::{MetadataCommandOutcome, MetadataCommandPlan, run_metadata_command};
-
 pub fn routes(journal_root: PathBuf) -> Router {
     lifecycle::sweep_abandoned_strava_uploads(&journal_root);
     Router::new()

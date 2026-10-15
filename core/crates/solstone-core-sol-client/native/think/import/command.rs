@@ -372,6 +372,11 @@ fn start_import(
     let timestamp = parsed
         .timestamp
         .as_deref()
+        .or_else(|| {
+            save_response
+                .get("source_timestamp")
+                .and_then(Value::as_str)
+        })
         .or_else(|| save_response.get("timestamp").and_then(Value::as_str))
         .filter(|value| !value.is_empty())
         .ok_or(ImportError::Malformed)?;
@@ -379,7 +384,8 @@ fn start_import(
         .get("timestamp")
         .and_then(Value::as_str)
         .ok_or(ImportError::Malformed)?;
-    let mut payload = json!({ "path": path, "timestamp": timestamp, "import_id": import_id, "force": parsed.force });
+    let mut payload = json!({ "path": path, "timestamp": timestamp, "import_id": import_id, "force": parsed.force,
+        "timestamp_override": parsed.timestamp.is_some(), "resolved_timestamp": save_response.get("resolved_timestamp") });
     let preview = decode_object(
         ctx.transport
             .request(ApiRequest {
@@ -402,6 +408,12 @@ fn start_import(
     }
     if parsed.dry_run {
         return Ok(preview);
+    }
+    if let Some(notice) = preview.get("force_notice").and_then(Value::as_str) {
+        announce(notice, parsed.json).map_err(|error| ImportError::Client {
+            error: format!("could not show import day notice: {error}"),
+            detail: None,
+        })?;
     }
     announce(&format_size(&preview), parsed.json).map_err(|error| ImportError::Client {
         error: format!("could not show import size: {error}"),
@@ -701,7 +713,7 @@ mod tests {
                     path: format!("{IMPORT_API}/preview"),
                     params: vec![],
                     json: Some(
-                        json!({"path":"/staged/notes.txt","timestamp":"20261011_120000","import_id":"20261011_120000","force":false}),
+                        json!({"path":"/staged/notes.txt","timestamp":"20261011_120000","import_id":"20261011_120000","force":false,"timestamp_override":false,"resolved_timestamp":null}),
                     ),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -805,7 +817,7 @@ mod tests {
                         "path": "/staged/imports/20260101_120000/sample.txt",
                         "timestamp": "20260101_120000",
                         "import_id": "20260101_120000",
-                        "force": true,
+                        "force": true, "timestamp_override": false, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -825,7 +837,7 @@ mod tests {
                         "timestamp": "20260101_120000",
                         "import_id": "20260101_120000",
                         "preview_token": "preview-1",
-                        "force": true,
+                        "force": true, "timestamp_override": false, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -896,7 +908,7 @@ mod tests {
                         "path": "/staged/imports/20260101_130000/source-dir",
                         "timestamp": "20260202_030405",
                         "import_id": "20260101_130000",
-                        "force": false,
+                        "force": false, "timestamp_override": true, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -916,7 +928,7 @@ mod tests {
                         "timestamp": "20260202_030405",
                         "import_id": "20260101_130000",
                         "preview_token": "preview-1",
-                        "force": false,
+                        "force": false, "timestamp_override": true, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -982,7 +994,7 @@ mod tests {
                         "path": "/staged/imports/20260101_140000/media.txt",
                         "timestamp": "20260101_140000",
                         "import_id": "20260101_140000",
-                        "force": false,
+                        "force": false, "timestamp_override": false, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -1002,7 +1014,7 @@ mod tests {
                         "timestamp": "20260101_140000",
                         "import_id": "20260101_140000",
                         "preview_token": "preview-1",
-                        "force": false,
+                        "force": false, "timestamp_override": false, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -1220,7 +1232,7 @@ mod tests {
                         "path": "/staged/imports/20260101_160000/media.txt",
                         "timestamp": "20260101_160000",
                         "import_id": "20260101_160000",
-                        "force": false,
+                        "force": false, "timestamp_override": false, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,
@@ -1240,7 +1252,7 @@ mod tests {
                         "timestamp": "20260101_160000",
                         "import_id": "20260101_160000",
                         "preview_token": "preview-1",
-                        "force": false,
+                        "force": false, "timestamp_override": false, "resolved_timestamp": null,
                     })),
                     headers: vec![],
                     policy: TimeoutPolicy::Upload,

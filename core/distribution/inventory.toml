@@ -568,10 +568,6 @@ bin = "solstone-generate-session-stub"
 reason = "test stub; never ship"
 
 [[deny]]
-bin = "solstone-import-web-metadata-stub"
-reason = "test stub; never ship"
-
-[[deny]]
 bin = "solstone-core-generate-session-kill-helper"
 reason = "test helper; never ship"
 

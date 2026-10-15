@@ -13,7 +13,7 @@ use solstone_core_callosum::{CallosumEnvelope, CallosumOneShotSender};
 use solstone_core_import::cli_render::CliRun;
 use solstone_core_import::publish::NativePublicationOperations;
 use solstone_core_import::{
-    AttemptFacts, AttemptState, ImportError, ImportResult, RegistrySource, cli_render,
+    AttemptFacts, AttemptState, BoundImport, ImportError, ImportResult, RegistrySource, cli_render,
 };
 use solstone_core_import_host::cli_argv::RegistryDispatch;
 use solstone_core_import_host::import_publication::{
@@ -125,9 +125,14 @@ fn preview_size(
         return save::preview_size(journal, &rendered);
     }
     match dispatch.source {
-        RegistrySource::Image => {
-            image::preview_size(&dispatch.media, journal, zone).map_err(|error| error.to_string())
-        }
+        RegistrySource::Image => image::preview_size(
+            &dispatch.media,
+            journal,
+            zone,
+            dispatch.owner_timestamp.as_deref(),
+            dispatch.fallback_timestamp.as_deref(),
+        )
+        .map_err(|error| error.to_string()),
         RegistrySource::JournalArchive => {
             solstone_core_import_sources::archive::preview_size(&dispatch.media, journal)
                 .map_err(|error| error.to_string())
@@ -144,6 +149,7 @@ fn preview_size(
                     password: None,
                     now: SystemTime::now(),
                     zone,
+                    owner_timestamp: dispatch.owner_timestamp.as_deref(),
                 },
                 journal,
                 dispatch.force,
@@ -186,7 +192,7 @@ fn preview_size(
     }
 }
 
-fn bind_dispatch(journal: &Path, dispatch: &RegistryDispatch) -> Result<String, String> {
+fn bind_dispatch(journal: &Path, dispatch: &RegistryDispatch) -> Result<BoundImport, String> {
     let requested = solstone_core_import::validate_timestamp(&dispatch.timestamp)
         .map_err(|error| error.to_string())?;
     // An archive timestamp is the attempt id. A second run of that id, including
@@ -196,26 +202,24 @@ fn bind_dispatch(journal: &Path, dispatch: &RegistryDispatch) -> Result<String, 
             .map_err(|error| error.to_string())?
             .is_some()
     {
-        return Ok(requested.as_str().to_owned());
+        return Ok(BoundImport {
+            import_id: requested.clone(),
+            source_timestamp: requested,
+        });
     }
-    let bound = solstone_core_import::bind_import_record(
-        journal,
-        &requested,
-        Some(dispatch.media.as_path()),
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(bound.import_id.as_str().to_owned())
+    solstone_core_import::bind_import_record(journal, &requested, Some(dispatch.media.as_path()))
+        .map_err(|error| error.to_string())
 }
 
 fn claim_dispatch_id(
     journal: &Path,
     dispatch: &mut RegistryDispatch,
     selected: &mut Option<String>,
-) -> Result<(), String> {
-    let import_id = bind_dispatch(journal, dispatch)?;
-    dispatch.timestamp = import_id.clone();
-    *selected = Some(import_id);
-    Ok(())
+) -> Result<BoundImport, String> {
+    let bound = bind_dispatch(journal, dispatch)?;
+    dispatch.timestamp = bound.import_id.as_str().to_owned();
+    *selected = Some(bound.import_id.as_str().to_owned());
+    Ok(bound)
 }
 
 /// Record in awareness that `import_id` finished during this invocation, so Home
@@ -444,6 +448,8 @@ fn cli_producer_request<'a>(
         source: dispatch.source,
         revision: None,
         password: None,
+        owner_timestamp: dispatch.owner_timestamp.as_deref(),
+        fallback_timestamp: dispatch.fallback_timestamp.as_deref(),
         force: dispatch.force,
         expected_generation: Some(generation),
         heartbeat_interval: None,
@@ -554,12 +560,15 @@ fn run_image(
     journal: &Path,
     selected: &mut Option<String>,
 ) -> CliRun {
-    if let Err(error) = claim_dispatch_id(journal, &mut dispatch, selected) {
-        return failure(format!(
-            "{} import failed: {error}\n",
-            dispatch.source.name()
-        ));
-    }
+    let bound = match claim_dispatch_id(journal, &mut dispatch, selected) {
+        Ok(bound) => bound,
+        Err(error) => {
+            return failure(format!(
+                "{} import failed: {error}\n",
+                dispatch.source.name()
+            ));
+        }
+    };
     if let Some(refused) = refuse_if_live_running(journal, &dispatch.timestamp, dispatch.source) {
         return refused;
     }
@@ -579,7 +588,9 @@ fn run_image(
         }
     };
     let wire = image::SystemWireClient;
-    let req = cli_producer_request(journal, &dispatch, facts.generation);
+    let mut req = cli_producer_request(journal, &dispatch, facts.generation);
+    req.owner_timestamp = Some(bound.source_timestamp.as_str());
+    req.fallback_timestamp = None;
     let outcome = match solstone_core_import_sources::run_native_producer(
         req,
         &wire,
@@ -1337,6 +1348,8 @@ mod tests {
             dry_run: false,
             json: false,
             force: false,
+            owner_timestamp: None,
+            fallback_timestamp: None,
         }
     }
 
@@ -1684,6 +1697,8 @@ mod tests {
             dry_run: false,
             json: false,
             force: false,
+            owner_timestamp: None,
+            fallback_timestamp: None,
         }
     }
 
@@ -2384,6 +2399,8 @@ mod tests {
             dry_run: false,
             json: false,
             force: false,
+            owner_timestamp: None,
+            fallback_timestamp: None,
         };
         let req = cli_producer_request(root, &dispatch, 1);
         assert_eq!(req.heartbeat_interval, None);
@@ -2753,6 +2770,8 @@ mod tests {
             dry_run: false,
             json: false,
             force: false,
+            owner_timestamp: None,
+            fallback_timestamp: None,
         };
 
         // Run 1
@@ -2896,6 +2915,8 @@ mod tests {
             dry_run: false,
             json: false,
             force: false,
+            owner_timestamp: None,
+            fallback_timestamp: None,
         }
     }
 

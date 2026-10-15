@@ -48,6 +48,7 @@ pub struct AudioImportRequest {
     pub journal_root: PathBuf,
     pub day: String,
     pub base_timestamp: NaiveDateTime,
+    pub source_instant: Option<chrono::DateTime<chrono::Utc>>,
     pub import_id: String,
     pub stream: String,
     pub facet: Option<String>,
@@ -688,9 +689,10 @@ fn chunk_start(request: &AudioImportRequest, index: u64) -> Result<NaiveDateTime
     let zone = solstone_core_journal_config::owner_zone(&request.journal_root);
     // A timestamp without an offset chooses the first occurrence of a repeated
     // local clock. Elapsed audio time then crosses DST in the owner's zone.
-    let start = zone
-        .from_local_datetime(&request.base_timestamp)
-        .earliest()
+    let start = request
+        .source_instant
+        .map(|instant| instant.with_timezone(&zone))
+        .or_else(|| zone.from_local_datetime(&request.base_timestamp).earliest())
         .ok_or_else(|| ImportError::AudioInputUnreadable {
             path: request.source_media.clone(),
             detail: "the import start time does not exist in your time zone".to_owned(),

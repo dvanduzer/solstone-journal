@@ -33,6 +33,7 @@ pub(crate) fn probed(duration_seconds: f64) -> AudioSourceProbe {
 
 fn request(temp: &TempDir, import_id: &str) -> AudioImportRequest {
     AudioImportRequest {
+        source_instant: None,
         source_media: temp.path().join("source.m4a"),
         journal_root: temp.path().join("journal"),
         day: "20260811".to_owned(),
@@ -1807,4 +1808,50 @@ fn preview_refuses_a_nonexistent_local_audio_start() {
     )
     .unwrap();
     assert!(solstone_core_import_host::audio::preview_with_probe(&req, probed(1.0)).is_err());
+}
+
+#[tokio::test]
+async fn utc_metadata_keeps_the_second_repeated_hour_for_audio_chunks() {
+    let temp = TempDir::new().unwrap();
+    let mut req = request(&temp, "20261101_015800");
+    req.base_timestamp = NaiveDateTime::parse_from_str("20261101_015800", "%Y%m%d_%H%M%S").unwrap();
+    req.day = "20261101".into();
+    fs::create_dir_all(req.journal_root.join("config")).unwrap();
+    fs::write(
+        req.journal_root.join("config/journal.json"),
+        br#"{"identity":{"timezone":"America/Denver"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &req.source_media,
+        include_bytes!("../../solstone-core-import/tests/fixtures/creation-fold.m4a"),
+    )
+    .unwrap();
+    let stamp =
+        solstone_core_import::detect_creation(&req.source_media, None, chrono_tz::America::Denver)
+            .unwrap();
+    req.source_instant = stamp.source_instant();
+    let preview =
+        solstone_core_import_host::audio::preview_with_probe(&req, probed(301.0)).unwrap();
+    let expected = ["015800_300", "020300_1"];
+    assert_eq!(
+        preview
+            .recordings
+            .iter()
+            .map(|row| row.segment.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let saved = fake_import(req, 301.0, None, Rc::new(RefCell::new(Vec::new())))
+        .await
+        .unwrap();
+    assert_eq!(
+        saved
+            .created()
+            .segments
+            .iter()
+            .map(|row| row.segment.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
 }

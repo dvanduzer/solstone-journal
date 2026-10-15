@@ -22,7 +22,7 @@ use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use image::ImageFormat;
 use serde::{Deserialize, Serialize};
@@ -805,6 +805,7 @@ pub struct DocumentPreviewRequest<'a> {
     pub now: SystemTime,
     /// The owner zone the preview's days are read in.
     pub zone: Tz,
+    pub owner_timestamp: Option<&'a str>,
 }
 
 pub struct DocumentImportRequest<'a> {
@@ -816,6 +817,7 @@ pub struct DocumentImportRequest<'a> {
     pub password: Option<&'a str>,
     pub force: bool,
     pub now: SystemTime,
+    pub owner_timestamp: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -869,6 +871,7 @@ pub fn preview(request: DocumentPreviewRequest<'_>, worker: &dyn PdfWorker) -> I
             summary: "No PDF documents found".to_owned(),
         };
     }
+    let single_file = !request.source.is_dir();
     let mut dates = Vec::new();
     let mut page_count = 0usize;
     let mut failures = Vec::new();
@@ -880,7 +883,17 @@ pub fn preview(request: DocumentPreviewRequest<'_>, worker: &dyn PdfWorker) -> I
             None,
         )) {
             Ok(payload) => {
-                dates.push(claim_timestamp(&payload, source, request.now).timestamp);
+                dates.push(
+                    claim_timestamp(
+                        &payload,
+                        source,
+                        request.now,
+                        request.zone,
+                        request.owner_timestamp,
+                        single_file,
+                    )
+                    .timestamp,
+                );
                 page_count += payload.page_count;
             }
             Err(failure) => failures.push(owner_message(source, &failure)),
@@ -919,6 +932,7 @@ pub fn preview_size(
     force: bool,
     worker: &dyn PdfWorker,
 ) -> Result<solstone_core_import::size::ImportSize, String> {
+    validate_owner_time(request.source, request.owner_timestamp, request.zone)?;
     let pdfs = find_pdfs(request.source);
     if pdfs.is_empty() {
         return Err("no PDF documents found".to_owned());
@@ -946,7 +960,14 @@ pub fn preview_size(
         } else {
             &payload.sha256
         };
-        let timestamp = claim_timestamp(&payload, &source, request.now);
+        let timestamp = claim_timestamp(
+            &payload,
+            &source,
+            request.now,
+            request.zone,
+            request.owner_timestamp,
+            !request.source.is_dir(),
+        );
         let claim = allocate_segment(
             journal,
             request.zone,
@@ -1007,6 +1028,15 @@ pub fn prepare_document_import(
     model: &dyn DocumentModelClient,
 ) -> PreparedDocumentImport {
     let zone = solstone_core_journal_config::owner_zone(request.journal_root);
+    if let Err(error) = validate_owner_time(request.source, request.owner_timestamp, zone) {
+        return PreparedDocumentImport {
+            items: Vec::new(),
+            errors: vec![error.clone()],
+            hard_failures: vec![error],
+            timestamps: Vec::new(),
+            _render_dirs: Vec::new(),
+        };
+    }
     let pdfs = find_pdfs(request.source);
     if pdfs.is_empty() {
         return PreparedDocumentImport {
@@ -1050,7 +1080,14 @@ pub fn prepare_document_import(
                 continue;
             }
         };
-        let timestamp = claim_timestamp(&first, source, request.now);
+        let timestamp = claim_timestamp(
+            &first,
+            source,
+            request.now,
+            zone,
+            request.owner_timestamp,
+            !request.source.is_dir(),
+        );
         let claim = match claim_segment(
             request.journal_root,
             zone,
@@ -1404,7 +1441,79 @@ struct TimestampChoice {
     source: &'static str,
 }
 
-fn claim_timestamp(payload: &PdfPayload, source: &Path, now: SystemTime) -> TimestampChoice {
+fn validate_owner_time(source: &Path, owner: Option<&str>, zone: Tz) -> Result<(), String> {
+    if source.is_file()
+        && let Some(owner) = owner
+    {
+        solstone_core_import::validate_timestamp(owner).map_err(|error| error.to_string())?;
+        if owner_wall_to_system_time(owner, zone).is_none() {
+            return Err(
+                "that date and time does not exist in your time zone; choose another time"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn owner_wall_to_system_time(stamp_str: &str, zone: Tz) -> Option<SystemTime> {
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp_str, "%Y%m%d_%H%M%S").ok()?;
+    match zone.from_local_datetime(&naive) {
+        chrono::offset::LocalResult::Single(dt) => Some(SystemTime::from(dt)),
+        chrono::offset::LocalResult::Ambiguous(earliest, _) => Some(SystemTime::from(earliest)),
+        chrono::offset::LocalResult::None => None,
+    }
+}
+
+fn claim_timestamp(
+    payload: &PdfPayload,
+    source: &Path,
+    now: SystemTime,
+    zone: Tz,
+    owner_timestamp: Option<&str>,
+    single_file: bool,
+) -> TimestampChoice {
+    if single_file
+        && let Some(owner) = owner_timestamp
+        && let Ok(ts) = solstone_core_import::validate_timestamp(owner)
+        && let Some(timestamp) = owner_wall_to_system_time(ts.as_str(), zone)
+    {
+        return TimestampChoice {
+            timestamp,
+            source: "owner",
+        };
+    }
+
+    let filename = source.file_name().and_then(|name| name.to_str());
+    if single_file
+        && let Some(filename_stamp) = solstone_core_import::detect_creation(source, filename, zone)
+    {
+        let credible_creation = payload
+            .metadata
+            .creation_date
+            .as_deref()
+            .and_then(parse_metadata_date)
+            .filter(|timestamp| timestamp_in_window(*timestamp, now));
+        let conflicts = if let Some(creation_time) = credible_creation {
+            let creation_wall = DateTime::<Utc>::from(creation_time)
+                .with_timezone(&zone)
+                .format("%Y%m%d_%H%M%S")
+                .to_string();
+            filename_stamp.as_str() != creation_wall
+        } else {
+            false
+        };
+
+        if !conflicts
+            && let Some(timestamp) = owner_wall_to_system_time(filename_stamp.as_str(), zone)
+        {
+            return TimestampChoice {
+                timestamp,
+                source: "filename",
+            };
+        }
+    }
+
     for date in [&payload.metadata.mod_date, &payload.metadata.creation_date] {
         if let Some(timestamp) = date
             .as_deref()

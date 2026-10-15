@@ -254,10 +254,19 @@ pub fn process_transcript(
     stream: &str,
     facet: Option<&str>,
     setting: Option<&str>,
+    source_instant: Option<DateTime<Utc>>,
 ) -> TextImportOutcome {
     let wire = SystemWireClient::sibling();
     let outcome = process_transcript_with_wire(
-        path, day_dir, start_time, import_id, stream, facet, setting, &wire,
+        path,
+        day_dir,
+        start_time,
+        import_id,
+        stream,
+        facet,
+        setting,
+        &wire,
+        source_instant,
     );
     wire.finish();
     outcome
@@ -276,9 +285,18 @@ pub fn process_transcript_with_wire(
     facet: Option<&str>,
     setting: Option<&str>,
     wire: &dyn WireClient,
+    source_instant: Option<DateTime<Utc>>,
 ) -> TextImportOutcome {
     match import(
-        path, day_dir, start_time, import_id, stream, facet, setting, wire,
+        path,
+        day_dir,
+        start_time,
+        import_id,
+        stream,
+        facet,
+        setting,
+        wire,
+        source_instant,
     ) {
         Ok(work) => TextImportOutcome::Success(work),
         Err((created, error)) => TextImportOutcome::Failed {
@@ -303,6 +321,7 @@ fn import(
     facet: Option<&str>,
     setting: Option<&str>,
     wire: &dyn WireClient,
+    source_instant: Option<DateTime<Utc>>,
 ) -> ImportResult {
     let early = |error| (Vec::new(), error);
     let text = read_transcript(path).map_err(early)?;
@@ -325,7 +344,8 @@ fn import(
     let mut model_available = true;
     let mut created = Vec::new();
 
-    let (planned, untimed) = plan_tiles(&text, day_dir, start_time, stream).map_err(early)?;
+    let (planned, untimed) =
+        plan_tiles(&text, day_dir, start_time, stream, source_instant).map_err(early)?;
     for tile_plan in planned {
         let tile_plan = tile_plan.map_err(|error| (created.clone(), error))?;
         let PlannedTile {
@@ -476,9 +496,10 @@ pub fn preview(
     day_dir: &Path,
     start_time: &str,
     stream: &str,
+    source_instant: Option<DateTime<Utc>>,
 ) -> Result<crate::size::ImportSize, TextImportError> {
     let text = read_transcript(path)?;
-    let (planned, _) = plan_tiles(&text, day_dir, start_time, stream)?;
+    let (planned, _) = plan_tiles(&text, day_dir, start_time, stream, source_instant)?;
     Ok(crate::size::ImportSize {
         recordings: planned
             .into_iter()
@@ -507,6 +528,7 @@ fn plan_tiles(
     day_dir: &Path,
     start_time: &str,
     stream: &str,
+    source_instant: Option<DateTime<Utc>>,
 ) -> Result<(Vec<Result<PlannedTile, TextImportError>>, bool), TextImportError> {
     let (journal_root, day) = journal_marker_context(day_dir)?;
     let zone = solstone_core_journal_config::owner_zone(journal_root);
@@ -564,14 +586,16 @@ fn plan_tiles(
         let naive_time =
             NaiveTime::from_num_seconds_from_midnight_opt(start_seconds as u32, 0).unwrap();
         let naive = day_date.and_time(naive_time);
-        let anchor = zone
-            .from_local_datetime(&naive)
-            .earliest()
+        let anchor = source_instant
+            .or_else(|| {
+                zone.from_local_datetime(&naive)
+                    .earliest()
+                    .map(|instant| instant.with_timezone(&Utc))
+            })
             .ok_or_else(|| TextImportError::LocalTimeMissing {
                 day: day.to_owned(),
                 time: start_time.to_owned(),
-            })?
-            .with_timezone(&Utc);
+            })?;
         (anchor, reading.turns)
     };
 
@@ -806,7 +830,7 @@ fn inline_turns(text: &str) -> Option<Reading> {
     let first = first_time?;
     let clock_start = if first < FIRST_HEADING_LIMIT_SECONDS {
         None
-    } else if last_time? < DAY_SECONDS {
+    } else if first < DAY_SECONDS && last_time? < DAY_SECONDS {
         Some(first)
     } else {
         return None;

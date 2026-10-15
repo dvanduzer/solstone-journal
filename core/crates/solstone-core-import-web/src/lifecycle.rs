@@ -3,13 +3,11 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
-    io::{Read, Write},
+    collections::BTreeMap,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -52,175 +50,9 @@ fn import_timestamp(zone: Tz) -> String {
         .to_string()
 }
 
-fn filename_timestamp(filename: &str) -> Option<String> {
-    let bytes = filename.as_bytes();
-    for start in 0..bytes.len().saturating_sub(14) {
-        let candidate = &bytes[start..start + 15];
-        if candidate.get(8) != Some(&b'_')
-            || !candidate[..8].iter().all(u8::is_ascii_digit)
-            || !candidate[9..].iter().all(u8::is_ascii_digit)
-        {
-            continue;
-        }
-        let candidate = std::str::from_utf8(candidate).expect("ASCII timestamp candidate");
-        if chrono::NaiveDateTime::parse_from_str(candidate, "%Y%m%d_%H%M%S").is_ok() {
-            return Some(candidate.to_owned());
-        }
-    }
-    None
-}
-
-const METADATA_CREATION_FIELDS: [&str; 8] = [
-    "SubSecCreateDate",
-    "SubSecDateTimeOriginal",
-    "CreateDate",
-    "CreationDate",
-    "DateTimeOriginal",
-    "MediaCreateDate",
-    "TrackCreateDate",
-    "ContentCreateDate",
-];
-const EXIFTOOL_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Planned metadata-helper invocation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetadataCommandPlan {
-    pub program: PathBuf,
-    pub args: Vec<OsString>,
-    pub path: PathBuf,
-    pub timeout: Duration,
-}
-
-/// Result of running one metadata-helper plan.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MetadataCommandOutcome {
-    Completed(Vec<u8>),
-    Unavailable,
-    TimedOut,
-}
-
-fn metadata_command_plan(path: &Path) -> MetadataCommandPlan {
-    MetadataCommandPlan {
-        program: PathBuf::from("exiftool"),
-        args: vec![OsString::from("-json"), path.as_os_str().to_os_string()],
-        path: path.to_path_buf(),
-        timeout: EXIFTOOL_TIMEOUT,
-    }
-}
-
-fn parse_metadata_timestamp(stdout: &[u8], zone: Tz) -> Option<String> {
-    let parsed = serde_json::from_slice::<Value>(stdout).ok()?;
-    metadata_timestamp_from_fields(parsed.as_array()?.first()?.as_object()?, zone)
-}
-
-/// Run the planned metadata helper and classify the process outcome.
-pub fn run_metadata_command(plan: &MetadataCommandPlan) -> MetadataCommandOutcome {
-    let mut command = Command::new(&plan.program);
-    for arg in &plan.args {
-        command.arg(arg);
-    }
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return MetadataCommandOutcome::Unavailable,
-    };
-    let Some(deadline) = Instant::now().checked_add(plan.timeout) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return MetadataCommandOutcome::Unavailable;
-    };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return MetadataCommandOutcome::Unavailable;
-                }
-                let mut stdout = Vec::new();
-                match child.stdout.take() {
-                    Some(mut pipe) => match pipe.read_to_end(&mut stdout) {
-                        Ok(_) => return MetadataCommandOutcome::Completed(stdout),
-                        Err(_) => return MetadataCommandOutcome::Unavailable,
-                    },
-                    None => return MetadataCommandOutcome::Unavailable,
-                }
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return MetadataCommandOutcome::TimedOut;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return MetadataCommandOutcome::Unavailable;
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-fn metadata_timestamp_with_runner(
-    path: &Path,
-    mut runner: impl FnMut(&MetadataCommandPlan) -> MetadataCommandOutcome,
-) -> Option<String> {
-    match runner(&metadata_command_plan(path)) {
-        MetadataCommandOutcome::Completed(output) => parse_metadata_timestamp(&output, Tz::UTC),
-        MetadataCommandOutcome::Unavailable | MetadataCommandOutcome::TimedOut => None,
-    }
-}
-
-/// A metadata creation time as a wall time: one that states its offset is read
-/// in the owner zone, one that states none is kept as written.
-fn metadata_timestamp(value: &str, zone: Tz) -> Option<String> {
-    let mut normalized = value.trim().replace('T', " ");
-    if normalized.starts_with("0000:") || normalized.starts_with("0000-") {
-        return None;
-    }
-    if normalized.as_bytes().get(4) == Some(&b':') && normalized.as_bytes().get(7) == Some(&b':') {
-        normalized.replace_range(7..8, "-");
-        normalized.replace_range(4..5, "-");
-    }
-    if normalized.ends_with('Z') {
-        normalized.pop();
-        normalized.push_str("+00:00");
-    }
-    let local = chrono::DateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f%:z")
-        .ok()
-        .map(|value| value.with_timezone(&zone).naive_local())
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S%.f").ok()
-        })?;
-    Some(local.format("%Y%m%d_%H%M%S").to_string())
-}
-
-fn metadata_timestamp_from_fields(metadata: &Map<String, Value>, zone: Tz) -> Option<String> {
-    let timestamps = METADATA_CREATION_FIELDS
-        .iter()
-        .filter_map(|field| metadata.get(*field).and_then(Value::as_str))
-        .filter_map(|value| metadata_timestamp(value, zone))
-        .collect::<BTreeSet<_>>();
-    (timestamps.len() == 1)
-        .then(|| timestamps.into_iter().next())
-        .flatten()
-}
-
-fn metadata_timestamp_from_file(path: &Path, zone: Tz) -> Option<String> {
-    match run_metadata_command(&metadata_command_plan(path)) {
-        MetadataCommandOutcome::Completed(output) => parse_metadata_timestamp(&output, zone),
-        MetadataCommandOutcome::Unavailable | MetadataCommandOutcome::TimedOut => None,
-    }
-}
-
 fn deterministic_timestamp(path: &Path, filename: &str, zone: Tz) -> Option<String> {
-    let from_filename = filename_timestamp(filename);
-    let from_metadata = metadata_timestamp_from_file(path, zone);
-    match (from_filename, from_metadata) {
-        (Some(filename), Some(metadata)) if filename != metadata => None,
-        (Some(filename), _) => Some(filename),
-        (_, Some(metadata)) => Some(metadata),
-        (None, None) => None,
-    }
+    solstone_core_import_sources::image::detected_creation_stamp(path, Some(filename), zone)
+        .map(|ts| ts.as_str().to_owned())
 }
 
 /// The upload's timestamp and how it was found. Saving consults no model: a file with no
@@ -231,6 +63,14 @@ fn timestamp_for_upload(
     filename: &str,
     zone: Tz,
 ) -> (String, &'static str, Option<&'static str>) {
+    // A PDF's worker chooses its dates after inspecting the document. A filename alone
+    // cannot promise an override before it has been compared with creation metadata.
+    if Path::new(filename)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        return (import_timestamp(zone), "document_dates", None);
+    }
     if let Some(timestamp) = deterministic_timestamp(path, filename, zone) {
         return (timestamp, "deterministic", None);
     }
@@ -466,6 +306,31 @@ fn recorded_source_timestamp(metadata: &ImportMetadata) -> Value {
     recorded_timestamp(metadata, "source_timestamp")
         .or_else(|| recorded_timestamp(metadata, "user_timestamp"))
         .map_or(Value::String(String::new()), Value::String)
+}
+
+/// An explicit choice is independent of the collision-safe staging directory.
+pub(crate) fn owner_timestamp_choice(data: &Value, metadata: &ImportMetadata) -> Option<String> {
+    let timestamp = data.get("timestamp")?.as_str()?;
+    let source = recorded_source_timestamp(metadata);
+    (data
+        .get("timestamp_override")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || source
+            .as_str()
+            .filter(|source| !source.is_empty())
+            .is_some_and(|source| source != timestamp))
+    .then(|| timestamp.to_owned())
+}
+
+fn resolved_summary(mut response: Value, path: &Path, filename: Option<&str>, zone: Tz) -> Value {
+    response["resolved_timestamp"] = solstone_core_import_sources::image::detected_creation_stamp(
+        path,
+        filename.or_else(|| path.file_name().and_then(|name| name.to_str())),
+        zone,
+    )
+    .map_or(Value::Null, |stamp| json!(stamp.as_str()));
+    response
 }
 
 fn claim_import_directory(root: &Path, semantic: &str) -> Result<String, String> {
@@ -886,7 +751,20 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
     };
     if let Some(existing) = staged_by_client_item(&state.root, &client_item_id) {
         if existing.get("source_hash").and_then(Value::as_str) == Some(source_hash.as_str()) {
-            return json_response(StatusCode::OK, replay_summary(&existing));
+            return json_response(
+                StatusCode::OK,
+                resolved_summary(
+                    replay_summary(&existing),
+                    &source_path,
+                    match &incoming {
+                        Incoming::File {
+                            original_filename, ..
+                        } => Some(original_filename.as_str()),
+                        Incoming::Paste { .. } => None,
+                    },
+                    solstone_core_journal_config::owner_zone(&state.root),
+                ),
+            );
         }
         return invalid_state(
             "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item",
@@ -898,7 +776,20 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
         return invalid_state("content already imported");
     }
     if let Some(existing) = staged_by_source_hash(&state.root, &source_hash) {
-        return json_response(StatusCode::OK, summary(&existing));
+        return json_response(
+            StatusCode::OK,
+            resolved_summary(
+                summary(&existing),
+                &source_path,
+                match &incoming {
+                    Incoming::File {
+                        original_filename, ..
+                    } => Some(original_filename.as_str()),
+                    Incoming::Paste { .. } => None,
+                },
+                solstone_core_journal_config::owner_zone(&state.root),
+            ),
+        );
     }
     let original_for_timestamp = match &incoming {
         Incoming::File {
@@ -1019,7 +910,15 @@ pub(crate) async fn save_path(State(state): State<AppState>, Json(data): Json<Va
     };
     if let Some(existing) = staged_by_client_item(&state.root, &client_item_id) {
         if existing.get("source_hash").and_then(Value::as_str) == Some(source_hash.as_str()) {
-            return json_response(StatusCode::OK, replay_summary(&existing));
+            return json_response(
+                StatusCode::OK,
+                resolved_summary(
+                    replay_summary(&existing),
+                    local,
+                    None,
+                    solstone_core_journal_config::owner_zone(&state.root),
+                ),
+            );
         }
         return invalid_state(
             "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item",
@@ -1029,20 +928,34 @@ pub(crate) async fn save_path(State(state): State<AppState>, Json(data): Json<Va
         return invalid_state("content already imported");
     }
     if let Some(existing) = staged_by_source_hash(&state.root, &source_hash) {
-        return json_response(StatusCode::OK, summary(&existing));
+        return json_response(
+            StatusCode::OK,
+            resolved_summary(
+                summary(&existing),
+                local,
+                None,
+                solstone_core_journal_config::owner_zone(&state.root),
+            ),
+        );
     }
-    let semantic = import_timestamp(solstone_core_journal_config::owner_zone(&state.root));
-    let import_id = match claim_import_directory(&state.root, &semantic) {
-        Ok(import_id) => import_id,
-        Err(error) => return metadata_failed(error),
-    };
+    let zone = solstone_core_journal_config::owner_zone(&state.root);
     let original_filename = local
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_owned();
+    let (semantic, method, no_match_reason) = timestamp_for_upload(local, &original_filename, zone);
+    let method = if method == "upload_fallback" {
+        "path_fallback"
+    } else {
+        method
+    };
+    let import_id = match claim_import_directory(&state.root, &semantic) {
+        Ok(import_id) => import_id,
+        Err(error) => return metadata_failed(error),
+    };
     let mut metadata = staged_metadata(StagedMetadata {
-        zone: solstone_core_journal_config::owner_zone(&state.root),
+        zone,
         timestamp: &semantic,
         original_filename: &original_filename,
         file_path: local_path,
@@ -1052,10 +965,14 @@ pub(crate) async fn save_path(State(state): State<AppState>, Json(data): Json<Va
         client_item_id,
         data: &data,
         is_local_path: true,
-        method: "path_fallback",
+        method,
     });
     metadata.insert("import_id".to_owned(), json!(import_id));
     metadata.insert("source_timestamp".to_owned(), json!(semantic));
+    metadata.insert(
+        "timestamp_detection_no_match_reason".to_owned(),
+        no_match_reason.map_or(Value::Null, |reason| json!(reason)),
+    );
     if let Err(error) = contained_import_file(&state.root, &import_id, "import.json") {
         return metadata_failed(error.to_string());
     }
@@ -1178,8 +1095,28 @@ pub(crate) fn command(
         "journal".to_owned(),
         "importer".to_owned(),
         path.to_owned(),
-        timestamp.to_owned(),
     ];
+    let method = metadata
+        .get("timestamp_detection_method")
+        .and_then(Value::as_str);
+    if metadata.contains_key("owner_timestamp") {
+        cmd.push(timestamp.to_owned());
+    } else if matches!(method, Some("deterministic") | Some("document_dates")) {
+        cmd.extend([
+            "--auto".to_owned(),
+            "--preview-stamp".to_owned(),
+            timestamp.to_owned(),
+        ]);
+    } else if matches!(method, Some("upload_fallback") | Some("path_fallback")) {
+        cmd.extend([
+            "--fallback-timestamp".to_owned(),
+            timestamp.to_owned(),
+            "--preview-stamp".to_owned(),
+            timestamp.to_owned(),
+        ]);
+    } else {
+        cmd.push(timestamp.to_owned());
+    }
     if let Some(setting) = metadata
         .get("setting")
         .and_then(Value::as_str)
@@ -1424,7 +1361,12 @@ where
         _ => {}
     }
     let mut command_path = path.to_owned();
-    if original_timestamp != timestamp {
+    let owner_choice = owner_timestamp_choice(data, &metadata);
+    let mut record_id = original_timestamp;
+    if owner_choice.is_some()
+        && original_timestamp != timestamp
+        && !imports.join(timestamp).try_exists().unwrap_or(true)
+    {
         if let Err(error) = contained_import_file(root, timestamp, "import.json") {
             return metadata_failed(error.to_string());
         }
@@ -1441,12 +1383,22 @@ where
         }
         metadata.insert("file_path".to_owned(), json!(command_path));
         metadata.insert("source_timestamp".to_owned(), json!(timestamp));
-        if let Err(error) = write(root, timestamp, &metadata) {
+        record_id = timestamp;
+        metadata.insert("import_id".to_owned(), json!(record_id));
+        metadata.insert("user_timestamp".to_owned(), json!(record_id));
+        if let Err(error) = write(root, record_id, &metadata) {
             return metadata_failed(format!("Failed to update file path in metadata: {error}"));
         }
     }
+    if let Some(owner) = owner_choice {
+        metadata.insert("owner_timestamp".to_owned(), json!(owner));
+        metadata.insert("source_timestamp".to_owned(), json!(timestamp));
+        if let Err(error) = write(root, record_id, &metadata) {
+            return metadata_failed(error.to_string());
+        }
+    }
     if let Some(relative) = data.get("_preview_source").and_then(Value::as_str) {
-        command_path = match contained_import_file(root, timestamp, relative) {
+        command_path = match contained_import_file(root, record_id, relative) {
             Ok(path) => path.display().to_string(),
             Err(error) => return metadata_failed(error.to_string()),
         };
@@ -1474,7 +1426,7 @@ where
         let source_hint_str = source_hint(&metadata);
         let facts = match solstone_core_import::admit_running_attempt(
             root,
-            timestamp,
+            record_id,
             started_at_ms,
             source_hint_str.as_deref(),
         ) {
@@ -1486,7 +1438,7 @@ where
         produce(
             root.to_path_buf(),
             PathBuf::from(&command_path),
-            timestamp.to_owned(),
+            record_id.to_owned(),
             source,
             force,
             facts.generation,
@@ -1514,11 +1466,11 @@ where
     // A whole-record write keeps the task id already on disk, so a retry records its own
     // separately: until its importer admits an attempt, the row reads running, not the
     // outcome being retried.
-    let written = write(root, timestamp, &metadata)
-        .and_then(|_| solstone_core_import::record_queued_task(root, timestamp, &task_id));
+    let written = write(root, record_id, &metadata)
+        .and_then(|_| solstone_core_import::record_queued_task(root, record_id, &task_id));
     // Called either way: the watch carries the request it sent, and a record without its
     // task id reads pending rather than running, so there is nothing for it to settle.
-    follow(&task_id, timestamp);
+    follow(&task_id, record_id);
     if let Err(error) = written {
         return metadata_error_with_task(
             &task_id,
@@ -1612,6 +1564,7 @@ fn run_to_end(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inprocess_producer_request<'a>(
     root: &'a Path,
     source_path: &'a Path,
@@ -1619,6 +1572,8 @@ fn inprocess_producer_request<'a>(
     source: solstone_core_import::RegistrySource,
     force: bool,
     generation: u64,
+    owner_timestamp: Option<&'a str>,
+    fallback_timestamp: Option<&'a str>,
 ) -> solstone_core_import_sources::NativeProducerRequest<'a> {
     solstone_core_import_sources::NativeProducerRequest {
         journal_root: root,
@@ -1627,6 +1582,8 @@ fn inprocess_producer_request<'a>(
         source,
         revision: None,
         password: None,
+        owner_timestamp,
+        fallback_timestamp,
         force,
         expected_generation: Some(generation),
         heartbeat_interval: Some(Duration::from_secs(60)),
@@ -1656,7 +1613,10 @@ fn run_inprocess_import(
             root,
             source_path,
             token,
-            import_id,
+            metadata
+                .get("source_timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or(import_id),
             force,
             metadata.get("setting").and_then(Value::as_str),
             source_hint(&metadata).as_deref(),
@@ -1676,7 +1636,28 @@ fn run_inprocess_import(
     }
     let wire = solstone_core_import_sources::image::SystemWireClient;
     let publication = solstone_core_import::NativePublicationOperations;
-    let req = inprocess_producer_request(root, source_path, import_id, source, force, generation);
+    let owner_timestamp = metadata.get("owner_timestamp").and_then(Value::as_str);
+    let fallback_timestamp = if owner_timestamp.is_none()
+        && matches!(
+            metadata
+                .get("timestamp_detection_method")
+                .and_then(Value::as_str),
+            Some("upload_fallback") | Some("path_fallback")
+        ) {
+        metadata.get("source_timestamp").and_then(Value::as_str)
+    } else {
+        None
+    };
+    let req = inprocess_producer_request(
+        root,
+        source_path,
+        import_id,
+        source,
+        force,
+        generation,
+        owner_timestamp,
+        fallback_timestamp,
+    );
 
     let res = match source {
         solstone_core_import::RegistrySource::Document => {
@@ -1791,7 +1772,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::{cell::RefCell, ffi::OsString, fs, rc::Rc, time::Duration};
+    use std::{cell::RefCell, fs, rc::Rc, time::Duration};
 
     use axum::{
         body::{Body, to_bytes},
@@ -1817,6 +1798,67 @@ mod tests {
 
     /// A video file imports as audio, so it is recorded as audio whether or not the browser
     /// sent a type; so is an audio file saved from a local path, which carries no type at all.
+    #[test]
+    fn choosing_a_date_preserves_row_identity_and_an_occupied_target() {
+        for occupied in [false, true] {
+            let root = TempDir::new().unwrap();
+            let old = "20261011_235959";
+            let chosen = "20261012_000000";
+            let source = root.path().join(format!("imports/{old}/notes.txt"));
+            let mut row = metadata(source.display().to_string(), "hash");
+            row.insert("import_id".into(), json!(old));
+            row.insert("source_timestamp".into(), json!(old));
+            staged(root.path(), old, Value::Object(row));
+            fs::write(&source, "source notes").unwrap();
+            if occupied {
+                fs::create_dir_all(root.path().join(format!("imports/{chosen}"))).unwrap();
+                fs::write(
+                    root.path().join(format!("imports/{chosen}/owner.txt")),
+                    "keep",
+                )
+                .unwrap();
+            }
+            let response = start_with(
+                root.path(),
+                &json!({"path":source,"import_id":old,
+                "timestamp":chosen,"timestamp_override":true}),
+                |_, _, cmd| {
+                    assert_eq!(cmd[4], chosen);
+                    Ok(())
+                },
+                write_import_metadata,
+                |_, _, _, _, _, _| panic!("text queues through supervisor"),
+                |_, _| {},
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            let id = if occupied { old } else { chosen };
+            let stored = read_import_metadata(root.path(), id).unwrap();
+            assert_eq!(super::summary(&stored)["timestamp"], id);
+            assert_eq!(stored["source_timestamp"], chosen);
+            assert_eq!(stored["owner_timestamp"], chosen);
+            if occupied {
+                assert_eq!(
+                    fs::read_to_string(root.path().join(format!("imports/{chosen}/owner.txt")))
+                        .unwrap(),
+                    "keep"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_date_equal_to_a_staging_id_still_overrides_the_source() {
+        let metadata = json!({"source_timestamp":"20261011_235959", "timestamp_detection_method":"deterministic"});
+        let metadata = metadata.as_object().unwrap();
+        let data = json!({"timestamp":"20261012_000000", "timestamp_override":true});
+        let choice = super::owner_timestamp_choice(&data, metadata).unwrap();
+        let mut chosen = metadata.clone();
+        chosen.insert("owner_timestamp".into(), json!(choice));
+        let cmd = super::command("photo.jpg", &choice, &chosen, false);
+        assert_eq!(cmd[4], "20261012_000000");
+        assert!(!cmd.iter().any(|arg| arg == "--auto"));
+    }
+
     #[test]
     fn a_video_or_audio_file_is_recorded_as_audio() {
         for (filename, content_type) in [
@@ -2116,7 +2158,7 @@ mod tests {
         let capture = Rc::clone(&captured);
         let started = start_with(
             root.path(),
-            &json!({"path": second_path.display().to_string(), "timestamp": "20260801_120001"}),
+            &json!({"path": second_path.display().to_string(), "timestamp": stamp, "import_id": "20260801_120001"}),
             move |_, _, cmd| {
                 *capture.borrow_mut() = cmd.to_vec();
                 Ok(())
@@ -2126,7 +2168,11 @@ mod tests {
             |_, _| {},
         );
         assert_eq!(started.status(), StatusCode::OK);
-        assert_eq!(captured.borrow()[4], "20260801_120001");
+        assert_eq!(captured.borrow()[4], "--auto");
+        assert_eq!(captured.borrow()[6], stamp);
+        let second_meta = read_import_metadata(root.path(), "20260801_120001").unwrap();
+        assert_eq!(second_meta["source_timestamp"], stamp);
+        assert!(!second_meta.contains_key("owner_timestamp"));
         assert_eq!(fs::read(&first_path).unwrap(), b"alpha-bytes");
         assert_eq!(fs::read(&second_path).unwrap(), b"bravo-bytes");
         assert!(!root.path().join("imports/20260801_120003").exists());
@@ -2254,7 +2300,6 @@ mod tests {
         assert_save_tmp_clean(root.path());
     }
 
-    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn upload_timestamp_prefers_a_valid_deterministic_filename_timestamp() {
         let (timestamp, method, reason) = super::timestamp_for_upload(
@@ -2267,7 +2312,6 @@ mod tests {
         assert_eq!(reason, None);
     }
 
-    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn deterministic_filename_timestamp_wins_when_payload_is_only_on_disk() {
         let root = TempDir::new().unwrap();
@@ -2278,6 +2322,173 @@ mod tests {
         assert_eq!(timestamp, "20260801_120000");
         assert_eq!(method, "deterministic");
         assert_eq!(reason, None);
+    }
+
+    fn make_test_jpeg_app1(dt: &str, md: &str) -> Vec<u8> {
+        let mut data = vec![0xFF, 0xD8];
+        data.extend_from_slice(&[0xFF, 0xE1]);
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(&[b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+
+        let exif_ifd_offset = 26u32;
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x8769u16.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&exif_ifd_offset.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let dt_bytes = format!("{dt}\0").into_bytes();
+        let mod_bytes = format!("{md}\0").into_bytes();
+        let num_entries = 2u16;
+        let ifd_len = 2 + (num_entries as usize * 12) + 4;
+        let mut string_data_offset = (26 + ifd_len) as u32;
+
+        tiff.extend_from_slice(&num_entries.to_le_bytes());
+
+        // Entry 1: Tag 0x0132 (ModifyDate)
+        tiff.extend_from_slice(&0x0132u16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(mod_bytes.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&string_data_offset.to_le_bytes());
+        string_data_offset += mod_bytes.len() as u32;
+
+        // Entry 2: Tag 0x9003 (DateTimeOriginal)
+        tiff.extend_from_slice(&0x9003u16.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(dt_bytes.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&string_data_offset.to_le_bytes());
+
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        tiff.extend_from_slice(&mod_bytes);
+        tiff.extend_from_slice(&dt_bytes);
+
+        let app1_len = (2 + 6 + tiff.len()) as u16;
+        data.extend_from_slice(&app1_len.to_be_bytes());
+        data.extend_from_slice(b"Exif\0\0");
+        data.extend_from_slice(&tiff);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        data
+    }
+
+    fn make_test_mp4_mvhd(creation_secs_since_1904: u32, brand: &[u8; 4]) -> Vec<u8> {
+        let mut data = Vec::new();
+        // ftyp box
+        data.extend_from_slice(&16u32.to_be_bytes());
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(brand);
+        data.extend_from_slice(&0u32.to_be_bytes());
+
+        // mvhd box
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&28u32.to_be_bytes());
+        mvhd.extend_from_slice(b"mvhd");
+        mvhd.push(0); // version 0
+        mvhd.extend_from_slice(&[0, 0, 0]); // flags
+        mvhd.extend_from_slice(&creation_secs_since_1904.to_be_bytes());
+        mvhd.extend_from_slice(&999999u32.to_be_bytes()); // mod time
+        mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+
+        // moov box
+        let moov_len = (8 + mvhd.len()) as u32;
+        data.extend_from_slice(&moov_len.to_be_bytes());
+        data.extend_from_slice(b"moov");
+        data.extend_from_slice(&mvhd);
+        data
+    }
+
+    #[test]
+    fn creation_stamp_parity() {
+        let root = TempDir::new().unwrap();
+        let old_mtime = std::time::UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+
+        let jpeg_path = root.path().join("photo.jpg");
+        fs::write(
+            &jpeg_path,
+            make_test_jpeg_app1("2026:05:10 14:30:00", "1999:01:01 00:00:00"),
+        )
+        .unwrap();
+
+        let m4a_path = root.path().join("audio.m4a");
+        fs::write(&m4a_path, make_test_mp4_mvhd(3_861_259_200, b"M4A ")).unwrap();
+
+        let mp4_path = root.path().join("video.mp4");
+        fs::write(&mp4_path, make_test_mp4_mvhd(3_861_259_200, b"mp42")).unwrap();
+
+        let txt_path = root.path().join("20260704_090000.txt");
+        fs::write(&txt_path, b"some text content").unwrap();
+
+        let wav_path = root
+            .path()
+            .join("limitless_pendant_2026-01-15T03-30-00_to_2026-01-15T04-00-00.wav");
+        fs::write(&wav_path, b"RIFF....WAVEfmt ").unwrap();
+
+        let nodate_path = root.path().join("nodate.bin");
+        fs::write(&nodate_path, b"unrecognized random bytes").unwrap();
+
+        for p in [
+            &jpeg_path,
+            &m4a_path,
+            &mp4_path,
+            &txt_path,
+            &wav_path,
+            &nodate_path,
+        ] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+                .unwrap();
+        }
+
+        let cases = [
+            (&jpeg_path, "photo.jpg", Tz::UTC, "20260510_143000"),
+            (&m4a_path, "audio.m4a", Tz::UTC, "20260510_120000"),
+            (&mp4_path, "video.mp4", Tz::UTC, "20260510_120000"),
+            (&txt_path, "20260704_090000.txt", Tz::UTC, "20260704_090000"),
+            (
+                &wav_path,
+                "limitless_pendant_2026-01-15T03-30-00_to_2026-01-15T04-00-00.wav",
+                Tz::America__New_York,
+                "20260114_223000",
+            ),
+        ];
+
+        for (path, filename, zone, expected_stamp) in cases {
+            let (upload_stamp, method, reason) = super::timestamp_for_upload(path, filename, zone);
+            let detected = solstone_core_import_sources::image::detected_creation_stamp(
+                path,
+                Some(filename),
+                zone,
+            );
+            assert_eq!(
+                detected.as_ref().map(|t| t.as_str()),
+                Some(upload_stamp.as_str()),
+                "mismatch for {filename}"
+            );
+            assert_eq!(
+                upload_stamp, expected_stamp,
+                "stamp mismatch for {filename}"
+            );
+            assert_eq!(method, "deterministic", "method mismatch for {filename}");
+            assert_eq!(reason, None, "reason mismatch for {filename}");
+        }
+
+        let (upload_stamp, method, reason) =
+            super::timestamp_for_upload(&nodate_path, "nodate.bin", Tz::UTC);
+        assert_eq!(method, "upload_fallback");
+        assert_eq!(reason, Some("no_deterministic_match"));
+        assert!(!upload_stamp.starts_with("20240101"));
+        let detected_none = solstone_core_import_sources::image::detected_creation_stamp(
+            &nodate_path,
+            Some("nodate.bin"),
+            Tz::UTC,
+        );
+        assert_eq!(detected_none, None);
     }
 
     /// Saving never consults a model, so an upload that falls back to its upload time must
@@ -2311,87 +2522,6 @@ mod tests {
             stored["timestamp_detection_no_match_reason"],
             "no_deterministic_match"
         );
-    }
-
-    #[test]
-    fn deterministic_metadata_timestamp_accepts_the_exiftool_creation_shape() {
-        assert_eq!(
-            super::metadata_timestamp("2026:08:01 12:34:56", Tz::America__Denver),
-            Some("20260801_123456".to_owned())
-        );
-        let fields = json!({"CreateDate":"2026-08-01T12:34:56Z"})
-            .as_object()
-            .unwrap()
-            .clone();
-        let expected = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:34:56Z")
-            .unwrap()
-            .with_timezone(&Tz::America__Denver)
-            .format("%Y%m%d_%H%M%S")
-            .to_string();
-        assert_eq!(expected, "20260801_063456");
-        assert_eq!(
-            super::metadata_timestamp_from_fields(&fields, Tz::America__Denver),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn metadata_plan_uses_exiftool_json_and_the_input_path() {
-        let path = std::path::Path::new("photo.jpg");
-        let mut recorded = None;
-        let result = super::metadata_timestamp_with_runner(path, |plan| {
-            recorded = Some((
-                plan.program.clone(),
-                plan.args.clone(),
-                plan.path.clone(),
-                plan.timeout,
-            ));
-            super::MetadataCommandOutcome::Unavailable
-        });
-        assert_eq!(result, None);
-        let (program, args, planned_path, timeout) = recorded.expect("recorded plan");
-        assert_eq!(program, std::path::Path::new("exiftool"));
-        assert_eq!(args, [OsString::from("-json"), OsString::from("photo.jpg")]);
-        assert_eq!(planned_path, path);
-        assert_eq!(timeout, Duration::from_secs(2));
-    }
-
-    #[test]
-    fn metadata_runner_success_parses_the_authored_exiftool_timestamp() {
-        let path = std::path::Path::new("photo.jpg");
-        let result = super::metadata_timestamp_with_runner(path, |_| {
-            super::MetadataCommandOutcome::Completed(
-                br#"[{"CreateDate":"2026:08:01 12:34:56"}]"#.to_vec(),
-            )
-        });
-        assert_eq!(result.as_deref(), Some("20260801_123456"));
-    }
-
-    #[test]
-    fn metadata_runner_malformed_output_is_none() {
-        let path = std::path::Path::new("photo.jpg");
-        let result = super::metadata_timestamp_with_runner(path, |_| {
-            super::MetadataCommandOutcome::Completed(b"not-json".to_vec())
-        });
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn metadata_runner_unavailable_is_none() {
-        let path = std::path::Path::new("photo.jpg");
-        let result = super::metadata_timestamp_with_runner(path, |_| {
-            super::MetadataCommandOutcome::Unavailable
-        });
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn metadata_runner_timeout_is_none() {
-        let path = std::path::Path::new("photo.jpg");
-        let result = super::metadata_timestamp_with_runner(path, |_| {
-            super::MetadataCommandOutcome::TimedOut
-        });
-        assert_eq!(result, None);
     }
 
     #[test]
@@ -2550,6 +2680,9 @@ mod tests {
                 "journal".to_owned(),
                 "importer".to_owned(),
                 notes.display().to_string(),
+                "--fallback-timestamp".to_owned(),
+                timestamp.clone(),
+                "--preview-stamp".to_owned(),
                 timestamp.clone(),
             ]
         );
@@ -3095,6 +3228,8 @@ mod tests {
             solstone_core_import::RegistrySource::Image,
             false,
             1,
+            None,
+            None,
         );
         assert_eq!(req.heartbeat_interval, Some(Duration::from_secs(60)));
     }

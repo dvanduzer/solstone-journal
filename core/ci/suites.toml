@@ -3260,19 +3260,6 @@ required_features = []
 runtime = "none"
 
 [[suites]]
-id = "solstone-core-import-web::import_metadata_component"
-package = "solstone-core-import-web"
-target = "import_metadata_component"
-set = "component"
-areas = ["import"]
-platforms = ["linux", "macos"]
-prerequisites = ["cargo-cache"]
-timeout = "standard"
-default_full = true
-required_features = []
-runtime = "none"
-
-[[suites]]
 id = "solstone-core-import-web::import_workspace_dom"
 package = "solstone-core-import-web"
 target = "import_workspace_dom"

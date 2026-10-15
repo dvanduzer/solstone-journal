@@ -1322,6 +1322,27 @@ fn run_importer(args: Vec<OsString>) -> ExitCode {
     run_storage_ops_verb("importer", args, |arguments, journal| {
         use solstone_core_import_host::cli_argv::CliOutcome;
         let mut execution_arguments = arguments.to_vec();
+        let day_notice = match solstone_core_import_host::cli_argv::force_day_notice_for_args(
+            arguments, journal,
+        ) {
+            Ok(notice) => notice,
+            Err(run) => return (run.stdout, run.stderr, run.exit_code),
+        };
+        if let Some(notice) = day_notice {
+            let json_mode = arguments.iter().any(|arg| arg == "--json");
+            if let Err(error) = solstone_core_import::flush_force_notice(
+                json_mode,
+                &notice,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            ) {
+                return (
+                    String::new(),
+                    format!("could not show import day notice: {error}\n"),
+                    1,
+                );
+            }
+        }
         let preview_args =
             match solstone_core_import_host::cli_argv::preview_arguments(arguments, journal) {
                 Ok(args) => args,

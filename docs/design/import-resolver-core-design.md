@@ -1,9 +1,17 @@
 # Import Resolver Design
 
-> The resolver shipped in `solstone-core-import`. Python `importers/cli.py`
-> is gone. What remains unbuilt is `detect_created` (filename/Exif created
-> time); see `solstone/think/detect_created.md`. Do not treat the rest of this
-> file as a port plan.
+> The resolver ships in `solstone-core-import`. Native filename, EXIF and
+> QuickTime creation-time readers now fill its deterministic seam in `creation.rs`;
+> CLI, upload, image and single-file PDF paths share that decision. Missing or
+> conflicting evidence does not become a detected date, and no model supplies one.
+> This document otherwise records the original resolver boundary and test corpus.
+
+Creation times are owner-local wall times with an optional source UTC instant.
+The instant survives audio and elapsed-transcript tiling across DST; the import
+folder ID is allocated separately and never substitutes for that time. PDF default
+placement retains modification date, creation date, then file mtime; only an
+explicit owner date or an unambiguous single-file name overrides those defaults.
+Imports already written are not migrated by this change.
 
 ## Purpose and boundary
 
