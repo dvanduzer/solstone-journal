@@ -64,15 +64,34 @@ pub(crate) fn spawn(deps: BackupWebDeps, nonce: String, generation: u64) {
     let Some(lease) = PollLease::try_acquire(&deps.handoff_poll_lease) else {
         return;
     };
-    let Some(cancellation) = operation::start_handoff_poll(&deps.operations, generation) else {
-        return;
-    };
     if validation::require_configured_portal_base(&deps.portal_base).is_err() {
-        finish_error(&deps, &nonce, generation, "failed");
+        // The refusal is recorded on the poll slot. No poll thread is started.
+        if operation::start_handoff_poll(&deps.operations, generation).is_some() {
+            finish_error(&deps, &nonce, generation, "failed");
+            operation::finish_handoff_poll(&deps.operations, generation);
+        }
         drop(lease);
-        operation::finish_handoff_poll(&deps.operations, generation);
         return;
     }
+    let mut guard = match deps.operations.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.closed {
+        if let Some(current) = guard.current.as_mut()
+            && current.generation == generation
+            && !operation::is_terminal(&current.view.phase)
+            && !current.worker_active
+        {
+            operation::finish_or_defer(current, operation::Terminal::error("failed"));
+        }
+        drop(guard);
+        deps.operations.notify_waiters();
+        return;
+    }
+    let Some(cancellation) = operation::start_handoff_poll_locked(&mut guard, generation) else {
+        return;
+    };
     let poll_deps = deps.clone();
     let failed_nonce = nonce.clone();
     let poll_started = spawn_poll_thread(move || {
@@ -85,17 +104,28 @@ pub(crate) fn spawn(deps: BackupWebDeps, nonce: String, generation: u64) {
         drop(lease);
         operation::finish_handoff_poll(&poll_deps.operations, generation);
     });
-    if poll_started.is_err() {
-        finish_error(&deps, &failed_nonce, generation, "failed");
-        operation::finish_handoff_poll(&deps.operations, generation);
-        return;
-    }
+    let poll_handle = match poll_started {
+        Ok(handle) => handle,
+        Err(_) => {
+            drop(guard);
+            finish_error(&deps, &failed_nonce, generation, "failed");
+            operation::finish_handoff_poll(&deps.operations, generation);
+            return;
+        }
+    };
+    guard.threads.push(poll_handle);
+
     let watchdog_slot = deps.operations.clone();
-    if thread::Builder::new()
-        .spawn(move || watchdog_loop(&watchdog_slot, generation))
-        .is_err()
-    {
-        finish_error(&deps, &failed_nonce, generation, "failed");
+    let watchdog_started =
+        thread::Builder::new().spawn(move || watchdog_loop(&watchdog_slot, generation));
+    match watchdog_started {
+        Ok(handle) => {
+            guard.threads.push(handle);
+        }
+        Err(_) => {
+            drop(guard);
+            finish_error(&deps, &failed_nonce, generation, "failed");
+        }
     }
 }
 
@@ -256,7 +286,35 @@ fn finish_error(deps: &BackupWebDeps, nonce: &str, generation: u64, reason: &str
     operation::fail_handoff_poll(&deps.operations, generation, nonce, reason);
 }
 
+#[cfg(all(test, feature = "full-tests"))]
+static APPLY_APPROVED_PAUSE_HOOK: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn arm_apply_approved_pause()
+-> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *APPLY_APPROVED_PAUSE_HOOK.lock().unwrap() = Some((entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+fn pause_apply_approved() {
+    let pair = {
+        let mut guard = APPLY_APPROVED_PAUSE_HOOK.lock().unwrap();
+        guard.take()
+    };
+    if let Some((entered_tx, release_rx)) = pair {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv();
+    }
+}
+
 fn apply_approved(deps: &BackupWebDeps, nonce: &str, generation: u64, binding: HostedBinding) {
+    #[cfg(all(test, feature = "full-tests"))]
+    pause_apply_approved();
     match live_wait(&deps.operations, generation) {
         LiveWait::Gone => return,
         LiveWait::Expired => {

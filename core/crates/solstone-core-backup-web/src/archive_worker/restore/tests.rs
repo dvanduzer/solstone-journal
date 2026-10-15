@@ -2,7 +2,9 @@
 // Copyright (c) 2026 sol pbc
 
 use super::*;
-use std::{cell::RefCell, fs, path::PathBuf, thread, time::Instant};
+#[cfg(not(windows))]
+use std::thread;
+use std::{cell::RefCell, fs, path::PathBuf, time::Instant};
 
 use serde::Deserialize;
 use solstone_core_backup::archive_admission::Clock;
@@ -16,7 +18,9 @@ use solstone_core_retention::archive_proof::{
 };
 
 use crate::archive_operation::ArchiveBeginRefusal;
-use crate::archive_worker::{begin_owned, prepare_read};
+use crate::archive_worker::begin_owned;
+#[cfg(not(windows))]
+use crate::archive_worker::prepare_read;
 
 #[derive(Default)]
 pub(super) struct DispatchControl {
@@ -471,6 +475,59 @@ fn local_restore() -> (
     deps.clock = clock.clone();
     deps.executable = journal.path().join("missing-package/bin/solstone");
     (journal, deps, clock, segment)
+}
+
+#[test]
+fn stopped_lifetime_releases_actual_unused_restore_without_status_response() {
+    let (journal, deps, _, _) = local_restore();
+    let before = fs::read(journal.path().join("config/journal.json")).unwrap();
+    start(&deps, None).unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if deps
+            .operations
+            .lock()
+            .unwrap()
+            .archive
+            .restore
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual restore worker must return"
+        );
+        std::thread::park_timeout(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        deps.operations.lock().unwrap().archive.restore.unused.len(),
+        1
+    );
+    let lifetime = deps.lifetime();
+    lifetime.request_stop();
+    assert_eq!(
+        lifetime.drain(
+            crate::test_support::join_executor(),
+            Instant::now() + std::time::Duration::from_secs(5)
+        ),
+        crate::BackupRouteDrain::Drained
+    );
+    let state = deps.operations.lock().unwrap();
+    assert!(state.archive.restore.worker.is_none());
+    assert!(state.join_batches.is_empty());
+    assert!(!deps.operations.joining());
+    assert!(!state.archive.is_busy());
+    assert_eq!(
+        state.current.as_ref().unwrap().view.reason_code.as_deref(),
+        Some("restic_unavailable")
+    );
+    assert_eq!(
+        fs::read(journal.path().join("config/journal.json")).unwrap(),
+        before
+    );
 }
 
 #[test]

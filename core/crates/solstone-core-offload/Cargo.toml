@@ -37,6 +37,7 @@ solstone-core-system.workspace = true
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+ureq.workspace = true
 solstone-core-journal-io = { workspace = true, features = ["test-hooks"] }
 solstone-core-backup-runtime = { workspace = true, features = ["test-support"] }
 tempfile = "3.24.0"

@@ -351,6 +351,70 @@ impl BindingFinalization {
 
     /// Attempt at most once; later calls borrow the exact original receipt.
     pub fn remove_binding(&mut self) -> &Arc<BindingRemovalReceipt> {
+        self.remove_binding_with(|held, prior| {
+            #[cfg(unix)]
+            let result = native::remove(
+                &held.binding_parent,
+                OsStr::new(BINDING),
+                prior,
+                &held.claim,
+                MAX_BINDING_BYTES,
+            );
+            #[cfg(windows)]
+            let result = native::remove(
+                &held.binding_parent,
+                OsStr::new(BINDING),
+                prior,
+                MAX_BINDING_BYTES,
+            );
+            result
+        })
+    }
+
+    /// Android removal requires the original teardown admission's retained lease.
+    #[cfg(target_os = "android")]
+    pub fn remove_binding_for_teardown(
+        &mut self,
+        lease: &Arc<solstone_core_journal_io::activity::TeardownLease>,
+    ) -> &Arc<BindingRemovalReceipt> {
+        if self.receipt.is_none() {
+            let admission = if Arc::ptr_eq(&self.root, lease.journal_root()) {
+                lease
+                    .revalidate()
+                    .map_err(|error| BindingFinalizationRefusal::Native(io::Error::other(error)))
+            } else {
+                Err(BindingFinalizationRefusal::Configuration(
+                    Refusal::RootChanged,
+                ))
+            };
+            if let Err(refusal) = admission {
+                self.receipt = Some(Arc::new(BindingRemovalReceipt {
+                    attempted: false,
+                    native: None,
+                    confirmation: Err(refusal),
+                }));
+            }
+        }
+        self.remove_binding_with(|held, prior| {
+            solstone_core_journal_io::claim_and_remove_android_teardown_observed_bounded(
+                lease,
+                &held.binding_parent,
+                std::path::Path::new("backup/hosted"),
+                OsStr::new(BINDING),
+                prior,
+                &held.claim,
+                MAX_BINDING_BYTES,
+            )
+        })
+    }
+
+    fn remove_binding_with(
+        &mut self,
+        remove: impl FnOnce(
+            &Self,
+            &solstone_core_journal_io::FileObservation,
+        ) -> Result<ClaimRemovalOutcome, ClaimRemovalError>,
+    ) -> &Arc<BindingRemovalReceipt> {
         if self.receipt.is_none() {
             let prior = (|| {
                 self.validate_original()?;
@@ -377,21 +441,7 @@ impl BindingFinalization {
                     confirmation: Err(refusal),
                 },
                 Ok(prior) => {
-                    #[cfg(unix)]
-                    let native = native::remove(
-                        &self.binding_parent,
-                        OsStr::new(BINDING),
-                        &prior,
-                        &self.claim,
-                        MAX_BINDING_BYTES,
-                    );
-                    #[cfg(windows)]
-                    let native = native::remove(
-                        &self.binding_parent,
-                        OsStr::new(BINDING),
-                        &prior,
-                        MAX_BINDING_BYTES,
-                    );
+                    let native = remove(self, &prior);
                     let confirmation = self.validate_absence();
                     BindingRemovalReceipt {
                         attempted: true,

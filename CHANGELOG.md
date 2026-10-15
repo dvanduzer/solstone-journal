@@ -6,21 +6,26 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- on windows, links to saved output from a thinking run open again.
+- on windows, `solstone link join` can finish pairing and save connection settings.
+- on windows, you can preview an import again.
+
+## [2.0.47] - 2026-10-15
+
 ### Changed
 
 - with confidential processing, your journal no longer waits between requests while it catches up on older recordings and days, so it gets through them faster.
 
 ### Fixed
 
-- on windows, links to saved output from a thinking run open again.
-- on windows, `solstone link join` can finish pairing and save connection settings.
-- on windows, you can preview an import again.
 - with confidential processing, older recordings and days waiting their turn no longer hold up new recordings and recent days. your journal works on one older item at a time, and newer work starts ahead of older work still waiting.
 - stopping or restarting your journal no longer waits several extra seconds when a background job left a helper program running. that time now goes to letting your journal's other programs stop cleanly.
 - media offload runs again on a large journal. a check it runs first mistook your journal's ordinary activity for unfinished work, so offload stopped before it began. nothing was removed, and your media stayed on this computer.
-- when one step of thinking about a recording failed the same way every time, your journal kept running it over and over. once a step has kept failing like that for a couple of hours, your journal now stops repeating it and lists it in health's set-aside work, where you can try again. it also tries once more on its own when the recording changes or an update fixes that failure. that recording's day stays open until the step finishes, so nothing from it is skipped.
+- when one step of thinking about a recording failed the same way every time, your journal kept running it over and over. once a step has kept failing like that for a couple of hours, your journal now stops repeating it and lists it in health's set-aside work, where you can try again. it also tries once more on its own when the recording changes or an update fixes that failure. while the step is set aside, that day's daily outputs wait for it, so nothing from the recording is left out.
 - health counted some set-aside work, like a story your journal couldn't use, as work still left, so it kept saying your journal was still catching up on older days. everything in the set-aside list now counts as set aside.
-- health's line about older history now moves as your journal works back through older recordings. before, it could stay on one date for weeks while a few newer days waited only for their daily outputs to be updated. those updates still count in what's left. the line also stays on screen while your journal checks its work, and no longer switches to "last checked" just because the next check starts a few minutes later than planned.
+- health's line about older history now moves as your journal works back through older recordings. before, it could stay on one date while a few newer days waited only for their daily outputs to be updated. those updates still count in what's left. the line also stays on screen while your journal checks its work, and no longer switches to "last checked" just because the next check starts a few minutes later than planned.
 
 ## [2.0.46] - 2026-10-14
 

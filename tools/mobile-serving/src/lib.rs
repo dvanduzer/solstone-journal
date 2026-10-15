@@ -14,13 +14,14 @@ use std::{
     net::SocketAddrV4,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
 };
 
+mod backup;
 mod brain;
 
 #[cfg(feature = "audio")]
@@ -41,11 +42,48 @@ pub struct MobileServing {
     runtime: tokio::runtime::Runtime,
     root: Arc<JournalRoot>,
     services: Mutex<Option<AppServices>>,
+    shutdown_complete: std::sync::atomic::AtomicBool,
+    shutdown_failed: std::sync::atomic::AtomicBool,
+    service_failures: Mutex<Vec<tokio::task::JoinError>>,
+    #[cfg(all(test, feature = "full-tests"))]
+    shutdown_test_fault: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[derive(Debug)]
+pub struct ShutdownFailure;
+
+/// Startup can expose the authenticated door before a consumer refuses readiness.
+/// The caller must retain and retire this actual owner before allowing replacement.
+pub struct StartupFailure {
+    message: String,
+    owner: Option<Box<MobileServing>>,
+}
+
+impl StartupFailure {
+    pub fn into_parts(self) -> (String, Option<Box<MobileServing>>) {
+        (self.message, self.owner)
+    }
+}
+
+impl From<String> for StartupFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            owner: None,
+        }
+    }
+}
+
+impl From<&str> for StartupFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
 }
 
 struct AppServices {
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    backup: JoinHandle<Result<(), tokio::task::JoinError>>,
 }
 
 impl MobileServing {
@@ -66,6 +104,31 @@ impl MobileServing {
         address: SocketAddrV4,
         payload_root: Option<PathBuf>,
     ) -> Result<Self, String> {
+        Self::start_using_owned(root, address, payload_root).map_err(|failure| {
+            let (message, owner) = failure.into_parts();
+            if let Some(owner) = owner {
+                // Existing synchronous callers keep the complete owner until
+                // settlement. JNI uses the owned API and observes it separately.
+                owner.shutdown();
+            }
+            message
+        })
+    }
+
+    /// Return any exposed startup owner for caller-owned asynchronous retirement.
+    pub fn start_with_payload_for_retirement(
+        root: PathBuf,
+        address: SocketAddrV4,
+        payload_root: PathBuf,
+    ) -> Result<Self, StartupFailure> {
+        Self::start_using_owned(root, address, Some(payload_root))
+    }
+
+    fn start_using_owned(
+        root: PathBuf,
+        address: SocketAddrV4,
+        payload_root: Option<PathBuf>,
+    ) -> Result<Self, StartupFailure> {
         if address.ip().is_unspecified() || address.ip().is_multicast() || address.port() == 0 {
             return Err("an explicit interface address and nonzero port are required".into());
         }
@@ -103,21 +166,13 @@ impl MobileServing {
         let (shutdown, mut stop) = watch::channel(false);
         let (ready, registered) = oneshot::channel();
         let brain_task = runtime.spawn(brain::run(Arc::clone(&root), stop.clone(), ready));
-        let brain_ready = runtime.block_on(async {
-            matches!(
-                tokio::time::timeout(Duration::from_secs(5), registered).await,
-                Ok(Ok(()))
-            )
-        });
-        if !brain_ready {
-            let _ = shutdown.send(true);
-            runtime.block_on(async {
-                let _ = brain_task.await;
-                handle.shutdown_and_wait().await;
-                bus.stop().await;
-            });
-            return Err("embedded Brain consumer did not register".into());
-        }
+        let (backup_ready, subscribed) = oneshot::channel();
+        let backup_task = runtime.spawn(backup::run(
+            Arc::clone(&root),
+            handle.backup_dependencies(),
+            stop.clone(),
+            backup_ready,
+        ));
         let mcp_root = root.canonical_path().to_path_buf();
         let mut mcp_stop = stop.clone();
         let mcp_task = runtime.spawn(async move {
@@ -166,7 +221,7 @@ impl MobileServing {
                 }
             }
         });
-        Ok(Self {
+        let owner = Self {
             #[cfg(feature = "audio")]
             audio: None,
             bus,
@@ -176,8 +231,53 @@ impl MobileServing {
             services: Mutex::new(Some(AppServices {
                 shutdown,
                 tasks: vec![brain_task, relay_task, mcp_task],
+                backup: backup_task,
             })),
-        })
+            shutdown_complete: std::sync::atomic::AtomicBool::new(false),
+            shutdown_failed: std::sync::atomic::AtomicBool::new(false),
+            service_failures: Mutex::new(Vec::new()),
+            #[cfg(all(test, feature = "full-tests"))]
+            shutdown_test_fault: Mutex::new(None),
+        };
+        owner.finish_registration(registered, subscribed)
+    }
+
+    fn finish_registration(
+        self,
+        brain_registered: oneshot::Receiver<()>,
+        backup_registered: oneshot::Receiver<()>,
+    ) -> Result<Self, StartupFailure> {
+        for (registered, message) in [
+            (brain_registered, "embedded Brain consumer did not register"),
+            (
+                backup_registered,
+                "embedded backup consumer did not register",
+            ),
+        ] {
+            let ready = self.runtime.block_on(async {
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(5), registered).await,
+                    Ok(Ok(()))
+                )
+            });
+            if !ready {
+                self.handle.backup_dependencies().lifetime().request_stop();
+                self.handle.shutdown();
+                if let Some(services) = self
+                    .services
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                {
+                    services.shutdown.send_replace(true);
+                }
+                return Err(StartupFailure {
+                    message: message.into(),
+                    owner: Some(Box::new(self)),
+                });
+            }
+        }
+        Ok(self)
     }
 
     pub fn status(&self) -> Value {
@@ -276,25 +376,92 @@ impl MobileServing {
         )
     }
 
-    pub fn shutdown(&self) {
+    /// Close and settle the actual app-owned services before destroying this owner.
+    /// On failure the caller must retain this value, including its Runtime.
+    pub fn shutdown_for_retirement(&self) -> Result<(), ShutdownFailure> {
+        use std::sync::atomic::Ordering;
+        if self.shutdown_failed.load(Ordering::Acquire) {
+            return Err(ShutdownFailure);
+        }
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
         #[cfg(feature = "audio")]
         if let Some(audio) = &self.audio {
             audio.stop();
         }
-        // Keep retirement serialized through the final bus stop. A concurrent
-        // caller must not observe the empty slot as proof of a completed stop.
         let mut service_owner = self.services.lock().unwrap_or_else(|p| p.into_inner());
+        if self.shutdown_failed.load(Ordering::Acquire) {
+            return Err(ShutdownFailure);
+        }
+        if self.shutdown_complete.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let lifetime = self.handle.backup_dependencies().lifetime();
+        lifetime.request_stop();
+        #[cfg(all(test, feature = "full-tests"))]
+        {
+            let fault = self.shutdown_test_fault.lock().unwrap().take();
+            if let Some(fault) = fault {
+                fault();
+            }
+        }
+        self.handle.shutdown();
         if let Some(services) = service_owner.take() {
             let _ = services.shutdown.send(true);
             self.runtime.block_on(async {
                 for task in services.tasks {
-                    let _ = task.await;
+                    if let Err(failure) = task.await {
+                        self.service_failures
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(failure);
+                        self.shutdown_failed.store(true, Ordering::Release);
+                    }
+                }
+                let failure = match services.backup.await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(failure)) | Err(failure) => Some(failure),
+                };
+                if let Some(failure) = failure {
+                    self.service_failures
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(failure);
+                    self.shutdown_failed.store(true, Ordering::Release);
                 }
             });
+            if self.shutdown_failed.load(Ordering::Acquire) {
+                return Err(ShutdownFailure);
+            }
         }
         self.runtime.block_on(self.handle.shutdown_and_wait());
+        loop {
+            match lifetime.drain(
+                self.runtime.handle(),
+                Instant::now() + Duration::from_secs(3600),
+            ) {
+                solstone_core_backup_web::BackupRouteDrain::Drained => break,
+                solstone_core_backup_web::BackupRouteDrain::Pending => continue,
+                solstone_core_backup_web::BackupRouteDrain::Failure => {
+                    self.shutdown_failed.store(true, Ordering::Release);
+                    return Err(ShutdownFailure);
+                }
+            }
+        }
         self.runtime.block_on(self.bus.stop());
+        self.shutdown_complete.store(true, Ordering::Release);
         drop(service_owner);
+        Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        if self.shutdown_for_retirement().is_err() {
+            log::error!("embedded service shutdown failed; actual journal owner retained");
+            loop {
+                std::thread::park();
+            }
+        }
     }
 }
 
@@ -305,8 +472,235 @@ impl Drop for MobileServing {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
+#[path = "../../android-runtime/native/src/retirement.rs"]
+mod android_retirement;
+
+#[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use super::*;
+    fn fixture() -> (MobileServing, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(address) = probe.local_addr().unwrap() else {
+            unreachable!()
+        };
+        drop(probe);
+        let server = MobileServing::start_with_payload(
+            directory.path().to_path_buf(),
+            address,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/payload"),
+        )
+        .unwrap();
+        (server, directory)
+    }
+
+    #[test]
+    fn startup_readiness_refusal_returns_actual_owner_until_admitted_work_settles() {
+        use crate::android_retirement::{Outcome, Retirement};
+        let (server, directory) = fixture();
+        let runtime = server.runtime.handle().clone();
+        let lifetime = server.handle.backup_dependencies().lifetime();
+        let permit = lifetime.admit_maintenance().unwrap();
+        let (release, held) = std::sync::mpsc::channel();
+        let worker = runtime.spawn_blocking(move || {
+            let _permit = permit;
+            held.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let (brain, brain_ready) = oneshot::channel();
+        let (backup, backup_ready) = oneshot::channel();
+        brain.send(()).unwrap();
+        drop(backup); // A real failed registration receiver, after door exposure.
+        let failure = match server.finish_registration(brain_ready, backup_ready) {
+            Ok(_) => panic!("registration must fail"),
+            Err(failure) => failure,
+        };
+        let (message, owner) = failure.into_parts();
+        assert_eq!(message, "embedded backup consumer did not register");
+        let owner = owner.expect("the exposed original owner must be returned");
+        assert!(lifetime.admit_maintenance().is_err());
+        let root = owner.root.clone();
+        let mut retirement = Retirement::start_isolated((*owner, directory), root, |owner| {
+            owner.0.shutdown_for_retirement().map_err(|_| ())
+        })
+        .ok()
+        .unwrap();
+        assert_eq!(retirement.wait(Duration::from_millis(25)), Outcome::Pending);
+        assert_eq!(runtime.block_on(runtime.spawn(async { 46 })).unwrap(), 46);
+        release.send(()).unwrap();
+        runtime.block_on(worker).unwrap();
+        assert_eq!(retirement.wait(Duration::from_secs(5)), Outcome::Stopped);
+    }
+
+    #[test]
+    fn maintenance_join_panic_retains_actual_runtime_and_opaque_payload() {
+        use crate::android_retirement::{Outcome, Retirement};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("failure payload must remain owned");
+            }
+        }
+        let (server, directory) = fixture();
+        let runtime = server.runtime.handle().clone();
+        let lifetime = server.handle.backup_dependencies().lifetime();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let payload = Payload(dropped.clone());
+        let failure = runtime.spawn(async move {
+            tokio::task::spawn_blocking(move || std::panic::panic_any(payload)).await
+        });
+        let old_backup = {
+            let mut services = server.services.lock().unwrap();
+            let services = services.as_mut().unwrap();
+            services.shutdown.send_replace(true);
+            std::mem::replace(&mut services.backup, failure)
+        };
+        runtime.block_on(old_backup).unwrap().unwrap();
+        let root = server.root.clone();
+        let mut retirement = Retirement::start_isolated((server, directory), root, |owner| {
+            owner.0.shutdown_for_retirement().map_err(|_| ())
+        })
+        .ok()
+        .unwrap();
+        assert_eq!(retirement.wait(Duration::from_secs(5)), Outcome::Failed);
+        assert_eq!(retirement.wait(Duration::ZERO), Outcome::Failed);
+        assert_eq!(runtime.block_on(runtime.spawn(async { 47 })).unwrap(), 47);
+        assert!(lifetime.admit_maintenance().is_err());
+        assert!(!dropped.load(Ordering::Acquire));
+        std::mem::forget(retirement);
+    }
+    #[test]
+    fn original_runtime_survives_actual_route_drain_failure() {
+        use crate::android_retirement::{Outcome, Retirement};
+        let directory = tempfile::tempdir().unwrap();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(address) = probe.local_addr().unwrap() else {
+            unreachable!()
+        };
+        drop(probe);
+        let server = MobileServing::start_with_payload(
+            directory.path().to_path_buf(),
+            address,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/payload"),
+        )
+        .unwrap();
+        let runtime = server.runtime.handle().clone();
+        let deps = server.handle.backup_dependencies();
+        let lifetime = deps.lifetime();
+        assert!(
+            std::thread::spawn(move || deps.poison_operation_mutex_for_test())
+                .join()
+                .is_err()
+        );
+        let root = server.root.clone();
+        let identity = Arc::downgrade(&root);
+        let mut retirement = Retirement::start_isolated((server, directory), root, |owner| {
+            owner.0.shutdown_for_retirement().map_err(|_| ())
+        })
+        .ok()
+        .unwrap();
+        assert_eq!(retirement.wait(Duration::from_secs(5)), Outcome::Failed);
+        assert_eq!(retirement.wait(Duration::ZERO), Outcome::Failed);
+        assert_eq!(runtime.block_on(runtime.spawn(async { 44 })).unwrap(), 44);
+        assert!(lifetime.admit_maintenance().is_err());
+        assert!(
+            identity
+                .upgrade()
+                .unwrap()
+                .revalidate_canonical_binding()
+                .is_ok()
+        );
+        // Retain this explicit test parent and the actual failed original owner.
+        // Production's corresponding parent is process-lifetime storage.
+        std::mem::forget(retirement);
+    }
+
+    #[test]
+    fn original_runtime_survives_pre_drained_shutdown_panic() {
+        use crate::android_retirement::{Outcome, Retirement, admission};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("retained panic payload must not drop during observation");
+            }
+        }
+        struct Fixture {
+            server: MobileServing,
+            _directory: tempfile::TempDir,
+        }
+        fn fixture() -> Fixture {
+            let directory = tempfile::tempdir().unwrap();
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let std::net::SocketAddr::V4(address) = probe.local_addr().unwrap() else {
+                unreachable!()
+            };
+            drop(probe);
+            let server = MobileServing::start_with_payload(
+                directory.path().to_path_buf(),
+                address,
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/payload"),
+            )
+            .unwrap();
+            Fixture {
+                server,
+                _directory: directory,
+            }
+        }
+        // Real service stop/start twins consume actual route and native joins.
+        for _ in 0..3 {
+            assert_eq!(admission(), Outcome::Stopped);
+            let owner = fixture();
+            let root = owner.server.root.clone();
+            let mut retirement = Retirement::start(owner, root, |owner| {
+                owner.server.shutdown_for_retirement().map_err(|_| ())
+            })
+            .ok()
+            .unwrap();
+            assert_eq!(retirement.wait(Duration::from_secs(5)), Outcome::Stopped);
+            drop(retirement);
+            assert_eq!(admission(), Outcome::Stopped);
+        }
+        let owner = fixture();
+        let runtime = owner.server.runtime.handle().clone();
+        let lifetime = owner.server.handle.backup_dependencies().lifetime();
+        let root = owner.server.root.clone();
+        let identity = Arc::downgrade(&root);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let payload = Payload(dropped.clone());
+        *owner.server.shutdown_test_fault.lock().unwrap() = Some(Box::new(move || {
+            std::panic::panic_any(payload);
+        }));
+        let mut retirement = Retirement::start(owner, root, |owner| {
+            owner.server.shutdown_for_retirement().map_err(|_| ())
+        })
+        .ok()
+        .unwrap();
+        assert_eq!(retirement.wait(Duration::from_secs(5)), Outcome::Failed);
+        assert_eq!(retirement.wait(Duration::ZERO), Outcome::Failed);
+        assert_eq!(runtime.block_on(runtime.spawn(async { 42 })).unwrap(), 42);
+        assert!(lifetime.admit_maintenance().is_err());
+        assert!(
+            identity
+                .upgrade()
+                .unwrap()
+                .revalidate_canonical_binding()
+                .is_ok()
+        );
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(retirement);
+        assert_eq!(admission(), Outcome::Failed);
+        assert_eq!(
+            crate::android_retirement::wait_for_process(Duration::ZERO),
+            Outcome::Failed
+        );
+        assert_eq!(runtime.block_on(runtime.spawn(async { 43 })).unwrap(), 43);
+        assert!(!dropped.load(Ordering::Acquire));
+        // The intentional Failed process record keeps this actual owner/fixture.
+    }
+
     #[test]
     fn synchronous_app_start_setup_and_stop() {
         let root = tempfile::tempdir().unwrap();

@@ -8,7 +8,7 @@ use crate::operation;
 #[cfg(all(
     test,
     feature = "full-tests",
-    any(target_os = "linux", target_os = "macos", target_os = "windows")
+    any(target_os = "linux", target_os = "macos")
 ))]
 use solstone_core_backup_runtime::DirectReadFinishState;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -96,6 +96,24 @@ pub(super) struct Custody {
 }
 
 impl Custody {
+    pub(super) fn needs_settlement(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            !self.unused.is_empty()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        false
+    }
+    pub(super) fn worker_running(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            self.worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        false
+    }
     pub(super) fn is_busy(&self) -> bool {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
@@ -108,6 +126,19 @@ impl Custody {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         false
+    }
+
+    pub(super) fn take_finished_worker(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+                self.worker.take()
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        None
     }
 }
 
@@ -132,6 +163,9 @@ pub(crate) fn start(
     let time = u64::try_from(deps.clock.now_unix()).map_err(|_| refuse("failed"))?;
     let mut state =
         operation::lock_for_begin(&deps.operations).map_err(|()| operation::busy_response())?;
+    if state.closed {
+        return Err(operation::busy_response());
+    }
     root.revalidate_canonical_binding()
         .map_err(|_| refuse("restore_held"))?;
     let begin = begin_owned_locked(&mut state, "offload_restore", root, Arc::clone(&deps.clock))
@@ -348,6 +382,58 @@ pub(crate) fn response(
             }
             _ => Some(crate::internal_error()),
         }
+    }
+}
+
+/// Called synchronously inside the worker holding the original admission.
+pub(super) fn settle_closed(state: &mut crate::operation::OperationState) {
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let _ = state;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let pending = &state.archive.restore;
+        if !state.closed
+            || pending.unused.len() != 1
+            || pending
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+            || !state.archive.retained.is_empty()
+        {
+            return;
+        }
+        let unused = &pending.unused[0];
+        let ticket = &unused.input.begin.ticket;
+        if !current_matches(state, ticket)
+            || state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.worker_active)
+            || ticket.0.root.revalidate_canonical_binding().is_err()
+        {
+            return;
+        }
+        let mut view = state
+            .current
+            .as_ref()
+            .expect("matching restore")
+            .view
+            .clone();
+        if !operation::is_terminal(&view.phase) {
+            let reason = unused.refusal.reason();
+            view.phase = "refused".into();
+            view.reason_code = Some(reason.clone());
+            if let UnusedRefusal::Tools(error) = &unused.refusal {
+                view.detail = Some(error.detail().into());
+                view.guidance = Some(error.guidance().into());
+            }
+            view.report = Some(json!({"status":"refused", "reason":reason,
+                "scope":if unused.input.day.is_some() {"day"} else {"all"},
+                "day":unused.input.day,"files_restored":0,"bytes_restored":0}));
+        }
+        state.current.as_mut().expect("matching restore").view = view;
+        drop(state.archive.restore.unused.pop());
+        state.archive.reservation = None;
     }
 }
 

@@ -76,6 +76,9 @@ pub(super) struct ApprovalCustody {
 }
 
 impl ApprovalCustody {
+    pub(super) fn needs_settlement(&self) -> bool {
+        !self.unused.is_empty()
+    }
     pub(super) fn is_busy(&self) -> bool {
         self.input.is_some()
             || !self.unused.is_empty()
@@ -86,12 +89,21 @@ impl ApprovalCustody {
                 .is_some_and(|worker| !worker.is_finished())
     }
 
-    fn settled(&self) -> bool {
+    pub(super) fn settled(&self) -> bool {
         self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    pub(super) fn take_finished_worker(&mut self) -> Option<JoinHandle<()>> {
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.worker.take()
+        } else {
+            None
+        }
     }
 
     /// Record a refused approval whose whole return was released.
     pub(super) fn discharge(&mut self, terminal: &Terminal) {
+        self.refused_selection = None;
         self.discharged_refusal = Some(
             terminal
                 .reason_code
@@ -99,6 +111,30 @@ impl ApprovalCustody {
                 .unwrap_or_else(|| "failed".into()),
         );
     }
+}
+
+pub(super) fn settle_closed(state: &mut OperationState) {
+    if !state.closed || !state.archive.approval.settled() {
+        return;
+    }
+    let approval = &state.archive.approval;
+    if approval.unused.len() != 1
+        || !current_matches(state, &approval.unused[0].input.begin.ticket)
+        || state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.worker_active)
+    {
+        return;
+    }
+    let reason = unused_reason(&approval.unused[0].refusal);
+    operation::apply_terminal(
+        state.current.as_mut().expect("matching current"),
+        Terminal::error(reason.clone()),
+    );
+    state.archive.approval.discharged_refusal = Some(reason);
+    drop(state.archive.approval.unused.pop());
+    state.archive.reservation = None;
 }
 
 #[derive(Debug)]
@@ -150,6 +186,9 @@ pub fn start(
     // Proof rechecks the entire selection and every repository before release.
     let mut state = operation::lock_for_begin(&deps.operations)
         .map_err(|()| ApprovalStartRefusal::Begin(ArchiveBeginRefusal::Busy))?;
+    if state.closed {
+        return Err(ApprovalStartRefusal::Begin(ArchiveBeginRefusal::Busy));
+    }
     let begin = begin_owned_locked(&mut state, KIND, root, Arc::clone(&deps.clock))
         .map_err(ApprovalStartRefusal::Begin)?;
     let generation = begin.generation();

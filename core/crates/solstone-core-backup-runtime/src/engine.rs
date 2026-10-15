@@ -27,7 +27,8 @@ use crate::runner::{ToolRunner, reason_for_returncode, run_restic, select_summar
 pub const ARCHIVE_TAG: &str = "solstone-archive";
 use solstone_core_backup::archive_activity::{
     ArchiveOperationPreparationFailure, OwnedArchivePreparationFailure, OwnedPreparedArchiveHold,
-    OwnedPreparedArchiveOperation, PreparedArchiveOperation,
+    OwnedPreparedArchiveOperation, OwnedUnusedArchiveRetirement, PreparedArchiveOperation,
+    UnusedArchiveRelease,
 };
 pub use solstone_core_backup::archive_admission::{
     ARCHIVE_BACKUP_TIMEOUT_SECONDS, ARCHIVE_LS_TIMEOUT_SECONDS, Clock,
@@ -795,6 +796,9 @@ thread_local! {
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
+    #[cfg(target_os = "android")]
+    static BACKUP_PATH_RESOLUTION_ATTEMPTS: Box<std::cell::Cell<u32>> = Box::new(std::cell::Cell::new(0));
+    #[cfg(not(target_os = "android"))]
     static BACKUP_PATH_RESOLUTION_ATTEMPTS: std::cell::Cell<u32> = const {
         std::cell::Cell::new(0)
     };
@@ -802,6 +806,9 @@ thread_local! {
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
+    #[cfg(target_os = "android")]
+    static BACKUP_RECORD_FAILURE_TARGET: Box<std::cell::RefCell<Option<PathBuf>>> = Box::new(std::cell::RefCell::new(None));
+    #[cfg(not(target_os = "android"))]
     static BACKUP_RECORD_FAILURE_TARGET: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
@@ -809,6 +816,9 @@ thread_local! {
 
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
+    #[cfg(target_os = "android")]
+    static BACKUP_RECORD_FAILURE_CONSUMED_TARGET: Box<std::cell::RefCell<Option<PathBuf>>> = Box::new(std::cell::RefCell::new(None));
+    #[cfg(not(target_os = "android"))]
     static BACKUP_RECORD_FAILURE_CONSUMED_TARGET: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
@@ -1006,7 +1016,7 @@ pub fn reset_backup_path_resolution_attempts() {
 /// Test-only instrumentation: read the per-thread `resolve_backup_journal` attempt count.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn backup_path_resolution_attempts() -> u32 {
-    BACKUP_PATH_RESOLUTION_ATTEMPTS.with(std::cell::Cell::get)
+    BACKUP_PATH_RESOLUTION_ATTEMPTS.with(|count| count.get())
 }
 fn snapshot_id(value: Option<&Value>) -> Option<String> {
     select_summary(value?)
@@ -1969,8 +1979,15 @@ enum ClosedArchiveAdmissionOwner {
     Preparation(Box<OwnedArchivePreparationFailure>),
     Readback(Box<OwnedReadbackAdmissionError>),
     Admitted(Box<OwnedAdmittedArchiveHold>),
+    Retired(Box<OwnedUnusedArchiveRetirement>),
 }
 impl OwnedArchiveAdmissionFailure {
+    pub fn unused_retirement(&self) -> Option<&OwnedUnusedArchiveRetirement> {
+        match &self.inner.owned {
+            ClosedArchiveAdmissionOwner::Retired(retirement) => Some(retirement),
+            _ => None,
+        }
+    }
     #[cfg(all(windows, feature = "test-support"))]
     #[doc(hidden)]
     pub fn from_readback_refusal_for_test(readback: OwnedReadbackAdmissionError) -> Self {
@@ -1999,6 +2016,7 @@ impl OwnedArchiveAdmissionFailure {
             ClosedArchiveAdmissionOwner::Preparation(preparation) => preparation.journal_root(),
             ClosedArchiveAdmissionOwner::Readback(readback) => readback.journal_root(),
             ClosedArchiveAdmissionOwner::Admitted(admitted) => admitted.journal_root(),
+            ClosedArchiveAdmissionOwner::Retired(retirement) => retirement.journal_root(),
         }
     }
     pub fn carrier(&self) -> Option<&Arc<solstone_core_journal_io::media::RootActivityCarrier>> {
@@ -2008,6 +2026,7 @@ impl OwnedArchiveAdmissionFailure {
             ClosedArchiveAdmissionOwner::Preparation(preparation) => preparation.carrier(),
             ClosedArchiveAdmissionOwner::Readback(readback) => Some(readback.carrier()),
             ClosedArchiveAdmissionOwner::Admitted(admitted) => Some(admitted.carrier()),
+            ClosedArchiveAdmissionOwner::Retired(_) => None,
         }
     }
     pub fn owned_clock(&self) -> Option<&Arc<dyn Clock + Send + Sync>> {
@@ -2019,6 +2038,7 @@ impl OwnedArchiveAdmissionFailure {
             }
             ClosedArchiveAdmissionOwner::Readback(readback) => Some(readback.owned_clock()),
             ClosedArchiveAdmissionOwner::Admitted(admitted) => Some(admitted.owned_clock()),
+            ClosedArchiveAdmissionOwner::Retired(retirement) => Some(retirement.owned_clock()),
         }
     }
     /// End a refused admission that leaves nothing running or written. Its
@@ -2042,19 +2062,42 @@ impl OwnedArchiveAdmissionFailure {
         match owned {
             ClosedArchiveAdmissionOwner::BeforePreparation(_) => Ok(()),
             ClosedArchiveAdmissionOwner::Prepared(operation) => {
-                operation.release_unused();
-                Ok(())
+                operation.retire_unused().map_err(|retirement| {
+                    held(ClosedArchiveAdmissionOwner::Retired(Box::new(retirement)))
+                })
             }
             ClosedArchiveAdmissionOwner::Preparation(preparation) => {
-                preparation.release();
-                Ok(())
+                preparation.retire_unused().map_err(|retirement| {
+                    held(ClosedArchiveAdmissionOwner::Retired(Box::new(retirement)))
+                })
             }
-            ClosedArchiveAdmissionOwner::Readback(readback) => readback
-                .release()
-                .map_err(|readback| held(ClosedArchiveAdmissionOwner::Readback(readback))),
-            ClosedArchiveAdmissionOwner::Admitted(admitted) => admitted
-                .release_unused()
-                .map_err(|admitted| held(ClosedArchiveAdmissionOwner::Admitted(admitted))),
+            ClosedArchiveAdmissionOwner::Readback(readback) => {
+                readback.release_retained().map_err(|refusal| {
+                    held(match refusal {
+                        UnusedArchiveRelease::Held(readback) => {
+                            ClosedArchiveAdmissionOwner::Readback(readback)
+                        }
+                        UnusedArchiveRelease::Retired(retirement) => {
+                            ClosedArchiveAdmissionOwner::Retired(Box::new(retirement))
+                        }
+                    })
+                })
+            }
+            ClosedArchiveAdmissionOwner::Admitted(admitted) => {
+                admitted.release_retained().map_err(|refusal| {
+                    held(match refusal {
+                        UnusedArchiveRelease::Held(admitted) => {
+                            ClosedArchiveAdmissionOwner::Admitted(admitted)
+                        }
+                        UnusedArchiveRelease::Retired(retirement) => {
+                            ClosedArchiveAdmissionOwner::Retired(Box::new(retirement))
+                        }
+                    })
+                })
+            }
+            ClosedArchiveAdmissionOwner::Retired(retirement) => {
+                Err(held(ClosedArchiveAdmissionOwner::Retired(retirement)))
+            }
         }
     }
 }
@@ -3080,6 +3123,42 @@ impl OwnedAdmittedArchiveHold {
         match *self.inner {
             OwnedAdmittedArchiveHoldInner::Direct(read) => {
                 (*read).release_unused().map_err(|read| {
+                    Box::new(Self {
+                        inner: Box::new(OwnedAdmittedArchiveHoldInner::Direct(read)),
+                    })
+                })
+            }
+            inner => Err(Box::new(Self {
+                inner: Box::new(inner),
+            })),
+        }
+    }
+
+    fn release_retained(self) -> Result<(), UnusedArchiveRelease<Box<Self>>> {
+        match *self.inner {
+            OwnedAdmittedArchiveHoldInner::Direct(read) => {
+                (*read).release_retained().map_err(|refusal| match refusal {
+                    UnusedArchiveRelease::Held(read) => {
+                        UnusedArchiveRelease::Held(Box::new(Self {
+                            inner: Box::new(OwnedAdmittedArchiveHoldInner::Direct(read)),
+                        }))
+                    }
+                    UnusedArchiveRelease::Retired(retirement) => {
+                        UnusedArchiveRelease::Retired(retirement)
+                    }
+                })
+            }
+            inner => Err(UnusedArchiveRelease::Held(Box::new(Self {
+                inner: Box::new(inner),
+            }))),
+        }
+    }
+
+    /// Return a quiescent refused direct read to its original finish owner.
+    pub fn release_refused(self) -> Result<RefusedDirectRead, Box<Self>> {
+        match *self.inner {
+            OwnedAdmittedArchiveHoldInner::Direct(read) => {
+                (*read).release_refused().map_err(|read| {
                     Box::new(Self {
                         inner: Box::new(OwnedAdmittedArchiveHoldInner::Direct(read)),
                     })

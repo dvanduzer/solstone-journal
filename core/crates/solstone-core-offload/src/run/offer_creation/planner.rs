@@ -23,6 +23,9 @@ pub use owning::{
 
 #[cfg(all(test, unix, feature = "full-tests"))]
 thread_local! {
+    #[cfg(target_os = "android")]
+    static PAYLOAD_CAPACITY_FAULT: Box<std::cell::Cell<bool>> = Box::new(std::cell::Cell::new(false));
+    #[cfg(not(target_os = "android"))]
     static PAYLOAD_CAPACITY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

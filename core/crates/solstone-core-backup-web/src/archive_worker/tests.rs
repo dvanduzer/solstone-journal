@@ -39,6 +39,171 @@ fn closed(begin: OwnedArchiveBegin) -> (ArchiveTicket, ArchivePreparationCustody
     (ticket, custody, ArchivePayload::Prepared(Box::new(owner)))
 }
 
+#[cfg(unix)]
+#[test]
+fn unused_native_retirement_fault_retains_actual_custody_across_closed_drains() {
+    use crate::{BackupRouteDrain, BackupWebDeps};
+    use solstone_core_journal_io::media::{MediaPrimitive, run_with_media_hook};
+    use std::time::Instant;
+    for kind in ["prepared", "preparation_failure", "admission_failure"] {
+        for fault in [
+            None,
+            Some(MediaPrimitive::CarrierRetirementRootSync),
+            Some(MediaPrimitive::CarrierRetirementConfirmation),
+        ] {
+            let (dir, root, clock, slot) = fixture();
+            let mut deps = BackupWebDeps::new(dir.path().to_path_buf());
+            deps.operations = Arc::clone(&slot);
+            let lifetime = deps.lifetime();
+            let before = std::fs::read(dir.path().join("config/journal.json")).unwrap();
+            let begin = begin_owned(
+                &slot,
+                "offload_restore",
+                Arc::clone(&root),
+                Arc::clone(&clock),
+            )
+            .unwrap();
+            let worker_slot = Arc::clone(&slot);
+            let worker_before = before.clone();
+            let (ready, entered) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            // Register the actual admitted worker while holding its slot. The
+            // drain, rather than this test caller, owns its eventual join.
+            let mut state = slot.lock().unwrap();
+            state.threads.push(thread::spawn(move || {
+                let work = || {
+                    if kind == "admission_failure" {
+                        assert!(
+                            prepare_read_in(
+                                &worker_slot,
+                                begin,
+                                None,
+                                Path::new("/must-not-open/restic")
+                            )
+                            .is_none()
+                        );
+                        return;
+                    }
+                    assert!(start_owned_worker(&worker_slot, &begin.ticket));
+                    let (ticket, root, budget, clock) = begin.into_parts();
+                    let (input, custody) =
+                        OwnedArchivePreparationInput::capture(Arc::clone(&root), budget, clock)
+                            .unwrap_or_else(|_| panic!("actual capture"));
+                    let payload = if kind == "preparation_failure" {
+                        std::fs::write(
+                            root.canonical_path().join("config/journal.json"),
+                            b"{broken",
+                        )
+                        .unwrap();
+                        let failure = input
+                            .prepare()
+                            .err()
+                            .expect("actual config preparation refusal");
+                        std::fs::write(
+                            root.canonical_path().join("config/journal.json"),
+                            &worker_before,
+                        )
+                        .unwrap();
+                        ArchivePayload::PreparationFailure(Box::new(failure))
+                    } else {
+                        ArchivePayload::Prepared(Box::new(
+                            input
+                                .prepare()
+                                .unwrap_or_else(|_| panic!("actual preparation"))
+                                .into_owned_hold(),
+                        ))
+                    };
+                    return_owned(
+                        &worker_slot,
+                        ticket,
+                        Some(custody),
+                        payload,
+                        Terminal::error("failed"),
+                    );
+                };
+                let fired = if let Some(fault) = fault {
+                    let (_, fired) = run_with_media_hook(
+                        fault,
+                        || Err(io::Error::other("unused retirement fault")),
+                        work,
+                    );
+                    fired
+                } else {
+                    work();
+                    false
+                };
+                ready.send(fired).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            drop(state);
+            assert_eq!(
+                entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+                fault.is_some(),
+                "{kind} {fault:?}"
+            );
+            lifetime.request_stop();
+            assert_eq!(
+                lifetime.drain(crate::test_support::join_executor(), Instant::now()),
+                BackupRouteDrain::Pending
+            );
+            assert_eq!(
+                lifetime
+                    .clone()
+                    .drain(crate::test_support::join_executor(), Instant::now()),
+                BackupRouteDrain::Pending
+            );
+            release.send(()).unwrap();
+            let outcome = lifetime.drain(
+                crate::test_support::join_executor(),
+                Instant::now() + Duration::from_secs(5),
+            );
+            if fault.is_some() {
+                assert_eq!(outcome, BackupRouteDrain::Pending, "{kind} {fault:?}");
+                assert_eq!(
+                    lifetime
+                        .clone()
+                        .drain(crate::test_support::join_executor(), Instant::now()),
+                    BackupRouteDrain::Pending
+                );
+                let state = slot.lock().unwrap();
+                assert!(
+                    state.threads.is_empty(),
+                    "actual worker must already have joined"
+                );
+                let retained = state
+                    .archive
+                    .retained
+                    .first()
+                    .expect("actual closed native owner retained");
+                assert!(
+                    retained
+                        .payload
+                        .matches(&retained.ticket.0, retained.custody.as_ref())
+                );
+                assert!(matches!(
+                    retained.payload,
+                    ArchivePayload::UnusedRetirement(_) | ArchivePayload::AdmissionFailure(_)
+                ));
+                assert!(matches!(
+                    ActivityLease::try_acquire(Arc::clone(&root)),
+                    Err(ActivityAdmissionError::Busy)
+                ));
+                assert!(matches!(
+                    TeardownLease::try_acquire(Arc::clone(&root)),
+                    Err(ActivityAdmissionError::Busy)
+                ));
+            } else {
+                assert_eq!(outcome, BackupRouteDrain::Drained, "{kind}");
+                assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_ok());
+            }
+            assert_eq!(
+                std::fs::read(dir.path().join("config/journal.json")).unwrap(),
+                before
+            );
+        }
+    }
+}
+
 fn terminal() -> Terminal {
     Terminal {
         phase: "degraded".into(),

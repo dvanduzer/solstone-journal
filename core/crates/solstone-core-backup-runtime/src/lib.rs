@@ -17,7 +17,12 @@
 //! use solstone_core_backup_runtime::backup_journal_resolved_hook_armed;
 //! ```
 
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 mod controlled_http;
 pub mod destination;
 pub mod destination_admission;

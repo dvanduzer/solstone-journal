@@ -83,10 +83,13 @@ async fn late_poll_failures_preserve_callback_admission_and_complete_worker_term
                         wait_lease_released(&deps, &http).await;
                         assert!(operation::is_busy(&deps.operations));
                     }
-                    operation::spawn_worker(deps.operations.clone(), generation, full_terminal)
-                        .unwrap()
-                        .join()
-                        .unwrap();
+                    assert!(operation::spawn_worker(
+                        deps.operations.clone(),
+                        generation,
+                        full_terminal
+                    ));
+                    let handle = deps.operations.lock().unwrap().threads.pop().unwrap();
+                    handle.join().unwrap();
                     if worker_first {
                         assert!(operation::is_busy(&deps.operations));
                         assert!(!operation::mark_cancelled(&deps.operations, generation));
@@ -228,11 +231,15 @@ async fn settled_poll_cannot_finish_a_paused_successor_closure() {
             operation::match_handoff(&deps.operations, "owned-nonce", None)
                 .unwrap_or_else(|_| panic!("nonce"));
             let paused = worker_hold.clone();
-            let worker = operation::spawn_worker(deps.operations.clone(), generation, move || {
-                paused.arrive_and_wait().unwrap();
-                full_terminal()
-            })
-            .unwrap();
+            assert!(operation::spawn_worker(
+                deps.operations.clone(),
+                generation,
+                move || {
+                    paused.arrive_and_wait().unwrap();
+                    full_terminal()
+                }
+            ));
+            let worker = deps.operations.lock().unwrap().threads.pop().unwrap();
             wait_started_or_terminal(&worker_hold, &deps, generation)
                 .await
                 .unwrap();

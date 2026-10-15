@@ -242,8 +242,10 @@ async fn status_shape_preserves_backup_phase_discrimination() {
         assert_eq!(status, 200);
         assert_eq!(
             body.as_object().expect("object").len(),
-            18 + usize::from(cfg!(windows))
+            20 + usize::from(cfg!(windows))
         );
+        assert_eq!(body["recovery_key_revocation_pending"], false);
+        assert_eq!(body["recovery_key_revocation_unresolved"], false);
         #[cfg(windows)]
         assert_eq!(body["cleanup_admission"], "ready");
         assert!(
@@ -1137,6 +1139,14 @@ impl ToolRunner for ScriptRunner {
         };
         Ok(output)
     }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        _cancellation: &solstone_core_backup::archive_admission::ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        self.run(request)
+    }
 }
 
 #[cfg(feature = "full-tests")]
@@ -1149,6 +1159,14 @@ impl ToolRunner for PanicAfterVersionRunner {
             return Ok(version_output());
         }
         panic!("restore fixture panic")
+    }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        _cancellation: &solstone_core_backup::archive_admission::ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        self.run(request)
     }
 }
 

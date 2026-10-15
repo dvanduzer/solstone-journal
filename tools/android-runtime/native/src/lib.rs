@@ -11,10 +11,47 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+mod retirement;
+
 static CANCEL: AtomicBool = AtomicBool::new(false);
 struct ServingInstance {
-    handle: journal_mobile_serving::MobileServing,
+    handle: Option<journal_mobile_serving::MobileServing>,
+    retirement: Option<retirement::Retirement>,
     root: std::sync::Arc<jio::JournalRoot>,
+}
+
+impl ServingInstance {
+    fn begin_retirement(&mut self) -> Result<(), String> {
+        if self.retirement.is_some() {
+            return Ok(());
+        }
+        let handle = self
+            .handle
+            .take()
+            .ok_or("server stop failed; journal retained")?;
+        match retirement::Retirement::start(handle, std::sync::Arc::clone(&self.root), |owner| {
+            owner.shutdown_for_retirement().map_err(|_| ())
+        }) {
+            Ok(retirement) => {
+                self.retirement = Some(retirement);
+                Ok(())
+            }
+            Err(handle) => {
+                self.handle = Some(handle);
+                Err("could not start server retirement; journal retained".into())
+            }
+        }
+    }
+    fn handle(&self) -> Result<&journal_mobile_serving::MobileServing, String> {
+        self.handle
+            .as_ref()
+            .ok_or_else(|| "server stop pending".into())
+    }
+    fn handle_mut(&mut self) -> Result<&mut journal_mobile_serving::MobileServing, String> {
+        self.handle
+            .as_mut()
+            .ok_or_else(|| "server stop pending".into())
+    }
 }
 
 static SERVING: std::sync::Mutex<Option<ServingInstance>> = std::sync::Mutex::new(None);
@@ -38,6 +75,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
         let binding = {
             let server = SERVING.lock().map_err(|_| "serving lock poisoned")?;
             let current = server.as_ref().ok_or("server stopped")?;
+            current.handle()?;
             current
                 .root
                 .revalidate_canonical_binding()
@@ -101,6 +139,24 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
     let mut server = SERVING.lock().map_err(|_| "serving lock poisoned")?;
     match operation {
         "start" => {
+            match retirement::admission() {
+                retirement::Outcome::Stopped => {}
+                retirement::Outcome::Pending => return Err("server stop pending".into()),
+                retirement::Outcome::Failed => {
+                    return Err("server stop failed; journal retained".into());
+                }
+            }
+            if let Some(current) = server.as_mut()
+                && let Some(retirement) = current.retirement.as_mut()
+            {
+                match retirement.wait(std::time::Duration::ZERO) {
+                    retirement::Outcome::Stopped => *server = None,
+                    retirement::Outcome::Pending => return Err("server stop pending".into()),
+                    retirement::Outcome::Failed => {
+                        return Err("server stop failed; journal retained".into());
+                    }
+                }
+            }
             if server.is_some() {
                 return Err("server already started".into());
             }
@@ -116,26 +172,82 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             ort::init_from(library).map_err(|e| e.to_string())?.commit();
             let binding =
                 std::sync::Arc::new(jio::JournalRoot::open(root).map_err(|e| e.to_string())?);
-            let handle = journal_mobile_serving::MobileServing::start_with_payload(
-                root.to_path_buf(),
-                address,
-                root.parent()
-                    .ok_or("app directory missing")?
-                    .join("journal-payload"),
-            )?;
+            let handle =
+                match journal_mobile_serving::MobileServing::start_with_payload_for_retirement(
+                    root.to_path_buf(),
+                    address,
+                    root.parent()
+                        .ok_or("app directory missing")?
+                        .join("journal-payload"),
+                ) {
+                    Ok(handle) => handle,
+                    Err(failure) => {
+                        let (message, owner) = failure.into_parts();
+                        if let Some(owner) = owner {
+                            let mut current = ServingInstance {
+                                handle: Some(*owner),
+                                retirement: None,
+                                root: binding,
+                            };
+                            let _ = current.begin_retirement();
+                            *server = Some(current);
+                        }
+                        return Err(message);
+                    }
+                };
             *server = Some(ServingInstance {
-                handle,
+                handle: Some(handle),
+                retirement: None,
                 root: binding,
             });
-            Ok(server.as_ref().unwrap().handle.status())
+            Ok(server.as_ref().unwrap().handle()?.status())
         }
         "stop" => {
+            if let Some(current) = server.as_mut() {
+                current.begin_retirement()?;
+                match current
+                    .retirement
+                    .as_mut()
+                    .unwrap()
+                    .wait(std::time::Duration::ZERO)
+                {
+                    retirement::Outcome::Stopped => {}
+                    retirement::Outcome::Pending => {}
+                    retirement::Outcome::Failed => {
+                        return Err("server stop failed; journal retained".into());
+                    }
+                }
+            }
+            match retirement::wait_for_process(std::time::Duration::from_secs(5)) {
+                retirement::Outcome::Stopped => {}
+                retirement::Outcome::Pending => {
+                    return Err("server stop pending; owned work still active".into());
+                }
+                retirement::Outcome::Failed => {
+                    return Err("server stop failed; journal retained".into());
+                }
+            }
             *server = None;
             GENERATE.drain_idle_pool();
             Ok(json!({"stopped":true}))
         }
-        "status" => Ok(server.as_ref().ok_or("server stopped")?.handle.status()),
-        "index" => server.as_ref().ok_or("server stopped")?.handle.index(),
+        "status" => {
+            let Some(current) = server.as_ref() else {
+                return match retirement::admission() {
+                    retirement::Outcome::Stopped => Err("server stopped".into()),
+                    retirement::Outcome::Pending => Ok(json!({"stopping":true,"failed":false})),
+                    retirement::Outcome::Failed => Ok(json!({"stopping":true,"failed":true})),
+                };
+            };
+            if current.retirement.is_some() {
+                Ok(
+                    json!({"stopping":true,"failed":retirement::admission()==retirement::Outcome::Failed,"root_current":current.root.revalidate_canonical_binding().is_ok()}),
+                )
+            } else {
+                Ok(current.handle()?.status())
+            }
+        }
+        "index" => server.as_ref().ok_or("server stopped")?.handle()?.index(),
         "service-tools" => {
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             let restic = solstone_core_backup_runtime::resolve::resolve_restic_member(&executable)
@@ -155,19 +267,19 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             server
                 .as_mut()
                 .ok_or("server stopped")?
-                .handle
+                .handle_mut()?
                 .enable_audio(
                     files.join("audio-models"),
                     files.join("audio-models/tdt-0.6b-v3-q8_0.gguf"),
                     files.join("audio-scratch"),
                 )?;
-            Ok(server.as_ref().unwrap().handle.status())
+            Ok(server.as_ref().unwrap().handle()?.status())
         }
         "audio-cancel" => {
             server
                 .as_ref()
                 .ok_or("server stopped")?
-                .handle
+                .handle()?
                 .cancel_audio()?;
             Ok(json!({"cancel_requested":true}))
         }
@@ -175,7 +287,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             server
                 .as_ref()
                 .ok_or("server stopped")?
-                .handle
+                .handle()?
                 .resume_audio()?;
             Ok(json!({"resumed":true}))
         }
@@ -183,7 +295,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             let response = server
                 .as_ref()
                 .ok_or("server stopped")?
-                .handle
+                .handle()?
                 .request_owner(
                     command["method"].as_str().ok_or("method required")?,
                     command["uri"].as_str().ok_or("uri required")?,
@@ -719,5 +831,226 @@ pub unsafe extern "C" fn journal_run(
 pub unsafe extern "C" fn journal_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+#[cfg(all(test, feature = "full-tests", target_os = "linux"))]
+mod retirement_start_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    struct HeldTls {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for HeldTls {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(30)).unwrap();
+        }
+    }
+    thread_local! { static TLS: RefCell<Option<HeldTls>> = const { RefCell::new(None) }; }
+    struct Release(Option<mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn native_worker_creation_failure_returns_original_owner() {
+        use std::os::unix::process::CommandExt;
+        let selector = format!(
+            "{}::limited_retirement_child",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &selector, "--ignored", "--test-threads=1"])
+            .env("SOLSTONE_RETIREMENT_SPAWN_FAILURE_CHILD", "1");
+        // RLIMIT_NPROC does not restrict UID0. Only this synthetic child drops UID.
+        if unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("1 passed; 0 failed")
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated ordinary child controls its own thread-creation limit"]
+    fn limited_retirement_child() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        assert_eq!(
+            std::env::var("SOLSTONE_RETIREMENT_SPAWN_FAILURE_CHILD").unwrap(),
+            "1"
+        );
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        let root = Arc::new(());
+        // Initialize and prove the actual executor before denying new OS threads.
+        let mut positive = retirement::Retirement::start((), root.clone(), |_| Ok(()))
+            .ok()
+            .unwrap();
+        assert_eq!(
+            positive.wait(Duration::from_secs(5)),
+            retirement::Outcome::Stopped
+        );
+        drop(positive);
+        struct Owner(Arc<AtomicBool>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let called = Arc::new(AtomicBool::new(false));
+        let call = called.clone();
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut original) },
+            0
+        );
+        let limited = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: original.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limited) }, 0);
+        let result = retirement::Retirement::start(Owner(destroyed.clone()), root, move |_| {
+            call.store(true, Ordering::Release);
+            Ok(())
+        });
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &original) }, 0);
+        let returned = result
+            .err()
+            .expect("real native thread creation must refuse under RLIMIT_NPROC0");
+        assert!(Arc::ptr_eq(&returned.0, &destroyed));
+        assert!(!destroyed.load(Ordering::Acquire));
+        assert!(!called.load(Ordering::Acquire));
+        assert_eq!(retirement::admission(), retirement::Outcome::Stopped);
+        drop(returned);
+        assert!(destroyed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn production_start_requires_real_join_after_local_slot_loss() {
+        let directory = std::env::temp_dir().join(format!(
+            "android-jni-retirement-start-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let first = directory.join("journal");
+        let second = directory.join("other-journal");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let payload = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../core/payload")
+            .canonicalize()
+            .unwrap();
+        std::os::unix::fs::symlink(payload, directory.join("journal-payload")).unwrap();
+        let binding = Arc::new(jio::JournalRoot::open(&first).unwrap());
+        let (entered, observed) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let mut release = Release(Some(release));
+        let observer = retirement::Retirement::start((), binding, move |_| {
+            TLS.with(|tls| {
+                *tls.borrow_mut() = Some(HeldTls {
+                    entered,
+                    release: held,
+                })
+            });
+            Ok(())
+        })
+        .ok()
+        .unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(observer);
+        *SERVING.lock().unwrap() = None;
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let library = std::env::var("SOLSTONE_JNI_TEST_ONNX_LIBRARY")
+            .expect("maintained pinned host ONNX input required");
+        let start = json!({"op":"start","address":address,"onnx_library":library}).to_string();
+        for root in [&first, &second] {
+            assert_eq!(serving(root, &start).unwrap_err(), "server stop pending");
+            assert!(SERVING.lock().unwrap().is_none());
+        }
+        assert_eq!(
+            serving(&first, "{\"op\":\"status\"}").unwrap()["stopping"],
+            true
+        );
+        let stopped = Instant::now();
+        assert_eq!(
+            serving(&first, "{\"op\":\"stop\"}").unwrap_err(),
+            "server stop pending; owned work still active"
+        );
+        assert!(stopped.elapsed() < Duration::from_secs(6));
+        assert!(SERVING.lock().unwrap().is_none());
+        release.0.take().unwrap().send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while retirement::admission() == retirement::Outcome::Pending && Instant::now() < deadline {
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+        assert_eq!(retirement::admission(), retirement::Outcome::Stopped);
+        assert_eq!(
+            serving(&first, "{\"op\":\"stop\"}").unwrap()["stopped"],
+            true
+        );
+        assert_eq!(serving(&first, &start).unwrap()["root_current"], true);
+        assert!(SERVING.lock().unwrap().as_ref().unwrap().handle.is_some());
+        assert_eq!(
+            serving(&first, "{\"op\":\"stop\"}").unwrap()["stopped"],
+            true
+        );
+        assert!(SERVING.lock().unwrap().is_none());
+        assert_eq!(retirement::admission(), retirement::Outcome::Stopped);
+        let binding = Arc::new(jio::JournalRoot::open(&first).unwrap());
+        let original = Arc::downgrade(&binding);
+        let mut failed = retirement::Retirement::start((), binding, |_| Err(()))
+            .ok()
+            .unwrap();
+        assert_eq!(
+            failed.wait(Duration::from_secs(5)),
+            retirement::Outcome::Failed
+        );
+        drop(failed);
+        for root in [&first, &second] {
+            assert_eq!(
+                serving(root, &start).unwrap_err(),
+                "server stop failed; journal retained"
+            );
+        }
+        assert_eq!(
+            serving(&first, "{\"op\":\"stop\"}").unwrap_err(),
+            "server stop failed; journal retained"
+        );
+        assert_eq!(
+            serving(&first, "{\"op\":\"status\"}").unwrap()["failed"],
+            true
+        );
+        original
+            .upgrade()
+            .unwrap()
+            .revalidate_canonical_binding()
+            .unwrap();
+        assert!(SERVING.lock().unwrap().is_none());
+        // The process retains this failed owner's root until native process exit.
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

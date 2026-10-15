@@ -43,6 +43,7 @@ pub const RESTORE_REASON_RECOVERY_CONFIRMATION_PUBLISH_FAILED: &str =
     "recovery_confirmation_publish_failed";
 pub const RESTORE_REASON_FULL_SCAN_FAILED: &str = "full_scan_failed";
 pub const RESTORE_REASON_RESTORE_RECORD_FAILED: &str = "restore_record_failed";
+pub const RESTORE_REASON_RECOVERY_KEY_REVOCATION_PENDING: &str = "recovery_key_revocation_pending";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreDraft {
@@ -277,6 +278,17 @@ fn finish(
     publish_restore_outcome(journal, clock, recorder, draft)
 }
 
+/// Refuse restore before it can overwrite an unresolved recovery-key transaction.
+pub fn restore_pending_rotation_refusal(journal: &Path) -> Option<&'static str> {
+    match get_backup_config(journal) {
+        Ok(backup) if backup.contains_key("pending_key_revocation") => {
+            Some(RESTORE_REASON_RECOVERY_KEY_REVOCATION_PENDING)
+        }
+        Ok(_) => None,
+        Err(_) => Some(RESTORE_REASON_DESTINATION_ADMISSION_FAILED),
+    }
+}
+
 /// Restore a BYO repository. The three config setters remain purposefully independent.
 pub fn restore_journal(
     journal: &Path,
@@ -310,6 +322,9 @@ pub fn restore_journal(
             return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
         }
     };
+    if let Some(reason) = restore_pending_rotation_refusal(journal) {
+        return unrecorded_outcome(error_draft(reason));
+    }
     let active_binding = load_hosted_binding(journal);
     let finish = |journal: &Path,
                   clock: &dyn Clock,
@@ -317,6 +332,13 @@ pub fn restore_journal(
                   draft: RestoreDraft| {
         #[cfg(windows)]
         if retaining_runner.cleanup_pending() {
+            return unrecorded_outcome(draft);
+        }
+        if let Some(reason) = restore_pending_rotation_refusal(journal) {
+            let mut draft = draft;
+            draft.status = "error".into();
+            draft.reason_code = Some(reason.into());
+            draft.resumable = false;
             return unrecorded_outcome(draft);
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -477,6 +499,11 @@ pub fn restore_journal(
             Some(counters) => (counters, false),
             None => (RestoreCounters::default(), true),
         };
+    // Restored configuration may contain a still-unresolved transaction. Neither
+    // the entered key nor ordinary restore bookkeeping may overwrite its material.
+    if let Some(reason) = restore_pending_rotation_refusal(journal) {
+        return unrecorded_outcome(counters.into_draft("error", Some(reason.into()), false, false));
+    }
     let check = match restic(
         services,
         &admitted,
@@ -1314,5 +1341,153 @@ mod tests {
         assert_eq!(outcome.recording_failure, None);
         assert_eq!(recorder.calls.borrow().len(), 0);
         assert_eq!(runner.calls.borrow().len(), 0);
+    }
+    #[cfg(feature = "full-tests")]
+    mod pending_rotation {
+        use super::*;
+        use solstone_core_backup::{PendingExecution, PendingKeyRevocation};
+        use std::path::PathBuf;
+
+        fn pending_configuration() -> Vec<u8> {
+            let source = tempfile::tempdir().unwrap();
+            solstone_core_backup::set_destination(source.path(), &destination()).unwrap();
+            let keys = solstone_core_backup::generate_and_store_keys(source.path()).unwrap();
+            let backup = get_backup_config(source.path()).unwrap();
+            let pending = PendingKeyRevocation {
+                original_key_id: "original".into(),
+                candidate_binding: solstone_core_backup::candidate_binding(
+                    &keys.daily_key,
+                    &keys.recovery_key,
+                )
+                .unwrap(),
+                execution: PendingExecution {
+                    mode: "byo".into(),
+                    repository: destination().repository,
+                    backend: destination().backend,
+                    credential_binding: solstone_core_backup::credential_binding(
+                        &keys.daily_key,
+                        &destination().credentials,
+                    )
+                    .unwrap(),
+                },
+                setup_fingerprint: solstone_core_backup::backup_setup_fingerprint(&backup, None),
+            };
+            assert!(
+                PendingKeyRevocation::parse(&serde_json::to_value(&pending).unwrap()).is_some()
+            );
+            let path = source.path().join("config/journal.json");
+            let mut config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            config["backup"]["pending_key_revocation"] = serde_json::to_value(pending).unwrap();
+            config["backup"]["confirmed_recovery_key"] = json!(false);
+            serde_json::to_vec_pretty(&config).unwrap()
+        }
+
+        #[test]
+        fn existing_pending_destination_refuses_before_restore_mutation() {
+            let original = pending_configuration();
+            for pending in [json!(null), json!("unresolved"), json!({"future":true}), serde_json::from_slice::<Value>(&original).unwrap()["backup"]["pending_key_revocation"].clone()] {
+                let journal = tempfile::tempdir().unwrap();
+                std::fs::create_dir(journal.path().join("config")).unwrap();
+                let mut config: Value = serde_json::from_slice(&original).unwrap();
+                config["backup"]["pending_key_revocation"] = pending;
+                let before = serde_json::to_vec_pretty(&config).unwrap();
+                let path = journal.path().join("config/journal.json");
+                std::fs::write(&path, &before).unwrap();
+                let original_note = journal.path().join("original.txt");
+                std::fs::write(&original_note, b"retained original").unwrap();
+                let runner = Script::new(vec![]);
+                let recorder = RestoreRecorderSpy::new();
+                let key = config["backup"]["recovery_key"].as_str().unwrap();
+                let outcome = restore_journal(journal.path(), &services(&runner, &TestClock, &Maintenance), &recorder, destination(), key);
+                assert_eq!(outcome.status, "error");
+                assert_eq!(outcome.reason_code.as_deref(), Some(RESTORE_REASON_RECOVERY_KEY_REVOCATION_PENDING));
+                assert!(runner.calls.borrow().is_empty());
+                assert!(recorder.calls().is_empty());
+                assert_eq!(std::fs::read(path).unwrap(), before);
+                assert_eq!(std::fs::read(original_note).unwrap(), b"retained original");
+            }
+        }
+
+        struct ImportPending {
+            config: Vec<u8>,
+            restore_exit: i32,
+            calls: RefCell<Vec<String>>,
+        }
+        impl ToolRunner for ImportPending {
+            fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                let args: Vec<String> = request
+                    .argv
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                self.calls.borrow_mut().push(args[0].clone());
+                match args[0].as_str() {
+                    "snapshots" => Ok(output(0, &catalog())),
+                    "restore" => {
+                        let target = PathBuf::from(
+                            &args[args.iter().position(|arg| arg == "--target").unwrap() + 1],
+                        );
+                        std::fs::create_dir_all(target.join("config"))?;
+                        std::fs::write(target.join("config/journal.json"), &self.config)?;
+                        Ok(output(self.restore_exit, CAPTURED_RESTORE))
+                    }
+                    other => panic!("imported pending transaction must refuse before {other}"),
+                }
+            }
+        }
+
+        #[test]
+        fn imported_pending_material_survives_equal_and_different_restore_keys() {
+            let imported = pending_configuration();
+            let candidate =
+                serde_json::from_slice::<Value>(&imported).unwrap()["backup"]["recovery_key"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            for same_key in [false, true] {
+                for restore_exit in [0, 1] {
+                    let journal = tempfile::tempdir().unwrap();
+                    let runner = ImportPending {
+                        config: imported.clone(),
+                        restore_exit,
+                        calls: RefCell::new(vec![]),
+                    };
+                    let recorder = RestoreRecorderSpy::new();
+                    let supplied = if same_key {
+                        candidate.clone()
+                    } else {
+                        solstone_core_backup::generate_recovery_key().unwrap()
+                    };
+                    let outcome = restore_journal(
+                        journal.path(),
+                        &services(&runner, &TestClock, &Maintenance),
+                        &recorder,
+                        destination(),
+                        &supplied,
+                    );
+                    assert_eq!(outcome.status, "error");
+                    assert_eq!(
+                        outcome.reason_code.as_deref(),
+                        Some(RESTORE_REASON_RECOVERY_KEY_REVOCATION_PENDING)
+                    );
+                    assert!(!outcome.resumable);
+                    assert!(recorder.calls().is_empty());
+                    assert_eq!(*runner.calls.borrow(), ["snapshots", "restore"]);
+                    let path = journal.path().join("config/journal.json");
+                    assert_eq!(std::fs::read(&path).unwrap(), imported);
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let desktop = Script::new(vec![]);
+                        let rotation = crate::rotate_recovery_key(
+                            journal.path(),
+                            &services(&desktop, &TestClock, &Maintenance),
+                        );
+                        assert_eq!(rotation.status, "error");
+                        assert!(desktop.calls.borrow().is_empty());
+                        assert_eq!(std::fs::read(path).unwrap(), imported);
+                    }
+                }
+            }
+        }
     }
 }

@@ -27,6 +27,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     thread,
+    time::Duration,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -218,90 +219,155 @@ fn seed_offer(
 #[test]
 fn offload_preflight_and_ready_admission_refusals_release_without_effects() {
     for case in ["selected", "planner_floor", "ready_cancel"] {
-        let dir = tempfile::tempdir().unwrap();
-        config(
-            dir.path(),
-            if case == "planner_floor" {
-                None
-            } else {
-                Some(1)
-            },
-        );
-        let root = Arc::new(JournalRoot::open(dir.path()).unwrap());
-        let id = if case != "selected" {
-            let segment = dir.path().join("chronicle/20261009/120000_60_fixture");
-            fs::create_dir_all(&segment).unwrap();
-            fs::write(segment.join("empty.flac"), b"empty").unwrap();
-            fs::write(segment.join("empty.jsonl"),format!("{}\n",json!({"_solstone_processing":{"schema":"solstone.processing.v1","handler":"transcribe","state":"empty","reason_code":"no_decodable_audio","input_size":5,"attempted_at":"2026-10-09T00:00:00Z"}}))).unwrap();
-            Some(seed_offer(
-                &root,
+        for fault in [
+            None,
+            Some(MediaPrimitive::CarrierRetirementRootSync),
+            Some(MediaPrimitive::CarrierRetirementConfirmation),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            config(
                 dir.path(),
-                &["empty.flac".into()],
-                &"a".repeat(64),
-                &"b".repeat(64),
-                &["/owned/empty.flac".into()],
-                true,
-            ))
-        } else {
-            None
-        };
-        let slot = operation::new_slot();
-        let clock = clock();
-        let begin = begin_owned(&slot, "offload", Arc::clone(&root), Arc::clone(&clock)).unwrap();
-        let worker_slot = Arc::clone(&slot);
-        thread::spawn(move || {
-            if case == "ready_cancel" {
-                CUT.with(|cut| cut.set(Cut::CancelAfterPreflight));
-            }
-            if case == "selected" {
-                create_selected(
-                    &worker_slot,
-                    begin,
-                    vec![],
-                    Utc::now().date_naive(),
-                    Utc::now(),
-                    Path::new("/must-not-open/restic"),
-                );
+                if case == "planner_floor" {
+                    None
+                } else {
+                    Some(1)
+                },
+            );
+            let root = Arc::new(JournalRoot::open(dir.path()).unwrap());
+            let config_before = fs::read(dir.path().join("config/journal.json")).unwrap();
+            let id = if case != "selected" {
+                let segment = dir.path().join("chronicle/20261009/120000_60_fixture");
+                fs::create_dir_all(&segment).unwrap();
+                fs::write(segment.join("empty.flac"), b"empty").unwrap();
+                fs::write(segment.join("empty.jsonl"),format!("{}\n",json!({"_solstone_processing":{"schema":"solstone.processing.v1","handler":"transcribe","state":"empty","reason_code":"no_decodable_audio","input_size":5,"attempted_at":"2026-10-09T00:00:00Z"}}))).unwrap();
+                Some(seed_offer(
+                    &root,
+                    dir.path(),
+                    &["empty.flac".into()],
+                    &"a".repeat(64),
+                    &"b".repeat(64),
+                    &["/owned/empty.flac".into()],
+                    true,
+                ))
             } else {
-                create_planned(
-                    &worker_slot,
-                    begin,
-                    Utc::now().fixed_offset(),
-                    Path::new("/must-not-open/restic"),
+                None
+            };
+            let slot = operation::new_slot();
+            let clock = clock();
+            let begin =
+                begin_owned(&slot, "offload", Arc::clone(&root), Arc::clone(&clock)).unwrap();
+            let worker_slot = Arc::clone(&slot);
+            let fired = thread::spawn(move || {
+                let work = || {
+                    if case == "ready_cancel" {
+                        CUT.with(|cut| cut.set(Cut::CancelAfterPreflight));
+                    }
+                    if case == "selected" {
+                        create_selected(
+                            &worker_slot,
+                            begin,
+                            vec![],
+                            Utc::now().date_naive(),
+                            Utc::now(),
+                            Path::new("/must-not-open/restic"),
+                        );
+                    } else {
+                        create_planned(
+                            &worker_slot,
+                            begin,
+                            Utc::now().fixed_offset(),
+                            Path::new("/must-not-open/restic"),
+                        );
+                    }
+                };
+                if let Some(fault) = fault {
+                    run_with_media_hook(
+                        fault,
+                        || Err(std::io::Error::other("offload retirement fault")),
+                        work,
+                    )
+                    .1
+                } else {
+                    work();
+                    false
+                }
+            })
+            .join()
+            .unwrap();
+            assert_eq!(fired, fault.is_some(), "{case} {fault:?}");
+            assert_eq!(
+                fs::read(dir.path().join("config/journal.json")).unwrap(),
+                config_before
+            );
+            if fault.is_some() {
+                let mut deps = crate::BackupWebDeps::new(dir.path().to_path_buf());
+                deps.operations = Arc::clone(&slot);
+                let lifetime = deps.lifetime();
+                lifetime.request_stop();
+                for clone in [lifetime.clone(), lifetime.clone()] {
+                    assert_eq!(
+                        clone.drain(
+                            crate::test_support::join_executor(),
+                            std::time::Instant::now() + Duration::from_millis(100)
+                        ),
+                        crate::BackupRouteDrain::Pending
+                    );
+                }
+                let state = slot.lock().unwrap();
+                let super::super::ArchivePayload::Offload(owner) =
+                    state.archive.retained.first().unwrap().payload()
+                else {
+                    panic!("actual offload custody");
+                };
+                let retirement = match &owner.state {
+                    ReturnState::UnusedRetirement(retirement) => retirement.as_ref(),
+                    ReturnState::AdmissionClosed(failure) => failure
+                        .unused_retirement()
+                        .expect("actual admission retirement"),
+                    _ => panic!("unexpected closed offload custody"),
+                };
+                assert!(Arc::ptr_eq(retirement.journal_root(), &root));
+                assert!(Arc::ptr_eq(retirement.owned_clock(), &clock));
+                assert!(
+                    retirement
+                        .retirement_receipts()
+                        .any(|receipt| !receipt.failures().is_empty())
+                );
+                assert!(ActivityLease::try_acquire(Arc::clone(&root)).is_err());
+                assert!(TeardownLease::try_acquire(Arc::clone(&root)).is_err());
+                continue;
+            }
+            let view = operation::current(&slot).unwrap();
+            assert!(operation::is_terminal(&view.phase), "{case}");
+            // Refused before any archive writer, copy or record: nothing is held.
+            released(&slot, &root, &clock);
+            let report = view.report.unwrap();
+            match case {
+                "selected" | "planner_floor" => assert!(report.get("admission").is_none()),
+                "ready_cancel" => assert!(report.get("admission").is_some()),
+                _ => unreachable!(),
+            }
+            if let Some(id) = id {
+                let register =
+                    solstone_core_retention::review_context::load_at_root(&root).unwrap();
+                assert!(!register.marks.contains_key(&id));
+                let groups = report["planning"]["reconciliation"]["groups"]
+                    .as_array()
+                    .unwrap();
+                assert!(
+                    groups
+                        .iter()
+                        .any(|group| group["disposition"]["publication"]["effect"] == "published")
+                );
+                assert_eq!(
+                    fs::read(
+                        dir.path()
+                            .join("chronicle/20261009/120000_60_fixture/empty.flac")
+                    )
+                    .unwrap(),
+                    b"empty"
                 );
             }
-        })
-        .join()
-        .unwrap();
-        let view = operation::current(&slot).unwrap();
-        assert!(operation::is_terminal(&view.phase), "{case}");
-        // Refused before any archive writer, copy or record: nothing is held.
-        released(&slot, &root, &clock);
-        let report = view.report.unwrap();
-        match case {
-            "selected" | "planner_floor" => assert!(report.get("admission").is_none()),
-            "ready_cancel" => assert!(report.get("admission").is_some()),
-            _ => unreachable!(),
-        }
-        if let Some(id) = id {
-            let register = solstone_core_retention::review_context::load_at_root(&root).unwrap();
-            assert!(!register.marks.contains_key(&id));
-            let groups = report["planning"]["reconciliation"]["groups"]
-                .as_array()
-                .unwrap();
-            assert!(
-                groups
-                    .iter()
-                    .any(|group| group["disposition"]["publication"]["effect"] == "published")
-            );
-            assert_eq!(
-                fs::read(
-                    dir.path()
-                        .join("chronicle/20261009/120000_60_fixture/empty.flac")
-                )
-                .unwrap(),
-                b"empty"
-            );
         }
     }
 }

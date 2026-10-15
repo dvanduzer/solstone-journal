@@ -11,7 +11,12 @@ use solstone_core_backup::archive_admission::{
 };
 
 use crate::hosted_runtime::{HostedCredsUnavailable, HttpError};
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 use crate::hosted_runtime::{HttpRequest, HttpResponse};
 use crate::teardown_admission::{
     CarrierTeardownAdmission, TeardownAdmissionRefusal, TeardownReader,
@@ -175,7 +180,12 @@ impl TeardownOperation {
         Ok(wall.min(monotonic))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    ))]
     pub(crate) fn date(&self) -> Result<String, TeardownRemoteRefusal> {
         self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
         let date = chrono::DateTime::<chrono::Utc>::from_timestamp(self.clock.now_unix(), 0)
@@ -184,7 +194,12 @@ impl TeardownOperation {
         Ok(date.format("%Y%m%dT%H%M%SZ").to_string())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    ))]
     pub(crate) fn request(
         &self,
         mut request: HttpRequest,
@@ -193,7 +208,9 @@ impl TeardownOperation {
             .timeout
             .min(self.remaining().map_err(TeardownRemoteRefusal::Operation)?);
         let response = crate::controlled_http::execute_teardown(&request, &self.cancellation);
-        // The actual worker and resolver have joined before any result is inspected.
+        // The request worker/runtime/socket has settled. Android's one permanent
+        // resolver may still hold only its hostname job; it cannot dispatch HTTP
+        // or retain teardown authority after this call returns.
         self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
         response.map_err(TeardownRemoteRefusal::Http)
     }
@@ -207,7 +224,12 @@ impl TeardownOperation {
         reader: &mut TeardownReader<'_>,
         version: &str,
     ) -> Result<RemoteTeardownDisposition, TeardownRemoteRefusal> {
-        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "android",
+            windows
+        ))]
         {
             use crate::hosted_runtime::{decode_hosted_credentials, hosted_credentials_request};
             if self.report.phase != RemoteTeardownPhase::NotStarted {
@@ -255,14 +277,24 @@ impl TeardownOperation {
             self.report.phase = RemoteTeardownPhase::Wiped;
             Ok(RemoteTeardownDisposition::Wiped)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "android",
+            windows
+        )))]
         {
             let _ = (admission, reader, version);
             Err(TeardownRemoteRefusal::Unsupported)
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    ))]
     pub(crate) fn report_mut(&mut self) -> &mut RemoteTeardownReport {
         &mut self.report
     }

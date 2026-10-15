@@ -242,6 +242,39 @@ pub fn run_cli_with_discovery_generation(
     parser::run(args, journal, &services, None, None)
 }
 
+/// The maintenance requests emitted by the embedded backup owner routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedBackupRoutine {
+    Run,
+    Verify,
+}
+
+/// Run an app-owned backup maintenance request through the production command
+/// path, including capability admission and installed-tool resolution.
+///
+/// The embedding owner must admit the actual worker into its backup lifetime
+/// and retain it through completion. Its transports carry that lifetime's
+/// cancellation token; dropping an awaiting request must not retire the worker.
+pub fn run_embedded_backup(
+    journal: &Path,
+    routine: EmbeddedBackupRoutine,
+    runner: &dyn ToolRunner,
+    http: &dyn HttpTransport,
+    executable: &Path,
+) -> CliRun {
+    let id = match routine {
+        EmbeddedBackupRoutine::Run => "backup:run",
+        EmbeddedBackupRoutine::Verify => "backup:verify",
+    };
+    run_cli_with_deps(
+        &["run".to_owned(), id.to_owned()],
+        journal,
+        runner,
+        http,
+        executable,
+    )
+}
+
 fn run_cli_with_deps(
     args: &[String],
     journal: &Path,

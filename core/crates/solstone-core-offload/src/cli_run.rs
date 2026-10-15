@@ -572,6 +572,9 @@ fn unknown(
 
 #[cfg(all(test, feature = "full-tests"))]
 thread_local! {
+    #[cfg(target_os = "android")]
+    static PANIC_AT: Box<std::cell::Cell<Option<CliUnwindPhase>>> = Box::new(std::cell::Cell::new(None));
+    #[cfg(not(target_os = "android"))]
     static PANIC_AT: std::cell::Cell<Option<CliUnwindPhase>> = const { std::cell::Cell::new(None) };
 }
 

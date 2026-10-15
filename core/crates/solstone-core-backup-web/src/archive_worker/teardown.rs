@@ -7,7 +7,6 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::Arc,
-    thread::JoinHandle,
 };
 
 use axum::response::Response;
@@ -69,6 +68,9 @@ pub(super) struct Custody {
 }
 
 impl Custody {
+    pub(super) fn needs_settlement(&self) -> bool {
+        self.pending.is_some() || !self.retained.is_empty()
+    }
     pub(super) fn is_busy(&self) -> bool {
         self.reservation.is_some()
             || self.input.is_some()
@@ -106,7 +108,7 @@ fn current_matches(state: &OperationState, ticket: &Ticket) -> bool {
 fn begin(deps: &BackupWebDeps) -> Result<Ticket, Response> {
     let mut state =
         operation::lock_for_begin(&deps.operations).map_err(|()| operation::busy_response())?;
-    let cancellation = ArchiveCancellation::new();
+    let cancellation = ArchiveCancellation::new_child(&state.cancellation);
     let generation = operation::install_slot(
         &mut state.current,
         "teardown",
@@ -130,6 +132,7 @@ fn begin(deps: &BackupWebDeps) -> Result<Ticket, Response> {
     Ok(ticket)
 }
 
+#[allow(dead_code)]
 fn start(slot: &SharedOperationSlot, ticket: &Ticket) -> bool {
     let Ok(mut state) = slot.lock() else {
         return false;
@@ -179,12 +182,22 @@ fn return_unused(slot: &SharedOperationSlot, ticket: &Ticket) {
     }
 }
 
-pub(crate) fn spawn(deps: &BackupWebDeps) -> Result<Option<JoinHandle<()>>, Response> {
+pub(crate) fn spawn(deps: &BackupWebDeps) -> Result<bool, Response> {
     let ticket = begin(deps)?;
-    if !start(&deps.operations, &ticket) {
+    let mut state = deps.operations.lock().expect("operation slot lock");
+    if state.closed || !current_matches(&state, &ticket) {
+        drop(state);
         return_unused(&deps.operations, &ticket);
-        return Ok(None);
+        return Ok(false);
     }
+    let current = state.current.as_mut().expect("matching current");
+    if current.worker_active || operation::is_terminal(&current.view.phase) {
+        drop(state);
+        return_unused(&deps.operations, &ticket);
+        return Ok(false);
+    }
+    current.worker_active = true;
+
     let slot = Arc::clone(&deps.operations);
     let worker_ticket = ticket.clone();
     #[cfg(all(test, feature = "full-tests"))]
@@ -203,10 +216,16 @@ pub(crate) fn spawn(deps: &BackupWebDeps) -> Result<Option<JoinHandle<()>>, Resp
             let _ = settled.send(());
         }
     }) {
-        Ok(handle) => Ok(Some(handle)),
+        Ok(handle) => {
+            state.threads.push(handle);
+            Ok(true)
+        }
         Err(_) => {
+            let current = state.current.as_mut().expect("matching current");
+            current.worker_active = false;
+            drop(state);
             return_unused(&deps.operations, &ticket);
-            Ok(None)
+            Ok(false)
         }
     }
 }
@@ -389,9 +408,19 @@ fn receive(slot: &SharedOperationSlot, returned: Returned) {
         );
     if !current_matches(&state, &returned.ticket)
         || (!active && !unused)
-        || cancelled_success
         || state.archive.teardown.pending.is_some()
     {
+        state.archive.teardown.retained.push(returned);
+        return;
+    }
+    if cancelled_success {
+        // The original coordinator has finished. Retain its complete return,
+        // but allow closed-route settlement once the real worker is joined.
+        state
+            .current
+            .as_mut()
+            .expect("matching current")
+            .worker_active = false;
         state.archive.teardown.retained.push(returned);
         return;
     }
@@ -443,6 +472,25 @@ pub(crate) fn response(deps: &BackupWebDeps) -> Option<Response> {
     }
 }
 
+pub(super) fn settle_closed(state: &mut OperationState) {
+    if !state.closed {
+        return;
+    }
+    let mut returned = std::mem::take(&mut state.archive.teardown.retained);
+    returned.extend(state.archive.teardown.pending.take());
+    for returned in returned {
+        if current_matches(state, &returned.ticket) && returned.dischargeable() {
+            let current = state.current.as_mut().expect("matching teardown");
+            current.worker_active = false;
+            operation::apply_terminal(current, returned.terminal.clone());
+            state.archive.teardown.reservation = None;
+            drop(returned);
+        } else {
+            state.archive.teardown.retained.push(returned);
+        }
+    }
+}
+
 #[cfg(all(test, feature = "full-tests"))]
 mod tests {
     use super::*;
@@ -453,6 +501,7 @@ mod tests {
     use solstone_core_backup_runtime::{
         HttpRequest, HttpResponse, HttpTransport, ToolOutput, ToolRequest, ToolRunner,
     };
+    use std::time::Instant;
     use std::{
         fs,
         sync::{
@@ -477,6 +526,14 @@ mod tests {
         fn run(&self, _: &ToolRequest<'_>) -> std::io::Result<ToolOutput> {
             self.0.fetch_add(1, Ordering::SeqCst);
             panic!("unstarted teardown launched helper")
+        }
+
+        fn run_cancellable(
+            &self,
+            request: &ToolRequest<'_>,
+            _cancellation: &ArchiveCancellation,
+        ) -> std::io::Result<ToolOutput> {
+            self.run(request)
         }
     }
     impl HttpTransport for NoIo {
@@ -534,6 +591,70 @@ mod tests {
         assert!(start(&deps.operations, &ticket));
         let input = take_input(&mut deps.operations.lock().unwrap(), &ticket).unwrap();
         execute(input, || {}, crate::teardown_report::outcome)
+    }
+
+    #[test]
+    fn stopped_lifetime_settles_actual_harmless_return_without_status_response() {
+        let (root, deps, io) = fixture();
+        let before = fs::read(root.path().join("config/journal.json")).unwrap();
+        let returned = actual_return(&deps);
+        assert!(returned.dischargeable());
+        receive(&deps.operations, returned);
+        assert!(
+            deps.operations
+                .lock()
+                .unwrap()
+                .archive
+                .teardown
+                .pending
+                .is_some()
+        );
+        let lifetime = deps.lifetime();
+        lifetime.request_stop();
+        assert_eq!(
+            lifetime.drain(
+                crate::test_support::join_executor(),
+                Instant::now() + Duration::from_secs(5)
+            ),
+            crate::BackupRouteDrain::Drained
+        );
+        let state = deps.operations.lock().unwrap();
+        assert!(!state.archive.teardown.is_busy());
+        assert_eq!(
+            state.current.as_ref().unwrap().view.reason_code.as_deref(),
+            Some("backup_only_held")
+        );
+        assert_eq!(io.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(root.path().join("config/journal.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn stopped_lifetime_keeps_actual_projection_panic_owner_pending() {
+        let (_root, deps, _) = fixture();
+        let ticket = begin(&deps).unwrap();
+        assert!(start(&deps.operations, &ticket));
+        worker(
+            &deps.operations,
+            &ticket,
+            || {},
+            |actual| {
+                assert!(actual.refused_before_effects());
+                panic!("lose the returned projection after actual owning execution");
+            },
+        );
+        let lifetime = deps.lifetime();
+        lifetime.request_stop();
+        assert_eq!(
+            lifetime.drain(
+                crate::test_support::join_executor(),
+                Instant::now() + Duration::from_millis(25)
+            ),
+            crate::BackupRouteDrain::Pending
+        );
+        assert!(deps.operations.lock().unwrap().archive.teardown.is_busy());
     }
 
     fn successor(deps: &BackupWebDeps) {
@@ -694,7 +815,7 @@ mod tests {
 
         let (_root, deps, _) = fixture();
         operation::fail_next_worker_start();
-        assert!(spawn(&deps).unwrap().is_none());
+        assert!(!spawn(&deps).unwrap());
         assert!(operation::is_busy(&deps.operations));
         assert!(response(&deps).unwrap().status().is_success());
         successor(&deps);
@@ -896,5 +1017,142 @@ mod tests {
                 .contains(&deps.journal_root.to_string_lossy().to_string())
         );
         receive(&deps.operations, returned);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "macos"),
+        ignore = "requires the copied installed package with the actual owned DNS member"
+    )]
+    fn stop_after_actual_finished_before_receive_drains_the_joined_worker() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        fs::write(
+            root.path().join("config/journal.json"),
+            br#"{"backup":{"enabled":true,"mode":"operated"},"other":7}"#,
+        )
+        .unwrap();
+        fs::write(root.path().join("original.txt"), b"retained original").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        solstone_core_backup::save_hosted_binding(
+            root.path(),
+            &solstone_core_backup::HostedBinding {
+                broker_endpoint: endpoint,
+                account_id: "account".into(),
+                instance_id: "instance".into(),
+                bucket: "bucket".into(),
+                prefix: "owner/".into(),
+                broker_token: "fixture-token".into(),
+            },
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut peer = loop {
+                match listener.accept() {
+                    Ok((peer, _)) => break peer,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(error) => panic!("bounded fixture accept: {error}"),
+                }
+            };
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                peer.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+                assert!(head.len() < 65536);
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("POST "));
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(length < 65536);
+            let mut body = vec![0; length];
+            peer.read_exact(&mut body).unwrap();
+            let body = br#"{"error":"binding_superseded"}"#;
+            write!(
+                peer,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            peer.write_all(body).unwrap();
+        });
+        let mut deps = BackupWebDeps::production(
+            root.path().to_path_buf(),
+            crate::measurement::with_geometry(crate::measurement::DeviceGeometry {
+                free_bytes: None,
+                total_bytes: None,
+            }),
+        );
+        deps.clock = Arc::new(FixedClock);
+        let ticket = begin(&deps).unwrap();
+        assert!(start(&deps.operations, &ticket));
+        let input = take_input(&mut deps.operations.lock().unwrap(), &ticket).unwrap();
+        let (finished, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let slot = deps.operations.clone();
+        let worker = operation::spawn_thread(move || {
+            let returned = execute(input, || {}, crate::teardown_report::outcome);
+            assert!(
+                matches!(
+                    &returned.payload,
+                    Payload::Outcome(OwnedTeardownOutcome::Finished(_))
+                ),
+                "actual coordinator: {:?}",
+                returned.terminal.report
+            );
+            assert!(returned.dischargeable());
+            finished.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            receive(&slot, returned);
+        })
+        .unwrap();
+        deps.operations.lock().unwrap().threads.push(worker);
+        ready
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actual coordinator Finished");
+        server.join().unwrap();
+        let lifetime = deps.lifetime();
+        lifetime.request_stop();
+        assert_eq!(
+            lifetime.drain(crate::test_support::join_executor(), Instant::now()),
+            crate::BackupRouteDrain::Pending
+        );
+        assert!(ticket.0.cancellation.is_cancelled());
+        release.send(()).unwrap();
+        assert_eq!(
+            lifetime.drain(
+                crate::test_support::join_executor(),
+                Instant::now() + Duration::from_secs(5)
+            ),
+            crate::BackupRouteDrain::Drained
+        );
+        let state = deps.operations.lock().unwrap();
+        assert!(!state.archive.teardown.is_busy());
+        assert!(!state.current.as_ref().unwrap().worker_active);
+        assert_eq!(state.current.as_ref().unwrap().view.phase, "done");
+        assert_eq!(
+            fs::read(root.path().join("original.txt")).unwrap(),
+            b"retained original"
+        );
     }
 }

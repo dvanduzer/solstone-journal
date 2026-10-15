@@ -155,7 +155,14 @@ impl BindingTeardownAdmission {
                 TeardownBindingRefusal::Admission(refusal),
             ));
         }
-        if !self.binding.remove_binding().complete() {
+        #[cfg(target_os = "android")]
+        let removed = self
+            .binding
+            .remove_binding_for_teardown(self.cleared.teardown_lease())
+            .complete();
+        #[cfg(not(target_os = "android"))]
+        let removed = self.binding.remove_binding().complete();
+        if !removed {
             return Err(TeardownBindingFailure::guarded(
                 self,
                 TeardownBindingRefusal::Removal,

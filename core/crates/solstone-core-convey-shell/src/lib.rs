@@ -346,10 +346,16 @@ pub struct EmbeddedConveyHandle {
     link_health_task: tokio::task::JoinHandle<()>,
     service_token_renewal_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     renewal_shutdown: tokio::sync::watch::Sender<bool>,
+    backup_deps: solstone_core_backup_web::BackupWebDeps,
 }
 
 #[cfg(feature = "host")]
 impl EmbeddedConveyHandle {
+    /// Share the exact operation ownership used by the embedded Home and backup routes.
+    pub fn backup_dependencies(&self) -> solstone_core_backup_web::BackupWebDeps {
+        self.backup_deps.clone()
+    }
+
     /// Execute a request already admitted by the embedding app's owner boundary.
     /// Never expose this method through a network listener or public IPC endpoint.
     pub async fn request_owner(
@@ -407,8 +413,7 @@ pub async fn bind_embedded_device_door(
     journal_root: PathBuf,
     address: std::net::SocketAddrV4,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
-    let app = router(journal_root.clone());
-    bind_embedded_router(journal_root, address, app).await
+    bind_embedded_with_dependencies(journal_root, address, None, None).await
 }
 
 #[cfg(feature = "host")]
@@ -417,9 +422,7 @@ pub async fn bind_embedded_device_door_with_payload(
     address: std::net::SocketAddrV4,
     payload_root: PathBuf,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
-    let app = router_with_payload_root(journal_root.clone(), &payload_root)
-        .map_err(ConveyServeError::EmbeddedPayload)?;
-    bind_embedded_router(journal_root, address, app).await
+    bind_embedded_with_dependencies(journal_root, address, Some(payload_root), None).await
 }
 
 /// Compose app-owned routes using the same optional agent owner surface as the
@@ -431,12 +434,29 @@ pub async fn bind_embedded_device_door_with_routes(
     payload_root: Option<PathBuf>,
     agents_routes: Router,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
+    bind_embedded_with_dependencies(journal_root, address, payload_root, Some(agents_routes)).await
+}
+
+#[cfg(feature = "host")]
+async fn bind_embedded_with_dependencies(
+    journal_root: PathBuf,
+    address: std::net::SocketAddrV4,
+    payload_root: Option<PathBuf>,
+    agents_routes: Option<Router>,
+) -> Result<EmbeddedConveyHandle, ConveyServeError> {
     let roots = payload_root
         .map(|payload| thinking_sol_reads::TalentRoots::from_payload_root(&payload))
         .transpose()
         .map_err(ConveyServeError::EmbeddedPayload)?;
-    let app = router_with_roots(journal_root.clone(), None, Some(agents_routes), roots);
-    bind_embedded_router(journal_root, address, app).await
+    let backup_deps = solstone_core_backup_web::BackupWebDeps::new(journal_root.clone());
+    let app = router_with_roots(
+        journal_root.clone(),
+        None,
+        agents_routes,
+        roots,
+        Some(backup_deps.clone()),
+    );
+    bind_embedded_router(journal_root, address, app, backup_deps).await
 }
 
 #[cfg(feature = "host")]
@@ -444,6 +464,7 @@ async fn bind_embedded_router(
     journal_root: PathBuf,
     address: std::net::SocketAddrV4,
     app: Router,
+    backup_deps: solstone_core_backup_web::BackupWebDeps,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
     use solstone_core_sol_link::ledger::AuthorizedClientsRead;
     use tokio::sync::watch;
@@ -509,6 +530,7 @@ async fn bind_embedded_router(
         link_health_task,
         service_token_renewal_task: tokio::sync::Mutex::new(Some(service_token_renewal_task)),
         renewal_shutdown,
+        backup_deps,
     })
 }
 
@@ -989,7 +1011,7 @@ fn router_with_hosted_parent(
     hosted_parent: Option<Arc<solstone_core_system::lifecycle::HostedServiceParentRuntime>>,
     agents_routes: Option<Router>,
 ) -> Router {
-    router_with_roots(journal_root, hosted_parent, agents_routes, None)
+    router_with_roots(journal_root, hosted_parent, agents_routes, None, None)
 }
 
 /// Compose the production routes with an explicitly packaged app payload.
@@ -998,7 +1020,13 @@ pub fn router_with_payload_root(
     payload_root: &std::path::Path,
 ) -> Result<Router, String> {
     let roots = thinking_sol_reads::TalentRoots::from_payload_root(payload_root)?;
-    Ok(router_with_roots(journal_root, None, None, Some(roots)))
+    Ok(router_with_roots(
+        journal_root,
+        None,
+        None,
+        Some(roots),
+        None,
+    ))
 }
 
 fn router_with_roots(
@@ -1006,6 +1034,7 @@ fn router_with_roots(
     hosted_parent: Option<Arc<solstone_core_system::lifecycle::HostedServiceParentRuntime>>,
     agents_routes: Option<Router>,
     payload_roots: Option<thinking_sol_reads::TalentRoots>,
+    backup_deps: Option<solstone_core_backup_web::BackupWebDeps>,
 ) -> Router {
     solstone_core_convey_body::warm_trends(journal_root.clone());
     let include_agents = agents_routes.is_some();
@@ -1022,7 +1051,8 @@ fn router_with_roots(
         relay_admissions,
         relay_access.clone(),
     ));
-    let backup_deps = solstone_core_backup_web::BackupWebDeps::new(journal_root.clone());
+    let backup_deps = backup_deps
+        .unwrap_or_else(|| solstone_core_backup_web::BackupWebDeps::new(journal_root.clone()));
     let mut routes = Router::new()
         .route("/", get(root))
         .route("/favicon.ico", get(favicon))

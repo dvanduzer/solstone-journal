@@ -144,6 +144,66 @@ fn pending_fixture() -> (
 }
 
 #[test]
+fn stopped_lifetime_releases_actual_unused_approval_without_status_response() {
+    let (journal, deps, _, context, _) = pending_fixture();
+    let before = fs::read(journal.path().join("config/journal.json")).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap();
+    start(&deps, context, now.date_naive(), now).unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if deps
+            .operations
+            .lock()
+            .unwrap()
+            .archive
+            .approval
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual approval worker must return"
+        );
+        std::thread::park_timeout(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        deps.operations
+            .lock()
+            .unwrap()
+            .archive
+            .approval
+            .unused
+            .len(),
+        1
+    );
+    let lifetime = deps.lifetime();
+    lifetime.request_stop();
+    assert_eq!(
+        lifetime.drain(
+            crate::test_support::join_executor(),
+            Instant::now() + std::time::Duration::from_secs(5)
+        ),
+        crate::BackupRouteDrain::Drained
+    );
+    let state = deps.operations.lock().unwrap();
+    assert!(state.archive.approval.worker.is_none());
+    assert!(state.join_batches.is_empty());
+    assert!(!deps.operations.joining());
+    assert!(!state.archive.is_busy());
+    assert_eq!(
+        state.current.as_ref().unwrap().view.reason_code.as_deref(),
+        Some("restic_unavailable")
+    );
+    assert_eq!(
+        fs::read(journal.path().join("config/journal.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn approval_pending_inputs_preserve_original_budget_custody_and_exact_response() {
     for cut in [
         "spawn", "start", "tools", "resolver", "deadline", "cancel", "stale", "poison",

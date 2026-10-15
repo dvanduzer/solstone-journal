@@ -92,6 +92,10 @@ pub trait ToolRunner {
             "cancellable tool execution is unsupported",
         ))
     }
+
+    fn cancellation(&self) -> Option<&ArchiveCancellation> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -666,6 +670,77 @@ pub(crate) fn run_restic_with_stdin(
             #[cfg(windows)]
             resources: Default::default(),
         })
+        .map_err(RunnerError::Process)?;
+    let stdout = scrub(&String::from_utf8_lossy(&output.stdout), &secrets);
+    let stderr = scrub(&String::from_utf8_lossy(&output.stderr), &secrets);
+    let parsed = if json && output.returncode != 124 {
+        parse_json(&stdout)
+    } else {
+        None
+    };
+    Ok(ResticResult {
+        returncode: output.returncode,
+        stdout,
+        stderr,
+        json: parsed,
+        argv,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
+pub(crate) fn run_restic_with_stdin_cancellable(
+    runner: &dyn ToolRunner,
+    args: &[String],
+    repository: &str,
+    password: &str,
+    restic_path: &Path,
+    backend_env: Option<&BTreeMap<String, Option<String>>>,
+    json: bool,
+    max_repack_size: Option<&str>,
+    timeout: Option<Duration>,
+    pass_fds: &[PassedHandle<'_>],
+    stdin: Option<Vec<u8>>,
+    cancellation: &ArchiveCancellation,
+) -> Result<ResticResult, RunnerError> {
+    if !is_explicit_program_path(restic_path) {
+        return Err(RunnerError::BareProgram);
+    }
+    let (env, mut secrets) = child_env(repository, password, backend_env);
+    if let Some(ref stdin_bytes) = stdin {
+        let text = String::from_utf8_lossy(stdin_bytes);
+        let stripped = text.strip_suffix('\n').unwrap_or(&text);
+        if !stripped.is_empty() {
+            secrets.push(stripped.to_owned());
+        }
+    }
+    let mut argv = args.to_vec();
+    // Match ordinary Android restic calls: the app has no ambient HOME cache.
+    #[cfg(target_os = "android")]
+    if !argv.iter().any(|arg| arg == "--no-cache") {
+        argv.push("--no-cache".into());
+    }
+    if json {
+        argv.push("--json".into());
+    }
+    if let Some(size) = max_repack_size {
+        argv.extend(["--max-repack-size".into(), size.into()]);
+    }
+    guard_argv(&argv, &secrets)?;
+    let output = runner
+        .run_cancellable(
+            &ToolRequest {
+                program: restic_path.as_os_str().to_os_string(),
+                argv: argv.iter().map(OsString::from).collect(),
+                env,
+                timeout,
+                pass_fds: pass_fds.to_vec(),
+                stdin,
+                #[cfg(windows)]
+                resources: Default::default(),
+            },
+            cancellation,
+        )
         .map_err(RunnerError::Process)?;
     let stdout = scrub(&String::from_utf8_lossy(&output.stdout), &secrets);
     let stderr = scrub(&String::from_utf8_lossy(&output.stderr), &secrets);

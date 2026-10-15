@@ -3,7 +3,8 @@
 
 #[cfg(not(windows))]
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, TryLockResult};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -63,7 +64,7 @@ pub(crate) struct PendingCleanup {
 }
 
 #[cfg(windows)]
-fn observe_cleanup(current: &mut Slot) {
+pub(crate) fn observe_cleanup(current: &mut Slot) {
     use solstone_core_system::process::HelperCleanupStatus;
     let settled = current.cleanup.as_ref().is_some_and(|pending| {
         pending
@@ -89,7 +90,7 @@ pub(crate) fn apply_terminal(current: &mut Slot, terminal: Terminal) {
     current.pending_handoff_terminal = None;
 }
 
-fn finish_or_defer(current: &mut Slot, terminal: Terminal) {
+pub(crate) fn finish_or_defer(current: &mut Slot, terminal: Terminal) {
     if current.pending_handoff_terminal.is_some() {
         return;
     }
@@ -109,6 +110,13 @@ fn finish_or_defer(current: &mut Slot, terminal: Terminal) {
 pub struct OperationState {
     pub(crate) current: Option<Slot>,
     pub(crate) archive: crate::archive_worker::ArchiveCustody,
+    pub(crate) closed: bool,
+    pub writes_in_flight: usize,
+    pub(crate) threads: Vec<thread::JoinHandle<()>>,
+    pub(crate) settlement_worker: Option<thread::JoinHandle<()>>,
+    pub(crate) join_batches: Vec<JoinBatch>,
+    pub(crate) failed_joins: Vec<JoinBatch>,
+    pub(crate) cancellation: ArchiveCancellation,
 }
 
 impl OperationState {
@@ -122,11 +130,144 @@ impl OperationState {
         Self {
             current,
             archive: Default::default(),
+            closed: false,
+            writes_in_flight: 0,
+            threads: Vec::new(),
+            settlement_worker: None,
+            join_batches: Vec::new(),
+            failed_joins: Vec::new(),
+            cancellation: ArchiveCancellation::new(),
         }
     }
 }
 
-pub type SharedOperationSlot = Arc<Mutex<OperationState>>;
+/// Queued tasks capture only shared custody. The real native handles remain
+/// here if the embedding app's executor cannot start its join task.
+pub(crate) struct JoinBatch {
+    pub(crate) task: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) owners: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    pub(crate) panics: Arc<Mutex<Vec<Box<dyn std::any::Any + Send>>>>,
+    pub(crate) failure: Option<tokio::task::JoinError>,
+}
+
+pub struct OperationShared {
+    mutex: Mutex<OperationState>,
+    cvar: Condvar,
+    wait_mutex: Mutex<()>,
+    stopping: AtomicBool,
+    cancellation: ArchiveCancellation,
+    joining: std::sync::atomic::AtomicUsize,
+    join_failure: AtomicBool,
+}
+
+impl OperationShared {
+    fn from_state(state: OperationState) -> Self {
+        let cancellation = state.cancellation.clone();
+        Self {
+            mutex: Mutex::new(state),
+            cvar: Condvar::new(),
+            wait_mutex: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+            cancellation,
+            joining: std::sync::atomic::AtomicUsize::new(0),
+            join_failure: AtomicBool::new(false),
+        }
+    }
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, OperationState>> {
+        match self.mutex.lock() {
+            Ok(mut guard) => {
+                self.apply_stop(&mut guard);
+                Ok(guard)
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                self.apply_stop(&mut guard);
+                Err(std::sync::PoisonError::new(guard))
+            }
+        }
+    }
+
+    pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, OperationState>> {
+        match self.mutex.try_lock() {
+            Ok(mut guard) => {
+                self.apply_stop(&mut guard);
+                Ok(guard)
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut guard = poisoned.into_inner();
+                self.apply_stop(&mut guard);
+                Err(std::sync::TryLockError::Poisoned(
+                    std::sync::PoisonError::new(guard),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.cancellation.cancel();
+        // Capability erasure is opportunistic; every later lock synchronizes
+        // the closed state before an admission can inspect it.
+        drop(self.try_lock());
+        self.notify_waiters();
+    }
+
+    pub(crate) fn begin_join(&self, count: usize) {
+        self.joining.fetch_add(count, Ordering::AcqRel);
+    }
+
+    pub(crate) fn finish_join(&self, count: usize, failed: bool) {
+        if failed {
+            self.join_failure.store(true, Ordering::Release);
+        }
+        self.joining.fetch_sub(count, Ordering::AcqRel);
+        self.notify_waiters();
+    }
+
+    pub(crate) fn joining(&self) -> bool {
+        self.joining.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn join_failed(&self) -> bool {
+        self.join_failure.load(Ordering::Acquire)
+    }
+
+    fn apply_stop(&self, state: &mut OperationState) {
+        if !self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        state.closed = true;
+        if let Some(current) = state.current.as_mut() {
+            if let Some(cancellation) = &current.archive_cancellation {
+                cancellation.cancel();
+            }
+            if let Some(cancellation) = &current.handoff_poll {
+                cancellation.cancel();
+            }
+            current.nonce = None;
+            current.restore_key = None;
+        }
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.mutex.is_poisoned()
+    }
+
+    pub(crate) fn notify_waiters(&self) {
+        self.cvar.notify_all();
+    }
+
+    pub(crate) fn wait_timeout(&self, timeout: Duration) {
+        // The wake mutex is used only for waiting, never for domain IO. A
+        // timeout must not reacquire the operation mutex held by a real worker.
+        if let Ok(guard) = self.wait_mutex.try_lock() {
+            drop(self.cvar.wait_timeout(guard, timeout));
+        }
+    }
+}
+
+pub type SharedOperationSlot = Arc<OperationShared>;
 
 #[cfg(test)]
 thread_local! {
@@ -134,7 +275,7 @@ thread_local! {
 }
 
 pub fn new_slot() -> SharedOperationSlot {
-    Arc::new(Mutex::new(OperationState::new(None)))
+    Arc::new(OperationShared::from_state(OperationState::new(None)))
 }
 
 pub fn is_terminal(phase: &str) -> bool {
@@ -241,14 +382,8 @@ pub(crate) fn worker_or_cleanup_active(slot: &SharedOperationSlot, generation: u
     })
 }
 
-pub(crate) fn start_worker(slot: &SharedOperationSlot, generation: u64) -> bool {
-    #[cfg(windows)]
-    let Ok(mut guard) = slot.try_lock() else {
-        return false;
-    };
-    #[cfg(not(windows))]
-    let mut guard = slot.lock().expect("operation slot lock");
-    if guard.archive.is_busy() {
+pub(crate) fn start_worker_locked(guard: &mut OperationState, generation: u64) -> bool {
+    if guard.closed || guard.archive.is_busy() {
         return false;
     }
     let Some(current) = guard.current.as_mut() else {
@@ -267,6 +402,17 @@ pub(crate) fn start_worker(slot: &SharedOperationSlot, generation: u64) -> bool 
     }
     current.worker_active = true;
     true
+}
+
+#[allow(dead_code)]
+pub(crate) fn start_worker(slot: &SharedOperationSlot, generation: u64) -> bool {
+    #[cfg(windows)]
+    let Ok(mut guard) = slot.try_lock() else {
+        return false;
+    };
+    #[cfg(not(windows))]
+    let mut guard = slot.lock().expect("operation slot lock");
+    start_worker_locked(&mut guard, generation)
 }
 
 #[cfg(windows)]
@@ -304,6 +450,8 @@ pub(crate) fn finish_worker(
     } else {
         finish_or_defer(current, terminal);
     }
+    drop(guard);
+    slot.notify_waiters();
 }
 
 #[cfg(not(windows))]
@@ -320,14 +468,15 @@ pub(crate) fn finish_worker(slot: &SharedOperationSlot, generation: u64, termina
     }
     current.worker_active = false;
     finish_or_defer(current, terminal);
+    drop(guard);
+    slot.notify_waiters();
 }
 
-pub(crate) fn start_handoff_poll(
-    slot: &SharedOperationSlot,
+pub(crate) fn start_handoff_poll_locked(
+    guard: &mut OperationState,
     generation: u64,
 ) -> Option<ArchiveCancellation> {
-    let mut guard = slot.lock().expect("operation slot lock");
-    if guard.archive.is_busy() {
+    if guard.closed || guard.archive.is_busy() {
         return None;
     }
     let current = guard.current.as_mut()?;
@@ -347,9 +496,18 @@ pub(crate) fn start_handoff_poll(
     {
         return None;
     }
-    let cancellation = ArchiveCancellation::new();
+    let cancellation = ArchiveCancellation::new_child(&guard.cancellation);
     current.handoff_poll = Some(cancellation.clone());
     Some(cancellation)
+}
+
+#[allow(dead_code)]
+pub(crate) fn start_handoff_poll(
+    slot: &SharedOperationSlot,
+    generation: u64,
+) -> Option<ArchiveCancellation> {
+    let mut guard = slot.lock().expect("operation slot lock");
+    start_handoff_poll_locked(&mut guard, generation)
 }
 
 pub(crate) fn finish_handoff_poll(slot: &SharedOperationSlot, generation: u64) {
@@ -361,15 +519,21 @@ pub(crate) fn finish_handoff_poll(slot: &SharedOperationSlot, generation: u64) {
         return;
     }
     if current.worker_active {
+        drop(guard);
+        slot.notify_waiters();
         return;
     }
     #[cfg(windows)]
     if current.cleanup.is_some() {
+        drop(guard);
+        slot.notify_waiters();
         return;
     }
     if let Some(terminal) = current.pending_handoff_terminal.take() {
         apply_terminal(current, terminal);
     }
+    drop(guard);
+    slot.notify_waiters();
 }
 
 #[cfg(all(test, feature = "full-tests"))]
@@ -451,7 +615,7 @@ pub(crate) fn begin_archive(
     clock: &dyn Clock,
 ) -> Result<ArchiveBegin, ArchiveBeginRefusal> {
     let mut guard = lock_for_begin(slot).map_err(|()| ArchiveBeginRefusal::Busy)?;
-    let cancellation = ArchiveCancellation::new();
+    let cancellation = ArchiveCancellation::new_child(&guard.cancellation);
     let budget = ArchiveBudget::new_cancellable(clock, cancellation.clone())
         .map_err(ArchiveBeginRefusal::Admission)?;
     let begun = install_slot(
@@ -486,7 +650,8 @@ pub(crate) fn lock_for_begin(
     let mut guard = slot.lock().map_err(|_| ())?;
     #[cfg(windows)]
     crate::archive_worker::observe_retained(&mut guard);
-    if guard.archive.is_busy()
+    if guard.closed
+        || guard.archive.is_busy()
         || observe(&mut guard.current).is_some_and(|slot| !is_terminal(&slot.view.phase))
     {
         return Err(());
@@ -677,33 +842,107 @@ impl Terminal {
 }
 
 #[cfg(not(windows))]
-pub fn spawn_worker<F>(
-    slot: SharedOperationSlot,
-    generation: u64,
-    work: F,
-) -> Option<thread::JoinHandle<()>>
+pub fn spawn_worker<F>(slot: SharedOperationSlot, generation: u64, work: F) -> bool
 where
     F: FnOnce() -> Terminal + Send + 'static,
 {
-    if !start_worker(&slot, generation) {
-        return None;
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.closed || !start_worker_locked(&mut guard, generation) {
+        if let Some(current) = guard.current.as_mut()
+            && current.generation == generation
+            && !is_terminal(&current.view.phase)
+            && !current.worker_active
+        {
+            finish_or_defer(current, Terminal::error("failed"));
+        }
+        drop(guard);
+        slot.notify_waiters();
+        return false;
     }
-    // ToolRunner/HttpTransport are blocking std process/HTTP calls. axum already
-    // owns the tokio runtime; a worker thread must not hold the slot lock across
-    // restic/broker, and resolve_operational_tools runs here so POST returns before
-    // restic install.
-    let failed_spawn = slot.clone();
+    let worker_slot = slot.clone();
     match spawn_thread(move || {
         let terminal = panic::catch_unwind(AssertUnwindSafe(work))
             .unwrap_or_else(|_| Terminal::error("failed"));
-        finish_worker(&slot, generation, terminal);
+        finish_worker(&worker_slot, generation, terminal);
     }) {
-        Ok(handle) => Some(handle),
+        Ok(handle) => {
+            guard.threads.push(handle);
+            drop(guard);
+            slot.notify_waiters();
+            true
+        }
         Err(_) => {
-            finish_worker(&failed_spawn, generation, Terminal::error("failed"));
-            None
+            if let Some(current) = guard.current.as_mut()
+                && current.generation == generation
+            {
+                current.worker_active = false;
+                finish_or_defer(current, Terminal::error("failed"));
+            }
+            drop(guard);
+            slot.notify_waiters();
+            false
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmitWrite {
+    DuringOperation,
+    IdleOnly,
+}
+
+pub struct WriteGuard {
+    slot: SharedOperationSlot,
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        let mut guard = match self.slot.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        guard.writes_in_flight = guard.writes_in_flight.saturating_sub(1);
+        drop(guard);
+        self.slot.notify_waiters();
+    }
+}
+
+pub fn admit_write(slot: &SharedOperationSlot, mode: AdmitWrite) -> Result<WriteGuard, Response> {
+    #[cfg(windows)]
+    if mode == AdmitWrite::IdleOnly {
+        use solstone_core_system::process::{
+            HelperAdmissionStatus, observe_bounded_helper_admission,
+        };
+        if !matches!(
+            observe_bounded_helper_admission(),
+            HelperAdmissionStatus::Ready
+        ) {
+            return Err(busy_response());
+        }
+    }
+    #[cfg(windows)]
+    let mut guard = slot.try_lock().map_err(|_| busy_response())?;
+    #[cfg(not(windows))]
+    let mut guard = slot.lock().map_err(|_| busy_response())?;
+    if guard.closed {
+        return Err(busy_response());
+    }
+    if mode == AdmitWrite::IdleOnly {
+        #[cfg(windows)]
+        crate::archive_worker::observe_retained(&mut guard);
+        if guard.archive.is_busy()
+            || observe(&mut guard.current).is_some_and(|slot| !is_terminal(&slot.view.phase))
+        {
+            return Err(busy_response());
+        }
+    }
+    guard.writes_in_flight = guard.writes_in_flight.saturating_add(1);
+    Ok(WriteGuard {
+        slot: Arc::clone(slot),
+    })
 }
 
 #[cfg(all(test, feature = "full-tests"))]
@@ -978,13 +1217,15 @@ mod terminal_tests {
     use super::*;
 
     pub(super) fn running_slot() -> SharedOperationSlot {
-        Arc::new(Mutex::new(OperationState::new(Some(admitted_slot(
-            "restore_hosted",
-            2,
-            Some("https://example.test/restore".into()),
-            Some("test-nonce".into()),
-            Some("test-key".into()),
-        )))))
+        Arc::new(OperationShared::from_state(OperationState::new(Some(
+            admitted_slot(
+                "restore_hosted",
+                2,
+                Some("https://example.test/restore".into()),
+                Some("test-nonce".into()),
+                Some("test-key".into()),
+            ),
+        ))))
     }
 
     pub(super) fn admitted_slot(
@@ -1202,13 +1443,10 @@ mod worker_tests {
 
     fn assert_no_worker_starts(slot: SharedOperationSlot, generation: u64) {
         let (entered, observed) = std::sync::mpsc::channel();
-        assert!(
-            spawn_worker(slot, generation, move || {
-                entered.send(()).unwrap();
-                Terminal::done()
-            })
-            .is_none()
-        );
+        assert!(!spawn_worker(slot, generation, move || {
+            entered.send(()).unwrap();
+            Terminal::done()
+        }));
         assert_eq!(
             observed.recv_timeout(Duration::from_secs(5)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
@@ -1218,14 +1456,20 @@ mod worker_tests {
     #[test]
     fn ordinary_worker_preserves_complete_terminal() {
         let slot = running_slot();
-        wait_for_worker(spawn_worker(slot.clone(), 2, failure).unwrap());
+        assert!(spawn_worker(slot.clone(), 2, failure));
+        let handle = slot.lock().unwrap().threads.pop().unwrap();
+        wait_for_worker(handle);
         assert_failure(&slot);
     }
 
     #[test]
     fn ordinary_worker_preserves_panic_failure() {
         let slot = running_slot();
-        wait_for_worker(spawn_worker(slot.clone(), 2, || panic!("test worker panic")).unwrap());
+        assert!(spawn_worker(slot.clone(), 2, || panic!(
+            "test worker panic"
+        )));
+        let handle = slot.lock().unwrap().threads.pop().unwrap();
+        wait_for_worker(handle);
         let guard = slot.lock().unwrap();
         let current = guard.current.as_ref().unwrap();
         assert_eq!(current.view.phase, "error");
@@ -1240,12 +1484,12 @@ mod worker_tests {
         let slot = running_slot();
         let (entered, observed) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
-        let handle = spawn_worker(slot.clone(), 2, move || {
+        assert!(spawn_worker(slot.clone(), 2, move || {
             entered.send(()).unwrap();
             released.recv_timeout(Duration::from_secs(5)).unwrap();
             failure()
-        })
-        .unwrap();
+        }));
+        let handle = slot.lock().unwrap().threads.pop().unwrap();
         observed.recv_timeout(Duration::from_secs(5)).unwrap();
         slot.lock().unwrap().current.as_mut().unwrap().started =
             Instant::now() - HANDOFF_TTL - Duration::from_secs(1);
@@ -1288,7 +1532,9 @@ mod worker_tests {
         assert!(!slot.lock().unwrap().current.as_ref().unwrap().worker_active);
         assert!(!is_busy(&slot));
         let next = begin(&slot, "rotate", None, None, None).unwrap().generation;
-        wait_for_worker(spawn_worker(slot.clone(), next, Terminal::done).unwrap());
+        assert!(spawn_worker(slot.clone(), next, Terminal::done));
+        let handle = slot.lock().unwrap().threads.pop().unwrap();
+        wait_for_worker(handle);
         assert_eq!(super::current(&slot).unwrap().phase, "done");
     }
 
@@ -1337,13 +1583,15 @@ mod handoff_state_tests {
     use super::*;
 
     fn admitted_poll() -> SharedOperationSlot {
-        Arc::new(Mutex::new(OperationState::new(Some(admitted_slot(
-            "restore_hosted",
-            2,
-            Some("portal".into()),
-            Some("nonce".into()),
-            Some("key".into()),
-        )))))
+        Arc::new(OperationShared::from_state(OperationState::new(Some(
+            admitted_slot(
+                "restore_hosted",
+                2,
+                Some("portal".into()),
+                Some("nonce".into()),
+                Some("key".into()),
+            ),
+        ))))
     }
 
     #[test]
@@ -1420,13 +1668,9 @@ mod cleanup_state_tests {
     #[test]
     fn poll_and_native_cleanup_each_hold_the_complete_terminal() {
         for poll_first in [false, true] {
-            let slot = Arc::new(Mutex::new(OperationState::new(Some(admitted_slot(
-                "restore_hosted",
-                2,
-                None,
-                Some("nonce".into()),
-                None,
-            )))));
+            let slot = Arc::new(OperationShared::from_state(OperationState::new(Some(
+                admitted_slot("restore_hosted", 2, None, Some("nonce".into()), None),
+            ))));
             start_handoff_poll(&slot, 2).unwrap();
             match_handoff(&slot, "nonce", Some(2)).unwrap_or_else(|_| panic!("match"));
             slot.lock().unwrap().current.as_mut().unwrap().cleanup = Some(PendingCleanup {
@@ -1455,7 +1699,9 @@ mod cleanup_state_tests {
         let flag = ArchiveCancellation::new();
         let mut admitted = admitted_slot("offload_approve", 2, None, None, None);
         admitted.archive_cancellation = Some(flag.clone());
-        let slot = Arc::new(Mutex::new(OperationState::new(Some(admitted))));
+        let slot = Arc::new(OperationShared::from_state(OperationState::new(Some(
+            admitted,
+        ))));
         assert!(start_worker(&slot, 2));
         assert_eq!(
             request_archive_cancellation(&slot, 2),

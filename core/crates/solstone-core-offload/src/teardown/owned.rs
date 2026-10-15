@@ -9,12 +9,22 @@ use std::sync::Arc;
 use solstone_core_backup::archive_admission::{AdmissionError, ArchiveCancellation, Clock};
 #[cfg(any(unix, windows))]
 use solstone_core_backup::teardown_configuration::BindingRemovalReceipt;
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 use solstone_core_backup_runtime::resolve_restic_member;
 use solstone_core_backup_runtime::teardown::owned::{
     RemoteTeardownReport, TeardownOperation, TeardownRemoteRefusal,
 };
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 use solstone_core_backup_runtime::teardown_admission::admit_teardown;
 #[cfg(any(unix, windows))]
 use solstone_core_backup_runtime::teardown_admission::{
@@ -146,7 +156,12 @@ impl Outside {
             retirement: None,
         }
     }
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    ))]
     fn remaining(&self) -> Result<(), TeardownRunRefusal> {
         self.operation
             .as_ref()
@@ -160,7 +175,12 @@ impl Outside {
 // Refused platforms expose the same closed custody views without constructing
 // executing phases.
 #[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", windows)),
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    )),
     allow(dead_code)
 )]
 enum PhaseOwner {
@@ -391,7 +411,12 @@ fn held(
     }))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 fn unknown(
     outside: Outside,
     owner: Option<PhaseOwner>,
@@ -415,11 +440,21 @@ pub fn run_owned_teardown(
     version: &str,
 ) -> OwnedTeardownOutcome {
     let outside = Outside::new(clock, cancellation);
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    ))]
     {
         execute(journal, outside, version)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    )))]
     {
         let _ = (journal, version);
         held(
@@ -431,7 +466,12 @@ pub fn run_owned_teardown(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardownOutcome {
     use solstone_core_journal_io::media::{
         ActivityCarrierRetirementEffect, Confirmation, Durability,
@@ -813,13 +853,26 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
 #[cfg(all(
     test,
     feature = "full-tests",
-    any(target_os = "linux", target_os = "macos", windows)
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    )
 ))]
 thread_local! {
+    #[cfg(target_os = "android")]
+    static PANIC_AT: Box<std::cell::Cell<Option<TeardownRunPhase>>> = Box::new(std::cell::Cell::new(None));
+    #[cfg(not(target_os = "android"))]
     static PANIC_AT: std::cell::Cell<Option<TeardownRunPhase>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+))]
 fn test_cut(phase: TeardownRunPhase) {
     #[cfg(all(test, feature = "full-tests"))]
     PANIC_AT.with(|cut| {
@@ -834,6 +887,11 @@ fn test_cut(phase: TeardownRunPhase) {
 #[cfg(all(
     test,
     feature = "full-tests",
-    any(target_os = "linux", target_os = "macos", windows)
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        windows
+    )
 ))]
 mod tests;

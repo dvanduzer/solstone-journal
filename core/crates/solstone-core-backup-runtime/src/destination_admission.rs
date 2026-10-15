@@ -32,6 +32,9 @@ impl std::error::Error for DestinationAdmissionError {}
 
 #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
 thread_local! {
+    #[cfg(target_os = "android")]
+    static FORCE_ADMISSION_FAILURE: Box<std::cell::Cell<bool>> = Box::new(std::cell::Cell::new(false));
+    #[cfg(not(target_os = "android"))]
     static FORCE_ADMISSION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

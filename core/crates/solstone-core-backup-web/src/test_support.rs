@@ -190,3 +190,15 @@ pub fn write_ready_restic(dir: &Path) -> PathBuf {
     write_file(dir, INSTALLED_PAYLOAD_MANIFEST, &manifest);
     dir.join("lib/solstone-restic/restic")
 }
+
+#[cfg(feature = "full-tests")]
+pub(crate) fn join_executor() -> &'static tokio::runtime::Handle {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+        })
+        .handle()
+}
