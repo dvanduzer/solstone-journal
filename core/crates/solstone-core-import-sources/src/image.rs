@@ -211,16 +211,19 @@ pub fn detected_creation_stamp(
     filename: Option<&str>,
     zone: Tz,
 ) -> Option<solstone_core_import::Timestamp> {
-    let extra_exif = match ImageFormat::from_path(path).ok() {
-        Some(ImageFormat::Png | ImageFormat::WebP | ImageFormat::Tiff) => (|| {
-            let mut reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
-            let mut limits = image::Limits::default();
-            limits.max_alloc = Some(16 * 1024 * 1024);
-            reader.limits(limits);
-            reader.into_decoder().ok()?.exif_metadata().ok().flatten()
-        })(),
-        _ => None,
-    };
+    let extra_exif = (|| {
+        let mut reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+        if !matches!(
+            reader.format(),
+            Some(ImageFormat::Png | ImageFormat::WebP | ImageFormat::Tiff)
+        ) {
+            return None;
+        }
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(16 * 1024 * 1024);
+        reader.limits(limits);
+        reader.into_decoder().ok()?.exif_metadata().ok().flatten()
+    })();
     solstone_core_import::detect_creation_with_exif(path, filename, zone, extra_exif.as_deref())
 }
 
@@ -1225,6 +1228,22 @@ mod tests {
             .write_to(&mut bytes, ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
+    }
+
+    #[test]
+    fn upload_temp_names_do_not_hide_png_creation_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["photo.png", "upload.tmp"] {
+            let path = root.path().join(name);
+            fs::write(
+                &path,
+                include_bytes!("../../solstone-core-import/tests/fixtures/creation-photo.png"),
+            )
+            .unwrap();
+            let stamp = detected_creation_stamp(&path, Some("photo.png"), Tz::UTC)
+                .expect("PNG creation time");
+            assert_eq!(stamp.as_str(), "20260624_003000");
+        }
     }
 
     #[test]

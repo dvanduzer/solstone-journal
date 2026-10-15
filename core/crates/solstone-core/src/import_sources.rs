@@ -1348,18 +1348,13 @@ mod tests {
             dry_run: false,
             json: false,
             force: false,
-            owner_timestamp: None,
+            owner_timestamp: Some(timestamp.to_owned()),
             fallback_timestamp: None,
         }
     }
 
-    fn image_time(img: &Path) -> (String, String) {
-        let modified = img.metadata().unwrap().modified().unwrap();
-        let dt: chrono::DateTime<chrono::Local> = modified.into();
-        (
-            dt.format("%Y%m%d").to_string(),
-            format!("{}_0", dt.format("%H%M%S")),
-        )
+    fn image_time(timestamp: &str) -> (String, String) {
+        (timestamp[..8].to_owned(), format!("{}_0", &timestamp[9..]))
     }
 
     #[test]
@@ -1367,7 +1362,7 @@ mod tests {
         let journal = tempfile::tempdir().unwrap();
         let img = journal.path().join("sample.png");
         fs::write(&img, TINY_PNG).unwrap();
-        let (day, seg) = image_time(&img);
+        let (day, seg) = image_time("20260809_090000");
         let dispatch = image_dispatch(&img, "20260809_090000");
 
         let run = run(dispatch, journal.path());
@@ -1395,7 +1390,7 @@ mod tests {
         let journal = tempfile::tempdir().unwrap();
         let img = journal.path().join("sample.png");
         fs::write(&img, TINY_PNG).unwrap();
-        let (day, seg) = image_time(&img);
+        let (day, seg) = image_time("20260809_090000");
         fs::create_dir_all(
             journal
                 .path()
@@ -1440,7 +1435,7 @@ mod tests {
         let journal = tempfile::tempdir().unwrap();
         let img = journal.path().join("sample.png");
         fs::write(&img, TINY_PNG).unwrap();
-        let (day, seg) = image_time(&img);
+        let (day, seg) = image_time("20260809_090000");
         fs::create_dir_all(
             journal
                 .path()
@@ -1615,16 +1610,16 @@ mod tests {
         fs::write(&second, OTHER_PNG).unwrap();
         set_mtime(&first, modified);
         set_mtime(&second, modified);
-        let stamp = "20260616_235959";
+        let stamp = "20260616_120000";
 
         let (first_run, first_id) = run_bound(image_dispatch(&first, stamp), journal.path());
         assert_eq!(first_run.exit_code, 0, "{}", first_run.stderr);
         assert_eq!(first_id.as_deref(), Some(stamp));
         let (second_run, second_id) = run_bound(image_dispatch(&second, stamp), journal.path());
         assert_eq!(second_run.exit_code, 0, "{}", second_run.stderr);
-        assert_eq!(second_id.as_deref(), Some("20260617_000000"));
+        assert_eq!(second_id.as_deref(), Some("20260616_120001"));
 
-        for id in [stamp, "20260617_000000"] {
+        for id in [stamp, "20260616_120001"] {
             let projection = solstone_core_import::project_import_result(journal.path(), id);
             assert_eq!(
                 projection.status,
@@ -1663,7 +1658,7 @@ mod tests {
             solstone_core_import::read_import_metadata(journal.path(), stamp).unwrap()["source_hash"],
             solstone_core_import::hash_source(&first).unwrap().as_str()
         );
-        assert!(!journal.path().join("imports/20260617_000001").exists());
+        assert!(!journal.path().join("imports/20260616_120002").exists());
 
         let preview_path = journal.path().join("preview.png");
         fs::write(&preview_path, OTHER_PNG).unwrap();
@@ -1672,7 +1667,7 @@ mod tests {
         let (preview_run, preview_id) = run_bound(preview, journal.path());
         assert_eq!(preview_run.exit_code, 0, "{}", preview_run.stderr);
         assert!(preview_id.is_none());
-        assert!(!journal.path().join("imports/20260617_000001").exists());
+        assert!(!journal.path().join("imports/20260616_120002").exists());
     }
 
     fn write_test_archive(dir: &Path, name: &str, members: &[(&str, &[u8])]) -> PathBuf {
