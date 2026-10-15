@@ -189,6 +189,11 @@ const SCANNED_MODULE_SOURCES: &[(&str, &str, &str)] = &[
     ),
     (
         "cortex",
+        "embedded_renewal",
+        include_str!("../../../solstone-core-cortex/src/embedded_renewal.rs"),
+    ),
+    (
+        "cortex",
         "process",
         include_str!("../../../solstone-core-cortex/src/process.rs"),
     ),
