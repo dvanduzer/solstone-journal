@@ -1,23 +1,16 @@
-<!doctype html>
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>support</title>
-  <style>
-    :root { font-family: system-ui, sans-serif; }
-    body { margin: 0; padding: clamp(1.5rem, 5vw, 4rem); }
-    .support-page { box-sizing: border-box; max-width: 42rem; margin: 0 auto; padding: clamp(1.25rem, 4vw, 2rem); background: var(--paper, #fff); border-radius: 12px; }
-    h1 { font-size: clamp(1.8rem, 5vw, 3rem); margin-bottom: .6rem; }
-    p { line-height: 1.6; }
-    button { min-height: 44px; padding: .7rem 1rem; font: inherit; font-weight: 650; cursor: pointer; }
-    .actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.5rem; }
-    a { color: inherit; }
+<!-- Copyright (c) 2026 sol pbc -->
+<style>
+    .support-workspace { padding: clamp(1.5rem, 5vw, 4rem); }
+    .support-page { box-sizing: border-box; max-width: 42rem; margin: 0 auto; padding: clamp(1.25rem, 4vw, 2rem); background: var(--paper); border-radius: 12px; }
+    .support-page h1 { font-size: clamp(1.8rem, 5vw, 3rem); margin-bottom: .6rem; }
+    .support-page p { line-height: 1.6; }
+    .support-page button { min-height: 44px; padding: .7rem 1rem; font: inherit; font-weight: 650; cursor: pointer; }
+    .support-page .actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.5rem; }
+    .support-page a { color: inherit; }
   </style>
-</head>
-<body>
-  <main class="support-page">
+<div class="support-workspace">
+  <section class="support-page">
     <h1>support</h1>
     <p>make a report here, or use "report this" beside any error. you'll review everything before the journal opens the support website.</p>
     <p>the journal does not send a report or register you with support on its own.</p>
@@ -25,7 +18,6 @@
       <button type="button" id="make-report">make a report</button>
       <a href="https://services.solstone.app/support" target="_blank" rel="noopener noreferrer">track requests</a>
     </div>
-  </main>
+  </section>
   <script src="/app/support/static/support.js"></script>
-</body>
-</html>
+</div>

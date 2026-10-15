@@ -9,6 +9,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - changing your backup recovery key now saves and checks the replacement before removing the old key. if removal is interrupted, trying again finishes the same change.
+- small orange links and labels in your journal dashboard are easier to read in light appearance. if your journal's mark cannot be read, its placeholder now follows the dashboard's appearance. opening support keeps the navigation in place.
 - in the date picker, each day now sits under its day of the week, and the days of the week are labeled along the top. before, every month started in the first column, so most dates looked like they fell on the wrong day. the up and down arrow keys now move a week at a time.
 - on windows, links to saved output from a thinking run open again.
 - on windows, `solstone link join` can finish pairing and save connection settings.
