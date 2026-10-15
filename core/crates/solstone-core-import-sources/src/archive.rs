@@ -1165,7 +1165,60 @@ enum UndoKind {
 struct UndoRecord {
     kind: UndoKind,
     relative: String,
-    segment_binding: Option<solstone_core_journal_io::JournalRoot>,
+    segment_binding: Option<PublishedSegment>,
+}
+
+// Retain the staged object through its known same-parent publication. Reopening
+// the live name only compares identity; it never establishes rollback ownership.
+struct PublishedSegment {
+    root: solstone_core_journal_io::JournalRoot,
+    ancestors: Vec<solstone_core_journal_io::DirectoryIdentityWitness>,
+    live_path: PathBuf,
+}
+
+impl PublishedSegment {
+    fn capture(staging: &Path, destination: &Path) -> io::Result<Self> {
+        let refusal =
+            |error: solstone_core_journal_io::JournalRootError| io::Error::other(error.to_string());
+        let root = solstone_core_journal_io::JournalRoot::open(staging).map_err(refusal)?;
+        let parent = solstone_core_journal_io::JournalRoot::open(
+            destination.parent().expect("publication has a parent"),
+        )
+        .map_err(refusal)?;
+        if root.canonical_path().parent() != Some(parent.canonical_path()) {
+            return Err(io::Error::other("archive staging parent changed"));
+        }
+        let ancestors = root
+            .canonical_path()
+            .ancestors()
+            .skip(1)
+            .map(|path| {
+                solstone_core_journal_io::DirectoryIdentityWitness::open(path).map_err(refusal)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        root.revalidate_canonical_binding().map_err(refusal)?;
+        Ok(Self {
+            live_path: parent
+                .canonical_path()
+                .join(destination.file_name().expect("publication has a name")),
+            root,
+            ancestors,
+        })
+    }
+
+    fn revalidate(&self, destination: &Path) -> io::Result<()> {
+        let refusal =
+            |error: solstone_core_journal_io::JournalRootError| io::Error::other(error.to_string());
+        self.root.revalidate().map_err(refusal)?;
+        for ancestor in &self.ancestors {
+            ancestor.revalidate_canonical_binding().map_err(refusal)?;
+        }
+        let named = solstone_core_journal_io::JournalRoot::open(destination).map_err(refusal)?;
+        if named.identity() != self.root.identity() || named.canonical_path() != self.live_path {
+            return Err(io::Error::other("published archive segment changed"));
+        }
+        named.revalidate_canonical_binding().map_err(refusal)
+    }
 }
 
 struct MergeState {
@@ -2735,20 +2788,20 @@ fn publish_one(
                 });
             }
             // Chronicle units are always whole new segments (stage_segments).
-            // Acquire attempts on the exact staged lock inodes that the pivot
-            // publishes, then exclude the live name through that pivot.
+            // Prepare persistent claim entries on the staged object, then keep
+            // only outside exclusion and original directory authority at rename.
             let is_segment = state.chronicle_units.contains_key(&relative);
-            let mut staged_claims = None;
+            let mut segment_binding = None;
             let mut live_name = None;
             publish_staged_dir(&destination, StagedDirOptions::default(), |staging| {
                 copy_tree(&staged, staging)?;
                 if is_segment {
-                    staged_claims = Some(
+                    let staged_claims =
                         solstone_core_segment::output_attempt::OutputClaims::discover(
                             staging,
                             LockOptions::default(),
-                        )?,
-                    );
+                        )?;
+                    segment_binding = Some(PublishedSegment::capture(staging, &destination)?);
                     live_name = Some(
                         solstone_core_segment::output_attempt::SegmentMutation::acquire(
                             &destination,
@@ -2760,6 +2813,9 @@ fn publish_one(
                             "segment appeared before archive publication",
                         ));
                     }
+                    // No processor can enter the absent live directory. The
+                    // private staging claims must close before Windows rename.
+                    drop(staged_claims);
                 }
                 Ok(())
             })
@@ -2770,19 +2826,24 @@ fn publish_one(
             state.published.push(UndoRecord {
                 kind: UndoKind::UnlinkNew,
                 relative,
-                segment_binding: if is_segment {
-                    Some(
-                        solstone_core_journal_io::JournalRoot::open(&destination).map_err(
-                            |error| ImportSourcesError::MergePublishFailed {
-                                detail: error.to_string(),
-                                mutation: MergeMutationState::MayHaveMutated,
-                            },
-                        )?,
-                    )
-                } else {
-                    None
-                },
+                segment_binding,
             });
+            // Record the completed pivot before any fallible post-pivot check.
+            // Abort must never call live bytes NotMutated or lose their undo.
+            if let Some(binding) = &state.published.last().unwrap().segment_binding {
+                #[cfg(all(test, feature = "full-tests"))]
+                AFTER_RAW_PIVOT.with(|slot| {
+                    if let Some(action) = slot.borrow_mut().take() {
+                        action();
+                    }
+                });
+                binding.revalidate(&destination).map_err(|error| {
+                    ImportSourcesError::MergePublishFailed {
+                        detail: error.to_string(),
+                        mutation: MergeMutationState::MayHaveMutated,
+                    }
+                })?;
+            }
         }
         PublishUnit::File => {
             publish_file(state, &destination, &staged, relative, mutation)?;
@@ -2983,7 +3044,19 @@ fn undo_publish(
                 && !state.import_units.contains_key(&record.relative);
             owned == owned_phase
         }) {
-            let destination = target.join(&record.relative);
+            let destination = match join_contained(target, &record.relative) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    failures.push(format!("coordinate {}: {error}", record.relative));
+                    continue;
+                }
+            };
+            if let Some(binding) = &record.segment_binding
+                && let Err(error) = binding.revalidate(&destination)
+            {
+                failures.push(format!("coordinate {}: {error}", record.relative));
+                continue;
+            }
             // Only chronicle trees are segment publications; entity/facet/import
             // files never enter the processing output-attempt namespace.
             let claims =
@@ -3001,9 +3074,8 @@ fn undo_publish(
                 } else {
                     None
                 };
-            let _commit = match claims
-                .as_ref()
-                .map(|claims| claims.commit(&destination))
+            let mutation = match claims
+                .map(|claims| claims.into_directory_mutation(&destination))
                 .transpose()
             {
                 Ok(commit) => commit,
@@ -3012,8 +3084,22 @@ fn undo_publish(
                     continue;
                 }
             };
+            #[cfg(all(test, feature = "full-tests"))]
+            AFTER_RAW_UNDO_CLAIMS.with(|slot| {
+                if record.segment_binding.is_some()
+                    && let Some(action) = slot.borrow_mut().take()
+                {
+                    action();
+                }
+            });
+            if let Some(mutation) = &mutation
+                && let Err(error) = mutation.revalidate()
+            {
+                failures.push(format!("coordinate {}: {error}", record.relative));
+                continue;
+            }
             if let Some(binding) = &record.segment_binding
-                && let Err(error) = binding.revalidate_canonical_binding()
+                && let Err(error) = binding.revalidate(&destination)
             {
                 failures.push(format!("coordinate {}: {error}", record.relative));
                 continue;
@@ -3047,6 +3133,8 @@ fn undo_publish(
 #[cfg(all(test, feature = "full-tests"))]
 thread_local! {
     static BEFORE_RAW_UNDO: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_RAW_PIVOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_RAW_UNDO_CLAIMS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn extra_files(path: &Path) -> Vec<PathBuf> {
@@ -3412,6 +3500,12 @@ mod tests {
             inject_extract_cleanup_fail(false);
             inject_before_publish(None);
             inject_while_locked(None);
+            #[cfg(feature = "full-tests")]
+            {
+                BEFORE_RAW_UNDO.with(|slot| *slot.borrow_mut() = None);
+                AFTER_RAW_PIVOT.with(|slot| *slot.borrow_mut() = None);
+                AFTER_RAW_UNDO_CLAIMS.with(|slot| *slot.borrow_mut() = None);
+            }
         }
     }
 
@@ -4208,7 +4302,11 @@ mod tests {
         assert!(merge_journal_archive(&archive, &target, &merge_options(&tree), None).is_err());
         assert!(publish_seen.get() && undo_seen.get());
         assert!(
-            !target.join("chronicle/20260311/120000_60").exists(),
+            !target
+                .join("chronicle")
+                .join("20260311")
+                .join("120000_60")
+                .exists(),
             "ABA restored absent raw state"
         );
         hold_lock(
@@ -4277,7 +4375,13 @@ mod tests {
             fs::read(target.join("imports/batch/value")).unwrap(),
             b"mine"
         );
-        assert!(!target.join("chronicle/20260311/120000_60").exists());
+        assert!(
+            !target
+                .join("chronicle")
+                .join("20260311")
+                .join("120000_60")
+                .exists()
+        );
     }
 
     #[test]
@@ -4302,7 +4406,7 @@ mod tests {
                 })));
             }
             let result = merge_journal_archive(&archive, &target, &merge_options(&tree), None);
-            let segment = target.join("chronicle/20260311/120000_60");
+            let segment = target.join("chronicle").join("20260311").join("120000_60");
             if deleted {
                 assert!(result.is_err());
                 assert!(!segment.exists());
@@ -4326,6 +4430,268 @@ mod tests {
                 assert!(claims.commit(&segment).is_ok());
             }
         }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn raw_archive_undo_keeps_commit_exclusion_after_releasing_child_claims() {
+        let _reset = FaultReset;
+        let tree = PlanTree::new();
+        let target = tree.path.join("target");
+        fs::create_dir(&target).unwrap();
+        let archive = write_zip(
+            &tree.path,
+            &[
+                (
+                    "chronicle/20260311/120000_60/audio.flac",
+                    b"synthetic audio",
+                ),
+                ("facets/new/facet.json", br#"{"title":"New"}"#),
+            ],
+        );
+        let segment = target.join("chronicle").join("20260311").join("120000_60");
+        let root = segment.clone();
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = reached.clone();
+        AFTER_RAW_UNDO_CLAIMS.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let contender = solstone_core_segment::output_attempt::OutputClaims::discover(
+                    &root,
+                    LockOptions {
+                        timeout: Duration::ZERO,
+                        ..LockOptions::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    contender.commit(&root).err().unwrap().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                assert_eq!(
+                    fs::read(root.join("audio.flac")).unwrap(),
+                    b"synthetic audio"
+                );
+                seen.set(true);
+            }))
+        });
+        inject_publish_fail_after(Some(2));
+        let error =
+            merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap_err();
+        assert!(reached.get());
+        assert!(!error.to_string().contains("undo incomplete"), "{error}");
+        assert!(!segment.exists());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn raw_archive_post_pivot_refusal_keeps_mutation_and_recovery_evidence() {
+        let _reset = FaultReset;
+        let tree = PlanTree::new();
+        let target = tree.path.join("target");
+        fs::create_dir(&target).unwrap();
+        let archive = write_zip(
+            &tree.path,
+            &[(
+                "chronicle/20260311/120000_60/audio.flac",
+                b"synthetic audio",
+            )],
+        );
+        let segment = target.join("chronicle").join("20260311").join("120000_60");
+        let displaced = tree.path.join("published-original");
+        let root = segment.clone();
+        let previous = displaced.clone();
+        AFTER_RAW_PIVOT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&root, previous).unwrap();
+                fs::create_dir(&root).unwrap();
+                fs::write(root.join("owner.txt"), b"replacement owner bytes").unwrap();
+            }))
+        });
+        let error =
+            merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ImportSourcesError::MergePublishFailed {
+                    mutation: MergeMutationState::MayHaveMutated,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("undo incomplete"), "{error}");
+        assert_eq!(
+            fs::read(segment.join("owner.txt")).unwrap(),
+            b"replacement owner bytes"
+        );
+        assert_eq!(
+            fs::read(displaced.join("audio.flac")).unwrap(),
+            b"synthetic audio"
+        );
+        let work = tree.path.join("work");
+        assert!(find_named(&work, "publish-undo").unwrap().is_dir());
+        let staged = find_named(&work, "staged-publish").unwrap();
+        assert_eq!(
+            fs::read(staged.join("chronicle/20260311/120000_60/audio.flac")).unwrap(),
+            b"synthetic audio"
+        );
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn raw_archive_undo_refuses_the_original_segment_in_a_replaced_day() {
+        let _reset = FaultReset;
+        let tree = PlanTree::new();
+        let target = tree.path.join("target");
+        fs::create_dir(&target).unwrap();
+        let archive = write_zip(
+            &tree.path,
+            &[
+                (
+                    "chronicle/20260311/120000_60/audio.flac",
+                    b"synthetic audio",
+                ),
+                ("facets/new/facet.json", br#"{"title":"New"}"#),
+            ],
+        );
+        let root = target.clone();
+        let old_day = tree.path.join("original-day");
+        let prevented = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = prevented.clone();
+        BEFORE_RAW_UNDO.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let day = root.join("chronicle/20260311");
+                if let Err(error) = fs::rename(&day, &old_day) {
+                    // Windows can prevent this forged ancestor move while its
+                    // descendant directory authority remains open.
+                    assert!(
+                        cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied,
+                        "{error}"
+                    );
+                    seen.set(true);
+                    return;
+                }
+                fs::create_dir(&day).unwrap();
+                fs::rename(old_day.join("120000_60"), day.join("120000_60")).unwrap();
+                fs::write(day.join("owner.txt"), b"replacement day").unwrap();
+            }))
+        });
+        inject_publish_fail_after(Some(2));
+        let error =
+            merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap_err();
+        if prevented.get() {
+            assert!(!error.to_string().contains("undo incomplete"), "{error}");
+            assert!(
+                !target
+                    .join("chronicle")
+                    .join("20260311")
+                    .join("120000_60")
+                    .exists()
+            );
+            return;
+        }
+        assert!(error.to_string().contains("undo incomplete"), "{error}");
+        assert_eq!(
+            fs::read(target.join("chronicle/20260311/owner.txt")).unwrap(),
+            b"replacement day"
+        );
+        assert_eq!(
+            fs::read(target.join("chronicle/20260311/120000_60/audio.flac")).unwrap(),
+            b"synthetic audio"
+        );
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn published_segment_authority_refuses_transplant_into_a_replacement_journal() {
+        let tree = PlanTree::new();
+        let target = tree.path.join("target");
+        let relative = "chronicle/20260311/120000_60";
+        let segment = target.join("chronicle").join("20260311").join("120000_60");
+        fs::create_dir_all(&segment).unwrap();
+        fs::write(segment.join("audio.flac"), b"synthetic audio").unwrap();
+        let authority = PublishedSegment::capture(&segment, &segment).unwrap();
+        let original = tree.path.join("original-journal");
+        if let Err(error) = fs::rename(&target, &original) {
+            // Retained descendant authority can itself prevent this forged
+            // ancestor move on Windows. The original binding must remain valid.
+            assert!(
+                cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            authority.revalidate(&segment).unwrap();
+            assert_eq!(
+                fs::read(segment.join("audio.flac")).unwrap(),
+                b"synthetic audio"
+            );
+            return;
+        }
+        fs::create_dir_all(segment.parent().unwrap()).unwrap();
+        fs::rename(original.join(relative), &segment).unwrap();
+        fs::write(target.join("owner.txt"), b"replacement journal").unwrap();
+        assert!(authority.revalidate(&segment).is_err());
+        assert_eq!(
+            fs::read(target.join("owner.txt")).unwrap(),
+            b"replacement journal"
+        );
+        assert_eq!(
+            fs::read(segment.join("audio.flac")).unwrap(),
+            b"synthetic audio"
+        );
+    }
+
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    fn raw_archive_undo_reports_an_independent_windows_reader_and_keeps_evidence() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _reset = FaultReset;
+        let tree = PlanTree::new();
+        let target = tree.path.join("target");
+        fs::create_dir(&target).unwrap();
+        let relative = "chronicle/20260311/120000_60/audio.flac";
+        let archive = write_zip(
+            &tree.path,
+            &[
+                (relative, b"synthetic audio"),
+                ("facets/new/facet.json", br#"{"title":"New"}"#),
+            ],
+        );
+        let raw = target.join(relative);
+        let path = raw.clone();
+        let reader = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let held = reader.clone();
+        AFTER_RAW_UNDO_CLAIMS.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // This independent reader deliberately withholds all sharing.
+                *held.borrow_mut() = Some(
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(path)
+                        .unwrap(),
+                );
+            }))
+        });
+        inject_publish_fail_after(Some(2));
+        let error =
+            merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ImportSourcesError::MergePublishFailed {
+                    mutation: MergeMutationState::MayHaveMutated,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("undo incomplete"), "{error}");
+        assert!(reader.borrow_mut().take().is_some());
+        assert_eq!(fs::read(&raw).unwrap(), b"synthetic audio");
+        let staged = find_named(&tree.path.join("work"), "staged-publish").unwrap();
+        assert_eq!(fs::read(staged.join(relative)).unwrap(), b"synthetic audio");
+        merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap();
+        assert_eq!(fs::read(raw).unwrap(), b"synthetic audio");
     }
 
     #[test]
@@ -4378,7 +4744,7 @@ mod tests {
             let error =
                 merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap_err();
             assert!(reached.get());
-            let segment = target.join("chronicle/20260311/120000_60");
+            let segment = target.join("chronicle").join("20260311").join("120000_60");
             if replaced {
                 assert_eq!(fs::read(segment.join("owner.txt")).unwrap(), b"keep");
                 assert!(error.to_string().contains("undo incomplete"));
