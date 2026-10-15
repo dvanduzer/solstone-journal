@@ -771,6 +771,7 @@
     if (job.state === "downloading") {
       body = `<p>downloading location accuracy: ${escapeHtml(bytes(job.received))} of ${escapeHtml(bytes(job.total))}. you can keep using your journal while it downloads.</p>
         <progress max="${Number(job.total) || 1}" value="${Number(job.received) || 0}"></progress>`;
+      if (installed && job.source === "automatic") actions = `<button type="button" data-accuracy="remove">remove location accuracy</button>`;
     } else if (installed && status.current) {
       body = `<p>location accuracy is on. ${escapeHtml(what)}</p>`;
       actions = `<button type="button" data-accuracy="remove">remove location accuracy</button>

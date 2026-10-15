@@ -2177,16 +2177,20 @@ pub(crate) async fn boot_and_tick(
         extra
     };
 
-    if let Err(error) = lifecycle.signal_ready(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |value| value.as_secs_f64()),
-        ready_extra,
+    let journal_for_boot = state.journal.clone();
+    let journal_for_refresh = state.journal.clone();
+    let ready_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |value| value.as_secs_f64());
+    if let Err(error) = super::admitted_boot::finish_admitted_start(
+        || lifecycle.signal_ready(ready_at, ready_extra),
+        || state.queue.set_ready(),
+        move || super::admitted_boot::record_admitted_boot(&journal_for_boot),
+        move || super::admitted_boot::refresh_installed_assets(&journal_for_refresh),
     ) {
         let startup = RuntimeBootError::Startup(error.to_string());
         return Err(abort_pre_ready_state(&mut state, &lifecycle, startup).await);
     }
-    state.queue.set_ready();
     if !state.no_daily {
         state.discovery.request();
     }

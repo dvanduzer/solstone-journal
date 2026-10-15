@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 use crate::{
-    checks::{common, parakeet_cpp_stt_ready},
+    checks::parakeet_cpp_stt_ready,
     context::CheckContext,
     vocabulary::{Check, RunnerResult, Status, make_result},
 };
 pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
-    let backend = match common::config_backend(context) {
+    let config = match solstone_core_journal_config::read_journal_config(&context.journal_path) {
         Ok(value) => value,
         Err(error) => {
             return Ok(make_result(
                 check,
                 Status::Fail,
-                error,
+                error.to_string(),
                 Some("repair or restore config/journal.json from a backup"),
             ));
         }
     };
-    if backend
-        .as_deref()
-        .is_some_and(|backend| backend != "parakeet")
-    {
+    let backend = config
+        .config
+        .as_ref()
+        .and_then(|root| root.get("transcribe"))
+        .and_then(|value| value.get("backend"))
+        .and_then(serde_json::Value::as_str);
+    if backend.is_some_and(|backend| backend != "parakeet") {
         return Ok(make_result(
             check,
             Status::Skip,
@@ -40,6 +43,7 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
     if context.platform == crate::vocabulary::Platform::Darwin && context.host_arch == "arm64" {
         return match solstone_core_system::provider_runtime::check_parakeet_coreml_cache(
             &context.home_dir,
+            &config,
             "darwin",
             "arm64",
         ) {
@@ -65,4 +69,63 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
         "parakeet not supported on this platform",
         None::<String>,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checks::test_support;
+    use crate::vocabulary::{Platform, Severity};
+    use solstone_core_journal_config::parakeet_coreml::{
+        parakeet_coreml_model_root, parakeet_coreml_sentinel_path,
+    };
+    use std::fs;
+
+    #[test]
+    fn doctor_uses_the_configured_tree_and_keeps_complete_legacy_bytes_admitted() {
+        let mut staged = test_support::context();
+        staged.context.platform = Platform::Darwin;
+        staged.context.host_arch = "arm64".to_owned();
+        let first = staged.home_dir.join("first/cache");
+        let second = staged.home_dir.join("second/cache");
+        for cache in [&first, &second] {
+            fs::create_dir_all(cache).unwrap();
+            for row in solstone_core_assets::catalog()
+                .iter()
+                .filter(|row| row.unit == "parakeet-coreml")
+            {
+                let path = parakeet_coreml_model_root(cache).join(row.filename);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"intact legacy bytes from an earlier pin").unwrap();
+            }
+        }
+        let sentinel = parakeet_coreml_sentinel_path(&staged.home_dir);
+        fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        fs::write(&sentinel, serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "backend": "parakeet", "variant": "coreml", "model_version": "v3", "quantization": "fp32", "fluidaudio_version": "0.14.0", "platform": {"os": "darwin", "arch": "arm64"}, "cache_dir": first
+        })).unwrap()).unwrap();
+        let path = staged.journal_path.join("config/journal.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let write_config = |cache: &std::path::Path| {
+            fs::write(&path, serde_json::to_vec(&serde_json::json!({"transcribe": {"backend": "parakeet", "parakeet": {"cache_dir": cache}}})).unwrap()).unwrap()
+        };
+        let check = || {
+            run(
+                &staged,
+                test_support::check("default_stt_ready", Severity::Advisory),
+            )
+            .unwrap()
+        };
+        write_config(&first);
+        assert_eq!(check().status, Status::Ok);
+        write_config(&second);
+        assert_eq!(check().status, Status::Warn);
+        write_config(&first);
+        assert_eq!(check().status, Status::Ok);
+        fs::remove_file(
+            parakeet_coreml_model_root(&first).join("Encoder.mlmodelc/weights/weight.bin"),
+        )
+        .unwrap();
+        assert_eq!(check().status, Status::Warn);
+    }
 }

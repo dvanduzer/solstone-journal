@@ -5,7 +5,7 @@
 //! installed, and one download or removal at a time.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
@@ -14,42 +14,33 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use solstone_core_convey_http::envelope::error_envelope;
 use solstone_core_convey_http::owner_read::{OwnerReadRole, spawn_blocking_response};
-use solstone_core_location::accuracy::{installed_packs, read_installed};
+use solstone_core_location::accuracy::installed_snapshot;
 use solstone_core_location::install;
 
 use crate::AppState;
 
-#[derive(Debug, Clone, PartialEq)]
-enum Job {
-    Idle,
-    Downloading { received: u64, total: u64 },
-    Failed { reason_code: &'static str },
-}
-
-static JOB: Mutex<Job> = Mutex::new(Job::Idle);
-
-fn job() -> Job {
-    JOB.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
-fn set_job(next: Job) {
-    *JOB.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-}
-
 /// Everything the map app shows about the choice.
 pub(crate) fn status(journal: &Path) -> Value {
     let offered = install::offered();
-    let installed = read_installed(journal);
-    let packs = installed.as_ref().and_then(|_| installed_packs(journal));
-    let job = match job() {
-        Job::Idle => json!({"state": "idle"}),
-        Job::Downloading { received, total } => {
-            json!({"state": "downloading", "received": received, "total": total})
+    let snapshot = installed_snapshot(journal);
+    let installed = snapshot.as_ref().map(|(installed, _)| installed);
+    let packs = snapshot.as_ref().and_then(|(_, packs)| packs.as_ref());
+    let job = match install::accuracy_job(journal) {
+        None => json!({"state": "idle"}),
+        Some(job) if job.state == "downloading" => {
+            json!({
+                "state": "downloading",
+                "source": job.source,
+                "received": job.received.unwrap_or(0),
+                "total": job.total.unwrap_or(0),
+            })
         }
-        Job::Failed { reason_code } => json!({"state": "failed", "reason_code": reason_code}),
+        Some(job) => {
+            json!({
+                "state": "failed",
+                "reason_code": job.reason_code.as_deref().unwrap_or("download_failed"),
+            })
+        }
     };
     json!({
         "offered": offered.as_ref().map(|offered| json!({
@@ -91,65 +82,70 @@ fn busy() -> Response {
     .into_response()
 }
 
-fn run_download(journal_root: PathBuf) {
-    let result = install::install(&journal_root, |received, total| {
-        set_job(Job::Downloading { received, total });
-    });
-    match result {
-        Ok(_) => set_job(Job::Idle),
-        Err(error) => {
-            log::warn!("location accuracy download: {error}");
-            set_job(Job::Failed {
-                reason_code: error.reason_code(),
-            });
-        }
+fn run_download(journal_root: PathBuf, reservation: install::InstallReservation) {
+    if let Err(error) = install::install_reserved(&journal_root, reservation, |_, _| {}) {
+        log::warn!("location accuracy download: {error}");
     }
 }
 
 pub(crate) async fn download(State(state): State<Arc<AppState>>) -> Response {
+    start_download(&state.journal_root, |journal, reservation| {
+        std::thread::Builder::new()
+            .name("location-accuracy".to_owned())
+            .spawn(move || run_download(journal, reservation))
+            .map(|_| ())
+    })
+}
+
+pub(crate) fn start_download(
+    journal_root: &Path,
+    spawn: impl FnOnce(PathBuf, install::InstallReservation) -> std::io::Result<()>,
+) -> Response {
+    if let Some(job) = install::accuracy_job(journal_root)
+        && job.state == "downloading"
     {
-        let mut current = JOB
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(*current, Job::Downloading { .. }) {
-            return busy();
-        }
-        if install::offered().is_none() {
+        return busy();
+    }
+    if install::offered().is_none() {
+        return error_envelope(
+            "accuracy_not_offered",
+            "this version of your journal has no location accuracy download.",
+            "Nothing offered",
+            StatusCode::NOT_FOUND,
+        )
+        .into_response();
+    }
+    let reservation = match install::reserve_install(journal_root) {
+        Ok(reservation) => reservation,
+        Err(install::InstallError::Busy) => return busy(),
+        Err(error) => {
             return error_envelope(
-                "accuracy_not_offered",
-                "this version of your journal has no location accuracy download.",
-                "Nothing offered",
-                StatusCode::NOT_FOUND,
+                error.reason_code(),
+                "location accuracy couldn't be downloaded.",
+                error.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
             )
             .into_response();
         }
-        *current = Job::Downloading {
-            received: 0,
-            total: install::offered().map_or(0, |offered| offered.size_bytes()),
-        };
+    };
+    if let Err(error) = spawn(journal_root.to_path_buf(), reservation) {
+        log::warn!("failed to spawn location accuracy download: {error}");
+        return error_envelope(
+            "accuracy_download_failed",
+            "location accuracy couldn't be downloaded.",
+            error.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .into_response();
     }
-    let journal_root = state.journal_root.clone();
-    let spawned = std::thread::Builder::new()
-        .name("location-accuracy".to_owned())
-        .spawn(move || run_download(journal_root));
-    if spawned.is_err() {
-        set_job(Job::Failed {
-            reason_code: "download_failed",
-        });
-    }
-    (StatusCode::ACCEPTED, Json(status(&state.journal_root))).into_response()
+    (StatusCode::ACCEPTED, Json(status(journal_root))).into_response()
 }
 
 pub(crate) async fn remove(State(state): State<Arc<AppState>>) -> Response {
-    if matches!(job(), Job::Downloading { .. }) {
-        return busy();
-    }
     // Removing is two unlinks and a directory; it runs inline.
     match install::remove(&state.journal_root) {
-        Ok(()) => {
-            set_job(Job::Idle);
-            Json(status(&state.journal_root)).into_response()
-        }
+        Ok(()) => Json(status(&state.journal_root)).into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => busy(),
         Err(error) => error_envelope(
             "accuracy_remove_failed",
             "location accuracy couldn't be removed.",

@@ -243,6 +243,7 @@ mod tests {
                 .unwrap();
         let installed = Installed {
             version: "v1".to_owned(),
+            folder: String::new(),
             files: vec![InstalledFile {
                 file: "venues.slpk".to_owned(),
                 sha256: "abc".to_owned(),

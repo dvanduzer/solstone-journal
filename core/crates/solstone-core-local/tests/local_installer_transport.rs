@@ -895,11 +895,58 @@ fn sentinel_write_failure_after_publish_leaves_no_sentinel() {
     server.join().unwrap();
     assert_eq!(error.reason_code, "sentinel_write_failed");
     assert!(
-        parakeet_coreml_model_root(&configured)
+        !parakeet_coreml_model_root(&configured)
             .join(artifact.filename)
             .is_file()
     );
     assert!(!parakeet_coreml_sentinel_path(&home).exists());
+    let _ = fs::remove_dir_all(temporary);
+}
+
+#[test]
+fn sentinel_write_failure_with_incumbent_preserves_previous_tree_and_sentinel() {
+    let temporary = temp("coreml-sentinel-write-failure-incumbent");
+    let home = temporary.join("home");
+    let configured = temporary.join("cache");
+    let config = coreml_config(&configured);
+    let target = parakeet_coreml_model_root(&configured);
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("old.bin"), b"old bytes").unwrap();
+    let old_sentinel = ParakeetCoremlSentinel::new(
+        configured.clone(),
+        "darwin",
+        "arm64",
+        "0.14.0",
+        "old-catalog-version",
+        Vec::new(),
+    );
+    write_sentinel(&parakeet_coreml_sentinel_path(&home), &old_sentinel);
+
+    let bytes = b"new bytes";
+    let artifact = coreml_row("new.bin", bytes);
+    let rows = [&artifact];
+    let (base, server) = server(bytes.to_vec(), 1);
+    let loopback = loopback(&base);
+    let mut publish = |staging: &Path, target: &Path| publish_tree(staging, target);
+    let error = with_runtime_fetch_loopback(loopback, || {
+        install_coreml_with_seams(
+            &home,
+            &config,
+            false,
+            ("darwin", "arm64"),
+            &rows,
+            &mut publish,
+            &mut |_, _| Err(std::io::Error::other("injected sentinel failure")),
+        )
+    })
+    .unwrap_err();
+    server.join().unwrap();
+    assert_eq!(error.reason_code, "sentinel_write_failed");
+    assert_eq!(fs::read(target.join("old.bin")).unwrap(), b"old bytes");
+    assert!(!target.join("new.bin").exists());
+    assert!(parakeet_coreml_sentinel_path(&home).is_file());
+    let reloaded = read_valid_parakeet_coreml_sentinel(&home, "darwin", "arm64").unwrap();
+    assert_eq!(reloaded.catalog_version(), "old-catalog-version");
     let _ = fs::remove_dir_all(temporary);
 }
 
@@ -976,7 +1023,14 @@ fn failed_download_preserves_a_preexisting_complete_tree_and_sentinel() {
         .unwrap();
     }
     fs::create_dir_all(&configured).unwrap();
-    let record = ParakeetCoremlSentinel::new(configured.clone(), "darwin", "arm64", "0.14.0");
+    let record = ParakeetCoremlSentinel::new(
+        configured.clone(),
+        "darwin",
+        "arm64",
+        "0.14.0",
+        "v-fixture",
+        Vec::new(),
+    );
     write_sentinel(&parakeet_coreml_sentinel_path(&home), &record);
     let (base, server) = response_server(vec![
         "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nnew one".to_owned(),

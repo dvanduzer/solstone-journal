@@ -265,12 +265,19 @@ pub struct InstalledFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Installed {
     pub version: String,
+    #[serde(default)]
+    pub folder: String,
     pub files: Vec<InstalledFile>,
 }
 
 impl Installed {
     pub fn directory(&self, journal: &Path) -> PathBuf {
-        accuracy_root(journal).join(&self.version)
+        let name = if !self.folder.is_empty() {
+            &self.folder
+        } else {
+            &self.version
+        };
+        accuracy_root(journal).join(name)
     }
 
     pub fn size_bytes(&self) -> u64 {
@@ -323,7 +330,23 @@ static LOADED: Mutex<LoadedPacks> = Mutex::new(None);
 /// The packs installed in this journal, opened once and reopened when the
 /// install changes. `None` when the owner has not downloaded them.
 pub fn installed_packs(journal: &Path) -> Option<Arc<Packs>> {
+    installed_snapshot(journal).and_then(|(_, packs)| packs)
+}
+
+/// Observe one installed record and its open packs under publication exclusion.
+/// This lock is separate from daily admission because talent readers may already
+/// hold daily admission. Writers acquire daily admission before this short lock.
+pub fn installed_snapshot(journal: &Path) -> Option<(Installed, Option<Arc<Packs>>)> {
+    read_installed_snapshot(journal, || {})
+}
+
+fn read_installed_snapshot(
+    journal: &Path,
+    after_read: impl FnOnce(),
+) -> Option<(Installed, Option<Arc<Packs>>)> {
+    let _publication = hold_publication(journal).ok()?;
     let installed = read_installed(journal);
+    after_read();
     let mut loaded = LOADED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -335,15 +358,24 @@ pub fn installed_packs(journal: &Path) -> Option<Arc<Packs>> {
         && path == journal
         && current == &installed
     {
-        return Some(Arc::clone(packs));
+        return Some((installed, Some(Arc::clone(packs))));
     }
     let packs = Arc::new(open_installed(journal, &installed));
     if !packs.has_venues() && !packs.has_containment() {
         *loaded = None;
-        return None;
+        return Some((installed, None));
     }
-    *loaded = Some((journal.to_path_buf(), installed, Arc::clone(&packs)));
-    Some(packs)
+    *loaded = Some((journal.to_path_buf(), installed.clone(), Arc::clone(&packs)));
+    Some((installed, Some(packs)))
+}
+
+pub(crate) fn hold_publication(
+    journal: &Path,
+) -> Result<solstone_core_journal_io::FileLock, solstone_core_journal_io::LockError> {
+    solstone_core_journal_io::hold_lock(
+        accuracy_root(journal).join(".publication.lock"),
+        solstone_core_journal_io::LockOptions::default(),
+    )
 }
 
 /// Close whatever this process has open, before files are removed.
@@ -468,6 +500,7 @@ pub(crate) mod tests {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/accuracy");
         let installed = Installed {
             version: "fixture-1".to_owned(),
+            folder: String::new(),
             files: ["venues.slpk", "containment.slpk"]
                 .iter()
                 .map(|name| InstalledFile {
@@ -488,5 +521,97 @@ pub(crate) mod tests {
         assert!(packs.has_venues() && packs.has_containment());
         std::fs::remove_file(&record).unwrap();
         assert!(installed_packs(journal.path()).is_none());
+    }
+
+    #[test]
+    fn installed_deserialization_handles_missing_or_custom_folder() {
+        let journal = Path::new("/test/journal");
+        let without_folder_json = r#"{"version":"v1","files":[]}"#;
+        let installed: Installed = serde_json::from_str(without_folder_json).unwrap();
+        assert_eq!(installed.folder, "");
+        assert_eq!(
+            installed.directory(journal),
+            accuracy_root(journal).join("v1")
+        );
+
+        let with_folder_json = r#"{"version":"v1","folder":"v1.42","files":[]}"#;
+        let installed_with_folder: Installed = serde_json::from_str(with_folder_json).unwrap();
+        assert_eq!(installed_with_folder.folder, "v1.42");
+        assert_eq!(
+            installed_with_folder.directory(journal),
+            accuracy_root(journal).join("v1.42")
+        );
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn record_and_pack_open_stay_together_while_a_replacement_publishes() {
+        use crate::install::publish_installed_record;
+        use std::{fs, sync::mpsc, thread, time::Duration};
+        let journal = tempfile::tempdir().unwrap();
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/accuracy");
+        let make = |version: &str| {
+            let directory = accuracy_root(journal.path()).join(version);
+            fs::create_dir_all(&directory).unwrap();
+            let files = ["venues.slpk", "containment.slpk"]
+                .into_iter()
+                .map(|name| {
+                    let bytes = fs::read(fixture_root.join(name)).unwrap();
+                    fs::write(directory.join(name), &bytes).unwrap();
+                    InstalledFile {
+                        file: name.to_owned(),
+                        sha256: String::new(),
+                        size_bytes: bytes.len() as u64,
+                    }
+                })
+                .collect();
+            Installed {
+                version: version.to_owned(),
+                folder: String::new(),
+                files,
+            }
+        };
+        let old = make("old");
+        publish_installed_record(journal.path(), &old).unwrap();
+        let new = make("new");
+        let (read_tx, read_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let path = journal.path().to_path_buf();
+        let reader = thread::spawn(move || {
+            read_installed_snapshot(&path, || {
+                read_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap()
+        });
+        read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let path = journal.path().to_path_buf();
+        let writer = thread::spawn(move || {
+            publish_installed_record(&path, &new).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let premature = done_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        let (record, packs) = reader.join().unwrap();
+        writer.join().unwrap();
+        assert!(
+            matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+            "publication must wait for the admitted reader"
+        );
+        assert_eq!(record, old);
+        let packs = packs.unwrap();
+        assert!(packs.has_venues() && packs.has_containment());
+        assert!(
+            !packs
+                .stop(39.7527, -105.0003, Some(95.0))
+                .unwrap()
+                .1
+                .near
+                .is_empty()
+        );
+        let (current, packs) = installed_snapshot(journal.path()).unwrap();
+        assert_eq!(current.version, "new");
+        let packs = packs.unwrap();
+        assert!(packs.has_venues() && packs.has_containment());
     }
 }

@@ -207,6 +207,153 @@ async fn the_accuracy_choice_is_offered_and_removal_is_safe_when_nothing_is_inst
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn accuracy_status_presents_failed_job_and_installed_packs() {
+    let journal = location_only_journal();
+    let offered = solstone_core_location::install::offered().expect("offered accuracy");
+    let version = &offered.version;
+    let acc_dir = journal.path().join("cache/location/accuracy").join(version);
+    fs::create_dir_all(&acc_dir).unwrap();
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../solstone-core-location/fixtures/accuracy");
+    let venues_bytes = fs::read(fixtures.join("venues.slpk")).unwrap();
+    let containment_bytes = fs::read(fixtures.join("containment.slpk")).unwrap();
+    fs::write(acc_dir.join("venues.slpk"), &venues_bytes).unwrap();
+    fs::write(acc_dir.join("containment.slpk"), &containment_bytes).unwrap();
+
+    let installed_record = json!({
+        "version": version,
+        "files": [
+            {
+                "file": "venues.slpk",
+                "sha256": "fake_sha",
+                "size_bytes": venues_bytes.len(),
+            },
+            {
+                "file": "containment.slpk",
+                "sha256": "fake_sha",
+                "size_bytes": containment_bytes.len(),
+            }
+        ]
+    });
+    fs::write(
+        journal
+            .path()
+            .join("cache/location/accuracy/installed.json"),
+        serde_json::to_vec_pretty(&installed_record).unwrap(),
+    )
+    .unwrap();
+
+    let job_record = json!({
+        "state": "failed",
+        "source": "automatic",
+        "reason_code": "download_failed"
+    });
+    fs::write(
+        journal.path().join("cache/location/accuracy/job.json"),
+        serde_json::to_vec_pretty(&job_record).unwrap(),
+    )
+    .unwrap();
+
+    let (status, _, accuracy) = get(journal.path(), "/app/map/api/accuracy").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accuracy["job"]["state"], "failed");
+    assert_eq!(accuracy["job"]["reason_code"], "download_failed");
+    assert_eq!(accuracy["installed"]["venues"], true);
+    assert_eq!(accuracy["installed"]["containment"], true);
+
+    let (_, _, day) = get(journal.path(), "/app/map/api/day/20261003").await;
+    assert_eq!(day["accuracy"]["job"]["state"], "failed");
+    assert_eq!(day["accuracy"]["job"]["reason_code"], "download_failed");
+    assert_eq!(day["accuracy"]["installed"]["venues"], true);
+    assert_eq!(day["accuracy"]["installed"]["containment"], true);
+}
+
+#[tokio::test]
+async fn accuracy_downloading_job_without_worker_lock_is_idle_and_allows_remove() {
+    let journal = location_only_journal();
+    let acc_root = journal.path().join("cache/location/accuracy");
+    fs::create_dir_all(&acc_root).unwrap();
+
+    let downloading_job = json!({
+        "state": "downloading",
+        "source": "explicit",
+        "received": 50,
+        "total": 100
+    });
+    fs::write(
+        acc_root.join("job.json"),
+        serde_json::to_vec_pretty(&downloading_job).unwrap(),
+    )
+    .unwrap();
+
+    let (status, _, accuracy) = get(journal.path(), "/app/map/api/accuracy").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accuracy["job"]["state"], "idle");
+
+    let (status, _) = post(journal.path(), "/app/map/api/accuracy/remove", "{}").await;
+    assert_ne!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn installed_accuracy_can_be_removed_while_an_automatic_worker_is_active() {
+    let journal = location_only_journal();
+    let root = journal.path().join("cache/location/accuracy");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("installed.json"),
+        serde_json::to_vec(&json!({"version": "incumbent", "files": []})).unwrap(),
+    )
+    .unwrap();
+    let _reservation = solstone_core_location::install::reserve_install(journal.path()).unwrap();
+    let (code, _) = post(journal.path(), "/app/map/api/accuracy/remove", "{}").await;
+    assert_eq!(
+        code,
+        StatusCode::CONFLICT,
+        "explicit downloads retain their existing Busy policy"
+    );
+    fs::write(
+        root.join("job.json"),
+        serde_json::to_vec(
+            &json!({"state": "downloading", "source": "automatic", "received": 1, "total": 10}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (code, _, state) = get(journal.path(), "/app/map/api/accuracy").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(state["job"]["state"], "downloading");
+    assert_eq!(state["job"]["source"], "automatic");
+    let (code, state) = post(journal.path(), "/app/map/api/accuracy/remove", "{}").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(state["installed"], Value::Null);
+    assert_eq!(state["job"]["state"], "idle");
+    assert!(!root.join("installed.json").exists());
+}
+
+#[test]
+fn failed_download_spawn_reports_failure_and_releases_the_reservation_for_retry() {
+    let journal = location_only_journal();
+    let response = crate::accuracy::start_download(journal.path(), |path, _reservation| {
+        assert_eq!(
+            solstone_core_location::install::accuracy_job(&path)
+                .unwrap()
+                .state,
+            "downloading"
+        );
+        Err(std::io::Error::other("injected thread refusal"))
+    });
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(solstone_core_location::install::accuracy_job(journal.path()).is_none());
+    let _retry = solstone_core_location::install::reserve_install(journal.path()).unwrap();
+    assert_eq!(
+        solstone_core_location::install::accuracy_job(journal.path())
+            .unwrap()
+            .state,
+        "downloading"
+    );
+}
+
 async fn post(root: &Path, uri: &str, body: &str) -> (StatusCode, Value) {
     let response = app(root.to_path_buf())
         .oneshot(

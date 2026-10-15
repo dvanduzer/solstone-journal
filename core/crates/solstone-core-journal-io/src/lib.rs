@@ -192,6 +192,8 @@ pub use legacy_log_alias::{
     LegacyAliasTarget, cleanup_legacy_log_aliases, observe_legacy_alias_symlink,
     remove_observed_legacy_alias_symlink,
 };
+#[cfg(unix)]
+pub use locking::hold_shared_lock;
 #[cfg(any(unix, windows))]
 pub use locking::lock_is_held;
 #[cfg(any(unix, windows))]

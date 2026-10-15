@@ -40,6 +40,7 @@ solstone-core-assets.workspace = true
 solstone-core-artifact-download.workspace = true
 solstone-core-journal-config.workspace = true
 solstone-core-journal-config-write.workspace = true
+solstone-core-journal-io.workspace = true
 uuid = { version = "1", features = ["v4"] }
 log.workspace = true
 tempfile = "3.24.0"

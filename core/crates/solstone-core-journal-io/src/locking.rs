@@ -1035,7 +1035,25 @@ fn acquire_lock_in_parent_retained(
 /// because the RAII guard owns the locked file descriptor.
 #[cfg(unix)]
 pub fn hold_lock(path: impl AsRef<Path>, options: LockOptions) -> Result<FileLock, LockError> {
-    let path = path.as_ref();
+    hold_sidecar_lock(path.as_ref(), options, FlockArg::LockExclusiveNonblock)
+}
+
+/// Hold the same sidecar as `hold_lock`, allowing concurrent Unix readers while
+/// excluding publication. Uses the same bounded acquisition and file policy.
+#[cfg(unix)]
+pub fn hold_shared_lock(
+    path: impl AsRef<Path>,
+    options: LockOptions,
+) -> Result<FileLock, LockError> {
+    hold_sidecar_lock(path.as_ref(), options, FlockArg::LockSharedNonblock)
+}
+
+#[cfg(unix)]
+fn hold_sidecar_lock(
+    path: &Path,
+    options: LockOptions,
+    operation: FlockArg,
+) -> Result<FileLock, LockError> {
     let parent = parent_dir(path);
     fs::create_dir_all(parent).map_err(|source| io_error(path, source))?;
     let file_name = path.file_name().ok_or_else(|| {
@@ -1056,7 +1074,7 @@ pub fn hold_lock(path: impl AsRef<Path>, options: LockOptions) -> Result<FileLoc
         let file = open_options
             .open(&sidecar)
             .map_err(|source| io_error(path, source))?;
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        match Flock::lock(file, operation) {
             Ok(guard) => {
                 return Ok(FileLock {
                     _guard: guard,
@@ -1105,7 +1123,7 @@ pub fn lock_is_held(path: impl AsRef<Path>) -> Result<bool, LockError> {
         Err(source) => return Err(io_error(path, source)),
     };
 
-    match Flock::lock(file, FlockArg::LockSharedNonblock) {
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(guard) => {
             drop(guard);
             Ok(false)
@@ -2687,5 +2705,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot(&entry).mode, 0o600);
+    }
+}
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+mod shared_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn shared_readers_coexist_and_exclude_an_exclusive_publisher() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("models");
+        let options = LockOptions {
+            timeout: Duration::ZERO,
+            ..LockOptions::default()
+        };
+        let first = hold_shared_lock(&path, options).unwrap();
+        let second = hold_shared_lock(&path, options).unwrap();
+        assert!(lock_is_held(&path).unwrap());
+        assert!(matches!(
+            hold_lock(&path, options),
+            Err(LockError::Timeout(_))
+        ));
+        drop(first);
+        assert!(matches!(
+            hold_lock(&path, options),
+            Err(LockError::Timeout(_))
+        ));
+        drop(second);
+        let publication = hold_lock(&path, options).unwrap();
+        assert!(matches!(
+            hold_shared_lock(&path, options),
+            Err(LockError::Timeout(_))
+        ));
+        drop(publication);
+        assert!(!lock_is_held(&path).unwrap());
+        assert!(hold_shared_lock(&path, options).is_ok());
     }
 }

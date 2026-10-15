@@ -58,6 +58,13 @@ pub fn parakeet_coreml_model_root(cache_dir: &Path) -> PathBuf {
         .join("parakeet-tdt-0.6b-v3")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParakeetCoremlFile {
+    pub file: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
 /// The sentinel contract shared by the installer and readiness checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParakeetCoremlSentinel {
@@ -69,6 +76,10 @@ pub struct ParakeetCoremlSentinel {
     fluidaudio_version: Value,
     platform: ParakeetCoremlSentinelPlatform,
     cache_dir: PathBuf,
+    #[serde(default)]
+    catalog_version: String,
+    #[serde(default)]
+    files: Vec<ParakeetCoremlFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +89,14 @@ struct ParakeetCoremlSentinelPlatform {
 }
 
 impl ParakeetCoremlSentinel {
-    pub fn new(cache_dir: PathBuf, os_name: &str, arch: &str, fluidaudio_version: &str) -> Self {
+    pub fn new(
+        cache_dir: PathBuf,
+        os_name: &str,
+        arch: &str,
+        fluidaudio_version: &str,
+        catalog_version: &str,
+        files: Vec<ParakeetCoremlFile>,
+    ) -> Self {
         Self {
             schema_version: 1,
             backend: "parakeet".to_owned(),
@@ -91,11 +109,21 @@ impl ParakeetCoremlSentinel {
                 arch: arch.to_owned(),
             },
             cache_dir,
+            catalog_version: catalog_version.to_owned(),
+            files,
         }
     }
 
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    pub fn catalog_version(&self) -> &str {
+        &self.catalog_version
+    }
+
+    pub fn files(&self) -> &[ParakeetCoremlFile] {
+        &self.files
     }
 
     fn is_valid_for(&self, os_name: &str, arch: &str) -> bool {
@@ -163,5 +191,26 @@ mod tests {
                 default_parakeet_coreml_cache_dir(&home)
             );
         }
+    }
+
+    #[test]
+    fn sentinel_deserializes_without_files_as_empty() {
+        let json_data = json!({
+            "schema_version": 1,
+            "backend": "parakeet",
+            "variant": "coreml",
+            "model_version": "v3",
+            "quantization": "fp32",
+            "fluidaudio_version": "0.14.0",
+            "platform": {
+                "os": "darwin",
+                "arch": "arm64"
+            },
+            "cache_dir": "/cache",
+            "catalog_version": "v1"
+        });
+        let sentinel: super::ParakeetCoremlSentinel = serde_json::from_value(json_data).unwrap();
+        assert!(sentinel.files().is_empty());
+        assert_eq!(sentinel.catalog_version(), "v1");
     }
 }

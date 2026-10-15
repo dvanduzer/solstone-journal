@@ -243,6 +243,8 @@ test('the accuracy card offers, follows and removes the download', async () => {
   assert.ok(!fresh.includes('building, park or campus'), 'no outlines promised without the outline file');
   const running = await card({ offered, installed: null, current: false, attributions: [], job: { state: 'downloading', received: 4.12e8, total: 1.4e9 } });
   assert.ok(running.includes('downloading location accuracy: 412 MB of 1.4 GB'));
+  const refreshing = await card({ offered, installed: { version: 'old', size_bytes: 1.4e9, venues: true }, current: false, attributions: [], job: { state: 'downloading', source: 'automatic', received: 0, total: 1.4e9 } });
+  assert.ok(refreshing.includes('data-accuracy="remove">remove location accuracy</button>'));
   const done = await card({ offered, installed: { version: 'v1', size_bytes: 1.4e9, venues: true, containment: false }, current: true, attributions: [], job: { state: 'idle' } });
   assert.ok(done.includes('data-accuracy="remove">remove location accuracy</button>'));
   const full = await card({ offered: null, installed: null, current: false, attributions: [], job: { state: 'idle' } });

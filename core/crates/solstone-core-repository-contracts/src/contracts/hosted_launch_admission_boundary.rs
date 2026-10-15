@@ -136,6 +136,11 @@ const SCANNED_MODULE_SOURCES: &[(&str, &str, &str)] = &[
     ),
     (
         "supervisor",
+        "admitted_boot",
+        include_str!("../../../solstone-core/src/supervisor/admitted_boot.rs"),
+    ),
+    (
+        "supervisor",
         "bus",
         include_str!("../../../solstone-core/src/supervisor/bus.rs"),
     ),

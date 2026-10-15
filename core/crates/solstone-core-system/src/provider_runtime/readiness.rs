@@ -9,11 +9,6 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use solstone_core_assets::catalog;
-use solstone_core_journal_config::parakeet_coreml::{
-    default_parakeet_coreml_cache_dir, parakeet_coreml_model_root,
-    read_valid_parakeet_coreml_sentinel,
-};
 use solstone_core_local::install::pins;
 
 use crate::process::{Disposition, LaunchError, launch};
@@ -164,36 +159,23 @@ pub fn classify_parakeet_cpp_probe_failure(detail: String) -> ParakeetCppReadine
 /// Verify the CoreML install sentinel and its required model files without loading them.
 pub fn check_parakeet_coreml_cache(
     home_dir: &Path,
+    config: &solstone_core_journal_config::JournalConfigRead,
     os_name: &str,
     arch: &str,
 ) -> Result<PathBuf, String> {
-    let cache = default_parakeet_coreml_cache_dir(home_dir);
-    let sentinel = read_valid_parakeet_coreml_sentinel(home_dir, os_name, arch);
-    let Some(sentinel) = sentinel else {
-        return Err(format!(
-            "parakeet check failed: sentinel not ready at {}",
-            cache.join(".install-complete").display()
-        ));
-    };
-    let configured = sentinel.cache_dir();
-    let model_root = parakeet_coreml_model_root(configured);
-    let complete = catalog()
-        .iter()
-        .filter(|artifact| artifact.unit == "parakeet-coreml")
-        .all(|artifact| model_root.join(artifact.filename).is_file());
-    complete.then_some(configured.to_path_buf()).ok_or_else(|| {
-        format!(
-            "parakeet check failed: cache verification failed at {}",
-            configured.display()
-        )
-    })
+    solstone_core_local::install::coreml_install::check_parakeet_coreml_cache_doctor(
+        home_dir, config, os_name, arch,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use solstone_core_assets::catalog;
     use solstone_core_journal_config::parakeet_coreml::{
-        default_parakeet_coreml_cache_dir, parakeet_coreml_model_root,
+        ParakeetCoremlFile, ParakeetCoremlSentinel, default_parakeet_coreml_cache_dir,
+        parakeet_coreml_model_root, parakeet_coreml_sentinel_path,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -237,7 +219,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(check_parakeet_coreml_cache(home.path(), "darwin", "arm64").is_err());
+        assert!(
+            check_parakeet_coreml_cache(home.path(), &config(&cache), "darwin", "arm64").is_err()
+        );
     }
 
     #[test]
@@ -282,7 +266,7 @@ mod tests {
         );
 
         assert_eq!(
-            check_parakeet_coreml_cache(home.path(), "darwin", "arm64").unwrap(),
+            check_parakeet_coreml_cache(home.path(), &config(&cache), "darwin", "arm64").unwrap(),
             cache
         );
     }
@@ -303,11 +287,146 @@ mod tests {
                 "quantization": "fp32",
                 "fluidaudio_version": "0.14.0",
                 "platform": {"os": "darwin", "arch": "arm64"},
-                "cache_dir": missing,
+                "cache_dir": &missing,
             })
             .to_string(),
         )
         .unwrap();
-        assert!(check_parakeet_coreml_cache(home.path(), "darwin", "arm64").is_err());
+        assert!(
+            check_parakeet_coreml_cache(home.path(), &config(&missing), "darwin", "arm64").is_err()
+        );
+    }
+
+    fn config(cache: &Path) -> solstone_core_journal_config::JournalConfigRead {
+        solstone_core_journal_config::JournalConfigRead {
+            present: true,
+            sha256: None,
+            config: Some(
+                serde_json::json!({"transcribe": {"parakeet": {"cache_dir": cache}}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        }
+    }
+
+    fn installed_fixture(home: &Path, cache: &Path, bytes: &[u8]) -> Vec<ParakeetCoremlFile> {
+        fs::create_dir_all(cache).unwrap();
+        let root = parakeet_coreml_model_root(cache);
+        let files: Vec<_> = catalog()
+            .iter()
+            .filter(|row| row.unit == "parakeet-coreml")
+            .map(|row| {
+                let path = root.join(row.filename);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, bytes).unwrap();
+                ParakeetCoremlFile {
+                    file: row.filename.to_owned(),
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    size_bytes: bytes.len() as u64,
+                }
+            })
+            .collect();
+        assert!(
+            files
+                .iter()
+                .any(|row| row.file == "Encoder.mlmodelc/weights/weight.bin")
+        );
+        let sentinel = ParakeetCoremlSentinel::new(
+            cache.to_path_buf(),
+            "darwin",
+            "arm64",
+            "0.14.0",
+            "incumbent-pin",
+            files.clone(),
+        );
+        let path = parakeet_coreml_sentinel_path(home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&sentinel).unwrap()).unwrap();
+        files
+    }
+
+    #[test]
+    fn coreml_readiness_rejects_missing_or_mismatched_recorded_files() {
+        let home = tempdir().unwrap();
+        let cache = default_parakeet_coreml_cache_dir(home.path());
+        installed_fixture(home.path(), &cache, b"expected-content");
+        let check = || check_parakeet_coreml_cache(home.path(), &config(&cache), "darwin", "arm64");
+        assert_eq!(check().unwrap(), cache);
+        let required =
+            parakeet_coreml_model_root(&cache).join("Encoder.mlmodelc/weights/weight.bin");
+        fs::write(&required, b"corrupt--content").unwrap();
+        assert!(check().is_err());
+        fs::write(&required, b"expected-content").unwrap();
+        assert!(check().is_ok());
+        fs::remove_file(required).unwrap();
+        assert!(check().is_err());
+    }
+
+    #[test]
+    fn coreml_readiness_rejects_a_valid_sentinel_for_a_different_configured_tree() {
+        let home = tempdir().unwrap();
+        let first = home.path().join("first/cache");
+        let second = home.path().join("second/cache");
+        assert_ne!(
+            parakeet_coreml_model_root(&first),
+            parakeet_coreml_model_root(&second)
+        );
+        installed_fixture(home.path(), &first, b"first-valid-tree");
+        let first_receipt = fs::read(parakeet_coreml_sentinel_path(home.path())).unwrap();
+        assert_eq!(
+            check_parakeet_coreml_cache(home.path(), &config(&first), "darwin", "arm64").unwrap(),
+            first
+        );
+        installed_fixture(home.path(), &second, b"other-valid-tree");
+        assert_eq!(
+            check_parakeet_coreml_cache(home.path(), &config(&second), "darwin", "arm64").unwrap(),
+            second
+        );
+        fs::write(parakeet_coreml_sentinel_path(home.path()), first_receipt).unwrap();
+        assert!(
+            check_parakeet_coreml_cache(home.path(), &config(&second), "darwin", "arm64").is_err()
+        );
+        assert_eq!(
+            check_parakeet_coreml_cache(home.path(), &config(&first), "darwin", "arm64").unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn coreml_readiness_recovers_pending_marker_to_complete_backup() {
+        let home = tempdir().unwrap();
+        let cache = default_parakeet_coreml_cache_dir(home.path());
+        let files = installed_fixture(home.path(), &cache, b"recorded-backup-bytes");
+        let root = parakeet_coreml_model_root(&cache);
+        let backup = root.with_extension("backup");
+        fs::rename(&root, &backup).unwrap();
+        for file in &files {
+            let path = root.join(&file.file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"uncommitted-canonical").unwrap();
+        }
+        let marker = cache.join(".publication.json");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "phase": "pending", "tree_canonical": root, "tree_backup": backup,
+                "published_catalog_version": "replacement-pin", "published_files": files
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            check_parakeet_coreml_cache(home.path(), &config(&cache), "darwin", "arm64").unwrap(),
+            cache
+        );
+        assert_eq!(
+            fs::read(root.join("Encoder.mlmodelc/weights/weight.bin")).unwrap(),
+            b"recorded-backup-bytes"
+        );
+        assert!(!marker.exists());
+        assert!(
+            check_parakeet_coreml_cache(home.path(), &config(&cache), "darwin", "arm64").is_ok()
+        );
     }
 }

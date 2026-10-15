@@ -240,7 +240,9 @@ On mac, each app handles its own updates. The shell installer verifies an existi
 
 On linux, use the route that owns the installation:
 
-For a tree install, `sh install.sh --upgrade` is the whole upgrade: it preserves the recorded lane unless `--lane` is explicit, verifies the signed release, flips `current`, and repoints the managed wrapper and service through setup. If a package owns the install, the tree installer refuses. This release has no package repository, so download the newer local `.deb` or `.rpm`, repeat the applicable package install command above, then run `solstone journal setup`.
+For a tree install, `sh install.sh --upgrade` is the whole upgrade: it preserves the recorded lane unless `--lane` is explicit, verifies the signed release, flips `current`, and repoints the managed wrapper and service through setup. If a package owns the install, the tree installer refuses. This release has no package repository. To upgrade an existing 2.x package installation, download the newer local `.deb` or `.rpm` and repeat the applicable package install command above. You do not need to run setup again.
+
+The new build takes effect when your journal next starts, including after a login or reboot. It checks for updates to models, location data and agent skills you already use. Files that already match the new build stay in place, and optional assets you have not installed stay absent. A failed refresh does not stop your journal; it tries again on a later start.
 
 If a tree install reports `setup-failed`, follow the named correction and rerun the same `install.sh` command. When setup may already have changed a managed wrapper or service, the installer keeps the candidate selected and writes `setup_status=pending` in its receipt; the same command finishes that transaction safely.
 

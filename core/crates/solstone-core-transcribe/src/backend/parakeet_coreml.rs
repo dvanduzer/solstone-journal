@@ -35,9 +35,10 @@ pub(crate) fn transcribe(
 ) -> Result<TranscriptionResponse, TranscribeError> {
     let helper = resolve_helper_path();
     let home = std::env::home_dir().unwrap_or_default();
-    transcribe_with_helper(
+    transcribe_with_installed_helper(
         audio,
         &helper,
+        &home,
         &parakeet_coreml_cache_dir(config, &home),
         &parakeet_coreml_model_version(config),
         parakeet_coreml_timeout(config),
@@ -52,6 +53,20 @@ pub(crate) fn get_model_info(config: &JournalConfigRead) -> Result<ModelInfo, Tr
         &parakeet_coreml_model_version(config),
         VERSION_TIMEOUT,
     )
+}
+
+fn transcribe_with_installed_helper(
+    audio: &[f32],
+    helper: &Path,
+    home: &Path,
+    cache_dir: &Path,
+    model_version: &str,
+    timeout: Duration,
+) -> Result<TranscriptionResponse, TranscribeError> {
+    let _admission =
+        solstone_core_local::install::coreml_install::hold_parakeet_coreml_read_admission(home)
+            .map_err(|error| deferred("coreml_models_updating", error.to_string()))?;
+    transcribe_with_helper(audio, helper, cache_dir, model_version, timeout)
 }
 
 pub(crate) fn transcribe_with_helper(
@@ -1079,5 +1094,103 @@ mod tests {
             panic!("expected hard CoreML error");
         };
         assert_eq!(reason, expected_reason);
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn helper_reads_wait_for_publication_and_see_the_rolled_back_incumbent() {
+        use super::transcribe_with_installed_helper;
+        use solstone_core_journal_config::parakeet_coreml::{
+            default_parakeet_coreml_cache_dir, parakeet_coreml_model_root,
+        };
+        use solstone_core_local::install::coreml_install::hold_parakeet_coreml_read_admission;
+        use std::{os::unix::fs::PermissionsExt, sync::mpsc, thread};
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let cache = default_parakeet_coreml_cache_dir(&home);
+        fs::create_dir_all(&cache).unwrap();
+        let root = parakeet_coreml_model_root(&cache);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("model.bin"), b"incumbent\n").unwrap();
+        fs::write(root.join("vocab.json"), b"vocabulary\n").unwrap();
+        let helper = temporary.path().join("parakeet-helper");
+        fs::write(
+            &helper,
+            format!(
+                r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cache-dir) cache="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+root="${{cache%/*}}/parakeet-tdt-0.6b-v3"
+IFS= read -r vocabulary < "$root/vocab.json" || exit 4
+IFS= read -r model < "$root/model.bin" || exit 4
+[ "$vocabulary" = "vocabulary" ] || exit 4
+[ "$model" = "incumbent" ] || exit 4
+printf '%s\n' '{}'
+"#,
+                SUCCESS
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let read = hold_parakeet_coreml_read_admission(&home).unwrap();
+        let authority = read.path().to_path_buf();
+        drop(read);
+        let publication = solstone_core_journal_io::hold_lock(
+            authority,
+            solstone_core_journal_io::LockOptions::default(),
+        )
+        .unwrap();
+        let backup = root.with_extension("previous");
+        let sentinel =
+            solstone_core_journal_config::parakeet_coreml::parakeet_coreml_sentinel_path(&home);
+        fs::write(
+            &sentinel,
+            serde_json::to_vec(
+                &solstone_core_journal_config::parakeet_coreml::ParakeetCoremlSentinel::new(
+                    cache.clone(),
+                    "darwin",
+                    "arm64",
+                    "0.14.0",
+                    "incumbent",
+                    vec![],
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let marker = cache.join(".publication.json");
+        fs::write(&marker, serde_json::to_vec(&serde_json::json!({"phase": "pending", "tree_canonical": root, "tree_backup": backup, "published_catalog_version": "replacement", "published_files": []})).unwrap()).unwrap();
+        fs::rename(&root, &backup).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(transcribe_with_installed_helper(
+                    &[0.0],
+                    &helper,
+                    &home,
+                    &cache,
+                    "v3",
+                    Duration::from_secs(5),
+                ))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(100));
+        // Model the publisher exiting before rollback: real consumer admission
+        // must recover the pending tree before launching its helper.
+        drop(publication);
+        reader.join().unwrap();
+        assert!(
+            matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+            "helper must not read an unpublished model tree"
+        );
+        assert_eq!(done_rx.recv().unwrap().unwrap().text, "hello world!");
+        assert_eq!(fs::read(root.join("model.bin")).unwrap(), b"incumbent\n");
+        assert!(!marker.exists());
     }
 }
