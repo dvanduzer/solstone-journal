@@ -22,11 +22,11 @@ mod app;
 mod convey;
 #[cfg(windows)]
 mod journal;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod prefs;
 #[cfg(windows)]
 mod shell;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod update;
 #[cfg(windows)]
 mod webview;

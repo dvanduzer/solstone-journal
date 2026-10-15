@@ -265,6 +265,36 @@ expect_refuse latest-invalid redirect-hop-exhaustion \
 	env PATH="$HTTP_BIN:$PATH" SOLSTONE_CURL_MODE=redirect HOME="$BASE/redirect-home" \
 	"$INSTALL" --prefix "$BASE/redirect-prefix" --origin http://127.0.0.1
 
+# No curl on PATH: wget must return the redirect to our origin check before
+# it can make another request. The stub models wget's automatic-follow default.
+WGET_BIN=$BASE/wget-bin
+mkdir -p "$WGET_BIN"
+for cmd in sh tar sha256sum uname mktemp mkdir cp mv ln cat awk chmod wc tr cut printf dirname rm rmdir ls env od; do
+	_path=$(command -v "$cmd" || true)
+	[ -n "$_path" ] && ln -s "$_path" "$WGET_BIN/$cmd"
+done
+cat >"$WGET_BIN/wget" <<'EOF'
+#!/bin/sh
+for arg in "$@"; do
+	if [ "$arg" = --max-redirect=0 ]; then
+		printf '  HTTP/1.1 302 Found\n  Location: https://outside.invalid/bytes\n' >&2
+		exit 8
+	fi
+done
+: >"$SOLSTONE_WGET_LEAK"
+exit 0
+EOF
+chmod 755 "$WGET_BIN/wget"
+expect_refuse origin-refused wget-redirect-origin-checked \
+	env PATH="$WGET_BIN" SOLSTONE_UNAME_S=Linux SOLSTONE_UNAME_M="$HOST_ARCH" \
+	SOLSTONE_WGET_LEAK="$BASE/wget-leak" HOME="$BASE/wget-home" \
+	"$INSTALL" --prefix "$BASE/wget-prefix" --origin http://127.0.0.1
+if [ ! -e "$BASE/wget-leak" ]; then
+	pass "wget did not follow the refused redirect"
+else
+	fail "wget contacted the redirect before the origin check"
+fi
+
 # fetcher-missing
 BINDIR=$BASE/nofetch
 mkdir -p "$BINDIR"
