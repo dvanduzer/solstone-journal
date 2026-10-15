@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- fixed an access-denied error when importing a journal archive on windows.
 - security fix: on mac, a redirected speech-model download could tell another website that you were using transcription. missing or damaged models now ask you to repair them with the journal's installer.
 - when older recordings arrive late, your journal no longer links them as if they were recorded after newer ones.
 - security fix: exports from older journals could include private keys for connections to other journals, giving a copy of those keys to anyone you shared the export with. exports now leave out those keys.

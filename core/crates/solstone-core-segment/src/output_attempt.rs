@@ -253,6 +253,44 @@ impl OutputClaims {
             _lock: lock,
         })
     }
+
+    /// Transfer to continuous live-name exclusion without retaining child locks.
+    /// Independent readers can still cause a native directory operation to refuse.
+    pub fn into_directory_mutation(mut self, segment: &Path) -> Result<DirectoryMutation> {
+        let SegmentCommit {
+            parent,
+            segment,
+            _lock,
+            ..
+        } = self.commit(segment)?;
+        let binding = self.parents.remove(&segment).expect("validated parent");
+        // The short lock is already held. Close child handles while keeping the
+        // original directory and its ancestry alive, so identity cannot be reused.
+        drop(self);
+        Ok(DirectoryMutation {
+            binding,
+            parent,
+            segment,
+            _lock,
+        })
+    }
+}
+
+/// Original directory authority and live-name exclusion for a directory mutation.
+pub struct DirectoryMutation {
+    binding: DirectoryBinding,
+    parent: JournalRoot,
+    segment: PathBuf,
+    _lock: BoundParentLock,
+}
+
+impl DirectoryMutation {
+    /// Recheck original identity, ancestry and owner deletion without reopening children.
+    pub fn revalidate(&self) -> Result<()> {
+        self.binding.revalidate()?;
+        revalidate(&self.parent)?;
+        live(&self.segment)
+    }
 }
 
 /// A publication boundary retaining its attempts and segment lock.
@@ -455,6 +493,48 @@ mod tests {
         let raw = segment.join("audio.wav");
         fs::write(&raw, b"before").unwrap();
         (root, segment, raw)
+    }
+
+    #[test]
+    fn directory_mutation_releases_child_claims_without_releasing_the_live_name() {
+        let (root, segment, raw) = fixture();
+        let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
+        let mutation = claims.into_directory_mutation(&segment).unwrap();
+        mutation.revalidate().unwrap();
+        // A later attempt may open children, but cannot publish while this
+        // mutation retains the short live-name lock.
+        let contender = OutputClaims::acquire([raw.with_extension("jsonl")], no_wait()).unwrap();
+        assert_eq!(
+            contender.commit(&segment).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(contender);
+        fs::rename(&segment, root.path().join("moved")).unwrap();
+        assert!(mutation.revalidate().is_err());
+        drop(mutation);
+        assert!(!segment.exists());
+        assert_eq!(
+            fs::read(root.path().join("moved/audio.wav")).unwrap(),
+            b"before"
+        );
+    }
+
+    #[test]
+    fn a_late_attempt_cannot_commit_after_directory_mutation_removes_its_parent() {
+        let (_root, segment, raw) = fixture();
+        fs::remove_file(raw).unwrap();
+        let claims = OutputClaims::discover(&segment, no_wait()).unwrap();
+        let mutation = claims.into_directory_mutation(&segment).unwrap();
+        let contender = OutputClaims::discover(&segment, no_wait()).unwrap();
+        assert_eq!(
+            contender.commit(&segment).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        mutation.revalidate().unwrap();
+        fs::remove_dir(&segment).unwrap();
+        drop(mutation);
+        assert!(contender.commit(&segment).is_err());
+        assert!(!segment.exists());
     }
 
     #[test]

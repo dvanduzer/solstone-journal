@@ -838,12 +838,11 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
-# Windows archive publication retains child claims across a directory rename; whole-library qualification is blocked.
 id = "package::solstone-core-import-sources"
 package = "solstone-core-import-sources"
 set = "component"
 areas = ["import"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
