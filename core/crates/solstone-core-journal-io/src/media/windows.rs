@@ -290,6 +290,15 @@ pub(super) fn entries(
     Ok(Some(result))
 }
 
+/// Windows cannot hold a colon in a name, the case this exists for, so every
+/// listed name is still admitted here.
+pub(super) fn entries_keeping_any_name(
+    directory: &Directory,
+    maximum: usize,
+) -> io::Result<Option<Vec<MediaEntry>>> {
+    entries(directory, maximum)
+}
+
 pub(super) fn entry(directory: &Directory, name: &OsStr) -> io::Result<Option<MediaEntry>> {
     super::plain_name(name)?;
     let handle = match nt_create_relative_exact(
