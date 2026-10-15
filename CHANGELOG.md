@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- security fix: app updates on mac now check each download address before connecting. before, a redirected update download could contact another website and reveal that you were checking for updates.
+
 - security fix: on mac, a redirected speech-model download could tell another website that you were using transcription. missing or damaged models now ask you to repair them with the journal's installer.
 - when older recordings arrive late, your journal no longer links them as if they were recorded after newer ones.
 - security fix: exports from older journals could include private keys for connections to other journals, giving a copy of those keys to anyone you shared the export with. exports now leave out those keys.
