@@ -10,6 +10,7 @@ const PORTABLE_TREES: &[&str] = &[
     "link",
     "mcp-endpoint",
     "tokens",
+    "peers",
     "awareness",
     "apps",
     "backup",
@@ -52,12 +53,15 @@ mod tests {
     #[test]
     fn portable_tree_prunes_are_root_relative() {
         assert_eq!(deny_top_level("config"), DenyAction::TreePrune);
+        assert_eq!(deny_top_level("peers"), DenyAction::TreePrune);
         assert_eq!(deny_top_level("indexer"), DenyAction::Skip);
         for path in [
             "config/journal.json",
             "mcp-endpoint/pop.ed25519.pk8",
             "backup/hosted/binding.json",
             "imports/archive-merge-work/extract/x",
+            "peers/remote/client.key",
+            "peers/remote/client.crt",
         ] {
             assert!(deny_member(path, true), "{path}");
         }
@@ -69,6 +73,7 @@ mod tests {
             "chronicle/20260101/indexer/120000_60/note.tmp",
             "health/retention.log",
             "health/pruning-runs/x.jsonl",
+            "imports/item/peers/original.txt",
         ] {
             assert!(!deny_member(path, true), "{path}");
         }
