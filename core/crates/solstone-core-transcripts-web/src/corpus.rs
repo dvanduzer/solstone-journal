@@ -423,6 +423,20 @@ mod tests {
                     for detail in details {
                         if let Some(detail) = detail.as_object_mut() {
                             detail.insert("ts".into(), Value::String("<TODAY_TIMESTAMP>".into()));
+                            if let Some(Value::String(file)) = detail.get_mut("file")
+                                && let Ok(relative) = Path::new(file).strip_prefix(root)
+                            {
+                                let parts = relative
+                                    .components()
+                                    .map(|part| match part {
+                                        std::path::Component::Normal(name) => name.to_str(),
+                                        _ => None,
+                                    })
+                                    .collect::<Option<Vec<_>>>();
+                                if let Some(parts) = parts {
+                                    *file = format!("<JOURNAL_ROOT>/{}", parts.join("/"));
+                                }
+                            }
                         }
                     }
                 }
