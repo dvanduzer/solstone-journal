@@ -28,6 +28,8 @@ use solstone_core_journal_io::{FlatDirectory, JournalRoot};
 use caseless::default_case_fold_str;
 use sha2::{Digest, Sha256};
 
+use solstone_core_format::segment::{is_date_key, segment_parse};
+
 use crate::continuity::{ContinuationBinding, continuation_binding};
 use crate::device::validate_cid;
 use crate::projection::{name_with_ordinal, paired_name_with_suffix, project_paired_stream_base};
@@ -1761,6 +1763,36 @@ fn unbound_reservation_record(
     })
 }
 
+fn capture_key<'a>(day: &'a str, segment: &str) -> Option<(&'a str, u8, u8, u8)> {
+    if !is_date_key(day) {
+        return None;
+    }
+    let times = segment_parse(segment)?;
+    Some((day, times.hour, times.minute, times.second))
+}
+
+fn predecessor_link(
+    prior_day: Option<&str>,
+    prior_segment: Option<&str>,
+    day: &str,
+    segment: &str,
+) -> (Option<String>, Option<String>) {
+    let (Some(prior_day), Some(prior_segment)) = (prior_day, prior_segment) else {
+        return (None, None);
+    };
+    let (Some(prior_key), Some(next_key)) = (
+        capture_key(prior_day, prior_segment),
+        capture_key(day, segment),
+    ) else {
+        return (None, None);
+    };
+    if next_key >= prior_key {
+        (Some(prior_day.to_owned()), Some(prior_segment.to_owned()))
+    } else {
+        (None, None)
+    }
+}
+
 fn update_record(
     record: Option<StreamRecord>,
     name: &str,
@@ -1785,8 +1817,12 @@ fn update_record(
             ))
         }
         Some(mut record) => {
-            let prev_day = record.last_day.clone();
-            let prev_segment = record.last_segment.clone();
+            let (prev_day, prev_segment) = predecessor_link(
+                record.last_day.as_deref(),
+                record.last_segment.as_deref(),
+                day,
+                segment,
+            );
             let seq = record
                 .seq
                 .checked_add(1)
