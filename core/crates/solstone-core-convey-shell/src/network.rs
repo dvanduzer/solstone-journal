@@ -1124,6 +1124,7 @@ mod tests {
     async fn same_machine_mint_rejects_each_forwarded_header_without_persisting_then_succeeds() {
         let temporary = TempDir::new();
         committed_identity(temporary.path());
+        fs::write(temporary.path().join("config").join("journal.json"), r#"{"setup":{"completed_at":1},"pairing":{"home_address":"10.0.0.2:7657","local_network":true}}"#).expect("open fixture network");
         let root = Arc::new(JournalRoot(temporary.path().to_path_buf()));
         let app = Router::new()
             .route("/start", axum::routing::post(pair_start))
@@ -1194,7 +1195,7 @@ mod tests {
         assert!(!temporary.path().join("link/nonces.json").exists());
         fs::write(
             temporary.path().join("config/journal.json"),
-            r#"{"pairing":{"home_address":"10.0.0.2:7657"}}"#,
+            r#"{"pairing":{"home_address":"10.0.0.2:7657","local_network":true}}"#,
         )
         .expect("direct posture");
         for header in ["x-forwarded-for", "x-real-ip", "x-forwarded-host"] {
@@ -2113,7 +2114,7 @@ mod tests {
             committed_identity(temporary.path());
             fs::write(
                 temporary.path().join("config/journal.json"),
-                r#"{"setup":{"completed_at":1},"pairing":{"home_address":"10.0.0.2:7657"}}"#,
+                r#"{"setup":{"completed_at":1},"pairing":{"home_address":"10.0.0.2:7657","local_network":true}}"#,
             )
             .expect("config");
             let app = crate::router(temporary.path().to_path_buf()).layer(Extension(basis.clone()));

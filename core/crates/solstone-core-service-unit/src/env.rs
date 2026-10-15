@@ -34,7 +34,7 @@ pub fn build_service_environment(
 #[cfg(test)]
 mod tests {
     use solstone_core_installation_identity::{
-        Generation, GuardFields, InstallationId, JournalToken, NamespaceName,
+        Generation, GuardFields, InstallationId, NamespaceName, journal_token_from_path,
     };
 
     use super::build_service_environment;
@@ -47,11 +47,11 @@ mod tests {
             .unwrap(),
             id: InstallationId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             generation: Generation::new(1).unwrap(),
-            journal_token: JournalToken::from_raw_absolute(if cfg!(windows) {
-                br"C:\journal".to_vec()
+            journal_token: journal_token_from_path(std::path::Path::new(if cfg!(windows) {
+                r"C:\journal"
             } else {
-                b"/journal".to_vec()
-            })
+                "/journal"
+            }))
             .unwrap(),
         }
     }

@@ -146,6 +146,16 @@ fn substitute(value: &str, root: &Path) -> String {
     roots.dedup();
     let mut normalized = value.to_owned();
     for text in roots {
+        // The captured corpus uses a slash at the fixture-root boundary.
+        // Match that boundary before the bare root, including JSON escaping.
+        let with_separator = format!("{text}{}", std::path::MAIN_SEPARATOR);
+        let encoded_prefix = serde_json::to_string(&with_separator).expect("encode fixture prefix");
+        normalized = normalized
+            .replace(
+                &encoded_prefix[1..encoded_prefix.len() - 1],
+                "<JOURNAL_ROOT>/",
+            )
+            .replace(&with_separator, "<JOURNAL_ROOT>/");
         // Bodies may be raw JSON; decoded fields carry the unescaped native path.
         let encoded = serde_json::to_string(&text).expect("encode fixture root");
         normalized = normalized
@@ -352,8 +362,9 @@ async fn replay_record(router: Router, root: &Path, expected: &Value) {
     assert_eq!(
         format!("{digest:x}"),
         recorded_digest,
-        "{}",
-        expected["path"]
+        "{}; response: {}",
+        expected["path"],
+        String::from_utf8_lossy(&body)
     );
 }
 
