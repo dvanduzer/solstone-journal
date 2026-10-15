@@ -2,6 +2,11 @@
 
 Swift helper for the Parakeet v3 STT backend in solstone.
 
+The helper loads installed model files through Core ML. Model installation and
+repair belong to `solstone journal install-models`; to replace damaged files, use
+`solstone journal install-models --force --variant coreml`. A load failure leaves
+the installed tree intact and reports an error without downloading replacements.
+
 ## Build
 
 ```bash
@@ -87,7 +92,7 @@ Non-zero exits emit one UTF-8 JSON object followed by `\n`:
 - `0`: success
 - `2`: argv / input parsing error
 - `3`: cache directory creation / write failure
-- `4`: model download / load failure
+- `4`: model load failure
 - `5`: transcription failure
 
 ## Fixture Regeneration
