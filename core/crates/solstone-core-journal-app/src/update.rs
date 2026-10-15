@@ -431,7 +431,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn redirect_is_refused_before_contacting_its_destination() {
         use std::io::{Read, Write};
@@ -489,7 +489,7 @@ mod tests {
         assert!(!contacted, "redirect destination received a request");
     }
 
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn a_sibling_package_streams_to_disk_and_reports_progress() {
         use std::io::{Read, Write};
