@@ -10,7 +10,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - new imports use creation dates in common filenames, photos, audio and video files instead of the date a file was copied. when no creation date is found, you can choose one. this works from the import page and the command line without installing an extra tool.
 - new conversations imported across midnight and daylight saving changes keep their source times. conversations in the repeated hour are kept separately, and timed text that crosses midnight continues on the next day. existing recordings stay where they are.
-
+- fixed an access-denied error when importing a journal archive on windows.
 - security fix: on mac, a redirected speech-model download could tell another website that you were using transcription. missing or damaged models now ask you to repair them with the journal's installer.
 - when older recordings arrive late, your journal no longer links them as if they were recorded after newer ones.
 - security fix: exports from older journals could include private keys for connections to other journals, giving a copy of those keys to anyone you shared the export with. exports now leave out those keys.
