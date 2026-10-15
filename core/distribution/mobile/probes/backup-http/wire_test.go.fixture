@@ -1,0 +1,246 @@
+//go:build backup_http_wire && (darwin || ios)
+
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+)
+
+type boundedWireListener struct {
+	net.Listener
+	accepted atomic.Int32
+}
+
+func (listener *boundedWireListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	listener.accepted.Add(1)
+	tcp, ok := connection.(*net.TCPConn)
+	if !ok {
+		_ = connection.Close()
+		return nil, errors.New("controlled peer requires TCP")
+	}
+	if err = tcp.SetReadBuffer(4096); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	raw, err := tcp.SyscallConn()
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	var size int
+	var optionErr error
+	err = raw.Control(func(fd uintptr) {
+		size, optionErr = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+	})
+	if err != nil || optionErr != nil || size <= 0 || size > 64*1024 {
+		_ = connection.Close()
+		return nil, errors.New("controlled peer receive window is not bounded")
+	}
+	return connection, nil
+}
+
+// Go serves the controlled peer only; every client request still executes the
+// production Foundation transport. The exact controlled test leaf is accepted solely
+// by the separately tagged harness hook for this one loopback address/port.
+func nativeHTTPWirePeer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	peer := httptest.NewUnstartedServer(handler)
+	peer.Listener = &boundedWireListener{Listener: peer.Listener}
+	peer.StartTLS()
+	t.Cleanup(peer.Close)
+	endpoint, _ := url.Parse(peer.URL)
+	port, _ := strconv.ParseUint(endpoint.Port(), 10, 16)
+	if !installWirePin(peer.Certificate().Raw, endpoint.Hostname(), uint32(port)) {
+		t.Fatal("isolated peer pin refused")
+	}
+	t.Cleanup(uninstallWirePin)
+	return peer
+}
+
+func TestNativeHTTPWireInFlightBodyCancellation(t *testing.T) {
+	accepted := make(chan int, 1)
+	release := make(chan struct{})
+	handlerLeft := make(chan struct{})
+	type bodyResult struct {
+		bytes       int64
+		err         error
+		deadlineSet bool
+	}
+	bodyEnded := make(chan bodyResult, 1)
+	peer := nativeHTTPWirePeer(t, func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerLeft)
+		prefix := make([]byte, 64*1024)
+		count, err := io.ReadFull(r.Body, prefix)
+		if err != nil {
+			accepted <- -1
+			return
+		}
+		accepted <- count
+		<-release
+		if deadlineErr := http.NewResponseController(w).SetReadDeadline(time.Now().Add(2 * time.Second)); deadlineErr != nil {
+			bodyEnded <- bodyResult{bytes: int64(count), err: deadlineErr}
+			return
+		}
+		rest, readErr := io.Copy(io.Discard, r.Body)
+		bodyEnded <- bodyResult{bytes: int64(count) + rest, err: readErr, deadlineSet: true}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	transport, err := newNativeHTTPTransport(ctx, peer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := http.NewRequest(http.MethodPut, peer.URL+"/in-flight", bytes.NewReader(make([]byte, 8*1024*1024)))
+	finished := make(chan error, 1)
+	joined := make(chan struct{})
+	var releaseOnce sync.Once
+	go func() {
+		defer close(joined)
+		response, err := transport.RoundTrip(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		finished <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-joined:
+		case <-time.After(10 * time.Second):
+			panic("wire test could not join actual native call")
+		}
+	})
+	select {
+	case count := <-accepted:
+		if count != 64*1024 {
+			t.Fatal("peer did not receive upload prefix")
+		}
+		t.Logf("actual peer read %d request bytes before cancellation; fixture request bytes=%d", count, request.ContentLength)
+	case <-time.After(10 * time.Second):
+		t.Fatal("peer never received upload bytes")
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("in-flight native cancel result: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("native cancelled task did not actually drain")
+	}
+	// The deliberately held server handler remains separately owned. Native
+	// drain does not prove the server cannot process already received bytes.
+	select {
+	case <-handlerLeft:
+		t.Fatal("server custody control ended prematurely")
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case received := <-bodyEnded:
+		if !received.deadlineSet || received.bytes >= request.ContentLength || received.err == nil {
+			t.Fatal("request body was complete before cancellation; in-flight upload control not established")
+		}
+		var networkError net.Error
+		if errors.As(received.err, &networkError) && networkError.Timeout() {
+			t.Fatal("peer read timed out; cancellation closure observation is inconclusive")
+		}
+		t.Logf("peer total received after cancellation=%d of %d; terminal body error type=%T", received.bytes, request.ContentLength, received.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer body observation did not finish")
+	}
+}
+
+func TestNativeHTTPWireDroppedResponseAttemptsStayInsideTask(t *testing.T) {
+	var attempts atomic.Int32
+	peer := nativeHTTPWirePeer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		attempts.Add(1)
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = connection.Close()
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	transport, err := newNativeHTTPTransport(ctx, peer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := http.NewRequest(http.MethodPut, peer.URL+"/lost-response", bytes.NewReader([]byte("synthetic ciphertext")))
+	response, err := transport.RoundTrip(request)
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	if !errors.Is(err, errHTTPNetwork) || response != nil || attempts.Load() < 1 {
+		t.Fatalf("dropped response lacked a real attempted write and network failure: %v", err)
+	}
+	observed := attempts.Load()
+	time.Sleep(50 * time.Millisecond)
+	if attempts.Load() != observed {
+		t.Fatal("new peer request after native task returned")
+	}
+	t.Logf("observed wire attempts=%d for one native task; no universal single-attempt or server-rollback claim", observed)
+}
+
+func TestNativeHTTPWireRedirectAndAuthenticationRefuse(t *testing.T) {
+	destination := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	destinationListener := &boundedWireListener{Listener: destination.Listener}
+	destination.Listener = destinationListener
+	destination.StartTLS()
+	t.Cleanup(destination.Close)
+	for _, test := range []struct {
+		name    string
+		handler http.HandlerFunc
+		want    error
+	}{
+		{"redirect", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, destination.URL+"/secret", http.StatusTemporaryRedirect)
+		}, errHTTPRedirect},
+		{"basic-auth", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="fixture"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		}, errHTTPAuth},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			peer := nativeHTTPWirePeer(t, test.handler)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			transport, err := newNativeHTTPTransport(ctx, peer.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, _ := http.NewRequest(http.MethodGet, peer.URL+"/policy", nil)
+			response, err := transport.RoundTrip(request)
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			if !errors.Is(err, test.want) || response != nil {
+				t.Fatalf("wire policy refusal differs: %v", err)
+			}
+			if destinationListener.accepted.Load() != 0 {
+				t.Fatal("refused redirect still contacted the destination authority")
+			}
+		})
+	}
+}

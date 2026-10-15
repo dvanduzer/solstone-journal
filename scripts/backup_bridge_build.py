@@ -67,6 +67,25 @@ def tree_digest(root):
     return digest.hexdigest()
 
 
+def check_native_http_closure(selection, target, header, symbols):
+    selected = {
+        key: selection.get(key, []) for key in ("GoFiles", "CgoFiles", "MFiles", "HFiles")
+    }
+    names = [name for values in selected.values() for name in values]
+    if any("testhooks" in name or "_probe" in name for name in names):
+        raise ValueError("qualification hooks selected in production archive")
+    if target == "ios":
+        if "native_http_apple.go" not in selected["CgoFiles"] or selected["MFiles"] != ["native_http_darwin.m"]:
+            raise ValueError("fixed Apple HTTP closure is missing or widened")
+    elif selected["MFiles"] or "native_http_other.go" not in selected["GoFiles"]:
+        raise ValueError("non-Apple HTTP platform boundary changed")
+    if any(token in symbols for token in ("sb_http_test_", "SBHTTPFixtureProtocol", "restic_bridge_http_probe")):
+        raise ValueError("qualification symbols present in production archive")
+    if any(token in header for token in ("sb_http_", "native_http_internal", "restic_bridge_http_probe")):
+        raise ValueError("private HTTP authority escaped into public header")
+    return selected
+
+
 class BridgeBuild:
     def __init__(self, args):
         self.args = args
@@ -222,7 +241,9 @@ class BridgeBuild:
         # Copy bridge files into restic/mobilebackup/
         pkg_dir = restic_dir / "mobilebackup"
         pkg_dir.mkdir(parents=True, exist_ok=True)
-        for src_file in sorted(BRIDGE_SRC_PATH.glob("*.go")):
+        for src_file in sorted(BRIDGE_SRC_PATH.iterdir()):
+            if not src_file.is_file() or src_file.suffix not in {".go", ".h", ".m"}:
+                continue
             shutil.copy2(src_file, pkg_dir / src_file.name)
 
         # 2. Acquire and extract toolchain
@@ -375,7 +396,7 @@ int main(void) {{
         if platform.system() == "Darwin":
             host_cc = shutil.which("clang") or "cc"
             host_link = [host_cc, "-I", host_artifacts, host_caller, host_archive,
-                         "-framework", "CoreFoundation", "-framework", "Security", "-lresolv", "-o", host_caller_bin]
+                         "-framework", "CoreFoundation", "-framework", "Foundation", "-framework", "Security", "-lresolv", "-o", host_caller_bin]
         else:
             host_cc = shutil.which("gcc") or shutil.which("clang") or "cc"
             host_link = [host_cc, "-I", host_artifacts, host_caller, host_archive,
@@ -433,6 +454,16 @@ int main(void) {{
         if not gen_header.exists():
             raise ValueError(f"expected C header: {gen_header}")
 
+        selection_log = self.run_step(
+            "target-source-selection", [go_bin, "list", "-mod=readonly", "-buildvcs=false",
+             "-tags=selfupdate,disable_grpc_modules", "-json", "./mobilebackup"], cwd=restic_dir, env=env,
+        )
+        symbols_log = self.run_step("target-archive-symbols", ["nm", "-g", archive_path], cwd=restic_dir, env=env)
+        self.receipt["native_http_production_closure"] = check_native_http_closure(
+            json.loads(selection_log.read_text()), self.args.target,
+            gen_header.read_text(), symbols_log.read_text(errors="replace"),
+        )
+
         # Step: Link check with standalone C caller
         caller_c = artifacts_dir / "caller.c"
         caller_c.write_text(
@@ -461,6 +492,7 @@ int main(void) {{
                 str(caller_c),
                 str(archive_path),
                 "-framework", "CoreFoundation",
+                "-framework", "Foundation",
                 "-framework", "Security",
                 "-lresolv",
                 "-o", str(caller_bin),

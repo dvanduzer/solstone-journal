@@ -51,3 +51,6 @@ and reinstall it, which removes only its synthetic fixtures.
 
 The archive and this check cover local repositories. They do not establish
 production backup admission, hosted transport, key rotation or service cleanup.
+
+The separate [native HTTP device check](../backup-http/README.md) checks signed
+storage requests and TLS behavior using a disposable protocol canary.
