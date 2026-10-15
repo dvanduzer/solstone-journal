@@ -187,6 +187,19 @@ func validateS3RequestForRoot(request *C.restic_s3_request, rooted *rootedRestor
 
 //export restic_bridge_s3_restore_root_v1_start
 func restic_bridge_s3_restore_root_v1_start(request *C.restic_s3_request, targetFD C.int32_t, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	return startS3RootedRestore(request, selector, selectorLen, outID, func(value string) (*rootedRestore, int32) {
+		return newRootedRestore(int(targetFD), value)
+	})
+}
+
+//export restic_bridge_s3_restore_admitted_v1_start
+func restic_bridge_s3_restore_admitted_v1_start(request *C.restic_s3_request, targetID C.uint64_t, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	return startS3RootedRestore(request, selector, selectorLen, outID, func(value string) (*rootedRestore, int32) {
+		return borrowRootedTarget(uint64(targetID), value)
+	})
+}
+
+func startS3RootedRestore(request *C.restic_s3_request, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t, admit func(string) (*rootedRestore, int32)) C.int32_t {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
@@ -197,13 +210,16 @@ func restic_bridge_s3_restore_root_v1_start(request *C.restic_s3_request, target
 	if selectorLen > maxPathLen {
 		return C.int32_t(StatusCapExceeded)
 	}
-	rooted, status := newRootedRestore(int(targetFD), string(copyCBytes(selector, selectorLen)))
+	rooted, status := admit(string(copyCBytes(selector, selectorLen)))
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
 	req, status := validateS3RequestForRoot(request, rooted)
 	if status != StatusOk {
 		_ = rooted.close()
+		if err := releaseRootedRestoreBorrow(rooted); err != nil {
+			return C.int32_t(StatusFailed)
+		}
 		return C.int32_t(status)
 	}
 	id, status := startBridgeCall(req)

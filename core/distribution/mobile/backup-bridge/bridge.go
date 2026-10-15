@@ -227,6 +227,7 @@ func rejectBridgeCall(req *bridgeRequest, status int32) int32 {
 	if req.remote != nil {
 		err = errors.Join(err, req.remote.owner.Close())
 	}
+	err = errors.Join(err, releaseRootedRestoreBorrow(req.rootedRestore))
 	zeroBytes(req.password)
 	zeroBytes(req.recoveryPassword)
 	if errors.Is(err, errMetadataCleanup) {
@@ -409,6 +410,19 @@ func restic_bridge_start(req *C.restic_request, outID *C.uint64_t) C.int32_t {
 //
 //export restic_bridge_restore_root_v1_start
 func restic_bridge_restore_root_v1_start(version C.uint32_t, request *C.restic_request, targetFD C.int32_t, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	return startLocalRootedRestore(version, request, selector, selectorLen, outID, func(value string) (*rootedRestore, int32) {
+		return newRootedRestore(int(targetFD), value)
+	})
+}
+
+//export restic_bridge_restore_admitted_v1_start
+func restic_bridge_restore_admitted_v1_start(version C.uint32_t, request *C.restic_request, targetID C.uint64_t, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	return startLocalRootedRestore(version, request, selector, selectorLen, outID, func(value string) (*rootedRestore, int32) {
+		return borrowRootedTarget(uint64(targetID), value)
+	})
+}
+
+func startLocalRootedRestore(version C.uint32_t, request *C.restic_request, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t, admit func(string) (*rootedRestore, int32)) C.int32_t {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
@@ -424,7 +438,7 @@ func restic_bridge_restore_root_v1_start(version C.uint32_t, request *C.restic_r
 	if request.password_len > maxPasswordLen || request.repo_path_len > maxPathLen || request.restore_path_len > maxPathLen || selectorLen > maxPathLen {
 		return C.int32_t(StatusCapExceeded)
 	}
-	r, status := newRootedRestore(int(targetFD), string(copyCBytes(selector, selectorLen)))
+	r, status := admit(string(copyCBytes(selector, selectorLen)))
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
@@ -629,6 +643,11 @@ func freeCall(id uint64) int32 {
 		h.mu.Unlock()
 		handlesMu.Unlock()
 		return StatusInvalidHandle
+	}
+	if err := releaseRootedRestoreBorrow(h.rootedRestore); err != nil {
+		h.mu.Unlock()
+		handlesMu.Unlock()
+		return StatusFailed
 	}
 
 	// Mark freed, zero memory, and remove from map

@@ -31,7 +31,10 @@ var rootedTargets = struct {
 	sync.Mutex
 	live    map[rootedTargetIdentity]*rootedRestore
 	private map[*os.File]struct{}
-}{live: make(map[rootedTargetIdentity]*rootedRestore), private: make(map[*os.File]struct{})}
+	owners  map[uint64]*rootedTargetAdmission
+	failed  map[*rootedRestore]struct{}
+}{live: make(map[rootedTargetIdentity]*rootedRestore), private: make(map[*os.File]struct{}),
+	owners: make(map[uint64]*rootedTargetAdmission), failed: make(map[*rootedRestore]struct{})}
 
 // Both admission orders use this mutex. Checking live private custody and
 // reserving a restore target are one decision, including ancestor aliases.
@@ -40,6 +43,9 @@ var rootedTargets = struct {
 func reserveRootedPrivateDirectory(file *os.File) error {
 	rootedTargets.Lock()
 	defer rootedTargets.Unlock()
+	if len(rootedTargets.failed) != 0 {
+		return errTargetAdmissionCleanup
+	}
 	for _, target := range rootedTargets.live {
 		if overlap, err := pinnedDirectoriesOverlap(file, target.target); err != nil || overlap {
 			if err != nil {
@@ -69,6 +75,11 @@ type rootedRestore struct {
 	reserved  bool
 	admitted  bool
 	mayMutate atomic.Bool
+	// A borrowed operation never closes its owner's descriptors. Its borrow
+	// remains live through terminal cleanup and is released only by Free.
+	borrowed       *rootedTargetAdmission
+	borrowReleased bool  // rootedTargets mutex
+	closeFailure   error // rootedTargets mutex; never retry an ambiguous close
 }
 
 func validateRootedSelector(value string) bool {
@@ -91,31 +102,67 @@ func newRootedRestore(fd int, selector string) (*rootedRestore, int32) {
 	if fd < 0 || !validateRootedSelector(selector) {
 		return nil, StatusInvalidArgument
 	}
+	rooted, status := duplicateRootedTarget(fd)
+	if status != StatusOk {
+		if rooted != nil {
+			_ = rooted.close() // failed cleanup remains in process-owned refusal custody
+		}
+		return nil, status
+	}
+	rooted.selector = selector
+	return rooted, StatusOk
+}
+
+// The caller owns any returned object, including on validation failure.
+func duplicateRootedTarget(fd int) (*rootedRestore, int32) {
+	if fd < 0 {
+		return nil, StatusInvalidArgument
+	}
 	owned, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		return nil, StatusInvalidArgument
 	}
-	rooted := &rootedRestore{selector: selector, target: os.NewFile(uintptr(owned), "restore target")}
+	rooted := &rootedRestore{target: os.NewFile(uintptr(owned), "restore target")}
 	var stat unix.Stat_t
 	if unix.Fstat(owned, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uint32(os.Geteuid()) {
-		_ = rooted.close()
-		return nil, StatusInvalidArgument
+		return rooted, StatusInvalidArgument
 	}
 	rooted.identity = rootedTargetIdentity{uint64(stat.Dev), stat.Ino}
 	return rooted, StatusOk
 }
 
 func (r *rootedRestore) close() error {
+	if r.borrowed != nil {
+		return nil
+	}
 	rootedTargets.Lock()
 	defer rootedTargets.Unlock()
-	var result error
+	return r.closeLocked()
+}
+
+func (r *rootedRestore) failCloseLocked(err error) error {
+	r.closeFailure = errors.Join(r.closeFailure, err)
+	rootedTargets.failed[r] = struct{}{}
+	return r.closeFailure
+}
+
+func (r *rootedRestore) closeLocked() error {
+	if r.closeFailure != nil {
+		return r.closeFailure
+	}
 	if r.lease != nil {
-		result = errors.Join(result, r.lease.Close())
+		file := r.lease
 		r.lease = nil
+		if err := closeTargetAdmissionResource("lease", file); err != nil {
+			return r.failCloseLocked(err)
+		}
 	}
 	if r.target != nil {
-		result = errors.Join(result, r.target.Close())
+		file := r.target
 		r.target = nil
+		if err := closeTargetAdmissionResource("target", file); err != nil {
+			return r.failCloseLocked(err)
+		}
 	}
 	if r.reserved {
 		if rootedTargets.live[r.identity] == r {
@@ -123,7 +170,7 @@ func (r *rootedRestore) close() error {
 		}
 		r.reserved = false
 	}
-	return result
+	return nil
 }
 
 func pinRootedRestore(req *bridgeRequest, protected []*os.File) error {
@@ -144,10 +191,34 @@ func pinRootedRestore(req *bridgeRequest, protected []*os.File) error {
 		return err
 	}
 	req.restoreRoot = root
-	rootedTargets.Lock()
-	if rootedTargets.live[r.identity] != nil {
+	if r.borrowed != nil {
+		rootedTargets.Lock()
+		owner := r.borrowed
+		valid := rootedTargets.owners[owner.id] == owner && owner.borrow == r && !r.borrowReleased &&
+			owner.rooted.closeFailure == nil && req.restorePath == owner.path
 		rootedTargets.Unlock()
-		return errS3OwnerBusy
+		if !valid {
+			return errPinnedIdentity
+		}
+		if err := recheckRootedRestore(req); err != nil {
+			return err
+		}
+		r.admitted, req.pathsPinned = true, true
+		return nil
+	}
+	rootedTargets.Lock()
+	if len(rootedTargets.failed) != 0 {
+		rootedTargets.Unlock()
+		return errTargetAdmissionCleanup
+	}
+	for _, target := range rootedTargets.live {
+		if overlap, err := pinnedDirectoriesOverlap(target.target, r.target); err != nil || overlap {
+			rootedTargets.Unlock()
+			if err != nil {
+				return err
+			}
+			return errS3OwnerBusy
+		}
 	}
 	for private := range rootedTargets.private {
 		if overlap, err := pinnedDirectoriesOverlap(private, r.target); err != nil || overlap {
