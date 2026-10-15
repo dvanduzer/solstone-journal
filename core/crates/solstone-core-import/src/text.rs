@@ -329,7 +329,7 @@ fn import(
     for tile_plan in planned {
         let tile_plan = tile_plan.map_err(|error| (created.clone(), error))?;
         let PlannedTile {
-            tile,
+            start_offset,
             turns,
             day: tile_day,
             segment: segment_key,
@@ -386,7 +386,7 @@ fn import(
             .join("conversation_transcript.jsonl");
         let rows = jsonl_rows(
             &turns,
-            tile * TILE_SECONDS,
+            start_offset,
             origin,
             import_id,
             raw_filename,
@@ -495,7 +495,7 @@ pub fn preview(
 }
 
 struct PlannedTile {
-    tile: u64,
+    start_offset: u64,
     turns: Vec<Turn>,
     day: String,
     segment: String,
@@ -577,9 +577,18 @@ fn plan_tiles(
 
     let mut occupied: HashMap<String, HashSet<String>> = HashMap::new();
     let mut planned = Vec::new();
-    for (tile, turns) in tiles(turns) {
+    for ((tile, local_day), turns) in tiles(turns, anchor, zone) {
         let result = (|| {
-            let tile_instant = anchor + TimeDelta::seconds((tile * TILE_SECONDS) as i64);
+            let nominal_offset = tile * TILE_SECONDS;
+            let nominal_instant = anchor + TimeDelta::seconds(nominal_offset as i64);
+            // One elapsed tile may straddle midnight. Keep each turn on its
+            // own local day, starting the second piece at its first turn.
+            let start_offset = if nominal_instant.with_timezone(&zone).date_naive() == local_day {
+                nominal_offset
+            } else {
+                turns[0].offset
+            };
+            let tile_instant = anchor + TimeDelta::seconds(start_offset as i64);
             let tile_local = tile_instant.with_timezone(&zone).naive_local();
             let tile_day = if is_literal_day && tile_local.date() == day_date {
                 day.to_owned()
@@ -595,7 +604,7 @@ fn plan_tiles(
                 .ok_or(TextImportError::SegmentKeyUnavailable { candidate })?;
             day_occupied.insert(segment.clone());
             Ok(PlannedTile {
-                tile,
+                start_offset,
                 turns,
                 day: tile_day,
                 segment,
@@ -988,12 +997,19 @@ fn speaker_line(line: &str) -> Option<(&str, &str)> {
     Some((speaker, rest[end + 3..].trim_start_matches([' ', '\t'])))
 }
 
-/// Group turns by the ~300-second tile of the import they fall in, in order.
-fn tiles(turns: Vec<Turn>) -> BTreeMap<u64, Vec<Turn>> {
-    let mut tiles: BTreeMap<u64, Vec<Turn>> = BTreeMap::new();
+/// Group turns by elapsed tile and owner day, preserving source order.
+fn tiles(
+    turns: Vec<Turn>,
+    anchor: DateTime<Utc>,
+    zone: chrono_tz::Tz,
+) -> BTreeMap<(u64, NaiveDate), Vec<Turn>> {
+    let mut tiles: BTreeMap<(u64, NaiveDate), Vec<Turn>> = BTreeMap::new();
     for turn in turns {
+        let day = (anchor + TimeDelta::seconds(turn.offset as i64))
+            .with_timezone(&zone)
+            .date_naive();
         tiles
-            .entry(turn.offset / TILE_SECONDS)
+            .entry((turn.offset / TILE_SECONDS, day))
             .or_default()
             .push(turn);
     }
