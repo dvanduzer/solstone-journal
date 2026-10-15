@@ -798,19 +798,18 @@ mod tests {
     fn final_commit_excludes_the_actual_relocation_pivot() {
         let (root, segment, raw) = fixture();
         let destination = segment.with_file_name("130000_60");
-        let end = |path: PathBuf, key: &str| crate::RelocationEnd {
+        let end = |key: &str| crate::RelocationEnd {
             day: "20260101".into(),
             segment: key.into(),
-            disk_rel: path
-                .strip_prefix(root.path())
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            disk_rel: format!("chronicle/20260101/work/{key}"),
             parent_rel: "chronicle/20260101/work".into(),
-            path,
+            path: crate::segment_dir::SegmentDir::resolve(root.path(), "20260101", key, "work")
+                .unwrap()
+                .path()
+                .to_path_buf(),
         };
-        let source = end(segment.clone(), "120000_60");
-        let target = end(destination.clone(), "130000_60");
+        let source = end("120000_60");
+        let target = end("130000_60");
         let relocation = crate::Relocation {
             journal: root.path(),
             source: &source,

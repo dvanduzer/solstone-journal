@@ -90,8 +90,13 @@ impl Cooperation {
                     .to_owned(),
             );
         }
-        let relative = relative.to_str().ok_or_else(binding_hold)?;
-        let contained = contained_path(self.journal(), relative).map_err(|_| binding_hold())?;
+        let relative = relative
+            .components()
+            .map(|part| part.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(binding_hold)?
+            .join("/");
+        let contained = contained_path(self.journal(), &relative).map_err(|_| binding_hold())?;
         if contained != path {
             return Err(binding_hold());
         }
@@ -116,3 +121,48 @@ fn binding_hold() -> String {
 
 #[cfg(all(test, unix, feature = "full-tests"))]
 pub(crate) mod tests;
+
+#[cfg(all(test, feature = "full-tests"))]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+mod path_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn native_targets_keep_the_admitted_binding_and_reserved_names() {
+        let root = TempDir::new();
+        let guard = Cooperation::admit(root.path()).unwrap();
+        let target = guard
+            .journal()
+            .join("chronicle")
+            .join("20261014")
+            .join("work")
+            .join("120000_60");
+        #[cfg(windows)]
+        {
+            let native = target
+                .strip_prefix(guard.journal())
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(native.contains('\\'));
+            assert!(contained_path(guard.journal(), native).is_err());
+        }
+        guard.target(&target).unwrap();
+        assert!(guard.target(root.path().parent().unwrap()).is_err());
+        assert!(guard.target(&guard.journal().join("../outside")).is_err());
+        for reserved in [
+            ".tmp-offload-owned",
+            ".removing_.tmp-offload-owned",
+            ".removing_.removing_.tmp-offload-owned",
+        ] {
+            assert!(guard.target(&guard.journal().join(reserved)).is_err());
+        }
+        #[cfg(unix)]
+        assert!(
+            guard
+                .target(&guard.journal().join("literal\\name"))
+                .is_err()
+        );
+    }
+}

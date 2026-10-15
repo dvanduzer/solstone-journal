@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 use solstone_core_journal_io::{
@@ -855,11 +855,23 @@ fn marker_stream(segment: &Path) -> Result<Option<String>, RelocationError> {
 
 /// The journal-relative form of a path inside the journal.
 fn relative(journal: &Path, path: &Path) -> Result<String, RelocationError> {
-    path.strip_prefix(journal)
+    let parts = path
+        .strip_prefix(journal)
         .ok()
-        .and_then(|rel| rel.to_str())
-        .map(str::to_owned)
-        .ok_or_else(|| RelocationError::new(format!("path is outside the journal: {path:?}")))
+        .and_then(|relative| {
+            relative
+                .components()
+                .map(|part| match part {
+                    Component::Normal(name) => {
+                        name.to_str().filter(|name| !name.contains(['/', '\\']))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .filter(|parts| !parts.is_empty())
+        .ok_or_else(|| RelocationError::new(format!("path is outside the journal: {path:?}")))?;
+    Ok(parts.join("/"))
 }
 
 #[cfg(test)]
@@ -902,11 +914,10 @@ mod tests {
             RelocationEnd {
                 day: day.to_owned(),
                 segment: segment.to_owned(),
-                path: disk_rel
-                    .split('/')
-                    .fold(self.path().to_path_buf(), |path, component| {
-                        path.join(component)
-                    }),
+                path: crate::segment_dir::SegmentDir::resolve(self.path(), day, segment, stream)
+                    .expect("valid fixture endpoint")
+                    .path()
+                    .to_path_buf(),
                 disk_rel,
                 parent_rel,
             }
@@ -937,6 +948,25 @@ mod tests {
             )
             .expect("state written");
             path
+        }
+    }
+
+    #[test]
+    fn native_relative_paths_serialize_only_normal_utf8_components() {
+        let fixture = Fixture::new();
+        let root = fixture.path();
+        assert_eq!(
+            relative(root, &root.join("chronicle").join("20261014").join("work")).unwrap(),
+            "chronicle/20261014/work"
+        );
+        assert!(relative(root, root).is_err());
+        assert!(relative(root, root.parent().unwrap()).is_err());
+        assert!(relative(root, &root.join("../outside")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(relative(root, &root.join("literal\\name")).is_err());
+            assert!(relative(root, &root.join(std::ffi::OsStr::from_bytes(b"bad-\xff"))).is_err());
         }
     }
 
