@@ -2080,7 +2080,7 @@ async function startGuidedImport(source) {
       return;
     }
     const path = saved.path;
-    const ts = saved.timestamp;
+    const ts = saved.source_timestamp || saved.timestamp;
     const setting = guidedSettingInput ? guidedSettingInput.value.trim() : '';
 
     const metaResponse = await fetch('/app/import/api/meta', {
@@ -2099,41 +2099,31 @@ async function startGuidedImport(source) {
     const previewToken = await prepareImportPreview('guided', payload, setting, startButton);
     preparedPreview = !previewToken && revision === previewRevisions.guided && Boolean(importPreviews.guided?.ready);
     if (!previewToken || revision !== previewRevisions.guided) return;
-    trackPendingImport(ts);
-    if (!importEvents[ts]) {
-      importEvents[ts] = {
-        import_id: ts,
-        event: 'started',
-        stage: 'initialization',
-        source_type: source.name,
-        source_display: source.display_name,
-      };
-    }
-
     const startResponse = await fetch('/app/import/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...payload, preview_token: previewToken }),
     });
 
+    const started = await startResponse.json().catch(() => ({}));
     if (!startResponse.ok) {
-      clearPendingImport(ts);
-      const errorData = await startResponse.json().catch(() => ({}));
-      throw new Error(importErrorMessage(errorData, 'Failed to start import'));
+      throw new Error(importErrorMessage(started, 'Failed to start import'));
     }
 
-    if (!importEvents[ts] || !IMPORT_TERMINAL_EVENTS.has(importEvents[ts].event)) {
-      importEvents[ts] = {
-        import_id: ts,
+    const importId = started.import_id || saved.timestamp;
+    if (!importEvents[importId] || !IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event)) {
+      trackPendingImport(importId);
+      importEvents[importId] = {
+        import_id: importId,
         event: 'started',
         stage: 'initialization',
         source_type: source.name,
         source_display: source.display_name,
-        ...(importEvents[ts] || {})
+        ...(importEvents[importId] || {})
       };
     }
     loadImports();
-    navigateTo(`progress/${ts}`);
+    navigateTo(`progress/${importId}`);
   } catch (err) {
     invalidateImportPreview('guided');
     if (window.showError && err instanceof Error) {
@@ -2379,43 +2369,33 @@ startBtn.addEventListener('click', async () => {
     const previewToken = await prepareImportPreview('quick', payload, setting, startBtn);
     preparedPreview = !previewToken && revision === previewRevisions.quick && Boolean(importPreviews.quick?.ready);
     if (!previewToken || revision !== previewRevisions.quick) return;
-    trackPendingImport(ts);
-    if (!importEvents[ts]) {
-      importEvents[ts] = {
-        import_id: ts,
-        event: 'started',
-        stage: 'initialization',
-        source_type: 'quick',
-        source_display: 'quick import',
-      };
-    }
-
     const startResponse = await fetch('/app/import/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...payload, preview_token: previewToken }),
     });
 
+    const started = await startResponse.json().catch(() => ({}));
     if (!startResponse.ok) {
-      clearPendingImport(ts);
-      const errorData = await startResponse.json().catch(() => ({}));
-      throw new Error(importErrorMessage(errorData, 'Failed to start import'));
+      throw new Error(importErrorMessage(started, 'Failed to start import'));
     }
 
+    const importId = started.import_id || window._quickSaved?.timestamp || ts;
     restoreImportButton('quick', startBtn);
     closeDetectModal();
-    if (!importEvents[ts] || !IMPORT_TERMINAL_EVENTS.has(importEvents[ts].event)) {
-      importEvents[ts] = {
-        import_id: ts,
+    if (!importEvents[importId] || !IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event)) {
+      trackPendingImport(importId);
+      importEvents[importId] = {
+        import_id: importId,
         event: 'started',
         stage: 'initialization',
         source_type: 'quick',
         source_display: 'quick import',
-        ...(importEvents[ts] || {})
+        ...(importEvents[importId] || {})
       };
     }
     loadImports();
-    navigateTo(`progress/${ts}`);
+    navigateTo(`progress/${importId}`);
   } catch (err) {
     invalidateImportPreview('quick');
     restoreImportButton('quick', startBtn);

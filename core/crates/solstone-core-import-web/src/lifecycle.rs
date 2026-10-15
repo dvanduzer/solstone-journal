@@ -1447,6 +1447,7 @@ where
             StatusCode::OK,
             json!({
                 "status": "ok",
+                "import_id": record_id,
                 "task_id": task_id,
                 "generation": facts.generation,
                 "attempt_id": facts.attempt_id
@@ -1479,7 +1480,10 @@ where
             ),
         );
     }
-    json_response(StatusCode::OK, json!({"status":"ok","task_id":task_id}))
+    json_response(
+        StatusCode::OK,
+        json!({"status":"ok","task_id":task_id,"import_id":record_id}),
+    )
 }
 
 pub(crate) fn detect_inprocess_source(
@@ -1798,8 +1802,8 @@ mod tests {
 
     /// A video file imports as audio, so it is recorded as audio whether or not the browser
     /// sent a type; so is an audio file saved from a local path, which carries no type at all.
-    #[test]
-    fn choosing_a_date_preserves_row_identity_and_an_occupied_target() {
+    #[tokio::test]
+    async fn choosing_a_date_preserves_row_identity_and_an_occupied_target() {
         for occupied in [false, true] {
             let root = TempDir::new().unwrap();
             let old = "20261011_235959";
@@ -1832,6 +1836,9 @@ mod tests {
             );
             assert_eq!(response.status(), StatusCode::OK);
             let id = if occupied { old } else { chosen };
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let started: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(started["import_id"], id);
             let stored = read_import_metadata(root.path(), id).unwrap();
             assert_eq!(super::summary(&stored)["timestamp"], id);
             assert_eq!(stored["source_timestamp"], chosen);
