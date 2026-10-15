@@ -16,6 +16,11 @@ full-tests = []
 name = "journal-app"
 path = "src/main.rs"
 
+[[test]]
+name = "updater_transport"
+path = "tests/updater_transport.rs"
+required-features = ["full-tests"]
+
 # The Windows journal app is a Win32 program: its window icon, Start-menu
 # shortcut, folder picker and sign-in entry are Win32 and COM calls. Each
 # unsafe block names the call it makes and why its arguments are sound; the

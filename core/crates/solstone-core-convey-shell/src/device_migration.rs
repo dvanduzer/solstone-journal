@@ -341,7 +341,11 @@ mod tests {
             fs::write(&push_path, br#"{"version":2,"devices":[]}"#).unwrap();
 
             fs::create_dir_all(root.join("health")).unwrap();
-            let _callosum = CallosumSocketServer::bind(root.join("health/callosum.sock"))
+            let socket = root.join("health/callosum.sock");
+            #[cfg(windows)]
+            let _namespace =
+                solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
+            let _callosum = CallosumSocketServer::bind(&socket)
                 .await
                 .expect("Callosum server");
             let app = solstone_core_ingest::api_router(root);
@@ -609,7 +613,11 @@ mod tests {
             assert_eq!(decision_resp.state.as_wire(), "new_device");
 
             fs::create_dir_all(root.join("health")).unwrap();
-            let _callosum = CallosumSocketServer::bind(root.join("health/callosum.sock"))
+            let socket = root.join("health/callosum.sock");
+            #[cfg(windows)]
+            let _namespace =
+                solstone_core_callosum::test_fixture::WindowsPipeNamespace::register(&socket);
+            let _callosum = CallosumSocketServer::bind(&socket)
                 .await
                 .expect("Callosum server");
             let app = solstone_core_ingest::api_router(root);

@@ -1064,6 +1064,9 @@ mod tests {
                     Err(error) => panic!("bounded fixture accept: {error}"),
                 }
             };
+            // Accepted sockets inherit the listener's nonblocking mode on Windows.
+            // Keep accept bounded above, then use the explicit I/O deadlines below.
+            peer.set_nonblocking(false).unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             peer.set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

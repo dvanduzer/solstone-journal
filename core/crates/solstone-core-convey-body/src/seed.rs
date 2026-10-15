@@ -394,10 +394,12 @@ fn write_bundle(imports: &Path, bundle: &BodySeedBundle) -> Result<(), BodySeedE
 
 fn write_aggregate(root: &Path, bundles: &[BodySeedBundle]) -> Result<(), BodySeedError> {
     let path = root.join("imports/health-dedupe.sqlite");
-    let connection = Connection::open(&path).map_err(BodySeedError::Sqlite)?;
+    let mut connection = Connection::open(&path).map_err(BodySeedError::Sqlite)?;
     connection
         .execute_batch(SCHEMA)
         .map_err(BodySeedError::Sqlite)?;
+    // A fixture is one complete aggregate; avoid a durable commit per synthetic row.
+    let transaction = connection.transaction().map_err(BodySeedError::Sqlite)?;
     for bundle in bundles {
         for rows in bundle.shards.values() {
             for row in rows {
@@ -409,7 +411,7 @@ fn write_aggregate(root: &Path, bundles: &[BodySeedBundle]) -> Result<(), BodySe
                     let encoded = serde_json::to_vec(value).expect("JSON value serializes");
                     format!("{:x}", Sha256::digest(encoded))
                 });
-                connection
+                transaction
                     .execute(
                         "INSERT OR REPLACE INTO health_dedupe (dedupe_key, source_family, source_record_id, record_type, start_time, end_time, value_hash, first_import_id, last_seen_import_id, normalized_ref, raw_ref, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?5, ?5)",
                         (
@@ -429,7 +431,7 @@ fn write_aggregate(root: &Path, bundles: &[BodySeedBundle]) -> Result<(), BodySe
             }
         }
     }
-    Ok(())
+    transaction.commit().map_err(BodySeedError::Sqlite)
 }
 
 fn string<'a>(row: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
