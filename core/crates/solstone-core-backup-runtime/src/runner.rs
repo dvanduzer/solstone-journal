@@ -688,7 +688,6 @@ pub(crate) fn run_restic_with_stdin(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
 pub(crate) fn run_restic_with_stdin_cancellable(
     runner: &dyn ToolRunner,
     args: &[String],

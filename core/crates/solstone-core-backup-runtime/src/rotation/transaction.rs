@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Android recovery-key publication and resumable original-key revocation.
+//! Recovery-key publication and resumable exact-original-key revocation.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -85,7 +85,14 @@ impl crate::runner::ToolRunner for RotationRunner<'_> {
 fn is_confirmed_publication(
     pub_receipt: &solstone_core_journal_config_write::BoundConfigPublication,
 ) -> bool {
-    let flush_ok = pub_receipt.directory_flush == DirectoryFlush::Synced;
+    // Windows flushes the staged file and confirms native replacement, but
+    // supplies no parent-directory flush. Keep that receipt honest; actual
+    // flush and observation failures still block revocation on every platform.
+    let flush_ok = match pub_receipt.directory_flush {
+        DirectoryFlush::Synced => true,
+        DirectoryFlush::Unavailable => cfg!(windows),
+        DirectoryFlush::Failed => false,
+    };
 
     flush_ok
         && pub_receipt.durability_uncertainty.is_none()
@@ -446,6 +453,7 @@ mod tests {
     use super::*;
     use crate::engine::{Clock, JournalMaintenance};
     use crate::hosted_runtime::{HttpError, HttpRequest, HttpResponse, HttpTransport};
+    use crate::rotation::rotate_recovery_key;
     use crate::runner::{ToolOutput, ToolRequest, ToolRunner};
     use solstone_core_backup::Destination;
     use std::cell::RefCell;
@@ -511,6 +519,12 @@ mod tests {
         }
     }
     fn journal() -> tempfile::TempDir {
+        #[cfg(windows)]
+        let journal = match std::env::var_os("SOLSTONE_BACKUP_ROTATION_TEST_ROOT") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        #[cfg(not(windows))]
         let journal = tempfile::tempdir().unwrap();
         let destination = Destination {
             repository: "repo".into(),
@@ -555,7 +569,7 @@ mod tests {
         assert!(!rendered.contains("DISPLAY_SECRET"));
     }
     #[test]
-    fn rotation_orders_remote_steps_then_publishes_new_key() {
+    fn rotation_confirms_local_candidate_before_removing_original() {
         let journal = journal();
         let prior = solstone_core_backup::get_keys(journal.path())
             .unwrap()
@@ -569,12 +583,43 @@ mod tests {
             ])),
             commands: RefCell::new(vec![]),
         };
+        struct CheckedRemoval<'a> {
+            inner: Script,
+            journal: &'a Path,
+            prior: &'a str,
+        }
+        impl ToolRunner for CheckedRemoval<'_> {
+            fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                if request.argv.get(1).is_some_and(|arg| arg == "remove") {
+                    let saved = solstone_core_backup::get_backup_config(self.journal).unwrap();
+                    assert_ne!(saved["recovery_key"].as_str(), Some(self.prior));
+                    assert_eq!(saved["confirmed_recovery_key"], false);
+                    let pending =
+                        PendingKeyRevocation::parse(&saved["pending_key_revocation"]).unwrap();
+                    assert_eq!(pending.original_key_id, "old");
+                    assert_eq!(request.argv[2], "old");
+                }
+                self.inner.run(request)
+            }
+            fn run_cancellable(
+                &self,
+                request: &ToolRequest<'_>,
+                _: &ArchiveCancellation,
+            ) -> io::Result<ToolOutput> {
+                self.run(request)
+            }
+        }
+        let checked = CheckedRemoval {
+            inner: runner,
+            journal: journal.path(),
+            prior: &prior.recovery_key,
+        };
         let http = Http;
         let clock = TestClock;
         let maintenance = Maintenance;
         let result = rotate_recovery_key(
             journal.path(),
-            &services(&runner, &http, &clock, &maintenance),
+            &services(&checked, &http, &clock, &maintenance),
         );
         assert_eq!(result.status, "ok");
         let keys = solstone_core_backup::get_keys(journal.path())
@@ -584,7 +629,7 @@ mod tests {
         let config = solstone_core_backup::get_backup_config(journal.path()).unwrap();
         assert_eq!(config["confirmed_recovery_key"], false);
         assert!(config.get("pending_key_revocation").is_none());
-        let commands = runner.commands.borrow();
+        let commands = checked.inner.commands.borrow();
         assert_eq!(
             commands
                 .iter()
@@ -1305,6 +1350,40 @@ mod tests {
         assert_eq!(result.reason_code.as_deref(), Some("timeout"));
         let config = solstone_core_backup::get_backup_config(journal.path()).unwrap();
         assert!(config.get("pending_key_revocation").is_some());
+        let candidate = config["recovery_key"].clone();
+        solstone_core_backup::set_recovery_key_confirmed(journal.path(), true).unwrap();
+        let retry = Script {
+            outputs: RefCell::new(VecDeque::from([
+                output(0, ""),
+                output(
+                    0,
+                    r#"[{"id":"daily","current":true},{"id":"old","current":false}]"#,
+                ),
+                output(0, ""),
+            ])),
+            commands: RefCell::new(vec![]),
+        };
+        assert_eq!(
+            rotate_recovery_key(
+                journal.path(),
+                &services(&retry, &http, &clock, &maintenance)
+            )
+            .status,
+            "ok"
+        );
+        let after = solstone_core_backup::get_backup_config(journal.path()).unwrap();
+        assert_eq!(after["recovery_key"], candidate);
+        assert_eq!(after["confirmed_recovery_key"], true);
+        assert!(!after.contains_key("pending_key_revocation"));
+        let commands = retry.commands.borrow();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|args| args[..2.min(args.len())].join(" "))
+                .collect::<Vec<_>>(),
+            vec!["cat config", "key list", "key remove"]
+        );
+        assert_eq!(commands[2][2], "old");
     }
 
     #[test]
@@ -1529,5 +1608,298 @@ mod tests {
         for temporary in ["ACCESS1", "SECRET1", "SESSION1"] {
             assert!(!serialized.contains(temporary));
         }
+    }
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    fn native_publication_failures_preserve_keys_and_retry_exact_original() {
+        use solstone_core_journal_io::atomic::run_with_windows_detailed_atomic_faults;
+        for step in ["fsync-file", "rename", "post-publication-observation"] {
+            let journal = journal();
+            let prior = solstone_core_backup::get_keys(journal.path())
+                .unwrap()
+                .unwrap();
+            let first = Script {
+                outputs: RefCell::new(VecDeque::from([
+                    output(0, r#"[{"id":"old","current":true}]"#),
+                    output(0, ""),
+                    output(0, ""),
+                ])),
+                commands: RefCell::new(vec![]),
+            };
+            let (result, attempted, _) =
+                run_with_windows_detailed_atomic_faults([(step, 1, 1117)], || {
+                    rotate_recovery_key(
+                        journal.path(),
+                        &services(&first, &Http, &TestClock, &Maintenance),
+                    )
+                });
+            assert!(attempted.contains(&step));
+            assert_eq!(result.status, "error");
+            assert!(first.outputs.borrow().is_empty());
+            assert!(
+                !first
+                    .commands
+                    .borrow()
+                    .iter()
+                    .any(|args| args.get(1).is_some_and(|arg| arg == "remove"))
+            );
+            let config = solstone_core_backup::get_backup_config(journal.path()).unwrap();
+            let visible = step == "post-publication-observation";
+            assert_eq!(config.contains_key("pending_key_revocation"), visible);
+            if !visible {
+                assert_eq!(
+                    config["recovery_key"].as_str(),
+                    Some(prior.recovery_key.as_str())
+                );
+            }
+            let outputs = if visible {
+                vec![
+                    output(0, ""),
+                    output(
+                        0,
+                        r#"[{"id":"old","current":false},{"id":"daily","current":true}]"#,
+                    ),
+                    output(0, ""),
+                ]
+            } else {
+                vec![
+                    output(0, r#"[{"id":"old","current":true}]"#),
+                    output(0, ""),
+                    output(0, ""),
+                    output(0, ""),
+                ]
+            };
+            let retry = Script {
+                outputs: RefCell::new(outputs.into()),
+                commands: RefCell::new(vec![]),
+            };
+            assert_eq!(
+                rotate_recovery_key(
+                    journal.path(),
+                    &services(&retry, &Http, &TestClock, &Maintenance)
+                )
+                .status,
+                "ok"
+            );
+            assert!(retry.outputs.borrow().is_empty());
+            let commands = retry.commands.borrow();
+            assert_eq!(commands.last().unwrap()[..3], ["key", "remove", "old"]);
+            if visible {
+                assert!(
+                    !commands
+                        .iter()
+                        .any(|args| args.get(1).is_some_and(|arg| arg == "add"))
+                );
+            }
+            assert!(
+                !solstone_core_backup::get_backup_config(journal.path())
+                    .unwrap()
+                    .contains_key("pending_key_revocation")
+            );
+        }
+    }
+
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    fn native_clear_uncertainty_is_error_after_original_removal() {
+        use solstone_core_journal_io::atomic::run_with_windows_detailed_atomic_faults;
+        for step in ["fsync-file", "post-publication-observation"] {
+            let journal = journal();
+            let runner = Script {
+                outputs: RefCell::new(VecDeque::from([
+                    output(0, r#"[{"id":"old","current":true}]"#),
+                    output(0, ""),
+                    output(0, ""),
+                    output(0, ""),
+                ])),
+                commands: RefCell::new(vec![]),
+            };
+            let (result, attempted, _) =
+                run_with_windows_detailed_atomic_faults([(step, 2, 1117)], || {
+                    rotate_recovery_key(
+                        journal.path(),
+                        &services(&runner, &Http, &TestClock, &Maintenance),
+                    )
+                });
+            assert!(attempted.contains(&step));
+            assert_eq!(result.status, "error");
+            assert!(result.recovery_key.is_none());
+            assert!(runner.outputs.borrow().is_empty());
+            assert_eq!(
+                runner.commands.borrow().last().unwrap()[..3],
+                ["key", "remove", "old"]
+            );
+            let config = solstone_core_backup::get_backup_config(journal.path()).unwrap();
+            assert_eq!(
+                config.contains_key("pending_key_revocation"),
+                step == "fsync-file"
+            );
+            assert_eq!(config["confirmed_recovery_key"], false);
+            if step == "fsync-file" {
+                let retry = Script {
+                    outputs: RefCell::new(VecDeque::from([
+                        output(0, ""),
+                        output(0, r#"[{"id":"daily","current":true}]"#),
+                    ])),
+                    commands: RefCell::new(vec![]),
+                };
+                assert_eq!(
+                    rotate_recovery_key(
+                        journal.path(),
+                        &services(&retry, &Http, &TestClock, &Maintenance)
+                    )
+                    .status,
+                    "ok"
+                );
+                assert!(retry.outputs.borrow().is_empty());
+                assert_eq!(retry.commands.borrow().len(), 2);
+            }
+        }
+    }
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    #[ignore = "requires native restic; set SOLSTONE_NATIVE_RESTIC and a fixture root"]
+    fn native_restic_publication_failure_keeps_original_and_resumes_saved_candidate() {
+        use solstone_core_journal_io::atomic::run_with_windows_detailed_atomic_faults;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        // Exercise actual restic keys without changing the production runner's
+        // signed-package admission. This is a transaction/filesystem proof.
+        struct NativeRestic;
+        impl ToolRunner for NativeRestic {
+            fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                assert!(request.pass_fds.is_empty());
+                let mut child = Command::new(&request.program)
+                    .args(&request.argv)
+                    .env_clear()
+                    .envs(&request.env)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                if let Some(bytes) = &request.stdin {
+                    child.stdin.take().unwrap().write_all(bytes)?;
+                }
+                let output = child.wait_with_output()?;
+                Ok(ToolOutput {
+                    returncode: output.status.code().unwrap_or(-1),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            }
+            fn run_cancellable(
+                &self,
+                request: &ToolRequest<'_>,
+                _: &ArchiveCancellation,
+            ) -> io::Result<ToolOutput> {
+                self.run(request)
+            }
+        }
+        let restic = std::env::var_os("SOLSTONE_NATIVE_RESTIC").expect("native restic required");
+        let restic = Path::new(&restic);
+        let journal = journal();
+        let mut destination = solstone_core_backup::get_destination(journal.path())
+            .unwrap()
+            .unwrap();
+        // Restic's local fixture ignores the synthetic backend credentials.
+        destination.repository = journal
+            .path()
+            .join("repository")
+            .to_string_lossy()
+            .into_owned();
+        solstone_core_backup::set_destination(journal.path(), &destination).unwrap();
+        let prior = solstone_core_backup::get_keys(journal.path())
+            .unwrap()
+            .unwrap();
+        let runner = NativeRestic;
+        let timeout = Some(Duration::from_secs(60));
+        crate::repo::init_repository(
+            &runner,
+            &destination,
+            &prior.daily_key,
+            &prior.recovery_key,
+            restic,
+            timeout,
+        )
+        .unwrap();
+        let original_id =
+            capture_rotation_key_id(&runner, &destination, &prior.recovery_key, restic, timeout)
+                .unwrap();
+        let daily_id =
+            capture_rotation_key_id(&runner, &destination, &prior.daily_key, restic, timeout)
+                .unwrap();
+        let mut services = services(&runner, &Http, &TestClock, &Maintenance);
+        services.restic_path = Some(restic);
+        let (failed, attempted, _) = run_with_windows_detailed_atomic_faults(
+            [("post-publication-observation", 1, 1117)],
+            || rotate_recovery_key(journal.path(), &services),
+        );
+        assert!(attempted.contains(&"post-publication-observation"));
+        assert_eq!(failed.status, "error");
+        let staged = solstone_core_backup::get_keys(journal.path())
+            .unwrap()
+            .unwrap();
+        for key in [&prior.recovery_key, &prior.daily_key, &staged.recovery_key] {
+            assert_eq!(
+                validate_destination(&runner, &destination, key, restic, timeout)
+                    .unwrap()
+                    .reason_code,
+                "repo_exists"
+            );
+        }
+        let pending = solstone_core_backup::get_backup_config(journal.path()).unwrap();
+        assert_eq!(
+            PendingKeyRevocation::parse(&pending["pending_key_revocation"])
+                .unwrap()
+                .original_key_id,
+            original_id
+        );
+        assert_eq!(rotate_recovery_key(journal.path(), &services).status, "ok");
+        assert_eq!(
+            solstone_core_backup::get_keys(journal.path())
+                .unwrap()
+                .unwrap()
+                .recovery_key,
+            staged.recovery_key
+        );
+        assert!(
+            strict_key_list_absence(
+                &runner,
+                &destination,
+                &prior.daily_key,
+                &original_id,
+                restic,
+                timeout
+            )
+            .unwrap()
+        );
+        assert!(
+            !strict_key_list_absence(
+                &runner,
+                &destination,
+                &prior.daily_key,
+                &daily_id,
+                restic,
+                timeout
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            validate_destination(&runner, &destination, &prior.recovery_key, restic, timeout)
+                .unwrap()
+                .reason_code,
+            "auth_failed"
+        );
+        assert_eq!(
+            validate_destination(&runner, &destination, &staged.recovery_key, restic, timeout)
+                .unwrap()
+                .reason_code,
+            "repo_exists"
+        );
+        assert!(
+            !solstone_core_backup::get_backup_config(journal.path())
+                .unwrap()
+                .contains_key("pending_key_revocation")
+        );
     }
 }

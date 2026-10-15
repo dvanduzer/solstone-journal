@@ -76,27 +76,9 @@ pub fn pause_after_remote_removal() {
     }
 }
 
-#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
-mod android;
-#[cfg(not(target_os = "android"))]
-mod desktop;
+mod transaction;
 
-/// Rotate using this platform's qualified transaction.
+/// Publish and confirm replacement material before revoking the recorded original.
 pub fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) -> RotationResult {
-    #[cfg(target_os = "android")]
-    {
-        android::rotate_recovery_key(journal, services)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        desktop::rotate_recovery_key(journal, services)
-    }
-}
-
-#[cfg(all(unix, feature = "test-support"))]
-pub(crate) fn rotate_android_for_test(
-    journal: &Path,
-    services: &BackupServices<'_>,
-) -> RotationResult {
-    android::rotate_recovery_key(journal, services)
+    transaction::rotate_recovery_key(journal, services)
 }

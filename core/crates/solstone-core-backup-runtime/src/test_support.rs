@@ -333,13 +333,3 @@ impl RestoreRecorder for RestoreRecorderSpy {
         }
     }
 }
-
-/// Exercise the production Android transaction explicitly from a Unix host test.
-/// Public desktop dispatch is unchanged by this fixture feature.
-#[cfg(unix)]
-pub fn rotate_android_recovery_key(
-    journal: &Path,
-    services: &crate::BackupServices<'_>,
-) -> crate::RotationResult {
-    crate::rotation::rotate_android_for_test(journal, services)
-}

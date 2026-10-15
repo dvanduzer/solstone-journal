@@ -1475,17 +1475,6 @@ mod tests {
                     assert_eq!(*runner.calls.borrow(), ["snapshots", "restore"]);
                     let path = journal.path().join("config/journal.json");
                     assert_eq!(std::fs::read(&path).unwrap(), imported);
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        let desktop = Script::new(vec![]);
-                        let rotation = crate::rotate_recovery_key(
-                            journal.path(),
-                            &services(&desktop, &TestClock, &Maintenance),
-                        );
-                        assert_eq!(rotation.status, "error");
-                        assert!(desktop.calls.borrow().is_empty());
-                        assert_eq!(std::fs::read(path).unwrap(), imported);
-                    }
                 }
             }
         }
