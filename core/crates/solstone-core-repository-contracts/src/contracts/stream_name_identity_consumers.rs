@@ -296,10 +296,8 @@ fn expected_consumers() -> BTreeSet<(String, String)> {
         ("solstone-core-import-sources/src/strava.rs", "place"),
         // operator CLI move seam; name comes from the relocation request
         ("solstone-core-segment-cli/src/move.rs", "relocate"),
-        // operator CLI helper; name is the marker/argv stream token
-        ("solstone-core-segment-cli/src/read.rs", "checks"),
-        // operator CLI helper; name is the marker/argv stream token
-        ("solstone-core-segment-cli/src/read.rs", "describe_next"),
+        // shared forward-pointer resolution; name is the marker/argv stream token
+        ("solstone-core-segment-cli/src/read.rs", "resolve_forward"),
         // operator CLI helper; name-keyed tail check
         ("solstone-core-segment-cli/src/read.rs", "is_tail"),
         // relocates a segment and repairs the named stream tail
