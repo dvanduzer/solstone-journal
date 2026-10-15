@@ -10,9 +10,9 @@ use solstone_core_assets::{Platform, resolve};
 pub const LLAMA_SERVER_PINS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "aarch64-apple-darwin",
-        "b11429",
-        "llama-b11429-bin-macos-arm64.tar.gz",
-        "740288ec6887be94280a5dfa25b5e23a78285cab104519e6c7e218904ee82459",
+        "b11669",
+        "llama-b11669-bin-macos-arm64.tar.gz",
+        "dbed55493d72bc1ba2babc8770d669c2289b5bc4ee9fb2a4dfc158d45b7d13fd",
         "llama-server",
     ),
     (
@@ -268,6 +268,93 @@ pub const METAL_MACOS_ARM64_B11429_REQUIRED: &[RequiredMember] = &[
     RequiredMember::Regular("llama-server"),
 ];
 
+pub const METAL_MACOS_ARM64_B11669_REQUIRED: &[RequiredMember] = &[
+    RequiredMember::Regular("LICENSE"),
+    RequiredMember::Regular("libggml-base.0.27.0.dylib"),
+    RequiredMember::Link {
+        name: "libggml-base.0.dylib",
+        target: "libggml-base.0.27.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libggml-base.dylib",
+        target: "libggml-base.0.dylib",
+    },
+    RequiredMember::Regular("libggml-blas.0.27.0.dylib"),
+    RequiredMember::Link {
+        name: "libggml-blas.0.dylib",
+        target: "libggml-blas.0.27.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libggml-blas.dylib",
+        target: "libggml-blas.0.dylib",
+    },
+    RequiredMember::Regular("libggml-cpu.0.27.0.dylib"),
+    RequiredMember::Link {
+        name: "libggml-cpu.0.dylib",
+        target: "libggml-cpu.0.27.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libggml-cpu.dylib",
+        target: "libggml-cpu.0.dylib",
+    },
+    RequiredMember::Regular("libggml-metal.0.27.0.dylib"),
+    RequiredMember::Link {
+        name: "libggml-metal.0.dylib",
+        target: "libggml-metal.0.27.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libggml-metal.dylib",
+        target: "libggml-metal.0.dylib",
+    },
+    RequiredMember::Regular("libggml-rpc.0.27.0.dylib"),
+    RequiredMember::Link {
+        name: "libggml-rpc.0.dylib",
+        target: "libggml-rpc.0.27.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libggml-rpc.dylib",
+        target: "libggml-rpc.0.dylib",
+    },
+    RequiredMember::Regular("libggml.0.27.0.dylib"),
+    RequiredMember::Link {
+        name: "libggml.0.dylib",
+        target: "libggml.0.27.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libggml.dylib",
+        target: "libggml.0.dylib",
+    },
+    RequiredMember::Regular("libllama-common.0.7.0.dylib"),
+    RequiredMember::Link {
+        name: "libllama-common.0.dylib",
+        target: "libllama-common.0.7.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libllama-common.dylib",
+        target: "libllama-common.0.dylib",
+    },
+    RequiredMember::Regular("libllama-server-impl.dylib"),
+    RequiredMember::Regular("libllama.0.7.0.dylib"),
+    RequiredMember::Link {
+        name: "libllama.0.dylib",
+        target: "libllama.0.7.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libllama.dylib",
+        target: "libllama.0.dylib",
+    },
+    RequiredMember::Regular("libmtmd.0.7.0.dylib"),
+    RequiredMember::Link {
+        name: "libmtmd.0.dylib",
+        target: "libmtmd.0.7.0.dylib",
+    },
+    RequiredMember::Link {
+        name: "libmtmd.dylib",
+        target: "libmtmd.0.dylib",
+    },
+    RequiredMember::Regular("llama-server"),
+];
+
 pub const B10068_REQUIRED: &[RequiredMember] = &[RequiredMember::Regular("llama-server")];
 
 pub fn required_members_for(
@@ -278,6 +365,7 @@ pub fn required_members_for(
         ("b11429", "x86_64-unknown-linux-gnu") => Some(VULKAN_LINUX_X64_B11429_REQUIRED),
         ("b11429", "aarch64-unknown-linux-gnu") => Some(VULKAN_LINUX_ARM64_B11429_REQUIRED),
         ("b11429", "aarch64-apple-darwin") => Some(METAL_MACOS_ARM64_B11429_REQUIRED),
+        ("b11669", "aarch64-apple-darwin") => Some(METAL_MACOS_ARM64_B11669_REQUIRED),
         ("b10068", _) => Some(B10068_REQUIRED),
         _ => None,
     }

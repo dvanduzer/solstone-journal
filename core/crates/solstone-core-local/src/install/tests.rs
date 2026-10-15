@@ -2585,7 +2585,7 @@ fn registry_preserves_prechange_identity_literals() {
         fingerprint::canonical(pins::vulkan_identity("aarch64-apple-darwin").unwrap()).unwrap();
     assert_eq!(
         current_metal,
-        "{\"artifact_key\":\"aarch64-apple-darwin\",\"binary_name\":\"llama-server\",\"filename\":\"llama-b11429-bin-macos-arm64.tar.gz\",\"release_tag\":\"b11429\",\"sha256\":\"740288ec6887be94280a5dfa25b5e23a78285cab104519e6c7e218904ee82459\",\"unit\":\"llama-server-vulkan\"}"
+        "{\"artifact_key\":\"aarch64-apple-darwin\",\"binary_name\":\"llama-server\",\"filename\":\"llama-b11669-bin-macos-arm64.tar.gz\",\"release_tag\":\"b11669\",\"sha256\":\"dbed55493d72bc1ba2babc8770d669c2289b5bc4ee9fb2a4dfc158d45b7d13fd\",\"unit\":\"llama-server-vulkan\"}"
     );
 
     let current_cuda =
@@ -4753,22 +4753,28 @@ fn windows_admission_enforces_gpu_verdict_before_local_target() {
     let _ = run_local_with_gpu_admission(&object, mac_exact);
     assert!(TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get) > 0);
 
-    // 2. UnsupportedDarwin -> unsupported_platform, zero counters.
-    TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
-    TEST_INSTALL_MODEL_COUNT.with(|count| count.set(0));
-    let mut darwin_obj = object.clone();
-    darwin_obj.insert("backend".into(), "metal".into());
-    let err = run_local_with_gpu_admission(&darwin_obj, LocalHardwareAdmission::UnsupportedDarwin)
-        .unwrap_err();
-    assert_eq!(
-        err.envelope.error.as_ref().unwrap().reason_code,
-        "unsupported_platform"
-    );
-    assert_eq!(
-        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
-        0
-    );
-    assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+    // UnsupportedDarwin delegates to native platform selection. This case needs
+    // a host that does not itself support the Metal path.
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        // 2. UnsupportedDarwin -> unsupported_platform, zero counters.
+        TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));
+        TEST_INSTALL_MODEL_COUNT.with(|count| count.set(0));
+        let mut darwin_obj = object.clone();
+        darwin_obj.insert("backend".into(), "metal".into());
+        let err =
+            run_local_with_gpu_admission(&darwin_obj, LocalHardwareAdmission::UnsupportedDarwin)
+                .unwrap_err();
+        assert_eq!(
+            err.envelope.error.as_ref().unwrap().reason_code,
+            "unsupported_platform"
+        );
+        assert_eq!(
+            TEST_FETCH_RUNTIME_MEMBER_COUNT.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(TEST_INSTALL_MODEL_COUNT.with(std::cell::Cell::get), 0);
+    }
 
     // 3. Linux NVIDIA memory just below GPU_DEVICE_LOCAL_MIN_BYTES refuses. Exactly that many bytes proceeds.
     TEST_FETCH_RUNTIME_MEMBER_COUNT.with(|count| count.set(0));

@@ -509,6 +509,7 @@ fn guard_outgoing_vulkan_keys_pinned_by_historical_releases_not_head() {
         "assets/llama-server-vulkan/b10068/llama-b10068-bin-ubuntu-vulkan-x64.tar.gz",
         "assets/llama-server-vulkan/b10068/llama-b10068-bin-macos-arm64.tar.gz",
         "assets/llama-server-vulkan/b10068/llama-b10068-bin-ubuntu-vulkan-arm64.tar.gz",
+        "assets/llama-server-vulkan/b11429/llama-b11429-bin-macos-arm64.tar.gz",
     ];
     for key in outgoing_keys {
         let expected = historical_origin_pins()
@@ -529,7 +530,6 @@ fn guard_outgoing_vulkan_keys_pinned_by_historical_releases_not_head() {
 fn guard_current_vulkan_keys_pinned_by_their_releases_and_head() {
     let candidate_keys = [
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-x64.tar.gz",
-        "assets/llama-server-vulkan/b11429/llama-b11429-bin-macos-arm64.tar.gz",
         "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-arm64.tar.gz",
     ];
     for key in candidate_keys {
@@ -546,6 +546,22 @@ fn guard_current_vulkan_keys_pinned_by_their_releases_and_head() {
             PruneAssessment::PinnedBy { owners }
         );
     }
+}
+
+#[test]
+fn guard_selected_metal_key_is_pinned_by_head_and_any_release_owners() {
+    let key = "assets/llama-server-vulkan/b11669/llama-b11669-bin-macos-arm64.tar.gz";
+    let mut owners = historical_origin_pins()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, pins)| pins.iter().any(|pin| pin.origin_key == key))
+        .map(|(version, _)| PinOwner::Release(version))
+        .collect::<Vec<_>>();
+    owners.push(PinOwner::HeadUnreleased);
+    assert_eq!(
+        assess_prune_with_current_support(key).unwrap(),
+        PruneAssessment::PinnedBy { owners }
+    );
 }
 
 #[test]
