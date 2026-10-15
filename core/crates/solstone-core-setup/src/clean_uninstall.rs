@@ -1238,15 +1238,23 @@ pub fn run_clean_uninstall(context: &mut CleanUninstallContext<'_>) -> CleanUnin
 mod tests {
     use super::*;
     use crate::args::parse_args_at;
+    #[cfg(unix)]
     use crate::identity_evidence::gather_artifact_evidence;
+    #[cfg(unix)]
     use crate::manifest::manifest_path;
-    use crate::user_config::{config_path, write_user_config};
-    use crate::wrapper::{WrapperCommand, render_wrapper, wrapper_paths};
+    #[cfg(unix)]
+    use crate::user_config::config_path;
+    #[cfg(unix)]
+    use crate::user_config::write_user_config;
+    use crate::wrapper::WrapperCommand;
+    #[cfg(unix)]
+    use crate::wrapper::{render_wrapper, wrapper_paths};
+    #[cfg(unix)]
     use solstone_core_installation_identity::{
-        CleanUninstallRequest, LegacyManifestEvidence, OwnerBase, PlatformTag,
-        SetupAdmissionRequest, admit_clean_uninstall, admit_setup, journal_token_from_path,
-        root_token_from_path,
+        CleanUninstallRequest, LegacyManifestEvidence, OwnerBase, SetupAdmissionRequest,
+        admit_clean_uninstall, admit_setup, root_token_from_path,
     };
+    use solstone_core_installation_identity::{PlatformTag, journal_token_from_path};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::ffi::OsString;
@@ -1267,20 +1275,21 @@ mod tests {
                 .expect("generation"),
             platform: solstone_core_installation_identity::PlatformTag::Linux,
             root_token: solstone_core_installation_identity::RootToken::from_raw_absolute(
-                if cfg!(windows) {
-                    br"C:\install\clean".to_vec()
+                journal_token_from_path(Path::new(if cfg!(windows) {
+                    r"C:\install\clean"
                 } else {
-                    b"/install/clean".to_vec()
-                },
+                    "/install/clean"
+                }))
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
             )
             .expect("root"),
-            journal_token: solstone_core_installation_identity::JournalToken::from_raw_absolute(
-                if cfg!(windows) {
-                    br"C:\journal".to_vec()
-                } else {
-                    b"/journal".to_vec()
-                },
-            )
+            journal_token: journal_token_from_path(Path::new(if cfg!(windows) {
+                r"C:\journal"
+            } else {
+                "/journal"
+            }))
             .expect("journal"),
         };
         let journal_token = binding.journal_token.clone();
@@ -1310,8 +1319,8 @@ mod tests {
 
     impl TestRoot {
         fn new(name: &str) -> Self {
-            let root = PathBuf::from("/var/tmp")
-                .join(format!("solstone-clean-{name}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("solstone-clean-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).unwrap();
             Self(root)
@@ -1644,7 +1653,7 @@ mod tests {
                 home.join(".local/bin").join(binary),
                 crate::wrapper::render_wrapper(
                     command,
-                    Path::new("/journal"),
+                    &guard.journal_token.to_path_buf(),
                     &runtime.join(binary),
                     &guard,
                 )
@@ -1862,6 +1871,7 @@ mod tests {
         assert!(!home.join(".local/bin/journal").exists());
     }
 
+    #[cfg(unix)]
     fn setup_request(
         owner: OwnerBase,
         install_root: &Path,
@@ -1878,6 +1888,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn clean_context<'a>(
         home: &Path,
         root: &Path,

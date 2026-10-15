@@ -2953,9 +2953,47 @@ fn normalize_windows_canonical_path(path: &Path) -> Result<Vec<u8>, IdentityErro
     normalize_windows_absolute_bytes(&bytes)
 }
 
+/// Scoped known-folder replacement for native adapter fixtures only.
+/// The caller must keep the supplied directory alive for the scope's lifetime.
+#[cfg(all(windows, feature = "test-hooks"))]
+pub struct TestLocalAppData {
+    previous: Option<PathBuf>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(all(windows, feature = "test-hooks"))]
+thread_local! {
+    static TEST_LOCAL_APP_DATA: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(windows, feature = "test-hooks"))]
+impl TestLocalAppData {
+    pub fn new(directory: PathBuf) -> Self {
+        assert!(
+            directory.is_absolute(),
+            "test LocalAppData must be absolute"
+        );
+        Self {
+            previous: TEST_LOCAL_APP_DATA.with(|slot| slot.replace(Some(directory))),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "test-hooks"))]
+impl Drop for TestLocalAppData {
+    fn drop(&mut self) {
+        TEST_LOCAL_APP_DATA.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn known_folder_local_app_data() -> Result<PathBuf, IdentityError> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(path) = TEST_LOCAL_APP_DATA.with(|slot| slot.borrow().clone()) {
+        return Ok(path);
+    }
     #[cfg(test)]
     if let Some(path) = known_folder_override_for_test() {
         return Ok(path);

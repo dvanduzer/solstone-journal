@@ -1145,20 +1145,29 @@ pub fn run_owner_setup_native(args: SetupArgs) -> ExitCode {
 mod tests {
     use super::*;
     use crate::args::parse_args_at;
-    use crate::identity_evidence::{gather_artifact_evidence, gather_wrapper_artifact_evidence};
+    use crate::identity_evidence::gather_artifact_evidence;
+    #[cfg(unix)]
+    use crate::identity_evidence::gather_wrapper_artifact_evidence;
     use crate::manifest::{SetupManifest, write_manifest};
-    use crate::steps::{CommandOutput, CommandRequest, service_artifact_path};
+    use crate::steps::service_artifact_path;
+    use crate::steps::{CommandOutput, CommandRequest};
+    #[cfg(unix)]
     use crate::wrapper::{
         WrapperEnvironment, provision_wrappers, wrapper_lock, wrapper_paths,
         write_wrappers_atomically_with,
     };
     use solstone_core_installation_identity::{
-        ArtifactBindingEvidence, GuardFields, LegacyManifestEvidence, LifecycleState, OwnerBase,
-        PlatformTag, SetupAdmissionRequest, admit_setup, decode_record, encode_record,
-        journal_token_from_path, namespace_name, root_token_from_path,
+        ArtifactBindingEvidence, OwnerBase, PlatformTag, journal_token_from_path, namespace_name,
+        root_token_from_path,
     };
+    use solstone_core_installation_identity::{
+        GuardFields, LegacyManifestEvidence, SetupAdmissionRequest, admit_setup,
+    };
+    #[cfg(unix)]
+    use solstone_core_installation_identity::{LifecycleState, decode_record, encode_record};
     use std::collections::VecDeque;
     use std::fs;
+    #[cfg(unix)]
     use std::io;
     use std::ops::Deref;
     use std::path::Path;
@@ -1233,14 +1242,9 @@ mod tests {
         fn run(&mut self, request: &CommandRequest) -> Result<CommandOutput, String> {
             if request
                 .args
-                .first()
-                .is_some_and(|argument| argument == "service")
-                && request
-                    .args
-                    .get(1)
-                    .is_some_and(|argument| argument == "install")
+                .starts_with(&["journal".into(), "service".into(), "install".into()])
             {
-                let mut lines = Vec::new();
+                let mut environment = std::collections::BTreeMap::new();
                 for (argument, key) in [
                     (
                         "--installation-namespace",
@@ -1262,7 +1266,7 @@ mod tests {
                         .position(|value| value == argument)
                         .and_then(|index| request.args.get(index + 1))
                         .ok_or_else(|| format!("missing {argument} from service install"))?;
-                    lines.push(format!("Environment=\"{key}={value}\""));
+                    environment.insert(key.to_owned(), value.clone());
                 }
                 fs::create_dir_all(
                     self.artifact_path
@@ -1270,8 +1274,46 @@ mod tests {
                         .expect("service artifact parent"),
                 )
                 .map_err(|error| error.to_string())?;
-                fs::write(&self.artifact_path, lines.join("\n"))
-                    .map_err(|error| error.to_string())?;
+                #[cfg(not(windows))]
+                let content = environment
+                    .iter()
+                    .map(|(key, value)| format!("Environment=\"{key}={value}\""))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into_bytes();
+                #[cfg(windows)]
+                let content = {
+                    use solstone_core_service_unit::{
+                        WindowsServiceAction, WindowsTaskInput, encode_windows_task_xml,
+                        render_windows_task_xml,
+                    };
+                    let guard =
+                        solstone_core_installation_identity::parse_service_guard_environment(
+                            &environment,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .ok_or("fixture service guard missing")?;
+                    let action = WindowsServiceAction {
+                        port: 5015,
+                        journal: guard
+                            .journal_token
+                            .to_path_buf()
+                            .to_string_lossy()
+                            .into_owned(),
+                        guard,
+                    };
+                    let xml = render_windows_task_xml(&WindowsTaskInput {
+                        principal_sid: "S-1-5-21-1-2-3-1001",
+                        command: request.program.to_str().unwrap(),
+                        working_directory: &action.journal,
+                        action: &action,
+                        enabled: true,
+                        starts_at_sign_in: true,
+                    })
+                    .map_err(str::to_owned)?;
+                    encode_windows_task_xml(&xml).map_err(str::to_owned)?
+                };
+                fs::write(&self.artifact_path, content).map_err(|error| error.to_string())?;
             }
             Ok(CommandOutput {
                 exit_code: 0,
@@ -1380,17 +1422,67 @@ mod tests {
         }
     }
 
-    struct TestRoot(PathBuf);
+    #[cfg(all(windows, feature = "full-tests"))]
+    #[test]
+    fn native_owner_fixture_is_scoped_and_restores_the_real_known_folder() {
+        use solstone_core_installation_identity::{TestLocalAppData, owner_base};
+        let fixture = tempfile::tempdir().unwrap();
+        let real = owner_base().unwrap();
+        assert_eq!(
+            OwnerBase::at_home(fixture.path().to_path_buf(), PlatformTag::Windows).unwrap(),
+            real
+        );
+        {
+            let _outer = TestLocalAppData::new(fixture.path().join("outer"));
+            let outer = owner_base().unwrap();
+            assert!(outer.path().starts_with(fixture.path()));
+            assert_eq!(
+                std::thread::spawn(|| owner_base().unwrap()).join().unwrap(),
+                real
+            );
+            let refusal = std::panic::catch_unwind(|| {
+                let _inner = TestLocalAppData::new(fixture.path().join("inner"));
+                assert_ne!(owner_base().unwrap(), outer);
+                panic!("fixture unwind");
+            });
+            assert!(refusal.is_err());
+            assert_eq!(owner_base().unwrap(), outer);
+            assert!(
+                !outer.path().exists(),
+                "resolving a fixture creates no owner storage"
+            );
+        }
+        assert_eq!(owner_base().unwrap(), real);
+    }
+
+    struct TestRoot {
+        root: PathBuf,
+        #[cfg(windows)]
+        _local_app_data: solstone_core_installation_identity::TestLocalAppData,
+    }
 
     impl TestRoot {
         fn new(name: &str) -> Self {
-            let root = PathBuf::from("/var/tmp").join(format!(
+            let root = std::env::temp_dir().join(format!(
                 "solstone-core-setup-lib-{name}-{}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).unwrap();
-            Self(root.canonicalize().unwrap())
+            let root = journal_token_from_path(&root.canonicalize().unwrap())
+                .unwrap()
+                .to_path_buf();
+            #[cfg(windows)]
+            let local_app_data = root.join("local-app-data");
+            #[cfg(windows)]
+            fs::create_dir_all(&local_app_data).unwrap();
+            Self {
+                root,
+                #[cfg(windows)]
+                _local_app_data: solstone_core_installation_identity::TestLocalAppData::new(
+                    local_app_data,
+                ),
+            }
         }
     }
 
@@ -1398,13 +1490,13 @@ mod tests {
         type Target = Path;
 
         fn deref(&self) -> &Self::Target {
-            &self.0
+            &self.root
         }
     }
 
     impl Drop for TestRoot {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1845,6 +1937,8 @@ mod tests {
         );
     }
 
+    // Requires Unix managed shell wrappers or service artifacts.
+    #[cfg(unix)]
     #[test]
     fn unsafe_wrapper_input_refuses_before_identity_or_setup_mutation() {
         let root = root("wrapper-preflight");
@@ -1897,6 +1991,8 @@ mod tests {
         );
     }
 
+    // Requires Unix managed shell wrappers or service artifacts.
+    #[cfg(unix)]
     #[test]
     fn unsafe_prepared_journal_refuses_without_adopting_identity() {
         let root = root("wrapper-preflight-prepared");
@@ -2085,6 +2181,8 @@ mod tests {
     /// adopted. Recognising "current still points at this exact sibling
     /// version directory" (the fix) must not widen into recognising an
     /// unrelated installation's wrapper as this one's own.
+    // Requires Unix managed shell wrappers or service artifacts.
+    #[cfg(unix)]
     #[test]
     fn foreign_wrapper_from_a_different_installation_still_refuses() {
         let root = root("identity-foreign-refusal");
@@ -2181,6 +2279,8 @@ mod tests {
         );
     }
 
+    // Requires Unix managed shell wrappers or service artifacts.
+    #[cfg(unix)]
     #[test]
     fn conflicting_wrapper_guards_refuse_without_cleanup_instructions() {
         let root = root("identity-conflicting-guards");
@@ -2280,6 +2380,8 @@ mod tests {
     /// print the standard steps either, because they would delete the other
     /// installation's wrappers.
     #[cfg(not(target_os = "macos"))]
+    // Requires Unix managed shell wrappers or service artifacts.
+    #[cfg(unix)]
     #[test]
     fn an_admitted_root_meeting_another_installations_wrappers_prints_no_commands() {
         let root = root("identity-admitted-foreign");
@@ -2781,7 +2883,7 @@ mod tests {
         fs::create_dir_all(&executable_dir).expect("create executable directory");
         let service_path = service_artifact_path(&home)
             .expect("resolve service artifact")
-            .expect("linux service artifact");
+            .expect("native service artifact");
 
         let initial_args = parsed(
             &[
@@ -2821,6 +2923,12 @@ mod tests {
         );
         assert!(stderr.is_empty());
 
+        assert!(
+            service_path.is_file(),
+            "the fixture must publish a real service artifact"
+        );
+        let original_service = fs::read(&service_path).unwrap();
+
         let root_token = root_token_from_path(&executable_dir).expect("root token");
         let namespace = namespace_name(PlatformTag::current(), &root_token);
         let owner = OwnerBase::at_home(home.clone(), PlatformTag::current()).expect("owner");
@@ -2831,10 +2939,20 @@ mod tests {
             journal_is_explicit: true,
             accept_prepared_retarget: false,
             legacy_manifest: LegacyManifestEvidence::Absent,
-            artifacts: gather_wrapper_artifact_evidence(&home, &namespace),
+            artifacts: {
+                #[cfg(unix)]
+                {
+                    gather_wrapper_artifact_evidence(&home, &namespace)
+                }
+                #[cfg(windows)]
+                {
+                    ArtifactBindingEvidence::Fresh
+                }
+            },
         })
         .expect("config-equivalent explicit admission");
         let expected = GuardFields::from_binding(updated.binding());
+        #[cfg(unix)]
         provision_wrappers(
             &WrapperEnvironment {
                 home_dir: home.clone(),
@@ -2849,6 +2967,7 @@ mod tests {
         .expect("config-equivalent wrapper rewrite");
         drop(updated);
 
+        #[cfg(unix)]
         let paths = wrapper_paths(&home);
         let mut prior = SetupManifest::initial(
             "2026-01-01T00:00:00Z".into(),
@@ -2856,18 +2975,13 @@ mod tests {
             serde_json::Map::new(),
         );
         prior.completed_at = Some("2026-01-01T00:00:01Z".into());
-        prior.steps.extend([
-            serde_json::json!({
-                "name":"wrapper",
-                "status":"ok",
-                "paths":[paths.solstone.clone(), paths.journal.clone()],
-            }),
-            serde_json::json!({
-                "name":"service",
-                "status":"ok",
-                "paths":[service_path.clone()],
-            }),
-        ]);
+        #[cfg(unix)]
+        prior.steps.push(serde_json::json!({
+            "name":"wrapper", "status":"ok", "paths":[paths.solstone.clone(), paths.journal.clone()],
+        }));
+        prior.steps.push(serde_json::json!({
+            "name":"service", "status":"ok", "paths":[service_path.clone()],
+        }));
         write_manifest(&manifest_path(&journal_two), &prior);
 
         let plain_args = parsed(
@@ -2892,7 +3006,7 @@ mod tests {
                 false,
                 false,
                 Seams {
-                    runner: Box::new(ServiceArtifactRunner::new(service_path)),
+                    runner: Box::new(ServiceArtifactRunner::new(service_path.clone())),
                     service_ops: Box::new(HealthyService),
                     check_report_builder: Box::new(Check),
                     already_keeps_journal_probe: no_probe,
@@ -2905,12 +3019,19 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert!(stderr.is_empty());
+        assert_ne!(
+            fs::read(&service_path).unwrap(),
+            original_service,
+            "the stale service guard must be rewritten"
+        );
         assert_eq!(
             gather_artifact_evidence(&home, &namespace),
             ArtifactBindingEvidence::Guarded(expected)
         );
     }
 
+    // Requires Unix managed shell wrappers or service artifacts.
+    #[cfg(unix)]
     #[test]
     fn wrapper_write_failure_after_an_explicit_journal_update_is_retryable() {
         let root = root("identity-wrapper-retry");

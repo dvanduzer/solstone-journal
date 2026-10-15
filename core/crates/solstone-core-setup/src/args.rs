@@ -507,7 +507,6 @@ mod tests {
     use crate::user_config::{config_path, write_user_config};
     use std::ffi::OsString;
     use std::fs;
-    use std::path::PathBuf;
 
     fn fixture(name: &str) -> ResolutionContext {
         let root = std::env::temp_dir().join(format!(
@@ -581,7 +580,13 @@ mod tests {
     #[test]
     fn args_resolved_matches_the_reference_key_value_and_source_contract() {
         let mut context = fixture("resolved");
-        context.journal_env = Some("/from-env".into());
+        context.journal_env = Some(
+            context
+                .current_dir
+                .join("from-env")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let parsed = args(
             &[
                 "--port=5016",
@@ -595,7 +600,7 @@ mod tests {
             &context,
         );
         let resolved = resolve_setup(&parsed, &context);
-        assert_eq!(resolved.journal_path, PathBuf::from("/from-env"));
+        assert_eq!(resolved.journal_path, context.current_dir.join("from-env"));
         assert_eq!(resolved.journal_source, "env");
         assert_eq!(resolved.args_resolved.len(), 18);
         assert_eq!(resolved.args_resolved["port"]["value"], 5016);
@@ -625,14 +630,24 @@ mod tests {
     fn journal_resolution_has_normal_and_clean_uninstall_precedence() {
         let mut context = fixture("journal");
         fs::create_dir_all(context.current_dir.clone()).unwrap();
-        write_user_config(&config_path(&context.home_dir), "/from-config").unwrap();
+        write_user_config(
+            &config_path(&context.home_dir),
+            &context.current_dir.join("from-config").to_string_lossy(),
+        )
+        .unwrap();
         let parsed = args(&[], &context);
         assert_eq!(resolve_setup(&parsed, &context).journal_source, "config");
-        context.journal_env = Some("/from-env".into());
+        context.journal_env = Some(
+            context
+                .current_dir
+                .join("from-env")
+                .to_string_lossy()
+                .into_owned(),
+        );
         assert_eq!(resolve_setup(&parsed, &context).journal_source, "env");
         assert_eq!(
             resolve_clean_uninstall_journal(&context),
-            PathBuf::from("/from-env")
+            context.current_dir.join("from-env")
         );
         let parsed = args(&["--journal", "/from-cli"], &context);
         assert_eq!(resolve_setup(&parsed, &context).journal_source, "cli");
